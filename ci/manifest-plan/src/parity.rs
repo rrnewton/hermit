@@ -2701,19 +2701,10 @@ fn run_bounded(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
-    let mut pipe = child.stderr.take().ok_or("stderr pipe is missing")?;
-    let reader = thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut buffer = [0u8; 8192];
-        while let Ok(read) = pipe.read(&mut buffer) {
-            if read == 0 {
-                break;
-            }
-            let room = STDERR_LIMIT_BYTES.saturating_sub(kept.len());
-            kept.extend_from_slice(&buffer[..read.min(room)]);
-        }
-        kept
-    });
+    let reader = capped_reader(
+        child.stderr.take().ok_or("stderr pipe is missing")?,
+        STDERR_LIMIT_BYTES,
+    );
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -3001,6 +2992,10 @@ pub enum LedgerPostPassState {
     Running,
     /// The node left no [`PARITY_STATUS_JSON`] at all.
     Absent,
+    /// [`node_ledger_sources`] refused the node's outputs, so
+    /// [`expected_ledger_sources`] owes each of its expected cells a
+    /// `record-missing` row naming the refusal.
+    Refused,
 }
 
 impl From<PostPassState> for LedgerPostPassState {
@@ -3141,6 +3136,119 @@ fn is_sha1_hex(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A UTC instant read by [`parse_utc_timestamp`]. It orders by the instant
+/// it names, so two spellings of one instant are equal and a later instant
+/// is greater whatever its spelling.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct UtcInstant {
+    /// Days since 1970-01-01 in the proleptic Gregorian calendar.
+    days: i64,
+    /// Seconds into the day: 86400 only for a leap second.
+    second: u32,
+    nanosecond: u32,
+}
+
+/// Read `text` as an RFC 3339 timestamp in UTC:
+/// `YYYY-MM-DDTHH:MM:SS[.F]Z`, where `F` is 1 to 9 digits and `+00:00` may
+/// stand for `Z`. Every field is range-checked (the day against its month's
+/// length, leap years included), second 60 is accepted only at 23:59, where
+/// a leap second falls, and anything else -- another offset, no offset, a
+/// space for `T`, lower case, trailing text -- is refused. A row's
+/// `emitted_at` is compared by the instant this returns, never as text: as
+/// text, `...:00.5Z` sorts before `...:00Z`.
+pub fn parse_utc_timestamp(text: &str) -> Result<UtcInstant, String> {
+    let bytes = text.as_bytes();
+    let number = |from: usize, to: usize| -> Result<u32, String> {
+        let digits = bytes
+            .get(from..to)
+            .filter(|digits| digits.iter().all(u8::is_ascii_digit))
+            .ok_or_else(|| format!("{text:?} has no digits at bytes {from}..{to}"))?;
+        Ok(digits
+            .iter()
+            .fold(0, |value, digit| value * 10 + u32::from(digit - b'0')))
+    };
+    let separator = |at: usize, expected: u8| -> Result<(), String> {
+        if bytes.get(at) == Some(&expected) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{text:?} does not have {:?} at byte {at}",
+                char::from(expected)
+            ))
+        }
+    };
+    let year = number(0, 4)?;
+    separator(4, b'-')?;
+    let month = number(5, 7)?;
+    separator(7, b'-')?;
+    let day = number(8, 10)?;
+    separator(10, b'T')?;
+    let hour = number(11, 13)?;
+    separator(13, b':')?;
+    let minute = number(14, 16)?;
+    separator(16, b':')?;
+    let second = number(17, 19)?;
+    let mut at = 19;
+    let mut nanosecond = 0u32;
+    if bytes.get(at) == Some(&b'.') {
+        let digits = bytes[at + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if !(1..=9).contains(&digits) {
+            return Err(format!(
+                "{text:?} has {digits} fractional-second digit(s); RFC 3339 needs 1 to 9 here"
+            ));
+        }
+        nanosecond = number(at + 1, at + 1 + digits)? * 10u32.pow(9 - digits as u32);
+        at += 1 + digits;
+    }
+    match &bytes[at..] {
+        b"Z" | b"+00:00" => {}
+        zone => {
+            return Err(format!(
+                "{text:?} ends in {:?}, not the UTC designator Z (or +00:00)",
+                String::from_utf8_lossy(zone)
+            ));
+        }
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return Err(format!("{text:?} has month {month}")),
+    };
+    if !(1..=month_days).contains(&day) {
+        return Err(format!(
+            "{text:?} has day {day}, but {year:04}-{month:02} has {month_days} days"
+        ));
+    }
+    if hour > 23 || minute > 59 {
+        return Err(format!("{text:?} has time {hour:02}:{minute:02}"));
+    }
+    if second > 60 || (second == 60 && (hour, minute) != (23, 59)) {
+        return Err(format!(
+            "{text:?} has second {second}; 60 is a leap second, only at 23:59"
+        ));
+    }
+    // Days from 1970-01-01 to the civil date (Howard Hinnant's
+    // days_from_civil), with the year starting in March so February's
+    // leap day is the last day of the shifted year.
+    let (year, month, day) = (i64::from(year), i64::from(month), i64::from(day));
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Ok(UtcInstant {
+        days: era * 146_097 + day_of_era - 719_468,
+        second: hour * 3600 + minute * 60 + second,
+        nanosecond,
+    })
+}
+
 /// The checks a source row and a published row share: the cell names its
 /// test and backend, the record is present exactly when the verdict is not
 /// `record-missing` and agrees with the row, the record passes
@@ -3168,12 +3276,19 @@ fn check_ledger_fields(
     if !verdict.is_measured() && reason.is_none_or(|reason| reason.trim().is_empty()) {
         return Err(format!("{at}: verdict {verdict} needs a reason"));
     }
-    if source.post_pass_state == LedgerPostPassState::Absent
-        && verdict != LedgerVerdict::RecordMissing
-    {
-        return Err(format!(
-            "{at}: a node that left no status can only owe record-missing rows, got {verdict}"
-        ));
+    match source.post_pass_state {
+        LedgerPostPassState::Absent if verdict != LedgerVerdict::RecordMissing => {
+            return Err(format!(
+                "{at}: a node that left no status can only owe record-missing rows, got {verdict}"
+            ));
+        }
+        LedgerPostPassState::Refused if verdict != LedgerVerdict::RecordMissing => {
+            return Err(format!(
+                "{at}: a node whose outputs were refused can only owe record-missing rows, \
+                 got {verdict}"
+            ));
+        }
+        _ => {}
     }
     match (verdict, record) {
         (LedgerVerdict::RecordMissing, None) => Ok(()),
@@ -3238,7 +3353,8 @@ impl ParityLedgerSource {
 
 impl ParityLedgerRow {
     /// Refuse a row that breaks the envelope contract: the schema and event
-    /// type, a 40-hex `hermit_sha`, the `event_id` derivation, the checks
+    /// type, a 40-hex `hermit_sha`, an `emitted_at` that
+    /// [`parse_utc_timestamp`] reads, the `event_id` derivation, the checks
     /// shared with [`ParityLedgerSource::validate`], and a record whose run
     /// and tree are the row's own.
     pub fn validate(&self) -> Result<(), String> {
@@ -3267,6 +3383,8 @@ impl ParityLedgerRow {
                 self.hermit_sha
             ));
         }
+        parse_utc_timestamp(&self.emitted_at)
+            .map_err(|error| format!("{at}: emitted_at is not an RFC 3339 UTC time: {error}"))?;
         let expected = parity_event_id(
             self.producer,
             &self.run_id,
@@ -3341,6 +3459,9 @@ pub fn parse_expected_scope(text: &str) -> Result<ExpectedScope, String> {
 ///   `parity post-pass <state>: <error>`.
 /// - A node of `expected` with no status owes each of its cells a
 ///   `record-missing` row with `post_pass_state` `absent`.
+/// - A cell of a node's expected scope that its status's scope leaves out
+///   (or, for a complete schema-1 status, that no record names) owes a
+///   `record-missing` row with `scope_source` `expected-scope`.
 ///
 /// Anything that cannot be accounted for exactly is refused rather than
 /// guessed: an unreadable or malformed file, a record that fails
@@ -3351,33 +3472,9 @@ pub fn ledger_sources(
     e2e_root: &Path,
     expected: Option<&ExpectedScope>,
 ) -> Result<Vec<ParityLedgerSource>, String> {
-    let mut nodes = BTreeMap::<String, (String, String, PathBuf)>::new();
-    for lane in sorted_directories(e2e_root)? {
-        let lane_name = directory_name(&lane)?;
-        for node in sorted_directories(&lane)? {
-            let node_name = directory_name(&node)?;
-            nodes.insert(
-                format!("{lane_name}/{node_name}"),
-                (lane_name.clone(), node_name, node),
-            );
-        }
-    }
-    if let Some(expected) = expected {
-        for key in expected.keys() {
-            if !nodes.contains_key(key) {
-                let (lane, node) = key.split_once('/').ok_or_else(|| {
-                    format!("expected parity scope key {key:?} is not <lane>/<node>")
-                })?;
-                nodes.insert(
-                    key.clone(),
-                    (
-                        lane.to_string(),
-                        node.to_string(),
-                        e2e_root.join(lane).join(node),
-                    ),
-                );
-            }
-        }
+    let (nodes, unlisted) = run_nodes(e2e_root, expected)?;
+    if let Some(error) = unlisted.into_iter().next() {
+        return Err(error);
     }
     let mut rows = Vec::new();
     for (key, (lane, node, directory)) in &nodes {
@@ -3385,6 +3482,62 @@ pub fn ledger_sources(
         rows.extend(node_ledger_sources(directory, lane, node, owed)?);
     }
     Ok(rows)
+}
+
+/// A run's nodes, keyed `<lane>/<node>`: every node directory below
+/// `e2e_root`, and every node `expected` names whether or not it has a
+/// directory. A directory that cannot be listed, or whose name is not UTF-8,
+/// is returned as an error line beside the nodes rather than ending the
+/// walk; only a malformed `expected` key is an error.
+#[allow(clippy::type_complexity)]
+fn run_nodes(
+    e2e_root: &Path,
+    expected: Option<&ExpectedScope>,
+) -> Result<(BTreeMap<String, (String, String, PathBuf)>, Vec<String>), String> {
+    let mut nodes = BTreeMap::<String, (String, String, PathBuf)>::new();
+    let mut unlisted = Vec::new();
+    let lanes = sorted_directories(e2e_root).unwrap_or_else(|error| {
+        unlisted.push(error);
+        Vec::new()
+    });
+    for lane in lanes {
+        let lane_nodes = directory_name(&lane)
+            .and_then(|lane_name| Ok((lane_name, sorted_directories(&lane)?)));
+        let (lane_name, lane_nodes) = match lane_nodes {
+            Ok(listed) => listed,
+            Err(error) => {
+                unlisted.push(error);
+                continue;
+            }
+        };
+        for node in lane_nodes {
+            match directory_name(&node) {
+                Ok(node_name) => {
+                    nodes.insert(
+                        format!("{lane_name}/{node_name}"),
+                        (lane_name.clone(), node_name, node),
+                    );
+                }
+                Err(error) => unlisted.push(error),
+            }
+        }
+    }
+    for key in expected.into_iter().flat_map(|expected| expected.keys()) {
+        if !nodes.contains_key(key) {
+            let (lane, node) = key
+                .split_once('/')
+                .ok_or_else(|| format!("expected parity scope key {key:?} is not <lane>/<node>"))?;
+            nodes.insert(
+                key.clone(),
+                (
+                    lane.to_string(),
+                    node.to_string(),
+                    e2e_root.join(lane).join(node),
+                ),
+            );
+        }
+    }
+    Ok((nodes, unlisted))
 }
 
 /// The ledger rows of one post-pass whose [`PARITY_STATUS_JSON`] and
@@ -3535,7 +3688,6 @@ pub fn node_ledger_sources(
         }
         rows.extend(records.iter().map(|(_, record)| record_row(record)));
     } else {
-        let owed = owed.unwrap_or_default();
         let by_cell = records.iter().cloned().collect::<BTreeMap<_, _>>();
         let error = status.error.as_deref().unwrap_or(match status.state {
             PostPassState::Running => {
@@ -3549,17 +3701,85 @@ pub fn node_ledger_sources(
             PostPassState::Complete => "complete",
         };
         let reason = format!("parity post-pass {state_text}: {error}");
-        for cell in &owed {
+        for cell in owed.iter().flatten() {
             rows.push(match by_cell.get(cell) {
                 Some(record) => record_row(record),
                 None => missing_row(cell, &reason, Some(&status), &origin)?,
             });
         }
     }
+    // A cell the caller expected that the status's own scope does not name
+    // (or, for a complete schema-1 status, that no record names) was owed
+    // by the plan all the same: it is a `record-missing` row filed under the
+    // expected scope, so a narrower post-pass scope cannot drop it from the
+    // denominator.
+    let covered = match &owed {
+        Some(owed) => owed.iter().collect::<BTreeSet<_>>(),
+        None => records.iter().map(|(cell, _)| cell).collect(),
+    };
+    let gap_origin = ParityLedgerOrigin {
+        scope_source: LedgerScopeSource::ExpectedScope,
+        ..origin.clone()
+    };
+    let gap_reason = format!(
+        "no parity row: the post-pass of node {lane}/{node} left this cell out of its scope, \
+         and the node's expected scope owes it"
+    );
+    for cell in expected
+        .into_iter()
+        .flatten()
+        .filter(|cell| !covered.contains(cell))
+    {
+        rows.push(missing_row(cell, &gap_reason, Some(&status), &gap_origin)?);
+    }
     for row in &rows {
         row.validate()?;
     }
     Ok(rows)
+}
+
+/// The ledger rows validate appends when [`ledger_sources`] refuses its run.
+/// Every node [`ledger_sources`] would read is read on its own by
+/// [`node_ledger_sources`]; the rows of each node it accepts are kept, and a
+/// node whose outputs it refuses owes each of its `expected` cells a
+/// `record-missing` row with `post_pass_state` `refused` and the refusal as
+/// its reason. A run whose outputs cannot all be accounted for therefore
+/// still reaches the ledger with every cell its plan owed, instead of
+/// vanishing from it. Returns the rows and one line per refusal:
+/// `<lane>/<node>: <error>` for a refused node, and the error itself for a
+/// directory that could not be listed.
+pub fn expected_ledger_sources(
+    e2e_root: &Path,
+    expected: &ExpectedScope,
+) -> Result<(Vec<ParityLedgerSource>, Vec<String>), String> {
+    let (nodes, mut refused) = run_nodes(e2e_root, Some(expected))?;
+    let mut rows = Vec::new();
+    for (key, (lane, node, directory)) in &nodes {
+        let owed = expected.get(key);
+        match node_ledger_sources(directory, lane, node, owed) {
+            Ok(node_rows) => rows.extend(node_rows),
+            Err(error) => {
+                // The bytes that were refused, when they can be read, so the
+                // row names exactly what it stands in for.
+                let digest = |name: &str| read_if_present(&directory.join(name)).ok().flatten();
+                let origin = ParityLedgerOrigin {
+                    lane: lane.to_string(),
+                    node: node.to_string(),
+                    post_pass_state: LedgerPostPassState::Refused,
+                    status_sha256: digest(PARITY_STATUS_JSON).as_deref().map(sha256_hex),
+                    records_sha256: digest(PARITY_JSONL).as_deref().map(sha256_hex),
+                    hermit_bin_sha256: None,
+                    scope_source: LedgerScopeSource::ExpectedScope,
+                };
+                let reason = format!("parity post-pass outputs refused: {error}");
+                for cell in owed.into_iter().flatten() {
+                    rows.push(missing_row(cell, &reason, None, &origin)?);
+                }
+                refused.push(format!("{key}: {error}"));
+            }
+        }
+    }
+    Ok((rows, refused))
 }
 
 fn missing_row(
@@ -3610,6 +3830,267 @@ fn directory_name(path: &Path) -> Result<String, String> {
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .ok_or_else(|| format!("{} has no UTF-8 directory name", path.display()))
+}
+
+// ---- Appending ledger rows ---------------------------------------------------
+//
+// validate and the pressure test hand their rows to dev-hermit's
+// `series.py append-parity` through the one function below, so both bound
+// the writer, probe it and report its outcome the same way.
+
+/// How long [`append_ledger_rows`] waits on dev-hermit's writer.
+#[derive(Clone, Copy, Debug)]
+pub struct AppendBounds {
+    /// The `append-parity --help` capability probe.
+    pub probe: Duration,
+    /// The append itself.
+    pub append: Duration,
+}
+
+impl Default for AppendBounds {
+    fn default() -> Self {
+        Self {
+            probe: Duration::from_secs(60),
+            append: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Bytes of the writer's stdout, and separately of its stderr, that
+/// [`append_ledger_rows`] keeps.
+const APPEND_OUTPUT_LIMIT_BYTES: usize = 16 * 1024;
+
+/// Where [`append_ledger_rows`] sends one run's rows.
+#[derive(Clone, Copy, Debug)]
+pub struct LedgerAppend<'a> {
+    /// `<tool root>/ci-hub/series/series.py`.
+    pub series: &'a Path,
+    /// The dev-hermit checkout whose ledger receives the rows.
+    pub parent: &'a Path,
+    pub producer: ParityProducer,
+    pub run_id: &'a str,
+    /// The Hermit tree the run measured.
+    pub tree: &'a str,
+    /// Where the rows were read from, named in the line.
+    pub source: &'a Path,
+}
+
+/// The rows counted by verdict, `diverged 1, record-missing 3`.
+pub fn ledger_row_counts(rows: &[ParityLedgerSource]) -> String {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for row in rows {
+        *counts.entry(row.verdict.as_str()).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(verdict, count)| format!("{verdict} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Send `rows` to `series.py append-parity` and return the one `parity:`
+/// line that reports the outcome. Parity is measured after determinism and
+/// decides nothing, so no outcome here is an error for the caller.
+///
+/// - The writer is probed with `append-parity --help`, which exits 0 only
+///   on a writer that has the subcommand (dev-hermit's `series.py` answers
+///   an unknown one with its usage and exit 2). A writer without it is
+///   named, and the rows are left where they are.
+/// - The rows reach the writer's stdin from an unlinked temporary file,
+///   never a pipe: a script whose prelude turns `SIGPIPE` into `_exit(0)`
+///   would otherwise end, reporting success, the moment a writer exited
+///   before reading them.
+/// - Each call is bounded by [`AppendBounds`]; a writer still running at its
+///   bound is killed with its process group, and the line says so.
+/// - At most [`APPEND_OUTPUT_LIMIT_BYTES`] of each of its outputs is kept.
+pub fn append_ledger_rows(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> String {
+    use std::io::Seek;
+    use std::io::Write;
+
+    let counts = ledger_row_counts(rows);
+    let left = |why: &str| {
+        format!(
+            "parity: {why}; {} rows left in {} ({counts})",
+            rows.len(),
+            append.source.display()
+        )
+    };
+    let series = append.series;
+    if !series.is_file() {
+        return left(&format!("{} does not exist", series.display()));
+    }
+    let mut probe = Command::new("python3");
+    probe.arg(series).args(["append-parity", "--help"]);
+    match run_bounded_capturing(&mut probe, Stdio::null(), bounds.probe) {
+        Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
+        Ok((None, _, _)) => {
+            return left(&format!(
+                "ERROR: `{} append-parity --help` did not finish within {:?} and was killed",
+                series.display(),
+                bounds.probe
+            ));
+        }
+        Ok((Some(status), _, _)) if !status.success() => {
+            return left(&format!(
+                "the series writer {} has no append-parity (`append-parity --help` {status})",
+                series.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    static STAGED: AtomicUsize = AtomicUsize::new(0);
+    let staged = std::env::temp_dir().join(format!(
+        "hermit-parity-append-{}-{}.jsonl",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    let input = fs::File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .and_then(|mut file| {
+            // Unlinked at once: the open descriptor is all the writer needs,
+            // and nothing is left behind whatever happens next.
+            fs::remove_file(&staged)?;
+            for row in rows {
+                serde_json::to_writer(&mut file, row).map_err(std::io::Error::other)?;
+                file.write_all(b"\n")?;
+            }
+            file.rewind()?;
+            Ok(file)
+        });
+    let input = match input {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            return left(&format!(
+                "cannot stage the rows for append-parity in {}: {error}",
+                staged.display()
+            ));
+        }
+    };
+    let mut command = Command::new("python3");
+    command
+        .arg(series)
+        .arg("append-parity")
+        .arg("--parent")
+        .arg(append.parent)
+        .arg("--producer")
+        .arg(append.producer.as_str())
+        .arg("--run-id")
+        .arg(append.run_id)
+        .arg("--tree")
+        .arg(append.tree);
+    let (status, stdout, stderr) =
+        match run_bounded_capturing(&mut command, Stdio::from(input), bounds.append) {
+            Ok(outcome) => outcome,
+            Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
+        };
+    let Some(status) = status else {
+        return left(&format!(
+            "ERROR: append-parity did not finish within {:?} and was killed, so the ledger may \
+             hold some of these rows",
+            bounds.append
+        ));
+    };
+    if !status.success() {
+        return left(&format!(
+            "ERROR: append-parity refused them ({status}): {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    format!(
+        "parity: appended {} row(s) from {} ({counts}): {}",
+        rows.len(),
+        append.source.display(),
+        String::from_utf8_lossy(&stdout).trim()
+    )
+}
+
+/// Keep at most `limit` bytes of `pipe`, reading it to its end so the writer
+/// never blocks on a full pipe.
+fn capped_reader(
+    mut pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 8192];
+        while let Ok(read) = pipe.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            let room = limit.saturating_sub(kept.len());
+            kept.extend_from_slice(&buffer[..read.min(room)]);
+        }
+        kept
+    })
+}
+
+/// Run `command` as the leader of its own process group, with `stdin`,
+/// keeping at most [`APPEND_OUTPUT_LIMIT_BYTES`] of each of stdout and
+/// stderr. A `None` status means the group was killed at `timeout`. Once
+/// the leader has ended, whatever it left running in its group is killed
+/// too, so a straggler holding a pipe cannot hold the caller.
+fn run_bounded_capturing(
+    command: &mut Command,
+    stdin: Stdio,
+    timeout: Duration,
+) -> Result<(Option<ExitStatus>, Vec<u8>, Vec<u8>), String> {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = command
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let group = child.id() as libc::pid_t;
+    let kill_group = || {
+        // SAFETY: kill(2) only sends a signal; a negative pid names the
+        // process group the child leads, which nothing else joins. Once the
+        // group is empty the call fails with ESRCH, which is harmless.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    };
+    let stdout = capped_reader(
+        child.stdout.take().ok_or("stdout pipe is missing")?,
+        APPEND_OUTPUT_LIMIT_BYTES,
+    );
+    let stderr = capped_reader(
+        child.stderr.take().ok_or("stderr pipe is missing")?,
+        APPEND_OUTPUT_LIMIT_BYTES,
+    );
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                kill_group();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                kill_group();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+    };
+    kill_group();
+    Ok((
+        status,
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    ))
 }
 
 #[cfg(test)]
@@ -6159,14 +6640,50 @@ mod tests {
         }
     }
 
-    fn ledger_root(label: &str) -> PathBuf {
+    /// A scratch e2e result root, removed when the test that made it ends,
+    /// unless that test is panicking: a failing test's directory is kept to
+    /// debug.
+    struct LedgerRoot(PathBuf);
+
+    impl std::ops::Deref for LedgerRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for LedgerRoot {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    fn ledger_root(label: &str) -> LedgerRoot {
         let dir = std::env::temp_dir().join(format!(
             "hermit-parity-ledger-{}-{label}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        LedgerRoot(dir)
+    }
+
+    /// The scratch roots of the ledger tests do not outlive them.
+    #[test]
+    fn a_ledger_root_is_removed_when_its_test_ends() {
+        let root = ledger_root("removed");
+        let path = root.to_path_buf();
+        write_node(
+            &root.join("portable/manifest_c_programs"),
+            Some(&ledger_status(PostPassState::Complete, Some(&[]), 0, None)),
+            Some(&[]),
+        );
+        assert!(path.join("portable/manifest_c_programs").is_dir());
+        drop(root);
+        assert!(!path.exists(), "{} outlived its test", path.display());
     }
 
     fn five_cells() -> Vec<ParityCellId> {
@@ -6414,6 +6931,527 @@ mod tests {
         ] {
             assert!(parse_expected_scope(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A cell the node's expected scope owes but its status's scope leaves
+    /// out is a `record-missing` row filed under the expected scope, whatever
+    /// the status's state; a narrower post-pass scope cannot drop it.
+    #[test]
+    fn a_cell_the_expected_scope_owes_but_the_status_omits_is_record_missing() {
+        let root = ledger_root("gap");
+        let node = root.join("portable/manifest_c_programs");
+        let scope = five_cells();
+        let expected = scope.iter().cloned().collect::<BTreeSet<_>>();
+        let gap_reason = "no parity row: the post-pass of node portable/manifest_c_programs \
+                          left this cell out of its scope, and the node's expected scope owes it";
+        let written = [ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)];
+        // Complete, with a schema-2 scope of one cell: four gaps.
+        write_node(
+            &node,
+            Some(&ledger_status(
+                PostPassState::Complete,
+                Some(&scope[..1]),
+                1,
+                None,
+            )),
+            Some(&written),
+        );
+        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected))
+            .unwrap();
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert_eq!(rows[0].record.as_ref(), Some(&written[0]));
+        assert_eq!(rows[0].source.scope_source, LedgerScopeSource::StatusScope);
+        for row in &rows[1..] {
+            assert_eq!(row.verdict, LedgerVerdict::RecordMissing);
+            assert_eq!(row.reason.as_deref(), Some(gap_reason));
+            assert_eq!(row.source.scope_source, LedgerScopeSource::ExpectedScope);
+            assert_eq!(row.source.post_pass_state, LedgerPostPassState::Complete);
+            assert_eq!(row.run_id.as_deref(), Some(LEDGER_RUN));
+        }
+        assert_eq!(
+            rows[1..]
+                .iter()
+                .map(|row| row.cell.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "c-programs/a@liteinst",
+                "c-programs/b@kvm",
+                "c-programs/b@sabre",
+                "c-programs/c@kvm"
+            ]
+        );
+        // Complete schema 1, checked by its count: the cells no record names
+        // are the gaps.
+        write_node(
+            &node,
+            Some(&ledger_status(PostPassState::Complete, None, 1, None)),
+            Some(&written),
+        );
+        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected))
+            .unwrap();
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert_eq!(rows[0].source.scope_source, LedgerScopeSource::StatusCount);
+        assert!(rows[1..].iter().all(|row| {
+            row.verdict == LedgerVerdict::RecordMissing
+                && row.reason.as_deref() == Some(gap_reason)
+                && row.source.scope_source == LedgerScopeSource::ExpectedScope
+        }));
+        // Failed with a scope of two cells: one owed by the status's scope,
+        // three by the expected scope alone.
+        write_node(
+            &node,
+            Some(&ledger_status(
+                PostPassState::Failed,
+                Some(&scope[..2]),
+                2,
+                Some("disk full"),
+            )),
+            Some(&written),
+        );
+        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected))
+            .unwrap();
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        let reasons = rows
+            .iter()
+            .map(|row| (row.cell.as_str(), row.source.scope_source, row.reason.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            [
+                ("c-programs/a@kvm", LedgerScopeSource::StatusScope, None),
+                (
+                    "c-programs/a@liteinst",
+                    LedgerScopeSource::StatusScope,
+                    Some("parity post-pass failed: disk full")
+                ),
+                (
+                    "c-programs/b@kvm",
+                    LedgerScopeSource::ExpectedScope,
+                    Some(gap_reason)
+                ),
+                (
+                    "c-programs/b@sabre",
+                    LedgerScopeSource::ExpectedScope,
+                    Some(gap_reason)
+                ),
+                (
+                    "c-programs/c@kvm",
+                    LedgerScopeSource::ExpectedScope,
+                    Some(gap_reason)
+                ),
+            ]
+        );
+        // With no expected scope, the status's own scope is all it owes.
+        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", None).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// When [`ledger_sources`] refuses a run, validate falls back to
+    /// [`expected_ledger_sources`]: the nodes it can read keep their rows, and
+    /// a refused node owes each expected cell a `record-missing` row naming
+    /// the refusal and the refused bytes.
+    #[test]
+    fn a_refused_node_owes_record_missing_rows_for_its_expected_cells() {
+        let root = ledger_root("refused");
+        // A records file with no status beside it: refused.
+        let refused_node = root.join("portable/manifest_c_programs");
+        write_node(
+            &refused_node,
+            None,
+            Some(&[ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)]),
+        );
+        let stray = fs::read(refused_node.join(PARITY_JSONL)).unwrap();
+        // A complete node the plan expected.
+        let cpuid = [parity_cell("c-programs/cpuid", ParityBackend::Kvm)];
+        write_node(
+            &root.join("privileged/manifest_c_programs"),
+            Some(&ledger_status(PostPassState::Complete, Some(&cpuid), 1, None)),
+            Some(&[ledger_diverged("c-programs/cpuid", ParityBackend::Kvm, 1)]),
+        );
+        // A complete node on disk that the plan did not name.
+        let ls = [parity_cell("system-utils/ls", ParityBackend::Sabre)];
+        write_node(
+            &root.join("portable/manifest_system_utils"),
+            Some(&ledger_status(PostPassState::Complete, Some(&ls), 1, None)),
+            Some(&[ledger_diverged("system-utils/ls", ParityBackend::Sabre, 2)]),
+        );
+        let expected = parse_expected_scope(
+            r#"{"portable/manifest_c_programs": ["c-programs/a@kvm", "c-programs/a@liteinst"],
+                "privileged/manifest_c_programs": ["c-programs/cpuid@kvm"]}"#,
+        )
+        .unwrap();
+        let error = ledger_sources(&root, Some(&expected)).unwrap_err();
+        assert!(
+            error.contains("has no parity.status.json beside it"),
+            "{error}"
+        );
+        let (rows, refused) = expected_ledger_sources(&root, &expected).unwrap();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("portable/manifest_c_programs: ")
+                && refused[0].contains("has no parity.status.json beside it"),
+            "{refused:?}"
+        );
+        let summary = rows
+            .iter()
+            .map(|row| (row.cell.as_str(), row.verdict, row.source.post_pass_state))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "c-programs/a@kvm",
+                    LedgerVerdict::RecordMissing,
+                    LedgerPostPassState::Refused
+                ),
+                (
+                    "c-programs/a@liteinst",
+                    LedgerVerdict::RecordMissing,
+                    LedgerPostPassState::Refused
+                ),
+                (
+                    "system-utils/ls@sabre",
+                    LedgerVerdict::Diverged,
+                    LedgerPostPassState::Complete
+                ),
+                (
+                    "c-programs/cpuid@kvm",
+                    LedgerVerdict::Diverged,
+                    LedgerPostPassState::Complete
+                ),
+            ]
+        );
+        for row in &rows[..2] {
+            assert_eq!(
+                row.reason.as_deref(),
+                Some(format!("parity post-pass outputs refused: {error}").as_str())
+            );
+            assert_eq!(row.source.status_sha256, None);
+            assert_eq!(
+                row.source.records_sha256.as_deref(),
+                Some(sha256_hex(&stray).as_str())
+            );
+            assert_eq!(row.source.scope_source, LedgerScopeSource::ExpectedScope);
+            assert_eq!(row.run_id, None);
+            row.validate().unwrap();
+        }
+        // A refused node can only owe record-missing rows.
+        let mut row = rows[2].clone();
+        row.source.post_pass_state = LedgerPostPassState::Refused;
+        let error = row.validate().unwrap_err();
+        assert!(
+            error.contains("a node whose outputs were refused can only owe record-missing rows"),
+            "{error}"
+        );
+        // An e2e root that cannot be listed still owes every expected cell.
+        let (rows, refused) =
+            expected_ledger_sources(&root.join("no-such-root"), &expected).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| {
+            row.verdict == LedgerVerdict::RecordMissing
+                && row.source.post_pass_state == LedgerPostPassState::Absent
+        }));
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].starts_with("cannot read "), "{refused:?}");
+    }
+
+    /// `emitted_at` is read as the instant it names, and anything that is
+    /// not an RFC 3339 UTC time is refused.
+    #[test]
+    fn emitted_at_is_read_as_an_rfc3339_utc_instant() {
+        let at = |text: &str| parse_utc_timestamp(text).unwrap();
+        assert_eq!(
+            at("1970-01-01T00:00:00Z"),
+            UtcInstant {
+                days: 0,
+                second: 0,
+                nanosecond: 0
+            }
+        );
+        // 2000-01-01 is day 10957 (30 years, 7 of them leap); March 1 follows
+        // 31 days of January and 29 of February.
+        assert_eq!(at("2000-03-01T00:00:00Z").days, 10957 + 31 + 29);
+        assert_eq!(
+            at("2026-09-29T04:10:00.25Z"),
+            UtcInstant {
+                days: 20725,
+                second: 4 * 3600 + 10 * 60,
+                nanosecond: 250_000_000
+            }
+        );
+        // As text, a fraction sorts before the bare second it follows.
+        assert!("2026-09-29T04:10:00.5Z" < "2026-09-29T04:10:00Z");
+        assert!(at("2026-09-29T04:10:00.5Z") > at("2026-09-29T04:10:00Z"));
+        assert!(at("2026-09-29T04:10:00.000000001Z") > at("2026-09-29T04:10:00Z"));
+        assert_eq!(
+            at("2026-09-29T04:10:00+00:00"),
+            at("2026-09-29T04:10:00Z")
+        );
+        assert_eq!(at("2026-09-29T04:10:00.5Z"), at("2026-09-29T04:10:00.500Z"));
+        assert!(at("2026-09-30T00:00:00Z") > at("2026-09-29T23:59:59.999999999Z"));
+        assert!(at("2024-02-29T12:00:00Z") > at("2024-02-28T12:00:00Z"));
+        assert!(at("2000-02-29T00:00:00Z") < at("2000-03-01T00:00:00Z"));
+        // A leap second falls between 23:59:59 and the next midnight.
+        let leap = at("2026-12-31T23:59:60Z");
+        assert!(leap > at("2026-12-31T23:59:59.999Z"));
+        assert!(leap < at("2027-01-01T00:00:00Z"));
+        for bad in [
+            "",
+            "zzzz not a time",
+            "2026-09-29 04:10:00Z",
+            "2026-09-29T04:10:00",
+            "2026-09-29T04:10:00+01:00",
+            "2026-09-29T04:10:00-00:00",
+            "2026-09-29T04:10:00z",
+            "2026-09-29t04:10:00Z",
+            "2026-09-29T04:10:00Zjunk",
+            "2026-09-29T04:10Z",
+            "2026-9-29T04:10:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-09-00T00:00:00Z",
+            "2026-09-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2026-09-29T24:00:00Z",
+            "2026-09-29T23:60:00Z",
+            "2026-09-29T23:58:60Z",
+            "2026-09-29T23:59:61Z",
+            "2026-09-29T04:10:00.Z",
+            "2026-09-29T04:10:00.1234567890Z",
+            "+2026-09-29T04:10:00Z",
+        ] {
+            assert!(parse_utc_timestamp(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// A row whose `emitted_at` is not an RFC 3339 UTC time is refused: the
+    /// reader orders runs by that instant, so it cannot be guessed.
+    #[test]
+    fn a_ledger_row_with_a_malformed_emitted_at_is_refused() {
+        let root = ledger_root("emitted-at");
+        let node = root.join("portable/manifest_c_programs");
+        let scope = [parity_cell("c-programs/a", ParityBackend::Kvm)];
+        write_node(
+            &node,
+            Some(&ledger_status(PostPassState::Complete, Some(&scope), 1, None)),
+            Some(&[ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)]),
+        );
+        let sources = ledger_sources(&root, None).unwrap();
+        let row = envelope(&sources[0], ParityProducer::Validate);
+        row.validate().unwrap();
+        for bad in ["zzzz not a time", "2026-09-29 04:00:00Z", "2026-09-29T04:00:00"] {
+            let mut row = row.clone();
+            row.emitted_at = bad.into();
+            let error = row.validate().unwrap_err();
+            assert!(
+                error.contains("emitted_at is not an RFC 3339 UTC time"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    // ---- appending ledger rows ---------------------------------------------
+
+    /// A scratch `series.py` whose `append-parity` behaves as `body` says.
+    /// `body` runs after `import os, subprocess, sys, time, json` with `help`
+    /// true for the `--help` probe.
+    fn fake_series(root: &Path, body: &str) -> PathBuf {
+        let series = root.join("series.py");
+        fs::write(
+            &series,
+            format!(
+                "import json, os, subprocess, sys, time\n\
+                 help = sys.argv[1:] == ['append-parity', '--help']\n\
+                 {body}\n"
+            ),
+        )
+        .unwrap();
+        series
+    }
+
+    fn append_rows(label: &str) -> Vec<ParityLedgerSource> {
+        let root = ledger_root(&format!("{label}-rows"));
+        let node = root.join("portable/manifest_c_programs");
+        let scope = [
+            parity_cell("c-programs/a", ParityBackend::Kvm),
+            parity_cell("c-programs/b", ParityBackend::Kvm),
+        ];
+        write_node(
+            &node,
+            Some(&ledger_status(
+                PostPassState::Failed,
+                Some(&scope),
+                2,
+                Some("x"),
+            )),
+            Some(&[ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)]),
+        );
+        ledger_sources(&root, None).unwrap()
+    }
+
+    fn append_to(series: &Path, source: &Path) -> LedgerAppend<'static> {
+        LedgerAppend {
+            series: Box::leak(series.to_path_buf().into_boxed_path()),
+            parent: Path::new("/parent"),
+            producer: ParityProducer::Validate,
+            run_id: LEDGER_RUN,
+            tree: SHA,
+            source: Box::leak(source.to_path_buf().into_boxed_path()),
+        }
+    }
+
+    /// The rows reach `append-parity` on its stdin with the run's identity
+    /// on its command line, and the writer's own words end the line.
+    #[test]
+    fn appended_rows_reach_the_writer_with_the_runs_identity() {
+        let root = ledger_root("append-ok");
+        let rows = append_rows("append-ok");
+        let capture = root.join("captured.json");
+        let series = fake_series(
+            &root,
+            &format!(
+                "if help:\n    sys.exit(0)\n\
+                 json.dump({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}, \
+                 open({capture:?}, 'w'))\n\
+                 print('wrote 2 rows')"
+            ),
+        );
+        let line = append_ledger_rows(
+            &append_to(&series, &root),
+            &rows,
+            AppendBounds::default(),
+        );
+        assert_eq!(
+            line,
+            format!(
+                "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): wrote 2 rows",
+                root.display()
+            )
+        );
+        let captured: serde_json::Value =
+            serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(
+            captured["argv"],
+            serde_json::json!([
+                "append-parity",
+                "--parent",
+                "/parent",
+                "--producer",
+                "validate",
+                "--run-id",
+                LEDGER_RUN,
+                "--tree",
+                SHA
+            ])
+        );
+        let expected = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect::<String>();
+        assert_eq!(captured["stdin"], serde_json::json!(expected));
+    }
+
+    /// A writer without `append-parity`, a missing writer and a refusing
+    /// writer are each named, and the rows are left where they are.
+    #[test]
+    fn a_writer_that_cannot_append_is_named_and_leaves_the_rows() {
+        let root = ledger_root("append-refused");
+        let rows = append_rows("append-refused");
+        let left = format!(
+            "; 2 rows left in {} (diverged 1, record-missing 1)",
+            root.display()
+        );
+        // dev-hermit's series.py answers an unknown subcommand with its usage
+        // and exit status 2.
+        let legacy = fake_series(
+            &root,
+            "sys.stderr.write('usage: series.py {append-cells}\\n')\nsys.exit(2)",
+        );
+        assert_eq!(
+            append_ledger_rows(&append_to(&legacy, &root), &rows, AppendBounds::default()),
+            format!(
+                "parity: the series writer {} has no append-parity (`append-parity --help` \
+                 exit status: 2){left}",
+                legacy.display()
+            )
+        );
+        let missing = root.join("absent/series.py");
+        assert_eq!(
+            append_ledger_rows(&append_to(&missing, &root), &rows, AppendBounds::default()),
+            format!("parity: {} does not exist{left}", missing.display())
+        );
+        let refusing = fake_series(
+            &root,
+            "if help:\n    sys.exit(0)\nsys.stdin.read()\nsys.stderr.write('fixture refusal\\n')\nsys.exit(1)",
+        );
+        assert_eq!(
+            append_ledger_rows(&append_to(&refusing, &root), &rows, AppendBounds::default()),
+            format!(
+                "parity: ERROR: append-parity refused them (exit status: 1): fixture refusal{left}"
+            )
+        );
+    }
+
+    /// A writer that hangs, in the probe or in the append, is killed at its
+    /// bound together with anything it started, and the line says so; so is
+    /// a straggler left holding its output after it exited.
+    #[test]
+    fn a_hanging_writer_is_killed_at_its_bound() {
+        let root = ledger_root("append-hang");
+        let rows = append_rows("append-hang");
+        let bounds = AppendBounds {
+            probe: Duration::from_millis(300),
+            append: Duration::from_millis(300),
+        };
+        let left = format!(
+            "; 2 rows left in {} (diverged 1, record-missing 1)",
+            root.display()
+        );
+        let probe = fake_series(&root, "time.sleep(60)");
+        let started = Instant::now();
+        assert_eq!(
+            append_ledger_rows(&append_to(&probe, &root), &rows, bounds),
+            format!(
+                "parity: ERROR: `{} append-parity --help` did not finish within 300ms and was \
+                 killed{left}",
+                probe.display()
+            )
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // The append hangs, and a child it started holds its stdout open.
+        let append = fake_series(
+            &root,
+            "if help:\n    sys.exit(0)\nsubprocess.Popen(['sleep', '60'])\ntime.sleep(60)",
+        );
+        let started = Instant::now();
+        assert_eq!(
+            append_ledger_rows(&append_to(&append, &root), &rows, bounds),
+            format!(
+                "parity: ERROR: append-parity did not finish within 300ms and was killed, so the \
+                 ledger may hold some of these rows{left}"
+            )
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // The writer succeeds but leaves a child holding its stdout.
+        let straggler = fake_series(
+            &root,
+            "if help:\n    sys.exit(0)\nsys.stdin.read()\nsubprocess.Popen(['sleep', '60'])\n\
+             print('wrote 2 rows', flush=True)",
+        );
+        let started = Instant::now();
+        assert_eq!(
+            append_ledger_rows(
+                &append_to(&straggler, &root),
+                &rows,
+                AppendBounds::default()
+            ),
+            format!(
+                "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): wrote 2 rows",
+                root.display()
+            )
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 
     /// A record that breaks a credit invariant is refused with its message,

@@ -2692,111 +2692,159 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
              Set it to the dev-hermit checkout root and re-run."
                 .to_string()
         })?;
-
-    let metadata_path = results.join("run.json");
-    let metadata: RunMetadata = serde_json::from_str(
-        &fs::read_to_string(&metadata_path)
-            .map_err(|e| format!("cannot read {}: {e}", metadata_path.display()))?,
-    )
-    .map_err(|e| format!("invalid {}: {e}", metadata_path.display()))?;
-
-    // Deliberately NOT the checkout-HEAD guard `summarize` applies. That guard is
-    // right for reading a campaign you are standing in; emitting a RETAINED
-    // campaign from a checkout that has since moved is the normal case, and the
-    // tree being attributed is recorded in the campaign, not read from git.
-    let collected = collect_series_rows(results, current_result_policy(&metadata, fresh)?)?;
-    if collected.is_empty() {
-        return Err(format!(
-            "no per-cell results under {}; nothing to emit",
-            results.display()
-        ));
+    let emission = emit_series_to(
+        Path::new(&parent),
+        results,
+        checkout,
+        fresh,
+        parity::AppendBounds::default(),
+    );
+    if let Some(line) = &emission.parity {
+        eprintln!("pressure-test: {line}");
     }
-    let run_id = if metadata.run_id.is_empty() {
-        results
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-            .ok_or_else(|| format!("{} has no usable run id", results.display()))?
-            .to_string()
-    } else {
-        metadata.run_id.clone()
-    };
-    let mut payload = String::new();
-    for (_, row) in &collected {
-        payload.push_str(
-            &serde_json::to_string(row).map_err(|e| format!("cannot encode a series row: {e}"))?,
-        );
-        payload.push('\n');
-    }
+    println!("{}", emission.cells?);
+    Ok(())
+}
 
-    let script = Path::new(&parent).join("ci-hub/series/series.py");
-    if !script.is_file() {
-        return Err(format!(
-            "{} does not exist; DEV_HERMIT_PARENT does not look like a dev-hermit checkout",
-            script.display()
-        ));
-    }
-    let mut child = Command::new("python3")
-        .arg(&script)
-        .arg("append-cells")
-        .arg("--parent")
-        .arg(&parent)
-        .arg("--checkout")
-        .arg(checkout)
-        .arg("--producer")
-        .arg("pressure-test")
-        .arg("--run-id")
-        .arg(&run_id)
-        .arg("--tree")
-        .arg(&metadata.hermit_sha)
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
-    child
-        .stdin
-        .take()
-        .ok_or("series append stdin unavailable")?
-        .write_all(payload.as_bytes())
-        .map_err(|e| format!("cannot send rows to the series writer: {e}"))?;
-    let status = child
-        .wait()
-        .map_err(|e| format!("series append did not terminate readably: {e}"));
-    // The series' parity rows go beside its cells whatever became of them:
-    // parity is measured after determinism and never decides the emit.
-    eprintln!(
-        "pressure-test: {}",
-        append_series_parity(
+/// What [`emit_series_to`] did.
+struct SeriesEmission {
+    /// The cells' `emitted ...` line, or why they were not all appended.
+    cells: Result<String, String>,
+    /// The one `parity:` line of the parity append, which runs once the
+    /// cells were offered to their writer, whatever became of them. `None`
+    /// when the emit stopped before that.
+    parity: Option<String>,
+}
+
+/// [`emit_series`] into the dev-hermit checkout `parent`: the cells to
+/// `series.py append-cells`, then the series' parity rows to `series.py
+/// append-parity`, the second bounded by `bounds`.
+fn emit_series_to(
+    parent: &Path,
+    results: &Path,
+    checkout: &Path,
+    fresh: bool,
+    bounds: parity::AppendBounds,
+) -> SeriesEmission {
+    let mut parity_line = None;
+    let cells = (|| {
+        let metadata_path = results.join("run.json");
+        let metadata: RunMetadata = serde_json::from_str(
+            &fs::read_to_string(&metadata_path)
+                .map_err(|e| format!("cannot read {}: {e}", metadata_path.display()))?,
+        )
+        .map_err(|e| format!("invalid {}: {e}", metadata_path.display()))?;
+
+        // Deliberately NOT the checkout-HEAD guard `summarize` applies. That guard is
+        // right for reading a campaign you are standing in; emitting a RETAINED
+        // campaign from a checkout that has since moved is the normal case, and the
+        // tree being attributed is recorded in the campaign, not read from git.
+        let collected = collect_series_rows(results, current_result_policy(&metadata, fresh)?)?;
+        if collected.is_empty() {
+            return Err(format!(
+                "no per-cell results under {}; nothing to emit",
+                results.display()
+            ));
+        }
+        let run_id = if metadata.run_id.is_empty() {
+            results
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or_else(|| format!("{} has no usable run id", results.display()))?
+                .to_string()
+        } else {
+            metadata.run_id.clone()
+        };
+        let mut payload = String::new();
+        for (_, row) in &collected {
+            payload.push_str(
+                &serde_json::to_string(row)
+                    .map_err(|e| format!("cannot encode a series row: {e}"))?,
+            );
+            payload.push('\n');
+        }
+
+        let script = parent.join("ci-hub/series/series.py");
+        if !script.is_file() {
+            return Err(format!(
+                "{} does not exist; DEV_HERMIT_PARENT does not look like a dev-hermit checkout",
+                script.display()
+            ));
+        }
+        let mut child = Command::new("python3")
+            .arg(&script)
+            .arg("append-cells")
+            .arg("--parent")
+            .arg(parent)
+            .arg("--checkout")
+            .arg(checkout)
+            .arg("--producer")
+            .arg("pressure-test")
+            .arg("--run-id")
+            .arg(&run_id)
+            .arg("--tree")
+            .arg(&metadata.hermit_sha)
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
+        let sent = child
+            .stdin
+            .take()
+            .ok_or_else(|| "series append stdin unavailable".to_string())
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(payload.as_bytes())
+                    .map_err(|e| format!("cannot send rows to the series writer: {e}"))
+            });
+        let status = child
+            .wait()
+            .map_err(|e| format!("series append did not terminate readably: {e}"));
+        // The series' parity rows go beside its cells whatever became of them:
+        // parity is measured after determinism and never decides the emit.
+        parity_line = Some(append_series_parity(
             &script,
-            Path::new(&parent),
+            parent,
             results,
             &run_id,
-            &metadata.hermit_sha
-        )
-    );
-    let status = status?;
-    if !status.success() {
-        // A nonzero status keeps every rejected cell visible to the caller.
-        // append-cells can still have retained independent valid rows, so do
-        // not claim that the whole batch was rolled back.
-        return Err(format!(
-            "the series writer rejected one or more cell results (exit {:?}); valid completed rows, if any, were retained",
-            status.code()
+            &metadata.hermit_sha,
+            bounds,
         ));
+        sent?;
+        let status = status?;
+        if !status.success() {
+            // A nonzero status keeps every rejected cell visible to the caller.
+            // append-cells can still have retained independent valid rows, so do
+            // not claim that the whole batch was rolled back.
+            return Err(format!(
+                "the series writer rejected one or more cell results (exit {:?}); valid completed rows, if any, were retained",
+                status.code()
+            ));
+        }
+        Ok(format!(
+            "emitted {} cell result(s) from run {run_id} to {}",
+            collected.len(),
+            parent.display()
+        ))
+    })();
+    SeriesEmission {
+        cells,
+        parity: parity_line,
     }
-    println!(
-        "emitted {} cell result(s) from run {run_id} to {parent}",
-        collected.len()
-    );
-    Ok(())
 }
 
 /// Send one series' parity rows -- [`parity::node_ledger_sources`] over the
 /// `parity.status.json` and `parity.jsonl` its post-pass left in `results`,
 /// filed under the pressure-test lane and node -- to `series.py
-/// append-parity` with `--producer pressure-test`, as validate sends its
-/// run's. The outcome is one line and never an error: a refused output, a
-/// writer that predates `append-parity` or one that refuses the rows is
-/// named, with the rows left where they are.
+/// append-parity` with `--producer pressure-test`, through the same
+/// [`parity::append_ledger_rows`] validate uses. The outcome is one line and
+/// never an error: a refused output, a writer that predates `append-parity`,
+/// one that refuses the rows or one killed at its bound is named, with the
+/// rows left where they are.
+///
+/// A pressure test has no plan that says which cells its post-pass owed, so,
+/// unlike validate, it cannot stand record-missing rows in for refused
+/// outputs; the line names the refusal instead.
 /// <https://github.com/rrnewton/hermit/issues/3301>
 fn append_series_parity(
     script: &Path,
@@ -2804,6 +2852,7 @@ fn append_series_parity(
     results: &Path,
     run_id: &str,
     tree: &str,
+    bounds: parity::AppendBounds,
 ) -> String {
     let rows = match parity::node_ledger_sources(
         results,
@@ -2826,80 +2875,17 @@ fn append_series_parity(
             results.display()
         );
     }
-    let mut counts = BTreeMap::<&str, usize>::new();
-    for row in &rows {
-        *counts.entry(row.verdict.as_str()).or_default() += 1;
-    }
-    let counts = counts
-        .iter()
-        .map(|(verdict, count)| format!("{verdict} {count}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let left = |why: &str| {
-        format!(
-            "parity: {why}; {} rows left in {} ({counts})",
-            rows.len(),
-            results.display()
-        )
-    };
-    match fs::read(script) {
-        Ok(bytes)
-            if bytes
-                .windows(b"append-parity".len())
-                .any(|w| w == b"append-parity") => {}
-        Ok(_) => return left("the series writer has no append-parity"),
-        Err(error) => return left(&format!("cannot read {}: {error}", script.display())),
-    }
-    let mut input = Vec::new();
-    for row in &rows {
-        if let Err(error) = serde_json::to_writer(&mut input, row) {
-            return left(&format!("cannot encode a parity row: {error}"));
-        }
-        input.push(b'\n');
-    }
-    let mut child = match Command::new("python3")
-        .arg(script)
-        .arg("append-parity")
-        .arg("--parent")
-        .arg(parent)
-        .arg("--producer")
-        .arg(parity::ParityProducer::PressureTest.as_str())
-        .arg("--run-id")
-        .arg(run_id)
-        .arg("--tree")
-        .arg(tree)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => return left(&format!("cannot run {}: {error}", script.display())),
-    };
-    let sent = child
-        .stdin
-        .take()
-        .map(|mut stdin| stdin.write_all(&input))
-        .unwrap_or_else(|| Err(std::io::Error::other("no writable stdin")));
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => return left(&format!("cannot wait for {}: {error}", script.display())),
-    };
-    if let Err(error) = sent {
-        return left(&format!("cannot send rows to append-parity: {error}"));
-    }
-    if !output.status.success() {
-        return left(&format!(
-            "ERROR: append-parity refused them ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    format!(
-        "parity: appended {} row(s) from {} ({counts}): {}",
-        rows.len(),
-        results.display(),
-        String::from_utf8_lossy(&output.stdout).trim()
+    parity::append_ledger_rows(
+        &parity::LedgerAppend {
+            series: script,
+            parent,
+            producer: parity::ParityProducer::PressureTest,
+            run_id,
+            tree,
+            source: results,
+        },
+        &rows,
+        bounds,
     )
 }
 
@@ -16640,11 +16626,26 @@ mod series_parity_append_tests {
             .replace("TREE", TREE)
     }
 
+    /// A writer with `append-parity`: its `--help` exits 0, and an append
+    /// records its argv and stdin under the parent.
     const WRITER: &str = r#"import json, pathlib, sys
-# fixture for series.py append-parity
+if sys.argv[1:] == ["append-parity", "--help"]:
+    print("usage: series.py append-parity --parent PARENT ...")
+    sys.exit(0)
 parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
 parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
 print("fixture parity append accepted")
+"#;
+
+    /// A writer from before `append-parity`: like dev-hermit's `series.py`,
+    /// it answers an unknown subcommand with its usage and exit 2.
+    const LEGACY_WRITER: &str = r#"import json, pathlib, sys
+if "--parent" in sys.argv:
+    parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+    parent.joinpath("captured.json").write_text("{}")
+print("usage: series.py {append-cells,lint} ...", file=sys.stderr)
+print("series.py: error: argument command: invalid choice: 'append-parity'", file=sys.stderr)
+sys.exit(2)
 "#;
 
     struct Fixture {
@@ -16697,6 +16698,7 @@ print("fixture parity append accepted")
                 &self.path("results"),
                 RUN,
                 TREE,
+                parity::AppendBounds::default(),
             )
         }
 
@@ -16791,19 +16793,19 @@ print("fixture parity append accepted")
 
     #[test]
     fn a_writer_without_append_parity_is_named_and_leaves_the_rows() {
-        let legacy = WRITER.replace("# fixture for series.py append-parity\n", "");
-        let fixture = Fixture::new("legacy", &legacy);
+        let fixture = Fixture::new("legacy", LEGACY_WRITER);
         assert_eq!(
             fixture.append(),
             format!(
-                "parity: the series writer has no append-parity; 2 rows left in {} \
-                 (diverged 1, record-missing 1)",
+                "parity: the series writer {} has no append-parity (`append-parity --help` \
+                 exit status: 2); 2 rows left in {} (diverged 1, record-missing 1)",
+                fixture.path("series.py").display(),
                 fixture.path("results").display()
             )
         );
         assert!(
             fixture.captured().is_none(),
-            "a legacy writer is never called"
+            "a legacy writer is only probed, never sent the rows"
         );
     }
 
@@ -16845,5 +16847,171 @@ print("fixture parity append accepted")
                 && line.contains("has no parity.status.json beside it"),
             "{line}"
         );
+    }
+
+    /// A dev-hermit checkout under `root` whose `series.py` records every
+    /// append it is sent in `calls.jsonl`; its append-cells exits
+    /// `cells_exit`.
+    fn recording_parent(root: &Path, cells_exit: u8) -> PathBuf {
+        let parent = root.join("parent");
+        let series = parent.join("ci-hub/series");
+        fs::create_dir_all(&series).unwrap();
+        fs::write(
+            series.join("series.py"),
+            format!(
+                r#"import json, pathlib, sys
+args = sys.argv[1:]
+if args == ["append-parity", "--help"]:
+    sys.exit(0)
+parent = pathlib.Path(args[args.index("--parent") + 1])
+with parent.joinpath("calls.jsonl").open("a") as calls:
+    calls.write(json.dumps({{"argv": args, "stdin": sys.stdin.read()}}) + "\n")
+if args[0] == "append-cells" and {cells_exit}:
+    sys.exit({cells_exit})
+print("fixture " + args[0] + " accepted")
+"#
+            ),
+        )
+        .unwrap();
+        parent
+    }
+
+    fn recorded_calls(parent: &Path) -> Vec<(Vec<String>, Vec<JsonValue>)> {
+        let Ok(text) = fs::read_to_string(parent.join("calls.jsonl")) else {
+            return Vec::new();
+        };
+        text.lines()
+            .map(|line| {
+                let call: JsonValue = serde_json::from_str(line).unwrap();
+                let argv = call["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_string())
+                    .collect();
+                let stdin = call["stdin"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .map(|row| serde_json::from_str(row).unwrap())
+                    .collect();
+                (argv, stdin)
+            })
+            .collect()
+    }
+
+    /// `emit_series`, the call site that sends a run's cells and then its
+    /// parity rows (E7 of the S12 review), reaches both writers with the
+    /// run's identity, and the parity rows go out even when the cells are
+    /// refused.
+    #[test]
+    fn emitting_a_series_sends_its_cells_and_then_its_parity_rows() {
+        for cells_exit in [0u8, 1] {
+            let fixture = Fixture::new(&format!("emit-{cells_exit}"), WRITER);
+            let parent = recording_parent(&fixture.root.path, cells_exit);
+            let results = fixture.path("results");
+            let checkout = fixture.path("checkout");
+            fs::write(
+                results.join("run.json"),
+                json!({
+                    "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                    "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                    "run_timeout_seconds": 60, "cells": [],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let cell = results.join("cells/portable-aio-refusal-verify-kvm");
+            fs::create_dir_all(&cell).unwrap();
+            let row = json!({
+                "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "source_tree_dirty": false, "test": "c-programs/aio-refusal",
+                "category": "c-programs", "lane": "portable", "mode": "verify",
+                "backend": "kvm", "classification": "required", "outcome": "PASS",
+                "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
+                "env": {}, "cwd": "/", "shell_command": "fixture", "attempts": [],
+                "artifact_dir": "/retained/1",
+            });
+            fs::write(cell.join("results.jsonl"), format!("{row}\n")).unwrap();
+
+            let emission = emit_series_to(
+                &parent,
+                &results,
+                &checkout,
+                false,
+                parity::AppendBounds::default(),
+            );
+            let expected_cells = if cells_exit == 0 {
+                Ok(format!(
+                    "emitted 1 cell result(s) from run {RUN} to {}",
+                    parent.display()
+                ))
+            } else {
+                Err("the series writer rejected one or more cell results (exit Some(1)); \
+                     valid completed rows, if any, were retained"
+                    .to_string())
+            };
+            assert_eq!(emission.cells, expected_cells);
+            assert_eq!(
+                emission.parity,
+                Some(format!(
+                    "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): \
+                     fixture append-parity accepted",
+                    results.display()
+                )),
+                "the parity rows go out whatever became of the cells"
+            );
+            let parent_arg = parent.display().to_string();
+            let checkout_arg = checkout.display().to_string();
+            let calls = recorded_calls(&parent);
+            let argv = calls.iter().map(|(argv, _)| argv.clone()).collect::<Vec<_>>();
+            assert_eq!(
+                argv,
+                [
+                    vec![
+                        "append-cells", "--parent", &parent_arg, "--checkout", &checkout_arg,
+                        "--producer", "pressure-test", "--run-id", RUN, "--tree", TREE,
+                    ],
+                    vec![
+                        "append-parity", "--parent", &parent_arg, "--producer", "pressure-test",
+                        "--run-id", RUN, "--tree", TREE,
+                    ],
+                ]
+            );
+            let cells = calls[0]
+                .1
+                .iter()
+                .map(|row| (row["test"].as_str().unwrap(), row["backend"].as_str().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(cells, [("c-programs/aio-refusal", "kvm")]);
+            let parity_rows = calls[1]
+                .1
+                .iter()
+                .map(|row| (row["cell"].as_str().unwrap(), row["verdict"].as_str().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parity_rows,
+                [
+                    ("c-programs/aio-refusal@kvm", "diverged"),
+                    ("c-programs/cpuid-probe@liteinst", "record-missing"),
+                ]
+            );
+        }
+
+        // An emit that stops before offering the cells sends no parity rows
+        // either, and says why.
+        let fixture = Fixture::new("emit-unreadable", WRITER);
+        let parent = recording_parent(&fixture.root.path, 0);
+        let emission = emit_series_to(
+            &parent,
+            &fixture.path("results"),
+            &fixture.path("checkout"),
+            false,
+            parity::AppendBounds::default(),
+        );
+        let error = emission.cells.expect_err("a run with no run.json emits nothing");
+        assert!(error.starts_with("cannot read "), "{error}");
+        assert_eq!(emission.parity, None);
+        assert!(recorded_calls(&parent).is_empty());
     }
 }

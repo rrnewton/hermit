@@ -6946,27 +6946,22 @@ fn validate_parity_expected_scope<'a>(
     Ok(expected)
 }
 
-/// Count the rows of one parity export by verdict, for the one line the
-/// append prints.
-fn parity_row_counts(rows: &[hermit_manifest_plan::parity::ParityLedgerSource]) -> String {
-    let mut counts = BTreeMap::<&str, usize>::new();
-    for row in rows {
-        *counts.entry(row.verdict.as_str()).or_default() += 1;
-    }
-    counts
-        .iter()
-        .map(|(verdict, count)| format!("{verdict} {count}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Send this run's parity rows, as `parity::ledger_sources` reads them from
 /// the post-pass outputs under `e2e_result_root`, to the parent's
-/// `series.py append-parity`. Parity is measured after determinism and never
+/// `series.py append-parity` through `parity::append_ledger_rows`, which
+/// probes the writer, bounds it by `bounds` and kills it (with anything it
+/// started) at its bound. Parity is measured after determinism and never
 /// decides the run, so nothing here fails it: the outcome is one line for the
 /// log, `None` when there is no parent to append to. A tool root whose writer
-/// predates `append-parity` is named, with the rows left where they are, so
-/// the run can be exported later with `test-harness parity export`.
+/// has no `append-parity` is named, with the rows left where they are, so the
+/// run can be exported later with `test-harness parity export`.
+///
+/// When `ledger_sources` refuses the run's outputs, the rows come from
+/// `parity::expected_ledger_sources` instead: every node it can read keeps
+/// its rows, a refused node owes each cell of its expected scope a
+/// `record-missing` row with `post_pass_state` `refused`, and the line starts
+/// with a WARNING naming each refusal. Only a run with no expected scope to
+/// fall back on appends nothing, and says so as an ERROR.
 /// <https://github.com/rrnewton/hermit/issues/3301>
 fn append_validate_parity(
     parent: Option<&Path>,
@@ -6975,96 +6970,73 @@ fn append_validate_parity(
     expected: Option<&hermit_manifest_plan::parity::ExpectedScope>,
     run_id: Option<&str>,
     tree: &str,
+    bounds: hermit_manifest_plan::parity::AppendBounds,
 ) -> Option<String> {
+    use hermit_manifest_plan::parity;
     let parent = parent?;
-    let rows = match hermit_manifest_plan::parity::ledger_sources(e2e_result_root, expected) {
-        Ok(rows) => rows,
-        Err(error) => {
-            return Some(format!(
-                "parity: ERROR: no parity rows appended; the post-pass outputs under {} \
-                 were refused: {error}",
-                e2e_result_root.display()
-            ));
-        }
+    let (rows, refused) = match parity::ledger_sources(e2e_result_root, expected) {
+        Ok(rows) => (rows, Vec::new()),
+        Err(error) => match expected.filter(|expected| !expected.is_empty()) {
+            None => {
+                return Some(format!(
+                    "parity: ERROR: no parity rows appended; the post-pass outputs under {} \
+                     were refused, and no expected scope names the cells they owed: {error}",
+                    e2e_result_root.display()
+                ));
+            }
+            Some(expected) => match parity::expected_ledger_sources(e2e_result_root, expected) {
+                Ok(fallback) => fallback,
+                Err(fallback_error) => {
+                    return Some(format!(
+                        "parity: ERROR: no parity rows appended; the post-pass outputs under {} \
+                         were refused ({error}), and the expected scope could not stand in for \
+                         them: {fallback_error}",
+                        e2e_result_root.display()
+                    ));
+                }
+            },
+        },
     };
-    if rows.is_empty() {
-        return Some(format!(
+    let line = if rows.is_empty() {
+        format!(
             "parity: no parity cells were in scope under {}; nothing appended",
             e2e_result_root.display()
-        ));
-    }
-    let left = |why: &str| {
-        Some(format!(
-            "parity: {why}; {} rows left in {} ({})",
-            rows.len(),
-            e2e_result_root.display(),
-            parity_row_counts(&rows)
-        ))
+        )
+    } else {
+        let left = |why: &str| {
+            format!(
+                "parity: {why}; {} rows left in {} ({})",
+                rows.len(),
+                e2e_result_root.display(),
+                parity::ledger_row_counts(&rows)
+            )
+        };
+        match (tool_root, run_id.filter(|run_id| !run_id.is_empty())) {
+            (None, _) => left("no executable tool root"),
+            (Some(_), None) => left("E2E_RUN_ID is missing"),
+            (Some(tool_root), Some(run_id)) => parity::append_ledger_rows(
+                &parity::LedgerAppend {
+                    series: &tool_root.join("ci-hub/series/series.py"),
+                    parent,
+                    producer: parity::ParityProducer::Validate,
+                    run_id,
+                    tree,
+                    source: e2e_result_root,
+                },
+                &rows,
+                bounds,
+            ),
+        }
     };
-    let Some(tool_root) = tool_root else {
-        return left("no executable tool root");
-    };
-    let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) else {
-        return left("E2E_RUN_ID is missing");
-    };
-    let script = tool_root.join("ci-hub/series/series.py");
-    match std::fs::read(&script) {
-        Ok(bytes)
-            if bytes
-                .windows(b"append-parity".len())
-                .any(|w| w == b"append-parity") => {}
-        Ok(_) => return left("tool root has no append-parity"),
-        Err(error) => return left(&format!("cannot read {}: {error}", script.display())),
-    }
-    let mut input = Vec::new();
-    for row in &rows {
-        serde_json::to_writer(&mut input, row).expect("a validated ledger source row serializes");
-        input.push(b'\n');
-    }
-    let mut child = match Command::new("python3")
-        .arg(&script)
-        .arg("append-parity")
-        .arg("--parent")
-        .arg(parent)
-        .arg("--producer")
-        .arg("validate")
-        .arg("--run-id")
-        .arg(run_id)
-        .arg("--tree")
-        .arg(tree)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => return left(&format!("cannot run {}: {error}", script.display())),
-    };
-    let sent = child
-        .stdin
-        .take()
-        .map(|mut stdin| stdin.write_all(&input))
-        .unwrap_or_else(|| Err(std::io::Error::other("no writable stdin")));
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => return left(&format!("cannot wait for {}: {error}", script.display())),
-    };
-    if let Err(error) = sent {
-        return left(&format!("cannot send rows to append-parity: {error}"));
-    }
-    if !output.status.success() {
-        return left(&format!(
-            "ERROR: append-parity refused them ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    if refused.is_empty() {
+        return Some(line);
     }
     Some(format!(
-        "parity: appended {} row(s) from {} ({}): {}",
-        rows.len(),
-        e2e_result_root.display(),
-        parity_row_counts(&rows),
-        String::from_utf8_lossy(&output.stdout).trim()
+        "parity: WARNING: the post-pass outputs were refused in {} place(s), so each cell the \
+         expected scope owed there is a record-missing row ({}); {}",
+        refused.len(),
+        refused.join("; "),
+        line.strip_prefix("parity: ").unwrap_or(&line)
     ))
 }
 
@@ -23797,6 +23769,7 @@ fn run(
             expected.as_ref(),
             run_id.as_deref(),
             &commit,
+            hermit_manifest_plan::parity::AppendBounds::default(),
         ) {
             eprintln!("validate: {line}");
         }
@@ -24916,14 +24889,48 @@ mod parity_append_tests {
         }
 
         fn append(&self, parent: bool) -> Option<String> {
+            self.append_with(
+                parent,
+                Some(&self.expected()),
+                hermit_manifest_plan::parity::AppendBounds::default(),
+            )
+        }
+
+        fn append_with(
+            &self,
+            parent: bool,
+            expected: Option<&hermit_manifest_plan::parity::ExpectedScope>,
+            bounds: hermit_manifest_plan::parity::AppendBounds,
+        ) -> Option<String> {
             append_validate_parity(
                 parent.then(|| self.root.join("parent")).as_deref(),
                 Some(&self.root.join("tool")),
                 &self.root.join("e2e"),
-                Some(&self.expected()),
+                expected,
                 Some(RUN),
                 TREE,
+                bounds,
             )
+        }
+
+        fn captured_rows(&self) -> Vec<(String, String, String)> {
+            let captured = self.captured().expect("append-parity was called");
+            captured["stdin"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    (
+                        row["cell"].as_str().unwrap().to_string(),
+                        row["verdict"].as_str().unwrap().to_string(),
+                        row["source"]["post_pass_state"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    )
+                })
+                .collect()
         }
 
         fn captured(&self) -> Option<serde_json::Value> {
@@ -24939,11 +24946,24 @@ mod parity_append_tests {
         }
     }
 
+    /// A writer with `append-parity`: it answers the `--help` probe with
+    /// exit 0, as dev-hermit's `series.py` does for a subcommand it has.
     const WRITER: &str = r#"import json, pathlib, sys
-# fixture for series.py append-parity
+if sys.argv[1:] == ["append-parity", "--help"]:
+    print("usage: series.py append-parity --parent P --producer X --run-id R --tree T")
+    sys.exit(0)
 parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
 parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
 print("fixture parity append accepted")
+"#;
+
+    /// A writer that predates `append-parity`: dev-hermit's `series.py`
+    /// answers a subcommand it does not have with its usage and exit 2.
+    const LEGACY_WRITER: &str = r#"import pathlib, sys
+if "--parent" in sys.argv:
+    pathlib.Path(sys.argv[sys.argv.index("--parent") + 1]).joinpath("captured.json").write_text("{}")
+sys.stderr.write("usage: series.py {append-cells,prune-cells} ...\nseries.py: error: argument command: invalid choice: 'append-parity'\n")
+sys.exit(2)
 "#;
 
     #[test]
@@ -25028,20 +25048,53 @@ print("fixture parity append accepted")
 
     #[test]
     fn a_writer_without_append_parity_is_named_and_leaves_the_rows() {
-        let legacy = WRITER.replace("# fixture for series.py append-parity\n", "");
-        let fixture = Fixture::new("legacy", &legacy);
+        let fixture = Fixture::new("legacy", LEGACY_WRITER);
         assert_eq!(
             fixture.append(true).unwrap(),
             format!(
-                "parity: tool root has no append-parity; 4 rows left in {} \
-                 (diverged 1, record-missing 3)",
+                "parity: the series writer {} has no append-parity (`append-parity --help` \
+                 exit status: 2); 4 rows left in {} (diverged 1, record-missing 3)",
+                fixture.root.join("tool/ci-hub/series/series.py").display(),
                 fixture.root.join("e2e").display()
             )
         );
         assert!(
             fixture.captured().is_none(),
-            "a legacy writer is never called"
+            "a legacy writer is only probed, never asked to append"
         );
+    }
+
+    /// A writer that never finishes is killed at its bound; the run goes on
+    /// with one line saying so.
+    #[test]
+    fn a_hanging_writer_is_killed_at_its_bound_and_is_a_line() {
+        let hanging = WRITER.replace(
+            "parent = pathlib.Path(",
+            "import time\ntime.sleep(60)\nparent = pathlib.Path(",
+        );
+        let fixture = Fixture::new("hanging", &hanging);
+        let started = std::time::Instant::now();
+        let line = fixture
+            .append_with(
+                true,
+                Some(&fixture.expected()),
+                hermit_manifest_plan::parity::AppendBounds {
+                    probe: std::time::Duration::from_secs(60),
+                    append: std::time::Duration::from_millis(300),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "parity: ERROR: append-parity did not finish within 300ms and was killed, so \
+                 the ledger may hold some of these rows; 4 rows left in {} \
+                 (diverged 1, record-missing 3)",
+                fixture.root.join("e2e").display()
+            )
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(fixture.captured().is_none());
     }
 
     #[test]
@@ -25067,16 +25120,67 @@ print("fixture parity append accepted")
             line.starts_with("parity: ERROR: append-parity refused them (exit status: 1): fixture refusal; 4 rows left in "),
             "{line}"
         );
-        // Records with no status beside them cannot be attributed.
+        // Records with no status beside them cannot be attributed, and with
+        // no expected scope to stand in for them nothing is appended.
+        let stray = fixture.root.join("e2e/portable/manifest_system_utils");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+        let line = fixture
+            .append_with(
+                true,
+                None,
+                hermit_manifest_plan::parity::AppendBounds::default(),
+            )
+            .unwrap();
+        assert!(
+            line.starts_with(
+                "parity: ERROR: no parity rows appended; the post-pass outputs under "
+            ) && line.contains("no expected scope names the cells they owed")
+                && line.contains("has no parity.status.json beside it"),
+            "{line}"
+        );
+    }
+
+    /// Refused outputs in one node do not take the run's other rows with
+    /// them: the refused node's expected cells are appended as
+    /// `record-missing` rows with `post_pass_state` `refused`, the other
+    /// nodes' rows are appended as read, and the line starts with a WARNING
+    /// naming the refusal.
+    #[test]
+    fn refused_node_outputs_still_owe_their_expected_cells() {
+        let fixture = Fixture::new("refused-node", WRITER);
         let stray = fixture.root.join("e2e/portable/manifest_system_utils");
         std::fs::create_dir_all(&stray).unwrap();
         std::fs::write(stray.join("parity.jsonl"), diverged_record() + "\n").unwrap();
         let line = fixture.append(true).unwrap();
-        assert!(
-            line.starts_with(
-                "parity: ERROR: no parity rows appended; the post-pass outputs under "
-            ) && line.contains("has no parity.status.json beside it"),
-            "{line}"
+        let e2e = fixture.root.join("e2e");
+        assert_eq!(
+            line,
+            format!(
+                "parity: WARNING: the post-pass outputs were refused in 1 place(s), so each cell \
+                 the expected scope owed there is a record-missing row \
+                 (portable/manifest_system_utils: {} has no parity.status.json beside it, so \
+                 its records cannot be attributed); appended 4 row(s) from {} (diverged 1, \
+                 record-missing 3): fixture parity append accepted",
+                stray.join("parity.jsonl").display(),
+                e2e.display()
+            )
+        );
+        let expect = |cell: &str, verdict: &str, state: &str| {
+            (cell.to_string(), verdict.to_string(), state.to_string())
+        };
+        assert_eq!(
+            fixture.captured_rows(),
+            [
+                expect("c-programs/aio-refusal@kvm", "diverged", "complete"),
+                expect("system-utils/ls@sabre", "record-missing", "refused"),
+                expect("c-programs/cpuid-probe@kvm", "record-missing", "failed"),
+                expect(
+                    "c-programs/cpuid-probe@liteinst",
+                    "record-missing",
+                    "failed"
+                ),
+            ]
         );
     }
 

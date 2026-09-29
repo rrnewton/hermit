@@ -144,10 +144,12 @@ A complete post-pass yields one row per record. A failed or running one
 yields the records it wrote plus a record-missing row for each other cell its
 status names. With --expected-scope, a JSON object mapping \"<lane>/<node>\" to
 the \"<test>@<backend>\" cells that node should have measured, a planned node
-with no status yields a record-missing row per expected cell. It runs no
-guest and writes nothing. Any inconsistency (a record that fails validation, a
+with no status yields a record-missing row per expected cell, and so does
+each expected cell a node's status leaves out of its scope. It runs no guest
+and writes nothing. Any inconsistency (a record that fails validation, a
 count that disagrees with its status, a record outside the scope) is an error
-and prints no rows.
+and prints no rows. validate, which must not lose a cell, instead appends a
+record-missing row for each cell the refused node's expected scope owed.
 
 Export options:
   --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/
