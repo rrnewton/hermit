@@ -74,7 +74,10 @@ const READINESS_CALLS: [&str; 4] = ["poll", "epoll", "select", "rawselect"];
 /// The guest's timeout for a wait that a signal must not end.
 const QUIET_TIMEOUT_MS: u64 = 300;
 /// Virtual-time slack allowed past that deadline before the wait returns.
-const QUIET_OVERSHOOT_MS: u64 = 200;
+/// Every must-not-wake cell measured on 2026-09-29 returned at 300-302 ms. A
+/// wait that a signal at 100 ms restarts with a fresh 300 ms timeout returns
+/// near 400 ms, so the slack must stay well below 100 ms to catch it.
+const QUIET_OVERSHOOT_MS: u64 = 50;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
