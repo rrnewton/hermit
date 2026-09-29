@@ -541,8 +541,8 @@ fn run_fixture(scenario: Scenario) {
             assert_eq!(operand.stderr_bytes, 0);
             assert_eq!(operand.stderr_sha256, Digest::new(b"").to_string());
         }
-        for prefix in ["run1_log_", "run2_log_"] {
-            let matches: Vec<_> = fs::read_dir(&logs)
+        let retained = |prefix: &str| -> Vec<_> {
+            fs::read_dir(&logs)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| {
@@ -551,17 +551,24 @@ fn run_fixture(scenario: Scenario) {
                         .to_string_lossy()
                         .starts_with(prefix)
                 })
-                .collect();
-            assert_eq!(matches.len(), 1, "one complete retained log per execution");
-            let log = String::from_utf8(bounded_read(&matches[0], 64 * MIB)).unwrap();
-            assert_no_single_step_dumps(&log, &matches[0]);
-            if !exit_only {
-                assert_pmu_handoffs(&log, stdout);
-            }
-            if preempted {
-                assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
-            }
+                .collect()
+        };
+        // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+        // run 2's log, which matched it, is deleted.
+        let golden = retained("run1_log_");
+        assert_eq!(golden.len(), 1, "one complete retained golden log");
+        let log = String::from_utf8(bounded_read(&golden[0], 64 * MIB)).unwrap();
+        assert_no_single_step_dumps(&log, &golden[0]);
+        if !exit_only {
+            assert_pmu_handoffs(&log, stdout);
         }
+        if preempted {
+            assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
+        }
+        assert!(
+            retained("run2_log_").is_empty(),
+            "a matched verification must not retain run 2's log"
+        );
         previous_stdout = Some(output);
         eprintln!("ptrace nonleader exec pair {pair}: two full canonical executions");
     }
@@ -688,11 +695,14 @@ fn preemption_artifact_case(
                     .starts_with(prefix)
             })
             .collect();
-        let expected = usize::from(!refused || prefix == "run1_log_");
+        // Only run 1's log survives either way: a refusal has no second
+        // verified run, and after a match `--keep-logs` keeps the golden log
+        // alone because run 2's log matched it and was deleted.
+        let expected = usize::from(prefix == "run1_log_");
         assert_eq!(
             paths.len(),
             expected,
-            "refusal cannot produce a second verified run"
+            "only run 1's log may be retained (refused: {refused})"
         );
         for path in paths {
             let log = String::from_utf8(bounded_read(&path, 64 * MIB)).unwrap();
