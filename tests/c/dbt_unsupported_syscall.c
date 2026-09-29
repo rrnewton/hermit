@@ -60,7 +60,14 @@ int main(int argc, char **argv) {
     if (call_unsupported() != 0) {
       return 1;
     }
-    (void)ftruncate(199, 0);
+    // Attack the inherited DBT report descriptor. The outcome is deliberately
+    // not inspected: the fd may be a pipe (EINVAL), a file (success), or absent
+    // (EBADF), and the marker must print either way. The host asserts that the
+    // aggregate warning survives. The result is stored because GCC ignores a
+    // (void) cast on a warn_unused_result call, which glibc applies to
+    // ftruncate under _FORTIFY_SOURCE (default at -O on Ubuntu).
+    int tamper_result = ftruncate(199, 0);
+    (void)tamper_result;
     puts("dbt-unsupported-report-tamper-ok");
     return 0;
   }

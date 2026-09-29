@@ -528,17 +528,24 @@ static int scenario_fork_vfork_blocking(void) {
       _exit(1);
     }
     if (vfork_child == 0) {
+      // The exit status carries this child's verdict and the driver checks the
+      // marker, so neither write result is inspected. Each is stored because
+      // GCC ignores a (void) cast on a warn_unused_result call, which glibc
+      // applies to write under _FORTIFY_SOURCE (default at -O on Ubuntu).
+      ssize_t written;
       errno = 0;
       int flock_result = flock(inherited, LOCK_EX);
       if (flock_result != -1 || errno != ENOLCK) {
         static const char failure[] =
             "FAIL: nested vfork child blocking flock did not return ENOLCK\n";
-        (void)write(STDOUT_FILENO, failure, sizeof(failure) - 1);
+        written = write(STDOUT_FILENO, failure, sizeof(failure) - 1);
+        (void)written;
         _exit(1);
       }
       static const char refused[] =
           "flock-nested-vfork-blocking-refused errno=37\n";
-      (void)write(STDOUT_FILENO, refused, sizeof(refused) - 1);
+      written = write(STDOUT_FILENO, refused, sizeof(refused) - 1);
+      (void)written;
       _exit(0);
     }
     int vfork_status = 0;
