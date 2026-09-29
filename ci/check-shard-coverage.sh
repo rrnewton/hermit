@@ -758,9 +758,12 @@ workflow_wiring_contract() {
             regular pattern 'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*' "$workflow_text"
 }
 
-# check.backend_parity_suites_on_host runs target/validate/verification-report
-# (build.workspace_on_host builds in the validate profile) after the debug tree
-# crosses a job boundary. Guard all three parts of that contract:
+# test.hermit_integration_on_host (the debug "integration" shard) runs the
+# verification_report_cli and verification_report_consumers tests, which execute
+# target/validate/verification-report (build.workspace_on_host builds in the
+# validate profile) through env!("CARGO_BIN_EXE_verification-report") after the
+# debug tree crosses the build-debug -> test-debug job boundary. Guard all three
+# parts of that contract:
 # producer existence, archive membership, and executable consumer assertion.
 # The mutation bracket proves the guard rejects the original omission instead
 # of passing merely because the binary is mentioned somewhere in the workflow.
