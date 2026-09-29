@@ -138,6 +138,10 @@ jobs:
         CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
         RUSTUP_AUTO_INSTALL: "0"
         PYTHONDONTWRITEBYTECODE: "1"
+        # Print one wall/CPU line per build phase to this step's log, so the
+        # step's duration can be split by phase from the log alone
+        # (https://github.com/rrnewton/dev-hermit/issues/391).
+        COMPATIBILITY_WEBSITE_PHASE_TIMING: "1"
         LEDGER_COMMIT: ${{ steps.website-source.outputs.ledger_commit }}
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
       run: |
