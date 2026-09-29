@@ -121,6 +121,22 @@ fi
 # refused. Pass the SHA, never the symbolic name.
 head_sha=$(git rev-parse HEAD)
 
+# The lookups above follow the caller's repository on purpose: under `git rebase
+# --exec` or a hook, an inherited GIT_DIR (or GIT_WORK_TREE and GIT_INDEX_FILE)
+# names the branch being judged. Everything below acts on the scratch checkout
+# instead, which is named explicitly, and those variables override both `git -C`
+# and the working directory (https://github.com/rrnewton/hermit/issues/3362).
+# Inherited, they would aim the merge at the caller's HEAD, index or working
+# tree, make the generator judge the caller's tree in place of the merged one,
+# and make wrkslots, whose launcher finds its registry with `git -C <its own
+# checkout> rev-parse --git-common-dir`, look beside the caller's repository.
+# So wrkslots, the merge and the generator run without them.
+without_git_location() (
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+    "$@"
+)
+
 parent_root=${DEV_HERMIT_PARENT:-$(git rev-parse --show-superproject-working-tree 2>/dev/null || true)}
 wrkslots="$parent_root/ci-hub/bin/wrkslots"
 if [[ -z $parent_root || ! -x $wrkslots ]]; then
@@ -138,7 +154,7 @@ cleanup() {
     trap - EXIT
     if [[ $slot_created -eq 1 ]]; then
         cleanup_output=$(
-            "$wrkslots" --allow-existing-unregistered-worktrees \
+            without_git_location "$wrkslots" --allow-existing-unregistered-worktrees \
                 remove "$slot" --validate-complete \
                 --coordinator-pid "$$" --expected-generation 1 2>&1
         )
@@ -155,7 +171,7 @@ cleanup() {
 trap cleanup EXIT
 
 create_output=$(
-    "$wrkslots" --allow-existing-unregistered-worktrees \
+    without_git_location "$wrkslots" --allow-existing-unregistered-worktrees \
         create "$slot" --format json --slot-type validate \
         --coordinator-authorized --agent "derived-check-$$" \
         --task "derived-current-after-merge" \
@@ -180,7 +196,8 @@ if [[ $parse_rc -ne 0 || ! -d $worktree ]]; then
     exit 1
 fi
 
-if ! git -C "$worktree" -c core.hooksPath=/dev/null merge --no-edit --no-ff "$head_sha" >/dev/null 2>&1; then
+if ! without_git_location git -C "$worktree" -c core.hooksPath=/dev/null \
+    merge --no-edit --no-ff "$head_sha" >/dev/null 2>&1; then
     echo "check-derived-current-after-merge: HEAD does not merge cleanly onto $BASE_REF." >&2
     echo "  Rebase first; the derived artifacts cannot be judged against a tree that" >&2
     echo "  does not exist." >&2
@@ -188,11 +205,14 @@ if ! git -C "$worktree" -c core.hooksPath=/dev/null merge --no-edit --no-ff "$he
 fi
 
 echo "check-derived-current-after-merge: evaluating the MERGED tree, not the branch head"
-# Run the generator IN the merged worktree. Note this is a plain subshell cd, not
-# `git -C`: the generator is not a git subcommand, and invoking it that way fails
-# with "is not a git command" -- which this script would then have reported as
-# STALE, refusing every applicable branch for the wrong reason. Caught in test.
-if (cd "$worktree" && "./$GENERATOR" check); then
+# Run the generator IN the merged worktree. Note this is a plain cd inside
+# without_git_location's subshell, not `git -C`: the generator is not a git
+# subcommand, and invoking it that way fails with "is not a git command" --
+# which this script would then have reported as STALE, refusing every
+# applicable branch for the wrong reason. Caught in test.
+# shellcheck disable=SC2317 # invoked indirectly through without_git_location
+generator_check() { cd "$worktree" && "./$GENERATOR" check; }
+if without_git_location generator_check; then
     echo "check-derived-current-after-merge: derived artifacts are current after merge"
     exit 0
 fi
