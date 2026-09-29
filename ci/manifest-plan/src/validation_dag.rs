@@ -782,7 +782,49 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         local_prepare,
         "./ci/nextest-binaries.rs prepare hosted-portable",
     );
+    let hosted_dbt_parity = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == HOSTED_DBT_PARITY_TAG)
+        .ok_or("hosted DBT parity node is absent")?;
+    if hosted_dbt_parity.cmd.matches(DBT_PARITY_MATRIX_ARGS).count() != 1
+        || !hosted_dbt_parity.cmd.ends_with(DBT_PARITY_MATRIX_ARGS)
+    {
+        return Err("hosted DBT parity node lost the exact local matrix command".into());
+    }
+    hosted_dbt_parity
+        .cmd
+        .push_str(&hosted_dbt_parity_case_exclusion_flags());
     Ok(())
+}
+
+/// The hosted-portable DBT parity node.
+const HOSTED_DBT_PARITY_TAG: &str = "test.dbt_parity_on_host";
+
+/// The tail of the local DBT parity command that the hosted node extends.
+const DBT_PARITY_MATRIX_ARGS: &str =
+    "run_matrix.py --hermit target/ci/hermit-strict --backend dbt --strict --require-backend --no-parent-scorecard";
+
+/// Backend-parity cases the hosted-portable DBT parity node omits with
+/// `run_matrix.py --exclude-case`.
+///
+/// `cpuid_policy` compares the DBT guest's CPUID against a ptrace reference
+/// run, and that reference needs CPUID faulting (`arch_prctl(ARCH_SET_CPUID)`).
+/// GitHub-hosted runners (AMD EPYC 7763 on 6.17 Azure kernels) do not have
+/// it, so the reference is BLOCKED and the matrix publishes the dbt row as a
+/// structured failure: run
+/// <https://github.com/rrnewton/hermit/actions/runs/36485831200>. The hosted
+/// command omits the case outright, so it is not run and writes no row; a
+/// BLOCKED row is never read as a pass or as filtered. The local `full` and
+/// `portable` node `test.dbt_parity` keeps every case. No GitHub lane runs the
+/// case automatically yet: <https://github.com/rrnewton/hermit/issues/3339>.
+pub const HOSTED_DBT_PARITY_EXCLUDED_CASES: &[&str] = &["cpuid_policy"];
+
+fn hosted_dbt_parity_case_exclusion_flags() -> String {
+    HOSTED_DBT_PARITY_EXCLUDED_CASES
+        .iter()
+        .map(|case| format!(" --exclude-case {case}"))
+        .collect()
 }
 
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
@@ -2226,6 +2268,26 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         {
             return Err("super selection unexpectedly owns manifest result rows".into());
         }
+        if profile.label != HOSTED_PORTABLE_LABEL {
+            // Only the hosted node omits cases; every local DBT parity node
+            // runs the whole catalogue, cpuid_policy included.
+            let narrowed = selected
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.cmd.contains("run_matrix.py")
+                        && (step.cmd.contains("--exclude-case") || step.cmd.contains("--case "))
+                })
+                .map(Step::tag)
+                .collect::<Vec<_>>();
+            if !narrowed.is_empty() {
+                return Err(format!(
+                    "{} DBT parity must run every backend-parity case: {}",
+                    profile.label,
+                    narrowed.join(", ")
+                ));
+            }
+        }
         if profile.label == HOSTED_PORTABLE_LABEL {
             let pinned = selected
                 .steps
@@ -2266,6 +2328,26 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                     "{HOSTED_PORTABLE_LABEL} step(s) do not carry the backend exclusion `{}` exactly once: {}",
                     exclusion.trim(),
                     unfiltered.join(", ")
+                ));
+            }
+            let case_exclusion = hosted_dbt_parity_case_exclusion_flags();
+            let dbt_parity = selected
+                .steps
+                .iter()
+                .filter(|step| step.cmd.contains("run_matrix.py"))
+                .map(|step| (step.tag(), step.cmd.as_str()))
+                .collect::<Vec<_>>();
+            if dbt_parity.len() != 1
+                || dbt_parity[0].0 != HOSTED_DBT_PARITY_TAG
+                || !dbt_parity[0]
+                    .1
+                    .ends_with(&format!("{DBT_PARITY_MATRIX_ARGS}{case_exclusion}"))
+                || dbt_parity[0].1.matches("--exclude-case").count()
+                    != HOSTED_DBT_PARITY_EXCLUDED_CASES.len()
+                || dbt_parity[0].1.contains("--case ")
+            {
+                return Err(format!(
+                    "{HOSTED_PORTABLE_LABEL} DBT parity must be exactly {HOSTED_DBT_PARITY_TAG} ending in `{DBT_PARITY_MATRIX_ARGS}{case_exclusion}`: {dbt_parity:?}"
                 ));
             }
             let expected_resources = HOSTED_RESOURCE_TUPLES
@@ -3125,6 +3207,76 @@ sys.exit(37)
     /// GitHub-hosted runners have no PMU, so the hosted-portable profile omits
     /// KVM cells from every command, owned result, and expected population,
     /// while the local profiles keep requiring them.
+    #[test]
+    fn hosted_dbt_parity_omits_cpuid_policy_and_locally_keeps_every_case() {
+        assert_eq!(HOSTED_DBT_PARITY_EXCLUDED_CASES, ["cpuid_policy"]);
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cmd = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .cmd
+                .clone()
+        };
+        assert!(cmd(HOSTED_DBT_PARITY_TAG).ends_with(
+            "run_matrix.py --hermit target/ci/hermit-strict --backend dbt --strict --require-backend --no-parent-scorecard --exclude-case cpuid_policy"
+        ));
+        let local = cmd("test.dbt_parity");
+        assert!(local.ends_with(&format!("{DBT_PARITY_MATRIX_ARGS}'")), "{local}");
+        assert!(!local.contains("--exclude-case") && !local.contains("--case "));
+        for label in ["full", "portable"] {
+            let selected = select_steps_by_labels(&committed, &[label.into()]).unwrap();
+            assert!(
+                selected.steps.iter().any(|step| step.tag() == "test.dbt_parity"),
+                "{label} must still run the whole DBT parity matrix"
+            );
+        }
+
+        let mut planted = committed.clone();
+        let step = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == HOSTED_DBT_PARITY_TAG)
+            .unwrap();
+        step.cmd = step.cmd.replace(" --exclude-case cpuid_policy", "");
+        let error = assert_invariants(&planted, &cells).unwrap_err();
+        assert!(
+            error.starts_with(
+                "hosted-portable DBT parity must be exactly test.dbt_parity_on_host ending in"
+            ),
+            "{error}"
+        );
+        let mut planted = committed.clone();
+        let step = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == HOSTED_DBT_PARITY_TAG)
+            .unwrap();
+        step.cmd.push_str(" --exclude-case cpuid_policy");
+        let error = assert_invariants(&planted, &cells).unwrap_err();
+        assert!(
+            error.starts_with("hosted-portable DBT parity must be exactly"),
+            "{error}"
+        );
+        let mut planted = committed.clone();
+        let step = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.dbt_parity")
+            .unwrap();
+        step.cmd = step.cmd.replace(
+            "--no-parent-scorecard'",
+            "--no-parent-scorecard --exclude-case cpuid_policy'",
+        );
+        assert_eq!(
+            assert_invariants(&planted, &cells).unwrap_err(),
+            "full DBT parity must run every backend-parity case: test.dbt_parity"
+        );
+    }
+
     #[test]
     fn hosted_portable_omits_the_excluded_backends_everywhere_and_locally_keeps_them() {
         assert_eq!(HOSTED_PORTABLE_EXCLUDED_BACKENDS, ["kvm"]);

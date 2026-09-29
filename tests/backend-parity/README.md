@@ -467,18 +467,27 @@ unlandable PR becomes landable code plus explicit, queryable test debt.
 
 ## Running
 
-The portable `check.backend_parity_suites` DAG node runs the three driver-side
+The portable `check.backend_parity_suites` DAG node runs the four driver-side
 contract suites on every portable-lane validation without building Hermit or starting a guest:
 
 ```bash
 python3 tests/backend-parity/test_verify_tier_evidence.py
 python3 tests/backend-parity/test_scorecard_header_compat.py
 python3 tests/backend-parity/test_run_matrix_output_skew.py
+python3 tests/backend-parity/test_run_matrix_case_selection.py
 ```
 
 These are separate from `tests/c/fixture_mutation.py` and from executing `run_matrix.py`
-as a backend matrix. They protect the evidence-tier, scorecard-schema, and
-whole-artifact writer contracts used by that driver.
+as a backend matrix. They protect the evidence-tier, scorecard-schema,
+whole-artifact writer, and case-selection contracts used by that driver.
+
+`run_matrix.py --case NAME` runs only the named cases and `--exclude-case NAME`
+omits them (both repeatable, not combinable). An omitted case is not run,
+writes no result row, and is counted neither as executed nor as filtered. The
+hosted-portable `test.dbt_parity_on_host` node passes
+`--exclude-case cpuid_policy`, because GitHub-hosted runners lack the CPUID
+faulting its ptrace reference needs; the local `test.dbt_parity` node runs
+every case.
 
 Validate the case catalog and known-gap invariants without backend prerequisites:
 

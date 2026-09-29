@@ -944,7 +944,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py && python3 tests/backend-parity/test_run_matrix_case_selection.py"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
