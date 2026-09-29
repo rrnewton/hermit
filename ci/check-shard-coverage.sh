@@ -167,6 +167,58 @@ while IFS= read -r node; do
     fi
 done < <(jq -r '.e2e_nodes[]' <<<"$shards_json")
 
+# The converse of the rule above. Only e2e jobs pack the parity-v1 transport
+# archive that the reducer in the `regular` job reads, and the reducer compares
+# its results against every portable cell in ci/expected-e2e-plan.json. A
+# manifest node that selects portable cells but is co-scheduled in a test shard
+# still runs and passes there, yet its results never reach the reducer, which
+# then reports those cells as missing. Run 36485831200 failed that way after
+# https://github.com/rrnewton/hermit/pull/3213 gave shared-futex-c and util-c
+# their first portable cells while both nodes still sat in the integration
+# shard, where they had been placed while their buckets were empty.
+reducer_orphan_nodes() {
+    local map_json=$1 plan_file=$2
+    # A node in both e2e_nodes and a test shard is already refused above as a
+    # duplicate assignment, so every manifest node found in a shard is unpacked.
+    jq -r --slurpfile plan "$plan_file" '
+        [ (.debug_shards // [])[], (.release_shards // [])[] | .nodes[] ]
+        | map(select(startswith("e2e.manifest_")))
+        | map(. as $node
+            | ($node | sub("^e2e\\.manifest_"; "") | sub("_on_host$"; "") | gsub("_"; "-"))
+                as $category
+            | select([$plan[0].cells[]
+                | select(.lane == "portable" and .category == $category)] | length > 0)
+            | $node)
+        | unique[]
+    ' <<<"$map_json"
+}
+
+orphan_fixture_dir=$(mktemp -d)
+printf '%s\n' '{"cells":[{"lane":"portable","category":"fixture-c"},{"lane":"privileged","category":"privileged-c"}]}' \
+    >"$orphan_fixture_dir/plan.json"
+fixture_orphans=$(reducer_orphan_nodes \
+    '{"e2e_nodes":[],"debug_shards":[{"slug":"x","nodes":["e2e.manifest_fixture_c_on_host","e2e.manifest_empty_c_on_host","e2e.manifest_privileged_c_on_host","test.fixture"]}],"release_shards":[]}' \
+    "$orphan_fixture_dir/plan.json")
+if [[ $fixture_orphans != e2e.manifest_fixture_c_on_host ]]; then
+    echo "check-shard-coverage.sh: FAIL — reducer-orphan guard did not name exactly the planted nonempty co-scheduled node (got: ${fixture_orphans:-nothing})" >&2
+    status=1
+fi
+fixture_orphans=$(reducer_orphan_nodes \
+    '{"e2e_nodes":["e2e.manifest_fixture_c_on_host"],"debug_shards":[{"slug":"x","nodes":["e2e.manifest_empty_c_on_host"]}],"release_shards":[]}' \
+    "$orphan_fixture_dir/plan.json")
+rm -rf "$orphan_fixture_dir"
+if [[ -n $fixture_orphans ]]; then
+    echo "check-shard-coverage.sh: FAIL — reducer-orphan guard named a planted co-scheduled node that selects no portable cells" >&2
+    status=1
+fi
+
+orphans=$(reducer_orphan_nodes "$shards_json" ci/expected-e2e-plan.json)
+if [[ -n $orphans ]]; then
+    echo "check-shard-coverage.sh: FAIL — E2E node(s) select portable cells but run in a test shard, which packs no parity-v1 archive for the reducer; move them to e2e_nodes:" >&2
+    printf '  %s\n' $orphans >&2
+    status=1
+fi
+
 dependency_misses() {
     local selected_json=$1
     local supplied_json=$2

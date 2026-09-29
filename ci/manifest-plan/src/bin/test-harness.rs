@@ -4317,8 +4317,9 @@ sys.exit(1 if failed else 0)
             }
         }
         // No manifest node belongs in a test shard while it selects portable
-        // cells: only the e2e jobs pack the parity-v1 archive the reducer reads.
-        // shared-futex-c and util-c left the integration shard once
+        // cells: only the e2e jobs pack the parity-v1 archive the reducer reads
+        // (ci/check-shard-coverage.sh enforces that against the committed cell
+        // plan). shared-futex-c and util-c left the integration shard once
         // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell.
         assert_eq!(physical_rows, 23);
         assert_eq!(resolved.len(), 23);
