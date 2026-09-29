@@ -1158,7 +1158,7 @@ fn self_test() {
     // closure therefore includes Hermit's other third-party-backend test
     // nodes, while explicit backend affinity still limits e2e cells to DBT.
     let rp_dbt = derive_run_plan(&dbt, &shards, &plan, &dag);
-    check("dbt ⇒ dbt-parity shard", rp_dbt.shards.contains(&"dbt-parity".to_string()));
+    check("dbt ⇒ dbt-runtime-abi shard", rp_dbt.shards.contains(&"dbt-runtime-abi".to_string()));
     check("dbt ⇒ hermit reverse-dep sabre shard", rp_dbt.shards.contains(&"sabre".to_string()));
     let expected_dbt_cells = plan.cells.iter().filter(|cell| cell.backend == "dbt").count();
     check(

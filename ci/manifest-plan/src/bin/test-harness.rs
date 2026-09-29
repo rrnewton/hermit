@@ -4531,8 +4531,9 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell
         // (25 to 23). In slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301, test.dbt_parity left
-        // the dbt-parity shard (23 to 22) and check.backend_parity_suites left
-        // the integration shard when tests/backend-parity was retired (22 to 21).
+        // the dbt-parity shard (23 to 22; the shard is now dbt-runtime-abi) and
+        // check.backend_parity_suites left the integration shard when
+        // tests/backend-parity was retired (22 to 21).
         assert_eq!(physical_rows, 21);
         assert_eq!(resolved.len(), 21);
         assert_eq!(actual_aliases, expected_aliases);
