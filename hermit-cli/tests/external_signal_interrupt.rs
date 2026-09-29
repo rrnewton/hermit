@@ -91,6 +91,13 @@ const SIGNAL_DELAY_MS: u64 = 100;
 /// waits return at 100-101 ms (measured 2026-09-29). A wait the signal did not
 /// end returns at its 300 ms timeout or later, far outside this window.
 const WAKE_SLACK_MS: u64 = 100;
+/// Lower bound on a child-exit wake. The `exit` child starts its 100 ms sleep
+/// at `fork()`, before the parent prints `READY`, arms its wait and takes its
+/// start stamp. Under Hermit each of those syscalls advances virtual time, so
+/// the wake reads about 1 ms short of `SIGNAL_DELAY_MS` (99 ms measured on
+/// 2026-09-29 for `epoll` on both backends). 90 ms still separates a wake by the
+/// exit from an immediate return, and the upper bound is unchanged.
+const EXIT_WAKE_FLOOR_MS: u64 = 90;
 /// Strict-verified repetitions of each child-exit SIGCHLD cell. The kernel also
 /// posts its own SIGCHLD for the exit at a host-timed moment, so a single
 /// matched pair of runs is weak evidence that the result ignores it.
@@ -441,9 +448,14 @@ fn assert_woken_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &s
         "{backend} {mode:?} {args:?}: expected `{expected}`\n{}",
         run.describe()
     );
+    let floor = if args.contains(&"exit") {
+        EXIT_WAKE_FLOOR_MS
+    } else {
+        SIGNAL_DELAY_MS
+    };
     let elapsed = run.elapsed_ms();
     assert!(
-        elapsed.is_some_and(|ms| (SIGNAL_DELAY_MS..SIGNAL_DELAY_MS + WAKE_SLACK_MS).contains(&ms)),
+        elapsed.is_some_and(|ms| (floor..SIGNAL_DELAY_MS + WAKE_SLACK_MS).contains(&ms)),
         "{backend} {mode:?} {args:?}: the wait took {elapsed:?} ms, not the \
          {SIGNAL_DELAY_MS} ms until the signal\n{}",
         run.describe()
@@ -453,19 +465,27 @@ fn assert_woken_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &s
 
 /// Fix A: a polling-mode futex wait must observe a signal that Hermit did not
 /// send. Before the fix the retry loop never looked for one and spun until the
-/// watchdog fired.
-#[test]
-fn polling_futex_wait_is_interrupted_by_an_external_signal() {
-    for backend in BACKENDS {
-        for trial in 0..EXTERNAL_TRIALS {
-            let run = run_cell(backend, FutexMode::Polling, &["futex", "external"], true);
-            assert!(
-                run.status.success() && run.result_line() == Some(EINTR_FUTEX),
-                "{backend} trial {trial}/{EXTERNAL_TRIALS}: expected `{EINTR_FUTEX}`\n{}",
-                run.describe()
-            );
-        }
+/// watchdog fired. Each backend is its own test so that each stays inside the
+/// per-test wall and CPU bounds.
+fn assert_polling_futex_wait_observes_external_signal(backend: &str) {
+    for trial in 0..EXTERNAL_TRIALS {
+        let run = run_cell(backend, FutexMode::Polling, &["futex", "external"], true);
+        assert!(
+            run.status.success() && run.result_line() == Some(EINTR_FUTEX),
+            "{backend} trial {trial}/{EXTERNAL_TRIALS}: expected `{EINTR_FUTEX}`\n{}",
+            run.describe()
+        );
     }
+}
+
+#[test]
+fn ptrace_polling_futex_wait_is_interrupted_by_an_external_signal() {
+    assert_polling_futex_wait_observes_external_signal("ptrace");
+}
+
+#[test]
+fn liteinst_polling_futex_wait_is_interrupted_by_an_external_signal() {
+    assert_polling_futex_wait_observes_external_signal("liteinst");
 }
 
 /// Fix C: a precise-mode futex waiter woken for a signal must return EINTR, not
@@ -576,65 +596,96 @@ fn untimed_futex_wait_restarts_under_sa_restart() {
 /// `poll`, `epoll_wait`, glibc `select` (pselect6 with no mask), and the
 /// `select` system call end with EINTR for a caught signal from a sibling
 /// thread or a live sibling process, SA_RESTART or not, as Linux does.
-#[test]
-fn readiness_waits_are_interrupted_by_internal_signals() {
-    for backend in BACKENDS {
-        for call in READINESS_CALLS {
-            for sender in ["thread", "process"] {
-                for restart in [None, Some("restart")] {
-                    let mut args = vec![call, sender];
-                    args.extend(restart);
-                    assert_cell(
-                        backend,
-                        FutexMode::Precise,
-                        &args,
-                        false,
-                        &format!("RESULT call={call} ret=-1 errno=EINTR handler=1"),
-                    );
-                }
+fn assert_readiness_waits_are_interrupted(backend: &str) {
+    for call in READINESS_CALLS {
+        for sender in ["thread", "process"] {
+            for restart in [None, Some("restart")] {
+                let mut args = vec![call, sender];
+                args.extend(restart);
+                assert_cell(
+                    backend,
+                    FutexMode::Precise,
+                    &args,
+                    false,
+                    &format!("RESULT call={call} ret=-1 errno=EINTR handler=1"),
+                );
             }
         }
     }
+}
+
+#[test]
+fn ptrace_readiness_waits_are_interrupted_by_internal_signals() {
+    assert_readiness_waits_are_interrupted("ptrace");
+}
+
+#[test]
+fn liteinst_readiness_waits_are_interrupted_by_internal_signals() {
+    assert_readiness_waits_are_interrupted("liteinst");
 }
 
 /// An ignored, blocked, or default-ignored signal does not end `poll`,
 /// `epoll_wait`, or either `select`: each returns 0 at its 300 ms timeout.
+/// Every one of these 48 cells is strict-verified, so they are split by backend
+/// and sender to keep each test inside the per-test wall and CPU bounds.
+fn assert_readiness_waits_are_not_ended(backend: &str, sender: &str) {
+    for call in READINESS_CALLS {
+        for quiet in ["ignored", "blocked", "winch"] {
+            assert_quiet_cell(
+                backend,
+                FutexMode::Precise,
+                &[call, sender, quiet],
+                &format!("RESULT call={call} ret=0 errno=none handler=0"),
+            );
+        }
+    }
+}
+
 #[test]
-fn readiness_waits_are_not_ended_by_non_interrupting_signals() {
-    for backend in BACKENDS {
-        for call in READINESS_CALLS {
-            for sender in ["thread", "process"] {
-                for quiet in ["ignored", "blocked", "winch"] {
-                    assert_quiet_cell(
-                        backend,
-                        FutexMode::Precise,
-                        &[call, sender, quiet],
-                        &format!("RESULT call={call} ret=0 errno=none handler=0"),
-                    );
-                }
+fn ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals() {
+    assert_readiness_waits_are_not_ended("ptrace", "thread");
+}
+
+#[test]
+fn ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals() {
+    assert_readiness_waits_are_not_ended("ptrace", "process");
+}
+
+#[test]
+fn liteinst_readiness_waits_are_not_ended_by_non_interrupting_thread_signals() {
+    assert_readiness_waits_are_not_ended("liteinst", "thread");
+}
+
+#[test]
+fn liteinst_readiness_waits_are_not_ended_by_non_interrupting_process_signals() {
+    assert_readiness_waits_are_not_ended("liteinst", "process");
+}
+
+/// An ignored, blocked, or default-ignored signal does not end a timed futex wait
+/// in either mode: it returns ETIMEDOUT at its original 300 ms deadline.
+fn assert_timed_futex_wait_is_not_ended(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        for sender in ["thread", "process"] {
+            for quiet in ["ignored", "blocked", "winch"] {
+                assert_quiet_cell(
+                    backend,
+                    mode,
+                    &["futex", sender, quiet],
+                    "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
+                );
             }
         }
     }
 }
 
-/// An ignored, blocked, or default-ignored signal does not end a timed futex wait
-/// in either mode: it returns ETIMEDOUT at its original 300 ms deadline.
 #[test]
-fn timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
-    for backend in BACKENDS {
-        for mode in [FutexMode::Precise, FutexMode::Polling] {
-            for sender in ["thread", "process"] {
-                for quiet in ["ignored", "blocked", "winch"] {
-                    assert_quiet_cell(
-                        backend,
-                        mode,
-                        &["futex", sender, quiet],
-                        "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
-                    );
-                }
-            }
-        }
-    }
+fn ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
+    assert_timed_futex_wait_is_not_ended("ptrace");
+}
+
+#[test]
+fn liteinst_timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
+    assert_timed_futex_wait_is_not_ended("liteinst");
 }
 
 /// Positive control: `select` already observed an external signal before the
@@ -734,38 +785,46 @@ fn liteinst_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked() {
 }
 
 /// A caught SIGCHLD from a child that exits during the wait ends a timed or
-/// untimed futex wait in either mode with EINTR near the exit. Hermit's
-/// scheduler delivers the child-exit SIGCHLD at a deterministic point; the
-/// kernel's own SIGCHLD for the same exit arrives at a host-timed moment and
-/// must not decide the result, so each cell is strict-verified
-/// `SIGCHLD_TRIALS` times.
-fn assert_child_exit_ends_futex_wait(backend: &str) {
+/// untimed futex wait with EINTR near the exit. Hermit's scheduler delivers the
+/// child-exit SIGCHLD at a deterministic point; the kernel's own SIGCHLD for
+/// the same exit arrives at a host-timed moment and must not decide the result,
+/// so each cell is strict-verified `SIGCHLD_TRIALS` times. Each backend and
+/// futex mode is its own test, to stay inside the per-test wall and CPU bounds.
+fn assert_child_exit_ends_futex_wait(backend: &str, mode: FutexMode) {
     for _ in 0..SIGCHLD_TRIALS {
-        for mode in [FutexMode::Precise, FutexMode::Polling] {
-            for timed in [None, Some("timed")] {
-                let mut args = vec!["futex", "exit"];
-                args.extend(timed);
-                assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
-            }
+        for timed in [None, Some("timed")] {
+            let mut args = vec!["futex", "exit"];
+            args.extend(timed);
+            assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
         }
     }
 }
 
 #[test]
-fn ptrace_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_futex_wait("ptrace");
+fn ptrace_precise_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_futex_wait("ptrace", FutexMode::Precise);
 }
 
 #[test]
-fn liteinst_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_futex_wait("liteinst");
+fn ptrace_polling_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_futex_wait("ptrace", FutexMode::Polling);
+}
+
+#[test]
+fn liteinst_precise_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_futex_wait("liteinst", FutexMode::Precise);
+}
+
+#[test]
+fn liteinst_polling_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_futex_wait("liteinst", FutexMode::Polling);
 }
 
 /// The same child-exit SIGCHLD ends `poll`, `epoll_wait`, and both `select`s
 /// with EINTR near the exit, each strict-verified `SIGCHLD_TRIALS` times.
-fn assert_child_exit_ends_readiness_waits(backend: &str) {
+fn assert_child_exit_ends_readiness_waits(backend: &str, calls: [&str; 2]) {
     for _ in 0..SIGCHLD_TRIALS {
-        for call in READINESS_CALLS {
+        for call in calls {
             assert_woken_cell(
                 backend,
                 FutexMode::Precise,
@@ -777,11 +836,21 @@ fn assert_child_exit_ends_readiness_waits(backend: &str) {
 }
 
 #[test]
-fn ptrace_readiness_waits_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_readiness_waits("ptrace");
+fn ptrace_poll_and_epoll_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_readiness_waits("ptrace", ["poll", "epoll"]);
 }
 
 #[test]
-fn liteinst_readiness_waits_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_readiness_waits("liteinst");
+fn ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_readiness_waits("ptrace", ["select", "rawselect"]);
+}
+
+#[test]
+fn liteinst_poll_and_epoll_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_readiness_waits("liteinst", ["poll", "epoll"]);
+}
+
+#[test]
+fn liteinst_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_readiness_waits("liteinst", ["select", "rawselect"]);
 }
