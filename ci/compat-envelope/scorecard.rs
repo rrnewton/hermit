@@ -4898,6 +4898,38 @@ impl ParityRefusal {
     }
 }
 
+/// An entry of the `parity/` store the reader keeps ([`parity_store_entry`]).
+#[derive(Clone, Debug, PartialEq)]
+enum ParityStoreEntry {
+    /// A team or host directory, listed in turn.
+    Directory,
+    /// A shard, read whole.
+    Shard,
+}
+
+/// What the store reader does with an entry `depth` directories below
+/// `parity/` (0 for a team, 1 for a host, 2 for a shard), typed as
+/// `symlink_metadata` reports it, so a symlink is neither a directory nor a
+/// regular file: descend into a team or host directory, read a regular
+/// `.jsonl` file at `parity/<team>/<host>/`, and refuse anything else with
+/// the returned message.
+fn parity_store_entry(
+    depth: usize,
+    is_dir: bool,
+    is_file: bool,
+    name: &str,
+) -> Result<ParityStoreEntry, String> {
+    if depth < 2 && is_dir {
+        Ok(ParityStoreEntry::Directory)
+    } else if depth == 2 && is_file && name.ends_with(".jsonl") {
+        Ok(ParityStoreEntry::Shard)
+    } else {
+        Err(format!(
+            "not a regular {PARITY_STORE}/<team>/<host>/<file>.jsonl shard"
+        ))
+    }
+}
+
 /// Read the ledger's `parity/` store: every regular file at
 /// `parity/<team>/<host>/<file>.jsonl`, in path order. Anything else below
 /// `parity/` is refused by name rather than read or skipped silently.
@@ -4944,18 +4976,16 @@ fn read_parity_store(ledger: &Path) -> Result<ParityStoreInput, String> {
             let child = format!("{relative}/{name}");
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| format!("cannot read {child}: {error}"))?;
-            if depth < 2 && metadata.is_dir() {
-                pending.push((child, entry.path(), depth + 1));
-            } else if depth == 2 && metadata.is_file() && name.ends_with(".jsonl") {
-                shards.push((child, entry.path()));
-            } else {
-                input.refusals.push(ParityRefusal {
+            match parity_store_entry(depth, metadata.is_dir(), metadata.is_file(), name) {
+                Ok(ParityStoreEntry::Directory) => {
+                    pending.push((child, entry.path(), depth + 1));
+                }
+                Ok(ParityStoreEntry::Shard) => shards.push((child, entry.path())),
+                Err(message) => input.refusals.push(ParityRefusal {
                     path: child,
                     line: None,
-                    message: format!(
-                        "not a regular {PARITY_STORE}/<team>/<host>/<file>.jsonl shard"
-                    ),
-                });
+                    message,
+                }),
             }
         }
     }
@@ -5058,15 +5088,34 @@ impl ParityCommitFacts {
     /// Read the facts for `shas` (see [`parity_store_shas`]) in the checkout
     /// at `root`.
     fn read(root: &Path, shas: &BTreeSet<String>) -> Self {
-        let mut facts = Self::default();
         if shas.is_empty() {
-            return facts;
+            return Self::default();
         }
-        let names = shas
-            .iter()
+        Self::from_answers(
+            shas,
+            git_cat_file_batch(root, &Self::batch_names(shas)),
+            |commits| git_commit_depths(root, commits),
+        )
+    }
+
+    /// The `cat-file --batch` request for `shas`: each commit, then its
+    /// [`PARITY_CELLS_PATH`], in `shas` order.
+    fn batch_names(shas: &BTreeSet<String>) -> Vec<String> {
+        shas.iter()
             .flat_map(|sha| [sha.clone(), format!("{sha}:{PARITY_CELLS_PATH}")])
-            .collect::<Vec<_>>();
-        let objects = match git_cat_file_batch(root, &names) {
+            .collect()
+    }
+
+    /// The facts from Git's answers: `objects` answers [`Self::batch_names`]
+    /// ([`git_cat_file_batch`]), and `depths_of` counts the depths of the
+    /// names that are commits ([`git_commit_depths`]).
+    fn from_answers(
+        shas: &BTreeSet<String>,
+        objects: Result<Option<Vec<Option<(String, Vec<u8>)>>>, String>,
+        depths_of: impl FnOnce(&[&str]) -> BTreeMap<String, SourceDepth>,
+    ) -> Self {
+        let mut facts = Self::default();
+        let objects = match objects {
             Ok(Some(objects)) => objects,
             Ok(None) => {
                 facts.committed = shas.iter().map(|sha| (sha.clone(), Ok(None))).collect();
@@ -5100,7 +5149,7 @@ impl ParityCommitFacts {
             };
             facts.committed.insert(sha.clone(), committed);
         }
-        facts.depths = git_commit_depths(root, &commits);
+        facts.depths = depths_of(&commits);
         facts
     }
 
@@ -5144,8 +5193,19 @@ fn git_cat_file_batch(
     if !output.status.success() {
         return Ok(None);
     }
+    parse_cat_file_batch(names, &output.stdout).map(Some)
+}
+
+/// Cut `git cat-file --batch` output into one answer per name, in order:
+/// `(type, content)` from a `<object> <type> <size>` header and exactly
+/// `<size>` content bytes, or `None` for `<name> missing` or
+/// `<name> ambiguous`. Anything else, fewer answers or more, is refused.
+fn parse_cat_file_batch(
+    names: &[String],
+    stdout: &[u8],
+) -> Result<Vec<Option<(String, Vec<u8>)>>, String> {
     let malformed = |name: &str| format!("git cat-file --batch gave no readable answer for {name}");
-    let mut rest = output.stdout.as_slice();
+    let mut rest = stdout;
     let mut objects = Vec::with_capacity(names.len());
     for name in names {
         let end = rest
@@ -5170,7 +5230,7 @@ fn git_cat_file_batch(
     if !rest.is_empty() {
         return Err("git cat-file --batch answered more names than it was asked".into());
     }
-    Ok(Some(objects))
+    Ok(objects)
 }
 
 /// [`repo_depth_at`] for every commit in `commits` from one
@@ -5180,9 +5240,8 @@ fn git_cat_file_batch(
 /// `rev-list --count --first-parent` count them. A commit whose history cannot
 /// be read has no depth.
 fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDepth> {
-    let mut depths = BTreeMap::new();
     if commits.is_empty() {
-        return depths;
+        return BTreeMap::new();
     }
     let Ok(output) = Command::new("git")
         .arg("--no-replace-objects")
@@ -5191,14 +5250,23 @@ fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDe
         .current_dir(root)
         .output()
     else {
-        return depths;
+        return BTreeMap::new();
     };
     let Ok(text) = String::from_utf8(output.stdout) else {
-        return depths;
+        return BTreeMap::new();
     };
     if !output.status.success() {
-        return depths;
+        return BTreeMap::new();
     }
+    commit_depths_from_parents(&text, commits)
+}
+
+/// Each of `commits`' [`SourceDepth`] from `git rev-list --parents` output
+/// (`<commit> <parent>...` per line) over their joint history. A commit the
+/// output does not list has no depth, and no commit has one when a listed
+/// parent is not itself listed: that history was not read whole.
+fn commit_depths_from_parents(text: &str, commits: &[&str]) -> BTreeMap<String, SourceDepth> {
+    let mut depths = BTreeMap::new();
     let mut index = BTreeMap::new();
     let mut lines = Vec::new();
     for line in text.lines() {
@@ -10939,10 +11007,30 @@ fn replace_generated_files_with(
     )
 }
 
+/// The `scorecard/parity.json` step of replacing `original` with `updated`:
+/// `Some(path)` writes the new summary at `path`, or removes the file when
+/// `updated` has none; `None` when the summary is unchanged. Only the history
+/// pair has a parity file (`parity` is its path), so a parity summary for the
+/// in-tree pair is refused before anything is written.
+fn parity_replacement_step<'a>(
+    parity: Option<&'a Path>,
+    original: &GeneratedFiles,
+    updated: &GeneratedFiles,
+) -> Result<Option<&'a Path>, String> {
+    match parity {
+        None if updated.parity.is_some() => Err(format!(
+            "{LEDGER_PARITY_SUMMARY} is written only beside the ledger's history files"
+        )),
+        None => Ok(None),
+        Some(_) if original.parity == updated.parity => Ok(None),
+        Some(path) => Ok(Some(path)),
+    }
+}
+
 /// Replace the generated files in order: the scorecard, then the cells, then
-/// (history only) `scorecard/parity.json`. `before_replace` runs before the
-/// first two steps only, so its callers keep their two-step contract. A
-/// failed later step restores every earlier one.
+/// (history only) `scorecard/parity.json` ([`parity_replacement_step`]).
+/// `before_replace` runs before the first two steps only, so its callers keep
+/// their two-step contract. A failed later step restores every earlier one.
 fn replace_generated_paths_with(
     scorecard: &Path,
     cells: &Path,
@@ -10956,16 +11044,7 @@ fn replace_generated_paths_with(
         guard()?;
         return Ok(false);
     }
-    let parity_step = match parity {
-        None if updated.parity.is_some() => {
-            return Err(format!(
-                "{LEDGER_PARITY_SUMMARY} is written only beside the ledger's history files"
-            ));
-        }
-        None => None,
-        Some(_) if original.parity == updated.parity => None,
-        Some(path) => Some(path),
-    };
+    let parity_step = parity_replacement_step(parity, original, updated)?;
     let new_scorecard = prepared_replacement(scorecard, &updated.scorecard)?;
     let old_scorecard = prepared_replacement(scorecard, &original.scorecard)?;
     let new_cells = prepared_replacement(cells, &updated.cells)?;
@@ -35330,64 +35409,82 @@ mod parity_summary_tests {
         }
     }
 
+    /// What `git cat-file --batch` prints for `name`'s object: its header,
+    /// then exactly `content`.
+    fn batch_answer(name: &str, kind: &str, content: &[u8]) -> Vec<u8> {
+        let mut answer = format!("{name} {kind} {}\n", content.len()).into_bytes();
+        answer.extend_from_slice(content);
+        answer.push(b'\n');
+        answer
+    }
+
     #[test]
     fn a_commits_selection_is_read_at_that_commit_or_is_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let git = |args: &[&str]| {
-            let out = fixture_git().args(args).current_dir(root).output().unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8(out.stdout).unwrap().trim().to_string()
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.name", "Fixture"]);
-        git(&["config", "user.email", "fixture@example.invalid"]);
-        fs::write(root.join("README"), "no selection yet").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "before the selection"]);
-        let without = git(&["rev-parse", "HEAD"]);
-        let path = root.join(PARITY_CELLS_PATH);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Several lines, so the batch reader must cut the answer by its size.
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "cells": [{"test_id": golden(1), "backend": "kvm", "selected": true}]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "select one cell"]);
-        let good = git(&["rev-parse", "HEAD"]);
-        // A merged side branch makes the reachable count differ from the
-        // first-parent count, so the two depths cannot be swapped unseen.
-        git(&["checkout", "-q", "-b", "side", &without]);
-        fs::write(root.join("SIDE"), "side").unwrap();
-        git(&["add", "SIDE"]);
-        git(&["commit", "-qm", "side"]);
-        git(&["checkout", "-q", "main"]);
-        git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
-        fs::write(&path, "{not json").unwrap();
-        git(&["commit", "-qam", "break the selection"]);
-        let broken = git(&["rev-parse", "HEAD"]);
-        git(&["rm", "-q", PARITY_CELLS_PATH]);
-        fs::create_dir(&path).unwrap();
-        fs::write(path.join("inner"), "a directory now").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "make the selection a directory"]);
-        let directory = git(&["rev-parse", "HEAD"]);
+        // Four commits of one history, and a name this checkout lacks.
+        let [without, good, broken, directory] =
+            ["1", "2", "5", "6"].map(|digit| digit.repeat(40));
         let absent = "89abcdef0123456789abcdef0123456789abcdef";
-
         let shas = [&without, &good, &broken, &directory, absent]
             .map(ToString::to_string)
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let facts = ParityCommitFacts::read(root, &shas);
+        let names = ParityCommitFacts::batch_names(&shas);
+        let at = |sha: &str| format!("{sha}:{PARITY_CELLS_PATH}");
+        assert_eq!(
+            names,
+            [
+                without.clone(),
+                at(&without),
+                good.clone(),
+                at(&good),
+                broken.clone(),
+                at(&broken),
+                directory.clone(),
+                at(&directory),
+                absent.to_string(),
+                at(absent),
+            ]
+        );
+        // Git's answer to that request. Each commit, the selection and the
+        // tree hold newlines, so the reader must cut every answer by its size.
+        let commit = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nfixture commit\n";
+        let selection = serde_json::to_string_pretty(&serde_json::json!({
+            "cells": [{"test_id": golden(1), "backend": "kvm", "selected": true}]
+        }))
+        .unwrap();
+        let mut stdout = Vec::new();
+        for answer in [
+            batch_answer(&without, "commit", commit),
+            format!("{} missing\n", at(&without)).into_bytes(),
+            batch_answer(&good, "commit", commit),
+            batch_answer(&at(&good), "blob", selection.as_bytes()),
+            batch_answer(&broken, "commit", commit),
+            batch_answer(&at(&broken), "blob", b"{not json"),
+            batch_answer(&directory, "commit", commit),
+            batch_answer(&at(&directory), "tree", b"100644 inner\0\n\x01\x02"),
+            format!("{absent} missing\n").into_bytes(),
+            format!("{} missing\n", at(absent)).into_bytes(),
+        ] {
+            stdout.extend(answer);
+        }
+        let objects = parse_cat_file_batch(&names, &stdout).unwrap();
+        assert_eq!(objects.len(), names.len());
+
+        // `rev-list --parents` over their history: `broken` follows a merge
+        // of `good` with a side commit off `without`, so its reachable count
+        // (5) and its first-parent count (4) differ and cannot be swapped
+        // unseen. Each depth below is what `git rev-list --count` and
+        // `git rev-list --count --first-parent` print for that commit.
+        let [side, merge] = ["3", "4"].map(|digit| digit.repeat(40));
+        let parents = format!(
+            "{directory} {broken}\n{broken} {merge}\n{merge} {good} {side}\n\
+             {side} {without}\n{good} {without}\n{without}\n"
+        );
+        let facts = ParityCommitFacts::from_answers(&shas, Ok(Some(objects)), |commits| {
+            // Only the names that are commits here are counted.
+            assert_eq!(commits, [&without, &good, &broken, &directory]);
+            commit_depths_from_parents(&parents, commits)
+        });
         assert_eq!(
             facts.committed(&good),
             Ok(Some(committed(&[(&golden(1), KVM)])))
@@ -35417,27 +35514,57 @@ mod parity_summary_tests {
             ))
         );
         assert_eq!(facts.depth(unasked), None);
-
-        // Each depth is what the per-commit `rev-list --count` pair reads.
-        for sha in [&without, &good, &broken, &directory] {
-            assert_eq!(facts.depth(sha), repo_depth_at(root, sha), "{sha}");
-        }
-        assert_eq!(
-            facts.depth(&broken),
+        let depth = |commits, first_parent| {
             Some(SourceDepth {
-                commits: 5,
-                first_parent: 4
+                commits,
+                first_parent,
             })
-        );
+        };
+        assert_eq!(facts.depth(&without), depth(1, 1));
+        assert_eq!(facts.depth(&good), depth(2, 2));
+        assert_eq!(facts.depth(&broken), depth(5, 4));
+        assert_eq!(facts.depth(&directory), depth(6, 5));
         assert_eq!(facts.depth(absent), None);
+        // A history that was not read whole gives no depth at all.
+        assert!(commit_depths_from_parents(&format!("{broken} {merge}\n"), &[&broken]).is_empty());
 
-        // A directory that is no checkout: every selection is unknown.
-        let bare = tempfile::tempdir().unwrap();
-        let facts = ParityCommitFacts::read(bare.path(), &shas);
+        // Git could not read the checkout (a directory that is no checkout):
+        // every selection is unknown and nothing is counted. Git could not be
+        // asked at all: every selection carries the error.
+        let no_checkout = ParityCommitFacts::from_answers(&shas, Ok(None), |_| {
+            panic!("no depth is counted without a checkout")
+        });
+        let unasked_git = ParityCommitFacts::from_answers(&shas, Err("no git".into()), |_| {
+            panic!("no depth is counted without git")
+        });
         for sha in &shas {
-            assert_eq!(facts.committed(sha), Ok(None), "{sha}");
-            assert_eq!(facts.depth(sha), None, "{sha}");
+            assert_eq!(no_checkout.committed(sha), Ok(None), "{sha}");
+            assert_eq!(no_checkout.depth(sha), None, "{sha}");
+            assert_eq!(unasked_git.committed(sha), Err("no git".to_string()), "{sha}");
+            assert_eq!(unasked_git.depth(sha), None, "{sha}");
         }
+
+        // An answer that is short, overlong, names another object, or is
+        // followed by more answers than were asked for is refused whole.
+        let unreadable = |name: &str| {
+            Err(format!(
+                "git cat-file --batch gave no readable answer for {name}"
+            ))
+        };
+        let first = &names[..1];
+        assert_eq!(parse_cat_file_batch(first, b""), unreadable(&without));
+        assert_eq!(
+            parse_cat_file_batch(first, format!("{without} commit 99\nshort\n").as_bytes()),
+            unreadable(&without)
+        );
+        assert_eq!(
+            parse_cat_file_batch(first, format!("{good} missing\n").as_bytes()),
+            unreadable(&without)
+        );
+        assert_eq!(
+            parse_cat_file_batch(first, &stdout),
+            Err("git cat-file --batch answered more names than it was asked".into())
+        );
     }
 
     #[test]
@@ -35459,6 +35586,40 @@ mod parity_summary_tests {
             BTreeSet::from([good.to_string()])
         );
         assert!(parity_store_shas(&ParityStoreInput::default()).is_empty());
+    }
+
+    #[test]
+    fn the_store_reader_reads_only_regular_shards_two_directories_down() {
+        use ParityStoreEntry::{Directory, Shard};
+        let refused = Err("not a regular parity/<team>/<host>/<file>.jsonl shard".to_string());
+        // (depth below parity/, is a directory, is a regular file, name), as
+        // symlink_metadata types an entry: a symlink is neither.
+        for (depth, is_dir, is_file, name, expected) in [
+            (0, true, false, "hermit", Ok(Directory)),
+            (1, true, false, "devbig014", Ok(Directory)),
+            (2, false, true, "2026-09.jsonl", Ok(Shard)),
+            // A stray file beside the host directories.
+            (1, false, true, "README", refused.clone()),
+            // A symlink where a shard would be.
+            (2, false, false, "link.jsonl", refused.clone()),
+            (2, true, false, "nested.jsonl", refused.clone()),
+            (2, false, true, "2026-09.json", refused.clone()),
+            // A shard outside the team/host layout.
+            (0, false, true, "rows.jsonl", refused.clone()),
+            (1, false, true, "rows.jsonl", refused.clone()),
+        ] {
+            assert_eq!(
+                parity_store_entry(depth, is_dir, is_file, name),
+                expected,
+                "{name} at depth {depth}"
+            );
+        }
+        // A ledger without a parity/ directory has published nothing: the
+        // store is absent, not empty.
+        let absent = read_parity_store(&fixture_dir().join("absent")).unwrap();
+        assert!(!absent.present);
+        assert!(absent.lines.is_empty() && absent.refusals.is_empty());
+        assert_eq!(absent.store_sha256, None);
     }
 
     /// Minimal inputs whose determinism rendering is known.
@@ -35528,38 +35689,6 @@ mod parity_summary_tests {
         input.store_sha256 = Some(format!("{:x}", digest.finalize()));
         assert_eq!(input.lines.len(), 192);
         assert!(input.refusals.is_empty());
-
-        // The directory reader sees the same store, and refuses a stray entry.
-        let ledger = tempfile::tempdir().unwrap();
-        let shard = ledger.path().join(SHARD);
-        fs::create_dir_all(shard.parent().unwrap()).unwrap();
-        fs::write(&shard, &rows).unwrap();
-        fs::write(ledger.path().join("parity/hermit/README"), "stray").unwrap();
-        std::os::unix::fs::symlink(
-            &shard,
-            ledger.path().join("parity/hermit/devbig014/link.jsonl"),
-        )
-        .unwrap();
-        let read = read_parity_store(ledger.path()).unwrap();
-        assert_eq!(read.store_sha256, input.store_sha256);
-        assert_eq!(read.lines.len(), 192);
-        let refused = read
-            .refusals
-            .iter()
-            .map(ParityRefusal::located)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            refused,
-            [
-                "parity/hermit/README: not a regular parity/<team>/<host>/<file>.jsonl shard",
-                "parity/hermit/devbig014/link.jsonl: not a regular parity/<team>/<host>/<file>.jsonl shard",
-            ]
-        );
-        assert!(
-            !read_parity_store(&ledger.path().join("absent"))
-                .unwrap()
-                .present
-        );
 
         // The run's own commit's selection, as provenance.json records it.
         let fixture_sha = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
@@ -35639,16 +35768,6 @@ mod parity_summary_tests {
         }
     }
 
-    fn history_pair(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-        let scorecard_dir = dir.join("scorecard");
-        fs::create_dir_all(&scorecard_dir).unwrap();
-        let scorecard = scorecard_dir.join("SCORECARD.md");
-        let cells = scorecard_dir.join("cells.json");
-        fs::write(&scorecard, "old scorecard").unwrap();
-        fs::write(&cells, "old cells").unwrap();
-        (scorecard, cells, scorecard_dir.join("parity.json"))
-    }
-
     fn files(tag: &str, parity: Option<&str>) -> GeneratedFiles {
         GeneratedFiles {
             scorecard: format!("{tag} scorecard").into_bytes(),
@@ -35658,88 +35777,53 @@ mod parity_summary_tests {
     }
 
     #[test]
-    fn the_parity_file_is_written_and_removed_with_the_history_pair() {
-        let dir = tempfile::tempdir().unwrap();
-        let (scorecard, cells, parity) = history_pair(dir.path());
-        let mut steps = Vec::new();
-        let replaced = replace_generated_paths_with(
-            &scorecard,
-            &cells,
-            Some(&parity),
-            &files("old", None),
-            &files("new", Some("{}\n")),
-            || Ok(()),
-            |step| {
-                steps.push(step);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(replaced);
-        assert_eq!(steps, [1, 2]);
-        assert_eq!(fs::read_to_string(&parity).unwrap(), "{}\n");
-        assert_eq!(fs::read_to_string(&cells).unwrap(), "new cells");
-        let replaced = replace_generated_paths_with(
-            &scorecard,
-            &cells,
-            Some(&parity),
-            &files("new", Some("{}\n")),
-            &files("newer", None),
-            || Ok(()),
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert!(replaced);
-        assert!(!parity.exists());
-        assert_eq!(fs::read_to_string(&scorecard).unwrap(), "newer scorecard");
-    }
-
-    #[test]
-    fn a_failed_parity_step_restores_the_scorecard_and_cells() {
-        let dir = tempfile::tempdir().unwrap();
-        let (scorecard, cells, parity) = history_pair(dir.path());
-        // A non-empty directory cannot be replaced by a file.
-        fs::create_dir_all(parity.join("occupied")).unwrap();
-        let error = replace_generated_paths_with(
-            &scorecard,
-            &cells,
-            Some(&parity),
-            &files("old", None),
-            &files("new", Some("{}\n")),
-            || Ok(()),
-            |_| Ok(()),
-        )
-        .unwrap_err();
-        assert!(
-            error.starts_with("cannot replace scorecard/parity.json: "),
-            "{error}"
-        );
-        assert!(
-            error.ends_with("; restored the original generated files"),
-            "{error}"
-        );
-        assert_eq!(fs::read_to_string(&scorecard).unwrap(), "old scorecard");
-        assert_eq!(fs::read_to_string(&cells).unwrap(), "old cells");
-    }
-
-    #[test]
-    fn the_in_tree_pair_refuses_a_parity_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let (scorecard, cells, _) = history_pair(dir.path());
-        let error = replace_generated_paths_with(
-            &scorecard,
-            &cells,
-            None,
-            &files("old", None),
-            &files("new", Some("{}\n")),
-            || Ok(()),
-            |_| Ok(()),
-        )
-        .unwrap_err();
+    fn only_the_history_pair_writes_or_removes_the_parity_file() {
+        let path = Path::new("ledger/scorecard/parity.json");
+        // A new or changed summary is written; a summary that is gone is
+        // removed.
         assert_eq!(
-            error,
-            "scorecard/parity.json is written only beside the ledger's history files"
+            parity_replacement_step(Some(path), &files("old", None), &files("new", Some("{}\n"))),
+            Ok(Some(path))
         );
-        assert_eq!(fs::read_to_string(&scorecard).unwrap(), "old scorecard");
+        assert_eq!(
+            parity_replacement_step(
+                Some(path),
+                &files("old", Some("{}\n")),
+                &files("new", Some("{\"runs\":[]}\n"))
+            ),
+            Ok(Some(path))
+        );
+        assert_eq!(
+            parity_replacement_step(Some(path), &files("new", Some("{}\n")), &files("newer", None)),
+            Ok(Some(path))
+        );
+        // An unchanged summary is left alone while the pair changes.
+        for parity in [None, Some("{}\n")] {
+            assert_eq!(
+                parity_replacement_step(Some(path), &files("old", parity), &files("new", parity)),
+                Ok(None)
+            );
+        }
+        // The in-tree pair has no parity file, and a summary for it is refused.
+        assert_eq!(parity_replacement_step(None, &files("old", None), &files("new", None)), Ok(None));
+        let refusal = "scorecard/parity.json is written only beside the ledger's history files";
+        assert_eq!(
+            parity_replacement_step(None, &files("old", None), &files("new", Some("{}\n"))),
+            Err(refusal.to_string())
+        );
+        // The refusal comes before anything is guarded, prepared or replaced:
+        // none of these paths exists, so any file work would fail otherwise.
+        assert_eq!(
+            replace_generated_paths_with(
+                Path::new("no-such-checkout/SCORECARD.md"),
+                Path::new("no-such-checkout/cells.json"),
+                None,
+                &files("old", None),
+                &files("new", Some("{}\n")),
+                || panic!("the refusal comes before the guard"),
+                |_| panic!("the refusal comes before any replacement"),
+            ),
+            Err(refusal.to_string())
+        );
     }
 }
