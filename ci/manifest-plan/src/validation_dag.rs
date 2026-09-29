@@ -3218,7 +3218,11 @@ sys.exit(37)
                 step.tag(),
                 step.cmd
             );
-            let local_tag = step.tag().strip_suffix(HOSTED_VARIANT_SUFFIX).unwrap().to_string();
+            let local_tag = step
+                .tag()
+                .strip_suffix(HOSTED_VARIANT_SUFFIX)
+                .unwrap()
+                .to_string();
             let local = committed
                 .steps
                 .iter()
@@ -3227,7 +3231,11 @@ sys.exit(37)
             assert!(!local.cmd.contains("--exclude-backend"), "{local_tag}");
             let hosted_cells = owned(step);
             let local_cells = owned(local);
-            assert!(hosted_cells.iter().all(|cell| !excluded(cell)), "{}", step.tag());
+            assert!(
+                hosted_cells.iter().all(|cell| !excluded(cell)),
+                "{}",
+                step.tag()
+            );
             assert_eq!(
                 hosted_cells,
                 local_cells
@@ -3252,8 +3260,9 @@ sys.exit(37)
                 .cmd
                 .clone()
         };
-        assert!(scorecard("scorecard.compatibility_on_host")
-            .ends_with("verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-backend kvm"));
+        assert!(scorecard("scorecard.compatibility_on_host").ends_with(
+            "verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-backend kvm"
+        ));
         assert!(scorecard("scorecard.compatibility").ends_with("--lanes portable"));
 
         let mut planted = committed.clone();
@@ -3283,8 +3292,14 @@ sys.exit(37)
         // `test-harness` refuses it ("--exclude-backend kvm was given twice"),
         // so the step would fail when run. The invariant counts the flag.
         for (tag, anchor) in [
-            ("e2e.manifest_bin_c_on_host", "--prebuilt --exclude-backend kvm"),
-            ("scorecard.compatibility_on_host", "--lanes portable --exclude-backend kvm"),
+            (
+                "e2e.manifest_bin_c_on_host",
+                "--prebuilt --exclude-backend kvm",
+            ),
+            (
+                "scorecard.compatibility_on_host",
+                "--lanes portable --exclude-backend kvm",
+            ),
         ] {
             let mut planted = committed.clone();
             let step = planted
@@ -3296,7 +3311,11 @@ sys.exit(37)
             step.cmd = step
                 .cmd
                 .replace(anchor, &format!("{anchor} --exclude-backend kvm"));
-            assert_eq!(step.cmd.matches("--exclude-backend kvm").count(), 2, "{tag}");
+            assert_eq!(
+                step.cmd.matches("--exclude-backend kvm").count(),
+                2,
+                "{tag}"
+            );
             assert_eq!(
                 assert_invariants(&planted, &cells).unwrap_err(),
                 format!(
@@ -3327,7 +3346,11 @@ sys.exit(37)
                 include_str!("../../hermetic/run-split-validate.sh"),
             ),
         ] {
-            assert_eq!(text.matches(&filter).count(), 1, "{path} must apply `{filter}` once");
+            assert_eq!(
+                text.matches(&filter).count(),
+                1,
+                "{path} must apply `{filter}` once"
+            );
             assert!(
                 !text.contains("[.cells[] | select(.lane == \"portable\")]")
                     && !text.contains("[.cells[] | select(.lane == \"portable\")\n"),
