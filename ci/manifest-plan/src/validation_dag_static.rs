@@ -336,8 +336,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands)
     // retain all 843 prior identities (`cargo nextest list --profile ci`
     // measured 845; https://github.com/rrnewton/hermit/issues/3360).
-    ("test.detcore_unit", 845),
-    ("test.detcore_misc", 27),
+    // Three inject_fstat scratch tests (syscalls::files::inject_fstat_scratch::
+    // writable_stack_scratch_is_used_while_its_guard_is_live,
+    // faulting_stack_scratch_falls_back_to_a_transient_page and
+    // descriptor_is_closed_when_no_scratch_can_be_found) retain all 845 prior
+    // identities (`cargo nextest list --profile ci` measured 848;
+    // https://github.com/rrnewton/hermit/issues/3328).
+    ("test.detcore_unit", 848),
+    // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
+    // retains all 27 prior selected identities under the unchanged skip filters
+    // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
+    ("test.detcore_misc", 28),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -384,9 +393,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 27),
+    ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 845),
+    ("test.detcore_unit_on_host", 848),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),
