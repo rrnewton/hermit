@@ -123,6 +123,11 @@ Every test declares `requires`. The vocabulary is closed in
 `ci/manifest-plan/src/runner.rs`; an unknown token refuses manifest loading.
 Most tokens are descriptive prerequisites only and can never suppress a cell.
 The sole current host capability mapping is `cpuid` to `cpuid-faulting`.
+One descriptive token is enforced at load time: a verify golden that prints
+the vDSO getrandom leg (`vdso-getrandom[`) can only be produced on a host
+kernel that exports `__vdso_getrandom` (Linux 6.11+ on x86-64), so its test
+must declare `vdso-getrandom`. The token is not probed; on an older kernel the
+cell runs and fails with that prerequisite named in its manifest.
 
 When that capability is provably absent, the harness records each selected cell
 as `HOST-INAPPLICABLE` with the probe evidence. The cell stays in the selected
@@ -294,6 +299,14 @@ comparison already requires the two runs to agree, so the marker adds the
 guarantee that what they agreed on is the guest's success output. The text
 must be non-empty, keys must name backends in `backends_enabled`, and the
 table is rejected outside `verify` mode.
+
+These keys carry the DBT cases of the retired strict parity matrix
+(`tests/backend-parity/run_matrix.py --backend dbt --strict`, see
+https://github.com/rrnewton/hermit/issues/3301). The matrix compared the
+stdout of three `--strict` runs with one attempt. A verify cell compares two
+runs, their stdout and their recorded event streams, and like every manifest
+cell a failed attempt is retried once; a passing retry passes the cell and the
+failed attempt's row is kept in the results.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

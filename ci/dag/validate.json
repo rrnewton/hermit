@@ -262,7 +262,7 @@
       "group": "check",
       "job": "dbt_runtime_abi",
       "desc": "Hermit supplies every reverie_dbt_runtime_* callback the DBT client declares",
-      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does.",
+      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does. test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301 and its 28 cases became DBT verify cells of the c-programs and system-utils manifests, so e2e.manifest_c_programs, e2e.manifest_system_utils and privileged-e2e.manifest_c_programs depend on this node. THOSE DEPENDENCIES ARE AN ORDERING FIX, NOT A DATA DEPENDENCY: nothing this node produces is consumed; the check runs first so a missing callback is named before eager-exit can cancel it. The cost is that a failure here skips those nodes' cells on every backend for that run, which is already red with the cause named. The e2e _on_host twins do not depend on it: the hosted-portable workflow runs each of them as its own job through ci/run-node.sh, which omits dependencies outside the job's selection, while this node runs in the separate dbt-parity release-shard job, which an E2E failure cannot cancel; ci/check-shard-coverage.sh therefore refuses an E2E edge to a node that no earlier hosted job supplies. The privileged-only-e2e nodes do not depend on it because this node is not in the privileged or hosted-privileged profiles.",
       "labels": [
         "full",
         "hosted-portable",
@@ -334,7 +334,7 @@
       "group": "check",
       "job": "backend_parity_mutation",
       "desc": "Identity fixtures in tests/c are non-vacuous (native mutation harness)",
-      "description": "Proves every identity fixture in tests/c that includes parity_probe.h would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. The harness refuses to run unless its registry equals the set of tests/c sources that include parity_probe.h, and prints every fixture it examined. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. The fixtures and this harness moved from tests/backend-parity when the backend-parity-c bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the job id is kept so shard maps and history keep naming the same node. Real cross-backend parity for those fixtures is carried by their c-programs verify cells, which e2e.manifest_c_programs and its _on_host twin select: c-programs/ioctl-fionread on ptrace and LiteInst, and c-programs/rlimit-identity and c-programs/sched-getaffinity-identity on ptrace, KVM and LiteInst. None of the three has a DBT cell. The retired test.dbt_parity matrix never compiled them either; its 28 cases now run as DBT verify cells in the c-programs and system-utils manifests (https://github.com/rrnewton/hermit/issues/3301, slice S13).",
+      "description": "Proves every identity fixture in tests/c that includes parity_probe.h would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. The harness refuses to run unless its registry equals the set of tests/c sources that include parity_probe.h, and prints every fixture it examined. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. The fixtures and this harness moved from tests/backend-parity when the backend-parity-c bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the job id is kept so shard maps and history keep naming the same node. Real cross-backend parity for those fixtures is carried by their c-programs verify cells, which e2e.manifest_c_programs and its _on_host twin select: c-programs/ioctl-fionread on ptrace and LiteInst, and c-programs/rlimit-identity and c-programs/sched-getaffinity-identity on ptrace, KVM and LiteInst. None of the three has a CI-selected DBT cell: ioctl-fionread disables DBT, and rlimit-identity and sched-getaffinity-identity enable a DBT verify cell with ci.dbt=false (infrastructure-error, RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9: DBT cannot isolate the required /test workdir). The retired test.dbt_parity matrix never compiled them either; its 28 cases now run as DBT verify cells in the c-programs and system-utils manifests (https://github.com/rrnewton/hermit/issues/3301, slice S13).",
       "labels": [
         "full",
         "hosted-portable",
@@ -6352,6 +6352,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -7807,6 +7808,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -8078,7 +8080,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "694",
+        "NEXTEST_EXPECTED_EXECUTED": "697",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -9392,7 +9394,7 @@
       "group": "privileged-e2e",
       "job": "manifest_c_programs",
       "desc": "Privileged manifest bucket: c-programs",
-      "description": "The selected cells are the three cpuid-probe cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
+      "description": "The selected cells are the four cpuid-probe verify cells (dbt, kvm, liteinst, ptrace): the kvm, liteinst and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix; the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
       "labels": [
         "full"
       ],
@@ -9440,6 +9442,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.manifest_guests_in_pinned_root",
@@ -13919,7 +13922,7 @@
       "group": "privileged-only-e2e",
       "job": "manifest_c_programs",
       "desc": "Privileged manifest bucket: c-programs",
-      "description": "The selected cells are the three cpuid-probe cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
+      "description": "The selected cells are the four cpuid-probe verify cells (dbt, kvm, liteinst, ptrace): the kvm, liteinst and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix; the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
       "labels": [
         "privileged"
       ],
@@ -22081,7 +22084,7 @@
       "group": "privileged-only-e2e",
       "job": "manifest_c_programs_on_host",
       "desc": "Privileged manifest bucket: c-programs",
-      "description": "The selected cells are the three cpuid-probe cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
+      "description": "The selected cells are the four cpuid-probe verify cells (dbt, kvm, liteinst, ptrace): the kvm, liteinst and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix; the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
       "labels": [
         "hosted-privileged"
       ],
@@ -62857,7 +62860,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "694",
+        "NEXTEST_EXPECTED_EXECUTED": "697",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,

@@ -17888,7 +17888,7 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this guest
           liteinst: No custom edge-case arguments have been calibrated for this guest
   - id: c-programs/random-sources-root-only
-    description: The root thread random stream of tests/c/random_sources.c is byte-identical across runs and backends; the golden includes the vDSO getrandom leg, so it assumes a host kernel that exports __vdso_getrandom (Linux 6.11+)
+    description: The root thread random stream of tests/c/random_sources.c is byte-identical across runs and backends; the golden includes the vDSO getrandom leg, so it needs a host kernel that exports __vdso_getrandom (Linux 6.11+), declared by the vdso-getrandom requirement
     lane: portable
     requires:
       - linux
@@ -17896,6 +17896,7 @@ test:
       - userns
       - ptrace
       - cc
+      - vdso-getrandom
     occasional: false
     program: tests/c/random_sources_root_only.c
     observation:

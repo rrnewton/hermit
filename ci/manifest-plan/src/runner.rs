@@ -158,9 +158,53 @@ pub const REQUIRES_VOCABULARY: &[(&str, Option<HostCapability>)] = &[
     ("sqlite3", None),
     ("tclsh", None),
     ("userns", None),
+    // The host kernel exports `__vdso_getrandom` (Linux 6.11+ on x86-64). A
+    // golden that prints the vDSO getrandom leg is only reachable on such a
+    // kernel; see [`VDSO_GETRANDOM_GOLDEN_MARKER`]. Descriptive only, like
+    // `cc`: nothing probes it, so on an older kernel the cell runs and fails
+    // with the declared prerequisite named, instead of being withheld.
+    ("vdso-getrandom", None),
     ("x86_64", None),
     ("zstd", None),
 ];
+
+/// The text tests/c/random_sources.c prints only when the host kernel exports
+/// `__vdso_getrandom`. On an older kernel it prints `vdso-getrandom
+/// unavailable` instead, so an exact golden carrying this marker has a kernel
+/// floor, and the test must declare it with the `vdso-getrandom` requires token.
+pub const VDSO_GETRANDOM_GOLDEN_MARKER: &str = "vdso-getrandom[";
+
+/// Refuse a verify golden that silently assumes a Linux 6.11+ host.
+///
+/// The manifest must say which host a golden was measured on when the golden
+/// cannot be produced elsewhere; otherwise an older-kernel FAIL reads as a
+/// determinism regression.
+pub fn validate_golden_kernel_floor(
+    id: &str,
+    requires: &[String],
+    modes: &BTreeMap<String, ModeRecipe>,
+) -> Result<(), String> {
+    if requires.iter().any(|token| token == "vdso-getrandom") {
+        return Ok(());
+    }
+    for (mode, recipe) in modes {
+        for (key, table) in [
+            ("expected_stdout", &recipe.expected_stdout),
+            ("expected_stdout_contains", &recipe.expected_stdout_contains),
+        ] {
+            if let Some(backend) = table.iter().find_map(|(backend, text)| {
+                text.contains(VDSO_GETRANDOM_GOLDEN_MARKER)
+                    .then_some(backend)
+            }) {
+                return Err(format!(
+                    "{id}: {mode} {key}.{backend} prints the vDSO getrandom leg, which only a \
+                     Linux 6.11+ host exports; declare `vdso-getrandom` in requires"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
     REQUIRES_VOCABULARY
@@ -1005,6 +1049,7 @@ fn validate_document_with_cpu(
         for token in &test.requires {
             requires_capability(token).map_err(|error| format!("{}.requires: {error}", test.id))?;
         }
+        validate_golden_kernel_floor(&test.id, &test.requires, &test.modes)?;
         match (&test.program, &test.direct) {
             (Some(program), None) => {
                 if !program.starts_with("tests/") || !root.join(program).exists() {
@@ -11248,6 +11293,49 @@ cp "{}" "$verdict"
             validate_expected_stdout_contains("b/t", "verify", &empty, &enabled),
             Err("b/t: verify expected_stdout_contains.ptrace must not be empty".into())
         );
+    }
+
+    /// A golden carrying the vDSO getrandom leg cannot be produced on a
+    /// pre-6.11 kernel, so the manifest must declare that floor; the same
+    /// golden with the token declared, and an unrelated golden without it,
+    /// both load.
+    #[test]
+    fn a_vdso_getrandom_golden_must_declare_its_kernel_floor() {
+        let golden = "getrandom[0]=aa\nvdso-getrandom[0]=bb\n".to_string();
+        for key in ["expected_stdout", "expected_stdout_contains"] {
+            let mut cell = ptrace_cell("verify");
+            let recipe = cell.test.modes.get_mut("verify").unwrap();
+            let table = BTreeMap::from([("ptrace".to_string(), golden.clone())]);
+            if key == "expected_stdout" {
+                recipe.expected_stdout = table;
+            } else {
+                recipe.expected_stdout_contains = table;
+            }
+            let undeclared = vec!["linux".to_string(), "cc".to_string()];
+            assert_eq!(
+                validate_golden_kernel_floor("b/t", &undeclared, &cell.test.modes),
+                Err(format!(
+                    "b/t: verify {key}.ptrace prints the vDSO getrandom leg, which only a \
+                     Linux 6.11+ host exports; declare `vdso-getrandom` in requires"
+                ))
+            );
+            let declared = vec!["linux".to_string(), "vdso-getrandom".to_string()];
+            assert_eq!(
+                validate_golden_kernel_floor("b/t", &declared, &cell.test.modes),
+                Ok(())
+            );
+        }
+        let mut cell = ptrace_cell("verify");
+        cell.test.modes.get_mut("verify").unwrap().expected_stdout = BTreeMap::from([(
+            "ptrace".to_string(),
+            "vdso-getrandom unavailable\n".to_string(),
+        )]);
+        assert_eq!(
+            validate_golden_kernel_floor("b/t", &[], &cell.test.modes),
+            Ok(())
+        );
+        // The token is descriptive: it never withholds a cell.
+        assert_eq!(requires_capability("vdso-getrandom"), Ok(None));
     }
 
     #[test]
