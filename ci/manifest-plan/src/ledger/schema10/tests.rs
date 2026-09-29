@@ -897,7 +897,9 @@ fn restore_pre_exclusion_ownership(cfg: &mut DagConfig, generated: &DagConfig) {
             step.result_manifests
                 .iter()
                 .flatten()
-                .filter(|manifest| !matches!(manifest, dagrun::model::ResultManifest::ManifestCell(_)))
+                .filter(|manifest| {
+                    !matches!(manifest, dagrun::model::ResultManifest::ManifestCell(_))
+                })
                 .cloned(),
         );
         step.result_manifests = Some(manifests);
@@ -951,8 +953,8 @@ fn generated_plan_populations_preserve_command_policy() {
     // Today's hosted-portable plan omits the KVM cells, because GitHub-hosted
     // runners have no PMU; its commands carry the exclusion and its steps own
     // exactly the remaining portable cells.
-    let hosted_now = dagrun::select_steps_by_labels(&generated, &["hosted-portable".to_owned()])
-        .unwrap();
+    let hosted_now =
+        dagrun::select_steps_by_labels(&generated, &["hosted-portable".to_owned()]).unwrap();
     let current_hosted = ConstructedValidationPlanV10 {
         schema: 1,
         run_id: "generated-hosted-portable-current".into(),

@@ -557,12 +557,12 @@ fn validate_args(command: &str, args: &Args) {
     {
         fail("--backend must name a Hermit backend");
     }
-    if args
-        .selection
-        .exclude_backends
-        .iter()
-        .any(|backend| !matches!(backend.as_str(), "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"))
-    {
+    if args.selection.exclude_backends.iter().any(|backend| {
+        !matches!(
+            backend.as_str(),
+            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"
+        )
+    }) {
         fail("--exclude-backend must name a Hermit backend");
     }
     if let Some(backend) = args.selection.backend.as_deref() {
@@ -602,7 +602,9 @@ fn validate_args(command: &str, args: &Args) {
             fail("--probe-disabled is mutually exclusive with --include-manual and --ci-only");
         }
         if !args.selection.exclude_backends.is_empty() {
-            fail("--probe-disabled names one exact backend; --exclude-backend has no meaning there");
+            fail(
+                "--probe-disabled names one exact backend; --exclude-backend has no meaning there",
+            );
         }
     }
     if args.allow_empty {
