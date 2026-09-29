@@ -1225,12 +1225,6 @@
       "why": "tests/c/kvm_exact_child_waits.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this workload and exercises KVM-specific child completion for exact wait ordering plus exact-self SIGKILL through kill, tkill, and tgkill; it remains coupled to that dedicated driver rather than a generic manifest cell."
     },
     {
-      "disposition": "guest-fixture",
-      "path": "tests/c/kvm_gettimeofday_efault.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/kvm_gettimeofday_efault.c is owned by hermit-cli/tests/cli.rs: The KVM CLI regressions compile this guest and require invalid-tv and faulting-timezone gettimeofday calls to return EFAULT without turning the backend result into a Detcore Tool failure."
-    },
-    {
       "disposition": "manifest-test",
       "path": "tests/c/listmount_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

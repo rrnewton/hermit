@@ -661,16 +661,15 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
 
 fn kvm_gettimeofday_efault_guest() -> &'static Path {
     KVM_GETTIMEOFDAY_EFAULT_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kvm_gettimeofday_efault.c");
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-gettimeofday-efault");
         fs::create_dir_all(&build_root)
             .expect("failed to create KVM gettimeofday EFAULT guest directory");
         let guest = build_root.join("kvm_gettimeofday_efault");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/kvm_gettimeofday_efault.c"))
+            .arg(&fixture)
             .arg("-o")
             .arg(&guest)
             .output()
