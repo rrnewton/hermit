@@ -5,7 +5,7 @@
     {
       "retired_bucket": "backend-parity-c",
       "successor_bucket": "c-programs",
-      "last_live_commit": "e8007f971a72c5fd92fcf3e17e41f38811c3cac3",
+      "last_live_commit": "3f66a249b30fada86b81e722b8e5439ac0789f8e",
       "reason": "The backend-parity-c bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301, slice S6). Each id kept its test name except backend-parity-c/pidfd-open-self, which became c-programs/pidfd-open-self-pair because c-programs/pidfd-open-self already names a different program (tests/c/pidfd_open_self.c).",
       "ids": {
         "backend-parity-c/aio-refusal": "c-programs/aio-refusal",

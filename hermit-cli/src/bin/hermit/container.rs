@@ -22,6 +22,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 use detcore_model::config::MountInfoRootRewrite;
@@ -672,6 +674,9 @@ extern "C" fn on_container_init_stop_signal(signal: libc::c_int) {
 /// the same silent no-op with a handler installed to suggest otherwise, so the
 /// mask is cleared for these three. `record_start.rs` learned the same lesson
 /// about `SIGALRM`.
+///
+/// This runs only after Reverie has set up the container. Until then the init
+/// relies on the [`ContainerInitStopSignalBridge`] it inherited at clone.
 fn install_container_init_stop_handlers() -> Result<(), Error> {
     let action = SigAction::new(
         SigHandler::Handler(on_container_init_stop_signal),
@@ -694,6 +699,236 @@ fn install_container_init_stop_handlers() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// The pid of the process that installed a [`ContainerInitStopSignalBridge`].
+///
+/// [`bridge_container_init_stop_signal`] compares it with `getpid()` to tell
+/// the `hermit` process, which installed the bridge, apart from a container init
+/// that inherited it at clone. A container init with its own PID namespace sees
+/// itself as PID 1, and one without sees its own host PID, so neither matches
+/// unless the `hermit` process is itself PID 1; see
+/// [`ContainerInitStopSignalBridge::install`] for that case.
+static STOP_SIGNAL_BRIDGE_HOLDER: AtomicI32 = AtomicI32::new(0);
+
+/// The stop-signal disposition the `hermit` process holds while it clones a
+/// container init. See [`ContainerInitStopSignalBridge`].
+///
+/// In the container init this is [`on_container_init_stop_signal`]: exit
+/// `128 + signo`, and so take the namespace down with it.
+///
+/// In the `hermit` process it reproduces `SIG_DFL`. It restores the default
+/// disposition, unblocks the signal and raises it again, so the process dies
+/// from the signal with the same wait status it would have had without the
+/// bridge. If the `hermit` process is itself a namespace init, the kernel
+/// discards the raised signal exactly as it would have discarded the original,
+/// and the handler returns.
+extern "C" fn bridge_container_init_stop_signal(signal: libc::c_int) {
+    // SAFETY: getpid(2) is async-signal-safe, and so is a lock-free atomic load.
+    if unsafe { libc::getpid() } != STOP_SIGNAL_BRIDGE_HOLDER.load(Ordering::Relaxed) {
+        // Does not return.
+        on_container_init_stop_signal(signal);
+    }
+    // SAFETY: sigaction(2), sigemptyset(3), sigaddset(3), sigprocmask(2) and
+    // raise(3) are async-signal-safe, and every pointer passed refers to a local
+    // that outlives the call.
+    unsafe {
+        let mut default: libc::sigaction = std::mem::zeroed();
+        default.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(signal, &default, std::ptr::null_mut());
+        let mut unblock: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut unblock);
+        libc::sigaddset(&mut unblock, signal);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+        libc::raise(signal);
+    }
+}
+
+/// The action currently installed for `signal`, read without changing it.
+fn current_signal_action(signal: Signal) -> Result<libc::sigaction, Error> {
+    // SAFETY: a null new action makes sigaction(2) a pure query, and `current`
+    // is a correctly sized out-parameter that is read only on success.
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(signal as libc::c_int, std::ptr::null(), &mut current) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to read the {signal} disposition"));
+    }
+    Ok(current)
+}
+
+/// Stop signals aimed at a container init before it arms its own handlers.
+///
+/// [`install_container_init_stop_handlers`] runs as the first statement of the
+/// container closure. Reverie calls that closure only after it has set up the
+/// container: identity maps, mounts, the root change and the new `/proc`. The
+/// container init is a PID-namespace init from the moment `clone` returns, and
+/// it is visible in `/proc` from then on. For that whole setup window it has
+/// whatever disposition it inherited from `hermit`, which is normally
+/// `SIG_DFL`, so a `SIGTERM`, `SIGINT` or `SIGHUP` aimed at it is discarded by
+/// the kernel at send time. The handler installed a moment later cannot recover
+/// a signal that was never queued, so the run keeps going as if nobody had
+/// asked it to stop.
+///
+/// Measured before this guard existed, with a probe that signalled each run's
+/// init as soon as it appeared in `/proc`: 12 of 60 signals were sent while
+/// `/proc` still showed no handler, and 9 of those 12 were lost (the init was
+/// still running 3 seconds later). None of the other 48 was lost. With the guard
+/// in place, none of 60 was lost. The integration test
+/// `container_init_honours_signals_aimed_at_it_directly` failed this way 6 times
+/// in one batch of 360 runs on a loaded host, and none in another.
+///
+/// No hermit code runs in the container init before Reverie's setup, so the
+/// disposition has to be in place when it is created. This guard installs
+/// [`bridge_container_init_stop_signal`] in the `hermit` process around the
+/// clone, and the new init inherits it. Reverie's setup leaves these
+/// dispositions alone: it clears the signal mask and resets only `SIGPIPE`.
+/// The container init then replaces the bridge with its own handler.
+///
+/// Only `SIG_DFL` dispositions are bridged. The bridge reproduces the default
+/// action in the `hermit` process exactly, but it cannot reproduce `SIG_IGN`
+/// without turning an ignored signal into an interrupted system call, and a
+/// handler someone installed deliberately is not ours to replace. A stop signal
+/// that `hermit` itself ignores, such as `SIGHUP` under `nohup`, therefore
+/// stays discarded until the container init arms.
+///
+/// Holding a mask instead of a handler would not work. The container init would
+/// queue a blocked signal, but Reverie's setup unblocks everything before the
+/// handler exists, and the kernel then discards a signal that is still at
+/// `SIG_DFL` or `SIG_IGN`. Blocking the signals would also defer a `SIGTERM`
+/// aimed at `hermit` itself for the whole run.
+#[must_use = "the bridge is removed when this guard is dropped"]
+pub(super) struct ContainerInitStopSignalBridge {
+    /// Which entries of [`CONTAINER_INIT_STOP_SIGNALS`] this guard bridged.
+    bridged: [bool; CONTAINER_INIT_STOP_SIGNALS.len()],
+    /// The exact `sa_sigaction` value this guard installed. Drop compares the
+    /// current action with this value rather than taking the function's
+    /// address again, because Rust does not promise that one function has only
+    /// one address.
+    handler: libc::sighandler_t,
+}
+
+impl ContainerInitStopSignalBridge {
+    /// Bridge every stop signal that is currently at `SIG_DFL`.
+    ///
+    /// Call this in the thread that clones the container init, immediately
+    /// before the clone. The query and the install are not one atomic step, so
+    /// this relies on the requirement Container already places on its caller:
+    /// no other thread is running.
+    pub(super) fn install() -> Result<Self, Error> {
+        let handler: extern "C" fn(libc::c_int) = bridge_container_init_stop_signal;
+        let mut guard = Self {
+            bridged: [false; CONTAINER_INIT_STOP_SIGNALS.len()],
+            handler: handler as libc::sighandler_t,
+        };
+        // SAFETY: getpid(2) has no preconditions.
+        let holder = unsafe { libc::getpid() };
+        if holder == 1 {
+            // The container init with its own PID namespace would also see
+            // itself as PID 1, so the bridge could not tell the two processes
+            // apart. The bridge stays out of the way here, and the container
+            // init behaves as it did before the bridge existed. A `hermit` that
+            // is PID 1 is a namespace init, so the kernel discards these signals
+            // for it in any case.
+            return Ok(guard);
+        }
+        STOP_SIGNAL_BRIDGE_HOLDER.store(holder, Ordering::Relaxed);
+
+        // SAFETY: an all-zero sigaction is a valid value.
+        let mut bridge: libc::sigaction = unsafe { std::mem::zeroed() };
+        bridge.sa_sigaction = guard.handler;
+        bridge.sa_flags = libc::SA_RESTART;
+        // SAFETY: sigemptyset(3) and sigaddset(3) only write the mask they are
+        // given, which is a field of the local above.
+        unsafe {
+            libc::sigemptyset(&mut bridge.sa_mask);
+            for signal in CONTAINER_INIT_STOP_SIGNALS {
+                libc::sigaddset(&mut bridge.sa_mask, signal as libc::c_int);
+            }
+        }
+        for (index, signal) in CONTAINER_INIT_STOP_SIGNALS.into_iter().enumerate() {
+            if current_signal_action(signal)?.sa_sigaction != libc::SIG_DFL {
+                continue;
+            }
+            // SAFETY: in the container init the handler performs only `_exit`.
+            // In this process it performs only the async-signal-safe calls
+            // listed in its body. `bridge` outlives the call.
+            if unsafe { libc::sigaction(signal as libc::c_int, &bridge, std::ptr::null_mut()) }
+                == -1
+            {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("Failed to install the container init {signal} bridge")
+                });
+            }
+            guard.bridged[index] = true;
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for ContainerInitStopSignalBridge {
+    fn drop(&mut self) {
+        let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        for (index, signal) in CONTAINER_INIT_STOP_SIGNALS.into_iter().enumerate() {
+            if !self.bridged[index] {
+                continue;
+            }
+            // Undo only our own bridge. The handler may already have restored
+            // `SIG_DFL`, and any other action was installed after us on purpose.
+            let still_bridged = current_signal_action(signal)
+                .is_ok_and(|current| current.sa_sigaction == self.handler);
+            if still_bridged {
+                // SAFETY: restoring the default action installs no handler.
+                let _ = unsafe { sigaction(signal, &default) };
+            }
+        }
+    }
+}
+
+/// Test-only: hold a freshly cloned container init before it arms its guards,
+/// so a test can aim a stop signal at an init that does not yet have its own
+/// handlers.
+///
+/// Without this the window is well under a millisecond to a few milliseconds of
+/// container setup, and an integration test lands in it only by chance: 6 times
+/// in one batch of 360 runs on a loaded host, and none in another.
+/// [`CONTAINER_INIT_ARMING_STALL`] is longer than any budget that test
+/// waits for, so a signal sent within those budgets is necessarily sent, and
+/// acted on, before the container init installed anything itself.
+///
+/// This is keyed off an environment variable rather than `cfg(test)` for the
+/// same reason as `run_timeout::stall_the_unwind_if_asked`: the bridge lives in
+/// the shipped binary and must be exercised there. The variable is read in the
+/// container init from the `hermit` process's environment, never from the
+/// guest's.
+pub(super) fn stall_container_init_before_arming_if_asked() {
+    if std::env::var_os(CONTAINER_INIT_ARMING_STALL_ENV).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    // Rename the thread for the length of the stall, so the test can see that
+    // the init really is waiting here, rather than inferring it from timing or
+    // passing against a binary that ignores the variable.
+    let mut name = [0u8; 16];
+    // SAFETY: PR_GET_NAME writes at most 16 bytes, including the terminator,
+    // into `name`; PR_SET_NAME reads a NUL-terminated string of at most 16.
+    unsafe {
+        libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr());
+        libc::prctl(libc::PR_SET_NAME, c"unarmed-init".as_ptr());
+    }
+    std::thread::sleep(CONTAINER_INIT_ARMING_STALL);
+    // SAFETY: as above; `name` is still NUL-terminated.
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+}
+
+/// See [`stall_container_init_before_arming_if_asked`].
+pub(super) const CONTAINER_INIT_ARMING_STALL_ENV: &str =
+    "HERMIT_INTERNAL_STALL_CONTAINER_INIT_BEFORE_ARMING";
+
+/// See [`stall_container_init_before_arming_if_asked`]. The integration test
+/// `container_init_honours_signals_sent_before_it_arms` copies this value and
+/// the thread name the stall sets.
+pub(super) const CONTAINER_INIT_ARMING_STALL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 /// Arm both container-init guards. Call this as the FIRST statement inside any
 /// `Container::run` closure that is not going through [`with_container`].
@@ -1132,6 +1367,283 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long a signalled test child may take to exit before it counts as
+    /// having ignored the signal. A child that honours it exits within
+    /// microseconds; this only bounds the failing case.
+    const STOP_SIGNAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Run `body` in a forked process, so that the process-wide signal
+    /// dispositions and namespaces it changes cannot reach the test harness or
+    /// any other test running beside it.
+    fn in_isolated_process<T>(body: impl FnMut() -> Result<T, String>) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        Container::new()
+            .run(body)
+            .expect("the isolated test process should run to completion")
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn set_default_stop_dispositions() -> Result<(), String> {
+        let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        for signal in CONTAINER_INIT_STOP_SIGNALS {
+            // SAFETY: the default action installs no handler.
+            unsafe { sigaction(signal, &default) }.map_err(|error| format!("{signal}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Enter a new user and PID namespace, so that the next child this process
+    /// forks is PID 1 of that namespace: a namespace init, like the container
+    /// init, for which the kernel discards `SIG_DFL` signals from outside.
+    fn enter_new_pid_namespace() -> Result<(), String> {
+        // SAFETY: `unshare` touches no caller memory. This process is a fresh
+        // fork and has one thread, as a new user namespace requires.
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) } == -1 {
+            return Err(format!("unshare: {}", io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Fork a child that runs `prepare`, reports through a pipe that it has
+    /// done so, and then waits for signals forever without installing any
+    /// handler of its own. Returns the child's pid once it has reported.
+    fn fork_waiting_child(prepare: fn() -> bool) -> Result<libc::pid_t, String> {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a correctly sized out-parameter.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+            return Err(format!("pipe: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: the parent is single-threaded, and the child calls only
+        // `prepare`, then async-signal-safe functions, and never returns.
+        match unsafe { libc::fork() } {
+            -1 => Err(format!("fork: {}", io::Error::last_os_error())),
+            0 => unsafe {
+                libc::close(fds[0]);
+                if !prepare() {
+                    libc::_exit(99);
+                }
+                libc::write(fds[1], [1u8].as_ptr().cast(), 1);
+                libc::close(fds[1]);
+                loop {
+                    libc::pause();
+                }
+            },
+            child => {
+                let mut ready = 0u8;
+                // SAFETY: both descriptors came from the pipe above, and
+                // `ready` is a one-byte buffer that outlives the read.
+                let read = unsafe {
+                    libc::close(fds[1]);
+                    let read = libc::read(fds[0], (&mut ready as *mut u8).cast(), 1);
+                    libc::close(fds[0]);
+                    read
+                };
+                if read != 1 {
+                    return Err(format!(
+                        "child {child} exited without reporting that it was ready, so its \
+                         preparation failed"
+                    ));
+                }
+                Ok(child)
+            }
+        }
+    }
+
+    /// Send `signal` to `child` and wait for it to exit. Returns its raw wait
+    /// status, or `None` if it was still running [`STOP_SIGNAL_BUDGET`] later,
+    /// in which case it is killed and reaped.
+    fn signal_and_reap(child: libc::pid_t, signal: Signal) -> Result<Option<i32>, String> {
+        // SAFETY: `kill` takes a pid and a signal number and touches no caller
+        // memory. `child` is our own unreaped child.
+        if unsafe { libc::kill(child, signal as libc::c_int) } == -1 {
+            return Err(format!(
+                "kill({child}, {signal}): {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let deadline = std::time::Instant::now() + STOP_SIGNAL_BUDGET;
+        loop {
+            let mut status = 0;
+            // SAFETY: `status` is a valid out-parameter for waitpid(2).
+            match unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } {
+                reaped if reaped == child => return Ok(Some(status)),
+                -1 => return Err(format!("waitpid({child}): {}", io::Error::last_os_error())),
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: as above. SIGKILL reaches a namespace init from its
+                // parent namespace, so the blocking wait returns.
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &mut status, 0);
+                }
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn describe_wait_status(status: Option<i32>) -> String {
+        match status {
+            None => format!("still running {STOP_SIGNAL_BUDGET:?} after the signal"),
+            Some(status) if libc::WIFEXITED(status) => {
+                format!("exited {}", libc::WEXITSTATUS(status))
+            }
+            Some(status) if libc::WIFSIGNALED(status) => {
+                format!("killed by signal {}", libc::WTERMSIG(status))
+            }
+            Some(status) => format!("wait status {status:#x}"),
+        }
+    }
+
+    /// The window the bridge closes, reproduced without timing: the namespace
+    /// init is forked while the bridge is installed and never installs a
+    /// handler of its own, so every signal here arrives before the init has
+    /// armed anything. Without the bridge the kernel discards all three and the
+    /// init is still running when the budget expires.
+    #[test]
+    fn a_namespace_init_honours_stop_signals_sent_before_it_arms() {
+        for signal in CONTAINER_INIT_STOP_SIGNALS {
+            let status = in_isolated_process(|| {
+                set_default_stop_dispositions()?;
+                let _bridge = ContainerInitStopSignalBridge::install()
+                    .map_err(|error| format!("{error:#}"))?;
+                enter_new_pid_namespace()?;
+                let init = fork_waiting_child(|| true)?;
+                signal_and_reap(init, signal)
+            });
+            assert!(
+                status.is_some_and(|status| libc::WIFEXITED(status)
+                    && libc::WEXITSTATUS(status) == 128 + signal as i32),
+                "{signal}: a namespace init that had not armed its own handlers should \
+                 exit {}, as `on_container_init_stop_signal` does; it {}",
+                128 + signal as i32,
+                describe_wait_status(status)
+            );
+        }
+    }
+
+    /// The bridge must not change what a stop signal does to the process that
+    /// holds it: the `hermit` process still dies from the signal itself, with
+    /// the wait status `SIG_DFL` would have given it.
+    #[test]
+    fn the_process_holding_the_bridge_still_dies_from_stop_signals() {
+        fn hold_the_bridge() -> bool {
+            if set_default_stop_dispositions().is_err() {
+                return false;
+            }
+            match ContainerInitStopSignalBridge::install() {
+                Ok(bridge) => {
+                    std::mem::forget(bridge);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        for signal in CONTAINER_INIT_STOP_SIGNALS {
+            let status = in_isolated_process(|| {
+                let holder = fork_waiting_child(hold_the_bridge)?;
+                signal_and_reap(holder, signal)
+            });
+            assert!(
+                status
+                    .is_some_and(|status| libc::WIFSIGNALED(status)
+                        && libc::WTERMSIG(status) == signal as i32),
+                "{signal}: the process holding the bridge should be killed by {signal}; it {}",
+                describe_wait_status(status)
+            );
+        }
+    }
+
+    /// Only `SIG_DFL` is bridged, and dropping the guard restores exactly
+    /// what was there before.
+    #[test]
+    fn the_bridge_leaves_ignored_and_handled_signals_alone_and_restores_the_default() {
+        extern "C" fn someone_elses_handler(_signal: libc::c_int) {}
+        let dispositions = in_isolated_process(|| {
+            let read = || -> Result<Vec<libc::sighandler_t>, String> {
+                CONTAINER_INIT_STOP_SIGNALS
+                    .into_iter()
+                    .map(|signal| {
+                        current_signal_action(signal)
+                            .map(|action| action.sa_sigaction)
+                            .map_err(|error| format!("{error:#}"))
+                    })
+                    .collect()
+            };
+            let actions = [
+                SigHandler::SigDfl,
+                SigHandler::SigIgn,
+                SigHandler::Handler(someone_elses_handler),
+            ];
+            for (signal, handler) in CONTAINER_INIT_STOP_SIGNALS.into_iter().zip(actions) {
+                let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
+                // SAFETY: the handler does nothing, and it is never invoked.
+                unsafe { sigaction(signal, &action) }
+                    .map_err(|error| format!("{signal}: {error}"))?;
+            }
+            let before = read()?;
+            let bridge =
+                ContainerInitStopSignalBridge::install().map_err(|error| format!("{error:#}"))?;
+            let during = read()?;
+            let installed = bridge.handler;
+            drop(bridge);
+            Ok((before, during, read()?, installed))
+        });
+        // Compare the values the kernel reports rather than function addresses
+        // taken here, which Rust does not promise are unique.
+        let (before, during, after, installed) = dispositions;
+        let other = before[2];
+        assert_eq!(
+            before[..2],
+            [libc::SIG_DFL, libc::SIG_IGN],
+            "SIGTERM starts at SIG_DFL and SIGINT at SIG_IGN"
+        );
+        assert!(
+            ![libc::SIG_DFL, libc::SIG_IGN, installed].contains(&other),
+            "SIGHUP starts at a handler that is not the bridge"
+        );
+        assert_eq!(
+            during,
+            vec![installed, libc::SIG_IGN, other],
+            "only SIGTERM, the signal at SIG_DFL, is bridged while the guard is held"
+        );
+        assert_eq!(
+            after, before,
+            "dropping the guard restores every disposition it found"
+        );
+    }
+
+    /// A `hermit` process that is itself PID 1 cannot be told apart from a
+    /// container init with its own PID namespace, so the bridge stays out of
+    /// the way rather than guessing which of the two it is running in.
+    #[test]
+    fn the_bridge_is_not_installed_by_a_process_that_is_pid_1() {
+        fn install_as_pid_1() -> bool {
+            // SAFETY: getpid(2) has no preconditions.
+            if unsafe { libc::getpid() } != 1 || set_default_stop_dispositions().is_err() {
+                return false;
+            }
+            let Ok(bridge) = ContainerInitStopSignalBridge::install() else {
+                return false;
+            };
+            let untouched = CONTAINER_INIT_STOP_SIGNALS.into_iter().all(|signal| {
+                current_signal_action(signal)
+                    .is_ok_and(|action| action.sa_sigaction == libc::SIG_DFL)
+            });
+            drop(bridge);
+            untouched
+        }
+        // A child whose check fails exits before reporting, which fails here.
+        in_isolated_process(|| {
+            enter_new_pid_namespace()?;
+            let init = fork_waiting_child(install_as_pid_1)?;
+            signal_and_reap(init, Signal::SIGKILL).map(drop)
+        });
+    }
 
     fn namespace_proc_contents() -> Result<(String, String), String> {
         Ok((

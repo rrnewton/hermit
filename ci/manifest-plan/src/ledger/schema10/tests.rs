@@ -734,12 +734,13 @@ fn exact_rng_population(cells: &[CellIdentity], count: usize) -> bool {
 const PRE_RELEASE_ENV_PARITY_COMMAND: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra '\'' %q'\'' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
 
 /// The two backend-parity-c selector commands exactly as ci/dag/validate.json
-/// emitted them at e8007f971a72c5fd92fcf3e17e41f38811c3cac3, the last Hermit
-/// commit whose manifests declared that bucket. Slice S6 of
-/// <https://github.com/rrnewton/hermit/issues/3301> folded the bucket into
-/// c-programs, so no generator emits these any more. Plans published with them
-/// must keep reading, and these retained bytes, rather than a derivation from
-/// the reader's constants, are what prove it.
+/// emitted them from e8007f971a72c5fd92fcf3e17e41f38811c3cac3 through
+/// 3f66a249b30fada86b81e722b8e5439ac0789f8e, the last Hermit commit whose
+/// manifests declared that bucket; the commands are byte-identical at both.
+/// Slice S6 of <https://github.com/rrnewton/hermit/issues/3301> folded the
+/// bucket into c-programs, so no generator emits these any more. Plans
+/// published with them must keep reading, and these retained bytes, rather
+/// than a derivation from the reader's constants, are what prove it.
 const LAST_LIVE_PORTABLE_PARITY_SELECTOR: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_EPOCH --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env HERMIT_VALIDATE_BUCK_DOTSLASH --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra '\'' %q'\'' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
 const LAST_LIVE_HOSTED_PARITY_SELECTOR: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
 
@@ -750,7 +751,7 @@ fn folded_ids() -> BTreeMap<String, String> {
     let retirement = retired.retirement("backend-parity-c").unwrap();
     assert_eq!(
         retirement.last_live_commit,
-        "e8007f971a72c5fd92fcf3e17e41f38811c3cac3"
+        "3f66a249b30fada86b81e722b8e5439ac0789f8e"
     );
     retirement
         .ids

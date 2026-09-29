@@ -256,7 +256,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (container::tests::image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem)
     // retains all 753 prior identities (`cargo nextest list --profile ci`
     // measured 754; https://github.com/rrnewton/hermit/issues/3334).
-    ("test.hermit_unit", 754),
+    // Four container-init stop-signal bridge tests (container::tests::
+    // a_namespace_init_honours_stop_signals_sent_before_it_arms,
+    // the_process_holding_the_bridge_still_dies_from_stop_signals,
+    // the_bridge_leaves_ignored_and_handled_signals_alone_and_restores_the_default,
+    // the_bridge_is_not_installed_by_a_process_that_is_pid_1) retain all 754
+    // prior identities (`cargo nextest list --profile ci` measured 758;
+    // https://github.com/rrnewton/hermit/issues/3354).
+    ("test.hermit_unit", 758),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -280,7 +287,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
     // The read-only proc chroot identity test retains all 170 prior identities.
-    ("test.hermit_integration", 171),
+    // 108e98c1e63 added run_evidence::tracing_time_mask_replaces_only_the_event_time
+    // without raising this count (listed 172 against 171). The container-init
+    // test container_init_honours_signals_sent_before_it_arms
+    // (https://github.com/rrnewton/hermit/issues/3354) adds one more. Both
+    // retain all 171 prior identities (`cargo nextest list --profile ci`
+    // measured 173).
+    ("test.hermit_integration", 173),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -319,8 +332,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 843),
     // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 171),
-    ("test.hermit_unit_on_host", 754),
+    ("test.hermit_integration_on_host", 173),
+    ("test.hermit_unit_on_host", 758),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.

@@ -103,6 +103,160 @@ fn run(args: &[&str]) -> Output {
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
 }
 
+/// Length of the host wall-clock prefix Hermit's tracing formatter writes on
+/// every event: `2026-09-29T04:03:28.423842Z`.
+const TRACING_TIME_LEN: usize = "2026-09-29T04:03:28.423842Z".len();
+/// The formatter pads each level to five bytes and separates it by one space
+/// on each side, so an event line reads `<time> <LEVEL> <target>: <message>`.
+const TRACING_LEVELS: [&[u8]; 5] = [b"TRACE", b"DEBUG", b" INFO", b" WARN", b"ERROR"];
+const MASKED_TRACING_TIME: &[u8] = b"<host-wall-clock-time>";
+
+fn is_tracing_time(prefix: &[u8]) -> bool {
+    prefix.len() == TRACING_TIME_LEN
+        && prefix.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'.',
+            26 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// Replace the host wall-clock time that starts each of Hermit's tracing event
+/// lines, and nothing else.
+///
+/// That prefix records when Hermit logged, not what the guest or Hermit did.
+/// Two otherwise identical runs differ in it whenever Hermit emits any event at
+/// the default level: on a host without CPUID faulting, Reverie logs an ERROR
+/// per traced exec, so the GitHub-hosted runner produced two such lines per run
+/// (https://github.com/rrnewton/hermit/issues/3344). Hermit's own log
+/// comparators exclude the same prefix: `detcore::logdiff` splits records at it
+/// and compares what follows.
+///
+/// Only the time bytes of a line that has exactly this shape, followed by a
+/// padded tracing level, are replaced. Guest output, Hermit's untimestamped
+/// notices, and each event's level, target, message and fields stay byte-exact,
+/// so an event that the sidecar adds, drops, reorders or rewords still fails
+/// the comparison.
+fn mask_tracing_times(bytes: &[u8]) -> Vec<u8> {
+    let mut masked = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let level_start = TRACING_TIME_LEN + 1;
+        let level_end = level_start + 5;
+        let is_event = line.len() > level_end
+            && is_tracing_time(&line[..TRACING_TIME_LEN])
+            && line[TRACING_TIME_LEN] == b' '
+            && TRACING_LEVELS.contains(&&line[level_start..level_end])
+            && line[level_end] == b' ';
+        if is_event {
+            masked.extend_from_slice(MASKED_TRACING_TIME);
+            masked.extend_from_slice(&line[TRACING_TIME_LEN..]);
+        } else {
+            masked.extend_from_slice(line);
+        }
+    }
+    masked
+}
+
+/// Compare a stream that carries guest output and Hermit diagnostics exactly,
+/// except for the wall-clock time on Hermit's tracing events.
+#[track_caller]
+fn assert_same_apart_from_tracing_times(actual: &[u8], expected: &[u8], what: &str) {
+    let (actual_masked, expected_masked) =
+        (mask_tracing_times(actual), mask_tracing_times(expected));
+    assert!(
+        actual_masked == expected_masked,
+        "{what} differs beyond Hermit's tracing wall-clock times\n\
+         with evidence:\n{}\nbaseline:\n{}",
+        String::from_utf8_lossy(actual),
+        String::from_utf8_lossy(expected),
+    );
+}
+
+#[test]
+fn tracing_time_mask_replaces_only_the_event_time() {
+    let event = |time: &str, level: &str, message: &str| {
+        format!("{time} {level} reverie_ptrace::task: {message} initial_state=1\n")
+    };
+    let first = "2026-09-29T04:03:28.423842Z";
+    let second = "2026-09-29T04:03:28.389695Z";
+
+    // Hosted-runner shape: an untimestamped Hermit notice, two ERROR events,
+    // then unterminated guest stderr.
+    let notice = "hermit: virtual-time epoch=2026-01-01T00:00:00.123456789+00:00\n";
+    let stream = |time: &str| {
+        format!(
+            "{notice}{}{}ordinary-err",
+            event(time, "ERROR", "no CPUID faulting"),
+            event(time, "ERROR", "no CPUID faulting"),
+        )
+    };
+    assert_eq!(
+        String::from_utf8(mask_tracing_times(stream(first).as_bytes())).unwrap(),
+        format!(
+            "{notice}{}{}ordinary-err",
+            event("<host-wall-clock-time>", "ERROR", "no CPUID faulting"),
+            event("<host-wall-clock-time>", "ERROR", "no CPUID faulting"),
+        )
+    );
+    assert_same_apart_from_tracing_times(
+        stream(first).as_bytes(),
+        stream(second).as_bytes(),
+        "hosted-runner stderr",
+    );
+    for level in [" INFO", " WARN", "DEBUG", "TRACE"] {
+        assert_eq!(
+            mask_tracing_times(event(first, level, "m").as_bytes()),
+            mask_tracing_times(event(second, level, "m").as_bytes()),
+            "{level} events differ only in time"
+        );
+    }
+
+    // Everything else remains part of the comparison.
+    for (left, right) in [
+        (event(first, "ERROR", "m"), event(second, " WARN", "m")),
+        (event(first, "ERROR", "m"), event(second, "ERROR", "n")),
+        (event(first, "ERROR", "m"), String::new()),
+        (
+            format!(
+                "{}{}",
+                event(first, "ERROR", "a"),
+                event(first, "ERROR", "b")
+            ),
+            format!(
+                "{}{}",
+                event(second, "ERROR", "b"),
+                event(second, "ERROR", "a")
+            ),
+        ),
+    ] {
+        assert_ne!(
+            mask_tracing_times(left.as_bytes()),
+            mask_tracing_times(right.as_bytes()),
+            "{left:?} must not compare equal to {right:?}"
+        );
+    }
+    for untouched in [
+        // Guest bytes that start with a time but carry no tracing level.
+        format!("{first} guest wrote this\n"),
+        format!("{first}  INFOguest\n"),
+        // Not the formatter's time shape.
+        "2026-09-29T04:03:28.423842 ERROR x: m\n".to_owned(),
+        "2026-09-29 04:03:28.423842Z ERROR x: m\n".to_owned(),
+        // An event that does not start the line is left for the comparison.
+        format!("guest{}", event(first, "ERROR", "m")),
+        // A bare prefix with nothing after the level.
+        format!("{first} ERROR"),
+    ] {
+        assert_eq!(
+            mask_tracing_times(untouched.as_bytes()),
+            untouched.as_bytes(),
+            "{untouched:?} was masked"
+        );
+    }
+}
+
 #[test]
 fn run_evidence_command_staging_is_exact() {
     let selected = hermit_test::hermit_binary();
@@ -350,7 +504,7 @@ fn sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info() {
 
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
+    assert_same_apart_from_tracing_times(&with_evidence.stderr, &baseline.stderr, "stderr");
     let RunEvidenceInspection::Complete(report) = inspect_run_evidence(&destination) else {
         panic!("ordinary ptrace evidence did not validate")
     };
@@ -397,7 +551,7 @@ fn sidecar_preserves_session_and_process_group_identity() {
     );
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
+    assert_same_apart_from_tracing_times(&with_evidence.stderr, &baseline.stderr, "stderr");
     let stdout = String::from_utf8(with_evidence.stdout).unwrap();
     assert!(stdout.contains("setpgid rc=0 errno=0"));
     assert!(stdout.contains("setsid rc=-1 errno=1"));
@@ -441,11 +595,12 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
     );
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
-    assert_eq!(
-        fs::read(&public_log).unwrap(),
-        fs::read(&baseline_log).unwrap(),
-        "the private INFO layer changed the default-WARN public log"
+    assert_same_apart_from_tracing_times(&with_evidence.stderr, &baseline.stderr, "stderr");
+    // The private INFO layer must not change the default-WARN public log.
+    assert_same_apart_from_tracing_times(
+        &fs::read(&public_log).unwrap(),
+        &fs::read(&baseline_log).unwrap(),
+        "the public --log-file",
     );
 
     let RunEvidenceInspection::Complete(report) = inspect_run_evidence(&evidence) else {
@@ -502,7 +657,7 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
     );
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
+    assert_same_apart_from_tracing_times(&with_evidence.stderr, &baseline.stderr, "stderr");
     assert_eq!(
         fs::read(&evidence_report).unwrap(),
         fs::read(&baseline_report).unwrap()
