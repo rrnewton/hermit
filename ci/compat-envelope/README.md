@@ -429,10 +429,12 @@ the selected cell.
 
 The ignored run directory retains `dag.json`, `run.json`, captured per-cell
 stdout/stderr, result rows, runner profiles, and `summary.json`. Verify-mode
-attempts also retain both raw INFO logs named by Hermit. A ptrace verify attempt
-runs the same Hermit binary's one-input `log-diff` command and retains the
-normalized first-run INFO stream for later cross-backend parity work. Retaining
-that input is preparation, not a parity result.
+attempts also retain the raw INFO logs named by Hermit's `--keep-logs`: after a
+match, only the first run's log, which is the deterministic golden copy; after
+a divergence, both logs. A matched attempt that retains a second log, or a
+divergent one that lacks either, is refused as incomplete evidence. Parity
+reads only that first-run log and canonicalizes it when it compares (`hermit
+log-diff --json`), so no separately normalized copy is retained.
 Replay-mode raw-log retention is not implemented yet. A one-time PASS is
 printed as a candidate for repeated confirmation; it never edits the tracked
 green set automatically.
