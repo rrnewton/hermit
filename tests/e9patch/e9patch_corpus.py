@@ -7,8 +7,8 @@ pre-trap its `SYSCALL` sites, then Detcore runs the rewritten image under
 ptrace. e9tool only rewrites the *main* executable, so a dynamically linked
 libc program exposes zero `SYSCALL` sites in its own ELF (they live in
 `libc.so`/`ld-linux`) and e9patch preprocessing becomes a no-op
-(`candidate_sites=0`). The shared `run_matrix.py` guests are all dynamic libc
-binaries and therefore never exercise the rewrite path. This harness instead
+(`candidate_sites=0`). An ordinary dynamically linked libc guest therefore
+never exercises the rewrite path. This harness instead
 uses a freestanding, statically linked, raw-`syscall` corpus (x86-64) whose
 `SYSCALL` sites live in the main ELF, so `candidate_sites > 0` and e9patch
 actually rewrites the guest.
@@ -39,8 +39,7 @@ prologue is a pure prefix; the achievable and enforced parity is guest-syscall
 DETLOG identity *modulo* that deterministic prologue (tail-match), plus L2 and
 guest-visible parity. This harness makes no claim of strict detlog identity.
 
-Prerequisites (absent in CI, hence BLOCKED there, mirroring the KVM /dev/kvm
-gate in run_matrix.py):
+Prerequisites (absent in CI, hence BLOCKED there):
   * a hermit built with the `e9patch` cargo feature
     (`cargo build -p hermit --features e9patch`);
   * HERMIT_E9TOOL and HERMIT_E9PATCH_BACKEND pointing at a built e9tool/e9patch
