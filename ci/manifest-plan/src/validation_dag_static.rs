@@ -301,7 +301,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
     // Thirty-three exec transfer, teardown and refusal controls retain all 810 IDs.
-    ("test.detcore_unit", 843),
+    // Two empty-queue fizzle shutdown tests (scheduler::test::
+    // sabre_last_exit_logs_one_fizzle_wherever_the_final_wait_status_lands and
+    // redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands)
+    // retain all 843 prior identities (`cargo nextest list --profile ci`
+    // measured 845; https://github.com/rrnewton/hermit/issues/3360).
+    ("test.detcore_unit", 845),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -351,7 +356,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 843),
+    ("test.detcore_unit_on_host", 845),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),
