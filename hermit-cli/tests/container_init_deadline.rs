@@ -66,6 +66,20 @@ const STARTUP_BUDGET: Duration = Duration::from_secs(12);
 /// How long a correctly supervised run may take to disappear after the stimulus.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(20);
 
+/// Makes the container init wait [`ARMING_STALL`] before it installs its own
+/// stop-signal handlers, under the thread name [`ARMING_STALL_COMM`]. All three
+/// are copied from `stall_container_init_before_arming_if_asked` in
+/// `bin/hermit/container.rs`.
+const ARMING_STALL_ENV: &str = "HERMIT_INTERNAL_STALL_CONTAINER_INIT_BEFORE_ARMING";
+const ARMING_STALL: Duration = Duration::from_secs(60);
+const ARMING_STALL_COMM: &str = "unarmed-init";
+
+// Everything `container_init_honours_signals_sent_before_it_arms` waits for fits
+// inside the stall, which is what makes its pass evidence about the window
+// before the init arms rather than about the armed handler.
+const _: () =
+    assert!(2 * STARTUP_BUDGET.as_secs() + TEARDOWN_BUDGET.as_secs() < ARMING_STALL.as_secs());
+
 /// These tests each start a real guest, so run them one at a time.
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -164,9 +178,10 @@ impl Drop for SessionGuard {
 
 /// Spawn `argv` as the leader of its own session, so the test can account for
 /// every process the run creates by scanning for that session id.
-fn spawn_in_new_session(argv: &[&str]) -> io::Result<Child> {
+fn spawn_in_new_session(argv: &[&str], envs: &[(&str, &str)]) -> io::Result<Child> {
     let mut command = Command::new(argv[0]);
     command.args(&argv[1..]);
+    command.envs(envs.iter().copied());
     hermit_test::configure_guest_execution(&mut command);
     command
         .stdin(Stdio::null())
@@ -194,8 +209,8 @@ fn hermit_bin() -> &'static str {
 
 /// Start a hung run and wait until its container init exists, so that any
 /// later assertion is about a run that genuinely reached the dangerous state.
-fn start_hung_run(argv: &[&str]) -> (Child, SessionGuard, i32) {
-    let child = spawn_in_new_session(argv)
+fn start_hung_run(argv: &[&str], envs: &[(&str, &str)]) -> (Child, SessionGuard, i32) {
+    let child = spawn_in_new_session(argv, envs)
         .unwrap_or_else(|error| panic!("failed to spawn {argv:?}: {error}"));
     let session = child.id() as i32;
     let guard = SessionGuard(session);
@@ -248,7 +263,7 @@ fn bare_timeout_kills_a_hung_hermit_run() {
     let mut argv = vec!["timeout", deadline.as_str(), hermit_bin(), "run", "--"];
     argv.extend_from_slice(SPINNER);
 
-    let (mut supervisor, guard, init) = start_hung_run(&argv);
+    let (mut supervisor, guard, init) = start_hung_run(&argv, &[]);
     assert!(
         alive(init),
         "container init {init} should still be running while the deadline is pending"
@@ -275,7 +290,7 @@ fn container_init_dies_with_the_hermit_process_that_forked_it() {
     let mut argv = vec![hermit_bin(), "run", "--"];
     argv.extend_from_slice(SPINNER);
 
-    let (mut hermit, guard, init) = start_hung_run(&argv);
+    let (mut hermit, guard, init) = start_hung_run(&argv, &[]);
     let outer = hermit.id() as i32;
     assert_ne!(
         outer, init,
@@ -311,7 +326,7 @@ fn container_init_honours_signals_aimed_at_it_directly() {
         let mut argv = vec![hermit_bin(), "run", "--"];
         argv.extend_from_slice(SPINNER);
 
-        let (mut hermit, guard, init) = start_hung_run(&argv);
+        let (mut hermit, guard, init) = start_hung_run(&argv, &[]);
         let outer = hermit.id() as i32;
         assert!(
             alive(outer),
@@ -339,5 +354,78 @@ fn container_init_honours_signals_aimed_at_it_directly() {
 
         let _ = hermit.wait();
         assert_session_drains(guard.0, &format!("run after signal {signal} to its init"));
+    }
+}
+
+/// The same three signals, aimed at the container init before it has installed
+/// any handler of its own.
+///
+/// The container init exists, and is visible in `/proc`, from the moment it is
+/// cloned, but it installs its handlers only after Reverie has set up the
+/// container. A signal that lands in that window used to be discarded by the
+/// kernel, and the test above failed whenever its first sight of the init came
+/// early enough: 6 times in one batch of 360 runs on a loaded host, and none in
+/// another. Here the init is held before it arms for longer than this test
+/// waits, so every signal lands in the window, and the init must still honour
+/// it.
+#[test]
+fn container_init_honours_signals_sent_before_it_arms() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        let mut argv = vec![hermit_bin(), "run", "--"];
+        argv.extend_from_slice(SPINNER);
+
+        let spawned = Instant::now();
+        let (mut hermit, guard, init) = start_hung_run(&argv, &[(ARMING_STALL_ENV, "1")]);
+        let stalled = poll_until(STARTUP_BUDGET, || {
+            let comm = fs::read_to_string(format!("/proc/{init}/comm")).ok()?;
+            (comm.trim_end() == ARMING_STALL_COMM).then_some(())
+        });
+        assert!(
+            stalled.is_some(),
+            "signal {signal}: container init {init} never showed the {ARMING_STALL_COMM:?} \
+             thread name, so it is not waiting before it arms and this test cannot \
+             place a signal in that window. The hermit under test ignores \
+             {ARMING_STALL_ENV}; is it older than this test?"
+        );
+
+        // SAFETY: `kill` takes a pid and a signal number and touches no caller
+        // memory. `init` was observed alive immediately above.
+        assert_eq!(
+            unsafe { libc::kill(init, signal) },
+            0,
+            "signal {signal}: failed to signal container init {init}: {}",
+            io::Error::last_os_error()
+        );
+
+        let died = poll_until(TEARDOWN_BUDGET, || (!alive(init)).then_some(()));
+        let elapsed = spawned.elapsed();
+        assert!(
+            died.is_some(),
+            "signal {signal}: container init {init} ignored a signal sent before it \
+             armed its own handlers and is still running {TEARDOWN_BUDGET:?} later. \
+             Whatever the init inherits from hermit at clone is all it has during \
+             container setup, and the kernel discards a default-disposition signal \
+             to a namespace init at send time."
+        );
+        assert!(
+            elapsed < ARMING_STALL,
+            "signal {signal}: the init died {elapsed:?} after spawn, which is not \
+             inside the {ARMING_STALL:?} stall, so this pass says nothing about the \
+             window before it arms"
+        );
+
+        let status = hermit.wait().expect("failed to wait for hermit");
+        assert_eq!(
+            status.code(),
+            Some(128 + signal),
+            "signal {signal}: hermit should report the init's stop as a signal death, \
+             128 + {signal}; got {status:?}"
+        );
+        assert_session_drains(
+            guard.0,
+            &format!("run after signal {signal} to its init before it armed"),
+        );
     }
 }

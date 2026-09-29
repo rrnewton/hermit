@@ -186,6 +186,7 @@ where
         move || {
             let mut alarm = None;
             let result = super::container::catch_child_panic_at(site, || {
+                super::container::stall_container_init_before_arming_if_asked();
                 super::container::arm_container_init_guards().map_err(Error::from)?;
                 if let Some(limit) = timeout {
                     let after = limit
@@ -217,7 +218,12 @@ where
             )
         }
     };
-    let (first, child_pid) = match container.run_with_deferred_drop_owned(&mut factory) {
+    // The container init inherits this at clone, and it covers the setup Reverie
+    // runs before the factory above can arm the init's own handlers.
+    let stop_signal_bridge = super::container::ContainerInitStopSignalBridge::install()?;
+    let started = container.run_with_deferred_drop_owned(&mut factory);
+    drop(stop_signal_bridge);
+    let (first, child_pid) = match started {
         Ok(run) => {
             let pid = run.cleanup().child_pid().as_raw();
             (run.finalize_until(Instant::now() + FINALIZE_BUDGET), pid)
