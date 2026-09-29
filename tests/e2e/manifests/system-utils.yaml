@@ -2021,8 +2021,8 @@ test:
           liteinst: The verify cell already self-asserts the mount; a custom arm adds no observation
         ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
   - id: system-utils/sysfs-sanitized-prefixes
-    description: One guest asserts readable stable leaves under the eight previously untouched sanitized sysfs prefixes
-    lane: portable
+    description: One guest asserts readable stable leaves under the eight previously untouched sanitized sysfs prefixes; it needs host hwmon sensors, which GitHub-hosted runners lack (the hosted workflow can loop-mount a btrfs for the btrfs prefix but cannot supply hwmon), so it runs in the privileged lane
+    lane: privileged
     requires:
       - linux
       - x86_64

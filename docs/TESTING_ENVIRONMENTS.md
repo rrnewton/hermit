@@ -228,6 +228,7 @@ erasing the host; this table is where the erased identities go back.
 | `privileged` lane, node `privileged-test.pmu_cli_cases` | `devbig014` | `skid_overshoot_and_guest_failure_have_different_exit_codes` passes in 0.44 s |
 | validation CPU placement, `scripts/lib/safe_ci_scope.rs` (https://github.com/rrnewton/hermit/issues/3265) | `devbig014` | A ptrace-stop-heavy cell costs 7.6-7.9x the CPU on the CPUs the AMD uncore and L3 PMUs are bound to |
 | `portable` cell `data-handling/dd-partial-transfers` payload, `tests/e2e/manifests/data-handling.yaml` (https://github.com/rrnewton/hermit/issues/3337) | `devbig014` | 2026-09-28 at Hermit `ad21724d5f64`, ptrace verify: payload 4096 -> 512 bytes; debug median CPU 18.59 s -> 4.76 s, release 4.39 s -> 1.14 s over 5 runs each |
+| `privileged` lane, cell `system-utils/sysfs-sanitized-prefixes`, nodes `privileged-e2e.manifest_system_utils` and `privileged-only-e2e.manifest_system_utils` (plus `_on_host`) | `devbig014` | Wall per run from the validation ledger series, 2026-08 to 2026-09: verify/ptrace 148 samples, median 2096 ms, max 15438 ms; verify/kvm 29 samples, median 2316 ms, max 3467 ms. This is the evidence cited by the nodes' descriptions in `ci/manifest-plan/src/validation_dag_static.rs` |
 
 ## Hardware-sensitive Cargo tests
 
