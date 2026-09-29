@@ -2974,7 +2974,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             //
             // SHRINKING IS DELIBERATELY LEFT ALONE. It is always permitted for
             // an unprivileged process, it is process-local with no host-derived
-            // input, and `tests/backend-parity/fixtures/pipe_capacity.c` locks
+            // input, and `tests/c/pipe_capacity.c` locks
             // it as a guest-visible contract: that fixture shrinks to one page
             // and requires the value to round-trip. Clamping every
             // `F_SETPIPE_SZ` to the pinned capacity would break that contract
@@ -4598,7 +4598,7 @@ mod test {
         ));
     }
 
-    /// Shrinking stays legal. `tests/backend-parity/fixtures/pipe_capacity.c`
+    /// Shrinking stays legal. `tests/c/pipe_capacity.c`
     /// shrinks to one page and requires the value to round-trip, so a blanket
     /// clamp to the pinned capacity would break a guest-visible contract this
     /// repository already locked.
