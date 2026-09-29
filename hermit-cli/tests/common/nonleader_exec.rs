@@ -29,6 +29,29 @@ const MIB: u64 = 1024 * 1024;
 /// with Hermit's refusal or verification verdict.
 const STDERR_TAIL_BYTES: u64 = 8 * 1024;
 
+/// Hermit's `--log=trace` stream without the one target no assertion reads.
+///
+/// On every single step of a PMU correction tail, `reverie_ptrace::timer` logs
+/// the decoded instruction and the whole register file at TRACE, which costs a
+/// `getregs` and an instruction decode per step. On the development host that
+/// target was 94% of a preempted execution's 30 MB log (46,711 records), and
+/// the preempted and preemption-artifact tests exceeded their 22 CPU-second
+/// budget. Every needle below comes from detcore or hermit, and verification
+/// compares only INFO records. An `EnvFilter` target directive overrides the
+/// global `--log=trace` level for that target alone, so every other TRACE
+/// record, including detcore's `updated rcb clock` lines, is still retained.
+/// Setting `RUST_LOG` explicitly also keeps an ambient value from changing the
+/// retained logs.
+const LOG_DIRECTIVES: &str = "reverie_ptrace::timer=debug";
+
+/// A `--log=trace` Hermit command whose retained logs these assertions read.
+fn traced_hermit_command(args: &[&str]) -> Command {
+    let mut command = super::hermit_command(args);
+    command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+    command.env("RUST_LOG", LOG_DIRECTIVES);
+    command
+}
+
 /// The last `limit` bytes of a retained stream, for a failure message.
 ///
 /// The hosted runner does not upload `CARGO_TARGET_TMPDIR`. An exit-status
@@ -83,13 +106,12 @@ fn assert_pmu_handoffs(log: &str, stdout: &str) {
         let leader = &identity[2];
         let worker = &identity[3];
         assert_ne!(leader, worker);
+        let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
+        let worker_clock = format!("[dtid {worker}] updated rcb clock,");
+        let leader_clock = format!("[dtid {leader}] updated rcb clock,");
         let exec = lines
             .iter()
-            .position(|line| {
-                line.contains(&format!(
-                    "[detcore, dtid {worker}] inbound syscall: execve("
-                ))
-            })
+            .position(|line| line.contains(&worker_execve))
             .expect("the identified worker really called execve");
         let raw_clock = |line: &str| {
             line.split_once("local rcb clock_value ")
@@ -100,11 +122,11 @@ fn assert_pmu_handoffs(log: &str, stdout: &str) {
         };
         let before = lines[..exec]
             .iter()
-            .rfind(|line| line.contains(&format!("[dtid {worker}] updated rcb clock,")))
+            .rfind(|line| line.contains(&worker_clock))
             .expect("worker clock accounted before exec");
         let after = lines[exec + 1..]
             .iter()
-            .find(|line| line.contains(&format!("[dtid {leader}] updated rcb clock,")))
+            .find(|line| line.contains(&leader_clock))
             .expect("replacement image resumes clock accounting as the leader");
         assert!(raw_clock(before) > 0, "worker executed counted branches");
         assert!(
@@ -158,23 +180,27 @@ fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
     for identity in identities {
         let leader = &identity[2];
         let worker = &identity[3];
+        let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
+        let leader_clock = format!("[dtid {leader}] updated rcb clock,");
+        let ending = |tid: &str| format!("[detcore, dtid {tid}] ending timeslice T");
+        let worker_ending = ending(worker);
+        let leader_ending = ending(leader);
+        let timer = |tid: &str| format!("[detcore, dtid {tid}] inbound timer preemption event");
+        let worker_timer = timer(worker);
+        let leader_timer = timer(leader);
+        let leader_getppid = format!("[detcore, dtid {leader}] inbound syscall: getppid(");
         let exec = lines
             .iter()
-            .position(|line| {
-                line.contains(&format!(
-                    "[detcore, dtid {worker}] inbound syscall: execve("
-                ))
-            })
+            .position(|line| line.contains(&worker_execve))
             .expect("the identified worker actually execs");
         let after_clock = exec
             + 1
             + lines[exec + 1..]
                 .iter()
-                .position(|line| line.contains(&format!("[dtid {leader}] updated rcb clock,")))
+                .position(|line| line.contains(&leader_clock))
                 .expect("replacement starts accounting the survivor's clock");
-        let ending = |tid: &str| format!("[detcore, dtid {tid}] ending timeslice T");
-        let number = |line: &str, tid: &str| {
-            line.split_once(&ending(tid))
+        let number = |line: &str, ending: &str| {
+            line.split_once(ending)
                 .unwrap()
                 .1
                 .split_once('.')
@@ -185,22 +211,21 @@ fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
         };
         let before = lines[..after_clock]
             .iter()
-            .rfind(|line| line.contains(&ending(worker)))
+            .rfind(|line| line.contains(&worker_ending))
             .expect("worker ends a real timeslice before takeover");
         let after = lines[after_clock..]
             .iter()
-            .find(|line| line.contains(&ending(leader)))
+            .find(|line| line.contains(&leader_ending))
             .expect("replacement ends the next timeslice");
         assert_eq!(
-            number(after, leader),
-            number(before, worker) + 1,
+            number(after, &leader_ending),
+            number(before, &worker_ending) + 1,
             "timeslice numbering survives takeover: {before}\n{after}"
         );
-        let timer = |tid: &str| format!("[detcore, dtid {tid}] inbound timer preemption event");
         assert!(
             lines[previous_handoff..exec]
                 .iter()
-                .any(|line| line.contains(&timer(worker))),
+                .any(|line| line.contains(&worker_timer)),
             "worker must receive an actual PMU timer before exec"
         );
         let next_exec = lines[after_clock..]
@@ -212,31 +237,23 @@ fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
         // check: require the timer before the next leader-spin phase.
         let replacement_end = lines[after_clock..next_exec]
             .iter()
-            .position(|line| {
-                line.contains(&format!(
-                    "[detcore, dtid {leader}] inbound syscall: getppid("
-                ))
-            })
+            .position(|line| line.contains(&leader_getppid))
             .map_or(next_exec, |offset| after_clock + offset);
         assert!(
             lines[after_clock..replacement_end]
                 .iter()
-                .any(|line| line.contains(&timer(leader))),
+                .any(|line| line.contains(&leader_timer)),
             "replacement must receive an actual PMU timer after exec"
         );
         if runnable_leader {
             let spin_start = previous_handoff
                 + lines[previous_handoff..exec]
                     .iter()
-                    .position(|line| {
-                        line.contains(&format!(
-                            "[detcore, dtid {leader}] inbound syscall: getppid("
-                        ))
-                    })
+                    .position(|line| line.contains(&leader_getppid))
                     .expect("the displaced leader actually entered its runnable spin");
             let leader_preemptions = lines[spin_start..exec]
                 .iter()
-                .filter(|line| line.contains(&timer(leader)))
+                .filter(|line| line.contains(&leader_timer))
                 .count();
             assert!(
                 leader_preemptions >= 3,
@@ -360,8 +377,7 @@ fn run_fixture(scenario: Scenario) {
             // Keep the blocked-leader cell's existing early notification.
             args.insert(8, "--skid-margin=3072");
         }
-        let mut command = super::hermit_command(&args);
-        command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+        let mut command = traced_hermit_command(&args);
         let status = bounded_command_with_timeout(&mut command, &directory, remaining());
         assert_eq!(
             status.code(),
@@ -497,8 +513,7 @@ fn preemption_artifact_case(
         guest.to_str().unwrap(),
         target.to_str().unwrap(),
     ];
-    let mut command = super::hermit_command(&args);
-    command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+    let mut command = traced_hermit_command(&args);
     let status = bounded_command_with_timeout(&mut command, directory, timeout);
     let stderr = String::from_utf8(bounded_read(&directory.join("stderr"), 16 * MIB)).unwrap();
     let stdout = String::from_utf8(bounded_read(&directory.join("stdout"), MIB)).unwrap();
@@ -563,6 +578,10 @@ fn preemption_artifact_case(
         }
         actual
     };
+    let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
+    let leader_syscall = format!("[detcore, dtid {leader}] inbound syscall:");
+    let worker_timer = format!("[detcore, dtid {worker}] inbound timer preemption event");
+    let worker_next_timeslice = format!("[dtid {worker}] next timeslice (T");
     let mut diagnostic = stderr.contains(PREEMPTION_REFUSAL);
     for prefix in ["run1_log_", "run2_log_"] {
         let paths: Vec<_> = fs::read_dir(&logs)
@@ -584,20 +603,16 @@ fn preemption_artifact_case(
         for path in paths {
             let log = String::from_utf8(bounded_read(&path, 64 * MIB)).unwrap();
             let exec = log
-                .find(&format!(
-                    "[detcore, dtid {worker}] inbound syscall: execve("
-                ))
+                .find(&worker_execve)
                 .expect("the identified worker attempted the same exec path");
             if refused {
                 assert!(
-                    !log[exec..].contains(&format!("[detcore, dtid {leader}] inbound syscall:")),
+                    !log[exec..].contains(&leader_syscall),
                     "the replacement must not enter ordinary syscall handling"
                 );
             }
             assert!(
-                log[..exec].contains(&format!(
-                    "[detcore, dtid {worker}] inbound timer preemption event"
-                )),
+                log[..exec].contains(&worker_timer),
                 "the recorded and replayed prefix contains actual PMU preemption"
             );
             if let Some(path) = artifact_option.strip_prefix("--replay-preemptions-from=") {
@@ -613,7 +628,7 @@ fn preemption_artifact_case(
                 let consumed: Vec<_> = log[..exec]
                     .lines()
                     .filter(|line| {
-                        line.contains(&format!("[dtid {worker}] next timeslice (T"))
+                        line.contains(&worker_next_timeslice)
                             && line.contains("set by recording to ")
                     })
                     .collect();
