@@ -14,7 +14,9 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `target/debug/test-harness` loads them through the structured Rust parser in
 `ci/manifest-plan`.
 
-`defaults.yaml` declares the global per-cell timeout. The 13 bucket manifests
+`defaults.yaml` declares the global per-cell timeout. The 12 bucket manifests
+(13 until the backend-parity-c bucket was folded into c-programs,
+https://github.com/rrnewton/hermit/issues/3301)
 separate calibrated blocking cells from discoverable migration inventory. CI
 creates one independently schedulable run node for every bucket.
 Six buckets currently contain calibrated blocking workloads:
@@ -355,7 +357,8 @@ that same requirement, and additionally requires the retained evidence described
 above, which the shared string has no field for. It rejects a stale reason left
 behind on a selected backend. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
 the bucket declares regardless of its `ci` flag; it is wired into the portable
-DAG for `backend-parity-c` and fails closed on zero compiled.
+DAG for `c-programs` (which absorbed the former `backend-parity-c` bucket) and
+fails closed on zero compiled.
 
 Use the load-bearing entrypoints:
 

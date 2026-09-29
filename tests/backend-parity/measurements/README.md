@@ -3,6 +3,15 @@
 Durable evidence behind the `ci` flags in `tests/e2e/manifests/backend-parity-c.yaml`.
 A flag flip in that manifest should cite a row here.
 
+That bucket was folded into `tests/e2e/manifests/c-programs.yaml`
+(https://github.com/rrnewton/hermit/issues/3301, slice S6). Its tests now carry
+`c-programs/<name>` ids, and the sweep below still names them by their old
+`backend-parity-c/<name>` ids. `tests/e2e/manifests/inventory/retired-ids.json`
+maps each old id to its new one; every successor is the plain prefix rename
+except `backend-parity-c/pidfd-open-self`, which became
+`c-programs/pidfd-open-self-pair` because c-programs already had a
+`c-programs/pidfd-open-self` test for a different program.
+
 ## `verify-sweep-6e1b59af0.tsv`
 
 Every `(test, backend)` pair that `[test.modes.verify]` declares in `backends_enabled`,

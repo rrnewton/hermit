@@ -19,211 +19,213 @@
 #   cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write
 schema: 1
 rule: >-
-  Every candidate-backend (dbt, kvm, liteinst, sabre) verify cell of a test in
-  the backend-parity-c manifest bucket whose ptrace verify cell is selected by
-  full validation, provided the candidate's verify cell is enabled. Candidate
-  cells that are enabled but not selected by full validation are included and
-  marked not selectable in ci/compat-envelope/parity-cells.json.
+  Every candidate-backend (dbt, kvm, liteinst, sabre) verify cell of a test
+  folded from the retired backend-parity-c bucket into c-programs (the ids of
+  the backend-parity-c retirement in
+  tests/e2e/manifests/inventory/retired-ids.json) whose ptrace verify cell is
+  selected by full validation, provided the candidate's verify cell is enabled.
+  Candidate cells that are enabled but not selected by full validation are
+  included and marked not selectable in ci/compat-envelope/parity-cells.json.
 cells:
-  - test: backend-parity-c/aio-refusal
+  - test: c-programs/aio-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/append-pwrite
+  - test: c-programs/append-pwrite
     backends: [kvm, liteinst]
-  - test: backend-parity-c/bind-getsockname
+  - test: c-programs/bind-getsockname
     backends: [kvm, liteinst]
-  - test: backend-parity-c/cachestat-refusal
+  - test: c-programs/cachestat-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/child-subreaper-refusal
+  - test: c-programs/child-subreaper-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/close-range-fds
+  - test: c-programs/close-range-fds
     backends: [kvm, liteinst]
-  - test: backend-parity-c/copy-file-range-refusal
+  - test: c-programs/copy-file-range-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/cpu-virtualization
+  - test: c-programs/cpu-virtualization
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/cpuid-probe
+  - test: c-programs/cpuid-probe
     backends: [kvm, liteinst]
-  - test: backend-parity-c/cwd-roundtrip
+  - test: c-programs/cwd-roundtrip
     backends: [kvm, liteinst]
-  - test: backend-parity-c/dup-shared-offset
+  - test: c-programs/dup-shared-offset
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/epoll-pwait2
+  - test: c-programs/epoll-pwait2
     backends: [liteinst]
-  - test: backend-parity-c/epoll-readiness
+  - test: c-programs/epoll-readiness
     backends: [kvm, liteinst]
-  - test: backend-parity-c/event-delivery-ordering
+  - test: c-programs/event-delivery-ordering
     backends: [liteinst]
-  - test: backend-parity-c/eventfd-semantics
+  - test: c-programs/eventfd-semantics
     backends: [kvm, liteinst]
-  - test: backend-parity-c/faccessat2-flags
+  - test: c-programs/faccessat2-flags
     backends: [kvm, liteinst]
-  - test: backend-parity-c/fadvise-hints
+  - test: c-programs/fadvise-hints
     backends: [kvm, liteinst]
-  - test: backend-parity-c/fallocate-extents
+  - test: c-programs/fallocate-extents
     backends: [kvm, liteinst]
-  - test: backend-parity-c/fchmod-bits
+  - test: c-programs/fchmod-bits
     backends: [kvm, liteinst]
-  - test: backend-parity-c/fchmodat2-flags
+  - test: c-programs/fchmodat2-flags
     backends: [liteinst]
-  - test: backend-parity-c/fcntl-owner
+  - test: c-programs/fcntl-owner
     backends: [liteinst]
-  - test: backend-parity-c/fd-duplication
+  - test: c-programs/fd-duplication
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/file-backed-mmap
+  - test: c-programs/file-backed-mmap
     backends: [kvm, liteinst]
-  - test: backend-parity-c/file-io-roundtrip
+  - test: c-programs/file-io-roundtrip
     backends: [kvm, liteinst]
-  - test: backend-parity-c/flock-lifecycle
+  - test: c-programs/flock-lifecycle
     backends: [kvm, liteinst]
-  - test: backend-parity-c/fork-exec-pipeline
+  - test: c-programs/fork-exec-pipeline
     backends: [kvm]
-  - test: backend-parity-c/fsync-durability
+  - test: c-programs/fsync-durability
     backends: [liteinst]
-  - test: backend-parity-c/ftruncate-sparse
+  - test: c-programs/ftruncate-sparse
     backends: [kvm, liteinst]
-  - test: backend-parity-c/getcpu-identity
+  - test: c-programs/getcpu-identity
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/getpriority-identity
+  - test: c-programs/getpriority-identity
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/getrusage-self-accounting
+  - test: c-programs/getrusage-self-accounting
     backends: [liteinst]
-  - test: backend-parity-c/hardware-trap-identity
+  - test: c-programs/hardware-trap-identity
     backends: [dbt, liteinst]
-  - test: backend-parity-c/host-identity
+  - test: c-programs/host-identity
     backends: [dbt, liteinst]
-  - test: backend-parity-c/inline-syscall-sites
+  - test: c-programs/inline-syscall-sites
     backends: [kvm, liteinst]
-  - test: backend-parity-c/inotify-watch
+  - test: c-programs/inotify-watch
     backends: [liteinst]
-  - test: backend-parity-c/ioctl-fionread
+  - test: c-programs/ioctl-fionread
     backends: [liteinst]
-  - test: backend-parity-c/kcmp-refusal
+  - test: c-programs/kcmp-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/linkat-flags
+  - test: c-programs/linkat-flags
     backends: [kvm, liteinst]
-  - test: backend-parity-c/lseek-positioning
+  - test: c-programs/lseek-positioning
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/mce-kill-refusal
+  - test: c-programs/mce-kill-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/membarrier-query
+  - test: c-programs/membarrier-query
     backends: [kvm, liteinst]
-  - test: backend-parity-c/memfd-create
+  - test: c-programs/memfd-create
     backends: [kvm, liteinst]
-  - test: backend-parity-c/mempolicy-default
+  - test: c-programs/mempolicy-default
     backends: [kvm, liteinst]
-  - test: backend-parity-c/mincore-residency
+  - test: c-programs/mincore-residency
     backends: [kvm, liteinst]
-  - test: backend-parity-c/mixed-inline-and-libc-syscalls
+  - test: c-programs/mixed-inline-and-libc-syscalls
     backends: [kvm, liteinst]
-  - test: backend-parity-c/mkdir-rmdir
+  - test: c-programs/mkdir-rmdir
     backends: [kvm, liteinst]
-  - test: backend-parity-c/mknod-special
+  - test: c-programs/mknod-special
     backends: [kvm, liteinst]
-  - test: backend-parity-c/mmap-layout-pointer-order
+  - test: c-programs/mmap-layout-pointer-order
     backends: [kvm, liteinst]
-  - test: backend-parity-c/msync-writeback
+  - test: c-programs/msync-writeback
     backends: [liteinst]
-  - test: backend-parity-c/name-to-handle-refusal
+  - test: c-programs/name-to-handle-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/no-new-privs-refusal
+  - test: c-programs/no-new-privs-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/numa-node-identity
+  - test: c-programs/numa-node-identity
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/o-tmpfile-anon
+  - test: c-programs/o-tmpfile-anon
     backends: [kvm, liteinst]
-  - test: backend-parity-c/openat-flags
+  - test: c-programs/openat-flags
     backends: [kvm, liteinst]
-  - test: backend-parity-c/openat2-refusal
+  - test: c-programs/openat2-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/path-file-ops
+  - test: c-programs/path-file-ops
     backends: [kvm, liteinst]
-  - test: backend-parity-c/personality-domain
+  - test: c-programs/personality-domain
     backends: [liteinst]
-  - test: backend-parity-c/pid-probe
+  - test: c-programs/pid-probe
     backends: [kvm, liteinst, sabre]
-  - test: backend-parity-c/pidfd-open-self
+  - test: c-programs/pidfd-open-self-pair
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/pipe-capacity
+  - test: c-programs/pipe-capacity
     backends: [kvm, liteinst]
-  - test: backend-parity-c/pipe-capacity-pin
+  - test: c-programs/pipe-capacity-pin
     backends: [kvm, liteinst]
-  - test: backend-parity-c/pipe-ipc
+  - test: c-programs/pipe-ipc
     backends: [kvm, liteinst]
-  - test: backend-parity-c/pipe2-flags
+  - test: c-programs/pipe2-flags
     backends: [kvm, liteinst]
-  - test: backend-parity-c/poll-readiness
+  - test: c-programs/poll-readiness
     backends: [liteinst]
-  - test: backend-parity-c/prctl-identity
+  - test: c-programs/prctl-identity
     backends: [dbt, liteinst]
-  - test: backend-parity-c/prctl-pdeathsig
+  - test: c-programs/prctl-pdeathsig
     backends: [liteinst]
-  - test: backend-parity-c/preadv2-flags
+  - test: c-programs/preadv2-flags
     backends: [liteinst]
-  - test: backend-parity-c/pthread-lifecycle
+  - test: c-programs/pthread-lifecycle
     backends: [kvm, liteinst, sabre]
-  - test: backend-parity-c/readdir-entries
+  - test: c-programs/readdir-entries
     backends: [kvm, liteinst]
-  - test: backend-parity-c/readdir-order-identity
+  - test: c-programs/readdir-order-identity
     backends: [kvm, liteinst]
-  - test: backend-parity-c/record-lock
+  - test: c-programs/record-lock
     backends: [liteinst]
-  - test: backend-parity-c/rename-ops
+  - test: c-programs/rename-ops
     backends: [kvm, liteinst]
-  - test: backend-parity-c/renameat2-flags
+  - test: c-programs/renameat2-flags
     backends: [kvm, liteinst]
-  - test: backend-parity-c/rlimit-identity
+  - test: c-programs/rlimit-identity
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/robust-list
+  - test: c-programs/robust-list
     backends: [kvm, liteinst]
-  - test: backend-parity-c/sched-getaffinity-identity
+  - test: c-programs/sched-getaffinity-identity
     backends: [dbt, kvm, liteinst]
-  - test: backend-parity-c/seccomp-refusal
+  - test: c-programs/seccomp-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/sendfile-copy
+  - test: c-programs/sendfile-copy
     backends: [kvm, liteinst]
-  - test: backend-parity-c/set-tid-address
+  - test: c-programs/set-tid-address
     backends: [kvm, liteinst]
-  - test: backend-parity-c/short-io-split-identity
+  - test: c-programs/short-io-split-identity
     backends: [kvm, liteinst]
-  - test: backend-parity-c/shutdown-socketpair
+  - test: c-programs/shutdown-socketpair
     backends: [kvm, liteinst]
-  - test: backend-parity-c/signal-delivery-sequence
+  - test: c-programs/signal-delivery-sequence
     backends: [liteinst]
-  - test: backend-parity-c/signal-waitstatus-identity
+  - test: c-programs/signal-waitstatus-identity
     backends: [dbt, liteinst]
-  - test: backend-parity-c/signalfd-create
+  - test: c-programs/signalfd-create
     backends: [kvm, liteinst]
-  - test: backend-parity-c/socket-epoll-ordering
+  - test: c-programs/socket-epoll-ordering
     backends: [kvm, liteinst]
-  - test: backend-parity-c/socket-options
+  - test: c-programs/socket-options
     backends: [liteinst]
-  - test: backend-parity-c/socketpair-flags
+  - test: c-programs/socketpair-flags
     backends: [liteinst]
-  - test: backend-parity-c/sockname-unnamed
+  - test: c-programs/sockname-unnamed
     backends: [liteinst]
-  - test: backend-parity-c/stat-metadata-identity
+  - test: c-programs/stat-metadata-identity
     backends: [kvm, liteinst]
-  - test: backend-parity-c/statfs-free-determinism
+  - test: c-programs/statfs-free-determinism
     backends: [kvm, liteinst]
-  - test: backend-parity-c/static-nolibc-syscall-sites
+  - test: c-programs/static-nolibc-syscall-sites
     backends: [kvm]
-  - test: backend-parity-c/statx-metadata
+  - test: c-programs/statx-metadata
     backends: [kvm, liteinst]
-  - test: backend-parity-c/symlink-ops
+  - test: c-programs/symlink-ops
     backends: [kvm, liteinst]
-  - test: backend-parity-c/sync-file-range
+  - test: c-programs/sync-file-range
     backends: [kvm, liteinst]
-  - test: backend-parity-c/sysv-ipc-refusal
+  - test: c-programs/sysv-ipc-refusal
     backends: [kvm, liteinst]
-  - test: backend-parity-c/thp-disable
+  - test: c-programs/thp-disable
     backends: [liteinst]
-  - test: backend-parity-c/umask-mode
+  - test: c-programs/umask-mode
     backends: [kvm, liteinst]
-  - test: backend-parity-c/uname-identity
+  - test: c-programs/uname-identity
     backends: [kvm, liteinst]
-  - test: backend-parity-c/utimensat-determinism
+  - test: c-programs/utimensat-determinism
     backends: [kvm, liteinst]
-  - test: backend-parity-c/vectored-file-io
+  - test: c-programs/vectored-file-io
     backends: [liteinst]
-  - test: backend-parity-c/vectored-io
+  - test: c-programs/vectored-io
     backends: [kvm, liteinst]

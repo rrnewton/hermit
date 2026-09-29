@@ -17,8 +17,8 @@
  * pin the memory.
  *
  * Adjacent cells exist and none of them run: determinism-stress-c/
- * mmap-fork-shared, backend-parity-c/memfd-create and
- * backend-parity-c/msync-writeback are all ci=false in all five modes. So this
+ * mmap-fork-shared, c-programs/memfd-create and c-programs/msync-writeback
+ * (both formerly backend-parity-c) are all ci=false in all five modes. So this
  * surface is guarded on paper and unguarded in practice.
  *
  * WHAT IS ASSERTED.

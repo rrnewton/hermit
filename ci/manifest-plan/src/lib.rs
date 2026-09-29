@@ -19,6 +19,7 @@ pub mod nextest_cpu;
 pub mod parity;
 #[path = "../../../hermit-cli/tests/common/proc_locks_lease.rs"]
 mod proc_locks_lease;
+pub mod retired_ids;
 pub mod runner;
 pub mod service_result;
 pub mod stress_series;

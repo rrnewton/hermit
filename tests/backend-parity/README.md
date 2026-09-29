@@ -476,7 +476,7 @@ python3 tests/backend-parity/test_scorecard_header_compat.py
 python3 tests/backend-parity/test_run_matrix_output_skew.py
 ```
 
-These are separate from `parity_mutation.py` and from executing `run_matrix.py`
+These are separate from `tests/c/fixture_mutation.py` and from executing `run_matrix.py`
 as a backend matrix. They protect the evidence-tier, scorecard-schema, and
 whole-artifact writer contracts used by that driver.
 

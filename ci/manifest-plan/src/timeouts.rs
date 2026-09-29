@@ -198,7 +198,7 @@ pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCa
 /// See docs/LITEINST_QUALIFICATION_20260916.md for retained evidence and limits.
 pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
     TimeoutCalibration {
-        test: "backend-parity-c/aio-refusal",
+        test: "c-programs/aio-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -210,7 +210,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/cwd-roundtrip",
+        test: "c-programs/cwd-roundtrip",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -222,7 +222,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/event-delivery-ordering",
+        test: "c-programs/event-delivery-ordering",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -234,7 +234,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/eventfd-semantics",
+        test: "c-programs/eventfd-semantics",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -246,7 +246,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fcntl-owner",
+        test: "c-programs/fcntl-owner",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -258,7 +258,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/file-io-roundtrip",
+        test: "c-programs/file-io-roundtrip",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -270,7 +270,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/membarrier-query",
+        test: "c-programs/membarrier-query",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -282,7 +282,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/mkdir-rmdir",
+        test: "c-programs/mkdir-rmdir",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -294,7 +294,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/o-tmpfile-anon",
+        test: "c-programs/o-tmpfile-anon",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -306,7 +306,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/personality-domain",
+        test: "c-programs/personality-domain",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -318,7 +318,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/pipe-capacity",
+        test: "c-programs/pipe-capacity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -330,7 +330,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/record-lock",
+        test: "c-programs/record-lock",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -342,7 +342,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/sendfile-copy",
+        test: "c-programs/sendfile-copy",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -354,7 +354,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/set-tid-address",
+        test: "c-programs/set-tid-address",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -366,7 +366,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/signal-delivery-sequence",
+        test: "c-programs/signal-delivery-sequence",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -378,7 +378,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/symlink-ops",
+        test: "c-programs/symlink-ops",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -390,7 +390,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/umask-mode",
+        test: "c-programs/umask-mode",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -402,7 +402,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/vectored-io",
+        test: "c-programs/vectored-io",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -469,7 +469,7 @@ pub const LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 22] = [
 /// See docs/LITEINST_QUALIFICATION_20260917.md for source and runtime limits.
 pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
     TimeoutCalibration {
-        test: "backend-parity-c/append-pwrite",
+        test: "c-programs/append-pwrite",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -481,7 +481,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/bind-getsockname",
+        test: "c-programs/bind-getsockname",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -493,7 +493,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/cachestat-refusal",
+        test: "c-programs/cachestat-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -505,7 +505,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/child-subreaper-refusal",
+        test: "c-programs/child-subreaper-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -517,7 +517,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/close-range-fds",
+        test: "c-programs/close-range-fds",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -529,7 +529,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/copy-file-range-refusal",
+        test: "c-programs/copy-file-range-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -541,7 +541,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/cpu-virtualization",
+        test: "c-programs/cpu-virtualization",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -553,7 +553,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/dup-shared-offset",
+        test: "c-programs/dup-shared-offset",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -565,7 +565,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/epoll-pwait2",
+        test: "c-programs/epoll-pwait2",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -577,7 +577,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/epoll-readiness",
+        test: "c-programs/epoll-readiness",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -589,7 +589,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/faccessat2-flags",
+        test: "c-programs/faccessat2-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -601,7 +601,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fadvise-hints",
+        test: "c-programs/fadvise-hints",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -613,7 +613,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fallocate-extents",
+        test: "c-programs/fallocate-extents",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -625,7 +625,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fchmod-bits",
+        test: "c-programs/fchmod-bits",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -637,7 +637,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fchmodat2-flags",
+        test: "c-programs/fchmodat2-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -649,7 +649,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fd-duplication",
+        test: "c-programs/fd-duplication",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -661,7 +661,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/file-backed-mmap",
+        test: "c-programs/file-backed-mmap",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -673,7 +673,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/flock-lifecycle",
+        test: "c-programs/flock-lifecycle",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -685,7 +685,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/fsync-durability",
+        test: "c-programs/fsync-durability",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -697,7 +697,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/ftruncate-sparse",
+        test: "c-programs/ftruncate-sparse",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -709,7 +709,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/getcpu-identity",
+        test: "c-programs/getcpu-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -721,7 +721,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/getpriority-identity",
+        test: "c-programs/getpriority-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -733,7 +733,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/hardware-trap-identity",
+        test: "c-programs/hardware-trap-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -745,7 +745,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/host-identity",
+        test: "c-programs/host-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -757,7 +757,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/inline-syscall-sites",
+        test: "c-programs/inline-syscall-sites",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -769,7 +769,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/inotify-watch",
+        test: "c-programs/inotify-watch",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -781,7 +781,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/ioctl-fionread",
+        test: "c-programs/ioctl-fionread",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -793,7 +793,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/kcmp-refusal",
+        test: "c-programs/kcmp-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -805,7 +805,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/linkat-flags",
+        test: "c-programs/linkat-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -817,7 +817,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/lseek-positioning",
+        test: "c-programs/lseek-positioning",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -829,7 +829,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/mce-kill-refusal",
+        test: "c-programs/mce-kill-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -841,7 +841,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/memfd-create",
+        test: "c-programs/memfd-create",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -853,7 +853,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/mempolicy-default",
+        test: "c-programs/mempolicy-default",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -865,7 +865,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/mincore-residency",
+        test: "c-programs/mincore-residency",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -877,7 +877,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/mixed-inline-and-libc-syscalls",
+        test: "c-programs/mixed-inline-and-libc-syscalls",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -889,7 +889,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/mknod-special",
+        test: "c-programs/mknod-special",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -901,7 +901,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/msync-writeback",
+        test: "c-programs/msync-writeback",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -913,7 +913,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/name-to-handle-refusal",
+        test: "c-programs/name-to-handle-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -925,7 +925,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/no-new-privs-refusal",
+        test: "c-programs/no-new-privs-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -937,7 +937,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/numa-node-identity",
+        test: "c-programs/numa-node-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -949,7 +949,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/openat-flags",
+        test: "c-programs/openat-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -961,7 +961,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/openat2-refusal",
+        test: "c-programs/openat2-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -973,7 +973,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/path-file-ops",
+        test: "c-programs/path-file-ops",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -985,7 +985,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/pidfd-open-self",
+        test: "c-programs/pidfd-open-self-pair",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -997,7 +997,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/pipe-capacity-pin",
+        test: "c-programs/pipe-capacity-pin",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1009,7 +1009,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/pipe-ipc",
+        test: "c-programs/pipe-ipc",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1021,7 +1021,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/pipe2-flags",
+        test: "c-programs/pipe2-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1033,7 +1033,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/poll-readiness",
+        test: "c-programs/poll-readiness",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1045,7 +1045,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/prctl-identity",
+        test: "c-programs/prctl-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1057,7 +1057,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/prctl-pdeathsig",
+        test: "c-programs/prctl-pdeathsig",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1069,7 +1069,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/preadv2-flags",
+        test: "c-programs/preadv2-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1081,7 +1081,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/pthread-lifecycle",
+        test: "c-programs/pthread-lifecycle",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1093,7 +1093,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/readdir-entries",
+        test: "c-programs/readdir-entries",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1105,7 +1105,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/readdir-order-identity",
+        test: "c-programs/readdir-order-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1117,7 +1117,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/rename-ops",
+        test: "c-programs/rename-ops",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1129,7 +1129,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/renameat2-flags",
+        test: "c-programs/renameat2-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1141,7 +1141,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/rlimit-identity",
+        test: "c-programs/rlimit-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1153,7 +1153,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/robust-list",
+        test: "c-programs/robust-list",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1165,7 +1165,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/sched-getaffinity-identity",
+        test: "c-programs/sched-getaffinity-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1177,7 +1177,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/seccomp-refusal",
+        test: "c-programs/seccomp-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1189,7 +1189,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/short-io-split-identity",
+        test: "c-programs/short-io-split-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1201,7 +1201,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/shutdown-socketpair",
+        test: "c-programs/shutdown-socketpair",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1213,7 +1213,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/signal-waitstatus-identity",
+        test: "c-programs/signal-waitstatus-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1225,7 +1225,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/signalfd-create",
+        test: "c-programs/signalfd-create",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1237,7 +1237,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/socket-epoll-ordering",
+        test: "c-programs/socket-epoll-ordering",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1249,7 +1249,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/socket-options",
+        test: "c-programs/socket-options",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1261,7 +1261,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/socketpair-flags",
+        test: "c-programs/socketpair-flags",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1273,7 +1273,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/sockname-unnamed",
+        test: "c-programs/sockname-unnamed",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1285,7 +1285,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/statfs-free-determinism",
+        test: "c-programs/statfs-free-determinism",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1297,7 +1297,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/statx-metadata",
+        test: "c-programs/statx-metadata",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1309,7 +1309,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/sync-file-range",
+        test: "c-programs/sync-file-range",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1321,7 +1321,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/sysv-ipc-refusal",
+        test: "c-programs/sysv-ipc-refusal",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1333,7 +1333,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/thp-disable",
+        test: "c-programs/thp-disable",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1345,7 +1345,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/uname-identity",
+        test: "c-programs/uname-identity",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1357,7 +1357,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/utimensat-determinism",
+        test: "c-programs/utimensat-determinism",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1369,7 +1369,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/vectored-file-io",
+        test: "c-programs/vectored-file-io",
         mode: "verify",
         backend: "liteinst",
         samples: 10,
@@ -1609,7 +1609,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
         configured_wall_seconds: 57,
     },
     TimeoutCalibration {
-        test: "backend-parity-c/cpuid-probe",
+        test: "c-programs/cpuid-probe",
         mode: "verify",
         backend: "liteinst",
         samples: 10,

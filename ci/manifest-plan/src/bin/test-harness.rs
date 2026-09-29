@@ -1331,9 +1331,12 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                     step.group, step.job, manifest_lane
                 ));
             }
+            // c-programs omits --allow-empty so an empty selection fails
+            // (https://github.com/rrnewton/hermit/issues/3301, slice S6); the
+            // generator and this audit read the same flag list.
             let selector = format!(
-                "target/debug/test-harness run --lane {lane} --category {} --ci-only --allow-empty --prebuilt",
-                category
+                "target/debug/test-harness run --lane {lane} --category {category} {}",
+                hermit_manifest_plan::validation_dag::manifest_selector_flags(category)
             );
             if !step.cmd.contains(&selector) {
                 return Err(format!(
@@ -3967,7 +3970,10 @@ sys.exit(1 if failed else 0)
             );
             direct += 1;
         }
-        assert_eq!((pinned, direct), (18, 15));
+        // (18, 15) until slice S6 of https://github.com/rrnewton/hermit/issues/3301
+        // folded e2e.manifest_backend_parity_c and its _on_host twin into the
+        // c-programs pair.
+        assert_eq!((pinned, direct), (17, 14));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -4020,7 +4026,11 @@ sys.exit(1 if failed else 0)
                 explicitly.entry(cell).or_default().push(step.tag());
             }
         }
-        assert_eq!(nodes, 15);
+        // 15 until e2e.manifest_backend_parity_c was folded into
+        // e2e.manifest_c_programs (slice S6 of
+        // https://github.com/rrnewton/hermit/issues/3301); the 192 selected
+        // cells are still each reported once.
+        assert_eq!(nodes, 14);
         let lines = reported.values().map(Vec::len).sum::<usize>();
         assert_eq!((selection.len(), lines), (192, 192));
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);

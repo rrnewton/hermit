@@ -1425,9 +1425,10 @@ fn nested_scope_probe_step(
 /// step declares a wider `preferred_inner_jobs` than the budget AND manages its own
 /// concurrency (an empty `jobs_flag`) — because clamping such a step's cgroup quota
 /// alone would leave its original worker count running inside a smaller box, which
-/// is a slowdown disguised as a limit. Four nodes are in exactly that position:
+/// is a slowdown disguised as a limit. Three nodes are in exactly that position:
 /// `build.workspace` and `build.runtime_release` at 32, and
-/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 8. All four
+/// `e2e.manifest_c_programs` at 8 (which absorbed `e2e.manifest_backend_parity_c`
+/// in slice S6 of https://github.com/rrnewton/hermit/issues/3301). All three
 /// bake their measured width into the command itself, so `-j` (host_cpus/8, floor
 /// 2, cap 16) would refuse the entire run.
 ///
@@ -1890,10 +1891,10 @@ const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
     "scripts/lib/validate_plan.rs",
     "scripts/lib/validate_super.rs",
     "tests/e2e/manifests/applications.yaml",
-    "tests/e2e/manifests/backend-parity-c.yaml",
     "tests/e2e/manifests/c-programs.yaml",
     "tests/e2e/manifests/data-handling.yaml",
     "tests/e2e/manifests/defaults.yaml",
+    "tests/e2e/manifests/inventory/retired-ids.json",
 ];
 
 /// Exercise the real bootstrap boundary around the first DAG node.
@@ -4227,7 +4228,7 @@ cleared-caps refusal names {} starved step(s)",
         }
         for tag in [
             "privileged-e2e.manifest_applications",
-            "privileged-e2e.manifest_backend_parity_c",
+            "privileged-e2e.manifest_c_programs",
         ] {
             let deps = deps_of(tag)
                 .ok_or_else(|| format!("full-plan bracket: pinned-root cell {tag} disappeared"))?;
@@ -6238,7 +6239,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         .as_ref()
         .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
     {
-        Some(("portable", "backend-parity-c" | "c-programs")) => Some("--jobs"),
+        Some(("portable", "c-programs")) => Some("--jobs"),
         Some(("portable", "system-utils")) => Some(""),
         _ => None,
     };
@@ -6361,10 +6362,14 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         } else {
             ""
         };
+        // A fail-closed bucket omits --allow-empty; the generator and this
+        // check read the one list in hermit_manifest_plan.
+        let selector =
+            hermit_manifest_plan::validation_dag::manifest_selector_flags(&manifest.category);
         (
             format!(
                 "./ci/run-with-hermit-e2e-artifact.sh {install}target/debug/test-harness run \
-            --lane {} --category {} --ci-only --allow-empty --prebuilt{jobs} \
+            --lane {} --category {} {selector}{jobs} \
             --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
             --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
                 manifest.lane, manifest.category
@@ -9687,8 +9692,8 @@ const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 12] = [
         "privileged-only-e2e.manifest_applications",
     ),
     (
-        "e2e.manifest_backend_parity_c",
-        "privileged-only-e2e.manifest_backend_parity_c",
+        "e2e.manifest_c_programs",
+        "privileged-only-e2e.manifest_c_programs",
     ),
     ("test.cli_kvm", "privileged-only-test.cli_kvm"),
 ];
@@ -11852,14 +11857,14 @@ fn summary_listing_bracket() -> Result<String, String> {
     //    failures, one a budget kill. The tenth must be COUNTED AND NAMED in its
     //    own right, and must NOT be silently absorbed into the failure count.
     let mut ten = nine.clone();
-    let mut killed = row("privileged-e2e.manifest_backend_parity_c", false);
+    let mut killed = row("privileged-e2e.manifest_c_programs", false);
     killed.aborted = true; // a budget kill: not ok, and not a `failure` either
     ten.push(killed);
     let (named, listing) = blocking_listing(&ten, &none, 9);
     if named.len() != 9 {
         return Err(format!("budget kill was absorbed into the failure count: {}", named.len()));
     }
-    if !listing.contains("NO VERDICT") || !listing.contains("manifest_backend_parity_c") {
+    if !listing.contains("NO VERDICT") || !listing.contains("manifest_c_programs") {
         return Err(format!("a node that did not pass went unreported: {listing}"));
     }
 
@@ -12401,10 +12406,10 @@ fn manifest_node_vacuity_profile_bracket(
         .find(|step| step.tag() == withheld_tag)
         .ok_or_else(|| format!("node vacuity: {label} selection lost bucket {withheld_tag}"))?;
     if manifest_bucket_of(shipped)
-        != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+        != Some(("privileged".to_string(), "c-programs".to_string()))
     {
         return Err(format!(
-            "node vacuity: {withheld_tag} must bind to privileged/backend-parity-c; got {:?}",
+            "node vacuity: {withheld_tag} must bind to privileged/c-programs; got {:?}",
             manifest_bucket_of(shipped)
         ));
     }
@@ -12461,7 +12466,7 @@ fn manifest_node_vacuity_profile_bracket(
 fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     let bucket = |selected: usize, withheld: usize| BucketCells {
         lane: "privileged".into(),
-        category: "backend-parity-c".into(),
+        category: "c-programs".into(),
         selected,
         withheld,
         capabilities: if withheld > 0 {
@@ -12521,11 +12526,8 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // model must NOT be matched against the bucket accounting.
     let mut shipped_buckets = Vec::new();
     for (label, tag) in [
-        ("full", "privileged-e2e.manifest_backend_parity_c"),
-        (
-            "privileged",
-            "privileged-only-e2e.manifest_backend_parity_c",
-        ),
+        ("full", "privileged-e2e.manifest_c_programs"),
+        ("privileged", "privileged-only-e2e.manifest_c_programs"),
     ] {
         let steps = validate_plan::lane_config(root, label)?.steps;
         let shipped = steps
@@ -12536,10 +12538,10 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
             })?
             .clone();
         if manifest_bucket_of(&shipped)
-            != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+            != Some(("privileged".to_string(), "c-programs".to_string()))
         {
             return Err(format!(
-                "node vacuity: shipped bucket {tag} must bind to privileged/backend-parity-c; got {:?}",
+                "node vacuity: shipped bucket {tag} must bind to privileged/c-programs; got {:?}",
                 manifest_bucket_of(&shipped)
             ));
         }
@@ -12547,21 +12549,21 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     }
     let unmodelled = [
         // A narrower selection than the accounting was taken with.
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --mode verify --results r --junit j",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --backend ptrace --results r --junit j",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --test backend-parity-c/cpuid-probe --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --mode verify --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --backend ptrace --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --test c-programs/cpuid-probe --results r --junit j",
         // A WIDER selection than the accounting was taken with.
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --include-occasional --results r --junit j",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --include-occasional --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --results r --junit j",
         // Output paths are required exactly once, and each must have a value.
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --junit j",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r1 --results r2 --junit j",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r --junit j1 --junit j2",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results --junit j",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r --junit",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results r",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results r1 --results r2 --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results r --junit j1 --junit j2",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results r --junit",
         // Unknown tokens remain fail-closed even with the required output pair.
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --future-selector value --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --future-selector value --results r --junit j",
         // Not a bucket run at all.
         "target/debug/test-harness validate",
         "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
@@ -12581,7 +12583,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         let mut mismatched = shipped.clone();
         mismatched.manifest = Some(DagManifest {
             lane: "portable".into(),
-            category: "backend-parity-c".into(),
+            category: "c-programs".into(),
             test: None,
             mode: None,
             backend: None,
@@ -12612,8 +12614,8 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     let parsed = read_bucket_cells(root, &absent)?;
     let privileged = parsed
         .iter()
-        .find(|bucket| bucket.lane == "privileged" && bucket.category == "backend-parity-c")
-        .ok_or("node vacuity: required plan lost the privileged backend-parity-c bucket")?;
+        .find(|bucket| bucket.lane == "privileged" && bucket.category == "c-programs")
+        .ok_or("node vacuity: required plan lost the privileged c-programs bucket")?;
     // The checked-in bucket selects cpuid-probe for KVM, LiteInst and ptrace.
     if privileged.selected != 3
         || !bucket_runs_nothing(privileged)
@@ -12635,12 +12637,12 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     for (label, withheld_tag, scorecard_tag) in [
         (
             "full",
-            "privileged-e2e.manifest_backend_parity_c",
+            "privileged-e2e.manifest_c_programs",
             "full-scorecard.compatibility",
         ),
         (
             "privileged",
-            "privileged-only-e2e.manifest_backend_parity_c",
+            "privileged-only-e2e.manifest_c_programs",
             "privileged-scorecard.compatibility",
         ),
     ] {
@@ -12656,7 +12658,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
     // dropped; ANY other dependent refuses the whole run rather than having a
     // prerequisite quietly removed from under it.
-    let gone: BTreeSet<String> = ["privileged-e2e.manifest_backend_parity_c".to_string()]
+    let gone: BTreeSet<String> = ["privileged-e2e.manifest_c_programs".to_string()]
         .into_iter()
         .collect();
     let consumer = (
@@ -12665,14 +12667,14 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
          --lanes portable,privileged"
             .to_string(),
         vec![
-            "privileged-e2e.manifest_backend_parity_c".to_string(),
+            "privileged-e2e.manifest_c_programs".to_string(),
             "e2e.manifest_util_c".to_string(),
         ],
     );
     let prerequisite = (
         "test.something".to_string(),
         "cargo nextest run -p hermit-detcore".to_string(),
-        vec!["privileged-e2e.manifest_backend_parity_c".to_string()],
+        vec!["privileged-e2e.manifest_c_programs".to_string()],
     );
     let unrelated = (
         "lint.rustfmt".to_string(),
@@ -12684,7 +12686,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     if droppable
         != vec![(
             "scorecard.compatibility".to_string(),
-            "privileged-e2e.manifest_backend_parity_c".to_string(),
+            "privileged-e2e.manifest_c_programs".to_string(),
         )]
         || !refusals.is_empty()
     {
@@ -14420,7 +14422,7 @@ mod nextest_timeout_tests {
         let selection = Selection {
             population: Some(Population::Required),
             lane: Some("portable".into()),
-            test: Some("backend-parity-c/readdir-order-identity".into()),
+            test: Some("c-programs/readdir-order-identity".into()),
             mode: Some("verify".into()),
             backend: Some("ptrace".into()),
             ..Default::default()
@@ -14672,7 +14674,10 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .iter()
             .filter(|step| step.cmd.contains("target/debug/test-harness run "))
             .collect::<Vec<_>>();
-        assert_eq!(steps.len(), 33);
+        // 33 until backend-parity-c was folded into c-programs, which removed
+        // e2e.manifest_backend_parity_c and its _on_host variant
+        // (https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(steps.len(), 31);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -15273,7 +15278,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     // (https://github.com/rrnewton/hermit/issues/3301). No committed manifest
     // command asks the harness for a ptrace reference run, and a planted
     // request is refused as an unmodeled argument, both on a bare command and
-    // on the committed backend-parity-c publishers.
+    // on the committed c-programs publishers, which absorbed the former
+    // backend-parity-c publishers.
     if let Some(step) = committed
         .steps
         .iter()
@@ -15340,10 +15346,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
         }
     }
-    for tag in [
-        "e2e.manifest_backend_parity_c",
-        "e2e.manifest_backend_parity_c_on_host",
-    ] {
+    for tag in ["e2e.manifest_c_programs", "e2e.manifest_c_programs_on_host"] {
         let publisher = committed
             .steps
             .iter()
@@ -24726,9 +24729,12 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany all 189 cases: {stdout}"
                 );
             } else {
+                // 252 until backend-parity-c was folded into c-programs, which
+                // removed e2e.manifest_backend_parity_c_on_host
+                // (https://github.com/rrnewton/hermit/issues/3301).
                 assert!(
                     stdout.contains(
-                        "252 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "251 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -27005,7 +27011,10 @@ mod raw_census_publication_tests {
             .iter()
             .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
             .collect::<Vec<_>>();
-        assert_eq!(publishers.len(), 33);
+        // 33 until backend-parity-c was folded into c-programs, which removed
+        // e2e.manifest_backend_parity_c and its _on_host variant
+        // (https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(publishers.len(), 31);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(
@@ -27040,7 +27049,7 @@ mod raw_census_publication_tests {
                 .as_ref()
                 .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
             {
-                Some(("portable", "backend-parity-c" | "c-programs")) => Some("--jobs"),
+                Some(("portable", "c-programs")) => Some("--jobs"),
                 Some(("portable", "system-utils")) => Some(""),
                 _ => None,
             };
