@@ -42,13 +42,89 @@ const STDERR_TAIL_BYTES: u64 = 8 * 1024;
 /// record, including detcore's `updated rcb clock` lines, is still retained.
 /// Setting `RUST_LOG` explicitly also keeps an ambient value from changing the
 /// retained logs.
+///
+/// The retained logs therefore lack the per-step `[instruction]` decode and
+/// register dump. The DEBUG timer lines, such as `Timer will single-step from
+/// ctr ...`, remain. To get the dumps back while debugging, temporarily change
+/// this value to `reverie_ptrace::timer=trace`; that also brings back the CPU
+/// cost above, so the preempted cases will again exceed their budget.
+///
+/// The directive names a module path. The per-step record is the `trace!` in
+/// `attempt_single_step` in reverie-ptrace `src/timer.rs`, which has no explicit
+/// target, so its target is that module path. A Reverie pin bump that moves or
+/// renames the module makes this directive match nothing. That would show up
+/// only as a CPU timeout, so [`assert_no_single_step_dumps`] checks every
+/// retained log for the record's text instead of trusting the module path.
 const LOG_DIRECTIVES: &str = "reverie_ptrace::timer=debug";
+
+/// The text that starts every per-step record [`LOG_DIRECTIVES`] turns off.
+const SINGLE_STEP_DUMP: &str = "[instruction]";
+
+/// Fails if a retained log contains a per-step instruction and register dump.
+fn assert_no_single_step_dumps(log: &str, path: &Path) {
+    assert!(
+        !log.contains(SINGLE_STEP_DUMP),
+        "{} contains per-step {SINGLE_STEP_DUMP} records, so RUST_LOG={LOG_DIRECTIVES} \
+         no longer turns them off. Did a Reverie pin bump move attempt_single_step's \
+         trace! out of the reverie_ptrace::timer module? Update LOG_DIRECTIVES.",
+        path.display()
+    );
+}
+
+/// The host CPU that Hermit runs started here must never be pinned to.
+///
+/// Hermit pins the tracer and every guest thread of a run to one core, chosen
+/// uniformly from the mask it inherits (`choose_affinity_core` in
+/// `hermit-cli/src/bin/hermit/container.rs`). On the development hosts, ptrace
+/// stops on CPU 0 cost about ten times as much CPU as elsewhere:
+/// https://github.com/rrnewton/hermit/issues/3265 measured 1.6 s per execution
+/// on CPU 5 and 17.1 s on CPU 0. CPU 0 was in the mask, so each Hermit run had
+/// about a 1 in 316 chance of landing there. A single-step-heavy case that
+/// landed there exceeded its 22 CPU-second budget. Validation launches already
+/// leave CPU 0 out of their cpuset when they can, but a standalone
+/// `cargo nextest` run and other runners do not.
+const AVOIDED_HOST_CPU: usize = 0;
+
+/// Removes [`AVOIDED_HOST_CPU`] from the child's allowed CPU mask.
+///
+/// Nothing changes if that CPU is not in the mask, or if it is the only CPU in
+/// the mask.
+fn avoid_host_cpu(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    use nix::sched::CpuSet;
+    use nix::sched::sched_getaffinity;
+    use nix::sched::sched_setaffinity;
+    use nix::unistd::Pid;
+
+    let inherited = sched_getaffinity(Pid::from_raw(0)).expect("read the test's allowed CPU mask");
+    let allowed_cpus = |mask: &CpuSet| {
+        (0..CpuSet::count())
+            .filter(|cpu| mask.is_set(*cpu).unwrap_or(false))
+            .count()
+    };
+    if !inherited.is_set(AVOIDED_HOST_CPU).unwrap_or(false) || allowed_cpus(&inherited) < 2 {
+        return;
+    }
+    let mut allowed = inherited;
+    allowed
+        .unset(AVOIDED_HOST_CPU)
+        .expect("CPU 0 is a valid CpuSet index");
+    // SAFETY: the callback makes one async-signal-safe system call on a mask
+    // built before fork, and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            sched_setaffinity(Pid::from_raw(0), &allowed).map_err(std::io::Error::from)
+        });
+    }
+}
 
 /// A `--log=trace` Hermit command whose retained logs these assertions read.
 fn traced_hermit_command(args: &[&str]) -> Command {
     let mut command = super::hermit_command(args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
     command.env("RUST_LOG", LOG_DIRECTIVES);
+    avoid_host_cpu(&mut command);
     command
 }
 
@@ -361,11 +437,10 @@ fn run_fixture(scenario: Scenario) {
             // retaining the same workload and repeated leader preemptions.
             // The precise target and refusal of every overshoot are unchanged.
             //
-            // CPU 0 adds about 5 CPU-seconds per execution on this host. The
-            // measured 22-CPU-second whole-case budget fits at most 3 of the 6
-            // executions on CPU 0, not arbitrary placement on smaller runners
-            // whose cpuset includes CPU 0. This is a measured limit, not a
-            // guarantee across hosts or loads: https://github.com/rrnewton/hermit/issues/3265.
+            // These runs never land on CPU 0, where ptrace stops cost about ten
+            // times as much: traced_hermit_command removes it from the mask
+            // Hermit picks a core from (https://github.com/rrnewton/hermit/issues/3265).
+            // The CPU measurements behind this margin cover the other cores only.
             //
             // This margin is below the product's calibrated 1,000 RCBs for
             // EPYC 9D85. With glibc 2.34, the replacement's first post-exec PMU
@@ -374,8 +449,20 @@ fn run_fixture(scenario: Scenario) {
             // change can reintroduce exit 122 at this timer.
             args.insert(8, "--skid-margin=512");
         } else if preempted {
-            // Keep the blocked-leader cell's existing early notification.
-            args.insert(8, "--skid-margin=3072");
+            // The PMU interrupt is requested this many RCBs before the exact
+            // target, and every RCB of the margin that skid does not use is one
+            // single step. Each execution takes six precise timers. At the old
+            // 3,072 RCBs they cost about 17,900 steps per execution, which put
+            // this case over its 22 CPU-second budget on a loaded host.
+            //
+            // 1,000 RCBs is the product's calibrated default for EPYC 9D85
+            // (reverie `pmu.rs`, which cites a p99 skid of 384 RCBs). Across 72
+            // timers of this case at 3,072 RCBs on that host, the largest skid
+            // was 391 RCBs. The value is explicit so the case costs the same on
+            // hosts whose default margin is 10,000 RCBs. A skid past the margin
+            // is still refused with exit 122, never delivered late; the exit
+            // status assertion below does not change.
+            args.insert(8, "--skid-margin=1000");
         }
         let mut command = traced_hermit_command(&args);
         let status = bounded_command_with_timeout(&mut command, &directory, remaining());
@@ -461,6 +548,7 @@ fn run_fixture(scenario: Scenario) {
                 .collect();
             assert_eq!(matches.len(), 1, "one complete retained log per execution");
             let log = String::from_utf8(bounded_read(&matches[0], 64 * MIB)).unwrap();
+            assert_no_single_step_dumps(&log, &matches[0]);
             if !exit_only {
                 assert_pmu_handoffs(&log, stdout);
             }
@@ -602,6 +690,7 @@ fn preemption_artifact_case(
         );
         for path in paths {
             let log = String::from_utf8(bounded_read(&path, 64 * MIB)).unwrap();
+            assert_no_single_step_dumps(&log, &path);
             let exec = log
                 .find(&worker_execve)
                 .expect("the identified worker attempted the same exec path");
