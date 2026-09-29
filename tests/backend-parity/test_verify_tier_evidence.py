@@ -31,11 +31,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from e9patch_corpus import (  # noqa: E402
-    CorpusError,
-    e9patch_engagement,
-    e9patch_feature_from_build_info,
-)
 from run_matrix import (  # noqa: E402
     cpuid_policy_is_blocked,
     DEFAULT_VERIFY_POLICY,
@@ -748,30 +743,9 @@ check(
     repr(SCORECARD_HEADER[-4:]),
 )
 
-print("case PRODUCER FACTS — typed build and host records drive decisions")
-build_record = {
-    "schema": 1,
-    "version": "0.2.0",
-    "build_date": "2026-08-29",
-    "git_sha": "0123456789ab",
-    "features": {"dbt": True, "e9patch": True, "sabre": True},
-}
-check(
-    "e9patch compile-time feature true is accepted",
-    e9patch_feature_from_build_info(json.dumps(build_record).encode()) is True,
-)
-build_record["features"]["e9patch"] = False
-check(
-    "mutating the typed e9patch feature changes the decision",
-    e9patch_feature_from_build_info(json.dumps(build_record).encode()) is False,
-)
-try:
-    e9patch_feature_from_build_info(b'{"schema":1,"features":{}}')
-except CorpusError as error:
-    refused = "features.e9patch" in str(error)
-else:
-    refused = False
-check("missing e9patch feature fails by field name", refused)
+# The e9patch build-info and engagement checks moved to
+# tests/e9patch/test_e9patch_corpus.py with the e9patch corpus.
+print("case PRODUCER FACTS — typed host records drive decisions")
 
 
 def capability_record(cpuid_present: bool) -> bytes:
@@ -808,39 +782,6 @@ except Exception as error:
 else:
     refused = False
 check("incomplete host capability set fails by capability name", refused)
-
-print("case E9PATCH RESULT — all preparation counts come from one typed record")
-with tempfile.TemporaryDirectory(prefix="e9patch-engagement-") as tmp:
-    engagement_path = Path(tmp) / "engagement.json"
-    engagement = {
-        "schema": 2,
-        "engagement": {
-            "backend": "e9patch",
-            "candidate_sites": 7,
-            "mapped_sites": 7,
-            "b0_sites": 0,
-        },
-    }
-    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
-    check(
-        "typed e9patch preparation counts are accepted",
-        e9patch_engagement(engagement_path) == (7, 7, 0),
-    )
-    engagement["engagement"]["mapped_sites"] = 6
-    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
-    check(
-        "mutating the producer count changes the consumer result",
-        e9patch_engagement(engagement_path) == (7, 6, 0),
-    )
-    del engagement["engagement"]["b0_sites"]
-    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
-    try:
-        e9patch_engagement(engagement_path)
-    except CorpusError as error:
-        refused = "incomplete" in str(error)
-    else:
-        refused = False
-    check("missing B0 count fails by shape", refused)
 
 print()
 if FAILURES:
