@@ -1036,3 +1036,248 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
         "stderr={diagnostics}",
     );
 }
+
+// Regression coverage for https://github.com/rrnewton/hermit/issues/3338: the
+// LiteInst runtime's preload constructor issues a few hundred syscalls before
+// the guest's main runs. Charging them as guest syscalls pushed sysinfo(2)
+// uptime from 121 to 123 under --max-timeslice=disabled, where each syscall is
+// charged at the no-PMU rate. These runs disable the timeslice explicitly so
+// the result does not depend on whether the host exposes a PMU.
+static BOOTSTRAP_TIME_HOST_IDENTITY: OnceLock<PathBuf> = OnceLock::new();
+static BOOTSTRAP_TIME_CLOCK_TRAJECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+fn compile_bootstrap_time_guest(
+    cell: &'static OnceLock<PathBuf>,
+    source: &str,
+    name: &str,
+) -> &'static Path {
+    cell.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-bootstrap-time");
+        fs::create_dir_all(&build_root).expect("failed to create bootstrap-time guest directory");
+        let guest = build_root.join(name);
+        // -D_GNU_SOURCE matches the build flags that
+        // tests/e2e/manifests/backend-parity-c.yaml gives host_identity.c.
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE"])
+            .arg(repository.join(source))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to compile {source}: {error}"));
+        assert!(
+            output.status.success(),
+            "{source} compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn bootstrap_time_host_identity() -> &'static Path {
+    // The unchanged backend-parity fixture. It asserts sysinfo.uptime == 121.
+    compile_bootstrap_time_guest(
+        &BOOTSTRAP_TIME_HOST_IDENTITY,
+        "tests/backend-parity/fixtures/host_identity.c",
+        "host_identity",
+    )
+}
+
+fn bootstrap_time_clock_trajectory() -> &'static Path {
+    compile_bootstrap_time_guest(
+        &BOOTSTRAP_TIME_CLOCK_TRAJECTORY,
+        "hermit-cli/tests/fixtures/clock_trajectory.c",
+        "clock_trajectory",
+    )
+}
+
+fn bootstrap_time_command(backend: &str, home: &Path) -> Command {
+    let mut command = Command::new(liteinst_runtime::hermit_binary());
+    command
+        .arg("--log=info")
+        .arg("run")
+        .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+        .args([
+            "--backend",
+            backend,
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+            "--env=LC_ALL=C",
+            "--env=TZ=UTC",
+        ])
+        .arg(format!("--env=HOME={}", home.display()))
+        .env("HOME", home);
+    command
+}
+
+fn assert_bootstrap_time_success(label: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{label}: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let scratch = tempfile::tempdir().expect("failed to create bootstrap-time scratch directory");
+    let report = scratch.path().join("verify.json");
+    let output = bootstrap_time_command("liteinst", scratch.path())
+        .args(["--verify", "--verify-strict"])
+        .arg(format!("--verify-json={}", report.display()))
+        .arg("--")
+        .arg(bootstrap_time_host_identity())
+        .output()
+        .expect("failed to run Hermit LiteInst on host_identity");
+    assert_bootstrap_time_success("liteinst host_identity", &output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.lines().any(|line| line == "sysinfo.uptime=121"),
+        "LiteInst host_identity must observe uptime 121:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Success: deterministic. Determinism verified."),
+        "{stderr}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("failed to read the --verify-json report"),
+    )
+    .expect("the --verify-json report must be JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(
+        report["verified"],
+        serde_json::Value::Bool(true),
+        "{report}"
+    );
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::Value::Bool(true),
+        "{report}"
+    );
+    let compared = &report["compared_log_messages"];
+    let left = compared["left"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("compared_log_messages.left is missing: {report}"));
+    assert!(
+        left > 0,
+        "strict verify compared no INFO messages: {report}"
+    );
+    assert_eq!(compared["right"].as_u64(), Some(left), "{report}");
+}
+
+/// clock_trajectory.c prints this many samples, the first half before it
+/// execs itself and the second half after.
+const CLOCK_TRAJECTORY_SAMPLES: usize = 10;
+const CLOCK_TRAJECTORY_FIRST_AFTER_EXEC: usize = 5;
+
+#[derive(Debug, PartialEq)]
+struct ClockSample {
+    monotonic_ns: u128,
+    uptime: i64,
+}
+
+fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
+    if backend == "liteinst" {
+        liteinst_runtime::ensure_liteinst_runtime();
+    }
+    let home = tempfile::tempdir().expect("failed to create clock-trajectory HOME");
+    let output = bootstrap_time_command(backend, home.path())
+        .arg("--")
+        .arg(bootstrap_time_clock_trajectory())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run Hermit {backend}: {error}"));
+    assert_bootstrap_time_success(backend, &output);
+    let stdout = String::from_utf8(output.stdout).expect("clock trajectory output is UTF-8");
+    let samples = stdout
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            let [sample, monotonic, uptime] = fields.as_slice() else {
+                panic!("{backend}: malformed clock sample {line:?}\n{stdout}");
+            };
+            assert_eq!(
+                *sample,
+                format!("sample={index}"),
+                "{backend}: out-of-order sample\n{stdout}"
+            );
+            let monotonic_ns = monotonic
+                .strip_prefix("monotonic_ns=")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("{backend}: bad monotonic field {line:?}"));
+            let uptime = uptime
+                .strip_prefix("uptime=")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("{backend}: bad uptime field {line:?}"));
+            ClockSample {
+                monotonic_ns,
+                uptime,
+            }
+        })
+        .collect::<Vec<_>>();
+    // Five samples before the fixture execs itself and five after it.
+    assert_eq!(
+        samples.len(),
+        CLOCK_TRAJECTORY_SAMPLES,
+        "{backend}: expected ten samples\n{stdout}"
+    );
+    for pair in samples.windows(2) {
+        assert!(
+            pair[1].monotonic_ns > pair[0].monotonic_ns,
+            "{backend}: CLOCK_MONOTONIC must strictly increase: {samples:?}"
+        );
+    }
+    samples
+}
+
+#[test]
+fn liteinst_clock_trajectory_matches_ptrace_after_runtime_bootstrap() {
+    let liteinst = clock_trajectory("liteinst");
+    let ptrace = clock_trajectory("ptrace");
+
+    let liteinst_uptime = liteinst.iter().map(|s| s.uptime).collect::<Vec<_>>();
+    let ptrace_uptime = ptrace.iter().map(|s| s.uptime).collect::<Vec<_>>();
+    assert_eq!(
+        liteinst_uptime, ptrace_uptime,
+        "LiteInst and ptrace must agree on sysinfo uptime\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
+
+    // The backends do not reach main at the same virtual instant. Before the
+    // runtime's first trap, the dynamic loader maps the preloaded runtime and
+    // its libgcc_s dependency, and those are ordinary guest syscalls that
+    // stay charged. Scheduler turns inside the bootstrap window also still
+    // advance global time. The exec reloads the runtime, so the same holds
+    // for the first sample after it. In standalone runs with these flags
+    // (values shift by a few ms with the environment), the LiteInst
+    // samples read 151,137,500 ns later than ptrace's before the exec and
+    // 287,275,000 ns later after it. Charging the runtime constructor as well made
+    // those gaps 2,101,387,500 ns and 4,187,775,000 ns. Bound each gap below
+    // one uptime second rather than asserting equal values.
+    for index in [0, CLOCK_TRAJECTORY_FIRST_AFTER_EXEC] {
+        let gap = liteinst[index]
+            .monotonic_ns
+            .abs_diff(ptrace[index].monotonic_ns);
+        assert!(
+            gap < 1_000_000_000,
+            "LiteInst sample {index} is {gap} ns away from ptrace\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+        );
+    }
+}
