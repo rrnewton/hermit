@@ -9139,10 +9139,17 @@ mod tests {
         let linked = fixture.join("linked");
         symlink(&regular, &linked).unwrap();
         assert!(require_absolute_file(&linked, "fixture symlink").is_err());
-        let socket = fixture.join("socket");
+        // A Unix socket path must fit sockaddr_un.sun_path (108 bytes), and the
+        // fixture root beneath a validation run's TMPDIR does not: the hosted
+        // run 36499357369 refused the bind with "path must be shorter than
+        // SUN_LEN". Bind the socket in a short directory of its own.
+        let socket_dir = PathBuf::from(format!("/tmp/bbr-{}", unique_identity().unwrap()));
+        fs::create_dir(&socket_dir).unwrap();
+        let socket = socket_dir.join("socket");
         let listener = UnixListener::bind(&socket).unwrap();
         assert!(require_absolute_file(&socket, "fixture socket").is_err());
         drop(listener);
+        fs::remove_dir_all(socket_dir).unwrap();
         assert!(create_exclusive_directory(&fixture, "stale fixture").is_err());
         fs::remove_dir_all(fixture).unwrap();
     }
