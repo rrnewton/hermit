@@ -542,6 +542,15 @@
       ]
     },
     {
+      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
+      "nodes": [
+        "check.e9patch_corpus"
+      ],
+      "paths": [
+        "tests/e9patch/**"
+      ]
+    },
+    {
       "_why": "The identity-fixture mutation guard and the fixtures it plants into moved to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",
       "nodes": [
         "check.backend_parity_mutation"

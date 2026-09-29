@@ -403,6 +403,42 @@
     },
     {
       "group": "check",
+      "job": "e9patch_corpus",
+      "desc": "e9patch corpus driver contracts (typed build-info and engagement readers)",
+      "description": "tests/e9patch/e9patch_corpus.py ratchets e9patch preprocessing parity against golden ptrace, but it needs e9tool and a Hermit built with the e9patch cargo feature, and CI has neither, so no validation lane runs its guests. This node runs tests/e9patch/test_e9patch_corpus.py, which checks the driver without running Hermit or compiling a guest: the build-info reader follows the boolean features.e9patch of a schema-1 `hermit version --json` record and refuses a record without it by field name; the engagement reader follows the producer's candidate, mapped and B0 site counts and refuses a record that lacks one; corpus commands use the caller's private host --tmp root rather than host /tmp; and `e9patch_corpus.py --check` finds exactly the corpus guest sources. The six reader checks ran in check.backend_parity_suites, inside tests/backend-parity/test_verify_tier_evidence.py, until the corpus moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. The --tmp check came from tests/backend-parity/test_parallel_validate_paths.py, which no node ran.",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/e9patch/test_e9patch_corpus.py",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 60,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 2.0,
+        "rss_baseline_bytes": 134217728,
+        "hard_mem_max_bytes": 536870912,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "check.e9patch_corpus"
+    },
+    {
+      "group": "check",
       "job": "portability_paths",
       "desc": "Reject developer-specific paths in build/run files",
       "description": "",

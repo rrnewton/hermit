@@ -238,17 +238,20 @@ struct Profile {
 // parent-only accept arm split out of check.lint_checks: 270/271 before.
 // full then gained one more step, and privileged and hosted-privileged one
 // each, for the privileged system-utils nodes: 271/272, 11/19 and 12/12
-// before.
+// before. full, portable and hosted-portable then gained check.e9patch_corpus
+// when the e9patch corpus left tests/backend-parity (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 272/273, 259/260 and
+// 250/250 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 272,
-        selected_steps: 273,
+        direct_steps: 273,
+        selected_steps: 274,
     },
     Profile {
         label: "portable",
-        direct_steps: 259,
-        selected_steps: 260,
+        direct_steps: 260,
+        selected_steps: 261,
     },
     Profile {
         label: "quick",
@@ -267,8 +270,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 250,
-        selected_steps: 250,
+        direct_steps: 251,
+        selected_steps: 251,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1821,13 +1824,15 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_manifest_gate_width_contract(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
-    // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
-    // since check.canonical_adapter_accept was added; +3 for the privileged
+    // 1609 since check.e9patch_corpus was added when the e9patch corpus left
+    // tests/backend-parity; 1606 until test.dbt_parity and
+    // test.dbt_parity_on_host were retired (both in slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301); 1605 since
+    // check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes.
-    if cfg.steps.len() != 1608 {
+    if cfg.steps.len() != 1609 {
         return Err(format!(
-            "superset has {} steps, expected 1608",
+            "superset has {} steps, expected 1609",
             cfg.steps.len()
         ));
     }
@@ -3364,9 +3369,11 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 250 since test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 250);
+        // 251 since check.e9patch_corpus was added when the e9patch corpus
+        // left tests/backend-parity; 250 since test.dbt_parity_on_host was
+        // retired; 251 before (both in slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(selected.steps.len(), 251);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3523,10 +3530,11 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 249 = the 250 hosted-portable direct steps since slice S13 of
+            // 250 = the 251 hosted-portable direct steps since
+            // check.e9patch_corpus was added in slice S13 of
             // https://github.com/rrnewton/hermit/issues/3301, minus the one
             // planted loss.
-            error.contains("hosted-portable label has 249 direct steps"),
+            error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
     }
