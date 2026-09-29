@@ -28358,6 +28358,297 @@ mod post_verdict_transaction_tests {
         }
     }
 
+    /// `row` whose attempt captured `stdout` and whose report records those
+    /// bytes for both compared runs, the report digest recomputed.
+    fn with_captured_stdout(row: &JsonValue, stdout: &str) -> JsonValue {
+        let mut row = row.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(row["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["stdout_sha256"] =
+                format!("{:x}", Sha256::digest(stdout.as_bytes())).into();
+            report["compared_outputs"][side]["stdout_bytes"] = stdout.len().into();
+        }
+        let report = serde_json::to_string(&report).unwrap();
+        row["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        row["attempts"][0]["verification_report"] = report.into();
+        row["attempts"][0]["stdout"] = stdout.into();
+        row
+    }
+
+    /// The runner's row for a verify attempt whose comparison matched but
+    /// whose stdout failed the cell's declared expectation: an attempt FAIL
+    /// with no timeout or error kind, inside a crash-error/product_failure
+    /// row, recording why only in its reason.
+    fn expected_output_failure(row: &JsonValue, reason: &str) -> JsonValue {
+        let mut row = row.clone();
+        row["attempts"][0]["outcome"] = "FAIL".into();
+        row["attempts"][0]["reason"] = reason.into();
+        row["outcome"] = "FAIL".into();
+        row["result"] = "crash-error".into();
+        row["failure_class"] = "product_failure".into();
+        row["reason"] = reason.into();
+        row
+    }
+
+    /// The reason the runner writes when a verify run's stdout is not the
+    /// declared expected_stdout, built by the runner's own formatter so a
+    /// change to its spelling fails these tests rather than publication.
+    fn expected_stdout_reason(run: &str, observed: &str, declared: &str) -> String {
+        hermit_manifest_plan::runner::expected_stdout_mismatch_reason(
+            run,
+            observed.len() as u64,
+            &format!("{:x}", Sha256::digest(observed.as_bytes())),
+            declared.len() as u64,
+            &format!("{:x}", Sha256::digest(declared.as_bytes())),
+        )
+    }
+
+    /// The runner's reason for captured stdout that omits the declared text.
+    fn expected_stdout_contains_reason(observed: &str, text: &str) -> String {
+        hermit_manifest_plan::runner::expected_stdout_contains_mismatch_reason(
+            observed.len() as u64,
+            &format!("{:x}", Sha256::digest(observed.as_bytes())),
+            text,
+        )
+    }
+
+    /// Validate run s22 of hermit 356dfd3ede03 refused its whole scorecard
+    /// write-back on one such row: c-programs/random-sources-root-only printed
+    /// the same 959 bytes in both compared runs, but not the bytes its
+    /// expected_stdout declares, and the reader called that FAIL "a FAIL whose
+    /// matched report ends as its row allows". It is the runner's red for a
+    /// failed expectation. Both readers keep it as a crash-error beside a
+    /// sibling that still passes; neither credits the match or aborts the run.
+    #[test]
+    fn a_failed_stdout_expectation_is_retained_red_beside_a_valid_sibling() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, declared) = declared_exit_row(&measured);
+        let sibling = fixture.row.clone();
+        let sibling_id = fixture.id.clone();
+        let mut undeclared = with_matched_exit(&declared, 0);
+        undeclared
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        let observed = "getrandom[0] 918fdb56\n";
+        let undeclared = with_captured_stdout(&undeclared, observed);
+        let declared = with_captured_stdout(&declared, observed);
+        let depth = BTreeMap::from([(
+            "hermit".to_string(),
+            SourceDepth {
+                commits: 20,
+                first_parent: 20,
+            },
+        )]);
+        let mut non_utf8_capture = expected_output_failure(
+            &undeclared,
+            &expected_stdout_reason("first", observed, "getrandom[0] a29a84d6\n"),
+        );
+        // The runner records an unreadable or non-UTF-8 capture as empty.
+        non_utf8_capture["attempts"][0]["stdout"] = "".into();
+        for (label, failed, names) in [
+            (
+                "undeclared exit, exact stdout differs",
+                expected_output_failure(
+                    &undeclared,
+                    &expected_stdout_reason("first", observed, "getrandom[0] a29a84d6\n"),
+                ),
+                "declared expected_stdout",
+            ),
+            (
+                "declared exit 3 matched, exact stdout differs",
+                expected_output_failure(
+                    &declared,
+                    &expected_stdout_reason("first", observed, "getrandom[0] a29a84d6\n"),
+                ),
+                "declared expected_stdout",
+            ),
+            (
+                "exact stdout differs, capture unreadable",
+                non_utf8_capture,
+                "declared expected_stdout",
+            ),
+            (
+                "stdout omits the declared text",
+                expected_output_failure(
+                    &undeclared,
+                    &expected_stdout_contains_reason(observed, "vdso-getrandom\t\"ok\""),
+                ),
+                "declared expected_stdout_contains",
+            ),
+        ] {
+            fixture.publish_rows(&[sibling.clone(), failed]);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            match candidates[&id][0].evidence(&id, ResultInput::Current) {
+                Ok(ValidateRowEvidence::Unavailable { reason, result }) => {
+                    assert!(
+                        reason.contains("failed its declared expected output")
+                            && reason.contains(names),
+                        "{label}: {reason}"
+                    );
+                    assert_eq!(result, Some(ObservedResult::CrashError), "{label}");
+                }
+                other => panic!("{label}: the failed expectation was not retained: {other:?}"),
+            }
+            let mut tracked = fixture.cells();
+            let fold = apply_validate_results(
+                &mut tracked,
+                &candidates,
+                &measured,
+                "tree-1",
+                &depth,
+                true,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{label}: the fold was aborted: {error}"));
+            assert_eq!(fold.passed, 1, "{label}: the sibling did not pass");
+            assert_eq!(fold.errored.len(), 1, "{label}: {:?}", fold.errored);
+            assert!(
+                fold.errored[0].contains(&display_id(&id)) && fold.errored[0].contains(names),
+                "{label}: {:?}",
+                fold.errored
+            );
+            let results = |cell_id: &CellId| {
+                let cell = tracked
+                    .cells
+                    .iter()
+                    .find(|cell| &cell.id == cell_id)
+                    .unwrap();
+                assert!(cell.last_tested.is_some(), "{label}: {cell_id:?} unstamped");
+                cell.observations
+                    .iter()
+                    .flat_map(|observation| observation.results.iter().copied())
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(
+                results(&sibling_id),
+                BTreeSet::from([ObservedResult::Pass]),
+                "{label}"
+            );
+            assert_eq!(
+                results(&id),
+                BTreeSet::from([ObservedResult::CrashError]),
+                "{label}"
+            );
+            let error = verify_candidate_set(
+                &BTreeSet::from([id.clone(), sibling_id.clone()]),
+                candidates,
+            )
+            .expect_err(&format!("{label}: verify-results admitted the red"));
+            assert!(
+                error.contains("0 missing, 1 non-passing") && error.contains(&display_id(&id)),
+                "{label} verify-results: {error}"
+            );
+        }
+    }
+
+    /// Only the runner's own expected-output red is retained. A FAIL whose
+    /// reason claims a failed expectation that its matched report or captured
+    /// stdout contradicts, or whose reason is not one the runner writes, is
+    /// still refused, so the exception cannot launder a malformed row.
+    #[test]
+    fn a_stdout_expectation_failure_the_evidence_contradicts_is_refused() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, declared) = declared_exit_row(&measured);
+        let sibling = fixture.row.clone();
+        let mut undeclared = with_matched_exit(&declared, 0);
+        undeclared
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        let observed = "getrandom[0] 918fdb56\n";
+        let expected = "getrandom[0] a29a84d6\n";
+        let undeclared = with_captured_stdout(&undeclared, observed);
+        let exact = expected_stdout_reason("first", observed, expected);
+        let mut wrong_capture = expected_output_failure(&undeclared, &exact);
+        wrong_capture["attempts"][0]["stdout"] = "getrandom[0] 00000000\n".into();
+        let mut marker_present = expected_output_failure(
+            &undeclared,
+            &expected_stdout_contains_reason(observed, "918fdb56"),
+        );
+        marker_present["attempts"][0]["stdout"] = observed.into();
+        for (label, row, expected_error) in [
+            (
+                "observed digest is not the compared runs' stdout",
+                expected_output_failure(
+                    &undeclared,
+                    &expected_stdout_reason("first", "getrandom[0] ffffffff\n", expected),
+                ),
+                "contradicts its evidence",
+            ),
+            (
+                "declared bytes equal the observed bytes",
+                expected_output_failure(
+                    &undeclared,
+                    &expected_stdout_reason("first", observed, observed),
+                ),
+                "contradicts its evidence",
+            ),
+            (
+                "second run differs although the runs matched",
+                expected_output_failure(
+                    &undeclared,
+                    &expected_stdout_reason("second", observed, expected),
+                ),
+                "contradicts its evidence",
+            ),
+            (
+                "captured stdout is not the reported bytes",
+                wrong_capture,
+                "contradicts its evidence",
+            ),
+            (
+                "captured stdout contains the declared text",
+                marker_present,
+                "contradicts its evidence",
+            ),
+            (
+                "declared digest is not SHA-256",
+                expected_output_failure(
+                    &undeclared,
+                    &exact.replace(
+                        &format!("{:x}", Sha256::digest(expected.as_bytes())),
+                        "not-a-digest",
+                    ),
+                ),
+                "contradicts its evidence",
+            ),
+            (
+                "reason the runner does not write",
+                expected_output_failure(&undeclared, "the guest printed something unexpected"),
+                "is a FAIL whose matched report ends as its row allows",
+            ),
+            (
+                "runner text with a suffix",
+                expected_output_failure(&undeclared, &format!("{exact}; and more")),
+                "is a FAIL whose matched report ends as its row allows",
+            ),
+            (
+                "no reason at all",
+                {
+                    let mut row = expected_output_failure(&undeclared, &exact);
+                    row["attempts"][0].as_object_mut().unwrap().remove("reason");
+                    row
+                },
+                "is a FAIL whose matched report ends as its row allows",
+            ),
+        ] {
+            fixture.publish_rows(&[sibling.clone(), row]);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            match candidates[&id][0].evidence(&id, ResultInput::Current) {
+                Err(error) => assert!(error.contains(expected_error), "{label}: {error}"),
+                other => panic!("{label}: the contradiction was retained: {other:?}"),
+            }
+        }
+    }
+
     /// A matched attempt counts only if the runner passed it, exactly as the
     /// series writer reads it: outcome PASS, `timed_out` false and no error
     /// kind, as well as the status and signal its row allows. A PASS row whose

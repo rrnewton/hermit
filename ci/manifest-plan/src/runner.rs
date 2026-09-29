@@ -515,6 +515,39 @@ enum ExpectedStdoutError {
     Mismatch(String),
 }
 
+/// The reason a verify attempt FAILs when the `run` ("first" or "second")
+/// compared run's stdout is not the cell's declared `expected_stdout`.
+///
+/// This text is the only record of that failure: the attempt carries no
+/// timeout and no error kind. The scorecard reader
+/// (ci/compat-envelope/scorecard.rs) recognizes it by rebuilding it with this
+/// function, so the writer and the reader share one spelling.
+pub fn expected_stdout_mismatch_reason(
+    run: &str,
+    observed_bytes: u64,
+    observed_sha256: &str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> String {
+    format!(
+        "verify {run} run stdout ({observed_bytes} bytes, sha256 {observed_sha256}) differs from the declared expected_stdout ({expected_bytes} bytes, sha256 {expected_sha256})"
+    )
+}
+
+/// The reason a verify attempt FAILs when its captured stdout, which equals
+/// both compared runs' stdout, omits the cell's declared
+/// `expected_stdout_contains` text. Shared with the scorecard reader exactly
+/// as [`expected_stdout_mismatch_reason`] is.
+pub fn expected_stdout_contains_mismatch_reason(
+    captured_bytes: u64,
+    captured_sha256: &str,
+    text: &str,
+) -> String {
+    format!(
+        "verify stdout ({captured_bytes} bytes, sha256 {captured_sha256}) does not contain the declared expected_stdout_contains text {text:?}"
+    )
+}
+
 /// Compare both runs a verify report compared with the declared stdout bytes.
 ///
 /// The report carries each run's stdout digest and length, so the check needs
@@ -533,10 +566,15 @@ fn check_expected_stdout(
     let expected_bytes = expected.len() as u64;
     for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
         if output.stdout_sha256 != expected_sha256 || output.stdout_bytes != expected_bytes {
-            return Err(ExpectedStdoutError::Mismatch(format!(
-                "verify {run} run stdout ({} bytes, sha256 {}) differs from the declared expected_stdout ({expected_bytes} bytes, sha256 {expected_sha256})",
-                output.stdout_bytes, output.stdout_sha256
-            )));
+            return Err(ExpectedStdoutError::Mismatch(
+                expected_stdout_mismatch_reason(
+                    run,
+                    output.stdout_bytes,
+                    &output.stdout_sha256,
+                    expected_bytes,
+                    &expected_sha256,
+                ),
+            ));
         }
     }
     Ok(())
@@ -576,9 +614,9 @@ fn check_expected_stdout_contains(
     {
         Ok(())
     } else {
-        Err(ExpectedStdoutError::Mismatch(format!(
-            "verify stdout ({captured_bytes} bytes, sha256 {captured_sha256}) does not contain the declared expected_stdout_contains text {text:?}"
-        )))
+        Err(ExpectedStdoutError::Mismatch(
+            expected_stdout_contains_mismatch_reason(captured_bytes, &captured_sha256, text),
+        ))
     }
 }
 
