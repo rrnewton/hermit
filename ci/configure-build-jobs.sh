@@ -520,8 +520,20 @@ fi
 # 117d54d744df23921c531d0fe08537249f5a510a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6297f7154299e30bed97e6aead6ae7f5e1fc45ed ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6297f7154299e30bed97e6aead6ae7f5e1fc45ed (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 2eeb704cefb166ef7411478a1bb37e2867cf3644 (2026-09-29): from
+# 6297f7154299e30bed97e6aead6ae7f5e1fc45ed, the 51-commit range changes reverie-dbt
+# native/client.c, src/ and tests/ (tree a62d15302ee5e907667d1c02f6e629177ad87f61
+# -> 0e92df9a7348861fab977a98165a616da6c4f41f), none of which is a DynamoRIO SDK
+# recipe input: build_dynamorio times only the CMake configure/build of
+# vendor/dynamorio. build.rs remains blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0;
+# DynamoRIO remains tree 117d54d744df23921c531d0fe08537249f5a510a; third-party
+# remains tree fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains
+# blob 4168dea2771f18a00fb1afdfd2218efba415ecbb. rust-toolchain.toml changes only
+# an @fb-only comment. CMAKE/CMAKE_GENERATOR selection, MAX_PARALLEL_JOBS=16 and
+# 1050 effective-job-seconds carry unchanged. This is source-identity carry, not
+# a new timing sample or runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 2eeb704cefb166ef7411478a1bb37e2867cf3644 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 2eeb704cefb166ef7411478a1bb37e2867cf3644 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
