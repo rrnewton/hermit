@@ -7847,7 +7847,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "759",
+        "NEXTEST_EXPECTED_EXECUTED": "754",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -8961,7 +8961,7 @@
       "group": "privileged-test",
       "job": "pmu_ptrace_completion_cases",
       "desc": "Run the five real-random ptrace completion cases that arm the reverie PMU timer",
-      "description": "The five ptrace_completion::tests::real_random_ cases run a real guest under Reverie ptrace with the default timeslice, which arms the PMU timer; without a PMU the run is refused with Perf support required. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.hermit_unit and its hosted twin skip exactly these five and this node runs them in full, after privileged-pmu.preemption has shown the PMU works. Measured on devbig014: the five pass in 1.94 s wall with a 33 MB peak RSS; the hint keeps the pmu_buck_chaos_cases budget shape.",
+      "description": "The five ptrace_completion::tests::real_random_ cases run a real guest under Reverie ptrace with the default timeslice, which arms the PMU timer; without a PMU the run is refused with Perf support required. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.hermit_unit and its hosted twin skip exactly these five and this node runs them in full, after privileged-pmu.preemption has shown the PMU works. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\": the five pass in 1.94 s wall with a 33 MB peak RSS; the hint keeps the pmu_buck_chaos_cases budget shape.",
       "labels": [
         "full"
       ],
@@ -9010,7 +9010,7 @@
       "group": "privileged-test",
       "job": "pmu_cli_cases",
       "desc": "Run the CLI cases whose subject is the PMU",
-      "description": "skid_overshoot_and_guest_failure_have_different_exit_codes asserts that the skid injector induces a PMU overshoot, so the PMU is its subject; on a host without one it fails with skid injector did not induce an overshoot. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.cli and test.cli_on_host skip exactly this case and this node runs it in full. The four ptrace nonleader-exec cases run_ptrace_nonleader_exec_{preserves_identity_and_time,preserves_preemption,displaces_runnable_leader,refuses_preemption_artifacts} assert the actual PMU counter, the PMU timer and PMU preemption across exec; with perf_event_open blocked (EACCES) they fail with worker clock accounted before exec or actual PMU preemption, or the displaced leader never yields and hits its 54 s wall limit, while run_ptrace_nonleader_exec_exit_only passes and stays in test.cli (measured at 70222e6c, https://github.com/rrnewton/hermit/pull/3268). They are skipped by exact name in test.cli and test.cli_on_host and run here, after privileged-pmu.preemption has shown the PMU works. It consumes the shared cli binary published by privileged-build.privileged_tests and therefore holds the integration_test_binaries.cli token like the other consumers. Measured on devbig014: 0.44 s for the skid case; the five nonleader-exec CLI cases took 69.6-82.7 s together on devbig030, so the wall limit is 300 s.",
+      "description": "skid_overshoot_and_guest_failure_have_different_exit_codes asserts that the skid injector induces a PMU overshoot, so the PMU is its subject; on a host without one it fails with skid injector did not induce an overshoot. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.cli and test.cli_on_host skip exactly this case and this node runs it in full. The four ptrace nonleader-exec cases run_ptrace_nonleader_exec_{preserves_identity_and_time,preserves_preemption,displaces_runnable_leader,refuses_preemption_artifacts} assert the actual PMU counter, the PMU timer and PMU preemption across exec; with perf_event_open blocked (EACCES) they fail with worker clock accounted before exec or actual PMU preemption, or the displaced leader never yields and hits its 54 s wall limit, while run_ptrace_nonleader_exec_exit_only passes and stays in test.cli (https://github.com/rrnewton/hermit/pull/3268). They are skipped by exact name in test.cli and test.cli_on_host and run here, after privileged-pmu.preemption has shown the PMU works. It consumes the shared cli binary published by privileged-build.privileged_tests and therefore holds the integration_test_binaries.cli token like the other consumers. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\": 0.44 s for the skid case, and 69.6-82.7 s together for the five nonleader-exec CLI cases, so the wall limit is 300 s.",
       "labels": [
         "full"
       ],
@@ -62278,7 +62278,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "759",
+        "NEXTEST_EXPECTED_EXECUTED": "754",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

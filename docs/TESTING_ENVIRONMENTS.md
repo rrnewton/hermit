@@ -211,6 +211,10 @@ erasing the host; this table is where the erased identities go back.
 | pre-push submodule diagnosis | `devbig014` | On 2026-09-04, a fresh detached worktree with unpopulated submodules made Cargo fail before linting a Python-and-Makefile-only change; the hook incorrectly described that as a compile failure until the diagnosis was made explicit. |
 | `portable` lane, node `test.hermit_unit` | `devbig030` | Warm repeats at `a6b0c37648df`: nextest `-j1` 27.0s and 27.3s; `-j16` 14.4s and 13.7s; `CARGO_BUILD_JOBS=8` unchanged |
 | `refusal_detail_tests::REAL` in `scripts/validate.rs`, run 1838 | `devbig014` | On 2026-09-17, validation of `158a89f6217b25db9540237f9c1e256cdbaf785c` recorded `parity history changes candidate identity` for `portable/backend-parity-c/backend-parity-c/aio-refusal/verify@kvm`, run `validate-ops-tick-158a89f6217b-088d91951315`, outer attempt 2. The original 407-byte diagnostic is preserved unchanged in `tests/fixtures/scorecard-writeback/refusal.txt` and included as test data; its historical artifact path is evidence, not a runtime filesystem dependency. |
+| `privileged` lane, node `privileged-test.pmu_ptrace_completion_cases` | `devbig014` | The five `ptrace_completion::tests::real_random_` cases pass in 1.94 s wall with a 33 MB peak RSS |
+| `privileged` lane, node `privileged-test.pmu_cli_cases` | `devbig014` | `skid_overshoot_and_guest_failure_have_different_exit_codes` passes in 0.44 s |
+| validation CPU placement, `scripts/lib/safe_ci_scope.rs` (https://github.com/rrnewton/hermit/issues/3265) | `devbig014` | A ptrace-stop-heavy cell costs 7.6-7.9x the CPU on the CPUs the AMD uncore and L3 PMUs are bound to |
+| `portable` cell `data-handling/dd-partial-transfers` payload, `tests/e2e/manifests/data-handling.yaml` (https://github.com/rrnewton/hermit/issues/3337) | `devbig014` | 2026-09-28 at Hermit `ad21724d5f64`, ptrace verify: payload 4096 -> 512 bytes; debug median CPU 18.59 s -> 4.76 s, release 4.39 s -> 1.14 s over 5 runs each |
 
 ## Hardware-sensitive Cargo tests
 
