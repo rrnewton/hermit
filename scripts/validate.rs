@@ -6843,6 +6843,208 @@ fn append_validate_series(
     Ok(true)
 }
 
+/// The parity cells each planned manifest node's post-pass owes, keyed
+/// `<lane>/manifest_<category>` as the node's result directory is, from the
+/// same rule the harness applies (`parity::resolve_scope` over the node's
+/// planned verify cells, with the node's `E2E_PARITY_SELECT` and
+/// `E2E_PARITY_POST_PASS`). A node withheld as host-inapplicable planned
+/// nothing and owes nothing. It only matters for a node that left no
+/// `parity.status.json` at all, or an unfinished schema-1 one: a harness that
+/// started names its own scope in the status it writes before any cell runs.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+fn validate_parity_expected_scope<'a>(
+    root: &Path,
+    steps: impl IntoIterator<Item = &'a Step>,
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+) -> Result<hermit_manifest_plan::parity::ExpectedScope, String> {
+    use hermit_manifest_plan::parity;
+    let withheld = host_inapplicable
+        .iter()
+        .map(|node| node.tag.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut manifests = None;
+    let mut expected = parity::ExpectedScope::new();
+    for step in steps {
+        let Some(manifest) = step.manifest.as_ref() else {
+            continue;
+        };
+        if validation_step_identity(step) != ValidationStepIdentity::ManifestRun
+            || !matches!(manifest.lane.as_str(), "portable" | "privileged")
+            || withheld.contains(step.tag().as_str())
+        {
+            continue;
+        }
+        let setting = |name: &str| {
+            step.env
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        };
+        match setting(parity::PARITY_POST_PASS_ENV).as_deref() {
+            None | Some("1") => {}
+            Some("0") => continue,
+            Some(other) => {
+                return Err(format!(
+                    "{} is {other:?} for {}; the harness refuses to start",
+                    parity::PARITY_POST_PASS_ENV,
+                    step.tag()
+                ));
+            }
+        }
+        let (selection, _) = manifest_step_policy(step)?;
+        if manifests.is_none() {
+            manifests = Some(
+                ManifestSet::load(root)
+                    .map_err(|error| format!("cannot load E2E manifests: {error}"))?,
+            );
+        }
+        let manifests = manifests.as_ref().expect("loaded above");
+        let planned = manifests
+            .select(&selection)
+            .map_err(|error| format!("cannot select cells for {}: {error}", step.tag()))?
+            .into_iter()
+            .filter(|cell| cell.id.mode == parity::PARITY_MODE)
+            .filter_map(|cell| cell.id.backend.map(|backend| (cell.id.test, backend)))
+            .collect::<BTreeSet<_>>();
+        let explicit = setting(parity::PARITY_SELECT_ENV);
+        let scope = parity::resolve_scope(root, manifests, explicit.as_deref(), &planned)
+            .map_err(|error| format!("{}: {error}", step.tag()))?;
+        if !scope.cells.is_empty() {
+            expected
+                .entry(format!(
+                    "{}/manifest_{}",
+                    manifest.lane,
+                    manifest.category.replace('-', "_")
+                ))
+                .or_default()
+                .extend(scope.cells);
+        }
+    }
+    Ok(expected)
+}
+
+/// Count the rows of one parity export by verdict, for the one line the
+/// append prints.
+fn parity_row_counts(rows: &[hermit_manifest_plan::parity::ParityLedgerSource]) -> String {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for row in rows {
+        *counts.entry(row.verdict.as_str()).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(verdict, count)| format!("{verdict} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Send this run's parity rows, as `parity::ledger_sources` reads them from
+/// the post-pass outputs under `e2e_result_root`, to the parent's
+/// `series.py append-parity`. Parity is measured after determinism and never
+/// decides the run, so nothing here fails it: the outcome is one line for the
+/// log, `None` when there is no parent to append to. A tool root whose writer
+/// predates `append-parity` is named, with the rows left where they are, so
+/// the run can be exported later with `test-harness parity export`.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+fn append_validate_parity(
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+    e2e_result_root: &Path,
+    expected: Option<&hermit_manifest_plan::parity::ExpectedScope>,
+    run_id: Option<&str>,
+    tree: &str,
+) -> Option<String> {
+    let parent = parent?;
+    let rows = match hermit_manifest_plan::parity::ledger_sources(e2e_result_root, expected) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return Some(format!(
+                "parity: ERROR: no parity rows appended; the post-pass outputs under {} \
+                 were refused: {error}",
+                e2e_result_root.display()
+            ));
+        }
+    };
+    if rows.is_empty() {
+        return Some(format!(
+            "parity: no parity cells were in scope under {}; nothing appended",
+            e2e_result_root.display()
+        ));
+    }
+    let left = |why: &str| {
+        Some(format!(
+            "parity: {why}; {} rows left in {} ({})",
+            rows.len(),
+            e2e_result_root.display(),
+            parity_row_counts(&rows)
+        ))
+    };
+    let Some(tool_root) = tool_root else {
+        return left("no executable tool root");
+    };
+    let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) else {
+        return left("E2E_RUN_ID is missing");
+    };
+    let script = tool_root.join("ci-hub/series/series.py");
+    match std::fs::read(&script) {
+        Ok(bytes)
+            if bytes
+                .windows(b"append-parity".len())
+                .any(|w| w == b"append-parity") => {}
+        Ok(_) => return left("tool root has no append-parity"),
+        Err(error) => return left(&format!("cannot read {}: {error}", script.display())),
+    }
+    let mut input = Vec::new();
+    for row in &rows {
+        serde_json::to_writer(&mut input, row).expect("a validated ledger source row serializes");
+        input.push(b'\n');
+    }
+    let mut child = match Command::new("python3")
+        .arg(&script)
+        .arg("append-parity")
+        .arg("--parent")
+        .arg(parent)
+        .arg("--producer")
+        .arg("validate")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--tree")
+        .arg(tree)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return left(&format!("cannot run {}: {error}", script.display())),
+    };
+    let sent = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&input))
+        .unwrap_or_else(|| Err(std::io::Error::other("no writable stdin")));
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => return left(&format!("cannot wait for {}: {error}", script.display())),
+    };
+    if let Err(error) = sent {
+        return left(&format!("cannot send rows to append-parity: {error}"));
+    }
+    if !output.status.success() {
+        return left(&format!(
+            "ERROR: append-parity refused them ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Some(format!(
+        "parity: appended {} row(s) from {} ({}): {}",
+        rows.len(),
+        e2e_result_root.display(),
+        parity_row_counts(&rows),
+        String::from_utf8_lossy(&output.stdout).trim()
+    ))
+}
+
 /// Merge one top-level validate's completed per-cell rows into the tracked
 /// scorecard files. Nested and off-the-record validates leave the tracked view
 /// untouched; only a receipt-producing top-level run owns that projection.
@@ -23573,6 +23775,44 @@ fn run(
             }
         }
     };
+    // Parity is measured after determinism and appended beside it, under the
+    // same gate, and never decides this run: every outcome is one log line.
+    if should_write_scorecard(
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+        release_builder,
+    ) {
+        let expected = match validate_parity_expected_scope(
+            &root,
+            execution_plan.cfg.steps.iter().chain(
+                execution_plan
+                    .second
+                    .iter()
+                    .flat_map(|second| second.steps.iter()),
+            ),
+            &plan.host_inapplicable,
+        ) {
+            Ok(expected) => Some(expected),
+            Err(error) => {
+                eprintln!(
+                    "validate: parity: expected scope unavailable, so a planned node that left \
+                     no parity status is not reported as record-missing: {error}"
+                );
+                None
+            }
+        };
+        let run_id = std::env::var("E2E_RUN_ID").ok();
+        if let Some(line) = append_validate_parity(
+            parent.as_deref(),
+            tool_root.as_deref(),
+            &e2e_result_root,
+            expected.as_ref(),
+            run_id.as_deref(),
+            &commit,
+        ) {
+            eprintln!("validate: {line}");
+        }
+    }
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
     let (peak_active, peak_live) = match &monitor {
@@ -24617,6 +24857,309 @@ fn stop_test_seam(
         s.ledger = Some(ledger);
     }
     s
+}
+
+#[cfg(test)]
+mod parity_append_tests {
+    //! The validate parity append of
+    //! <https://github.com/rrnewton/hermit/issues/3301>: what reaches
+    //! `series.py append-parity`, and that no outcome of it fails the run.
+    use super::*;
+
+    const TREE: &str = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
+    const RUN: &str = "validate-parity-fixture";
+
+    /// RUN 1953's first portable record, with this fixture's run id.
+    fn diverged_record() -> String {
+        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
+            .replace("RUN", RUN)
+            .replace("TREE", TREE)
+    }
+
+    fn status(state: &str, scope: &[&str], error: Option<&str>) -> String {
+        serde_json::json!({
+            "schema": 2, "state": state, "run_id": RUN, "hermit_sha": TREE,
+            "hermit_bin": "/src/hermit", "hermit_bin_sha256": null,
+            "records": "/results/parity.jsonl", "cells": scope.len(), "scope": scope,
+            "summary": null, "error": error,
+        })
+        .to_string()
+    }
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(label: &str, writer: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "validate-parity-append-{}-{label}-{}",
+                std::process::id(),
+                epoch_now()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let portable = root.join("e2e/portable/manifest_c_programs");
+            let privileged = root.join("e2e/privileged/manifest_c_programs");
+            for dir in [
+                root.join("parent"),
+                root.join("tool/ci-hub/series"),
+                portable.clone(),
+                privileged.clone(),
+            ] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(root.join("tool/ci-hub/series/series.py"), writer).unwrap();
+            std::fs::write(
+                portable.join("parity.status.json"),
+                status("complete", &["c-programs/aio-refusal@kvm"], None),
+            )
+            .unwrap();
+            std::fs::write(portable.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+            std::fs::write(
+                privileged.join("parity.status.json"),
+                status(
+                    "failed",
+                    &[
+                        "c-programs/cpuid-probe@kvm",
+                        "c-programs/cpuid-probe@liteinst",
+                    ],
+                    Some("log-diff timed out"),
+                ),
+            )
+            .unwrap();
+            Fixture { root }
+        }
+
+        fn expected(&self) -> hermit_manifest_plan::parity::ExpectedScope {
+            hermit_manifest_plan::parity::parse_expected_scope(
+                r#"{"portable/manifest_system_utils": ["system-utils/ls@sabre"]}"#,
+            )
+            .unwrap()
+        }
+
+        fn append(&self, parent: bool) -> Option<String> {
+            append_validate_parity(
+                parent.then(|| self.root.join("parent")).as_deref(),
+                Some(&self.root.join("tool")),
+                &self.root.join("e2e"),
+                Some(&self.expected()),
+                Some(RUN),
+                TREE,
+            )
+        }
+
+        fn captured(&self) -> Option<serde_json::Value> {
+            std::fs::read(self.root.join("parent/captured.json"))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const WRITER: &str = r#"import json, pathlib, sys
+# fixture for series.py append-parity
+parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
+print("fixture parity append accepted")
+"#;
+
+    #[test]
+    fn complete_failed_and_absent_nodes_all_reach_append_parity() {
+        let fixture = Fixture::new("rows", WRITER);
+        let line = fixture.append(true).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "parity: appended 4 row(s) from {} (diverged 1, record-missing 3): \
+                 fixture parity append accepted",
+                fixture.root.join("e2e").display()
+            )
+        );
+        let captured = fixture.captured().expect("append-parity was called");
+        let argv = captured["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "append-parity");
+        let parent = fixture.root.join("parent").display().to_string();
+        for pair in [
+            ["--parent", parent.as_str()],
+            ["--producer", "validate"],
+            ["--run-id", RUN],
+            ["--tree", TREE],
+        ] {
+            assert!(
+                argv.windows(2).any(|window| window == pair),
+                "{pair:?} missing from {argv:?}"
+            );
+        }
+        let rows = captured["stdin"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let seen = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["cell"].as_str().unwrap().to_string(),
+                    row["verdict"].as_str().unwrap().to_string(),
+                    row["source"]["post_pass_state"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expect = |cell: &str, verdict: &str, state: &str| {
+            (cell.to_string(), verdict.to_string(), state.to_string())
+        };
+        assert_eq!(
+            seen,
+            [
+                expect("c-programs/aio-refusal@kvm", "diverged", "complete"),
+                expect("system-utils/ls@sabre", "record-missing", "absent"),
+                expect("c-programs/cpuid-probe@kvm", "record-missing", "failed"),
+                expect(
+                    "c-programs/cpuid-probe@liteinst",
+                    "record-missing",
+                    "failed"
+                ),
+            ]
+        );
+        // The record reaches the writer byte-for-byte as the post-pass wrote
+        // it: same fields, same order, so the raw row text contains it.
+        let first_line = captured["stdin"].as_str().unwrap().lines().next().unwrap();
+        assert!(
+            first_line.contains(&format!(r#""record":{}"#, diverged_record())),
+            "the record reaches the writer byte-for-byte: {first_line}"
+        );
+        assert_eq!(
+            rows[2]["reason"],
+            "parity post-pass failed: log-diff timed out"
+        );
+    }
+
+    #[test]
+    fn a_writer_without_append_parity_is_named_and_leaves_the_rows() {
+        let legacy = WRITER.replace("# fixture for series.py append-parity\n", "");
+        let fixture = Fixture::new("legacy", &legacy);
+        assert_eq!(
+            fixture.append(true).unwrap(),
+            format!(
+                "parity: tool root has no append-parity; 4 rows left in {} \
+                 (diverged 1, record-missing 3)",
+                fixture.root.join("e2e").display()
+            )
+        );
+        assert!(
+            fixture.captured().is_none(),
+            "a legacy writer is never called"
+        );
+    }
+
+    #[test]
+    fn with_the_gate_off_nothing_is_called() {
+        let fixture = Fixture::new("gate", WRITER);
+        assert_eq!(fixture.append(false), None);
+        assert!(fixture.captured().is_none());
+        // The gate the call site applies before calling at all.
+        assert!(!should_write_scorecard(true, false, RELEASE_BUILDER_CARGO));
+        assert!(!should_write_scorecard(false, true, RELEASE_BUILDER_CARGO));
+        assert!(should_write_scorecard(false, false, RELEASE_BUILDER_CARGO));
+    }
+
+    #[test]
+    fn refused_outputs_and_a_refusing_writer_are_lines_not_failures() {
+        let refusing = WRITER.replace(
+            "print(\"fixture parity append accepted\")",
+            "sys.exit(\"fixture refusal\")",
+        );
+        let fixture = Fixture::new("refusing", &refusing);
+        let line = fixture.append(true).unwrap();
+        assert!(
+            line.starts_with("parity: ERROR: append-parity refused them (exit status: 1): fixture refusal; 4 rows left in "),
+            "{line}"
+        );
+        // Records with no status beside them cannot be attributed.
+        let stray = fixture.root.join("e2e/portable/manifest_system_utils");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+        let line = fixture.append(true).unwrap();
+        assert!(
+            line.starts_with(
+                "parity: ERROR: no parity rows appended; the post-pass outputs under "
+            ) && line.contains("has no parity.status.json beside it"),
+            "{line}"
+        );
+    }
+
+    /// The committed DAG's manifest nodes owe exactly the committed
+    /// selection: 192 cells, 190 from the portable c-programs node and 2 from
+    /// the privileged one, as RUN 1953 measured. A node whose environment
+    /// turns the post-pass off owes nothing, and a withheld node plans
+    /// nothing.
+    #[test]
+    fn the_committed_nodes_owe_the_committed_selection() {
+        let root = test_source_root();
+        let steps = validate_plan::validation_config(&root).unwrap().steps;
+        let expected = validate_parity_expected_scope(&root, steps.iter(), &[]).unwrap();
+        let sizes = expected
+            .iter()
+            .map(|(node, cells)| (node.as_str(), cells.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sizes,
+            [
+                ("portable/manifest_c_programs", 190),
+                ("privileged/manifest_c_programs", 2)
+            ]
+        );
+        assert!(
+            expected["privileged/manifest_c_programs"]
+                .iter()
+                .all(|cell| cell.test_id == "c-programs/cpuid-probe")
+        );
+
+        let mut off = steps.clone();
+        for step in &mut off {
+            if step.tag().contains("privileged") {
+                step.env.insert("E2E_PARITY_POST_PASS".into(), "0".into());
+            }
+        }
+        let expected = validate_parity_expected_scope(&root, off.iter(), &[]).unwrap();
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            ["portable/manifest_c_programs"]
+        );
+        let withheld = steps
+            .iter()
+            .filter(|step| {
+                step.manifest.as_ref().is_some_and(|manifest| {
+                    manifest.lane == "portable" && manifest.category == "c-programs"
+                })
+            })
+            .map(|step| validate_plan::HostInapplicableNode {
+                tag: step.tag(),
+                capability: validate_plan::HostCapability::Kvm,
+                evidence: "fixture".into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!withheld.is_empty());
+        let expected = validate_parity_expected_scope(&root, steps.iter(), &withheld).unwrap();
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            ["privileged/manifest_c_programs"]
+        );
+    }
 }
 
 #[cfg(test)]
