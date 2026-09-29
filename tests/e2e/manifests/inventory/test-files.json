@@ -157,12 +157,6 @@
       "why": "tests/backend-parity/e9patch_corpus/writev_multi.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a single writev with three iovecs emits the gathered bytes atomically and returns the correct total byte count, proving gathered-write output parity between e9patch preprocessing and golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
-      "disposition": "guest-fixture",
-      "path": "tests/backend-parity/fixtures/mountinfo_device_identity.c",
-      "runner": "hermit-cli/tests/kvm_harder.rs",
-      "why": "tests/backend-parity/fixtures/mountinfo_device_identity.c is owned by hermit-cli/tests/kvm_harder.rs: The KVM integration suite compiles this focused guest and checks deterministic mountinfo device identities through its backend-specific execution contract; it is not a standalone manifest program."
-    },
-    {
       "disposition": "special-driver",
       "path": "tests/backend-parity/run_matrix.py",
       "runner": "make validate-kvm/validate-dbt and the nightly Buck shadow driver scripts/build-buck-release.rs",
@@ -983,6 +977,12 @@
       "path": "tests/c/mount_nscd_order.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs and hermit-cli/tests/record_replay.rs",
       "why": "tests/c/mount_nscd_order.c is owned by hermit-cli/tests/procfs_determinism.rs and hermit-cli/tests/record_replay.rs: Those integration suites compile the guest and assert stable mount and nscd ordering across both procfs observation and recording-stream lifecycles."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/mountinfo_device_identity.c",
+      "runner": "hermit-cli/tests/kvm_harder.rs",
+      "why": "tests/c/mountinfo_device_identity.c is owned by hermit-cli/tests/kvm_harder.rs: The KVM integration suite compiles this focused guest and checks deterministic mountinfo device identities through its backend-specific execution contract; it is not a standalone manifest program."
     },
     {
       "disposition": "manifest-test",
