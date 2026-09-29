@@ -653,6 +653,117 @@ const HERMETIC_TEST_WORKDIR: &str = "/test";
 const FIXED_GUEST_WORKDIR: &str = "/tmp/test";
 const FIXED_WORKDIR_SOURCE_DIR: &str = "workdir";
 
+/// One per-cell input directory a verify cell binds to a fixed guest path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EqualizedInput {
+    /// The directory below the cell directory (`prepare_dirs` creates it).
+    pub cell_subdir: &'static str,
+    /// The guest environment variable that names the directory.
+    pub env: &'static str,
+    /// Where the guest sees the directory: below [`EQUALIZED_INPUT_ROOT`].
+    pub guest_path: &'static str,
+}
+
+/// Guest directory below which a verify cell's per-cell inputs are bound.
+///
+/// Every cell runs from its own directory, and that directory's name contains
+/// the backend (see [`cell_artifact_path`]). Handing the guest those host
+/// paths gives the ptrace and candidate runs of one test a different HOME,
+/// XDG_CONFIG_HOME, fixture directory and program path, and those strings
+/// alone make ptrace diverge from ptrace: 16 of 18 pairs in the S0 control
+/// (<https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696>).
+/// Binding each directory to the same guest path, and naming only guest paths
+/// in the guest's environment and argv, gives every backend that honours
+/// `--bind` the same guest-visible inputs. The dbt backend refuses `--bind`,
+/// so its cells keep the host paths (see [`equalizes_guest_inputs`]).
+///
+/// It is below guest `/tmp` because `--bind` accepts only targets there;
+/// every such guest gets a private tmpfs `/tmp`, in which the bind targets
+/// are created.
+pub const EQUALIZED_INPUT_ROOT: &str = "/tmp/e2e";
+
+/// The inputs bound below [`EQUALIZED_INPUT_ROOT`], in argv order.
+pub const EQUALIZED_INPUTS: [EqualizedInput; 3] = [
+    EqualizedInput {
+        cell_subdir: "home",
+        env: "HOME",
+        guest_path: "/tmp/e2e/home",
+    },
+    EqualizedInput {
+        cell_subdir: "xdg-config",
+        env: "XDG_CONFIG_HOME",
+        guest_path: "/tmp/e2e/xdg-config",
+    },
+    EqualizedInput {
+        cell_subdir: "fixtures",
+        env: "E2E_FIXTURE_DIR",
+        guest_path: "/tmp/e2e/fixtures",
+    },
+];
+
+/// Whether a cell's guest is given the equalized inputs.
+///
+/// Only `verify` cells are, because only they are compared across backends
+/// (the parity post-pass). Other modes keep the host paths they always had.
+/// The dbt backend refuses `--bind` (`hermit-cli/src/bin/hermit/run.rs`: "the
+/// dbt backend cannot apply --mount or --bind"), so a dbt cell cannot be given
+/// them and its parity rows say `inputs-not-equalized`.
+pub fn equalizes_guest_inputs(mode: &str, backend: &str) -> bool {
+    mode == "verify" && backend != "dbt"
+}
+
+/// The guest path of a host path at or below one of `cell_dir`'s equalized
+/// input directories, or `None` for any other value.
+fn equalized_guest_path(cell_dir: &Path, value: &str) -> Option<String> {
+    EQUALIZED_INPUTS.iter().find_map(|input| {
+        let host = cell_dir.join(input.cell_subdir);
+        let host = host.to_str()?;
+        if value == host {
+            Some(input.guest_path.to_string())
+        } else {
+            value
+                .strip_prefix(host)
+                .filter(|rest| rest.starts_with('/'))
+                .map(|rest| format!("{}{rest}", input.guest_path))
+        }
+    })
+}
+
+/// `guest_argv` with each whole argument that names a path in one of the
+/// cell's equalized input directories rewritten to its guest path, so the
+/// program is launched as `/tmp/e2e/fixtures/program`. A path embedded in a
+/// longer argument is left alone; it still names a host file the guest can
+/// read, and the parity post-pass then sees unequal argv and reports the
+/// comparison as not equalized.
+fn equalized_guest_argv(cell_dir: &Path, guest_argv: Vec<String>) -> Vec<String> {
+    guest_argv
+        .into_iter()
+        .map(|arg| equalized_guest_path(cell_dir, &arg).unwrap_or(arg))
+        .collect()
+}
+
+/// The cell environment as the guest of an equalized cell sees it: each
+/// equalized variable names its guest path. The row keeps the host paths,
+/// which name where the directories really are.
+fn equalized_guest_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = env.clone();
+    for input in EQUALIZED_INPUTS {
+        env.insert(input.env.into(), input.guest_path.into());
+    }
+    env
+}
+
+/// Bind each equalized input directory of `cell_dir` to its guest path.
+fn append_equalized_input_binds(argv: &mut Vec<String>, cell_dir: &Path) {
+    for input in EQUALIZED_INPUTS {
+        argv.push(format!(
+            "--bind={}:{}",
+            cell_dir.join(input.cell_subdir).to_string_lossy(),
+            input.guest_path
+        ));
+    }
+}
+
 fn fixed_workdir_source_for_attempt(cell_dir: &Path, attempt: &str) -> Result<PathBuf, String> {
     let mut components = Path::new(attempt).components();
     let is_one_normal_component = matches!(
@@ -2576,6 +2687,14 @@ pub fn build_spec(
     // hermetic tmpfs path does not remove this path-safety property.
     let fixed_workdir_source = fixed_workdir_source_for_attempt(&dir, attempt)?;
     let backend = cell.id.backend.as_deref().unwrap_or("native");
+    let equalized_inputs = equalizes_guest_inputs(&cell.id.mode, backend);
+    // The recorded guest argv is the argv after `--`, so both carry the guest
+    // paths of an equalized cell.
+    let guest_argv = if equalized_inputs {
+        equalized_guest_argv(&dir, guest_argv)
+    } else {
+        guest_argv
+    };
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
     if cell.id.mode != "naked" {
@@ -2661,7 +2780,12 @@ pub fn build_spec(
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
             );
-            append_guest_env_args(&mut argv, &env, isolated);
+            if equalized_inputs {
+                append_equalized_input_binds(&mut argv, &dir);
+                append_guest_env_args(&mut argv, &equalized_guest_env(&env), isolated);
+            } else {
+                append_guest_env_args(&mut argv, &env, isolated);
+            }
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -5788,6 +5912,67 @@ mod tests {
     }
 
     fn assert_minimal_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+        assert_minimal_base_env(argv);
+        assert_eq!(
+            guest_env_args(argv),
+            vec![
+                "LC_ALL=C".to_string(),
+                "TZ=UTC".to_string(),
+                format!("HOME={dir}/home"),
+                format!("XDG_CONFIG_HOME={dir}/xdg-config"),
+                format!("E2E_TMPDIR={tmp}"),
+                format!("E2E_FIXTURE_DIR={dir}/fixtures"),
+                format!("HERMIT_E2E_SCHEDULED_JOBS={jobs}"),
+            ],
+            "the guest environment is an exact allowlist; an added, removed, or inherited name is a regression"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains(EQUALIZED_INPUT_ROOT)),
+            "a cell that is not equalized binds nothing below {EQUALIZED_INPUT_ROOT}: {argv:?}"
+        );
+    }
+
+    /// The guest of an equalized verify cell names only guest paths, and each
+    /// of the cell's input directories is bound at the path it names.
+    fn assert_equalized_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+        assert_minimal_base_env(argv);
+        assert_eq!(
+            guest_env_args(argv),
+            vec![
+                "LC_ALL=C".to_string(),
+                "TZ=UTC".to_string(),
+                "HOME=/tmp/e2e/home".to_string(),
+                "XDG_CONFIG_HOME=/tmp/e2e/xdg-config".to_string(),
+                format!("E2E_TMPDIR={tmp}"),
+                "E2E_FIXTURE_DIR=/tmp/e2e/fixtures".to_string(),
+                format!("HERMIT_E2E_SCHEDULED_JOBS={jobs}"),
+            ],
+            "the guest environment is an exact allowlist; an added, removed, or inherited name is a regression"
+        );
+        let separator = argv.iter().position(|arg| arg == "--").unwrap();
+        let binds = argv[..separator]
+            .iter()
+            .filter(|arg| arg.starts_with("--bind=") && arg.contains(EQUALIZED_INPUT_ROOT))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            binds,
+            [
+                format!("--bind={dir}/home:/tmp/e2e/home"),
+                format!("--bind={dir}/xdg-config:/tmp/e2e/xdg-config"),
+                format!("--bind={dir}/fixtures:/tmp/e2e/fixtures"),
+            ],
+            "{argv:?}"
+        );
+        assert!(
+            !argv[..separator]
+                .iter()
+                .any(|arg| arg.contains(&format!("={dir}/")) && !arg.starts_with("--bind=")),
+            "no guest environment value names a host cell path: {argv:?}"
+        );
+    }
+
+    fn assert_minimal_base_env(argv: &[String]) {
         let mut base_env = Vec::new();
         let mut index = 0;
         while index < argv.len() {
@@ -5803,19 +5988,6 @@ mod tests {
             base_env,
             ["minimal"],
             "every hermetic Hermit cell must select the minimal base environment exactly once: {argv:?}"
-        );
-        assert_eq!(
-            guest_env_args(argv),
-            vec![
-                "LC_ALL=C".to_string(),
-                "TZ=UTC".to_string(),
-                format!("HOME={dir}/home"),
-                format!("XDG_CONFIG_HOME={dir}/xdg-config"),
-                format!("E2E_TMPDIR={tmp}"),
-                format!("E2E_FIXTURE_DIR={dir}/fixtures"),
-                format!("HERMIT_E2E_SCHEDULED_JOBS={jobs}"),
-            ],
-            "the guest environment is an exact allowlist; an added, removed, or inherited name is a regression"
         );
     }
 
@@ -8461,7 +8633,7 @@ backends_disabled:
             .position(|args| args == ["--workdir", "/test"])
             .unwrap();
         assert!(mount < separator && workdir < separator);
-        assert_minimal_guest_env(&spec.argv, "/repo/results/cell", "/test", "7");
+        assert_equalized_guest_env(&spec.argv, "/repo/results/cell", "/test", "7");
 
         let mut replay_test = recipe(true);
         let replay_mode = replay_test.modes.remove("verify").unwrap();
@@ -8837,6 +9009,131 @@ backends_disabled:
         );
     }
 
+    /// A verify cell's guest sees its home, xdg-config and fixture directories
+    /// only at the fixed guest paths below `/tmp/e2e`, so the ptrace and
+    /// candidate cells of one test, which run from different cell directories,
+    /// give their guests the same argv and environment in both runner shapes.
+    /// dbt refuses `--bind` and keeps the host paths, as does every mode the
+    /// parity post-pass does not compare. The row's own environment keeps the
+    /// host paths, which name where the directories are.
+    #[test]
+    fn verify_cells_give_every_bindable_backend_the_same_guest_inputs() {
+        // build_spec creates the sabre path-evidence file, so the root is real.
+        let root = std::env::temp_dir().join(format!(
+            "hermit-manifest-equalized-inputs-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for isolated in [None, Some(PathBuf::from("/test"))] {
+            let mut context = run_context(&root);
+            context.isolated_workdir = isolated.clone();
+            let spec_for = |backend: &str, mode: &str| {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                let dir = cell_artifact_path(&context.result_root, &context.run_id, &cell.id, 1);
+                let host = dir.display().to_string();
+                let guest = vec![
+                    format!("{host}/fixtures/program"),
+                    format!("{host}/home/.rc"),
+                    format!("{host}/xdg-config"),
+                    // Embedded and look-alike paths are not rewritten.
+                    format!("--input={host}/fixtures/data"),
+                    format!("{host}/fixtures-extra"),
+                    "plain".into(),
+                ];
+                let spec = build_spec(&context, &cell, dir, guest, "1", Some(1), 15).unwrap();
+                (host, spec)
+            };
+            let after_separator = |spec: &CellRunSpec| {
+                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+                spec.argv[separator + 1..].to_vec()
+            };
+            // What the guest can see: argv, environment and each bind target.
+            let guest_view = |spec: &CellRunSpec| {
+                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+                let before = &spec.argv[..separator];
+                let targets = before
+                    .iter()
+                    .filter_map(|arg| arg.strip_prefix("--bind="))
+                    .map(|bind| bind.split_once(':').unwrap().1.to_string())
+                    .collect::<Vec<_>>();
+                (guest_env_args(before), targets, after_separator(spec))
+            };
+
+            let (reference_dir, reference) = spec_for("ptrace", "verify");
+            let jobs = "1";
+            let tmp = if isolated.is_some() {
+                "/test"
+            } else {
+                "/tmp/hermit-e2e"
+            };
+            assert_equalized_guest_env(&reference.argv, &reference_dir, tmp, jobs);
+            assert_eq!(
+                reference.guest_argv,
+                vec![
+                    "/tmp/e2e/fixtures/program".to_string(),
+                    "/tmp/e2e/home/.rc".to_string(),
+                    "/tmp/e2e/xdg-config".to_string(),
+                    format!("--input={reference_dir}/fixtures/data"),
+                    format!("{reference_dir}/fixtures-extra"),
+                    "plain".to_string(),
+                ]
+            );
+            assert_eq!(after_separator(&reference), reference.guest_argv);
+            for (name, subdir) in [
+                ("HOME", "home"),
+                ("XDG_CONFIG_HOME", "xdg-config"),
+                ("E2E_FIXTURE_DIR", "fixtures"),
+            ] {
+                assert_eq!(
+                    reference.env.get(name),
+                    Some(&format!("{reference_dir}/{subdir}")),
+                    "{name}"
+                );
+            }
+            if isolated.is_none() {
+                assert_eq!(
+                    bound_workdir_source(&reference),
+                    PathBuf::from(format!("{reference_dir}/workdir/1"))
+                );
+            }
+
+            for backend in ["kvm", "liteinst", "sabre"] {
+                let (dir, candidate) = spec_for(backend, "verify");
+                assert_ne!(dir, reference_dir);
+                assert_equalized_guest_env(&candidate.argv, &dir, tmp, jobs);
+                // Only the embedded and look-alike arguments still differ.
+                let (env, targets, argv) = guest_view(&candidate);
+                let (reference_env, reference_targets, reference_argv) = guest_view(&reference);
+                assert_eq!((env, targets), (reference_env, reference_targets));
+                assert_eq!(argv[..3], reference_argv[..3], "{backend}");
+                assert_eq!(argv[5], reference_argv[5], "{backend}");
+            }
+
+            let (dir, dbt) = spec_for("dbt", "verify");
+            assert_minimal_guest_env(&dbt.argv, &dir, tmp, jobs);
+            assert_eq!(dbt.guest_argv[0], format!("{dir}/fixtures/program"));
+            assert!(!dbt.argv.iter().any(|arg| arg.starts_with("--bind=")));
+
+            for mode in ["chaos", "replay", "custom"] {
+                let (dir, spec) = spec_for("ptrace", mode);
+                assert!(
+                    !spec
+                        .argv
+                        .iter()
+                        .any(|arg| arg.contains(EQUALIZED_INPUT_ROOT)),
+                    "{mode} binds nothing below {EQUALIZED_INPUT_ROOT}: {:?}",
+                    spec.argv
+                );
+                assert_eq!(spec.guest_argv[0], format!("{dir}/fixtures/program"));
+            }
+        }
+        assert!(!equalizes_guest_inputs("verify", "dbt"));
+        assert!(!equalizes_guest_inputs("naked", "ptrace"));
+        assert!(equalizes_guest_inputs("verify", "ptrace"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn run_spec_records_correct_policy_without_hidden_portable_flags() {
         let test = recipe(true);
@@ -8892,7 +9189,7 @@ backends_disabled:
             spec.env.get(SCHEDULED_JOBS_ENV).map(String::as_str),
             Some("7")
         );
-        assert_minimal_guest_env(&spec.argv, "/repo/results/cell", "/tmp/hermit-e2e", "7");
+        assert_equalized_guest_env(&spec.argv, "/repo/results/cell", "/tmp/hermit-e2e", "7");
         assert!(!spec.argv.iter().any(|arg| arg == "--no-virtualize-cpuid"));
         assert!(
             !spec
