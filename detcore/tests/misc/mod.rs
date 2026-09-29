@@ -1299,6 +1299,11 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
         wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
         wait4_error(HIGH_WORD_INT_MIN, 0, libc::ESRCH);
         wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
+        // Only INT_MIN is refused. INT_MIN + 1 selects process group INT_MAX,
+        // which no process can have, so Linux finds no child to wait for.
+        wait4_error(INT_MIN + 1, 0, libc::ECHILD);
+        wait4_error(INT_MIN + 1, libc::WNOHANG, libc::ECHILD);
+        wait4_error(0, libc::WNOHANG, libc::ECHILD);
 
         let mut release_pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
@@ -1325,6 +1330,9 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
         let zombie_wnohang = spawn_exiting_child(41);
         wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
         wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
+        // The zombie is in this process's group, not group INT_MAX.
+        wait4_error(INT_MIN + 1, libc::WNOHANG, libc::ECHILD);
+        wait4_error(INT_MIN + 1, 0, libc::ECHILD);
         reap_child(zombie_wnohang, 41);
 
         let zombie_blocking = spawn_exiting_child(42);
