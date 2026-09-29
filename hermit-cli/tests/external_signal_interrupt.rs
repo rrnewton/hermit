@@ -15,6 +15,13 @@
 //! `tests/c/external_signal_interrupt.c` under both the ptrace and LiteInst
 //! backends and asserts the guest's single deterministic `RESULT` line.
 //!
+//! A signal that is ignored, blocked, or ignored by default must not end a
+//! wait: `poll`, `epoll_wait`, `select`, and a timed futex wait then run to
+//! their 300 ms deadline.
+//!
+//! Every ptrace cell with only Hermit-internal senders runs under
+//! `--verify --verify-strict` and requires a matched strict report.
+//!
 //! The watchdog lives in this host process, as in
 //! `waitid_signal_interrupt.rs`: a dedicated thread drains Hermit's stderr
 //! while this thread polls the process, the guest's stdout file, and an
@@ -62,6 +69,12 @@ const EXTERNAL_TRIALS: usize = 10;
 const MAX_DIAGNOSTIC_LINES: usize = 2_000;
 
 const EINTR_FUTEX: &str = "RESULT call=futex ret=-1 errno=EINTR handler=1";
+/// Guest calls that wait for fd readiness.
+const READINESS_CALLS: [&str; 4] = ["poll", "epoll", "select", "rawselect"];
+/// The guest's timeout for a wait that a signal must not end.
+const QUIET_TIMEOUT_MS: u64 = 300;
+/// Virtual-time slack allowed past that deadline before the wait returns.
+const QUIET_OVERSHOOT_MS: u64 = 200;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -75,6 +88,8 @@ struct GuestRun {
     status: ExitStatus,
     stdout: String,
     stderr: String,
+    /// The strict verification report, for a cell run under `--verify`.
+    verify_report: Option<serde_json::Value>,
 }
 
 impl GuestRun {
@@ -84,9 +99,17 @@ impl GuestRun {
 
     fn describe(&self) -> String {
         format!(
-            "status={:?}\nguest stdout:\n{}\nhermit stderr:\n{}",
-            self.status, self.stdout, self.stderr
+            "status={:?}\nverify report: {:?}\nguest stdout:\n{}\nhermit stderr:\n{}",
+            self.status, self.verify_report, self.stdout, self.stderr
         )
+    }
+
+    /// The `ELAPSED ms=` value a must-not-wake cell prints.
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ELAPSED ms="))
+            .and_then(|value| value.parse().ok())
     }
 }
 
@@ -177,10 +200,21 @@ fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> Gu
     let stdout_path = trial.path().join("stdout");
     let stdout_writer = fs::File::create(&stdout_path).expect("failed to create guest stdout");
 
+    // Strict verification replays the guest, so it needs a sender inside Hermit.
+    let verify_report =
+        (backend == "ptrace" && !external).then(|| trial.path().join("verify.json"));
     let mut command = Command::new(liteinst_runtime::hermit_binary());
+    if verify_report.is_some() {
+        command.arg("--log=info");
+    }
     command.args(["run", "--backend", backend, "--strict"]);
     if let FutexMode::Polling = mode {
         command.arg("--debug-futex-mode=polling");
+    }
+    if let Some(report) = &verify_report {
+        command
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(report);
     }
     command
         .arg("--")
@@ -304,11 +338,37 @@ fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> Gu
             "{backend} {mode:?} {args:?}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}"
         );
     }
+    let verify_report = verify_report.map(|report| {
+        let bytes = fs::read(&report).unwrap_or_else(|error| {
+            panic!(
+                "{backend} {mode:?} {args:?}: strict verification did not publish its report: \
+                 {error}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}"
+            )
+        });
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("{backend} {mode:?} {args:?}: invalid verification report: {error}")
+        })
+    });
     GuestRun {
         status: status.expect("hermit status should be collected"),
         stdout,
         stderr,
+        verify_report,
     }
+}
+
+/// Require a matched strict verification report on a cell that ran under `--verify`.
+fn assert_verified(backend: &str, mode: FutexMode, args: &[&str], run: &GuestRun) {
+    let Some(report) = &run.verify_report else {
+        return;
+    };
+    assert!(
+        report["verdict"] == "matched"
+            && report["verified"] == true
+            && report["comparison"]["strictness"] == "canonical",
+        "{backend} {mode:?} {args:?}: strict verification did not match\n{}",
+        run.describe()
+    );
 }
 
 /// Run a cell and require a clean exit, the expected `RESULT` line, and `DONE`.
@@ -324,6 +384,30 @@ fn assert_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool, ex
         "{backend} {mode:?} {args:?}: guest did not finish\n{}",
         run.describe()
     );
+    assert_verified(backend, mode, args, &run);
+}
+
+/// A signal that must not end the wait: the call returns its timeout result, the
+/// handler never ran, and the call took its full 300 ms timeout.
+fn assert_quiet_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &str) {
+    let run = run_cell(backend, mode, args, false);
+    assert!(
+        run.status.success()
+            && run.result_line() == Some(expected)
+            && run.stdout.lines().any(|line| line == "DONE"),
+        "{backend} {mode:?} {args:?}: expected `{expected}`\n{}",
+        run.describe()
+    );
+    let elapsed = run.elapsed_ms();
+    assert!(
+        elapsed.is_some_and(|ms| {
+            (QUIET_TIMEOUT_MS..QUIET_TIMEOUT_MS + QUIET_OVERSHOOT_MS).contains(&ms)
+        }),
+        "{backend} {mode:?} {args:?}: the wait took {elapsed:?} ms, not its \
+         {QUIET_TIMEOUT_MS} ms timeout\n{}",
+        run.describe()
+    );
+    assert_verified(backend, mode, args, &run);
 }
 
 /// Fix A: a polling-mode futex wait must observe a signal that Hermit did not
@@ -422,10 +506,12 @@ fn timed_futex_wait_returns_eintr_under_sa_restart() {
 }
 
 /// Control: an untimed FUTEX_WAIT restarts under SA_RESTART. The handler runs
-/// and the call never reports EINTR. Natively the restarted wait is woken by
-/// the thread's FUTEX_WAKE and returns 0; precise mode reproduces that. In
-/// polling mode the restarted wait may start after the thread has already set
-/// the word, which Linux also permits and reports as EAGAIN.
+/// and the call never reports EINTR. The waker thread sets the word and wakes the
+/// futex only after the handler has run, so the wait must have been interrupted.
+/// Natively the restarted wait is woken by the thread's FUTEX_WAKE and returns
+/// 0; precise mode reproduces that. Polling mode's deterministic schedule runs
+/// the restarted wait after the thread has set the word, which Linux also
+/// permits and reports as EAGAIN. Each mode's result is pinned.
 #[test]
 fn untimed_futex_wait_restarts_under_sa_restart() {
     for backend in BACKENDS {
@@ -436,25 +522,77 @@ fn untimed_futex_wait_restarts_under_sa_restart() {
             false,
             "RESULT call=futex ret=0 errno=none handler=1",
         );
-        let run = run_cell(
+        assert_cell(
             backend,
             FutexMode::Polling,
             &["futex", "thread", "restart"],
             false,
+            "RESULT call=futex ret=-1 errno=EAGAIN handler=1",
         );
-        let result = run.result_line();
-        assert!(
-            run.status.success()
-                && matches!(
-                    result,
-                    Some(
-                        "RESULT call=futex ret=0 errno=none handler=1"
-                            | "RESULT call=futex ret=-1 errno=EAGAIN handler=1"
-                    )
-                ),
-            "{backend} polling SA_RESTART futex: expected a restarted wait\n{}",
-            run.describe()
-        );
+    }
+}
+
+/// `poll`, `epoll_wait`, glibc `select` (pselect6 with no mask), and the
+/// `select` system call end with EINTR for a caught signal from a sibling
+/// thread or a live sibling process, SA_RESTART or not, as Linux does.
+#[test]
+fn readiness_waits_are_interrupted_by_internal_signals() {
+    for backend in BACKENDS {
+        for call in READINESS_CALLS {
+            for sender in ["thread", "process"] {
+                for restart in [None, Some("restart")] {
+                    let mut args = vec![call, sender];
+                    args.extend(restart);
+                    assert_cell(
+                        backend,
+                        FutexMode::Precise,
+                        &args,
+                        false,
+                        &format!("RESULT call={call} ret=-1 errno=EINTR handler=1"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An ignored, blocked, or default-ignored signal does not end `poll`,
+/// `epoll_wait`, or either `select`: each returns 0 at its 300 ms timeout.
+#[test]
+fn readiness_waits_are_not_ended_by_non_interrupting_signals() {
+    for backend in BACKENDS {
+        for call in READINESS_CALLS {
+            for sender in ["thread", "process"] {
+                for quiet in ["ignored", "blocked", "winch"] {
+                    assert_quiet_cell(
+                        backend,
+                        FutexMode::Precise,
+                        &[call, sender, quiet],
+                        &format!("RESULT call={call} ret=0 errno=none handler=0"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An ignored, blocked, or default-ignored signal does not end a timed futex wait
+/// in either mode: it returns ETIMEDOUT at its original 300 ms deadline.
+#[test]
+fn timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
+    for backend in BACKENDS {
+        for mode in [FutexMode::Precise, FutexMode::Polling] {
+            for sender in ["thread", "process"] {
+                for quiet in ["ignored", "blocked", "winch"] {
+                    assert_quiet_cell(
+                        backend,
+                        mode,
+                        &["futex", sender, quiet],
+                        "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
+                    );
+                }
+            }
+        }
     }
 }
 

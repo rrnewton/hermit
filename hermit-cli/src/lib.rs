@@ -3003,6 +3003,12 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     // resuming through the kernel's ptrace syscall-restart frame.
     config.backend_supports_parked_write_signal_interruption =
         matches!(backend, Backend::Ptrace | Backend::E9patch);
+    // Only ptrace and LiteInst have been measured to report a thread's signal state
+    // in /proc and to resume a restart errno through the kernel's signal delivery
+    // (https://github.com/rrnewton/hermit/issues/3146). Every other backend keeps the
+    // previous blocking-wait behavior.
+    config.backend_supports_blocked_wait_signal_interruption =
+        matches!(backend, Backend::Ptrace | Backend::Liteinst);
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -5453,6 +5459,24 @@ mod tests {
             assert_eq!(
                 config.backend_supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_blocked_wait_signal_contract_is_explicit() {
+        for (backend, supports_interruption) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, true),
+            (Backend::E9patch, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_supports_blocked_wait_signal_interruption, supports_interruption,
+                "unexpected blocked-wait signal support for {backend:?}"
             );
         }
     }
