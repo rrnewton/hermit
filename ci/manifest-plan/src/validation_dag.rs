@@ -297,17 +297,19 @@ struct Profile {
 // full, portable and hosted-portable then gained check.e9patch_corpus when the
 // e9patch corpus left tests/backend-parity (slice S13 of
 // https://github.com/rrnewton/hermit/issues/3301): 277/278, 264/265 and
-// 255/255 before.
+// 255/255 before. full, portable and hosted-portable then each lost one step
+// when check.backend_parity_suites and its _on_host twin were retired with
+// tests/backend-parity (also slice S13): 278/279, 265/266 and 256/256 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 278,
-        selected_steps: 279,
+        direct_steps: 277,
+        selected_steps: 278,
     },
     Profile {
         label: "portable",
-        direct_steps: 265,
-        selected_steps: 266,
+        direct_steps: 264,
+        selected_steps: 265,
     },
     Profile {
         label: "quick",
@@ -326,8 +328,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 256,
-        selected_steps: 256,
+        direct_steps: 255,
+        selected_steps: 255,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -812,11 +814,12 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    // 213 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301).
-    if split.len() != 212 {
+    // 212 until check.backend_parity_suites was retired with
+    // tests/backend-parity; 213 until test.dbt_parity was retired (both in
+    // slice S13 of https://github.com/rrnewton/hermit/issues/3301).
+    if split.len() != 211 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 212",
+            "hosted test dependency closure has {} nodes, expected 211",
             split.len()
         ));
     }
@@ -1968,10 +1971,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // since check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes; +10 for the five selftest.* nodes and their
     // quick/super variants; +1 for check.e9patch_corpus when the e9patch
-    // corpus left tests/backend-parity (also slice S13).
-    if cfg.steps.len() != 1619 {
+    // corpus left tests/backend-parity (also slice S13); -2 when
+    // check.backend_parity_suites and its _on_host twin were retired with
+    // tests/backend-parity (also slice S13).
+    if cfg.steps.len() != 1617 {
         return Err(format!(
-            "superset has {} steps, expected 1619",
+            "superset has {} steps, expected 1617",
             cfg.steps.len()
         ));
     }
@@ -3508,13 +3513,15 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 256 since check.e9patch_corpus was added when the e9patch corpus
-        // left tests/backend-parity (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301); 255 since the five
+        // 255 since check.backend_parity_suites_on_host was retired with
+        // tests/backend-parity (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301); 256 since
+        // check.e9patch_corpus was added when the e9patch corpus left
+        // tests/backend-parity (also slice S13); 255 since the five
         // selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13); 251 before.
-        assert_eq!(selected.steps.len(), 256);
+        assert_eq!(selected.steps.len(), 255);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3565,15 +3572,16 @@ sys.exit(37)
             "build.e2e_artifact_on_host".into(),
             "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
-            "check.backend_parity_suites_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
-        // 212 since test.dbt_parity_on_host was retired with its pinned twin
-        // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(new_variants.len(), 212);
+        // 211 since check.backend_parity_suites_on_host was retired with
+        // tests/backend-parity; 212 since test.dbt_parity_on_host was retired
+        // with its pinned twin (both in slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(new_variants.len(), 211);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3671,13 +3679,13 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 255 = the 256 hosted-portable direct steps since
-            // check.e9patch_corpus was added in slice S13 of
-            // https://github.com/rrnewton/hermit/issues/3301 (255 since the
-            // five selftest.<name> nodes left gate.manifest,
-            // https://github.com/rrnewton/hermit/issues/3381), minus the one
-            // planted loss.
-            error.contains("hosted-portable label has 255 direct steps"),
+            // 254 = the 255 hosted-portable direct steps since
+            // check.backend_parity_suites_on_host was retired with
+            // tests/backend-parity in slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301 (256 before,
+            // since check.e9patch_corpus was added, also in slice S13), minus
+            // the one planted loss.
+            error.contains("hosted-portable label has 254 direct steps"),
             "{error}"
         );
     }

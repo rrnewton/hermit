@@ -498,10 +498,7 @@ fn backend_private_guest_files(inventory: &JsonValue) -> BTreeSet<String> {
                 .get("runner")
                 .and_then(JsonValue::as_str)
                 .unwrap_or("");
-            let parity_private = path.starts_with("tests/backend-parity/")
-                || runner.contains("tests/backend-parity/");
-            (parity_private || names_backend(path) || names_backend(runner))
-                .then(|| path.to_string())
+            (names_backend(path) || names_backend(runner)).then(|| path.to_string())
         })
         .collect()
 }
@@ -2372,9 +2369,9 @@ sabre = "unsupported"
         let inventory = json!({
             "files": [
                 {
-                    "path": "tests/backend-parity/fixtures/new_contract.c",
+                    "path": "tests/c/new_contract.c",
                     "disposition": "guest-fixture",
-                    "runner": "tests/backend-parity/run_matrix.py"
+                    "runner": "hermit-cli/tests/kvm_contract.rs"
                 },
                 {
                     "path": "tests/c/liteinst_only.c",
@@ -2396,8 +2393,8 @@ sabre = "unsupported"
         assert_eq!(
             backend_private_guest_files(&inventory),
             BTreeSet::from([
-                "tests/backend-parity/fixtures/new_contract.c".to_string(),
                 "tests/c/liteinst_only.c".to_string(),
+                "tests/c/new_contract.c".to_string(),
             ])
         );
     }
@@ -2460,11 +2457,11 @@ backends_enabled = []
     }
 
     #[test]
-    #[should_panic(expected = "unexpected=[\"tests/backend-parity/private.c\"]")]
+    #[should_panic(expected = "unexpected=[\"tests/c/kvm_private.c\"]")]
     fn rejects_backend_private_guest_growth() {
         enforce_exact_ratchet(
             "backend-private guest debt",
-            &BTreeSet::from(["tests/backend-parity/private.c".to_string()]),
+            &BTreeSet::from(["tests/c/kvm_private.c".to_string()]),
             &BTreeSet::new(),
         );
     }
