@@ -968,10 +968,9 @@ jobs:
             # suite provably never executes. The demo job runs
             # `scripts/super-validate.sh --demos-only` (parent demos 1-8 only)
             # and never runs the Hermit e2e corpus, so nothing under
-            # `tests/e2e/**` can change a demo outcome; the standalone
-            # `tests/backend-parity/**` parity fixtures are likewise never read.
-            # A PR whose only hot-path-matching files live under those trees is
-            # NOT a demo hot path, so it does not require the serial P0 gate.
+            # `tests/e2e/**` can change a demo outcome. A PR whose only
+            # hot-path-matching files live under that tree is NOT a demo hot
+            # path, so it does not require the serial P0 gate.
             # Genuinely demo-affecting paths (detcore*/, hermit-cli/, other
             # guest programs under tests/ such as tests/c/**, Cargo.*, and
             # demo-hot-path.yml itself) are NOT subtracted and stay hot.
@@ -981,7 +980,7 @@ jobs:
             )"
             hot_files="$(
               grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
-                | grep -vE '^tests/(e2e|backend-parity)/' || true
+                | grep -vE '^tests/e2e/' || true
             )"
             if [ -n "$hot_files" ]; then
               demo_runs="$(
