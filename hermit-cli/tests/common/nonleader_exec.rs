@@ -23,6 +23,47 @@ use super::kvm_cancellation::bounded_read;
 
 const MIB: u64 = 1024 * 1024;
 
+/// How much of Hermit's retained stderr a failed exit-status assertion quotes.
+/// The trace logs go to `verify-logs`, so stderr for these runs is small
+/// (2,706 bytes for a passing exit-only pair on the development host) and ends
+/// with Hermit's refusal or verification verdict.
+const STDERR_TAIL_BYTES: u64 = 8 * 1024;
+
+/// The last `limit` bytes of a retained stream, for a failure message.
+///
+/// The hosted runner does not upload `CARGO_TARGET_TMPDIR`. An exit-status
+/// failure that names only the retained directory therefore loses its cause:
+/// `run_ptrace_nonleader_exec_exit_only` exited 1 in
+/// https://github.com/rrnewton/hermit/actions/runs/36550265580 and no artifact
+/// kept `pair-0`.
+fn retained_tail(path: &Path, limit: u64) -> String {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<cannot open {}: {error}>", path.display()),
+    };
+    let length = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return format!("<cannot stat {}: {error}>", path.display()),
+    };
+    if let Err(error) = file.seek(SeekFrom::Start(length.saturating_sub(limit))) {
+        return format!("<cannot seek {}: {error}>", path.display());
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(limit).read_to_end(&mut bytes) {
+        return format!("<cannot read {}: {error}>", path.display());
+    }
+    format!(
+        "last {} of {length} bytes of {}:\n{}",
+        bytes.len(),
+        path.display(),
+        String::from_utf8_lossy(&bytes)
+    )
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Scenario {
     Original,
@@ -325,8 +366,9 @@ fn run_fixture(scenario: Scenario) {
         assert_eq!(
             status.code(),
             Some(0),
-            "ptrace pair {pair}: {}",
-            directory.display()
+            "ptrace pair {pair}: {}\n{}",
+            directory.display(),
+            retained_tail(&directory.join("stderr"), STDERR_TAIL_BYTES)
         );
         let output = bounded_read(&directory.join("stdout"), MIB);
         let stdout = std::str::from_utf8(&output).expect("guest trajectory text");
