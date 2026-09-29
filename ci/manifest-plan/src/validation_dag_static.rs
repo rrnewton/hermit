@@ -272,7 +272,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
-    ("test.detcore_unit", 810),
+    // The LiteInst runtime-bootstrap time-charging test retains all 810 prior
+    // identities (`cargo nextest list` measured 811).
+    ("test.detcore_unit", 811),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -286,7 +288,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
     // The PMU-subject skid-overshoot case moves to privileged-test.pmu_cli_cases.
     ("test.cli", 87),
-    ("test.liteinst_strict", 25),
+    // Two LiteInst runtime-bootstrap time tests (host_identity uptime and the
+    // clock trajectory against ptrace) retain all 25 prior identities
+    // (`cargo nextest list` measured 27).
+    ("test.liteinst_strict", 27),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
@@ -312,12 +317,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 810),
+    ("test.detcore_unit_on_host", 811),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 754),
     ("test.ignored_syscall_regressions_on_host", 4),
-    ("test.liteinst_strict_on_host", 25),
+    ("test.liteinst_strict_on_host", 27),
     // The host node carries the identical selection.
     ("test.regular_crates_on_host", 666),
     ("test.rr_suite_contract_on_host", 1),
