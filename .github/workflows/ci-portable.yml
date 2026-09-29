@@ -421,6 +421,18 @@ jobs:
           set -euo pipefail
           corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
           printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
+      # check.lint_checks runs scripts/build-buck-release.rs's tests, two of
+      # which enter the exact `unshare --user --map-root-user --mount` stage the
+      # matrix proxy composes. Ubuntu 24.04 runners restrict unprivileged user
+      # namespaces through AppArmor, so run 36499357369 failed both with
+      # "unshare: write failed /proc/self/uid_map: Operation not permitted".
+      # Lift the restriction as the test jobs below do, and probe that shape.
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --mount cat /proc/self/uid_map
       - name: Run preflight check nodes
         env:
           # Let gh authenticate with this repository's read-only token. The two

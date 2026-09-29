@@ -3610,10 +3610,13 @@ fn manifest_target_dir(tool: &Path, configured: Option<&std::ffi::OsStr>) -> Pat
         .unwrap_or_else(|| tool.join("target"))
 }
 
-fn derive(root: &Path) -> Result<Derived, String> {
+/// `cargo <subcommand>` for the manifest-plan helper's default binary.
+fn manifest_plan_cargo(subcommand: &str) -> Result<Command, String> {
     let tool = manifest_tool_root()?;
-    let output = Command::new("cargo")
-        .args(["run", "--quiet", "-p", "hermit-manifest-plan"])
+    let mut command = Command::new("cargo");
+    command
+        .args([subcommand, "--quiet", "-p", "hermit-manifest-plan"])
+        .args(["--bin", "hermit-manifest-plan"])
         .arg("--manifest-path")
         .arg(tool.join("Cargo.toml"))
         // Immutable tool sources use the caller's standard mutable Cargo
@@ -3623,7 +3626,33 @@ fn derive(root: &Path) -> Result<Derived, String> {
         .arg(manifest_target_dir(
             tool,
             env::var_os("CARGO_TARGET_DIR").as_deref(),
-        ))
+        ));
+    Ok(command)
+}
+
+/// Compile the manifest-plan helper that `derive` runs, so that a caller can
+/// pay for a cold build BEFORE it takes the scorecard write-back lock. The
+/// lock waits at most 30 s, and a cold debug build of the helper takes longer
+/// on four CPUs (33.5 s measured on 2026-09-29; over 40 s of lock hold on a
+/// hosted runner), so concurrent `check`s timed out behind the one compiling
+/// under the lock. Cargo serializes concurrent builds on its own target lock
+/// without a deadline, and `derive`'s `cargo run` of the same binary is then
+/// a fingerprint check.
+fn build_manifest_plan() -> Result<(), String> {
+    let output = manifest_plan_cargo("build")?
+        .output()
+        .map_err(|e| format!("cannot build hermit-manifest-plan: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "hermit-manifest-plan failed to build:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn derive(root: &Path) -> Result<Derived, String> {
+    let output = manifest_plan_cargo("run")?
         .args(["--", "--root"])
         .arg(root)
         .args(["--format", "matrix-json"])
@@ -5578,6 +5607,8 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
 }
 
 fn check_tracked_with_lock(root: &Path) -> Result<Derived, String> {
+    // Compile outside the lock; the lock covers every read of the check.
+    build_manifest_plan()?;
     let _lock = acquire_scorecard_write_lock(root)?;
     check_tracked(root)
 }
