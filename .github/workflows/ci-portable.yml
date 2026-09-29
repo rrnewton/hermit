@@ -1478,6 +1478,23 @@ jobs:
             cp "$junit" "ignored/reduced/$slug.junit.xml"
           done < <(find ignored/reduced/expanded -path '*/parity-v1/junit.xml' \
             -type f -print0 | sort -z)
+      # scorecard.compatibility_on_host runs `cargo run -p hermit-manifest-plan`
+      # (manifest_plan_cargo in ci/compat-envelope/scorecard.rs). The unpacked
+      # tarball carries that binary but not Cargo's fingerprints, so in this job
+      # the `cargo run` compiled the helper from cold INSIDE the node's 120 s CPU
+      # budget and was killed as CPU-TIMEOUT before it verified a single cell:
+      # 123.2 s CPU at 41 s wall, rustc still compiling hermit_manifest_plan, in
+      # https://github.com/rrnewton/hermit/actions/runs/36550265580. Local lanes
+      # never charge that compile to the node: setup.manifest_plan builds the
+      # helper in the same target directory first. Do the same here. RUSTFLAGS
+      # matches the verdict step below so the node's `cargo run` finds a fresh
+      # fingerprint. This changes only when the compile happens, not what the
+      # node checks or what counts as a pass.
+      - name: Build the scorecard's manifest-plan helper
+        if: needs.select.outputs.run_e2e != 'false'
+        env:
+          RUSTFLAGS: ""
+        run: cargo build --locked --quiet -p hermit-manifest-plan --bin hermit-manifest-plan
       - name: Run constructed E2E verdict
         if: needs.select.outputs.run_e2e != 'false'
         env:
