@@ -51,8 +51,10 @@ use hermit_manifest_plan::logdiff_report::LogDiffVerdict;
 use hermit_manifest_plan::logdiff_report::RecordEnvelopePolicy;
 use hermit_manifest_plan::retired_ids::RetiredIds;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
+use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::parse_expected_output_failure_reason;
 use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
@@ -1435,29 +1437,6 @@ fn default_attempt() -> u64 {
     1
 }
 
-/// What a runner reason says about a verify attempt's declared stdout. Only
-/// the texts `check_expected_stdout` and `check_expected_stdout_contains` in
-/// ci/manifest-plan/src/runner.rs write are recognized, and only by rebuilding
-/// them with the runner's own formatters.
-#[derive(Debug, PartialEq, Eq)]
-enum ExpectedOutputClaim {
-    /// The named compared run's stdout is not the declared exact bytes.
-    Exact {
-        run: String,
-        observed_bytes: u64,
-        observed_sha256: String,
-        declared_bytes: u64,
-        declared_sha256: String,
-    },
-    /// The captured stdout, which equals both compared runs' stdout, omits
-    /// the declared text.
-    Contains {
-        captured_bytes: u64,
-        captured_sha256: String,
-        text: String,
-    },
-}
-
 /// The declared stdout that a verify attempt's two agreeing runs did not
 /// print, stored on that attempt's invocation so a published cell says why it
 /// is red.
@@ -1551,87 +1530,6 @@ impl ExpectedOutputFailure {
                 }
             }
         }
-    }
-}
-
-/// Split `<bytes> bytes, sha256 <digest>)<rest>`.
-fn split_sized_digest(text: &str) -> Option<(u64, &str, &str)> {
-    let (bytes, rest) = text.split_once(" bytes, sha256 ")?;
-    let (digest, rest) = rest.split_once(')')?;
-    Some((bytes.parse().ok()?, digest, rest))
-}
-
-/// Invert Rust's `{:?}` rendering of a string, which is how the runner quotes
-/// a declared expected_stdout_contains text. The caller still requires the
-/// re-rendered reason to reproduce the original exactly, so a lenient decode
-/// here cannot admit a text the runner would not write.
-fn parse_debug_string(quoted: &str) -> Option<String> {
-    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
-    let mut text = String::new();
-    let mut chars = inner.chars();
-    while let Some(character) = chars.next() {
-        match character {
-            '"' => return None,
-            '\\' => text.push(match chars.next()? {
-                't' => '\t',
-                'r' => '\r',
-                'n' => '\n',
-                '0' => '\0',
-                '\\' => '\\',
-                '"' => '"',
-                '\'' => '\'',
-                'u' => {
-                    let (hex, rest) = chars.as_str().strip_prefix('{')?.split_once('}')?;
-                    let decoded = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
-                    chars = rest.chars();
-                    decoded
-                }
-                _ => return None,
-            }),
-            other => text.push(other),
-        }
-    }
-    Some(text)
-}
-
-/// Recognize the runner's reason for a failed stdout expectation, or `None`
-/// for any other text.
-fn parse_expected_output_claim(reason: &str) -> Option<ExpectedOutputClaim> {
-    use hermit_manifest_plan::runner::expected_stdout_contains_mismatch_reason;
-    use hermit_manifest_plan::runner::expected_stdout_mismatch_reason;
-    if let Some(rest) = reason.strip_prefix("verify stdout (") {
-        let (captured_bytes, captured_sha256, rest) = split_sized_digest(rest)?;
-        let quoted =
-            rest.strip_prefix(" does not contain the declared expected_stdout_contains text ")?;
-        let text = parse_debug_string(quoted)?;
-        (expected_stdout_contains_mismatch_reason(captured_bytes, captured_sha256, &text) == reason)
-            .then(|| ExpectedOutputClaim::Contains {
-                captured_bytes,
-                captured_sha256: captured_sha256.into(),
-                text,
-            })
-    } else {
-        let (run, rest) = reason
-            .strip_prefix("verify ")?
-            .split_once(" run stdout (")?;
-        let (observed_bytes, observed_sha256, rest) = split_sized_digest(rest)?;
-        let rest = rest.strip_prefix(" differs from the declared expected_stdout (")?;
-        let (declared_bytes, declared_sha256, rest) = split_sized_digest(rest)?;
-        (rest.is_empty()
-            && expected_stdout_mismatch_reason(
-                run,
-                observed_bytes,
-                observed_sha256,
-                declared_bytes,
-                declared_sha256,
-            ) == reason)
-            .then(|| ExpectedOutputClaim::Exact {
-                run: run.into(),
-                observed_bytes,
-                observed_sha256: observed_sha256.into(),
-                declared_bytes,
-                declared_sha256: declared_sha256.into(),
-            })
     }
 }
 
@@ -2304,7 +2202,7 @@ impl ResultRow {
         let Some(reason) = attempt.get("reason").and_then(JsonValue::as_str) else {
             return Ok(None);
         };
-        let Some(claim) = parse_expected_output_claim(reason) else {
+        let Some(claim) = parse_expected_output_failure_reason(reason) else {
             return Ok(None);
         };
         let contradiction = |why: &str| {
@@ -2320,7 +2218,7 @@ impl ResultRow {
             )));
         }
         let failure = match claim {
-            ExpectedOutputClaim::Exact {
+            ExpectedOutputFailureReason::Exact {
                 run,
                 observed_bytes,
                 observed_sha256,
@@ -2341,7 +2239,7 @@ impl ResultRow {
                     declared_stdout_sha256: declared_sha256,
                 }
             }
-            ExpectedOutputClaim::Contains {
+            ExpectedOutputFailureReason::Contains {
                 captured_bytes,
                 captured_sha256,
                 text,
@@ -29450,20 +29348,23 @@ mod post_verdict_transaction_tests {
         ] {
             let reason = expected_stdout_contains_mismatch_reason(9, &digest, text);
             assert_eq!(
-                parse_expected_output_claim(&reason),
-                Some(ExpectedOutputClaim::Contains {
+                parse_expected_output_failure_reason(&reason),
+                Some(ExpectedOutputFailureReason::Contains {
                     captured_bytes: 9,
                     captured_sha256: digest.clone(),
                     text: text.into(),
                 }),
                 "{reason}"
             );
-            assert_eq!(parse_expected_output_claim(&format!("{reason} ")), None);
+            assert_eq!(
+                parse_expected_output_failure_reason(&format!("{reason} ")),
+                None
+            );
         }
         let exact = expected_stdout_mismatch_reason("first", 959, &digest, 958, &"b".repeat(64));
         assert_eq!(
-            parse_expected_output_claim(&exact),
-            Some(ExpectedOutputClaim::Exact {
+            parse_expected_output_failure_reason(&exact),
+            Some(ExpectedOutputFailureReason::Exact {
                 run: "first".into(),
                 observed_bytes: 959,
                 observed_sha256: digest.clone(),
@@ -29491,7 +29392,11 @@ mod post_verdict_transaction_tests {
             "the guest printed something unexpected".into(),
         ];
         for reason in not_written {
-            assert_eq!(parse_expected_output_claim(&reason), None, "{reason}");
+            assert_eq!(
+                parse_expected_output_failure_reason(&reason),
+                None,
+                "{reason}"
+            );
         }
     }
 

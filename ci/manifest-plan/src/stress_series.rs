@@ -17,6 +17,7 @@ pub use crate::host_capability::HostCapability;
 use crate::runner::ExpectedGuestExit;
 use crate::runner::FailureClass;
 use crate::runner::ObservedResult;
+use crate::runner::parse_expected_output_failure_reason;
 use crate::runner::validate_expected_guest_exit;
 
 pub const STRESS_SERIES_SCHEMA_V1: &str = "stress-series/v1";
@@ -179,11 +180,14 @@ pub enum SeriesNoVerdictKind {
     MissingReportTimeout,
     NoncanonicalMatch,
     NoncanonicalDivergence,
-    /// A canonical match whose attempt the runner failed because the process
-    /// did not end as its row allows: a declared verify cell that ended
-    /// differently, or an undeclared verify or replay that exited nonzero.
-    /// It earns no credit; it is the crash-error red, retained beside its
-    /// siblings instead of refusing the whole run.
+    /// A canonical match whose attempt the runner failed: the process did
+    /// not end as its row allows (a declared verify cell that ended
+    /// differently, or an undeclared verify or replay that exited nonzero),
+    /// or the two agreeing runs of a verify cell printed other stdout than the
+    /// cell declares. The latter carries the runner's reason as `detail`,
+    /// which is the only record of it. It earns no credit; it is the
+    /// crash-error red, retained beside its siblings instead of refusing the
+    /// whole run.
     FailedMatch,
 }
 
@@ -963,9 +967,14 @@ impl SeriesRow {
                 return Err("no_verdict_evidence detail must be nonempty when present".into());
             }
             if disposition.detail.is_some()
-                && disposition.kind != SeriesNoVerdictKind::ComparisonRefused
+                && !matches!(
+                    disposition.kind,
+                    SeriesNoVerdictKind::ComparisonRefused | SeriesNoVerdictKind::FailedMatch
+                )
             {
-                return Err("only comparison_refused evidence may carry detail".into());
+                return Err(
+                    "only comparison_refused and failed_match evidence may carry detail".into(),
+                );
             }
             if disposition
                 .error_kind
@@ -1135,10 +1144,41 @@ impl SeriesRow {
                                 .into(),
                         );
                     }
-                    // Undeclared, only a nonzero exit fails a match.
-                    if self.series.declared_guest_exit.is_none() && disposition.status == Some(0) {
+                    // A detail is the runner's reason for a failed declared
+                    // stdout, the only record of that failure. The runner
+                    // checks declared stdout before the guest's exit, so the
+                    // attempt may have ended any way at all. The series row
+                    // does not carry the report, so the writer verifies the
+                    // reason against it; this checks what the reason alone
+                    // can show.
+                    let failed_expected_output = match disposition.detail.as_deref() {
+                        None => false,
+                        Some(detail) => {
+                            let reason = parse_expected_output_failure_reason(detail).ok_or(
+                                "failed_match detail must be the runner's reason for a failed declared expected output",
+                            )?;
+                            if let Some(why) = reason.contradiction() {
+                                return Err(format!(
+                                    "failed_match detail contradicts a matched comparison: {why}"
+                                ));
+                            }
+                            if mode != "verify" {
+                                return Err(
+                                    "failed_match detail names a declared expected output, which only a verify cell has"
+                                        .into(),
+                                );
+                            }
+                            true
+                        }
+                    };
+                    // Undeclared, only a nonzero exit or a failed declared
+                    // stdout fails a match.
+                    if self.series.declared_guest_exit.is_none()
+                        && disposition.status == Some(0)
+                        && !failed_expected_output
+                    {
                         return Err(
-                            "failed_match evidence without a declared guest exit must record a nonzero status or a signal"
+                            "failed_match evidence without a declared guest exit or a failed declared expected output must record a nonzero status or a signal"
                                 .into(),
                         );
                     }
@@ -2058,7 +2098,7 @@ mod tests {
             (
                 "undeclared exit 0",
                 |row| attempt(row).status = Some(0),
-                "without a declared guest exit must record a nonzero status",
+                "without a declared guest exit or a failed declared expected output must record a nonzero status",
             ),
         ];
         fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
@@ -2067,6 +2107,103 @@ mod tests {
         for (label, edit, expected) in edits {
             let mut row = failed_match();
             edit(&mut row);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        // A verify attempt whose two runs matched but printed other stdout
+        // than the cell declares is also a failed match. The runner checks the
+        // declared stdout before the guest's exit, so the attempt may have
+        // exited 0, and the runner's reason, carried as detail, is the only
+        // record of the failure.
+        let (observed, declared) = ("a".repeat(64), "d".repeat(64));
+        let exact =
+            crate::runner::expected_stdout_mismatch_reason("first", 22, &observed, 22, &declared);
+        let contains =
+            crate::runner::expected_stdout_contains_mismatch_reason(22, &observed, "vdso\t\"ok\"");
+        let with_detail = |detail: &str, status: Option<i32>| {
+            let mut row = failed_match();
+            let disposition = attempt(&mut row);
+            disposition.detail = Some(detail.into());
+            disposition.status = status;
+            row
+        };
+        for (label, row) in [
+            ("exact stdout, exit 0", with_detail(&exact, Some(0))),
+            ("contained text, exit 0", with_detail(&contains, Some(0))),
+            ("exact stdout, exit 3", with_detail(&exact, Some(3))),
+        ] {
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            row.validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+        let mut replay_detail = with_detail(&exact, Some(0));
+        replay_detail.series.cell = "fixture/test/replay/ptrace".into();
+        let mut not_run_detail = no_verdict_row();
+        attempt(&mut not_run_detail).detail = Some(exact.clone());
+        for (label, row, expected) in [
+            (
+                "a reason the runner does not write",
+                with_detail("verify stdout differs", Some(0)),
+                "must be the runner's reason for a failed declared expected output",
+            ),
+            (
+                "a reason with trailing text",
+                with_detail(&format!("{exact}; and more"), Some(0)),
+                "must be the runner's reason for a failed declared expected output",
+            ),
+            (
+                "the later run of a matched pair",
+                with_detail(
+                    &crate::runner::expected_stdout_mismatch_reason(
+                        "second", 22, &observed, 22, &declared,
+                    ),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: it names a later run",
+            ),
+            (
+                "declared stdout that is the observed stdout",
+                with_detail(
+                    &crate::runner::expected_stdout_mismatch_reason(
+                        "first", 22, &observed, 22, &observed,
+                    ),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: the declared stdout is the observed stdout",
+            ),
+            (
+                "a digest that is not SHA-256",
+                with_detail(
+                    &crate::runner::expected_stdout_mismatch_reason(
+                        "first", 22, "abc", 22, &declared,
+                    ),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: a stdout digest is not SHA-256",
+            ),
+            (
+                "an empty declared text",
+                with_detail(
+                    &crate::runner::expected_stdout_contains_mismatch_reason(22, &observed, ""),
+                    Some(0),
+                ),
+                "contradicts a matched comparison: the runner finds an empty declared text",
+            ),
+            (
+                "a replay cell",
+                replay_detail,
+                "which only a verify cell has",
+            ),
+            (
+                "another kind",
+                not_run_detail,
+                "only comparison_refused and failed_match evidence may carry detail",
+            ),
+        ] {
             let error = row
                 .validate_for_write()
                 .expect_err(&format!("{label}: admitted"));

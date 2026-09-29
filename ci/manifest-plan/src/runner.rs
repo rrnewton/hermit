@@ -520,8 +520,10 @@ enum ExpectedStdoutError {
 ///
 /// This text is the only record of that failure: the attempt carries no
 /// timeout and no error kind. The scorecard reader
-/// (ci/compat-envelope/scorecard.rs) recognizes it by rebuilding it with this
-/// function, so the writer and the reader share one spelling.
+/// (ci/compat-envelope/scorecard.rs) and the series `failed_match` evidence
+/// recognize it through [`parse_expected_output_failure_reason`], which
+/// rebuilds it with this function, so the writer and the readers share one
+/// spelling.
 pub fn expected_stdout_mismatch_reason(
     run: &str,
     observed_bytes: u64,
@@ -546,6 +548,162 @@ pub fn expected_stdout_contains_mismatch_reason(
     format!(
         "verify stdout ({captured_bytes} bytes, sha256 {captured_sha256}) does not contain the declared expected_stdout_contains text {text:?}"
     )
+}
+
+/// What a reason written by [`expected_stdout_mismatch_reason`] or
+/// [`expected_stdout_contains_mismatch_reason`] says. The scorecard reader and
+/// the series `failed_match` evidence both recognize those reasons through
+/// [`parse_expected_output_failure_reason`], so the runner, the scorecard and
+/// the series schema share one spelling and one parser.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExpectedOutputFailureReason {
+    /// The named compared run's stdout is not the declared exact bytes.
+    Exact {
+        run: String,
+        observed_bytes: u64,
+        observed_sha256: String,
+        declared_bytes: u64,
+        declared_sha256: String,
+    },
+    /// The captured stdout, which equals both compared runs' stdout, omits
+    /// the declared text.
+    Contains {
+        captured_bytes: u64,
+        captured_sha256: String,
+        text: String,
+    },
+}
+
+impl ExpectedOutputFailureReason {
+    /// Why the runner could not have written this reason for a verify
+    /// attempt whose two compared runs matched, judged from the reason alone,
+    /// or `None`. The runner names the first run whose stdout differs, and
+    /// both runs of a matched pair print the same bytes; it fails only
+    /// declared stdout that differs from the observed stdout; and it finds an
+    /// empty declared text in any stdout.
+    pub fn contradiction(&self) -> Option<&'static str> {
+        match self {
+            Self::Exact {
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            } => {
+                if !is_lower_sha256(observed_sha256) || !is_lower_sha256(declared_sha256) {
+                    Some("a stdout digest is not SHA-256")
+                } else if run != "first" {
+                    Some(
+                        "it names a later run, but the first run of a matched pair printed the same bytes",
+                    )
+                } else if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
+                    Some("the declared stdout is the observed stdout")
+                } else {
+                    None
+                }
+            }
+            Self::Contains {
+                captured_sha256,
+                text,
+                ..
+            } => {
+                if !is_lower_sha256(captured_sha256) {
+                    Some("the stdout digest is not SHA-256")
+                } else if text.is_empty() {
+                    Some("the runner finds an empty declared text in any stdout")
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Split `<bytes> bytes, sha256 <digest>)<rest>`.
+fn split_sized_digest(text: &str) -> Option<(u64, &str, &str)> {
+    let (bytes, rest) = text.split_once(" bytes, sha256 ")?;
+    let (digest, rest) = rest.split_once(')')?;
+    Some((bytes.parse().ok()?, digest, rest))
+}
+
+/// Invert Rust's `{:?}` rendering of a string, which is how the runner quotes
+/// a declared expected_stdout_contains text. The caller still requires the
+/// re-rendered reason to reproduce the original exactly, so a lenient decode
+/// here cannot admit a text the runner would not write.
+fn parse_debug_string(quoted: &str) -> Option<String> {
+    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    let mut text = String::new();
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => return None,
+            '\\' => text.push(match chars.next()? {
+                't' => '\t',
+                'r' => '\r',
+                'n' => '\n',
+                '0' => '\0',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                'u' => {
+                    let (hex, rest) = chars.as_str().strip_prefix('{')?.split_once('}')?;
+                    let decoded = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+                    chars = rest.chars();
+                    decoded
+                }
+                _ => return None,
+            }),
+            other => text.push(other),
+        }
+    }
+    Some(text)
+}
+
+/// Recognize the runner's reason for a failed stdout expectation, or `None`
+/// for any other text. Only a reason that the runner's own formatter
+/// rebuilds byte for byte is recognized.
+pub fn parse_expected_output_failure_reason(reason: &str) -> Option<ExpectedOutputFailureReason> {
+    if let Some(rest) = reason.strip_prefix("verify stdout (") {
+        let (captured_bytes, captured_sha256, rest) = split_sized_digest(rest)?;
+        let quoted =
+            rest.strip_prefix(" does not contain the declared expected_stdout_contains text ")?;
+        let text = parse_debug_string(quoted)?;
+        (expected_stdout_contains_mismatch_reason(captured_bytes, captured_sha256, &text) == reason)
+            .then(|| ExpectedOutputFailureReason::Contains {
+                captured_bytes,
+                captured_sha256: captured_sha256.into(),
+                text,
+            })
+    } else {
+        let (run, rest) = reason
+            .strip_prefix("verify ")?
+            .split_once(" run stdout (")?;
+        let (observed_bytes, observed_sha256, rest) = split_sized_digest(rest)?;
+        let rest = rest.strip_prefix(" differs from the declared expected_stdout (")?;
+        let (declared_bytes, declared_sha256, rest) = split_sized_digest(rest)?;
+        (rest.is_empty()
+            && expected_stdout_mismatch_reason(
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            ) == reason)
+            .then(|| ExpectedOutputFailureReason::Exact {
+                run: run.into(),
+                observed_bytes,
+                observed_sha256: observed_sha256.into(),
+                declared_bytes,
+                declared_sha256: declared_sha256.into(),
+            })
+    }
 }
 
 /// Compare both runs a verify report compared with the declared stdout bytes.
