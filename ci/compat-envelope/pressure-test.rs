@@ -2849,19 +2849,30 @@ struct CheckedScorecard<'a> {
 }
 
 fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
-    let status = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
+    let output = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
         .arg("check")
         .current_dir(root)
-        .status()
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| format!("cannot run scorecard check: {e}"))?;
-    if status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprint!("{stderr}");
+    if output.status.success() {
         Ok(CheckedScorecard {
             root,
             enforce_host_capabilities: true,
             memory_budget_override: None,
         })
     } else {
-        Err("tracked scorecard is stale; update it before generating a pressure run".into())
+        // Name the check's own reason: it also fails when it cannot take the
+        // scorecard write-back lock, which is not a stale scorecard.
+        Err(format!(
+            "scorecard check failed ({}); a stale tracked scorecard must be updated before \
+             generating a pressure run: {}",
+            output.status,
+            stderr.trim()
+        ))
     }
 }
 
