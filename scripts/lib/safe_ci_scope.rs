@@ -237,7 +237,8 @@ fn outer_scope_limits_observed(proof: Option<&ContainmentProof>, expected_memory
 
 // --------------------------------------------------------------- CPU placement
 //
-// https://github.com/rrnewton/hermit/issues/3265: on devbig014 a
+// https://github.com/rrnewton/hermit/issues/3265: on the development host
+// recorded in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts") a
 // ptrace-stop-heavy cell costs 7.6-7.9x the CPU on the CPUs the AMD uncore and
 // L3 PMUs are bound to. The dev-hermit launcher (ci-hub/validate/cpu_placement.py)
 // derives the allowed set from the host and hands it down in the variables

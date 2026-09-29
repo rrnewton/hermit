@@ -305,7 +305,8 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
-  # Power/weight 2026-09-28 @ Hermit ad21724d5f64, ptrace verify, devbig014
+  # Power/weight 2026-09-28 @ Hermit ad21724d5f64, ptrace verify, on the host
+  # recorded in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts")
   # (https://github.com/rrnewton/hermit/issues/3337): payload 4096 -> 512 bytes.
   # Debug Hermit, the build the E2E artifact ships: median CPU 18.59s -> 4.76s
   # (3.9x) over 5 runs each. Release Hermit: 4.39s -> 1.14s (3.8x). Syscalls per
