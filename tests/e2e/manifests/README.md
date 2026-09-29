@@ -165,6 +165,17 @@ strictness, log comparison, positive INFO counts on both runs, bitwise parity,
 and a matched verdict. Output-only, stripped, empty-log, malformed, or
 contradictory reports are infrastructure errors rather than product results.
 
+A `verify` guest on any backend except dbt finds its home, XDG configuration
+and fixture directories at `/tmp/e2e/home`, `/tmp/e2e/xdg-config` and
+`/tmp/e2e/fixtures`, bound from the cell directory; `HOME`, `XDG_CONFIG_HOME`
+and `E2E_FIXTURE_DIR` name those paths and a prepared program runs as
+`/tmp/e2e/fixtures/program`. Every backend's guest therefore sees the same
+strings, which the parity post-pass requires before it reports a
+comparison's `credit` rather than its `unequalized_credit`
+(<https://github.com/rrnewton/hermit/issues/3301>). dbt refuses `--bind`, so a
+dbt guest, and a guest in any other mode, sees the host paths. Read these
+directories through the variables rather than assuming either form.
+
 `ci` may also be a mapping when enabled backends have different validation
 status. The mapping must name every enabled backend and no disabled backend.
 Each `false` backend requires its own structured reason; a `true` backend must

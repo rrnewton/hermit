@@ -75,6 +75,21 @@ logical work path so built-in verification cannot leak run-one mutations into
 run two. The checked-in XDG seed is under `tests/e2e/xdg-config/`; developer
 configuration is never read.
 
+A `verify` cell on any backend except dbt binds its `home`, `xdg-config` and
+`fixtures` directories to `/tmp/e2e/home`, `/tmp/e2e/xdg-config` and
+`/tmp/e2e/fixtures`, names those guest paths in `HOME`, `XDG_CONFIG_HOME` and
+`E2E_FIXTURE_DIR`, and launches a prepared program as
+`/tmp/e2e/fixtures/program`. The cell directory's name contains the backend,
+so without this the ptrace and candidate guests of one test saw different
+strings, and those strings alone made ptrace diverge from ptrace in 16 of 18
+control pairs
+(<https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696>).
+The dbt backend refuses `--bind`, so dbt cells, and cells in every other mode,
+keep the host paths. The parity post-pass sets `inputs_equalized` only when both
+operands were launched this way with the same argv, guest environment,
+working directory, bind targets and `HERMIT_EPOCH`; it reports `credit` for
+those comparisons and `unequalized_credit` for the rest.
+
 ## DAG wiring
 
 `ci/dag/validate.json` is the single committed validation graph. Its `portable`
