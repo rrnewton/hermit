@@ -197,6 +197,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./ci/hermetic/assert-build-dependencies.sh --self-test
 	./ci/hermetic/check-image-provenance.rs
 	./ci/hermetic/tests/test-retry-fetch.sh
+	python3 ./ci/hermetic/run-in-pinned-root-cache-test.py
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
