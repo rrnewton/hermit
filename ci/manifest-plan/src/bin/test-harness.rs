@@ -132,7 +132,7 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
   HERMIT_BIN=<PATH>                      Hermit executable; a relative path is under the
                                          repository root (default: target/debug/hermit)
   HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
-  E2E_KEEP_VERIFY_LOGS=1                 Retain successful verification logs
+  E2E_KEEP_VERIFY_LOGS=1                 Retain verify logs (one golden log after a match)
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
   HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=<N> Positive finite wall-time multiplier";
 
@@ -3680,30 +3680,27 @@ report.write_bytes((root/'verification.json').read_bytes())
                     )
                 })
                 .collect::<BTreeSet<_>>();
-            // The single-log `log-diff` call is the ptrace cell's own golden
-            // normalization, part of its ordinary verification. A two-log
-            // comparison would be recorded as "compare".
-            assert_eq!(calls.len(), 4, "{scenario}: {calls:#?}");
+            // One guest run per cell and no `log-diff` of either kind. The
+            // ptrace golden-log normalization, a fourth, single-log call here
+            // until https://github.com/rrnewton/hermit/issues/3301, was
+            // removed: parity canonicalizes run 1's log when it compares. The
+            // fake still records a single-log call as "normalize" and a
+            // two-log comparison as "compare", so either would fail this.
+            assert_eq!(calls.len(), 3, "{scenario}: {calls:#?}");
             assert_eq!(
                 kinds,
                 BTreeSet::from([
                     "custom:kvm:false".to_string(),
-                    "normalize:-:false".to_string(),
                     "run:kvm:false".to_string(),
                     "run:ptrace:false".to_string(),
                 ]),
                 "{scenario}: no ptrace reference run and no log-diff comparison"
             );
-            let normalized = calls
-                .iter()
-                .find(|call| call["kind"] == "normalize")
-                .unwrap();
             assert!(
-                normalized["argv"][1]
-                    .as_str()
-                    .unwrap()
-                    .contains("/parity-mixed-verify-ptrace/"),
-                "{scenario}: only the ptrace cell's own log is normalized: {normalized}"
+                calls
+                    .iter()
+                    .all(|call| call["kind"] != "normalize" && call["kind"] != "compare"),
+                "{scenario}: E2E_KEEP_VERIFY_LOGS launched a log-diff: {calls:#?}"
             );
         }
     }
@@ -3902,19 +3899,22 @@ report.write_bytes((root/'verification.json').read_bytes())
             include_str!("../../tests/fixtures/fake-parity-log-diff.py"),
         )
         .unwrap();
-        // One fake hermit: `run` is a guest execution and is counted; the
-        // single-log `log-diff` is ptrace golden normalization; a two-log
-        // `log-diff` is a parity comparison. The scenario is a list of words:
+        // One fake hermit: `run` is a guest execution and is counted; a
+        // single-log `log-diff`, the ptrace golden normalization removed for
+        // https://github.com/rrnewton/hermit/issues/3301, is counted so that
+        // its return fails the test; a two-log `log-diff` is a parity
+        // comparison. The scenario is a list of words:
         // parity/beta's liteinst cell fails determinism unless it has `pass`,
         // and `mutated` changes every candidate's second detcore message.
         let hermit = fixture.join("hermit");
-        // This fake starts about 150 times per test run, so it imports only
-        // `os`. `-IS` skips the site-packages scan at every start, the
-        // `--help` and version probes exit before any import, and each
-        // invocation record is written as the literal line `json.dumps`
-        // produces for it: the cell directory names are ASCII slugs with no
-        // quote or backslash. Importing json and pathlib cost more than the
-        // rest of the script. The log-diff stand-in starts with `-IS` too.
+        // This fake starts at every probe, guest run and `log-diff` of the
+        // test, so it imports only `sys` and, past the probes, `os`. `-IS`
+        // skips the site-packages scan at every start, the `--help` and
+        // version probes exit before `os` is imported, and each invocation
+        // record is written as the literal line `json.dumps` produces for
+        // it: the cell directory names are ASCII slugs with no quote or
+        // backslash. Importing json and pathlib cost more than the rest of
+        // the script. The log-diff stand-in starts with `-IS` too.
         fs::write(
             &hermit,
             r#"#!/usr/bin/python3 -IS
@@ -4243,8 +4243,8 @@ sys.exit(1 if failed else 0)
             );
             assert_eq!(
                 count(calls, "normalize"),
-                2,
-                "E2E_KEEP_VERIFY_LOGS normalizes each ptrace golden"
+                0,
+                "E2E_KEEP_VERIFY_LOGS retains logs and launches no golden-log normalization"
             );
         }
         assert_eq!(count(&none_calls, "compare"), 0);
