@@ -31,7 +31,7 @@ struct Consumer {
 
 const CONSUMERS: &[Consumer] = &[
     Consumer {
-        path: "tests/backend-parity/e9patch_corpus.py",
+        path: "tests/e9patch/e9patch_corpus.py",
         requirement: "matched",
         invocation: "verification_matched(hermit,",
         minimum_invocations: 2,
