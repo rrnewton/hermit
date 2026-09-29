@@ -4883,3 +4883,360 @@ mod test {
         }
     }
 }
+
+/// `inject_fstat` and `add_fd` against a scripted guest whose "address space"
+/// is this test process, so every injected syscall runs for real on host
+/// memory and a real descriptor. Regression coverage for
+/// <https://github.com/rrnewton/hermit/issues/3328>; the traced end-to-end case
+/// is `tests_misc::tight_stack_openat`.
+#[cfg(test)]
+mod inject_fstat_scratch {
+    use std::os::fd::IntoRawFd;
+    use std::os::fd::RawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::Tool;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::ProtFlags;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::types::DetPid;
+
+    /// Room for one `libc::stat`, 8-byte aligned like a real stack slot.
+    const ARENA_WORDS: usize = 32;
+
+    /// A guest stack scratch that is either writable or faults on commit,
+    /// like the ptrace scratch below an `rsp` with no writable memory under
+    /// it. The writable arena belongs to the guest and outlives every guard,
+    /// so an early guard drop is reported by `guard_live` rather than by a
+    /// write into freed memory.
+    struct ScriptedStack {
+        writable: bool,
+        arena: usize,
+        guard_live: Arc<AtomicBool>,
+    }
+
+    struct ScriptedStackGuard {
+        guard_live: Arc<AtomicBool>,
+    }
+
+    impl Drop for ScriptedStackGuard {
+        fn drop(&mut self) {
+            self.guard_live.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl reverie::Stack for ScriptedStack {
+        type StackGuard = ScriptedStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("inject_fstat must not query the scratch size")
+        }
+        fn capacity(&self) -> usize {
+            panic!("inject_fstat must not query the scratch capacity")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("inject_fstat reserves its buffer rather than pushing one")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            assert!(std::mem::size_of::<T>() <= ARENA_WORDS * std::mem::size_of::<u64>());
+            AddrMut::from_raw(self.arena).unwrap()
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            if !self.writable {
+                return Err(Errno::EFAULT);
+            }
+            self.guard_live.store(true, Ordering::SeqCst);
+            Ok(ScriptedStackGuard {
+                guard_live: self.guard_live,
+            })
+        }
+    }
+
+    struct ScriptedGuest {
+        config: Config,
+        thread: ThreadState<()>,
+        stack_writable: bool,
+        mmap_fails: bool,
+        arena: Box<[u64; ARENA_WORDS]>,
+        guard_live: Arc<AtomicBool>,
+        injected: Vec<Sysno>,
+        /// Whether a stack guard was live when each fstat was injected.
+        fstat_guard_live: Vec<bool>,
+        /// Buffer address of each injected fstat.
+        fstat_buffers: Vec<usize>,
+        /// (address, length) of each page the guest mapped.
+        mapped: Vec<(usize, usize)>,
+        /// (address, length) of each successful munmap.
+        unmapped: Vec<(usize, usize)>,
+        /// Descriptors closed through injection.
+        closed: Vec<RawFd>,
+    }
+
+    impl ScriptedGuest {
+        fn new(stack_writable: bool, mmap_fails: bool) -> (Detcore, Self) {
+            let config = Config {
+                virtualize_metadata: true,
+                ..Config::default()
+            };
+            let pid = DetPid::from_raw(1);
+            let mut thread = ThreadState::new(pid, &config, ());
+            thread.detpid = Some(pid);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+            let guest = Self {
+                config,
+                thread,
+                stack_writable,
+                mmap_fails,
+                arena: Box::new([u64::MAX; ARENA_WORDS]),
+                guard_live: Arc::new(AtomicBool::new(false)),
+                injected: Vec::new(),
+                fstat_guard_live: Vec::new(),
+                fstat_buffers: Vec::new(),
+                mapped: Vec::new(),
+                unmapped: Vec::new(),
+                closed: Vec::new(),
+            };
+            (tool, guest)
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ScriptedGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!("fd registration must not send an RPC: {:?}", message.2)
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ScriptedGuest {
+        type Memory = LocalMemory;
+        type Stack = ScriptedStack;
+
+        fn tid(&self) -> Pid {
+            Pid::from_raw(1)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(1)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("fd registration must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            ScriptedStack {
+                writable: self.stack_writable,
+                arena: self.arena.as_mut_ptr() as usize,
+                guard_live: self.guard_live.clone(),
+            }
+        }
+        async fn daemonize(&mut self) {
+            panic!("fd registration must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, args) = syscall.into_parts();
+            self.injected.push(number);
+            // SAFETY: each arm runs the syscall Detcore asked for against this
+            // process, on addresses Detcore obtained from this guest.
+            let raw = match Syscall::from_raw(number, args) {
+                Syscall::Mmap(call) => {
+                    assert!(call.addr().is_none(), "the kernel must choose the address");
+                    assert_eq!(call.prot(), ProtFlags::PROT_READ | ProtFlags::PROT_WRITE);
+                    assert_eq!(
+                        call.flags(),
+                        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS
+                    );
+                    if self.mmap_fails {
+                        return Err(Errno::ENOMEM);
+                    }
+                    let address = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            call.len(),
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if address == libc::MAP_FAILED {
+                        -1
+                    } else {
+                        self.mapped.push((address as usize, call.len()));
+                        address as i64
+                    }
+                }
+                Syscall::Fstat(call) => {
+                    let buffer = call.stat().expect("fstat without a buffer").0.as_raw();
+                    self.fstat_buffers.push(buffer);
+                    self.fstat_guard_live
+                        .push(self.guard_live.load(Ordering::SeqCst));
+                    i64::from(unsafe { libc::fstat(call.fd(), buffer as *mut libc::stat) })
+                }
+                Syscall::Munmap(call) => {
+                    let address = call.addr().expect("munmap without an address").as_raw();
+                    let raw = i64::from(unsafe { libc::munmap(address as *mut _, call.len()) });
+                    if raw == 0 {
+                        self.unmapped.push((address, call.len()));
+                    }
+                    raw
+                }
+                Syscall::Close(call) => {
+                    self.closed.push(call.fd());
+                    i64::from(unsafe { libc::close(call.fd()) })
+                }
+                other => panic!("unexpected injected syscall {other:?}"),
+            };
+            Errno::result(raw)
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("fd registration must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("fd registration must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("fd registration must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("fd registration must not read a clock")
+        }
+    }
+
+    /// A real descriptor the test owns by number, and its inode. Ownership is
+    /// raw so a descriptor that Detcore closes is never closed a second time.
+    fn open_file() -> (RawFd, u64) {
+        let file = tempfile::tempfile().unwrap();
+        let inode = file.metadata().unwrap().ino();
+        (file.into_raw_fd(), inode)
+    }
+
+    fn close_unless_detcore_did(guest: &ScriptedGuest, fd: RawFd) {
+        if !guest.closed.contains(&fd) {
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+    }
+
+    fn recorded_inode(guest: &ScriptedGuest, fd: RawFd) -> Option<u64> {
+        guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn writable_stack_scratch_is_used_while_its_guard_is_live() {
+        let (fd, inode) = open_file();
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+
+        let result = tool
+            .add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(guest.injected, [Sysno::fstat]);
+        assert_eq!(
+            guest.fstat_guard_live,
+            [true],
+            "the stack guard must outlive the injected fstat: backends whose \
+             scratch is an arena free it when the guard drops"
+        );
+        assert_eq!(
+            guest.fstat_buffers,
+            [guest.arena.as_ptr() as usize],
+            "fstat must write into the stack scratch"
+        );
+        let used_words = std::mem::size_of::<libc::stat>().div_ceil(8);
+        assert!(
+            guest.arena[..used_words].iter().all(|word| *word == 0),
+            "the stat must not be left in the guest's stack scratch"
+        );
+        assert_eq!(recorded_inode(&guest, fd), Some(inode));
+    }
+
+    #[tokio::test]
+    async fn faulting_stack_scratch_falls_back_to_a_transient_page() {
+        let (fd, inode) = open_file();
+        let (tool, mut guest) = ScriptedGuest::new(false, false);
+
+        let result = tool
+            .add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            result,
+            Ok(()),
+            "a stack that cannot hold the fstat buffer must not fail the open"
+        );
+        assert_eq!(guest.injected, [Sysno::mmap, Sysno::fstat, Sysno::munmap]);
+        let [(page, len)] = guest.mapped[..] else {
+            panic!(
+                "expected exactly one transient page, got {:?}",
+                guest.mapped
+            );
+        };
+        assert_eq!(
+            guest.fstat_buffers,
+            [page],
+            "fstat must write into the transient page"
+        );
+        assert_eq!(
+            guest.unmapped,
+            [(page, len)],
+            "the transient page must be unmapped, whole"
+        );
+        assert_eq!(recorded_inode(&guest, fd), Some(inode));
+    }
+
+    #[tokio::test]
+    async fn descriptor_is_closed_when_no_scratch_can_be_found() {
+        let (fd, _) = open_file();
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+
+        let result = tool
+            .add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(result, Err(Errno::ENOMEM));
+        assert_eq!(guest.injected, [Sysno::mmap, Sysno::close]);
+        assert_eq!(
+            guest.closed,
+            [fd],
+            "the descriptor must not stay open behind the error"
+        );
+        assert_eq!(
+            guest.thread.with_detfd(fd, |_| ()),
+            Err(Errno::EBADF),
+            "a descriptor that failed registration must not be modeled"
+        );
+    }
+}
