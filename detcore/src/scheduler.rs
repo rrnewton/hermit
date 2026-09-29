@@ -9180,6 +9180,13 @@ mod test {
 
     /// Records, in order, the text of every INFO event from
     /// `detcore::scheduler`: the stream the L2 verify comparator reads.
+    ///
+    /// It is a thread-scoped subscriber, so a test that reads it must start
+    /// with `exec_teardown_tests::in_isolated_log_test`. `tracing` caches
+    /// callsite interest for the whole process, and a parallel in-process test
+    /// that reaches a scheduler callsite with no subscriber can cache `never`
+    /// and drop a real record from this capture
+    /// (https://github.com/rrnewton/hermit/issues/3366).
     #[derive(Clone, Default)]
     struct SchedulerInfoLog(Arc<Mutex<Vec<String>>>);
 
@@ -9354,6 +9361,13 @@ mod test {
     /// and state must not change.
     #[tokio::test]
     async fn sabre_last_exit_logs_one_fizzle_wherever_the_final_wait_status_lands() {
+        // Reads `SchedulerInfoLog`; see there for why it runs in its own process.
+        if !super::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "sabre_last_exit_logs_one_fizzle_wherever_the_final_wait_status_lands",
+        ) {
+            return;
+        }
         let config = Config {
             backend_reports_physical_process_exits: true,
             ..Config::default()
@@ -9393,6 +9407,13 @@ mod test {
     /// scheduler's INFO log and state must not change.
     #[tokio::test]
     async fn redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands() {
+        // Reads `SchedulerInfoLog`; see there for why it runs in its own process.
+        if !super::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands",
+        ) {
+            return;
+        }
         let config = Config::default();
         assert!(!config.backend_reports_physical_process_exits);
         let leader = DetTid::from_raw(3);
