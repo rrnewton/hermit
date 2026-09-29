@@ -1058,8 +1058,8 @@ fn compile_bootstrap_time_guest(
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-bootstrap-time");
         fs::create_dir_all(&build_root).expect("failed to create bootstrap-time guest directory");
         let guest = build_root.join(name);
-        // -D_GNU_SOURCE matches the build flags that
-        // tests/e2e/manifests/backend-parity-c.yaml gives host_identity.c.
+        // -D_GNU_SOURCE matches the build flags that the c-programs/host-identity
+        // cell in tests/e2e/manifests/c-programs.yaml gives host_identity.c.
         let output = Command::new("cc")
             .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE"])
             .arg(repository.join(source))
@@ -1078,10 +1078,10 @@ fn compile_bootstrap_time_guest(
 }
 
 fn bootstrap_time_host_identity() -> &'static Path {
-    // The unchanged backend-parity fixture. It asserts sysinfo.uptime == 121.
+    // The unchanged host-identity fixture. It asserts sysinfo.uptime == 121.
     compile_bootstrap_time_guest(
         &BOOTSTRAP_TIME_HOST_IDENTITY,
-        "tests/backend-parity/fixtures/host_identity.c",
+        "tests/c/host_identity.c",
         "host_identity",
     )
 }
@@ -1248,11 +1248,34 @@ fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
     samples
 }
 
+/// Upper bound on how much later, in virtual nanoseconds, each LiteInst image
+/// reaches main than the same image under ptrace.
+///
+/// The fix for https://github.com/rrnewton/hermit/issues/3338 stops charging the
+/// runtime's preload constructor, which cost about 2.1 s per image here. It does
+/// not make the backends reach main at the same instant. Before the runtime's
+/// begin trap, the dynamic loader maps the preloaded runtime and its libgcc_s
+/// dependency as ordinary guest syscalls, and those stay charged. Scheduler
+/// turns inside the bootstrap window also still advance global time. Measured
+/// with these flags, LiteInst reaches main 151,137,500 ns after ptrace in the
+/// first image, and the exec adds 136,137,500 ns more. Both values are exact and
+/// repeat across runs; they depend on the fixture binary that the host's cc
+/// produces and on the runtime's library set, so the test bounds them instead of
+/// asserting them. 200 ms per image leaves about 50 ms of headroom and fails if
+/// even a tenth of the runtime constructor is charged again. This residual is
+/// not parity: it grows with every exec, and after enough execs sysinfo uptime
+/// differs between the backends again. The follow-up is tracked from
+/// https://github.com/rrnewton/hermit/issues/3338.
+const LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS: u128 = 200_000_000;
+
 #[test]
-fn liteinst_clock_trajectory_matches_ptrace_after_runtime_bootstrap() {
+fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
     let liteinst = clock_trajectory("liteinst");
     let ptrace = clock_trajectory("ptrace");
 
+    // The fixture's last read is about 0.92 s past the epoch under LiteInst,
+    // below the next uptime boundary, so both backends read the same uptime.
+    // This is not a general guarantee; see LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS.
     let liteinst_uptime = liteinst.iter().map(|s| s.uptime).collect::<Vec<_>>();
     let ptrace_uptime = ptrace.iter().map(|s| s.uptime).collect::<Vec<_>>();
     assert_eq!(
@@ -1260,24 +1283,54 @@ fn liteinst_clock_trajectory_matches_ptrace_after_runtime_bootstrap() {
         "LiteInst and ptrace must agree on sysinfo uptime\nliteinst={liteinst:?}\nptrace={ptrace:?}"
     );
 
-    // The backends do not reach main at the same virtual instant. Before the
-    // runtime's first trap, the dynamic loader maps the preloaded runtime and
-    // its libgcc_s dependency, and those are ordinary guest syscalls that
-    // stay charged. Scheduler turns inside the bootstrap window also still
-    // advance global time. The exec reloads the runtime, so the same holds
-    // for the first sample after it. In standalone runs with these flags
-    // (values shift by a few ms with the environment), the LiteInst
-    // samples read 151,137,500 ns later than ptrace's before the exec and
-    // 287,275,000 ns later after it. Charging the runtime constructor as well made
-    // those gaps 2,101,387,500 ns and 4,187,775,000 ns. Bound each gap below
-    // one uptime second rather than asserting equal values.
-    for index in [0, CLOCK_TRAJECTORY_FIRST_AFTER_EXEC] {
-        let gap = liteinst[index]
-            .monotonic_ns
-            .abs_diff(ptrace[index].monotonic_ns);
-        assert!(
-            gap < 1_000_000_000,
-            "LiteInst sample {index} is {gap} ns away from ptrace\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    // Inside one image, after main starts, the guest runs identical code under
+    // both backends, so the time between consecutive samples must be identical
+    // (6,500,000 ns with these flags). A difference means the backend charges
+    // guest code differently, not just the bootstrap.
+    for index in 1..CLOCK_TRAJECTORY_SAMPLES {
+        if index == CLOCK_TRAJECTORY_FIRST_AFTER_EXEC {
+            continue;
+        }
+        let liteinst_delta = liteinst[index].monotonic_ns - liteinst[index - 1].monotonic_ns;
+        let ptrace_delta = ptrace[index].monotonic_ns - ptrace[index - 1].monotonic_ns;
+        assert_eq!(
+            liteinst_delta,
+            ptrace_delta,
+            "samples {} and {index} must be the same distance apart under both backends\nliteinst={liteinst:?}\nptrace={ptrace:?}",
+            index - 1
         );
     }
+
+    // LiteInst reaches main later than ptrace in each image, by the loader and
+    // scheduler residual only. Bound the first image's gap, and the growth of
+    // the gap across the exec, by the per-image residual bound.
+    let gap_before_exec = liteinst[0]
+        .monotonic_ns
+        .checked_sub(ptrace[0].monotonic_ns)
+        .unwrap_or_else(|| {
+            panic!("LiteInst reached main before ptrace\nliteinst={liteinst:?}\nptrace={ptrace:?}")
+        });
+    let gap_after_exec = liteinst[CLOCK_TRAJECTORY_FIRST_AFTER_EXEC]
+        .monotonic_ns
+        .checked_sub(ptrace[CLOCK_TRAJECTORY_FIRST_AFTER_EXEC].monotonic_ns)
+        .unwrap_or_else(|| {
+            panic!(
+                "LiteInst reached the exec'd main before ptrace\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+            )
+        });
+    assert!(
+        gap_before_exec < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
+        "LiteInst reaches main {gap_before_exec} ns after ptrace in the first image\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
+    let exec_growth = gap_after_exec
+        .checked_sub(gap_before_exec)
+        .unwrap_or_else(|| {
+            panic!(
+                "the LiteInst gap shrank across the exec\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+            )
+        });
+    assert!(
+        exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
+        "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
 }
