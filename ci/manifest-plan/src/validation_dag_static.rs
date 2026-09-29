@@ -349,7 +349,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_bridge_is_not_installed_by_a_process_that_is_pid_1) retain all 754
     // prior identities (`cargo nextest list --profile ci` measured 758;
     // https://github.com/rrnewton/hermit/issues/3354).
-    ("test.hermit_unit", 758),
+    // Thirteen SaBRe trust-cache range-eviction tests (sabre_ptrace::tests::
+    // a_range_eviction_drops_pages_in_range_and_keeps_the_rest,
+    // mmap_and_mprotect_ranges, a_zero_length_mprotect_evicts_nothing,
+    // mremap_evicts_both_its_old_and_its_new_range,
+    // a_failed_mutator_evicts_the_whole_space,
+    // calls_without_a_provable_range_evict_the_whole_space,
+    // possible_hugetlb_mappings_evict_the_whole_space,
+    // growing_mprotect_evicts_the_whole_space,
+    // an_overflowing_range_evicts_the_whole_space,
+    // a_sibling_thread_sees_a_range_eviction,
+    // a_clone_vm_child_sees_a_range_eviction,
+    // a_range_eviction_leaves_an_unrelated_address_space_alone,
+    // a_mutation_before_admission_drops_every_cached_page) retain all 758
+    // prior identities (`cargo nextest list --profile ci` measured 771;
+    // https://github.com/rrnewton/hermit/issues/3378).
+    ("test.hermit_unit", 771),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -454,7 +469,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 849),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 177),
-    ("test.hermit_unit_on_host", 758),
+    // The host node carries test.hermit_unit's selection, including the
+    // thirteen SaBRe trust-cache range-eviction tests.
+    ("test.hermit_unit_on_host", 771),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
