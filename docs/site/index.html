@@ -46,7 +46,7 @@
     <section class="score-strip" aria-label="Current compatibility highlights">
       <div><strong>191/191</strong><span>ptrace strict L2 corpus</span></div>
       <div><strong>70/89</strong><span>DBT-native Reverie tests</span></div>
-      <div><strong>4</strong><span>backends compared with ptrace, after determinism</span></div>
+      <div><strong>3</strong><span>backends compared with ptrace (KVM, SaBRe, LiteInst); DBT not compared: inputs cannot be equalized</span></div>
       <div><strong>0&ndash;1</strong><span>parity credit, from the first divergence</span></div>
     </section>
 
@@ -134,25 +134,25 @@
             <tr>
               <th scope="row">DBT</th>
               <td><strong>70/89</strong> Reverie-native tests</td>
-              <td>measured after determinism</td>
+              <td>not compared: dbt refuses --bind/--mount, so inputs cannot be equalized</td>
               <td><strong>B2</strong></td>
             </tr>
             <tr>
               <th scope="row">KVM</th>
               <td><span class="todo">TODO: publish native-suite denominator</span></td>
-              <td>measured after determinism</td>
+              <td><span class="todo">no parity rows published yet</span></td>
               <td><strong>B2</strong></td>
             </tr>
             <tr>
               <th scope="row">SaBRe</th>
               <td><strong>198/198</strong> compatibility rows</td>
-              <td>measured after determinism</td>
+              <td><span class="todo">no parity rows published yet</span></td>
               <td><strong>B2</strong></td>
             </tr>
             <tr>
               <th scope="row">LiteInst</th>
               <td><span class="todo">TODO: publish native-suite denominator</span></td>
-              <td>measured after determinism</td>
+              <td><span class="todo">no parity rows published yet</span></td>
               <td><span class="todo">TODO: not assigned in current snapshot</span></td>
             </tr>
             <tr>
