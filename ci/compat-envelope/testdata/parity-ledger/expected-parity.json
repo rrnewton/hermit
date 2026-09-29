@@ -1,7 +1,7 @@
 {
   "schema": "parity-summary/v1",
   "generated_from": {
-    "store_sha256": "d2750e52eb70b0bf984f3b4798f05aa32e413261bf3a127f90f8f4de46cbc9b3",
+    "store_sha256": "0520e2ded9f9a86935622f8be288f2387287aad415ad443524d93d6acf9abf93",
     "series_commit": null,
     "tool_hermit_commit": null
   },

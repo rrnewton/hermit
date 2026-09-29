@@ -19,17 +19,17 @@
       "status_sha256": "9635821c2ce75d21b1c51349029385a3618df030adcc40653f770f66c5bf0eb5"
     }
   ],
-  "source_root": "dev-hermit ignored/validate/artifacts/<run_id>/ on devbig014 (retained validate artifacts; not published)",
+  "source_root": "dev-hermit ignored/validate/artifacts/<run_id>/ on the host named for this fixture in docs/TESTING_ENVIRONMENTS.md under \"Named measurement hosts\" (retained validate artifacts; not published)",
   "export_command": "test-harness parity export --e2e-root <source_root>/e2e",
   "export_sha256": "dfa186f44662a635b543d518fbb70bf4b7e10a4c198b516b98fab80183140863",
   "wrapping": "Each exported source row became one line: compact JSON of schema \"parity-ledger/v1\", event_type \"parity.record\", event_id = sha256(\"validate\\0<run_id>\\0<cell>\\0<lane>\\0<node>\"), team, host, emitted_at, producer \"validate\", run_id, hermit_sha, source_tree_dirty false, then the source row's cell, test_id, backend, verdict, reason and source, then ,\"record\": followed by the post-pass record text spliced byte-for-byte from parity.jsonl. All 192 records were checked to be byte-identical to a line of the two sources.",
   "fixture_values": {
     "team": "hermit",
-    "host": "devbig014",
+    "host": "fixture-host-b",
     "emitted_at": "2026-09-29T04:10:00Z",
-    "note": "This run was never published to the ledger, so team, host and emitted_at are fixture values, not a publication record. Every other field is the run's own."
+    "note": "This run was never published to the ledger, so team, host and emitted_at are fixture values, not a publication record. Every other field is the run's own. host is fixture-host-b, the host directory of the shard the fixture test reads the rows from (parity/hermit/fixture-host-b/2026-09.jsonl); it was the measuring machine's name until scripts/check-portable-paths.sh refused a literal host name in a tracked ci/ file. event_id does not cover host, so no event id changed. The machine is recorded in docs/TESTING_ENVIRONMENTS.md under \"Named measurement hosts\"."
   },
-  "rows_jsonl_sha256": "f7288bc0ccd1a69565ed490b6d3a1547ee3083e63ae36eb499b10523a8e3a028",
+  "rows_jsonl_sha256": "76bc229e1577ee534e253603c517419698d60af31a9ffa10b44f1767531b3015",
   "committed_cells": {
     "path": "committed-cells.json",
     "sha256": "13060e6e078178a597935cbccc68fa52e6efb39313157b6b029855b10300f173",
@@ -40,9 +40,10 @@
   },
   "expected_summary": "parity: 0/192 matched; selected 192 of 192 committed; measured 175; unavailable 17; record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 [inputs not equalized]",
   "expected_summary_check": "The totals and every per-backend line were computed independently in Python from rows.jsonl before expected-parity.json was accepted.",
-  "expected_parity_sha256": "75e0c62c8c920edc31f0e2e0b9fc93d24a90964bd6cc4c35d7088a69227e9e81",
+  "expected_parity_sha256": "1c49c0c359652ec5521a880694e11bcebb5108d9e8065ecebce3f7009c3af1b5",
   "expected_parity_origin": "expected-parity.json is produced by the code under test and then reviewed; it is never edited by hand. To regenerate it, run the fixture test (rust-script --test ci/compat-envelope/scorecard.rs the_real_run_1953_rows_summarize_to_the_checked_in_expectation); on a difference it writes the actual summary to $TMPDIR/expected-parity-<pid>.json. Review that file's diff against the checked-in one, explain every changed number here, and only then copy it over.",
   "expected_parity_history": [
-    "Adding the committed selection (S12 review findings E2/E3) and the clean/unequalized credit split (S8) only added fields: conflicting_hermit_shas, committed_unknown, committed_cells_without_row and cells_outside_committed per run; clean_credit_sum, unequalized_credit_sum, clean_mean_credit, unequalized_mean_credit, committed, committed_selected and outside_committed per tally; legacy_dropped_cells at the top level; and \"selected 192 of 192 committed; \" in each run line. No existing number changed: every credit is unequalized, so unequalized_credit_sum equals credit_sum (kvm 7.678, liteinst 1.375, sabre 0.020, total 9.073 over 175 measured cells = 0.052), and the clean sums are 0."
+    "Adding the committed selection (S12 review findings E2/E3) and the clean/unequalized credit split (S8) only added fields: conflicting_hermit_shas, committed_unknown, committed_cells_without_row and cells_outside_committed per run; clean_credit_sum, unequalized_credit_sum, clean_mean_credit, unequalized_mean_credit, committed, committed_selected and outside_committed per tally; legacy_dropped_cells at the top level; and \"selected 192 of 192 committed; \" in each run line. No existing number changed: every credit is unequalized, so unequalized_credit_sum equals credit_sum (kvm 7.678, liteinst 1.375, sabre 0.020, total 9.073 over 175 measured cells = 0.052), and the clean sums are 0.",
+    "Replacing the fixture host name (every row's host, and the shard path the fixture test reads them from) with fixture-host-b changed only generated_from.store_sha256, from d2750e52eb70b0bf984f3b4798f05aa32e413261bf3a127f90f8f4de46cbc9b3 to 0520e2ded9f9a86935622f8be288f2387287aad415ad443524d93d6acf9abf93: the store digest covers each shard's path and bytes. The new value was computed independently in Python as sha256(path, NUL, u64 little-endian length, bytes) before the test's output was accepted. No count or credit changed."
   ]
 }

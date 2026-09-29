@@ -3501,8 +3501,8 @@ fn run_nodes(
         Vec::new()
     });
     for lane in lanes {
-        let lane_nodes = directory_name(&lane)
-            .and_then(|lane_name| Ok((lane_name, sorted_directories(&lane)?)));
+        let lane_nodes =
+            directory_name(&lane).and_then(|lane_name| Ok((lane_name, sorted_directories(&lane)?)));
         let (lane_name, lane_nodes) = match lane_nodes {
             Ok(listed) => listed,
             Err(error) => {
@@ -3927,14 +3927,17 @@ pub fn append_ledger_rows(
     probe.arg(series).args(["append-parity", "--help"]);
     match run_bounded_capturing(&mut probe, Stdio::null(), bounds.probe) {
         Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
-        Ok((None, _, _)) => {
+        Ok(Captured { status: None, .. }) => {
             return left(&format!(
                 "ERROR: `{} append-parity --help` did not finish within {:?} and was killed",
                 series.display(),
                 bounds.probe
             ));
         }
-        Ok((Some(status), _, _)) if !status.success() => {
+        Ok(Captured {
+            status: Some(status),
+            ..
+        }) if !status.success() => {
             return left(&format!(
                 "the series writer {} has no append-parity (`append-parity --help` {status})",
                 series.display()
@@ -3986,11 +3989,14 @@ pub fn append_ledger_rows(
         .arg(append.run_id)
         .arg("--tree")
         .arg(append.tree);
-    let (status, stdout, stderr) =
-        match run_bounded_capturing(&mut command, Stdio::from(input), bounds.append) {
-            Ok(outcome) => outcome,
-            Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
-        };
+    let Captured {
+        status,
+        stdout,
+        stderr,
+    } = match run_bounded_capturing(&mut command, Stdio::from(input), bounds.append) {
+        Ok(outcome) => outcome,
+        Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
+    };
     let Some(status) = status else {
         return left(&format!(
             "ERROR: append-parity did not finish within {:?} and was killed, so the ledger may \
@@ -4032,6 +4038,14 @@ fn capped_reader(
     })
 }
 
+/// What [`run_bounded_capturing`] kept of one bounded run.
+struct Captured {
+    /// `None` when the group was killed at its bound.
+    status: Option<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// Run `command` as the leader of its own process group, with `stdin`,
 /// keeping at most [`APPEND_OUTPUT_LIMIT_BYTES`] of each of stdout and
 /// stderr. A `None` status means the group was killed at `timeout`. Once
@@ -4041,7 +4055,7 @@ fn run_bounded_capturing(
     command: &mut Command,
     stdin: Stdio,
     timeout: Duration,
-) -> Result<(Option<ExitStatus>, Vec<u8>, Vec<u8>), String> {
+) -> Result<Captured, String> {
     use std::os::unix::process::CommandExt;
 
     let mut child = command
@@ -4086,11 +4100,11 @@ fn run_bounded_capturing(
         }
     };
     kill_group();
-    Ok((
+    Ok(Captured {
         status,
-        stdout.join().unwrap_or_default(),
-        stderr.join().unwrap_or_default(),
-    ))
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -6956,8 +6970,8 @@ mod tests {
             )),
             Some(&written),
         );
-        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected))
-            .unwrap();
+        let rows =
+            node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected)).unwrap();
         assert_eq!(rows.len(), 5, "{rows:#?}");
         assert_eq!(rows[0].record.as_ref(), Some(&written[0]));
         assert_eq!(rows[0].source.scope_source, LedgerScopeSource::StatusScope);
@@ -6987,8 +7001,8 @@ mod tests {
             Some(&ledger_status(PostPassState::Complete, None, 1, None)),
             Some(&written),
         );
-        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected))
-            .unwrap();
+        let rows =
+            node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected)).unwrap();
         assert_eq!(rows.len(), 5, "{rows:#?}");
         assert_eq!(rows[0].source.scope_source, LedgerScopeSource::StatusCount);
         assert!(rows[1..].iter().all(|row| {
@@ -7008,12 +7022,18 @@ mod tests {
             )),
             Some(&written),
         );
-        let rows = node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected))
-            .unwrap();
+        let rows =
+            node_ledger_sources(&node, "portable", "manifest_c_programs", Some(&expected)).unwrap();
         assert_eq!(rows.len(), 5, "{rows:#?}");
         let reasons = rows
             .iter()
-            .map(|row| (row.cell.as_str(), row.source.scope_source, row.reason.as_deref()))
+            .map(|row| {
+                (
+                    row.cell.as_str(),
+                    row.source.scope_source,
+                    row.reason.as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             reasons,
@@ -7065,7 +7085,12 @@ mod tests {
         let cpuid = [parity_cell("c-programs/cpuid", ParityBackend::Kvm)];
         write_node(
             &root.join("privileged/manifest_c_programs"),
-            Some(&ledger_status(PostPassState::Complete, Some(&cpuid), 1, None)),
+            Some(&ledger_status(
+                PostPassState::Complete,
+                Some(&cpuid),
+                1,
+                None,
+            )),
             Some(&[ledger_diverged("c-programs/cpuid", ParityBackend::Kvm, 1)]),
         );
         // A complete node on disk that the plan did not name.
@@ -7183,10 +7208,7 @@ mod tests {
         assert!("2026-09-29T04:10:00.5Z" < "2026-09-29T04:10:00Z");
         assert!(at("2026-09-29T04:10:00.5Z") > at("2026-09-29T04:10:00Z"));
         assert!(at("2026-09-29T04:10:00.000000001Z") > at("2026-09-29T04:10:00Z"));
-        assert_eq!(
-            at("2026-09-29T04:10:00+00:00"),
-            at("2026-09-29T04:10:00Z")
-        );
+        assert_eq!(at("2026-09-29T04:10:00+00:00"), at("2026-09-29T04:10:00Z"));
         assert_eq!(at("2026-09-29T04:10:00.5Z"), at("2026-09-29T04:10:00.500Z"));
         assert!(at("2026-09-30T00:00:00Z") > at("2026-09-29T23:59:59.999999999Z"));
         assert!(at("2024-02-29T12:00:00Z") > at("2024-02-28T12:00:00Z"));
@@ -7234,13 +7256,22 @@ mod tests {
         let scope = [parity_cell("c-programs/a", ParityBackend::Kvm)];
         write_node(
             &node,
-            Some(&ledger_status(PostPassState::Complete, Some(&scope), 1, None)),
+            Some(&ledger_status(
+                PostPassState::Complete,
+                Some(&scope),
+                1,
+                None,
+            )),
             Some(&[ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)]),
         );
         let sources = ledger_sources(&root, None).unwrap();
         let row = envelope(&sources[0], ParityProducer::Validate);
         row.validate().unwrap();
-        for bad in ["zzzz not a time", "2026-09-29 04:00:00Z", "2026-09-29T04:00:00"] {
+        for bad in [
+            "zzzz not a time",
+            "2026-09-29 04:00:00Z",
+            "2026-09-29T04:00:00",
+        ] {
             let mut row = row.clone();
             row.emitted_at = bad.into();
             let error = row.validate().unwrap_err();
@@ -7317,11 +7348,7 @@ mod tests {
                  print('wrote 2 rows')"
             ),
         );
-        let line = append_ledger_rows(
-            &append_to(&series, &root),
-            &rows,
-            AppendBounds::default(),
-        );
+        let line = append_ledger_rows(&append_to(&series, &root), &rows, AppendBounds::default());
         assert_eq!(
             line,
             format!(
@@ -7396,13 +7423,22 @@ mod tests {
     /// A writer that hangs, in the probe or in the append, is killed at its
     /// bound together with anything it started, and the line says so; so is
     /// a straggler left holding its output after it exited.
+    ///
+    /// Each case shortens only the bound of the call it hangs. The call that
+    /// must succeed keeps its default bound: a loaded host can take more than
+    /// 300 ms just to start Python, which once made the append case report a
+    /// killed probe instead of a killed append.
     #[test]
     fn a_hanging_writer_is_killed_at_its_bound() {
         let root = result_root("append-hang");
         let rows = append_rows("append-hang");
-        let bounds = AppendBounds {
+        let hung_probe = AppendBounds {
             probe: Duration::from_millis(300),
+            ..AppendBounds::default()
+        };
+        let hung_append = AppendBounds {
             append: Duration::from_millis(300),
+            ..AppendBounds::default()
         };
         let left = format!(
             "; 2 rows left in {} (diverged 1, record-missing 1)",
@@ -7411,7 +7447,7 @@ mod tests {
         let probe = fake_series(&root, "time.sleep(60)");
         let started = Instant::now();
         assert_eq!(
-            append_ledger_rows(&append_to(&probe, &root), &rows, bounds),
+            append_ledger_rows(&append_to(&probe, &root), &rows, hung_probe),
             format!(
                 "parity: ERROR: `{} append-parity --help` did not finish within 300ms and was \
                  killed{left}",
@@ -7426,7 +7462,7 @@ mod tests {
         );
         let started = Instant::now();
         assert_eq!(
-            append_ledger_rows(&append_to(&append, &root), &rows, bounds),
+            append_ledger_rows(&append_to(&append, &root), &rows, hung_append),
             format!(
                 "parity: ERROR: append-parity did not finish within 300ms and was killed, so the \
                  ledger may hold some of these rows{left}"
@@ -7647,7 +7683,7 @@ mod tests {
                 &source.source.node,
             ),
             team: "hermit".into(),
-            host: "devbig".into(),
+            host: "fixture-host".into(),
             emitted_at: "2026-09-29T04:00:00Z".into(),
             producer,
             run_id,

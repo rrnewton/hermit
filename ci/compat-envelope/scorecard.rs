@@ -33928,7 +33928,7 @@ mod parity_summary_tests {
     const RUN: &str = "validate-golden-run";
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const LEGACY_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
-    const SHARD: &str = "parity/hermit/devbig014/2026-09.jsonl";
+    const SHARD: &str = "parity/hermit/fixture-host-b/2026-09.jsonl";
     const KVM: ParityBackend = ParityBackend::Kvm;
     const LITEINST: ParityBackend = ParityBackend::Liteinst;
     const SABRE: ParityBackend = ParityBackend::Sabre;
@@ -34063,7 +34063,7 @@ mod parity_summary_tests {
             event_type: PARITY_LEDGER_EVENT_TYPE.into(),
             event_id: parity_event_id(producer, run_id, &cell, &source.lane, &source.node),
             team: "hermit".into(),
-            host: "devbig014".into(),
+            host: "fixture-host-b".into(),
             emitted_at: emitted_at.into(),
             producer,
             run_id: run_id.into(),
@@ -34681,7 +34681,7 @@ mod parity_summary_tests {
         let lines = [line(&row(half)), "{not json".to_string()];
         let mut input = store(&lines);
         input.add_shard(
-            "parity/hermit/devbig014/2026-10.jsonl".into(),
+            "parity/hermit/fixture-host-b/2026-10.jsonl".into(),
             b"\n",
             &mut Sha256::new(),
         );
@@ -34707,7 +34707,7 @@ mod parity_summary_tests {
         );
         assert_eq!(
             messages[2],
-            "parity/hermit/devbig014/2026-10.jsonl:1: blank line in a parity shard"
+            "parity/hermit/fixture-host-b/2026-10.jsonl:1: blank line in a parity shard"
         );
         assert_eq!(summary.refused_rows, 2);
         let run = only_run(&summary);
@@ -35148,8 +35148,8 @@ mod parity_summary_tests {
         ));
         let selection = committed_of_rows(&rows);
         let (early, late) = (
-            "parity/hermit/devbig013/2026-09.jsonl",
-            "parity/hermit/devbig014/2026-09.jsonl",
+            "parity/hermit/fixture-host-a/2026-09.jsonl",
+            "parity/hermit/fixture-host-b/2026-09.jsonl",
         );
         let half = rows.len() / 2;
         let reversed = rows.iter().rev().cloned().collect::<Vec<_>>();
@@ -35216,8 +35216,8 @@ mod parity_summary_tests {
         );
         let mut seen = Vec::new();
         for stray_shard in [
-            "parity/hermit/devbig013/2026-09.jsonl",
-            "parity/hermit/devbig015/2026-09.jsonl",
+            "parity/hermit/fixture-host-a/2026-09.jsonl",
+            "parity/hermit/fixture-host-c/2026-09.jsonl",
         ] {
             let input = store_of(&[
                 (SHARD, twelve_diverged()),
@@ -35657,7 +35657,7 @@ mod parity_summary_tests {
         // symlink_metadata types an entry: a symlink is neither.
         for (depth, is_dir, is_file, name, expected) in [
             (0, true, false, "hermit", Ok(Directory)),
-            (1, true, false, "devbig014", Ok(Directory)),
+            (1, true, false, "fixture-host-b", Ok(Directory)),
             (2, false, true, "2026-09.jsonl", Ok(Shard)),
             // A stray file beside the host directories.
             (1, false, true, "README", refused.clone()),
