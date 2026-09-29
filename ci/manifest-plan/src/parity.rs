@@ -1213,7 +1213,12 @@ pub const PARITY_POST_PASS_BUDGET: Duration = Duration::from_secs(900);
 /// works, then `complete` or `failed`. `parity.jsonl` is this run's report
 /// only while the status beside it is `complete`.
 pub const PARITY_STATUS_JSON: &str = "parity.status.json";
-pub const PARITY_STATUS_SCHEMA: u64 = 1;
+/// Schema 2 names every cell in scope (`scope`), so a reader can say which
+/// cells a post-pass that never completed left without a record. Readers still
+/// accept [`PARITY_STATUS_SCHEMA_COUNT_ONLY`], which carries only the count.
+pub const PARITY_STATUS_SCHEMA: u64 = 2;
+/// The first status schema: a `cells` count and no `scope` list.
+pub const PARITY_STATUS_SCHEMA_COUNT_ONLY: u64 = 1;
 /// The smallest wall bound (`timeout`) of any dagrun step that runs a harness
 /// post-pass. dagrun exports only when a step started
 /// (`DAGRUN_STEP_STARTED_MONOTONIC_NS`), not its bound, so a harness inside a
@@ -1577,8 +1582,93 @@ pub struct PostPassStatus {
     pub records: String,
     /// Cells in scope; a complete report has one line per cell.
     pub cells: usize,
+    /// Every cell in scope as `<test>@<backend>`, in scope order. Written in
+    /// the `running` state before any comparison, so a post-pass that is
+    /// killed still names the cells it owed. Present from schema 2; absent in
+    /// a schema-1 status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<String>>,
     pub summary: Option<String>,
     pub error: Option<String>,
+}
+
+impl PostPassStatus {
+    /// The status a post-pass writes before it compares anything.
+    pub fn running(config: &PostPassConfig, scope: &BTreeSet<ParityCellId>) -> Self {
+        Self {
+            schema: PARITY_STATUS_SCHEMA,
+            state: PostPassState::Running,
+            run_id: config.run_id.clone(),
+            hermit_sha: config.hermit_sha.clone(),
+            hermit_bin: path_text(&config.hermit_bin),
+            hermit_bin_sha256: hashed(&config.hermit_bin, None)
+                .ok()
+                .map(|operand| operand.sha256),
+            records: path_text(&config.output),
+            cells: scope.len(),
+            scope: Some(scope.iter().map(ToString::to_string).collect()),
+            summary: None,
+            error: None,
+        }
+    }
+
+    /// The cells this status names, or `None` for a schema-1 status, which
+    /// names only their count. Refuses an unknown schema, a schema-2 status
+    /// without a scope or whose scope disagrees with `cells`, a schema-1
+    /// status with a scope, and a scope entry that is not one parity cell.
+    pub fn checked_scope(&self) -> Result<Option<Vec<ParityCellId>>, String> {
+        match (self.schema, &self.scope) {
+            (PARITY_STATUS_SCHEMA_COUNT_ONLY, None) => Ok(None),
+            (PARITY_STATUS_SCHEMA_COUNT_ONLY, Some(_)) => Err(format!(
+                "parity status schema {PARITY_STATUS_SCHEMA_COUNT_ONLY} carries no scope, \
+                 but this one has one"
+            )),
+            (PARITY_STATUS_SCHEMA, None) => Err(format!(
+                "parity status schema {PARITY_STATUS_SCHEMA} must name its scope"
+            )),
+            (PARITY_STATUS_SCHEMA, Some(scope)) => {
+                if scope.len() != self.cells {
+                    return Err(format!(
+                        "parity status names {} scope cell(s) but counts {}",
+                        scope.len(),
+                        self.cells
+                    ));
+                }
+                let mut seen = BTreeSet::new();
+                scope
+                    .iter()
+                    .map(|text| {
+                        let cell = parse_cell_text(text)?;
+                        if !seen.insert(cell.clone()) {
+                            return Err(format!("parity status names {text} twice"));
+                        }
+                        Ok(cell)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Some)
+            }
+            (other, _) => Err(format!(
+                "parity status schema must be {PARITY_STATUS_SCHEMA_COUNT_ONLY} or \
+                 {PARITY_STATUS_SCHEMA}, got {other}"
+            )),
+        }
+    }
+}
+
+/// Parse `<test>@<backend>`, the [`ParityCellId`] display form, without a
+/// matrix: the test id is not checked against the manifests.
+pub fn parse_cell_text(text: &str) -> Result<ParityCellId, String> {
+    let (test_id, backend) = text
+        .rsplit_once('@')
+        .ok_or_else(|| format!("parity cell {text:?} is not <test>@<backend>"))?;
+    if test_id.trim().is_empty() || test_id != test_id.trim() {
+        return Err(format!("parity cell {text:?} has no usable test id"));
+    }
+    Ok(ParityCellId {
+        test_id: test_id.to_string(),
+        backend: ParityBackend::parse(backend)
+            .map_err(|error| format!("parity cell {text:?}: {error}"))?,
+    })
 }
 
 /// Remove what an earlier post-pass left below `config`: the records file,
@@ -1608,6 +1698,17 @@ fn write_status(config: &PostPassConfig, status: &PostPassStatus) -> Result<(), 
     let mut text = serde_json::to_vec_pretty(status).map_err(|error| error.to_string())?;
     text.push(b'\n');
     write_atomically(&config.status_path(), &text)
+}
+
+/// Remove the previous outputs ([`clear_outputs`]) and mark the post-pass
+/// `running` with its scope, before the determinism cells run. A process
+/// that is then killed before [`post_pass`] finishes leaves a status naming
+/// every cell it owed, so each is reported `record-missing` rather than
+/// vanishing from the denominator. [`post_pass`] writes the same status again
+/// when it starts.
+pub fn mark_running(config: &PostPassConfig, scope: &BTreeSet<ParityCellId>) -> Result<(), String> {
+    clear_outputs(config)?;
+    write_status(config, &PostPassStatus::running(config, scope))
 }
 
 fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
@@ -1822,20 +1923,7 @@ pub fn post_pass(
     scope: &BTreeSet<ParityCellId>,
     rows: &[CellResult],
 ) -> Result<PostPassReport, String> {
-    let mut status = PostPassStatus {
-        schema: PARITY_STATUS_SCHEMA,
-        state: PostPassState::Running,
-        run_id: config.run_id.clone(),
-        hermit_sha: config.hermit_sha.clone(),
-        hermit_bin: path_text(&config.hermit_bin),
-        hermit_bin_sha256: hashed(&config.hermit_bin, None)
-            .ok()
-            .map(|operand| operand.sha256),
-        records: path_text(&config.output),
-        cells: scope.len(),
-        summary: None,
-        error: None,
-    };
+    let mut status = PostPassStatus::running(config, scope);
     let result = clear_outputs(config)
         .and_then(|()| write_status(config, &status))
         .and_then(|()| {
@@ -2604,6 +2692,823 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(&temporary, bytes)
         .and_then(|()| fs::rename(&temporary, path))
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+// ---- Ledger sources ---------------------------------------------------------
+//
+// One row per parity cell of one run, for the parity ledger store. hermit
+// builds the rows because it owns `ParityRecord` and the scope; dev-hermit's
+// `series.py append-parity` wraps each in the `parity-ledger/v1` envelope and
+// publishes it. The scorecard reads the published rows back through
+// [`ParityLedgerRow`]. See <https://github.com/rrnewton/hermit/issues/3301>.
+
+/// The published envelope's schema.
+pub const PARITY_LEDGER_SCHEMA: &str = "parity-ledger/v1";
+/// The published envelope's event type.
+pub const PARITY_LEDGER_EVENT_TYPE: &str = "parity.record";
+/// The lane a pressure-test run's rows are filed under; it has one post-pass.
+pub const PRESSURE_TEST_LEDGER_LANE: &str = "pressure-test";
+/// The node a pressure-test run's rows are filed under.
+pub const PRESSURE_TEST_LEDGER_NODE: &str = "post-pass";
+
+/// One cell's outcome in the ledger: a [`ParityVerdict`], or `record-missing`
+/// when the run owed the cell a record and wrote none. Declared from the most
+/// to the least adverse, so the derived `Ord` is the deduplication order: when
+/// one run reports a cell twice, the smaller verdict wins.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum LedgerVerdict {
+    RecordMissing,
+    Unavailable,
+    ReferenceMissing,
+    CandidateMissing,
+    InputsNotEqualized,
+    Diverged,
+    Matched,
+}
+
+impl LedgerVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordMissing => "record-missing",
+            Self::Unavailable => "unavailable",
+            Self::ReferenceMissing => "reference-missing",
+            Self::CandidateMissing => "candidate-missing",
+            Self::InputsNotEqualized => "inputs-not-equalized",
+            Self::Diverged => "diverged",
+            Self::Matched => "matched",
+        }
+    }
+
+    pub fn is_measured(self) -> bool {
+        matches!(self, Self::Matched | Self::Diverged)
+    }
+}
+
+impl From<ParityVerdict> for LedgerVerdict {
+    fn from(verdict: ParityVerdict) -> Self {
+        match verdict {
+            ParityVerdict::Matched => Self::Matched,
+            ParityVerdict::Diverged => Self::Diverged,
+            ParityVerdict::ReferenceMissing => Self::ReferenceMissing,
+            ParityVerdict::CandidateMissing => Self::CandidateMissing,
+            ParityVerdict::Unavailable => Self::Unavailable,
+            ParityVerdict::InputsNotEqualized => Self::InputsNotEqualized,
+        }
+    }
+}
+
+impl fmt::Display for LedgerVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a cell that is neither measured nor record-missing was not measured,
+/// derived from its verdict and the reason templates [`post_pass`] writes.
+/// Declared in the order the scorecard prints the classes.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnavailableClass {
+    /// An operand's verify cell failed determinism.
+    DeterminismFail,
+    /// An operand's verify cell was host-inapplicable, so it left no log.
+    HostInapplicable,
+    /// An operand's verify cell ended some other way (timeout, crash, ...).
+    OperandEnded,
+    /// An operand passed but its log was not retained, was empty, or was not
+    /// exactly one file.
+    LogNotRetained,
+    /// The backend cannot be given the reference's inputs.
+    InputsNotEqualized,
+    /// The reference verify cell has no result row in the run.
+    ReferenceMissing,
+    /// The candidate verify cell has no result row in the run.
+    CandidateMissing,
+    /// Anything else, such as a log-diff refusal.
+    Other,
+}
+
+impl UnavailableClass {
+    pub const ALL: [Self; 8] = [
+        Self::DeterminismFail,
+        Self::HostInapplicable,
+        Self::OperandEnded,
+        Self::LogNotRetained,
+        Self::InputsNotEqualized,
+        Self::ReferenceMissing,
+        Self::CandidateMissing,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeterminismFail => "determinism-fail",
+            Self::HostInapplicable => "host-inapplicable",
+            Self::OperandEnded => "operand-ended",
+            Self::LogNotRetained => "log-not-retained",
+            Self::InputsNotEqualized => "inputs-not-equalized",
+            Self::ReferenceMissing => "reference-missing",
+            Self::CandidateMissing => "candidate-missing",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for UnavailableClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The unavailable class of one cell, or `None` for a measured or
+/// record-missing cell. It reads the `the <role> verify cell of <test> ...`
+/// templates of the operand checks; a reason it does not recognize is
+/// classed by its verdict alone, and an unrecognized `unavailable` reason is
+/// [`UnavailableClass::Other`].
+pub fn unavailable_class(verdict: LedgerVerdict, reason: Option<&str>) -> Option<UnavailableClass> {
+    let by_verdict = match verdict {
+        LedgerVerdict::Matched | LedgerVerdict::Diverged | LedgerVerdict::RecordMissing => {
+            return None;
+        }
+        LedgerVerdict::InputsNotEqualized => return Some(UnavailableClass::InputsNotEqualized),
+        LedgerVerdict::ReferenceMissing => UnavailableClass::ReferenceMissing,
+        LedgerVerdict::CandidateMissing => UnavailableClass::CandidateMissing,
+        LedgerVerdict::Unavailable => UnavailableClass::Other,
+    };
+    let Some((role, rest)) = reason.and_then(operand_reason) else {
+        return Some(by_verdict);
+    };
+    Some(if rest.starts_with("failed determinism:") {
+        UnavailableClass::DeterminismFail
+    } else if rest.starts_with("was host-inapplicable, so it left no log") {
+        UnavailableClass::HostInapplicable
+    } else if rest.starts_with("ended ") {
+        UnavailableClass::OperandEnded
+    } else if rest.starts_with("retained ") {
+        UnavailableClass::LogNotRetained
+    } else if rest == "has no result row in this run" {
+        if role == "reference" {
+            UnavailableClass::ReferenceMissing
+        } else {
+            UnavailableClass::CandidateMissing
+        }
+    } else {
+        by_verdict
+    })
+}
+
+/// Split `the <role> verify cell of <test> <rest>` into the role's last word
+/// (`candidate` or `reference`) and `rest`. The post-pass names a role in two
+/// words, `<backend> candidate` and `ptrace reference`, so the role is
+/// everything before ` verify cell of `, not one word.
+fn operand_reason(reason: &str) -> Option<(&str, &str)> {
+    let rest = reason.strip_prefix("the ")?;
+    let (role, rest) = rest.split_once(" verify cell of ")?;
+    let (_test, rest) = rest.split_once(' ')?;
+    Some((role.rsplit(' ').next()?, rest))
+}
+
+/// How far the node's post-pass got, as the ledger records it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LedgerPostPassState {
+    Complete,
+    Failed,
+    Running,
+    /// The node left no [`PARITY_STATUS_JSON`] at all.
+    Absent,
+}
+
+impl From<PostPassState> for LedgerPostPassState {
+    fn from(state: PostPassState) -> Self {
+        match state {
+            PostPassState::Running => Self::Running,
+            PostPassState::Complete => Self::Complete,
+            PostPassState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Where the list of cells a node owed came from.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LedgerScopeSource {
+    /// The status's own `scope` list (schema 2).
+    StatusScope,
+    /// A complete schema-1 status, checked by its `cells` count only.
+    StatusCount,
+    /// The caller's expected scope for the node.
+    ExpectedScope,
+}
+
+/// Which node's post-pass a row came from, and the evidence behind it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityLedgerOrigin {
+    pub lane: String,
+    pub node: String,
+    pub post_pass_state: LedgerPostPassState,
+    /// SHA-256 of the node's [`PARITY_STATUS_JSON`] bytes; `null` when absent.
+    pub status_sha256: Option<String>,
+    /// SHA-256 of the node's [`PARITY_JSONL`] bytes; `null` when it has none.
+    pub records_sha256: Option<String>,
+    pub hermit_bin_sha256: Option<String>,
+    pub scope_source: LedgerScopeSource,
+}
+
+/// One row [`ledger_sources`] builds: everything in the published envelope
+/// except the fields the dev-hermit writer adds (`schema`, `event_type`,
+/// `event_id`, `team`, `host`, `emitted_at`, `producer`, `source_tree_dirty`).
+/// `run_id` and `hermit_sha` are the node status's own, `null` for a node
+/// that left no status; the writer checks them against `--run-id` and
+/// `--tree` before it uses its own.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityLedgerSource {
+    /// `<test_id as emitted>@<backend>`.
+    pub cell: String,
+    pub test_id: String,
+    pub backend: ParityBackend,
+    pub verdict: LedgerVerdict,
+    pub reason: Option<String>,
+    pub run_id: Option<String>,
+    pub hermit_sha: Option<String>,
+    pub source: ParityLedgerOrigin,
+    /// The [`ParityRecord`] as written in `parity.jsonl` (its line is
+    /// checked to be the canonical encoding, so re-encoding it reproduces the
+    /// same bytes); `null` exactly when the verdict is `record-missing`.
+    pub record: Option<ParityRecord>,
+}
+
+/// The producers that publish parity rows.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParityProducer {
+    Validate,
+    PressureTest,
+}
+
+impl ParityProducer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::PressureTest => "pressure-test",
+        }
+    }
+}
+
+impl fmt::Display for ParityProducer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One published row of the parity ledger store, `parity-ledger/v1`: a
+/// [`ParityLedgerSource`] wrapped by dev-hermit's writer.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityLedgerRow {
+    pub schema: String,
+    pub event_type: String,
+    pub event_id: String,
+    pub team: String,
+    pub host: String,
+    pub emitted_at: String,
+    pub producer: ParityProducer,
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub source_tree_dirty: bool,
+    pub cell: String,
+    pub test_id: String,
+    pub backend: ParityBackend,
+    pub verdict: LedgerVerdict,
+    pub reason: Option<String>,
+    pub source: ParityLedgerOrigin,
+    pub record: Option<ParityRecord>,
+}
+
+/// `sha256(producer \0 run_id \0 cell \0 lane \0 node)`, the envelope's
+/// `event_id`.
+pub fn parity_event_id(
+    producer: ParityProducer,
+    run_id: &str,
+    cell: &str,
+    lane: &str,
+    node: &str,
+) -> String {
+    sha256_hex(format!("{producer}\0{run_id}\0{cell}\0{lane}\0{node}").as_bytes())
+}
+
+fn is_sha1_hex(text: &str) -> bool {
+    text.len() == 40
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The checks a source row and a published row share: the cell names its
+/// test and backend, the record is present exactly when the verdict is not
+/// `record-missing` and agrees with the row, the record passes
+/// [`ParityRecord::validate`] (every credit invariant), and a reason is given
+/// for every verdict but `matched` and `diverged`.
+#[allow(clippy::too_many_arguments)]
+fn check_ledger_fields(
+    at: &str,
+    cell: &str,
+    test_id: &str,
+    backend: ParityBackend,
+    verdict: LedgerVerdict,
+    reason: Option<&str>,
+    run_id: Option<&str>,
+    hermit_sha: Option<&str>,
+    source: &ParityLedgerOrigin,
+    record: Option<&ParityRecord>,
+) -> Result<(), String> {
+    if cell != format!("{test_id}@{backend}") {
+        return Err(format!("{at}: cell {cell:?} is not {test_id}@{backend}"));
+    }
+    if source.lane.is_empty() || source.node.is_empty() {
+        return Err(format!("{at}: source lane and node must be non-empty"));
+    }
+    if !verdict.is_measured() && reason.is_none_or(|reason| reason.trim().is_empty()) {
+        return Err(format!("{at}: verdict {verdict} needs a reason"));
+    }
+    if source.post_pass_state == LedgerPostPassState::Absent
+        && verdict != LedgerVerdict::RecordMissing
+    {
+        return Err(format!(
+            "{at}: a node that left no status can only owe record-missing rows, got {verdict}"
+        ));
+    }
+    match (verdict, record) {
+        (LedgerVerdict::RecordMissing, None) => Ok(()),
+        (LedgerVerdict::RecordMissing, Some(_)) => {
+            Err(format!("{at}: a record-missing row carries no record"))
+        }
+        (_, None) => Err(format!("{at}: verdict {verdict} needs its record")),
+        (_, Some(record)) => {
+            record
+                .validate()
+                .map_err(|error| format!("{at}: {error}"))?;
+            if LedgerVerdict::from(record.verdict) != verdict {
+                return Err(format!(
+                    "{at}: row verdict {verdict} disagrees with record verdict {}",
+                    LedgerVerdict::from(record.verdict)
+                ));
+            }
+            if record.test_id != test_id || record.backend != backend {
+                return Err(format!(
+                    "{at}: record names {}@{}",
+                    record.test_id, record.backend
+                ));
+            }
+            if record.reason.as_deref() != reason {
+                return Err(format!("{at}: row reason disagrees with the record's"));
+            }
+            if run_id.is_some_and(|run_id| run_id != record.run_id) {
+                return Err(format!(
+                    "{at}: row run_id {:?} disagrees with record run_id {:?}",
+                    run_id.unwrap_or_default(),
+                    record.run_id
+                ));
+            }
+            if hermit_sha.is_some_and(|sha| sha != record.hermit_sha) {
+                return Err(format!(
+                    "{at}: row hermit_sha {:?} disagrees with record hermit_sha {:?}",
+                    hermit_sha.unwrap_or_default(),
+                    record.hermit_sha
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+impl ParityLedgerSource {
+    pub fn validate(&self) -> Result<(), String> {
+        check_ledger_fields(
+            &format!("parity ledger source {}", self.cell),
+            &self.cell,
+            &self.test_id,
+            self.backend,
+            self.verdict,
+            self.reason.as_deref(),
+            self.run_id.as_deref(),
+            self.hermit_sha.as_deref(),
+            &self.source,
+            self.record.as_ref(),
+        )
+    }
+}
+
+impl ParityLedgerRow {
+    /// Refuse a row that breaks the envelope contract: the schema and event
+    /// type, a 40-hex `hermit_sha`, the `event_id` derivation, the checks
+    /// shared with [`ParityLedgerSource::validate`], and a record whose run
+    /// and tree are the row's own.
+    pub fn validate(&self) -> Result<(), String> {
+        let at = format!(
+            "parity ledger row {} ({} run {})",
+            self.cell, self.producer, self.run_id
+        );
+        if self.schema != PARITY_LEDGER_SCHEMA {
+            return Err(format!(
+                "{at}: schema must be {PARITY_LEDGER_SCHEMA}, got {:?}",
+                self.schema
+            ));
+        }
+        if self.event_type != PARITY_LEDGER_EVENT_TYPE {
+            return Err(format!(
+                "{at}: event_type must be {PARITY_LEDGER_EVENT_TYPE}, got {:?}",
+                self.event_type
+            ));
+        }
+        if self.run_id.trim().is_empty() {
+            return Err(format!("{at}: run_id must be non-empty"));
+        }
+        if !is_sha1_hex(&self.hermit_sha) {
+            return Err(format!(
+                "{at}: hermit_sha must be 40 lowercase hex digits, got {:?}",
+                self.hermit_sha
+            ));
+        }
+        let expected = parity_event_id(
+            self.producer,
+            &self.run_id,
+            &self.cell,
+            &self.source.lane,
+            &self.source.node,
+        );
+        if self.event_id != expected {
+            return Err(format!(
+                "{at}: event_id {} is not sha256(producer, run_id, cell, lane, node) = {expected}",
+                self.event_id
+            ));
+        }
+        check_ledger_fields(
+            &at,
+            &self.cell,
+            &self.test_id,
+            self.backend,
+            self.verdict,
+            self.reason.as_deref(),
+            Some(&self.run_id),
+            Some(&self.hermit_sha),
+            &self.source,
+            self.record.as_ref(),
+        )
+    }
+}
+
+/// The cells each node of a run was expected to report, keyed by
+/// `<lane>/<node>` (the node's directory below the e2e result root). A
+/// caller that planned the nodes builds it; a node with no
+/// [`PARITY_STATUS_JSON`] owes each of its cells a `record-missing` row.
+pub type ExpectedScope = BTreeMap<String, BTreeSet<ParityCellId>>;
+
+/// Parse an expected scope file: a JSON object from `<lane>/<node>` to a list
+/// of `<test>@<backend>` cells.
+pub fn parse_expected_scope(text: &str) -> Result<ExpectedScope, String> {
+    let raw: BTreeMap<String, Vec<String>> = serde_json::from_str(text)
+        .map_err(|error| format!("expected parity scope is not a JSON object of lists: {error}"))?;
+    raw.into_iter()
+        .map(|(node, cells)| {
+            let parts = node.split('/').collect::<Vec<_>>();
+            if parts.len() != 2
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || *part == "." || *part == "..")
+            {
+                return Err(format!(
+                    "expected parity scope key {node:?} is not <lane>/<node>"
+                ));
+            }
+            let mut set = BTreeSet::new();
+            for text in &cells {
+                if !set.insert(parse_cell_text(text)?) {
+                    return Err(format!("expected parity scope {node} names {text} twice"));
+                }
+            }
+            Ok((node, set))
+        })
+        .collect()
+}
+
+/// The ledger rows of one validate run: one per cell each node's post-pass
+/// owed, read from every `<lane>/<node>/`[`PARITY_STATUS_JSON`] below
+/// `e2e_root` and its sibling [`PARITY_JSONL`].
+///
+/// - `complete`: every record is validated, and there must be exactly
+///   `cells` of them (and exactly the status's `scope`, when it has one).
+/// - `failed` or `running`: the records that exist, plus a `record-missing`
+///   row for every other cell of the status's scope (or, for a schema-1
+///   status, of the node's expected scope), with the reason
+///   `parity post-pass <state>: <error>`.
+/// - A node of `expected` with no status owes each of its cells a
+///   `record-missing` row with `post_pass_state` `absent`.
+///
+/// Anything that cannot be accounted for exactly is refused rather than
+/// guessed: an unreadable or malformed file, a record that fails
+/// [`ParityRecord::validate`] or is not the canonical encoding of itself, a
+/// record from another run, a count or scope mismatch, a records file with
+/// no status, or an unfinished schema-1 status with no expected scope.
+pub fn ledger_sources(
+    e2e_root: &Path,
+    expected: Option<&ExpectedScope>,
+) -> Result<Vec<ParityLedgerSource>, String> {
+    let mut nodes = BTreeMap::<String, (String, String, PathBuf)>::new();
+    for lane in sorted_directories(e2e_root)? {
+        let lane_name = directory_name(&lane)?;
+        for node in sorted_directories(&lane)? {
+            let node_name = directory_name(&node)?;
+            nodes.insert(
+                format!("{lane_name}/{node_name}"),
+                (lane_name.clone(), node_name, node),
+            );
+        }
+    }
+    if let Some(expected) = expected {
+        for key in expected.keys() {
+            if !nodes.contains_key(key) {
+                let (lane, node) = key.split_once('/').ok_or_else(|| {
+                    format!("expected parity scope key {key:?} is not <lane>/<node>")
+                })?;
+                nodes.insert(
+                    key.clone(),
+                    (
+                        lane.to_string(),
+                        node.to_string(),
+                        e2e_root.join(lane).join(node),
+                    ),
+                );
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for (key, (lane, node, directory)) in &nodes {
+        let owed = expected.and_then(|expected| expected.get(key));
+        rows.extend(node_ledger_sources(directory, lane, node, owed)?);
+    }
+    Ok(rows)
+}
+
+/// The ledger rows of one post-pass whose [`PARITY_STATUS_JSON`] and
+/// [`PARITY_JSONL`] sit directly in `directory`, filed under `lane` and
+/// `node`; [`ledger_sources`] applies it to each node, and the pressure test
+/// to its results directory. `expected` is the node's expected scope, if the
+/// caller knows it.
+pub fn node_ledger_sources(
+    directory: &Path,
+    lane: &str,
+    node: &str,
+    expected: Option<&BTreeSet<ParityCellId>>,
+) -> Result<Vec<ParityLedgerSource>, String> {
+    let status_path = directory.join(PARITY_STATUS_JSON);
+    let records_path = directory.join(PARITY_JSONL);
+    let status_bytes = read_if_present(&status_path)?;
+    let records_bytes = read_if_present(&records_path)?;
+    let Some(status_bytes) = status_bytes else {
+        if records_bytes.is_some() {
+            return Err(format!(
+                "{} has no {PARITY_STATUS_JSON} beside it, so its records cannot be attributed",
+                records_path.display()
+            ));
+        }
+        let origin = ParityLedgerOrigin {
+            lane: lane.to_string(),
+            node: node.to_string(),
+            post_pass_state: LedgerPostPassState::Absent,
+            status_sha256: None,
+            records_sha256: None,
+            hermit_bin_sha256: None,
+            scope_source: LedgerScopeSource::ExpectedScope,
+        };
+        let reason = format!("no parity row: node {lane}/{node} left no {PARITY_STATUS_JSON}");
+        return expected
+            .into_iter()
+            .flatten()
+            .map(|cell| missing_row(cell, &reason, None, &origin))
+            .collect();
+    };
+    let at = status_path.display().to_string();
+    let status: PostPassStatus = serde_json::from_slice(&status_bytes)
+        .map_err(|error| format!("{at} is not a parity status: {error}"))?;
+    let scope = status
+        .checked_scope()
+        .map_err(|error| format!("{at}: {error}"))?;
+    if status.run_id.trim().is_empty() || !is_sha1_hex(&status.hermit_sha) {
+        return Err(format!(
+            "{at}: run_id must be non-empty and hermit_sha 40 lowercase hex digits, got {:?} \
+             at {:?}",
+            status.run_id, status.hermit_sha
+        ));
+    }
+    let mut records = Vec::new();
+    if let Some(bytes) = &records_bytes {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| format!("{} is not UTF-8: {error}", records_path.display()))?;
+        let mut seen = BTreeSet::new();
+        for (index, line) in text.lines().enumerate() {
+            let line_at = format!("{} line {}", records_path.display(), index + 1);
+            let record: ParityRecord = serde_json::from_str(line)
+                .map_err(|error| format!("{line_at} is not a parity record: {error}"))?;
+            record
+                .validate()
+                .map_err(|error| format!("{line_at}: {error}"))?;
+            let canonical = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+            if canonical != line {
+                return Err(format!(
+                    "{line_at} is not the canonical encoding of its record, so it cannot be \
+                     published byte-for-byte"
+                ));
+            }
+            if record.run_id != status.run_id || record.hermit_sha != status.hermit_sha {
+                return Err(format!(
+                    "{line_at} belongs to run {} at {}, not the status's run {} at {}",
+                    record.run_id, record.hermit_sha, status.run_id, status.hermit_sha
+                ));
+            }
+            let cell = ParityCellId {
+                test_id: record.test_id.clone(),
+                backend: record.backend,
+            };
+            if !seen.insert(cell.clone()) {
+                return Err(format!("{line_at} repeats {cell}"));
+            }
+            records.push((cell, record));
+        }
+    }
+    let state = LedgerPostPassState::from(status.state);
+    let (owed, scope_source) = match (&scope, status.state, expected) {
+        (Some(scope), _, _) => (Some(scope.clone()), LedgerScopeSource::StatusScope),
+        (None, PostPassState::Complete, _) => (None, LedgerScopeSource::StatusCount),
+        (None, _, Some(expected)) => (
+            Some(expected.iter().cloned().collect()),
+            LedgerScopeSource::ExpectedScope,
+        ),
+        (None, state, None) => {
+            return Err(format!(
+                "{at}: a schema-{PARITY_STATUS_SCHEMA_COUNT_ONLY} status in state {state:?} \
+                 counts {} cell(s) but does not name them, and no expected scope was given",
+                status.cells
+            ));
+        }
+    };
+    let origin = ParityLedgerOrigin {
+        lane: lane.to_string(),
+        node: node.to_string(),
+        post_pass_state: state,
+        status_sha256: Some(sha256_hex(&status_bytes)),
+        records_sha256: records_bytes.as_deref().map(sha256_hex),
+        hermit_bin_sha256: status.hermit_bin_sha256.clone(),
+        scope_source,
+    };
+    if let Some(owed) = &owed {
+        let owed_set = owed.iter().collect::<BTreeSet<_>>();
+        if let Some((cell, _)) = records.iter().find(|(cell, _)| !owed_set.contains(cell)) {
+            return Err(format!(
+                "{at}: record {cell} is outside the post-pass scope"
+            ));
+        }
+    }
+    let record_row = |record: &ParityRecord| ParityLedgerSource {
+        cell: format!("{}@{}", record.test_id, record.backend),
+        test_id: record.test_id.clone(),
+        backend: record.backend,
+        verdict: record.verdict.into(),
+        reason: record.reason.clone(),
+        run_id: Some(status.run_id.clone()),
+        hermit_sha: Some(status.hermit_sha.clone()),
+        source: origin.clone(),
+        record: Some(record.clone()),
+    };
+    let mut rows = Vec::new();
+    if status.state == PostPassState::Complete {
+        if records_bytes.is_none() {
+            return Err(format!(
+                "{at} is complete but {} does not exist",
+                records_path.display()
+            ));
+        }
+        if records.len() != status.cells {
+            return Err(format!(
+                "{at} is complete with {} cell(s) in scope, but {} holds {} record(s)",
+                status.cells,
+                records_path.display(),
+                records.len()
+            ));
+        }
+        rows.extend(records.iter().map(|(_, record)| record_row(record)));
+    } else {
+        let owed = owed.unwrap_or_default();
+        let by_cell = records.iter().cloned().collect::<BTreeMap<_, _>>();
+        let error = status.error.as_deref().unwrap_or(match status.state {
+            PostPassState::Running => {
+                "no error recorded; the process ended before the post-pass finished"
+            }
+            _ => "no error recorded",
+        });
+        let state_text = match status.state {
+            PostPassState::Running => "running",
+            PostPassState::Failed => "failed",
+            PostPassState::Complete => "complete",
+        };
+        let reason = format!("parity post-pass {state_text}: {error}");
+        for cell in &owed {
+            rows.push(match by_cell.get(cell) {
+                Some(record) => record_row(record),
+                None => missing_row(cell, &reason, Some(&status), &origin)?,
+            });
+        }
+    }
+    for row in &rows {
+        row.validate()?;
+    }
+    Ok(rows)
+}
+
+fn missing_row(
+    cell: &ParityCellId,
+    reason: &str,
+    status: Option<&PostPassStatus>,
+    origin: &ParityLedgerOrigin,
+) -> Result<ParityLedgerSource, String> {
+    let row = ParityLedgerSource {
+        cell: cell.to_string(),
+        test_id: cell.test_id.clone(),
+        backend: cell.backend,
+        verdict: LedgerVerdict::RecordMissing,
+        reason: Some(reason.to_string()),
+        run_id: status.map(|status| status.run_id.clone()),
+        hermit_sha: status.map(|status| status.hermit_sha.clone()),
+        source: origin.clone(),
+        record: None,
+    };
+    row.validate()?;
+    Ok(row)
+}
+
+fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
+}
+
+fn sorted_directories(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut directories = fs::read_dir(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    directories.retain(|path| path.is_dir());
+    directories.sort();
+    Ok(directories)
+}
+
+fn directory_name(path: &Path) -> Result<String, String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} has no UTF-8 directory name", path.display()))
 }
 
 #[cfg(test)]
@@ -4330,6 +5235,11 @@ mod tests {
         assert_eq!(complete.state, PostPassState::Complete);
         assert_eq!(complete.schema, PARITY_STATUS_SCHEMA);
         assert_eq!(complete.cells, 1);
+        assert_eq!(complete.scope, Some(vec!["fx/one@kvm".to_string()]));
+        assert_eq!(
+            complete.checked_scope(),
+            Ok(Some(vec![parity_cell("fx/one", ParityBackend::Kvm)]))
+        );
         assert_eq!(complete.records, path_text(&config.output));
         assert_eq!(
             complete.summary.as_deref(),
@@ -4355,6 +5265,7 @@ mod tests {
         assert_eq!(failed.state, PostPassState::Failed);
         assert_eq!(failed.error.as_deref(), Some(error.as_str()));
         assert_eq!(failed.summary, None);
+        assert_eq!(failed.scope, Some(vec!["fx/one@kvm".to_string()]));
 
         // A panic inside is an error, not an unwinding harness.
         post_pass(&config, &scope, &rows).unwrap();
@@ -4798,5 +5709,670 @@ mod tests {
         let failed = status(&config);
         assert_eq!(failed.state, PostPassState::Failed);
         assert_eq!(failed.error.as_deref(), Some(error.as_str()));
+    }
+
+    // ---- ledger sources ----------------------------------------------------
+
+    const LEDGER_RUN: &str = "run-ledger";
+
+    fn ledger_diverged(test: &str, backend: ParityBackend, prefix: usize) -> ParityRecord {
+        let record = ParityRecord {
+            schema: PARITY_RECORD_SCHEMA,
+            test_id: test.into(),
+            backend,
+            verdict: ParityVerdict::Diverged,
+            inputs_equalized: false,
+            reason: None,
+            credit: None,
+            unequalized_credit: credit(prefix, 10, 10),
+            first_divergent_record: Some(prefix + 1),
+            left_len: Some(10),
+            right_len: Some(10),
+            matched_prefix: Some(prefix),
+            first_difference: Some(ParityFirstDifference {
+                field: Some("token 2: `a` vs `b`".into()),
+                syscall: Some(12),
+                scheduler_turn: None,
+                virtual_nanoseconds: None,
+                reference_message: Some("DETLOG brk a".into()),
+                candidate_message: Some("DETLOG brk b".into()),
+            }),
+            reference_log: Some("ref.log".into()),
+            candidate_log: Some("cand.log".into()),
+            run_id: LEDGER_RUN.into(),
+            hermit_sha: SHA.into(),
+        };
+        record.validate().unwrap();
+        record
+    }
+
+    fn ledger_unmeasured(
+        test: &str,
+        backend: ParityBackend,
+        verdict: ParityVerdict,
+        reason: &str,
+    ) -> ParityRecord {
+        ParityRecord::unmeasured(
+            &parity_cell(test, backend),
+            verdict,
+            false,
+            reason,
+            None,
+            None,
+            LEDGER_RUN,
+            SHA,
+        )
+        .unwrap()
+    }
+
+    fn ledger_status(
+        state: PostPassState,
+        scope: Option<&[ParityCellId]>,
+        cells: usize,
+        error: Option<&str>,
+    ) -> PostPassStatus {
+        PostPassStatus {
+            schema: if scope.is_some() {
+                PARITY_STATUS_SCHEMA
+            } else {
+                PARITY_STATUS_SCHEMA_COUNT_ONLY
+            },
+            state,
+            run_id: LEDGER_RUN.into(),
+            hermit_sha: SHA.into(),
+            hermit_bin: "/src/hermit".into(),
+            hermit_bin_sha256: Some("ab".repeat(32)),
+            records: "/results/parity.jsonl".into(),
+            cells,
+            scope: scope.map(|scope| scope.iter().map(ToString::to_string).collect()),
+            summary: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn write_node(dir: &Path, status: Option<&PostPassStatus>, records: Option<&[ParityRecord]>) {
+        fs::create_dir_all(dir).unwrap();
+        if let Some(status) = status {
+            fs::write(
+                dir.join(PARITY_STATUS_JSON),
+                serde_json::to_vec_pretty(status).unwrap(),
+            )
+            .unwrap();
+        }
+        if let Some(records) = records {
+            let text = records
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap() + "\n")
+                .collect::<String>();
+            fs::write(dir.join(PARITY_JSONL), text).unwrap();
+        }
+    }
+
+    fn ledger_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-parity-ledger-{}-{label}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn five_cells() -> Vec<ParityCellId> {
+        vec![
+            parity_cell("c-programs/a", ParityBackend::Kvm),
+            parity_cell("c-programs/a", ParityBackend::Liteinst),
+            parity_cell("c-programs/b", ParityBackend::Kvm),
+            parity_cell("c-programs/b", ParityBackend::Sabre),
+            parity_cell("c-programs/c", ParityBackend::Kvm),
+        ]
+    }
+
+    /// A post-pass that failed after writing two of its five records owes
+    /// the other three `record-missing` rows, each naming the failure, and
+    /// keeps the two it wrote. None vanishes from the denominator.
+    #[test]
+    fn a_failed_status_owes_record_missing_rows_for_its_unrecorded_scope() {
+        let root = ledger_root("failed");
+        let scope = five_cells();
+        let written = [
+            ledger_diverged("c-programs/a", ParityBackend::Kvm, 3),
+            ledger_unmeasured(
+                "c-programs/b",
+                ParityBackend::Sabre,
+                ParityVerdict::Unavailable,
+                "the candidate verify cell of c-programs/b failed determinism: run 2 differed",
+            ),
+        ];
+        let node = root.join("portable/manifest_c_programs");
+        let failed = ledger_status(PostPassState::Failed, Some(&scope), 5, Some("disk full"));
+        write_node(&node, Some(&failed), Some(&written));
+        let rows = ledger_sources(&root, None).unwrap();
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        let missing = rows
+            .iter()
+            .filter(|row| row.verdict == LedgerVerdict::RecordMissing)
+            .collect::<Vec<_>>();
+        assert_eq!(missing.len(), 3);
+        for row in &missing {
+            assert_eq!(
+                row.reason.as_deref(),
+                Some("parity post-pass failed: disk full")
+            );
+            assert_eq!(row.record, None);
+            assert_eq!(row.run_id.as_deref(), Some(LEDGER_RUN));
+            assert_eq!(row.source.post_pass_state, LedgerPostPassState::Failed);
+            assert_eq!(row.source.scope_source, LedgerScopeSource::StatusScope);
+            assert_eq!(row.source.lane, "portable");
+            assert_eq!(row.source.node, "manifest_c_programs");
+        }
+        assert_eq!(
+            missing
+                .iter()
+                .map(|row| row.cell.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "c-programs/a@liteinst",
+                "c-programs/b@kvm",
+                "c-programs/c@kvm"
+            ]
+        );
+        let kept = rows
+            .iter()
+            .filter_map(|row| row.record.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, written);
+        // Each kept record is the line as written.
+        let line = fs::read_to_string(node.join(PARITY_JSONL)).unwrap();
+        let first = rows.iter().find(|row| row.record.is_some()).unwrap();
+        assert_eq!(
+            serde_json::to_string(first.record.as_ref().unwrap()).unwrap(),
+            line.lines().next().unwrap()
+        );
+        assert_eq!(
+            first.source.records_sha256.as_deref(),
+            Some(sha256_hex(line.as_bytes()).as_str())
+        );
+        // A running status (the process was killed) is reported the same way.
+        let running = ledger_status(PostPassState::Running, Some(&scope), 5, None);
+        write_node(&node, Some(&running), None);
+        fs::remove_file(node.join(PARITY_JSONL)).unwrap();
+        let rows = ledger_sources(&root, None).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|row| {
+            row.verdict == LedgerVerdict::RecordMissing
+                && row.reason.as_deref()
+                    == Some(
+                        "parity post-pass running: no error recorded; the process ended \
+                         before the post-pass finished",
+                    )
+        }));
+    }
+
+    /// A complete status must account for exactly its cells.
+    #[test]
+    fn a_complete_status_with_a_count_mismatch_is_refused() {
+        let root = ledger_root("count");
+        let scope = five_cells();
+        let node = root.join("portable/manifest_c_programs");
+        let records = [ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)];
+        write_node(
+            &node,
+            Some(&ledger_status(
+                PostPassState::Complete,
+                Some(&scope),
+                5,
+                None,
+            )),
+            Some(&records),
+        );
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(
+            error.contains("is complete with 5 cell(s) in scope, but")
+                && error.contains("holds 1 record(s)"),
+            "{error}"
+        );
+        // The same mismatch in a schema-1 status, checked by its count.
+        write_node(
+            &node,
+            Some(&ledger_status(PostPassState::Complete, None, 2, None)),
+            Some(&records),
+        );
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(
+            error.contains("is complete with 2 cell(s) in scope"),
+            "{error}"
+        );
+        // A scope whose length disagrees with its count.
+        let mut status = ledger_status(PostPassState::Complete, Some(&scope), 5, None);
+        status.cells = 4;
+        write_node(&node, Some(&status), Some(&records));
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(
+            error.contains("names 5 scope cell(s) but counts 4"),
+            "{error}"
+        );
+        // A complete status with no records file at all.
+        fs::remove_file(node.join(PARITY_JSONL)).unwrap();
+        write_node(
+            &node,
+            Some(&ledger_status(
+                PostPassState::Complete,
+                Some(&scope[..1]),
+                1,
+                None,
+            )),
+            None,
+        );
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(error.contains("is complete but"), "{error}");
+        // Records with no status cannot be attributed.
+        fs::remove_file(node.join(PARITY_STATUS_JSON)).unwrap();
+        write_node(&node, None, Some(&records));
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(
+            error.contains("has no parity.status.json beside it"),
+            "{error}"
+        );
+    }
+
+    /// A schema-1 status names only a count. Complete, it is accepted by that
+    /// count; unfinished, it needs the caller's expected scope to say which
+    /// cells are missing, and is refused without one.
+    #[test]
+    fn a_schema_one_status_is_accepted_by_its_count() {
+        let root = ledger_root("schema-one");
+        let node = root.join("privileged/manifest_c_programs");
+        let records = [
+            ledger_diverged("c-programs/cpuid", ParityBackend::Kvm, 2),
+            ledger_diverged("c-programs/cpuid", ParityBackend::Liteinst, 0),
+        ];
+        write_node(
+            &node,
+            Some(&ledger_status(PostPassState::Complete, None, 2, None)),
+            Some(&records),
+        );
+        let rows = ledger_sources(&root, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| {
+            row.source.scope_source == LedgerScopeSource::StatusCount
+                && row.source.post_pass_state == LedgerPostPassState::Complete
+                && row.verdict == LedgerVerdict::Diverged
+        }));
+        assert_eq!(
+            rows[1].record.as_ref().unwrap().unequalized_credit,
+            Some(0.0)
+        );
+
+        write_node(
+            &node,
+            Some(&ledger_status(PostPassState::Failed, None, 3, Some("boom"))),
+            None,
+        );
+        fs::remove_file(node.join(PARITY_JSONL)).unwrap();
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(
+            error.contains("status in state Failed counts 3 cell(s) but does not name them"),
+            "{error}"
+        );
+        let expected = ExpectedScope::from([(
+            "privileged/manifest_c_programs".to_string(),
+            BTreeSet::from([
+                parity_cell("c-programs/cpuid", ParityBackend::Kvm),
+                parity_cell("c-programs/cpuid", ParityBackend::Liteinst),
+            ]),
+        )]);
+        let rows = ledger_sources(&root, Some(&expected)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| {
+            row.verdict == LedgerVerdict::RecordMissing
+                && row.source.scope_source == LedgerScopeSource::ExpectedScope
+                && row.reason.as_deref() == Some("parity post-pass failed: boom")
+        }));
+    }
+
+    /// A planned node that left no status at all owes each expected cell a
+    /// `record-missing` row with `post_pass_state` `absent`.
+    #[test]
+    fn an_absent_status_owes_its_expected_cells() {
+        let root = ledger_root("absent");
+        fs::create_dir_all(root.join("portable/manifest_system_utils")).unwrap();
+        let expected = parse_expected_scope(
+            r#"{"portable/manifest_c_programs": ["c-programs/a@kvm", "c-programs/a@dbt"]}"#,
+        )
+        .unwrap();
+        let rows = ledger_sources(&root, Some(&expected)).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        for row in &rows {
+            assert_eq!(row.verdict, LedgerVerdict::RecordMissing);
+            assert_eq!(row.source.post_pass_state, LedgerPostPassState::Absent);
+            assert_eq!(row.source.scope_source, LedgerScopeSource::ExpectedScope);
+            assert_eq!(row.source.status_sha256, None);
+            assert_eq!(row.run_id, None);
+            assert_eq!(
+                row.reason.as_deref(),
+                Some("no parity row: node portable/manifest_c_programs left no parity.status.json")
+            );
+        }
+        // Without an expected scope an absent node owes nothing.
+        assert!(ledger_sources(&root, None).unwrap().is_empty());
+        for bad in [
+            r#"{"portable": ["c-programs/a@kvm"]}"#,
+            r#"{"portable/x": ["c-programs/a@ptrace"]}"#,
+            r#"{"portable/x": ["c-programs/a@kvm", "c-programs/a@kvm"]}"#,
+        ] {
+            assert!(parse_expected_scope(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A record that breaks a credit invariant is refused with its message,
+    /// never clamped or skipped; so is a line that is not its record's
+    /// canonical encoding, and a record of another run.
+    #[test]
+    fn an_invalid_record_refuses_the_node() {
+        let root = ledger_root("invalid");
+        let node = root.join("portable/manifest_c_programs");
+        let scope = [parity_cell("c-programs/a", ParityBackend::Kvm)];
+        let status = ledger_status(PostPassState::Complete, Some(&scope), 1, None);
+        let mut matched = ledger_diverged("c-programs/a", ParityBackend::Kvm, 3);
+        matched.verdict = ParityVerdict::Matched;
+        matched.first_divergent_record = None;
+        matched.first_difference = None;
+        write_node(&node, Some(&status), None);
+        fs::write(
+            node.join(PARITY_JSONL),
+            serde_json::to_string(&matched).unwrap() + "\n",
+        )
+        .unwrap();
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(
+            error.contains("parity record c-programs/a@kvm: a match must be full credit"),
+            "{error}"
+        );
+        let good = ledger_diverged("c-programs/a", ParityBackend::Kvm, 3);
+        let spaced = serde_json::to_string_pretty(&good)
+            .unwrap()
+            .replace('\n', " ");
+        fs::write(node.join(PARITY_JSONL), spaced + "\n").unwrap();
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(error.contains("is not the canonical encoding"), "{error}");
+        let mut other = good.clone();
+        other.run_id = "another-run".into();
+        write_node(&node, Some(&status), Some(&[other]));
+        let error = ledger_sources(&root, None).unwrap_err();
+        assert!(error.contains("belongs to run another-run"), "{error}");
+    }
+
+    /// The real post-pass output reads back as one row per record, and a
+    /// status marked running before the cells ran owes its whole scope.
+    #[test]
+    fn a_real_post_pass_reads_back_through_ledger_sources() {
+        let fixture = Fixture::new("ledger");
+        let rows = vec![
+            fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/one", "kvm", 1, "PASS", Some(REFERENCE)),
+        ];
+        let scope = BTreeSet::from([
+            parity_cell("fx/one", ParityBackend::Kvm),
+            parity_cell("fx/one", ParityBackend::Sabre),
+        ]);
+        let config = fixture.config();
+        mark_running(&config, &scope).unwrap();
+        let running = node_ledger_sources(&config.output_dir, "lane", "node", None).unwrap();
+        assert_eq!(running.len(), 2);
+        assert!(
+            running
+                .iter()
+                .all(|row| row.verdict == LedgerVerdict::RecordMissing
+                    && row.source.post_pass_state == LedgerPostPassState::Running)
+        );
+        let report = post_pass(&config, &scope, &rows).unwrap();
+        let sources = node_ledger_sources(&config.output_dir, "lane", "node", None).unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|row| row.record.clone().unwrap())
+                .collect::<Vec<_>>(),
+            report.records
+        );
+        assert!(sources.iter().all(|row| {
+            row.source.scope_source == LedgerScopeSource::StatusScope
+                && row.source.hermit_bin_sha256.as_deref()
+                    == Some(sha256_hex(FAKE_LOG_DIFF.as_bytes()).as_str())
+        }));
+        // Source rows survive a JSON round trip unchanged.
+        for row in &sources {
+            let text = serde_json::to_string(row).unwrap();
+            assert_eq!(
+                &serde_json::from_str::<ParityLedgerSource>(&text).unwrap(),
+                row
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_reasons_are_classed_by_their_templates() {
+        let class = |verdict, reason: &str| unavailable_class(verdict, Some(reason));
+        use LedgerVerdict as V;
+        use UnavailableClass as C;
+        assert_eq!(unavailable_class(V::Matched, None), None);
+        assert_eq!(unavailable_class(V::Diverged, None), None);
+        assert_eq!(unavailable_class(V::RecordMissing, Some("x")), None);
+        assert_eq!(
+            class(
+                V::Unavailable,
+                "the candidate verify cell of c-programs/x failed determinism: y"
+            ),
+            Some(C::DeterminismFail)
+        );
+        // The roles exactly as the post-pass spells them: `<backend> candidate`
+        // and `ptrace reference`, two words each.
+        assert_eq!(
+            class(
+                V::Unavailable,
+                "the kvm candidate verify cell of c-programs/x failed determinism: y"
+            ),
+            Some(C::DeterminismFail)
+        );
+        assert_eq!(
+            class(
+                V::Unavailable,
+                "the ptrace reference verify cell of c-programs/x ended TIMEOUT (wall): y"
+            ),
+            Some(C::OperandEnded)
+        );
+        assert_eq!(
+            class(
+                V::CandidateMissing,
+                &no_result_row("t/x", "liteinst candidate")
+            ),
+            Some(C::CandidateMissing)
+        );
+        assert_eq!(
+            class(
+                V::ReferenceMissing,
+                &no_result_row("t/x", "ptrace reference")
+            ),
+            Some(C::ReferenceMissing)
+        );
+        assert_eq!(
+            class(
+                V::ReferenceMissing,
+                "the reference verify cell of c-programs/x was host-inapplicable, so it left no log: z"
+            ),
+            Some(C::HostInapplicable)
+        );
+        assert_eq!(
+            class(
+                V::Unavailable,
+                "the candidate verify cell of c-programs/x ended TIMEOUT (wall): y"
+            ),
+            Some(C::OperandEnded)
+        );
+        for retained in [
+            "retained no logs (its argv has no --verify-log-dir)",
+            "retained no readable log directory /d: gone",
+            "retained an empty log /d/run1_log_x",
+            "retained 2 run1_log_* logs in /d; expected exactly one",
+        ] {
+            assert_eq!(
+                class(
+                    V::CandidateMissing,
+                    &format!("the candidate verify cell of t/x {retained}")
+                ),
+                Some(C::LogNotRetained)
+            );
+        }
+        assert_eq!(
+            class(V::CandidateMissing, &no_result_row("t/x", "candidate")),
+            Some(C::CandidateMissing)
+        );
+        assert_eq!(
+            class(V::ReferenceMissing, &no_result_row("t/x", "reference")),
+            Some(C::ReferenceMissing)
+        );
+        assert_eq!(
+            class(V::InputsNotEqualized, DBT_INPUTS_NOT_EQUALIZABLE),
+            Some(C::InputsNotEqualized)
+        );
+        assert_eq!(
+            class(V::Unavailable, "log-diff verdict was Refused"),
+            Some(C::Other)
+        );
+        assert_eq!(
+            class(V::ReferenceMissing, "something new"),
+            Some(C::ReferenceMissing)
+        );
+    }
+
+    fn envelope(source: &ParityLedgerSource, producer: ParityProducer) -> ParityLedgerRow {
+        let run_id = source.run_id.clone().unwrap_or_else(|| LEDGER_RUN.into());
+        ParityLedgerRow {
+            schema: PARITY_LEDGER_SCHEMA.into(),
+            event_type: PARITY_LEDGER_EVENT_TYPE.into(),
+            event_id: parity_event_id(
+                producer,
+                &run_id,
+                &source.cell,
+                &source.source.lane,
+                &source.source.node,
+            ),
+            team: "hermit".into(),
+            host: "devbig".into(),
+            emitted_at: "2026-09-29T04:00:00Z".into(),
+            producer,
+            run_id,
+            hermit_sha: SHA.into(),
+            source_tree_dirty: false,
+            cell: source.cell.clone(),
+            test_id: source.test_id.clone(),
+            backend: source.backend,
+            verdict: source.verdict,
+            reason: source.reason.clone(),
+            source: source.source.clone(),
+            record: source.record.clone(),
+        }
+    }
+
+    /// The published envelope must agree with its record and its own
+    /// identity; a disagreement is refused, not reconciled.
+    #[test]
+    fn a_ledger_row_that_disagrees_with_its_record_is_refused() {
+        let root = ledger_root("envelope");
+        let node = root.join("portable/manifest_c_programs");
+        let scope = five_cells();
+        write_node(
+            &node,
+            Some(&ledger_status(
+                PostPassState::Failed,
+                Some(&scope),
+                5,
+                Some("x"),
+            )),
+            Some(&[ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)]),
+        );
+        let sources = ledger_sources(&root, None).unwrap();
+        for source in &sources {
+            envelope(source, ParityProducer::Validate)
+                .validate()
+                .unwrap();
+        }
+        let diverged = envelope(&sources[0], ParityProducer::Validate);
+        assert_eq!(diverged.verdict, LedgerVerdict::Diverged);
+        let mut row = diverged.clone();
+        row.verdict = LedgerVerdict::Matched;
+        let error = row.validate().unwrap_err();
+        assert!(
+            error.contains("row verdict matched disagrees with record verdict diverged"),
+            "{error}"
+        );
+        let mut row = diverged.clone();
+        row.event_id = "0".repeat(64);
+        assert!(row.validate().unwrap_err().contains("is not sha256("));
+        let mut row = diverged.clone();
+        row.run_id = "other-run".into();
+        row.event_id = parity_event_id(
+            row.producer,
+            &row.run_id,
+            &row.cell,
+            &row.source.lane,
+            &row.source.node,
+        );
+        assert!(
+            row.validate()
+                .unwrap_err()
+                .contains("row run_id \"other-run\" disagrees with record run_id")
+        );
+        let mut row = diverged.clone();
+        row.record = None;
+        assert!(row.validate().unwrap_err().contains("needs its record"));
+        let missing = envelope(&sources[1], ParityProducer::PressureTest);
+        assert_eq!(missing.verdict, LedgerVerdict::RecordMissing);
+        let mut row = missing.clone();
+        row.reason = None;
+        assert!(row.validate().unwrap_err().contains("needs a reason"));
+        let mut row = missing;
+        row.record = diverged.record.clone();
+        assert!(row.validate().unwrap_err().contains("carries no record"));
+        let mut text = serde_json::to_value(&diverged).unwrap();
+        text["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<ParityLedgerRow>(text).is_err());
+    }
+
+    /// The deduplication order is the most adverse verdict first.
+    #[test]
+    fn ledger_verdicts_order_from_most_to_least_adverse() {
+        use LedgerVerdict as V;
+        let mut verdicts = vec![
+            V::Matched,
+            V::Diverged,
+            V::InputsNotEqualized,
+            V::CandidateMissing,
+            V::ReferenceMissing,
+            V::Unavailable,
+            V::RecordMissing,
+        ];
+        verdicts.sort();
+        assert_eq!(
+            verdicts
+                .iter()
+                .map(|verdict| verdict.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "record-missing",
+                "unavailable",
+                "reference-missing",
+                "candidate-missing",
+                "inputs-not-equalized",
+                "diverged",
+                "matched"
+            ]
+        );
+        for verdict in verdicts {
+            assert_eq!(
+                serde_json::to_value(verdict).unwrap(),
+                serde_json::json!(verdict.as_str())
+            );
+        }
     }
 }
