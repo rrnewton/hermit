@@ -27330,14 +27330,19 @@ mod post_verdict_transaction_tests {
         fixture.publish().unwrap();
         let comparable = serde_json::to_value(fixture.cells().cells).unwrap();
         fixture.restore();
-        // These are the complete three unmatched identities from full run1897.
-        // They are already declared by the real manifest/selected plan.
+        // This is the complete selected custom population of the real
+        // manifest/selected plan: the three unmatched identities from full
+        // run1897, plus the two io-uring-fallback custom cells that
+        // 2be6440ddd6 added when it carried the DBT strict parity matrix into
+        // manifest verify cells.
         let selected = derive(&fixture.root).unwrap().selected_custom;
-        assert_eq!(selected.len(), 3);
+        assert_eq!(selected.len(), 5);
         assert_eq!(
             selected.iter().map(display_id).collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "portable/c-programs/c-programs/environment-and-workdir/custom@ptrace".into(),
+                "portable/c-programs/c-programs/io-uring-fallback/custom@dbt".into(),
+                "portable/c-programs/c-programs/io-uring-fallback/custom@ptrace".into(),
                 "portable/system-utils/system-utils/clock-determinism/custom@liteinst".into(),
                 "portable/system-utils/system-utils/clock-determinism/custom@ptrace".into(),
             ])
@@ -27428,7 +27433,7 @@ mod post_verdict_transaction_tests {
                 .unwrap()
                 .receipts
                 .len(),
-            3
+            5
         );
 
         // Refuse absence, ambiguity, altered classifications and malformed
@@ -27507,8 +27512,10 @@ mod post_verdict_transaction_tests {
         retry_events.push(fail_event);
         let receipts =
             retain_selected_custom_results(&tracked, &selected, &retried, &retry_events).unwrap();
-        assert_eq!(receipts.receipts.len(), 4);
-        assert_eq!(receipts.event_ids.len(), 4);
+        // One receipt and one event per selected cell, plus the failed first
+        // attempt of the retried cell.
+        assert_eq!(receipts.receipts.len(), 6);
+        assert_eq!(receipts.event_ids.len(), 6);
         assert_eq!(
             receipts
                 .receipts
@@ -27531,8 +27538,10 @@ mod post_verdict_transaction_tests {
         folded[0].series.num_runs = 2;
         let receipts =
             retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
-        assert_eq!(receipts.receipts.len(), 4);
-        assert_eq!(receipts.event_ids.len(), 3);
+        // The folded event covers both attempts of the retried cell, so it has
+        // one receipt more than it has events.
+        assert_eq!(receipts.receipts.len(), 6);
+        assert_eq!(receipts.event_ids.len(), 5);
         folded[0].series.last_run_index = None;
         let implicit =
             retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
