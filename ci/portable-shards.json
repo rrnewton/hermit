@@ -26,6 +26,7 @@
     "check.shard_coverage",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
+    "check.e9patch_corpus",
     "check.portability_paths",
     "check.dagrun_naming",
     "check.run_node_args",
