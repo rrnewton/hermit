@@ -355,8 +355,9 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    # check.lint_checks alone has a committed 2400s bound: its historical
-    # loaded run reached 8m54s, and it now owns every lint-checks script test.
+    # check.lint_checks_on_host alone has a committed 2400s bound: its
+    # historical loaded run reached 8m54s, and it now owns every lint-checks
+    # script test.
     # Run 35354614446 proved the old 10-minute outer job bound contradictory:
     # it canceled the healthy node after 390s of visible progress. Preserve the
     # inner 40-minute hang detector plus ten minutes for setup and artifacts.
@@ -377,8 +378,8 @@ jobs:
           sudo apt-get install -y liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
-      # check.lint_checks runs the real structured-Nextest fixture.  Installing
-      # rust-script alone made that fixture fail with "no such command:
+      # check.lint_checks_on_host runs the real structured-Nextest fixture.
+      # Installing rust-script alone made that fixture fail with "no such command:
       # nextest" on run 35335623037; the fixture is a test of the production
       # adapter, not a reason to replace it with a mock in hosted CI.
       - name: Install cargo-nextest (checks)
@@ -408,8 +409,8 @@ jobs:
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           ./ci/prepare-rust-scripts.sh --check
-      # check.lint_checks runs every rust-script test suite, including the
-      # scorecard self-test that gate.manifest already ran in preflight. That
+      # check.lint_checks_on_host runs every rust-script test suite, including
+      # the scorecard self-test that gate.manifest already ran in preflight. That
       # test reads the pinned ledger corpus and never fetches, and GITHUB_ENV
       # does not cross jobs, so this job prepares its own copy. Run 36485831200
       # omitted it here: the corpus test failed and 14 unrelated scorecard
@@ -421,8 +422,8 @@ jobs:
           set -euo pipefail
           corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
           printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
-      # check.lint_checks runs scripts/build-buck-release.rs's tests, two of
-      # which enter the exact `unshare --user --map-root-user --mount` stage the
+      # check.lint_checks_on_host runs scripts/build-buck-release.rs's tests, two
+      # of which enter the exact `unshare --user --map-root-user --mount` stage the
       # matrix proxy composes. Ubuntu 24.04 runners restrict unprivileged user
       # namespaces through AppArmor, so run 36499357369 failed both with
       # "unshare: write failed /proc/self/uid_map: Operation not permitted".
