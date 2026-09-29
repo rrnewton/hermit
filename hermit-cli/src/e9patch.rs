@@ -1492,28 +1492,61 @@ mod tests {
         );
     }
 
+    /// The ancestor walk trusts only directories owned by root or by the caller,
+    /// all the way up to `/`. A fixture under the host's temporary directory
+    /// would therefore test who owns the host's `/`, not this function: inside
+    /// a user namespace that does not map host root (the hosted CI wrapper, a
+    /// rootless container), `/` belongs to the overflow UID and the walk
+    /// correctly refuses it. Build the whole chain instead. A fresh tmpfs
+    /// becomes `/` in a private user and mount namespace, owned by the mapped
+    /// root, with a sticky world-writable `/tmp` and a private working
+    /// directory below it, the shape of an ordinary host.
     #[test]
     fn cache_directory_is_private_and_not_a_symlink() {
-        let directory = tempfile::tempdir().unwrap();
-        let cache = directory.path().join("cache");
-        fs::create_dir(&cache).unwrap();
-        let mut permissions = fs::metadata(&cache).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&cache, permissions).unwrap();
+        use reverie::process::Container;
+        use reverie::process::Mount;
 
-        ensure_private_cache_dir(&cache).unwrap();
-        assert_eq!(
-            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .map_err(|error| format!("chmod {:o} {}: {error}", mode, path.display()))
+        }
+        fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
+            fs::create_dir(path).map_err(|error| format!("mkdir {}: {error}", path.display()))?;
+            set_mode(path, mode)
+        }
 
-        let link = directory.path().join("cache-link");
-        std::os::unix::fs::symlink(&cache, &link).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (mode, symlink_refusal) = Container::new()
+            .map_root()
+            .mount(Mount::tmpfs(root.path()).data("mode=0755"))
+            .chroot(root.path())
+            .run(|| -> Result<(u32, String), String> {
+                let work = Path::new("/tmp/work");
+                make_dir(Path::new("/tmp"), 0o1777)?;
+                make_dir(work, 0o700)?;
+                let cache = work.join("cache");
+                make_dir(&cache, 0o755)?;
+
+                ensure_private_cache_dir(&cache).map_err(|error| format!("{error:#}"))?;
+                let mode = fs::metadata(&cache)
+                    .map_err(|error| error.to_string())?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+
+                let link = work.join("cache-link");
+                std::os::unix::fs::symlink(&cache, &link).map_err(|error| error.to_string())?;
+                match ensure_private_cache_dir(&link) {
+                    Ok(()) => Err("a symlinked cache directory was accepted".to_owned()),
+                    Err(error) => Ok((mode, error.to_string())),
+                }
+            })
+            .expect("run the cache fixture in a private root")
+            .expect("a private cache below a trusted ancestor chain must be accepted");
+        assert_eq!(mode, 0o700);
         assert!(
-            ensure_private_cache_dir(&link)
-                .unwrap_err()
-                .to_string()
-                .contains("real directory")
+            symlink_refusal.contains("real directory"),
+            "{symlink_refusal}"
         );
     }
 

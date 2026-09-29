@@ -223,6 +223,30 @@ source bytes.
   `ci/manifest-plan/src/timeouts.rs` for the measured policy. Preserve that
   fixed workload when investigating future runtime variation.
 
+### 2026-09-28 — portable / verify / ptrace — CPU bound exceeded; payload shrunk to 512 bytes
+
+- Failure: hosted CI measured 22.46 CPU-seconds against the 22-second CPU
+  bound, with 22.95 seconds of wall time
+  (https://github.com/rrnewton/hermit/issues/3337). The E2E artifact is a
+  debug Hermit (`publish-hermit-e2e-artifact.sh` publishes
+  `target/debug/hermit`), and the work had grown since calibration: 22,637
+  syscalls per execution at Hermit `ad21724d5f64` against 18,616 on
+  2026-09-02. Five local debug runs used 17.7 to 19.8 CPU-seconds, so the
+  local margin was only about 15 percent and the slower hosted cores used it
+  up.
+- Fix: the guest payload is now 512 bytes. The size is a variable in the
+  script, and every check compares against it. The file and pipe copies still
+  use `dd bs=1`. The odd-block copy (89 bytes in 13 seven-byte blocks) is
+  unchanged. The fixed-workload guidance above now applies to the 512-byte
+  payload.
+- Evidence (debug Hermit, 5 runs each): median CPU 18.59 seconds before and
+  4.76 seconds after. With two cells pinned to four CPUs at once, like the
+  hosted runner, 4096 bytes used 17.9 to 18.6 CPU-seconds and 512 bytes used
+  3.7 to 4.4. The syscall-type, result-class, io-buffer and event-class sets
+  are identical. `scripts/hermit-code-coverage.rs diff --fail-on-loss`
+  reported no lost Hermit lines or regions. The full score is in the comment
+  above the manifest entry.
+
 # debugger-c
 
 # determinism-stress

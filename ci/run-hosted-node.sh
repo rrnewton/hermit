@@ -44,7 +44,17 @@ exec unshare --user --map-root-user --uts --net --mount \
         # runner checkout lives below host-owned /home, whose ancestors map to
         # the overflow UID and correctly fail security-sensitive path checks.
         # A fresh tmpfs also gives repeated strict runs the same inode baseline.
-        mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
+        #
+        # Mount it without nosuid/nodev, like the local validation /tmp and the
+        # runner'"'"'s own /tmp. Hermit nests a user namespace of its own, where
+        # the kernel locks any nosuid/nodev on this mount, so every read-only
+        # bind Hermit makes of a TMPDIR file must learn and restate them via
+        # statfs. That turns the flags into a different test environment, not
+        # extra isolation: this tmpfs is owned by the wrapper'"'"'s namespace and
+        # nothing in it is set-uid or a device. The locked-flag case has its
+        # own explicit test (image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem).
+        # See https://github.com/rrnewton/hermit/issues/3334.
+        mount -t tmpfs -o mode=1777 tmpfs /tmp
         export TMPDIR=/tmp
         # Exercise the exact nested mount capability the per-physical-run /test
         # helper needs, without leaving the probe mount visible to validation.

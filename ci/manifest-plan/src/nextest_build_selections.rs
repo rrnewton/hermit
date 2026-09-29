@@ -19,7 +19,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--exclude",
             "hermetic_infra_hermit_flaky-tests",
         ]),
-        "test.hermit_unit" => Some(&[
+        "test.hermit_unit" | "privileged-test.pmu_ptrace_completion_cases" => Some(&[
             "-p",
             "hermit",
             "--features",
@@ -155,6 +155,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         "test.cli"
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"
+        | "privileged-test.pmu_cli_cases"
         | "super.liteinst_python3_verify_diagnostics"
         | "super.dbt_pipe_backpressure_diagnostic"
         | "super.dbt_failed_exec_recovery_diagnostic"

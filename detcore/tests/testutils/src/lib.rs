@@ -587,6 +587,7 @@ where
         tracing::subscriber::with_default(collector, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
+                .enable_time()
                 .build()
                 .unwrap();
             rt.block_on(async move {

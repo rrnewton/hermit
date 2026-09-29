@@ -5067,11 +5067,15 @@ fn log_file_under_tmp_lands_on_the_host() {
     let epoch = "2026-01-01T00:00:00.123456789+00:00";
     let epoch_arg = format!("--epoch={epoch}");
 
+    // `--max-timeslice=disabled` keeps the exact stderr comparison below about
+    // the log destination: without it, a host lacking accessible PMU counters
+    // prints the timeslice downgrade warning, which is unrelated to --log-file.
     let output = hermit(&[
         "--log=info",
         "--log-file",
         log.to_str().unwrap(),
         "run",
+        "--max-timeslice=disabled",
         &epoch_arg,
         "--",
         "/bin/sh",
