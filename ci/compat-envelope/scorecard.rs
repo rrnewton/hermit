@@ -5011,28 +5011,248 @@ fn committed_parity_cells(text: &str) -> Result<CommittedParityCells, String> {
     Ok(selected)
 }
 
-/// [`committed_parity_cells`] as of `sha` in the checkout at `root`.
-/// `Ok(None)` when this checkout cannot read [`PARITY_CELLS_PATH`] at that
-/// commit (it does not have the commit, or the commit has no such file), so
-/// the run's coverage is unknown rather than guessed.
-fn committed_parity_cells_at(
+/// The distinct Hermit commits the store's lines name, as far as each line can
+/// be read that far. Only 40-digit lowercase hexadecimal names are kept: every
+/// admitted row's commit is one ([`ParityLedgerRow::validate`]), so this is a
+/// superset of the commits [`summarize_parity`] asks about, and nothing that
+/// Git could read as an option or a revision expression reaches it.
+fn parity_store_shas(input: &ParityStoreInput) -> BTreeSet<String> {
+    #[derive(Deserialize)]
+    struct NamedCommit {
+        hermit_sha: String,
+    }
+    input
+        .lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<NamedCommit>(&line.text).ok())
+        .map(|row| row.hermit_sha)
+        .filter(|sha| {
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .collect()
+}
+
+/// What the checkout at `root` records about the Hermit commits a parity
+/// store names: each commit's [`SourceDepth`], and the cells its
+/// [`PARITY_CELLS_PATH`] selects ([`committed_parity_cells`]).
+///
+/// However many runs the store holds, this costs at most two Git processes --
+/// one `cat-file --batch` for the commits and their files, and one
+/// `rev-list --parents` for the ancestry both depths are counted over -- and
+/// none when the store names no commit.
+#[derive(Debug, Default)]
+struct ParityCommitFacts {
+    /// Each named object that is a commit in this checkout, with its depth.
+    depths: BTreeMap<String, SourceDepth>,
+    /// Each name's selection. `Ok(None)` when this checkout cannot read
+    /// [`PARITY_CELLS_PATH`] at that commit (it does not have the commit, or
+    /// the commit has no such file), so the run's coverage is unknown rather
+    /// than guessed.
+    committed: BTreeMap<String, Result<Option<CommittedParityCells>, String>>,
+}
+
+impl ParityCommitFacts {
+    /// Read the facts for `shas` (see [`parity_store_shas`]) in the checkout
+    /// at `root`.
+    fn read(root: &Path, shas: &BTreeSet<String>) -> Self {
+        let mut facts = Self::default();
+        if shas.is_empty() {
+            return facts;
+        }
+        let names = shas
+            .iter()
+            .flat_map(|sha| [sha.clone(), format!("{sha}:{PARITY_CELLS_PATH}")])
+            .collect::<Vec<_>>();
+        let objects = match git_cat_file_batch(root, &names) {
+            Ok(Some(objects)) => objects,
+            Ok(None) => {
+                facts.committed = shas.iter().map(|sha| (sha.clone(), Ok(None))).collect();
+                return facts;
+            }
+            Err(error) => {
+                facts.committed = shas
+                    .iter()
+                    .map(|sha| (sha.clone(), Err(error.clone())))
+                    .collect();
+                return facts;
+            }
+        };
+        let mut commits = Vec::new();
+        for (sha, pair) in shas.iter().zip(objects.chunks(2)) {
+            if matches!(&pair[0], Some((kind, _)) if kind == "commit") {
+                commits.push(sha.as_str());
+            }
+            let object = format!("{sha}:{PARITY_CELLS_PATH}");
+            let committed = match &pair[1] {
+                None => Ok(None),
+                Some((kind, _)) if kind != "blob" => {
+                    Err(format!("{object}: {PARITY_CELLS_PATH} is a {kind}, not a file"))
+                }
+                Some((_, bytes)) => std::str::from_utf8(bytes)
+                    .map_err(|_| format!("{object} is not UTF-8"))
+                    .and_then(|text| {
+                        committed_parity_cells(text).map_err(|error| format!("{object}: {error}"))
+                    })
+                    .map(Some),
+            };
+            facts.committed.insert(sha.clone(), committed);
+        }
+        facts.depths = git_commit_depths(root, &commits);
+        facts
+    }
+
+    fn depth(&self, sha: &str) -> Option<SourceDepth> {
+        self.depths.get(sha).copied()
+    }
+
+    fn committed(&self, sha: &str) -> Result<Option<CommittedParityCells>, String> {
+        self.committed.get(sha).cloned().unwrap_or_else(|| {
+            Err(format!(
+                "{sha} was not among the commits read from this checkout"
+            ))
+        })
+    }
+}
+
+/// Every name's object in the checkout at `root`, from one
+/// `git cat-file --batch`: `(type, content)`, or `None` when the name does not
+/// resolve. `Ok(None)` when Git ran but could not read the checkout at all.
+///
+/// The request is handed to Git as a file rather than a pipe: this process
+/// exits on `SIGPIPE` ([`rust_script_prelude::init`]), so writing to a Git
+/// that stopped reading must not be possible.
+fn git_cat_file_batch(
     root: &Path,
-    sha: &str,
-) -> Result<Option<CommittedParityCells>, String> {
-    let object = format!("{sha}:{PARITY_CELLS_PATH}");
+    names: &[String],
+) -> Result<Option<Vec<Option<(String, Vec<u8>)>>>, String> {
+    let request = tempfile::tempfile()
+        .map_err(|error| format!("cannot create the git cat-file request: {error}"))?;
+    let mut text = names.join("\n");
+    text.push('\n');
+    UnixFileExt::write_all_at(&request, text.as_bytes(), 0)
+        .map_err(|error| format!("cannot write the git cat-file request: {error}"))?;
     let output = Command::new("git")
         .arg("--no-replace-objects")
-        .args(["show", &object])
+        .args(["cat-file", "--batch"])
         .current_dir(root)
+        .stdin(Stdio::from(request))
         .output()
-        .map_err(|error| format!("cannot run git show {object}: {error}"))?;
+        .map_err(|error| format!("cannot run git cat-file --batch: {error}"))?;
     if !output.status.success() {
         return Ok(None);
     }
-    let text = String::from_utf8(output.stdout).map_err(|_| format!("{object} is not UTF-8"))?;
-    committed_parity_cells(&text)
-        .map(Some)
-        .map_err(|error| format!("{object}: {error}"))
+    let malformed = |name: &str| format!("git cat-file --batch gave no readable answer for {name}");
+    let mut rest = output.stdout.as_slice();
+    let mut objects = Vec::with_capacity(names.len());
+    for name in names {
+        let end = rest
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .ok_or_else(|| malformed(name))?;
+        let header = std::str::from_utf8(&rest[..end]).map_err(|_| malformed(name))?;
+        rest = &rest[end + 1..];
+        match header.split(' ').collect::<Vec<_>>().as_slice() {
+            [object, "missing" | "ambiguous"] if object == name => objects.push(None),
+            [_, kind, size] => {
+                let size = size.parse::<usize>().map_err(|_| malformed(name))?;
+                if rest.len() <= size || rest[size] != b'\n' {
+                    return Err(malformed(name));
+                }
+                objects.push(Some((kind.to_string(), rest[..size].to_vec())));
+                rest = &rest[size + 1..];
+            }
+            _ => return Err(malformed(name)),
+        }
+    }
+    if !rest.is_empty() {
+        return Err("git cat-file --batch answered more names than it was asked".into());
+    }
+    Ok(Some(objects))
+}
+
+/// [`repo_depth_at`] for every commit in `commits` from one
+/// `git rev-list --parents` over their joint history: `commits` counts the
+/// commits reachable from each one (itself included), `first_parent` the
+/// length of its first-parent chain, exactly as `rev-list --count` and
+/// `rev-list --count --first-parent` count them. A commit whose history cannot
+/// be read has no depth.
+fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDepth> {
+    let mut depths = BTreeMap::new();
+    if commits.is_empty() {
+        return depths;
+    }
+    let Ok(output) = Command::new("git")
+        .arg("--no-replace-objects")
+        .args(["rev-list", "--parents"])
+        .args(commits)
+        .current_dir(root)
+        .output()
+    else {
+        return depths;
+    };
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return depths;
+    };
+    if !output.status.success() {
+        return depths;
+    }
+    let mut index = BTreeMap::new();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split(' ');
+        let Some(commit) = fields.next() else {
+            return depths;
+        };
+        index.insert(commit, lines.len());
+        lines.push(fields.collect::<Vec<_>>());
+    }
+    let Some(parents) = lines
+        .iter()
+        .map(|parents| {
+            parents
+                .iter()
+                .map(|parent| index.get(parent).copied())
+                .collect::<Option<Vec<usize>>>()
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return depths;
+    };
+    for &commit in commits {
+        let Some(&start) = index.get(commit) else {
+            continue;
+        };
+        let mut seen = vec![false; parents.len()];
+        let mut pending = vec![start];
+        seen[start] = true;
+        let mut reachable = 0u64;
+        while let Some(at) = pending.pop() {
+            reachable += 1;
+            for &parent in &parents[at] {
+                if !seen[parent] {
+                    seen[parent] = true;
+                    pending.push(parent);
+                }
+            }
+        }
+        let mut first_parent = 1u64;
+        let mut at = start;
+        while let Some(&parent) = parents[at].first() {
+            first_parent += 1;
+            at = parent;
+        }
+        depths.insert(
+            commit.to_string(),
+            SourceDepth {
+                commits: reachable,
+                first_parent,
+            },
+        );
+    }
+    depths
 }
 
 /// One cell of one run in the parity summary.
@@ -5620,7 +5840,7 @@ impl ParityRunAccumulator {
 /// order the store was listed or the rows were written in.
 ///
 /// `committed_of` reads the parity selection a Hermit commit committed to
-/// ([`committed_parity_cells_at`]); each run is measured against its own
+/// ([`ParityCommitFacts`]); each run is measured against its own
 /// commit's selection, so a partial run is marked partial and headlines only
 /// when no complete run exists.
 fn summarize_parity(
@@ -6023,16 +6243,20 @@ fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
 }
 
 /// Read the ledger's parity store and summarize it beside `tracked`.
+///
+/// A ledger without parity rows runs no Git process here; one with rows runs
+/// at most three, however many runs it holds ([`ParityCommitFacts`], and the
+/// tool's own commit, which only `scorecard/parity.json` records).
 fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySummary, String> {
     let ledger = ledger_root(root, false)?;
     let input = read_parity_store(&ledger)?;
-    let mut summary = summarize_parity(
-        &input,
-        tracked,
-        &|sha| repo_depth_at(root, sha),
-        &|sha| committed_parity_cells_at(root, sha),
-    );
-    summary.generated_from.tool_hermit_commit = git_head(root).ok();
+    let facts = ParityCommitFacts::read(root, &parity_store_shas(&input));
+    let mut summary = summarize_parity(&input, tracked, &|sha| facts.depth(sha), &|sha| {
+        facts.committed(sha)
+    });
+    if summary.store_present {
+        summary.generated_from.tool_hermit_commit = git_head(root).ok();
+    }
     Ok(summary)
 }
 
@@ -35128,38 +35352,113 @@ mod parity_summary_tests {
         let without = git(&["rev-parse", "HEAD"]);
         let path = root.join(PARITY_CELLS_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Several lines, so the batch reader must cut the answer by its size.
         fs::write(
             &path,
-            serde_json::json!({
+            serde_json::to_string_pretty(&serde_json::json!({
                 "cells": [{"test_id": golden(1), "backend": "kvm", "selected": true}]
-            })
-            .to_string(),
+            }))
+            .unwrap(),
         )
         .unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "select one cell"]);
         let good = git(&["rev-parse", "HEAD"]);
+        // A merged side branch makes the reachable count differ from the
+        // first-parent count, so the two depths cannot be swapped unseen.
+        git(&["checkout", "-q", "-b", "side", &without]);
+        fs::write(root.join("SIDE"), "side").unwrap();
+        git(&["add", "SIDE"]);
+        git(&["commit", "-qm", "side"]);
+        git(&["checkout", "-q", "main"]);
+        git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
         fs::write(&path, "{not json").unwrap();
         git(&["commit", "-qam", "break the selection"]);
         let broken = git(&["rev-parse", "HEAD"]);
+        git(&["rm", "-q", PARITY_CELLS_PATH]);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("inner"), "a directory now").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "make the selection a directory"]);
+        let directory = git(&["rev-parse", "HEAD"]);
+        let absent = "89abcdef0123456789abcdef0123456789abcdef";
 
+        let shas = [&without, &good, &broken, &directory, absent]
+            .map(ToString::to_string)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let facts = ParityCommitFacts::read(root, &shas);
         assert_eq!(
-            committed_parity_cells_at(root, &good),
+            facts.committed(&good),
             Ok(Some(committed(&[(&golden(1), KVM)])))
         );
         // The commit has no selection file, or this checkout lacks the commit.
-        assert_eq!(committed_parity_cells_at(root, &without), Ok(None));
-        assert_eq!(
-            committed_parity_cells_at(root, "89abcdef0123456789abcdef0123456789abcdef"),
-            Ok(None)
-        );
-        let error = committed_parity_cells_at(root, &broken).unwrap_err();
+        assert_eq!(facts.committed(&without), Ok(None));
+        assert_eq!(facts.committed(absent), Ok(None));
+        let error = facts.committed(&broken).unwrap_err();
         assert!(
             error.starts_with(&format!(
                 "{broken}:{PARITY_CELLS_PATH}: {PARITY_CELLS_PATH} is not a readable cell list: "
             )),
             "{error}"
         );
+        assert_eq!(
+            facts.committed(&directory),
+            Err(format!(
+                "{directory}:{PARITY_CELLS_PATH}: {PARITY_CELLS_PATH} is a tree, not a file"
+            ))
+        );
+        // A commit nobody asked about is not guessed at.
+        let unasked = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            facts.committed(unasked),
+            Err(format!(
+                "{unasked} was not among the commits read from this checkout"
+            ))
+        );
+        assert_eq!(facts.depth(unasked), None);
+
+        // Each depth is what the per-commit `rev-list --count` pair reads.
+        for sha in [&without, &good, &broken, &directory] {
+            assert_eq!(facts.depth(sha), repo_depth_at(root, sha), "{sha}");
+        }
+        assert_eq!(
+            facts.depth(&broken),
+            Some(SourceDepth {
+                commits: 5,
+                first_parent: 4
+            })
+        );
+        assert_eq!(facts.depth(absent), None);
+
+        // A directory that is no checkout: every selection is unknown.
+        let bare = tempfile::tempdir().unwrap();
+        let facts = ParityCommitFacts::read(bare.path(), &shas);
+        for sha in &shas {
+            assert_eq!(facts.committed(sha), Ok(None), "{sha}");
+            assert_eq!(facts.depth(sha), None, "{sha}");
+        }
+    }
+
+    #[test]
+    fn only_full_lowercase_commit_names_in_the_store_reach_git() {
+        let named = |sha: &str| serde_json::json!({ "hermit_sha": sha }).to_string();
+        let good = "0123456789abcdef0123456789abcdef01234567";
+        let input = store(&[
+            named(good),
+            named(good),
+            named(&good.to_uppercase()),
+            named(&good[..39]),
+            named("--output=/tmp/x0123456789abcdef0123456789"),
+            named("HEAD"),
+            "{not json".to_string(),
+            serde_json::json!({ "hermit_sha": 7 }).to_string(),
+        ]);
+        assert_eq!(
+            parity_store_shas(&input),
+            BTreeSet::from([good.to_string()])
+        );
+        assert!(parity_store_shas(&ParityStoreInput::default()).is_empty());
     }
 
     /// Minimal inputs whose determinism rendering is known.
