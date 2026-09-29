@@ -24,7 +24,9 @@
 //! force when the signal arrives, not the one when the wait began: a signal
 //! caught after the wait parked ends it near the 100 ms send, and one ignored
 //! after the wait parked leaves it running to its original deadline. A
-//! SIGCHLD from an exiting child ends a wait whose handler is installed.
+//! SIGCHLD from an exiting child ends a wait whose handler is installed,
+//! including a child that dies by SIGKILL or by its only thread calling `exit`,
+//! whose SIGCHLD comes from the kernel alone.
 //!
 //! Every cell with only Hermit-internal senders, on both backends, runs under
 //! `--verify --verify-strict` and requires a matched strict report.
@@ -747,6 +749,34 @@ fn ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked() {
 #[test]
 fn liteinst_futex_wait_is_ended_by_a_signal_caught_after_it_parked() {
     assert_caught_after_parking_ends_futex_wait("liteinst");
+}
+
+/// As `chldlate`, but the child dies without `exit_group`: by SIGKILL, or by its
+/// only thread calling `exit`. Hermit's scheduler then sends no child-exit
+/// SIGCHLD of its own, so the only SIGCHLD is the kernel's, and the scheduler
+/// makes it eligible at the child's logical death. The wait must still end with
+/// EINTR near the death, timed or not, under strict verification, as it does on
+/// Linux.
+fn assert_child_death_without_exit_group_ends_futex_wait(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        for flip in ["chldkill", "chldthrexit"] {
+            for timed in [None, Some("timed")] {
+                let mut args = vec!["futex", "thread", flip];
+                args.extend(timed);
+                assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
+            }
+        }
+    }
+}
+
+#[test]
+fn ptrace_futex_wait_is_ended_by_the_sigchld_of_a_child_that_dies_without_exit_group() {
+    assert_child_death_without_exit_group_ends_futex_wait("ptrace");
+}
+
+#[test]
+fn liteinst_futex_wait_is_ended_by_the_sigchld_of_a_child_that_dies_without_exit_group() {
+    assert_child_death_without_exit_group_ends_futex_wait("liteinst");
 }
 
 /// A signal whose disposition a sibling changes to ignored while the waiter is

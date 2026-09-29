@@ -32,12 +32,15 @@ use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
+use crate::syscalls::threads::sigchld_eligibility_is_tracked;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigchldEligibilityRequest;
 use crate::tool_global::alarm_remaining;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
+use crate::tool_global::sigchld_eligibility;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -482,12 +485,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             // and changing it would make the syscall wrapper observable.
             let mut kernel_action = kernel_action;
             kernel_action.mask = without_perf_event_signal(kernel_action.mask);
-            let mut stack = guest.stack().await;
-            let sanitized_action = stack.push(kernel_action);
-            let _stack_guard = stack.commit()?;
-            guest
-                .inject(call.with_action(Some(sanitized_action.cast())))
-                .await?
+            let value = {
+                let mut stack = guest.stack().await;
+                let sanitized_action = stack.push(kernel_action);
+                let _stack_guard = stack.commit()?;
+                guest
+                    .inject(call.with_action(Some(sanitized_action.cast())))
+                    .await?
+            };
+            let handler = kernel_action.handler as libc::sighandler_t;
+            if call.signum() == libc::SIGCHLD
+                && (handler == libc::SIG_IGN || handler == libc::SIG_DFL)
+                && sigchld_eligibility_is_tracked(guest)
+            {
+                // Linux discards every pending SIGCHLD of the process when its
+                // disposition becomes ignored, as SIG_DFL is for SIGCHLD
+                // (`do_sigaction`), so no eligible one is pending any more
+                // (https://github.com/rrnewton/hermit/issues/3146).
+                let thread = guest.thread_state().dettid;
+                sigchld_eligibility(guest, SigchldEligibilityRequest::Flush { thread }).await;
+            }
+            value
         } else {
             guest.inject(call).await?
         })
@@ -747,6 +765,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // can be represented and none is dropped for being unnameable. Signal
         // zero is only an existence/permission probe and queues no signal.
         if should_notify_cross_task_signal(guest.thread_state().dettid, target, raw_signal) {
+            if raw_signal == libc::SIGCHLD && sigchld_eligibility_is_tracked(guest) {
+                // This send was queued in the sender's turn, so a gated wait of the
+                // target may count it (see `eligible_pending_signals`). The mark
+                // names the queue the kernel put it on: the process's shared queue
+                // for a process-directed send, else the target thread's own. A send
+                // to the sender itself is not marked: it is delivered as the send
+                // returns unless blocked, and a blocked one cannot interrupt a wait
+                // (https://github.com/rrnewton/hermit/issues/3146).
+                let process = target_process.filter(|_| {
+                    !guest
+                        .config()
+                        .backend_requires_thread_directed_process_signals
+                });
+                sigchld_eligibility(
+                    guest,
+                    SigchldEligibilityRequest::Mark {
+                        thread: target,
+                        process,
+                    },
+                )
+                .await;
+            }
             notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process).await;
         }
     }
