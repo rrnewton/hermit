@@ -726,6 +726,41 @@ def validate_catalog() -> list[str]:
     return list(cases)
 
 
+def select_cases(
+    names: list[str],
+    cases: list[str] | None,
+    exclude_cases: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Apply `--case` / `--exclude-case` to the catalogue, in catalogue order.
+
+    Returns the selected and the omitted case names. An omitted case is not
+    run for any backend, writes no result row, and is counted neither as
+    executed nor as filtered: it is outside this run's population, the same as
+    a cell `test-harness run --exclude-backend` omits. A misspelled, repeated,
+    or conflicting name refuses the run instead of silently selecting a
+    different population, and so does a selection that leaves nothing to run.
+    """
+    if cases and exclude_cases:
+        raise MatrixError("--case and --exclude-case cannot be used together")
+    requested = cases or exclude_cases or []
+    flag = "--case" if cases else "--exclude-case"
+    seen: set[str] = set()
+    for name in requested:
+        if name not in names:
+            raise MatrixError(f"{flag} {name!r} names no backend-parity case")
+        if name in seen:
+            raise MatrixError(f"{flag} {name} was given twice")
+        seen.add(name)
+    if cases:
+        selected = [name for name in names if name in seen]
+    else:
+        selected = [name for name in names if name not in seen]
+    omitted = [name for name in names if name not in selected]
+    if not selected:
+        raise MatrixError(f"{flag} leaves no backend-parity case to run")
+    return selected, omitted
+
+
 def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
     gaps = L2_GAPS if verify else L1_GAPS
     reason = gaps.get((backend, name))
@@ -1940,6 +1975,23 @@ def parse_args() -> argparse.Namespace:
         help="backend to run (repeatable; default: all)",
     )
     parser.add_argument(
+        "--case",
+        action="append",
+        dest="cases",
+        metavar="NAME",
+        help="run only this catalogue case (repeatable; default: every case)",
+    )
+    parser.add_argument(
+        "--exclude-case",
+        action="append",
+        dest="exclude_cases",
+        metavar="NAME",
+        help=(
+            "omit this catalogue case (repeatable); an omitted case is not run "
+            "and writes no result row"
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="validate the case catalog and print expected rates without running guests",
@@ -1999,7 +2051,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    names = validate_catalog()
+    catalogue = validate_catalog()
+    names, omitted = select_cases(catalogue, args.cases, args.exclude_cases)
     backends = args.backends or list(BACKENDS)
     # --verify presupposes strict mode.  The default Stripped comparator remains
     # below L2; only canonical --verify-strict evidence can establish L2.
@@ -2010,7 +2063,13 @@ def main() -> int:
         print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
     else:
         print("MODE: compatibility (repeat-run), byte-identical stdout across 3 runs")
-    baseline = len(names)
+    if omitted:
+        flag = "--case" if args.cases else "--exclude-case"
+        print(
+            f"SELECTION ({flag}): {len(names)} of {len(catalogue)} case(s) per "
+            f"backend; omitted {', '.join(omitted)} (not run, no result row)"
+        )
+    baseline = len(catalogue)
     for backend in BACKENDS:
         passing = baseline - sum(gap_backend == backend for gap_backend, _ in L1_GAPS)
         print(f"RATCHET {backend}: {passing}/{baseline} ({passing / baseline:.1%})")
