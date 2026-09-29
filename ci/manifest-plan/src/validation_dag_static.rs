@@ -238,8 +238,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 653 prior identities (`cargo nextest list` measured 663).
     // The series parity post-pass adds one parity test (a rejected operand is
     // unavailable) and retains all 663 prior identities (measured 664).
-    // The relative-path log-diff parity test from e8007f971 retains all 664
-    // prior identities.
+    // e8007f971a7 adds relative_artifacts_and_hermit_paths_are_still_measured
+    // and ad21724d5f6 adds only_a_program_name_without_a_slash_is_left_for_path;
+    // both retain all 664 prior identities (`cargo nextest list` measured 666).
     ("test.regular_crates", 666),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
