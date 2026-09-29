@@ -593,6 +593,12 @@ enum MeasurementState {
     /// a crash, timeout or OOM. ⚠️ A NON-VERDICT IS NOT A DIVERGENCE: reading
     /// one as a product failure is how an infrastructure hiccup becomes a false
     /// regression.
+    ///
+    /// ⚠️ `crash-error` ALSO COVERS, FOR NOW, a verify attempt whose two runs
+    /// agreed on other stdout than the cell declares. That is a product
+    /// failure, not a crash; the failing attempt's stored invocation carries
+    /// an [`ExpectedOutputFailure`] record saying so. A distinct result and
+    /// measurement for it are tracked in https://github.com/rrnewton/hermit/issues/3373.
     MeasuredNoVerdict,
     /// A real divergence, whose position could not be established. A LEGITIMATE
     /// answer, not an error: refusing it would force a writer to invent a
@@ -823,6 +829,10 @@ struct ObservedAttemptInvocation {
     /// that this value reconstructs exactly from cwd, env and argv.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     shell_command: String,
+    /// Set only on a verify attempt whose agreeing runs failed the cell's
+    /// declared expected output; see [`ExpectedOutputFailure`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_output_failure: Option<ExpectedOutputFailure>,
 }
 
 /// How deep in a repository's history an observation was taken, so staleness is
@@ -1389,6 +1399,15 @@ enum ValidateRowEvidence {
         reason: String,
         result: Option<ObservedResult>,
     },
+    /// A verify attempt's comparison matched, but its agreeing runs did not
+    /// print the output the cell declares. It earns no credit and keeps the
+    /// runner's result, like `Unavailable`; `failures` holds each such
+    /// attempt's verified record, keyed by its position in the row.
+    ExpectedOutputFailed {
+        reason: String,
+        result: Option<ObservedResult>,
+        failures: BTreeMap<usize, ExpectedOutputFailure>,
+    },
 }
 
 impl ValidateRowEvidence {
@@ -1404,7 +1423,9 @@ impl ValidateRowEvidence {
                 CheckIdentity::parity(report),
                 StampComparisonVerdict::Diverged,
             ),
-            Self::NotRun { .. } | Self::Unavailable { .. } => return (None, None),
+            Self::NotRun { .. } | Self::Unavailable { .. } | Self::ExpectedOutputFailed { .. } => {
+                return (None, None);
+            }
         };
         (check.complete().then_some(check), Some(verdict))
     }
@@ -1435,6 +1456,102 @@ enum ExpectedOutputClaim {
         captured_sha256: String,
         text: String,
     },
+}
+
+/// The declared stdout that a verify attempt's two agreeing runs did not
+/// print, stored on that attempt's invocation so a published cell says why it
+/// is red.
+///
+/// Only [`ResultRow::expected_output_failure`] creates one, after the attempt's
+/// matched report has borne out the runner's reason. The validate fold writes
+/// it over whatever the raw attempt carried, and `encoded_cells` refuses a
+/// stored record on an attempt the runner could not have failed this way.
+///
+/// ⚠️ THE INVOCATION'S RESULT IS STILL `crash-error`, which derives
+/// `measured-no-verdict`, the same label as a crash. This record is what tells
+/// the two apart until the result vocabulary has a distinct failed-expectation
+/// result, tracked in https://github.com/rrnewton/hermit/issues/3373.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "declaration", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedOutputFailure {
+    /// Both compared runs printed these bytes, not the declared exact bytes.
+    ExpectedStdout {
+        observed_stdout_bytes: u64,
+        observed_stdout_sha256: String,
+        declared_stdout_bytes: u64,
+        declared_stdout_sha256: String,
+    },
+    /// Both compared runs printed these bytes, which omit the declared text.
+    ExpectedStdoutContains {
+        observed_stdout_bytes: u64,
+        observed_stdout_sha256: String,
+        declared_text: String,
+    },
+}
+
+impl ExpectedOutputFailure {
+    /// The reason the runner wrote for this failure, rebuilt with its own
+    /// formatter.
+    fn runner_reason(&self) -> String {
+        match self {
+            Self::ExpectedStdout {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                declared_stdout_bytes,
+                declared_stdout_sha256,
+            } => hermit_manifest_plan::runner::expected_stdout_mismatch_reason(
+                "first",
+                *observed_stdout_bytes,
+                observed_stdout_sha256,
+                *declared_stdout_bytes,
+                declared_stdout_sha256,
+            ),
+            Self::ExpectedStdoutContains {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                declared_text,
+            } => hermit_manifest_plan::runner::expected_stdout_contains_mismatch_reason(
+                *observed_stdout_bytes,
+                observed_stdout_sha256,
+                declared_text,
+            ),
+        }
+    }
+
+    /// Why a stored record could not have come from the runner, or `None`.
+    fn malformation(&self) -> Option<&'static str> {
+        match self {
+            Self::ExpectedStdout {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                declared_stdout_bytes,
+                declared_stdout_sha256,
+            } => {
+                if !is_sha256(observed_stdout_sha256) || !is_sha256(declared_stdout_sha256) {
+                    Some("a stdout digest is not SHA-256")
+                } else if observed_stdout_bytes == declared_stdout_bytes
+                    && observed_stdout_sha256 == declared_stdout_sha256
+                {
+                    Some("the declared stdout is the observed stdout")
+                } else {
+                    None
+                }
+            }
+            Self::ExpectedStdoutContains {
+                observed_stdout_sha256,
+                declared_text,
+                ..
+            } => {
+                if !is_sha256(observed_stdout_sha256) {
+                    Some("the stdout digest is not SHA-256")
+                } else if declared_text.is_empty() {
+                    Some("the runner finds an empty declared text in any stdout")
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Split `<bytes> bytes, sha256 <digest>)<rest>`.
@@ -2167,35 +2284,42 @@ impl ResultRow {
     /// ci/manifest-plan/src/runner.rs fail a matched verify attempt whose two
     /// runs agree on other bytes than the cell declares, and record why only
     /// in the attempt's reason. `Ok(None)`: the reason is not one of those
-    /// texts. `Ok(Some)`: it is, and the matched report and the captured
-    /// stdout bear it out, so the attempt is that red and the returned text
-    /// says so. `Err`: the reason claims such a failure that its evidence
-    /// contradicts, which is malformed evidence.
+    /// texts. `Ok(Some)`: it is, and the attempt's evidence bears it out, so
+    /// the attempt is that red and the record says what it failed. `Err`: the
+    /// reason claims such a failure that its evidence contradicts, which is
+    /// malformed evidence.
+    ///
+    /// The evidence is what the runner decided from. For an exact
+    /// `expected_stdout` that is only the matched report's per-run stdout
+    /// digests, so the captured `stdout` field is not consulted. For
+    /// `expected_stdout_contains` the runner searched the capture after
+    /// requiring it to equal both compared runs, so a capture that is recorded
+    /// must be those bytes and must omit the text.
     fn expected_output_failure(
         &self,
         index: usize,
         attempt: &JsonValue,
         report: &canonical_verdict::VerificationReport,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<ExpectedOutputFailure>, String> {
         let Some(reason) = attempt.get("reason").and_then(JsonValue::as_str) else {
             return Ok(None);
         };
         let Some(claim) = parse_expected_output_claim(reason) else {
             return Ok(None);
         };
-        let contradiction = |why: String| {
+        let contradiction = |why: &str| {
             format!(
                 "attempt {} reason claims a failed stdout expectation that contradicts its evidence: {why}",
                 index + 1
             )
         };
         if self.mode != "verify" {
-            return Err(contradiction(format!(
+            return Err(contradiction(&format!(
                 "only a verify cell declares expected stdout, and this is a {} cell",
                 self.mode
             )));
         }
-        let (bytes, digest) = match &claim {
+        let failure = match claim {
             ExpectedOutputClaim::Exact {
                 run,
                 observed_bytes,
@@ -2203,79 +2327,80 @@ impl ResultRow {
                 declared_bytes,
                 declared_sha256,
             } => {
-                if !is_sha256(observed_sha256) || !is_sha256(declared_sha256) {
-                    return Err(contradiction("a stdout digest is not SHA-256".into()));
-                }
                 // The runner names the first run whose stdout differs, and
                 // both runs of a matched report print the same bytes.
                 if run != "first" {
-                    return Err(contradiction(format!(
+                    return Err(contradiction(&format!(
                         "it names the {run} run, but the first run of a matched pair printed the same bytes"
                     )));
                 }
-                if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
-                    return Err(contradiction(
-                        "the declared stdout is the observed stdout".into(),
-                    ));
+                ExpectedOutputFailure::ExpectedStdout {
+                    observed_stdout_bytes: observed_bytes,
+                    observed_stdout_sha256: observed_sha256,
+                    declared_stdout_bytes: declared_bytes,
+                    declared_stdout_sha256: declared_sha256,
                 }
-                (*observed_bytes, observed_sha256.as_str())
             }
             ExpectedOutputClaim::Contains {
                 captured_bytes,
                 captured_sha256,
                 text,
-            } => {
-                if !is_sha256(captured_sha256) {
-                    return Err(contradiction("the stdout digest is not SHA-256".into()));
-                }
-                if text.is_empty() {
-                    return Err(contradiction(
-                        "the runner finds an empty declared text in any stdout".into(),
-                    ));
-                }
-                (*captured_bytes, captured_sha256.as_str())
-            }
+            } => ExpectedOutputFailure::ExpectedStdoutContains {
+                observed_stdout_bytes: captured_bytes,
+                observed_stdout_sha256: captured_sha256,
+                declared_text: text,
+            },
         };
-        let outputs = report.compared_outputs.as_ref().ok_or_else(|| {
-            contradiction("the matched report records no compared outputs".into())
-        })?;
+        if let Some(why) = failure.malformation() {
+            return Err(contradiction(why));
+        }
+        let (ExpectedOutputFailure::ExpectedStdout {
+            observed_stdout_bytes: bytes,
+            observed_stdout_sha256: digest,
+            ..
+        }
+        | ExpectedOutputFailure::ExpectedStdoutContains {
+            observed_stdout_bytes: bytes,
+            observed_stdout_sha256: digest,
+            ..
+        }) = &failure;
+        let outputs = report
+            .compared_outputs
+            .as_ref()
+            .ok_or_else(|| contradiction("the matched report records no compared outputs"))?;
         for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
-            if output.stdout_bytes != bytes || output.stdout_sha256 != digest {
-                return Err(contradiction(format!(
+            if output.stdout_bytes != *bytes || &output.stdout_sha256 != digest {
+                return Err(contradiction(&format!(
                     "the report's {run} run printed {} bytes with sha256 {}, not the stdout the reason names",
                     output.stdout_bytes, output.stdout_sha256
                 )));
             }
         }
-        // The runner records a capture it cannot read as UTF-8 text as empty,
-        // so an empty capture of nonempty output is absent, not other bytes.
-        match attempt.get("stdout") {
-            None | Some(JsonValue::Null) => {}
-            Some(JsonValue::String(stdout)) if stdout.is_empty() && bytes > 0 => {}
-            Some(JsonValue::String(stdout)) => {
-                if stdout.len() as u64 != bytes
-                    || format!("{:x}", Sha256::digest(stdout.as_bytes())) != digest
-                {
-                    return Err(contradiction(
-                        "the captured stdout is not the stdout the reason names".into(),
-                    ));
-                }
-                if let ExpectedOutputClaim::Contains { text, .. } = &claim {
-                    if stdout.contains(text.as_str()) {
+        if let ExpectedOutputFailure::ExpectedStdoutContains { declared_text, .. } = &failure {
+            // The runner records a capture it cannot read as UTF-8 text as
+            // empty, so an empty capture of nonempty output is absent, not
+            // other bytes.
+            match attempt.get("stdout") {
+                None | Some(JsonValue::Null) => {}
+                Some(JsonValue::String(stdout)) if stdout.is_empty() && *bytes > 0 => {}
+                Some(JsonValue::String(stdout)) => {
+                    if stdout.len() as u64 != *bytes
+                        || &format!("{:x}", Sha256::digest(stdout.as_bytes())) != digest
+                    {
                         return Err(contradiction(
-                            "the captured stdout contains the declared text".into(),
+                            "the captured stdout is not the stdout the reason names",
+                        ));
+                    }
+                    if stdout.contains(declared_text.as_str()) {
+                        return Err(contradiction(
+                            "the captured stdout contains the declared text",
                         ));
                     }
                 }
-            }
-            Some(_) => {
-                return Err(contradiction("the captured stdout is not text".into()));
+                Some(_) => return Err(contradiction("the captured stdout is not text")),
             }
         }
-        Ok(Some(format!(
-            "attempt {} failed its declared expected output: {reason}",
-            index + 1
-        )))
+        Ok(Some(failure))
     }
 
     /// A declared row's match counts only if it ends exactly as declared, and
@@ -2511,6 +2636,7 @@ impl ResultRow {
         let mut unavailable = None;
         let mut retained_failed_match = false;
         let mut retained_crash = false;
+        let mut expected_output_failures = BTreeMap::new();
         let mut operand_verifications = Vec::new();
         let mut admitted_policies = Vec::new();
 
@@ -2721,7 +2847,7 @@ impl ResultRow {
                                 {
                                     match self.expected_output_failure(index, attempt, &report)? {
                                         Some(failure) => {
-                                            unavailable.get_or_insert(failure);
+                                            expected_output_failures.insert(index, failure);
                                         }
                                         None if self
                                             .require_matched_disposition(index, attempt, &report)
@@ -3123,6 +3249,21 @@ impl ResultRow {
                     self.result
                 ));
             }
+        }
+        // A completed comparison whose agreeing runs failed the declared
+        // output is the most specific account of the row short of a
+        // divergence, so it names the row even beside a timeout or a later
+        // attempt that did not run.
+        if let Some((index, failure)) = expected_output_failures.first_key_value() {
+            return Ok(ValidateRowEvidence::ExpectedOutputFailed {
+                reason: format!(
+                    "attempt {} failed its declared expected output: {}",
+                    index + 1,
+                    failure.runner_reason()
+                ),
+                result: no_verdict_result,
+                failures: expected_output_failures,
+            });
         }
         if saw_not_run && !saw_canonical_match {
             return Ok(ValidateRowEvidence::NotRun {
@@ -5756,6 +5897,7 @@ fn publish_history_command(
 fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
     validate_observation_identity_namespace(cells)?;
     validate_attempt_bindings(cells, None)?;
+    validate_expected_output_failures(cells)?;
     // ⚠️ THE NORMALISATION HAPPENS HERE, AT THE SINGLE WRITE CHOKE POINT, AND
     // NOT ONLY AT INGEST. `update` carries already-tracked rows forward without
     // re-reading their results, so an ingest-only fix would clean new rows and
@@ -6509,6 +6651,19 @@ fn apply_pressure_summary(
             ));
             continue;
         };
+        // Only the validate fold, after verifying an attempt's matched report,
+        // may record a failed declared expected output.
+        if invocation
+            .attempts
+            .iter()
+            .any(|attempt| attempt.expected_output_failure.is_some())
+        {
+            skipped.push((
+                display_id(&row.cell),
+                "a pressure summary cannot establish a failed declared expected output".to_string(),
+            ));
+            continue;
+        }
         if invocation.run_id.trim().is_empty()
             || invocation.argv.is_empty()
             || invocation.guest_argv.is_empty()
@@ -6778,6 +6933,13 @@ struct ValidateFold {
     /// Named, not just counted, so each missing comparison identifies the cell
     /// and retained reason for follow-up.
     errored: Vec<String>,
+    /// Rows whose canonical comparison matched but whose agreeing runs failed
+    /// the cell's declared expected output. Their result stays the runner's
+    /// crash-error, with each failing attempt's typed record stored on its
+    /// invocation. Kept apart from `errored` because these rows DID complete
+    /// a comparison: what they lack is the declared output, and saying they
+    /// lack a comparison would send a reader looking for the wrong fault.
+    failed_expectations: Vec<String>,
 }
 
 impl ValidateFold {
@@ -6789,7 +6951,29 @@ impl ValidateFold {
     /// same trap as asserting against an expression that merely looks like the
     /// function under test. The summary and the self-test both go through here.
     fn reads_all_green(&self) -> bool {
-        self.located == 0 && self.unlocated == 0 && self.errored.is_empty()
+        self.located == 0
+            && self.unlocated == 0
+            && self.errored.is_empty()
+            && self.failed_expectations.is_empty()
+    }
+}
+
+/// Name the rows whose agreeing runs failed a declared expected output. They
+/// completed a comparison, so they are not listed with the rows that lack one.
+fn print_failed_expectations(fold: &ValidateFold) {
+    if fold.failed_expectations.is_empty() {
+        return;
+    }
+    println!(
+        "  ⚠️ {} row(s) FAILED A DECLARED EXPECTED OUTPUT: both compared runs printed the \
+         same stdout, but not the stdout the cell declares. This run is NOT all-green. \
+         Each failing attempt's typed expected_output_failure record, its exact \
+         invocation and the runner's crash-error result were retained; crash-error is \
+         an interim label for this failure (https://github.com/rrnewton/hermit/issues/3373).",
+        fold.failed_expectations.len()
+    );
+    for row in &fold.failed_expectations {
+        println!("    failed declared expected output: {row}");
     }
 }
 
@@ -6934,6 +7118,7 @@ fn apply_validate_results_from(
                 && row.first_divergent_virtual_nanoseconds.is_none()
                 && row.first_divergent_record.is_none()
                 && row.first_divergent_syscall.is_none();
+            let mut expected_output_failures = BTreeMap::new();
             let (result, comparison, backend_parity, unavailable_reason) = match evidence {
                 ValidateRowEvidence::Matched {
                     left_info_messages,
@@ -6972,13 +7157,26 @@ fn apply_validate_results_from(
                 | ValidateRowEvidence::Unavailable { reason, result } => {
                     (result, None, None, Some(reason))
                 }
+                ValidateRowEvidence::ExpectedOutputFailed {
+                    reason,
+                    result,
+                    failures,
+                } => {
+                    expected_output_failures = failures;
+                    (result, None, None, Some(reason))
+                }
             };
             if let Some(reason) = &unavailable_reason {
-                fold.errored.push(format!(
+                let entry = format!(
                     "{} (outcome={}, reason={reason})",
                     display_id(id),
                     row.outcome,
-                ));
+                );
+                if expected_output_failures.is_empty() {
+                    fold.errored.push(entry);
+                } else {
+                    fold.failed_expectations.push(entry);
+                }
             }
             // A no-verdict is still a measurement. Stamp it and retain its exact
             // invocation, but do not manufacture a canonical comparison or a
@@ -7010,11 +7208,24 @@ fn apply_validate_results_from(
                     display_id(id)
                 ));
             }
+            // The raw attempt's own `expected_output_failure`, if any, is never
+            // read or trusted: only the record the evidence reader verified is
+            // stored.
             let attempt_invocations = row
                 .attempts
                 .iter()
-                .map(|attempt| {
-                    serde_json::from_value::<ObservedAttemptInvocation>(attempt.clone())
+                .enumerate()
+                .map(|(index, attempt)| {
+                    let mut attempt = attempt.clone();
+                    if let Some(fields) = attempt.as_object_mut() {
+                        fields.remove("expected_output_failure");
+                    }
+                    serde_json::from_value::<ObservedAttemptInvocation>(attempt)
+                        .map(|mut invocation| {
+                            invocation.expected_output_failure =
+                                expected_output_failures.remove(&index);
+                            invocation
+                        })
                         .map_err(|e| format!("{}: unreadable attempt record: {e}", display_id(id)))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -7371,6 +7582,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
             println!("    no canonical comparison: {cell}");
         }
     }
+    print_failed_expectations(&fold);
     if fold.reads_all_green() {
         println!(
             "  no row diverged. That is the expected result for an all-green run \
@@ -7522,8 +7734,10 @@ fn import_results(
             fold.unlocated += one.unlocated;
             if has_completed_parity {
                 parity_unavailable.extend(one.errored);
+                parity_unavailable.extend(one.failed_expectations);
             } else {
                 fold.errored.extend(one.errored);
+                fold.failed_expectations.extend(one.failed_expectations);
             }
             None
         };
@@ -7554,8 +7768,10 @@ fn import_results(
                 fold.unlocated += one.unlocated;
                 if has_completed_parity {
                     parity_unavailable.extend(one.errored);
+                    parity_unavailable.extend(one.failed_expectations);
                 } else {
                     fold.errored.extend(one.errored);
+                    fold.failed_expectations.extend(one.failed_expectations);
                 }
             }
             ImportEvidence::None => {}
@@ -7573,6 +7789,13 @@ fn import_results(
             "retained import selected {} rows without an admitted canonical comparison; first is {}",
             fold.errored.len(),
             fold.errored[0]
+        ));
+    }
+    if !fold.failed_expectations.is_empty() {
+        return Err(format!(
+            "retained import selected {} rows that failed a declared expected output; first is {}",
+            fold.failed_expectations.len(),
+            fold.failed_expectations[0]
         ));
     }
     archive_retired_import_comparisons(&before, &mut tracked)?;
@@ -8789,6 +9012,7 @@ where
             println!("    no canonical comparison: {row}");
         }
     }
+    print_failed_expectations(&fold);
     for skipped in &projection.skipped {
         println!("  skipped {skipped}");
     }
@@ -9478,6 +9702,46 @@ fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) ->
         && row.run_id == binding.run_id
         && row.series.run_index <= binding.attempt
         && series_last_run_index(row).is_some_and(|last| binding.attempt <= last)
+}
+
+/// Refuse a stored [`ExpectedOutputFailure`] the validate fold could not have
+/// written: one outside a validate observation of a verify cell, on an attempt
+/// the runner did not FAIL without a timeout, under an invocation whose result
+/// is a pass or a divergence, or one the runner's reason could not state.
+fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), String> {
+    for cell in &tracked.cells {
+        for observation in &cell.observations {
+            for invocation in &observation.invocations {
+                for attempt in &invocation.attempts {
+                    let Some(failure) = &attempt.expected_output_failure else {
+                        continue;
+                    };
+                    let why = if cell.id.mode != "verify" {
+                        Some("only a verify cell declares expected output")
+                    } else if observation.provenance != ObservationProvenance::Validate {
+                        Some("only a validate observation verifies one")
+                    } else if attempt.outcome != "FAIL" || attempt.timed_out {
+                        Some("the runner records one only on a FAIL attempt that did not time out")
+                    } else if invocation.result.is_none_or(|result| {
+                        result == ObservedResult::Pass || result.carries_divergence_position()
+                    }) {
+                        Some("its invocation's result is not the runner's red for it")
+                    } else {
+                        failure.malformation()
+                    };
+                    if let Some(why) = why {
+                        return Err(format!(
+                            "{} run {} attempt {} stores an expected-output failure it cannot carry: {why}",
+                            display_id(&cell.id),
+                            invocation.run_id,
+                            attempt.index
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_attempt_bindings(
@@ -12862,7 +13126,9 @@ fn read_retained_results(
                     measured_parity = true;
                     parity.push(candidate);
                 }
-                ValidateRowEvidence::NotRun { .. } | ValidateRowEvidence::Unavailable { .. } => {
+                ValidateRowEvidence::NotRun { .. }
+                | ValidateRowEvidence::Unavailable { .. }
+                | ValidateRowEvidence::ExpectedOutputFailed { .. } => {
                     parity.push(candidate);
                 }
             }
@@ -12923,7 +13189,9 @@ fn read_retained_results(
                     candidate.path.display()
                 )
             })? {
-            ValidateRowEvidence::NotRun { .. } | ValidateRowEvidence::Unavailable { .. } => {
+            ValidateRowEvidence::NotRun { .. }
+            | ValidateRowEvidence::Unavailable { .. }
+            | ValidateRowEvidence::ExpectedOutputFailed { .. } => {
                 continue;
             }
             ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => false,
@@ -15476,6 +15744,7 @@ fn self_test() -> Result<(), String> {
                 env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
                 cwd: "/workspace/pressure-fixture".into(),
                 shell_command: "cd /workspace/pressure-fixture && env LC_ALL=C hermit run".into(),
+                expected_output_failure: None,
             }],
         }),
     };
@@ -25280,6 +25549,7 @@ fn self_test() -> Result<(), String> {
             env: foreign_env,
             cwd: foreign_root.into(),
             shell_command: "stale".into(),
+            expected_output_failure: None,
         }],
     };
     normalise_invocation_root(&mut fixture);
@@ -28651,8 +28921,11 @@ mod post_verdict_transaction_tests {
     /// the same 959 bytes in both compared runs, but not the bytes its
     /// expected_stdout declares, and the reader called that FAIL "a FAIL whose
     /// matched report ends as its row allows". It is the runner's red for a
-    /// failed expectation. Both readers keep it as a crash-error beside a
-    /// sibling that still passes; neither credits the match or aborts the run.
+    /// failed expectation. Both readers keep it red beside a sibling that
+    /// still passes; neither credits the match nor aborts the run. The fold
+    /// lists it apart from crashes, and the published cell's failing attempt
+    /// carries the failure the runner found, even though its result is still
+    /// the interim `crash-error`.
     #[test]
     fn a_failed_stdout_expectation_is_retained_red_beside_a_valid_sibling() {
         let _fixture_lock = history_fixture_lock();
@@ -28667,6 +28940,7 @@ mod post_verdict_transaction_tests {
             .unwrap()
             .remove("expected_guest_exit");
         let observed = "getrandom[0] 918fdb56\n";
+        let expected = "getrandom[0] a29a84d6\n";
         let undeclared = with_captured_stdout(&undeclared, observed);
         let declared = with_captured_stdout(&declared, observed);
         let depth = BTreeMap::from([(
@@ -28676,53 +28950,82 @@ mod post_verdict_transaction_tests {
                 first_parent: 20,
             },
         )]);
-        let mut non_utf8_capture = expected_output_failure(
-            &undeclared,
-            &expected_stdout_reason("first", observed, "getrandom[0] a29a84d6\n"),
-        );
+        let sha256 = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+        let exact_failure = ExpectedOutputFailure::ExpectedStdout {
+            observed_stdout_bytes: observed.len() as u64,
+            observed_stdout_sha256: sha256(observed),
+            declared_stdout_bytes: expected.len() as u64,
+            declared_stdout_sha256: sha256(expected),
+        };
+        let exact = expected_stdout_reason("first", observed, expected);
+        let mut non_utf8_capture = expected_output_failure(&undeclared, &exact);
         // The runner records an unreadable or non-UTF-8 capture as empty.
         non_utf8_capture["attempts"][0]["stdout"] = "".into();
-        for (label, failed, names) in [
+        // The runner decides an exact expectation from the report's digests
+        // alone, so a capture of other bytes does not contradict it.
+        let mut other_capture = expected_output_failure(&undeclared, &exact);
+        other_capture["attempts"][0]["stdout"] = "getrandom[0] 00000000\n".into();
+        let marker = "vdso-getrandom\t\"ok\"";
+        for (label, failed, names, failure) in [
             (
                 "undeclared exit, exact stdout differs",
-                expected_output_failure(
-                    &undeclared,
-                    &expected_stdout_reason("first", observed, "getrandom[0] a29a84d6\n"),
-                ),
+                expected_output_failure(&undeclared, &exact),
                 "declared expected_stdout",
+                exact_failure.clone(),
             ),
             (
                 "declared exit 3 matched, exact stdout differs",
-                expected_output_failure(
-                    &declared,
-                    &expected_stdout_reason("first", observed, "getrandom[0] a29a84d6\n"),
-                ),
+                expected_output_failure(&declared, &exact),
                 "declared expected_stdout",
+                exact_failure.clone(),
             ),
             (
                 "exact stdout differs, capture unreadable",
                 non_utf8_capture,
                 "declared expected_stdout",
+                exact_failure.clone(),
+            ),
+            (
+                "exact stdout differs, capture of other bytes",
+                other_capture,
+                "declared expected_stdout",
+                exact_failure.clone(),
             ),
             (
                 "stdout omits the declared text",
                 expected_output_failure(
                     &undeclared,
-                    &expected_stdout_contains_reason(observed, "vdso-getrandom\t\"ok\""),
+                    &expected_stdout_contains_reason(observed, marker),
                 ),
                 "declared expected_stdout_contains",
+                ExpectedOutputFailure::ExpectedStdoutContains {
+                    observed_stdout_bytes: observed.len() as u64,
+                    observed_stdout_sha256: sha256(observed),
+                    declared_text: marker.into(),
+                },
             ),
         ] {
+            let runner_reason = failed["attempts"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(failure.runner_reason(), runner_reason, "{label}");
             fixture.publish_rows(&[sibling.clone(), failed]);
             let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
             match candidates[&id][0].evidence(&id, ResultInput::Current) {
-                Ok(ValidateRowEvidence::Unavailable { reason, result }) => {
+                Ok(ValidateRowEvidence::ExpectedOutputFailed {
+                    reason,
+                    result,
+                    failures,
+                }) => {
                     assert!(
                         reason.contains("failed its declared expected output")
-                            && reason.contains(names),
+                            && reason.contains(names)
+                            && reason.ends_with(&runner_reason),
                         "{label}: {reason}"
                     );
                     assert_eq!(result, Some(ObservedResult::CrashError), "{label}");
+                    assert_eq!(failures, BTreeMap::from([(0, failure.clone())]), "{label}");
                 }
                 other => panic!("{label}: the failed expectation was not retained: {other:?}"),
             }
@@ -28738,32 +29041,102 @@ mod post_verdict_transaction_tests {
             )
             .unwrap_or_else(|error| panic!("{label}: the fold was aborted: {error}"));
             assert_eq!(fold.passed, 1, "{label}: the sibling did not pass");
-            assert_eq!(fold.errored.len(), 1, "{label}: {:?}", fold.errored);
-            assert!(
-                fold.errored[0].contains(&display_id(&id)) && fold.errored[0].contains(names),
+            assert!(fold.errored.is_empty(), "{label}: {:?}", fold.errored);
+            assert_eq!(
+                fold.failed_expectations.len(),
+                1,
                 "{label}: {:?}",
-                fold.errored
+                fold.failed_expectations
             );
-            let results = |cell_id: &CellId| {
-                let cell = tracked
+            assert!(
+                fold.failed_expectations[0].contains(&display_id(&id))
+                    && fold.failed_expectations[0].contains(names),
+                "{label}: {:?}",
+                fold.failed_expectations
+            );
+            assert!(!fold.reads_all_green(), "{label}");
+            let cell = |tracked: &TrackedCells, cell_id: &CellId| {
+                tracked
                     .cells
                     .iter()
                     .find(|cell| &cell.id == cell_id)
-                    .unwrap();
-                assert!(cell.last_tested.is_some(), "{label}: {cell_id:?} unstamped");
+                    .unwrap()
+                    .clone()
+            };
+            let results = |cell: &TrackedCell| {
+                assert!(
+                    cell.last_tested.is_some(),
+                    "{label}: {:?} unstamped",
+                    cell.id
+                );
                 cell.observations
                     .iter()
                     .flat_map(|observation| observation.results.iter().copied())
                     .collect::<BTreeSet<_>>()
             };
+            let stored_failures = |cell: &TrackedCell| {
+                cell.observations
+                    .iter()
+                    .flat_map(|observation| &observation.invocations)
+                    .flat_map(|invocation| &invocation.attempts)
+                    .map(|attempt| attempt.expected_output_failure.clone())
+                    .collect::<Vec<_>>()
+            };
+            let red = cell(&tracked, &id);
+            let green = cell(&tracked, &sibling_id);
             assert_eq!(
-                results(&sibling_id),
+                results(&green),
                 BTreeSet::from([ObservedResult::Pass]),
                 "{label}"
             );
+            assert_eq!(stored_failures(&green), vec![None], "{label}");
             assert_eq!(
-                results(&id),
+                results(&red),
                 BTreeSet::from([ObservedResult::CrashError]),
+                "{label}"
+            );
+            assert_eq!(
+                stored_failures(&red),
+                vec![Some(failure.clone())],
+                "{label}"
+            );
+            // Interim: the measurement cannot yet tell this red from a crash;
+            // the stored record is what does.
+            assert_eq!(
+                derive_measurement(&red),
+                MeasurementState::MeasuredNoVerdict,
+                "{label}"
+            );
+            let encoded = encoded_cells(&tracked)
+                .unwrap_or_else(|error| panic!("{label}: the scorecard did not encode: {error}"));
+            let published: JsonValue = serde_json::from_str(&encoded).unwrap();
+            let published_failures = published["cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|cell| serde_json::from_value::<CellId>((*cell).clone()).unwrap() == id)
+                .flat_map(|cell| cell["observations"].as_array().unwrap())
+                .flat_map(|observation| observation["invocations"].as_array().unwrap())
+                .flat_map(|invocation| invocation["attempts"].as_array().unwrap())
+                .map(|attempt| attempt["expected_output_failure"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                published_failures,
+                vec![serde_json::to_value(&failure).unwrap()],
+                "{label}"
+            );
+            let declaration = if names.ends_with("contains") {
+                "expected_stdout_contains"
+            } else {
+                "expected_stdout"
+            };
+            assert_eq!(
+                published_failures[0]["declaration"], declaration,
+                "{label}: {published_failures:?}"
+            );
+            assert_eq!(
+                published_failures[0]["observed_stdout_sha256"],
+                sha256(observed),
                 "{label}"
             );
             let error = verify_candidate_set(
@@ -28778,10 +29151,184 @@ mod post_verdict_transaction_tests {
         }
     }
 
+    /// A stored expected-output failure is the fold's finding, never the raw
+    /// row's claim: a record forged onto a passing attempt is not carried into
+    /// the scorecard, and `encoded_cells` refuses a record on an attempt the
+    /// runner could not have failed that way.
+    #[test]
+    fn an_expected_output_failure_the_runner_could_not_have_found_is_not_published() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, declared) = declared_exit_row(&measured);
+        let sibling_id = fixture.id.clone();
+        let mut undeclared = with_matched_exit(&declared, 0);
+        undeclared
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        let observed = "getrandom[0] 918fdb56\n";
+        let expected = "getrandom[0] a29a84d6\n";
+        let undeclared = with_captured_stdout(&undeclared, observed);
+        let sha256 = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+        let failure = ExpectedOutputFailure::ExpectedStdout {
+            observed_stdout_bytes: observed.len() as u64,
+            observed_stdout_sha256: sha256(observed),
+            declared_stdout_bytes: expected.len() as u64,
+            declared_stdout_sha256: sha256(expected),
+        };
+        let depth = BTreeMap::from([(
+            "hermit".to_string(),
+            SourceDepth {
+                commits: 20,
+                first_parent: 20,
+            },
+        )]);
+        let stored = |tracked: &TrackedCells, cell_id: &CellId| {
+            tracked
+                .cells
+                .iter()
+                .find(|cell| &cell.id == cell_id)
+                .unwrap()
+                .observations
+                .iter()
+                .flat_map(|observation| &observation.invocations)
+                .flat_map(|invocation| &invocation.attempts)
+                .map(|attempt| attempt.expected_output_failure.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut tracked = fixture.cells();
+        for (label, forged_record) in [
+            ("well-formed", serde_json::to_value(&failure).unwrap()),
+            ("malformed", JsonValue::String("not a record".into())),
+        ] {
+            let mut forged = fixture.row.clone();
+            forged["attempts"][0]["expected_output_failure"] = forged_record;
+            fixture.publish_rows(&[
+                forged,
+                expected_output_failure(
+                    &undeclared,
+                    &expected_stdout_reason("first", observed, expected),
+                ),
+            ]);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            tracked = fixture.cells();
+            let fold = apply_validate_results(
+                &mut tracked,
+                &candidates,
+                &measured,
+                "tree-1",
+                &depth,
+                true,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{label}: the fold was aborted: {error}"));
+            assert_eq!(fold.passed, 1, "{label}: {fold:?}");
+            assert_eq!(fold.failed_expectations.len(), 1, "{label}: {fold:?}");
+            assert_eq!(
+                stored(&tracked, &sibling_id),
+                vec![None],
+                "{label}: the forged record was stored"
+            );
+            assert_eq!(
+                stored(&tracked, &id),
+                vec![Some(failure.clone())],
+                "{label}"
+            );
+        }
+        encoded_cells(&tracked).unwrap_or_else(|error| panic!("the fold did not encode: {error}"));
+        // Rewrite one stored attempt of `cell_id` and require encode to refuse.
+        let refuses = |label: &str,
+                       cell_id: &CellId,
+                       edit: &dyn Fn(
+            &mut Observation,
+            &mut ObservedInvocation,
+            &mut ObservedAttemptInvocation,
+        )| {
+            let mut edited = tracked.clone();
+            let cell = edited
+                .cells
+                .iter_mut()
+                .find(|cell| &cell.id == cell_id)
+                .unwrap();
+            assert_eq!(cell.observations.len(), 1, "{label}");
+            let mut observation = cell.observations.remove(0);
+            let mut invocations = std::mem::take(&mut observation.invocations)
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(invocations.len(), 1, "{label}");
+            let mut attempt = invocations[0].attempts.remove(0);
+            edit(&mut observation, &mut invocations[0], &mut attempt);
+            invocations[0].attempts.insert(0, attempt);
+            observation.invocations = invocations.into_iter().collect();
+            cell.observations.insert(0, observation);
+            let error =
+                encoded_cells(&edited).expect_err(&format!("{label}: the record was published"));
+            assert!(
+                error.contains("stores an expected-output failure it cannot carry"),
+                "{label}: {error}"
+            );
+        };
+        refuses(
+            "record on a passing attempt",
+            &sibling_id,
+            &|_, _, attempt| {
+                attempt.expected_output_failure = Some(failure.clone());
+            },
+        );
+        refuses(
+            "record on a PASS attempt of a red cell",
+            &id,
+            &|_, _, attempt| {
+                attempt.outcome = "PASS".into();
+            },
+        );
+        refuses("record on a timed-out attempt", &id, &|_, _, attempt| {
+            attempt.timed_out = true;
+        });
+        refuses(
+            "record under a passing invocation",
+            &id,
+            &|_, invocation, _| {
+                invocation.result = Some(ObservedResult::Pass);
+            },
+        );
+        refuses("record under a divergence", &id, &|_, invocation, _| {
+            invocation.result = Some(ObservedResult::DeterminismFailure);
+        });
+        refuses(
+            "record from a pressure summary",
+            &id,
+            &|observation, _, _| {
+                observation.provenance = ObservationProvenance::PressureTest;
+            },
+        );
+        refuses(
+            "declared stdout is the observed stdout",
+            &id,
+            &|_, _, attempt| {
+                attempt.expected_output_failure = Some(ExpectedOutputFailure::ExpectedStdout {
+                    observed_stdout_bytes: observed.len() as u64,
+                    observed_stdout_sha256: sha256(observed),
+                    declared_stdout_bytes: observed.len() as u64,
+                    declared_stdout_sha256: sha256(observed),
+                });
+            },
+        );
+        refuses("empty declared text", &id, &|_, _, attempt| {
+            attempt.expected_output_failure = Some(ExpectedOutputFailure::ExpectedStdoutContains {
+                observed_stdout_bytes: observed.len() as u64,
+                observed_stdout_sha256: sha256(observed),
+                declared_text: String::new(),
+            });
+        });
+    }
+
     /// Only the runner's own expected-output red is retained. A FAIL whose
-    /// reason claims a failed expectation that its matched report or captured
-    /// stdout contradicts, or whose reason is not one the runner writes, is
-    /// still refused, so the exception cannot launder a malformed row.
+    /// reason claims a failed expectation that its matched report contradicts,
+    /// or an omitted text that the searched capture contradicts, or whose
+    /// reason is not one the runner writes, is still refused, so the exception
+    /// cannot launder a malformed row.
     #[test]
     fn a_stdout_expectation_failure_the_evidence_contradicts_is_refused() {
         let _fixture_lock = history_fixture_lock();
@@ -28798,7 +29345,11 @@ mod post_verdict_transaction_tests {
         let expected = "getrandom[0] a29a84d6\n";
         let undeclared = with_captured_stdout(&undeclared, observed);
         let exact = expected_stdout_reason("first", observed, expected);
-        let mut wrong_capture = expected_output_failure(&undeclared, &exact);
+        // The runner searched only a capture equal to both compared runs.
+        let mut wrong_capture = expected_output_failure(
+            &undeclared,
+            &expected_stdout_contains_reason(observed, "vdso-getrandom"),
+        );
         wrong_capture["attempts"][0]["stdout"] = "getrandom[0] 00000000\n".into();
         let mut marker_present = expected_output_failure(
             &undeclared,
@@ -28831,7 +29382,7 @@ mod post_verdict_transaction_tests {
                 "contradicts its evidence",
             ),
             (
-                "captured stdout is not the reported bytes",
+                "captured stdout searched for the text is not the reported bytes",
                 wrong_capture,
                 "contradicts its evidence",
             ),
