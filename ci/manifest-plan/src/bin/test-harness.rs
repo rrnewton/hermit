@@ -5071,7 +5071,6 @@ sys.exit(1 if failed else 0)
         let shards: serde_json::Value =
             serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
         let expected_aliases = [
-            "check.backend_parity_suites",
             // A hosted twin since the one-build change of 2026-09-30 moved
             // the local check into the pinned root.
             "check.dbt_runtime_abi",
@@ -5129,10 +5128,12 @@ sys.exit(1 if failed else 0)
         // (ci/check-shard-coverage.sh enforces that against the committed cell
         // plan). shared-futex-c and util-c left the integration shard once
         // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell
-        // (25 to 23), and test.dbt_parity left the dbt-parity shard in slice
-        // S13 of https://github.com/rrnewton/hermit/issues/3301 (23 to 22).
-        assert_eq!(physical_rows, 22);
-        assert_eq!(resolved.len(), 22);
+        // (25 to 23). In slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301, test.dbt_parity left
+        // the dbt-parity shard (23 to 22) and check.backend_parity_suites left
+        // the integration shard when tests/backend-parity was retired (22 to 21).
+        assert_eq!(physical_rows, 21);
+        assert_eq!(resolved.len(), 21);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.

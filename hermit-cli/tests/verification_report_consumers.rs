@@ -37,12 +37,6 @@ const CONSUMERS: &[Consumer] = &[
         minimum_invocations: 2,
     },
     Consumer {
-        path: "tests/backend-parity/run_matrix.py",
-        requirement: "matched",
-        invocation: "[str(VERIFICATION_REPORT_BIN), \"--json\", \"matched\", str(path)]",
-        minimum_invocations: 1,
-    },
-    Consumer {
         path: "tests/e2e/lib/data-handling/common.bash",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
@@ -384,7 +378,9 @@ fn verdict(requirement: &str, path: &Path) -> std::process::Output {
 #[test]
 fn every_named_consumer_delegates_to_the_shared_typed_reader() {
     let root = root();
-    assert_eq!(CONSUMERS.len(), 11, "the published consumer list changed");
+    // 10 since tests/backend-parity/run_matrix.py was retired in slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301.
+    assert_eq!(CONSUMERS.len(), 10, "the published consumer list changed");
     for consumer in CONSUMERS {
         let source = fs::read_to_string(root.join(consumer.path))
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", consumer.path));
