@@ -8,6 +8,9 @@
 #include "keeper-readback.h"
 #define UG_LINKS 31
 #define UG_MAPS 10
+/* Exact zero-error RECORD_FAILURE payload for a clean keeper-local policy
+ * observation. Generic errors, including ECANCELED, never carry this marker. */
+#define UG_JOURNAL_POLICY_OBSERVED "keeper-policy-v1"
 struct ug_session;
 /* Implemented by the exec-created outside keeper only. Inputs are borrowed
  * capabilities: a held immutable ELF, bpffs directory and regular recovery
@@ -30,8 +33,9 @@ int ug_session_observe_birth(struct ug_session *, u64 sequence, struct ug_birth 
 /* An externally authenticated stopped initial guest, not the tracer. Partial
  * insertion retains its held pidfd + STAGED/LIVE row and cannot authorize run. */
 int ug_session_register_initial(struct ug_session *, int held_pidfd, u64 sequence);
-int ug_session_monitor(struct ug_session *, int other_actor_pidfd,
-                       struct ug_monitor_result *);
+/* Session-owned observation history also serves TERMINAL. Keep pumping after
+ * policy: a later independent failure must remain in the original journal. */
+int ug_session_monitor(struct ug_session *, int other_actor_pidfd, u64 sequence);
 /* Record actor failure durably while retaining every map/link/pidfd. This is
  * not terminal proof. Process exit leaves the completed bpffs pins in place. */
 int ug_session_note_failure(struct ug_session *, u64 sequence, int error);

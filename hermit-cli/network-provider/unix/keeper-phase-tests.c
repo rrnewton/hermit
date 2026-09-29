@@ -53,6 +53,93 @@ static struct ug_terminal_receipt prepare(void) {
     assert(exported_inventory.proof_sequence==10 && exported_inventory.record_ordinal==proof.record_ordinal);
     return proof;
 }
+static void committed_policy(void) {
+    status_value.first_outcome=UG_EVENT_DENIAL;
+    status_value.first_denial=(struct ug_denial){.phase=2,.incarnation=7,.reason=UG_FOREIGN_PEER};
+}
+static unsigned policy_rows(u64 sequence) {
+    unsigned found=0;bool terminal=false;
+    for(unsigned i=0;i<writes;i++) {
+        const struct recovery_record *r=&journal[i];
+        if(r->phase==RECORD_TERMINAL)terminal=true;
+        if(r->phase==RECORD_FAILURE && !r->error) {
+            assert(!terminal && r->sequence==sequence && !r->kind && !r->id);
+            assert(!strcmp(r->pin_name,UG_JOURNAL_POLICY_OBSERVED));found++;
+        }
+    }
+    return found;
+}
+static unsigned failure_rows(void) {
+    unsigned found=0;
+    for(unsigned i=0;i<writes;i++)if(journal[i].phase==RECORD_FAILURE && journal[i].error) {
+        assert(!journal[i].pin_name[0]);found++;
+    }
+    return found;
+}
+static void phase_fresh(void) {
+    fresh();queries=clock_failure=clock_calls=exported=0;clock_ns=1000000000;
+}
+static struct ug_terminal_receipt phase_prepare(void) {
+    struct ug_terminal_receipt proof;int inventory=-1;
+    assert(ug_session_prepare_terminal(&subject,10,&proof,&inventory)==0);
+    assert(inventory==800 && exported_inventory.count==72 && queries==0);
+    assert(subject.close_prepared && !object_closed && destroys==31 && unlinks==41);
+    return proof;
+}
+static void phase_close(struct ug_terminal_receipt proof,bool clean_suffix) {
+    struct ug_object_close closed;
+    assert(ug_session_close_terminal(&subject,11,10,proof.record_ordinal,4000000000,&closed)==0);
+    assert(object_closed && !dir_present && closed.count==72 && queries==0);
+    assert(closed.closed_ns==1000000000 && closed.deadline_ns==2000000000);
+    assert(journal[writes-2].phase==RECORD_OBJECT_CLOSED && journal[writes-1].phase==RECORD_QUERY_DEADLINE);
+    if(clean_suffix)assert(closed.record_ordinal==proof.record_ordinal+2);
+    else assert(closed.record_ordinal>proof.record_ordinal+2); /* Retained failure, never a clean receipt. */
+}
+static void provenance_controls(void) {
+    /* Actual session + monitor implementation; every native operation is a
+     * wrapped premise. These journals are NOT successful kernel receipts. */
+    unsigned passed=0;struct ug_terminal_receipt proof;
+    phase_fresh();committed_policy();assert(ug_session_monitor(&subject,33,9)==0);
+    assert(policy_rows(9)==1 && !failure_rows());proof=phase_prepare();
+    unsigned before=writes;assert(ug_session_monitor(&subject,33,10)==0 && writes==before);
+    assert(policy_rows(9)==1);phase_close(proof,true);passed++;
+
+    phase_fresh();assert(ug_session_monitor(&subject,33,9)==0 && !writes);
+    committed_policy(); /* Committed after the clean loop snapshot, before TERMINAL. */
+    proof=phase_prepare();assert(policy_rows(10)==1 && !failure_rows());
+    before=writes;assert(ug_session_monitor(&subject,33,10)==0 && writes==before);
+    assert(policy_rows(10)==1);phase_close(proof,true);passed++;
+
+    phase_fresh();monitor_lookup_error=EIO;
+    assert(ug_session_monitor(&subject,33,9)==-1 && errno==EIO);
+    assert(failure_rows()==1 && journal[0].error==EIO);
+    monitor_lookup_error=0;committed_policy();proof=phase_prepare();
+    assert(proof.first_outcome==UG_EVENT_DENIAL && failure_rows()==1 && !policy_rows(10));
+    assert(subject.monitor.primary==UG_INTERNAL_FAILURE);phase_close(proof,true);passed++;
+
+    phase_fresh();committed_policy();assert(ug_session_monitor(&subject,33,9)==0);
+    monitor_lookup_error=EIO;assert(ug_session_monitor(&subject,33,9)==-1);
+    assert(subject.monitor.primary==UG_POLICY_REFUSAL && subject.monitor.secondary_monitor_failures==UG_MONITOR_LOOKUP);
+    assert(policy_rows(9)==1 && failure_rows()==1);monitor_lookup_error=0;
+    proof=phase_prepare();assert(proof.first_outcome==UG_EVENT_DENIAL);
+    phase_close(proof,true);assert(failure_rows()==1);passed++;
+
+    phase_fresh();committed_policy();proof=phase_prepare();
+    monitor_lookup_error=EIO;assert(ug_session_monitor(&subject,33,10)==-1);
+    assert(policy_rows(10)==1 && failure_rows()==1);monitor_lookup_error=0;
+    phase_close(proof,false);passed++;
+
+    phase_fresh();assert(ug_session_note_failure(&subject,9,ECANCELED)==0);
+    committed_policy();proof=phase_prepare();assert(failure_rows()==1 && journal[0].error==ECANCELED);
+    assert(!journal[0].pin_name[0] && policy_rows(10)==1);phase_close(proof,true);passed++;
+
+    phase_fresh();proof=phase_prepare();committed_policy(); /* Impossible late publication must refuse. */
+    assert(ug_session_monitor(&subject,33,10)==-1 && errno==EPROTO && failure_rows()==1 && !policy_rows(10));
+    before=writes;assert(ug_session_monitor(&subject,33,10)==0 && writes==before);
+    phase_close(proof,false);passed++;
+    printf("guard_keeper_provenance_controls=%u passed; native operations substituted\n",passed);
+    assert(passed==7);
+}
 int main(void) {
     assert(retained_terminal_controls()==0);unsigned passed=0;
     struct ug_terminal_receipt proof=prepare();struct ug_object_close closed;
@@ -77,5 +164,6 @@ int main(void) {
     assert(!object_closed);passed++;
     proof=prepare();assert(ug_session_close_terminal(&subject,11,10,proof.record_ordinal,4000000000,&closed)==0);
     assert(ug_session_close_terminal(&subject,12,10,proof.record_ordinal,9000000000,&closed)==-1 && errno==EBUSY);passed++;
-    printf("guard_two_phase_controls=%u passed\n",passed);assert(passed==8);return 0;
+    printf("guard_two_phase_controls=%u passed\n",passed);assert(passed==8);
+    provenance_controls();return 0;
 }

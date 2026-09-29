@@ -65,6 +65,8 @@ struct ug_session {
     u32 links_count, initial_count;
     struct initial_owner initial[UG_MAX_INITIAL_TASKS];
     bool prepared, creator_armed, failed;
+    struct ug_monitor_result monitor;
+    bool policy_noted, monitor_failure_noted;
 };
 static const char *const map_names[UG_MAPS] = {
     "ug_config","ug_status","ug_allocator","ug_events","ug_tasks",
@@ -282,14 +284,42 @@ int ug_session_register_initial(struct ug_session *s,int pidfd,u64 sequence) {
     if(append(s,RECORD_INITIAL_LIVE,sequence,0,0,NULL,0))return -1;
     owner->live=true;return 0;
 }
-int ug_session_monitor(struct ug_session *s,int other,struct ug_monitor_result *result) {
-    if(!s || !s->prepared)return fail(EINVAL);
-    struct ug_monitor_fds f={s->maps[0],s->maps[1],s->maps[3],other,s->incarnation};
-    return ug_monitor_once(&f,result);
-}
 int ug_session_note_failure(struct ug_session *s,u64 seq,int error) {
     if(!s)return fail(EINVAL);s->failed=true;
     return append(s,RECORD_FAILURE,seq,0,0,NULL,error);
+}
+/* Both the loop and terminal proof consume actual keeper reads through this
+ * one latch. A parent's independently clean result cannot explain our errors.
+ * One retained failure suffices to refuse completion; repeated pumps cannot
+ * exhaust the journal with the same latched fault. It never blocks cleanup. */
+static int note_observation(struct ug_session *s,u64 seq,int observed,int error) {
+    bool bad=observed<0 || s->monitor.primary==UG_INTERNAL_FAILURE ||
+        s->monitor.secondary_monitor_failures || s->monitor.secondary_guard_faults;
+    if(bad && !s->monitor_failure_noted) {
+        s->monitor_failure_noted=true;
+        if(ug_session_note_failure(s,seq,error?error:EPROTO))return -1;
+    }
+    if(!bad && !s->monitor_failure_noted && s->monitor.primary==UG_POLICY_REFUSAL && !s->policy_noted) {
+        /* TERMINAL must observe the committed status before READY. An outcome
+         * first seen after that proof is a protocol failure, not a late policy
+         * exception to the original close suffix. */
+        if(s->terminal_proved) {
+            s->monitor_failure_noted=true;
+            if(ug_session_note_failure(s,seq,EPROTO))return -1;
+            return fail(EPROTO);
+        }
+        s->failed=true; /* Close ordinary admission, preserve recovery. */
+        if(append(s,RECORD_FAILURE,seq,0,0,UG_JOURNAL_POLICY_OBSERVED,0))return -1;
+        s->policy_noted=true;
+    }
+    return 0;
+}
+int ug_session_monitor(struct ug_session *s,int other,u64 sequence) {
+    if(!s || !s->prepared)return fail(EINVAL);
+    struct ug_monitor_fds f={s->maps[0],s->maps[1],s->maps[3],other,s->incarnation};
+    int observed=ug_monitor_once(&f,&s->monitor),error=observed<0?errno:0;
+    if(note_observation(s,sequence,observed,error))return -1;
+    return observed<0?fail(error?error:EPROTO):observed;
 }
 
 static int task_terminal(int pidfd) {
@@ -310,7 +340,7 @@ static int empty_hash(int map) {
     if(!bpf_call(BPF_MAP_GET_NEXT_KEY,&a))return fail(EAGAIN);
     return errno==ENOENT?0:-1;
 }
-static int prove_terminal(struct ug_session *s) {
+static int prove_terminal(struct ug_session *s,u64 sequence) {
     if(s->controller>=0 && task_terminal(s->controller))return -1;
     /* No registration/arm method runs after admissions_closed. Before any
      * admission attempt, even a partial load has no cohort or owned namespace. */
@@ -335,8 +365,20 @@ static int prove_terminal(struct ug_session *s) {
         if(row.incarnation!=s->incarnation)return fail(EPROTO);
         if(row.phase!=UG_INITIAL_TERMINAL)return fail(EAGAIN);
     }
-    struct ug_status status;u32 zero=0;
-    if(lookup_value(s->maps[1],&zero,&status,BPF_F_LOCK))return -1;
+    struct ug_status status;struct ug_config config;u32 zero=0;
+    if(lookup_value(s->maps[1],&zero,&status,BPF_F_LOCK) ||
+       lookup_value(s->maps[0],&zero,&config,0)) {
+        int error=errno;
+        ug_monitor_note_failure(&s->monitor,UG_MONITOR_LOOKUP);
+        if(note_observation(s,sequence,-1,error))return -1;
+        return fail(error);
+    }
+    /* Consume the SAME locked status that establishes terminality, after the
+     * actual task-death checks and before RECORD_TERMINAL/READY. A policy
+     * committed since the loop's last snapshot is recorded here exactly once. */
+    int observed=ug_monitor_decode(&config,&status,s->incarnation,&s->monitor);
+    if(note_observation(s,sequence,observed,observed<0?EPROTO:0))return -1;
+    if(observed<0)return fail(EPROTO);
     /* A tracking fault makes a zero count insufficient. Never clear faults,
      * queues, membership, or sockets to manufacture a terminal certificate. */
     if(status.faults || status.first_outcome>UG_EVENT_INTERNAL)return fail(EPROTO);
@@ -406,7 +448,7 @@ static int terminal_core(struct ug_session *s,u64 sequence,struct ug_terminal_re
         if(append(s,RECORD_ADMISSION_CLOSED,sequence,0,0,NULL,0))return -1;
     }
     if(!s->terminal_proved) {
-        if(prove_terminal(s))return -1;
+        if(prove_terminal(s,sequence))return -1;
         if(append(s,RECORD_TERMINAL,sequence,0,0,NULL,0))return -1;
         s->terminal_proved=true;
         s->terminal.incarnation=s->incarnation;s->terminal.sequence=sequence;

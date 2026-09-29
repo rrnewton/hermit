@@ -29,8 +29,8 @@ int ug_session_readers(struct ug_session *s,int out[3]) {
     if(observed->scenario==3) { errno=EIO;return -1; }
     return 0;
 }
-int ug_session_monitor(struct ug_session *s,int parent,struct ug_monitor_result *out) {
-    assert(s==&fake && parent>=0);observed->monitors++;memset(out,0,sizeof(*out));return 0;
+int ug_session_monitor(struct ug_session *s,int parent,u64 sequence) {
+    assert(s==&fake && parent>=0 && sequence);observed->monitors++;return 0;
 }
 int ug_session_note_failure(struct ug_session *s,u64 sequence,int error) {
     assert(s==&fake && sequence && error);observed->failures++;return 0;

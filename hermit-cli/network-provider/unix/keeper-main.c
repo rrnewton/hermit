@@ -37,19 +37,14 @@ int ug_keeper_main(u64 bootstrap_deadline_ns) {
     if(self_pidfd<0)return 125;
     struct ug_session *session=NULL;u64 incarnation=0,last_sequence[2]={0};
     int parent_pidfd=-1,controller=-1;bool controller_registered=false;
-    bool outcome_noted=false,controller_closed=false;
+    bool controller_closed=false;
     u64 terminal_deadline=0;struct ug_terminal_receipt terminal_prepared={0};
-    struct ug_monitor_result outcome={0};
     int retained[4*(UG_MAX_INITIAL_TASKS+8)];u32 retained_count=0;
     for(;;) {
-        if(session && parent_pidfd>=0 && !outcome_noted) {
-            int observed=ug_session_monitor(session,parent_pidfd,&outcome);
-            if(observed<0 || outcome.primary) {
-                ug_session_note_failure(session,last_sequence[0],ECANCELED);
-                outcome_noted=true;
-                /* Keep the parent recovery lane and pinned policy alive.
-                 * Independent controller status/pidfd monitor owns abort. */
-            }
+        if(session && parent_pidfd>=0) {
+            /* Session bookkeeping preserves keeper-local origin and secondary
+             * failure after policy. Keep the parent recovery lane alive. */
+            ug_session_monitor(session,parent_pidfd,last_sequence[0]);
         }
         int timeout=50;
         if(parent_pidfd<0) {

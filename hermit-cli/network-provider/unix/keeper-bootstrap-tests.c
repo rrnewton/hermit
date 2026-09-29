@@ -9,6 +9,7 @@
  * substituted. No policy, map, process, socket or descriptor is created. */
 static u64 now_ns, deadline;
 static int scenario, polls, receives, opens, sends, failures, closes;
+static unsigned monitors;
 static struct ug_frame last_response;
 int __wrap_clock_gettime(clockid_t id,struct timespec *out) {
     assert(id==CLOCK_MONOTONIC);
@@ -40,6 +41,7 @@ int __wrap_poll(struct pollfd *fds,nfds_t count,int timeout) {
         return 0; /* Another actor retains channel: no HUP or readable input. */
     }
     if(polls==1) {fds[0].revents=POLLIN;return 1;}
+    if(scenario==7 && polls==2)return 0;
     /* An alias is still readable, but actual registered parent has died.
      * This happens far beyond the bootstrap deadline after valid INIT. */
     assert(fds[2].fd==63);now_ns+=100000000000ULL;
@@ -67,8 +69,10 @@ int ug_session_open(int elf,int bpffs,int recovery,u64 incarnation,struct ug_ses
 int ug_session_readers(struct ug_session *s,int out[3]) {
     assert(s==(void *)123);for(int i=0;i<3;i++)out[i]=70+i;return 0;
 }
-int ug_session_monitor(struct ug_session *s,int fd,struct ug_monitor_result *out) {
-    assert(s==(void *)123 && fd==63);memset(out,0,sizeof(*out));return 0;
+int ug_session_monitor(struct ug_session *s,int fd,u64 sequence) {
+    assert(s==(void *)123 && fd==63 && sequence==1);monitors++;
+    if(scenario==7 && monitors==1) {errno=EIO;return -1;}
+    return 0;
 }
 int ug_session_note_failure(struct ug_session *s,u64 sequence,int error) {
     assert(s==(void *)123 && sequence==1 && error);failures++;return 0;
@@ -84,6 +88,7 @@ int ug_session_close_terminal(struct ug_session *s,u64 seq,u64 proof,u64 ordinal
 static void fresh(int which) {
     scenario=which;now_ns=1000000000ULL;deadline=now_ns+50000000;
     polls=receives=opens=sends=failures=closes=0;memset(&last_response,0,sizeof(last_response));
+    monitors=0;
 }
 int main(void) {
     unsigned passed=0;
@@ -95,5 +100,10 @@ int main(void) {
     fresh(5);assert(ug_keeper_main(deadline)==125);assert(receives==1 && !opens && !sends);passed++;
     fresh(6);assert(ug_keeper_main(deadline)==125);assert(opens==1 && sends==1 && last_response.error==ETIMEDOUT && polls==2);passed++;
     fresh(0);now_ns=deadline;assert(ug_keeper_main(deadline)==125);assert(!closes && !polls);passed++;
-    printf("guard_bootstrap_controls=%u passed\n",passed);assert(passed==8);return 0;
+    printf("guard_bootstrap_controls=%u passed\n",passed);assert(passed==8);
+    /* Session substituted here: independently check the maintained main loop
+     * keeps calling it after an observed failure instead of disabling it. */
+    fresh(7);assert(ug_keeper_main(deadline)==125);
+    assert(monitors==2 && polls==3 && opens==1 && sends==1 && failures==1);
+    printf("guard_keeper_continued_pump_controls=1 passed; session substituted\n");return 0;
 }

@@ -4,10 +4,13 @@
 #include <assert.h>
 #include <stdarg.h>
 #include "keeper-session.c"
+#include "keeper-monitor.c"
 /* Every process/map/FD/filesystem operation below is link-wrapped. These call
  * the actual ug_session_terminal method; none loads a policy or uses a real FD. */
 static struct ug_session subject;
 static struct ug_status status_value;
+static int monitor_lookup_error;
+static struct recovery_record journal[1024];
 static struct ug_birth birth_value;
 static struct ug_initial_task initial_value;
 static bool pins[UG_MAPS+UG_LINKS], links[UG_LINKS], dir_present;
@@ -25,7 +28,12 @@ long __wrap_syscall(long nr,...) {
     assert(va_arg(ap,size_t)==sizeof(*a));va_end(ap);
     switch(cmd) {
     case BPF_MAP_LOOKUP_ELEM:
-        if(a->map_fd==107)memcpy((void *)(uintptr_t)a->value,&birth_value,sizeof(birth_value));
+        if(a->map_fd==100) {
+            if(monitor_lookup_error) {errno=monitor_lookup_error;return -1;}
+            struct ug_config config={7,UG_DENY,UG_ABI_VERSION};
+            memcpy((void *)(uintptr_t)a->value,&config,sizeof(config));
+        }
+        else if(a->map_fd==107)memcpy((void *)(uintptr_t)a->value,&birth_value,sizeof(birth_value));
         else if(a->map_fd==108)memcpy((void *)(uintptr_t)a->value,&initial_value,sizeof(initial_value));
         else {assert(a->map_fd==101 && a->flags==BPF_F_LOCK);locked_reads++;
               memcpy((void *)(uintptr_t)a->value,&status_value,sizeof(status_value));}
@@ -53,6 +61,7 @@ long __wrap_syscall(long nr,...) {
     }
 }
 int __wrap_poll(struct pollfd *p,nfds_t n,int timeout) {
+    if(n==2) {assert(p[0].fd==103 && p[1].fd==33 && timeout==50);return 0;}
     assert(n==1 && timeout==0 && p->events==POLLIN);
     p->revents=p->fd==live_pidfd?0:POLLIN;return p->revents?1:0;
 }
@@ -60,6 +69,7 @@ ssize_t __wrap_write(int fd,const void *bytes,size_t size) {
     assert(fd==900 && size==sizeof(struct recovery_record));
     const struct recovery_record *r=bytes;
     assert(r->incarnation==7 && r->ordinal==subject.next_record+1);
+    assert(writes<sizeof(journal)/sizeof(journal[0]));journal[writes]=*r;
     writes++;return (ssize_t)size;
 }
 int __wrap_fdatasync(int fd) {assert(fd==900);return 0;}
@@ -99,6 +109,7 @@ static void fresh(void) {
     initial_value=(struct ug_initial_task){7,UG_INITIAL_TERMINAL};
     live_pidfd=hash_entries=unlink_error=wrong_pin=external_link=0;
     unlinks=destroys=locked_reads=writes=0;object_closed=false;dir_present=true;
+    monitor_lookup_error=0;memset(journal,0,sizeof(journal));
 }
 static void refuses_without_unpin(int expected) {
     struct ug_terminal_receipt receipt;
