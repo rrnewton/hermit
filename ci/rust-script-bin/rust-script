@@ -120,7 +120,18 @@ fi
 source_abs=$(realpath -- "$source") || die "cannot resolve script path $source"
 case $source_abs in
     "$ROOT_DIR"/*)
-        if ! source_root=$(git -C "$(dirname -- "$source_abs")" rev-parse --show-toplevel 2>/dev/null); then
+        # Ownership is a property of the script's own directory. Git exports
+        # GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE to hooks and `git rebase
+        # --exec` steps, and they override `git -C`: under an inherited GIT_DIR
+        # the lookup reports the script's directory as a separate checkout and
+        # delegates to the compiler, and under GIT_WORK_TREE it reports the
+        # caller's tree (https://github.com/rrnewton/hermit/issues/3362). The
+        # command substitution's subshell drops them for this lookup only.
+        if ! source_root=$(
+            unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+                GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+            git -C "$(dirname -- "$source_abs")" rev-parse --show-toplevel 2>/dev/null
+        ); then
             die "cannot establish Git ownership for repository script $source_abs"
         fi
         [[ -n $source_root && -d $source_root ]] ||

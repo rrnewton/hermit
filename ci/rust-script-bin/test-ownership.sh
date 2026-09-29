@@ -9,7 +9,7 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
     GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
 SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-scratch=$(mktemp -d /tmp/hermit-rust-script-ownership.XXXXXXXX)
+scratch=$(mktemp -d -t hermit-rust-script-ownership.XXXXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 root="$scratch/outer checkout"
 published="$scratch/prepared"
@@ -114,6 +114,54 @@ for layout in directory file; do
     cmp "$scratch/stdout" "$HERMIT_TEST_RUST_SCRIPT_CALLS"
 done
 
+# Git exports GIT_DIR to `git rebase --exec` steps, and GIT_DIR, GIT_WORK_TREE
+# and GIT_INDEX_FILE to hooks. The ownership lookup names the script's own
+# directory, so an inherited location aimed at the caller's repository must not
+# turn a listed source into a delegated one, refuse it, or touch the caller
+# (https://github.com/rrnewton/hermit/issues/3362).
+caller="$scratch/caller"
+git init -q "$caller/main"
+printf 'caller\n' > "$caller/main/tracked.txt"
+git -C "$caller/main" add tracked.txt
+git -C "$caller/main" -c user.email=fixture@example.invalid -c user.name=fixture \
+    -c commit.gpgsign=false commit -qm caller
+git -C "$caller/main" worktree add -q --detach "$caller/linked"
+caller_git_dir="$caller/main/.git/worktrees/linked"
+caller_state() {
+    (cd "$caller" && find . -type f -print0 | sort -z | xargs -0 sha256sum &&
+        find . -type f -printf '%P %i\n' | sort)
+}
+caller_before=$(caller_state)
+invoke_inherited() {
+    : > "$HERMIT_TEST_RUST_SCRIPT_CALLS"
+    status=0
+    (cd "$caller/linked" && env "${location[@]}" "$wrapper" "$@") \
+        > "$scratch/stdout" 2> "$scratch/stderr" || status=$?
+}
+nested_source="$root/target/nested-directory/source.rs"
+for shape in GIT_DIR GIT_WORK_TREE+GIT_INDEX_FILE GIT_DIR+GIT_WORK_TREE+GIT_INDEX_FILE; do
+    case $shape in
+        GIT_DIR) location=(GIT_DIR="$caller_git_dir") ;;
+        GIT_WORK_TREE+GIT_INDEX_FILE)
+            location=(GIT_WORK_TREE="$caller/linked" GIT_INDEX_FILE="$caller_git_dir/index") ;;
+        GIT_DIR+GIT_WORK_TREE+GIT_INDEX_FILE)
+            location=(GIT_DIR="$caller_git_dir" GIT_WORK_TREE="$caller/linked"
+                GIT_INDEX_FILE="$caller_git_dir/index") ;;
+    esac
+    case_label="inherited $shape, listed source"
+    invoke_inherited --force "$listed" -- fixture
+    expect_output prepared -- fixture
+    [[ ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+    case_label="inherited $shape, nested source"
+    invoke_inherited --force "$nested_source" -- fixture
+    expect_output delegated --force "$nested_source" -- fixture
+    cmp "$scratch/stdout" "$HERMIT_TEST_RUST_SCRIPT_CALLS"
+done
+[[ $(caller_state) == "$caller_before" ]] || {
+    echo "rust-script ownership: an inherited-location lookup changed the caller's repository" >&2
+    exit 1
+}
+
 # An unsuccessful or malformed ownership lookup never authorizes compilation.
 cat > "$scratch/git-control/git" <<'GIT'
 #!/usr/bin/env bash
@@ -189,4 +237,4 @@ for result in failure empty missing unrelated; do
     expect_refusal 'cannot establish Git ownership for repository script'
 done
 
-echo 'rust-script ownership: prepared, external, nested, and refusal controls passed'
+echo 'rust-script ownership: prepared, external, nested, inherited-location, and refusal controls passed'
