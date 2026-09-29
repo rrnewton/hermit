@@ -24,6 +24,36 @@ const DYNAMORIO_FILES: &[&str] = &[
     "ext/lib64/release/libdrwrap.so",
 ];
 
+/// Variables through which a caller names a repository. Git exports GIT_DIR to
+/// `git rebase --exec` steps, and GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE to
+/// hooks, so a release build started from either inherits them, and they
+/// override `git -C` (https://github.com/rrnewton/hermit/issues/3362).
+const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// A git command for a checkout this script names by path: the hermit source
+/// tree, its e9patch submodule, and the bundled SaBRe source. Each read must
+/// see that checkout and not an inherited one. Under an inherited GIT_DIR these
+/// commands answered for the caller's repository: `rev-parse HEAD` returned the
+/// caller's HEAD, so the pin checks failed, and `submodule update --init` ran
+/// against the caller's repository and failed. Configuration passed through
+/// GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS is kept.
+fn git() -> Command {
+    let mut command = Command::new("git");
+    for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn run(command: &mut Command, description: &str) {
     eprintln!("hermit-install: {description}: {command:?}");
     let status = command
@@ -75,7 +105,7 @@ fn ensure_submodule(
     let source = repository.join(relative);
     if !source.join(marker).is_file() {
         run(
-            Command::new("git").arg("-C").arg(repository).args([
+            git().arg("-C").arg(repository).args([
                 "-c",
                 &format!("submodule.{relative}.update=checkout"),
                 "submodule",
@@ -93,17 +123,14 @@ fn ensure_submodule(
     }
 
     let expected = output(
-        Command::new("git")
+        git()
             .arg("-C")
             .arg(repository)
             .args(["rev-parse", &format!(":{relative}")]),
         &format!("read the pinned {name} revision"),
     );
     let actual = output(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["rev-parse", "HEAD"]),
+        git().arg("-C").arg(&source).args(["rev-parse", "HEAD"]),
         &format!("read the checked-out {name} revision"),
     );
     assert_eq!(
@@ -119,10 +146,7 @@ fn stage_sabre(resources: &Path, expected_reverie_revision: &str) {
     // same Cargo dependency, including its verified source and build recipe.
     let source = reverie_sabre::bundled_sabre_source_dir();
     let revision = output(
-        Command::new("git")
-            .arg("-C")
-            .arg(source)
-            .args(["rev-parse", "HEAD"]),
+        git().arg("-C").arg(source).args(["rev-parse", "HEAD"]),
         "read the bundled SaBRe source's Reverie revision",
     );
     assert_eq!(
