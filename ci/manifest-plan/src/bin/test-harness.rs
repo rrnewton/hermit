@@ -4078,8 +4078,9 @@ sys.exit(1 if failed else 0)
         }
         // (18, 15) until slice S6 of https://github.com/rrnewton/hermit/issues/3301
         // folded e2e.manifest_backend_parity_c and its _on_host twin into the
-        // c-programs pair.
-        assert_eq!((pinned, direct), (17, 14));
+        // c-programs pair; +2 pinned and +1 direct for the privileged
+        // system-utils bucket that owns sysfs-sanitized-prefixes.
+        assert_eq!((pinned, direct), (19, 15));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -4134,9 +4135,10 @@ sys.exit(1 if failed else 0)
         }
         // 15 until e2e.manifest_backend_parity_c was folded into
         // e2e.manifest_c_programs (slice S6 of
-        // https://github.com/rrnewton/hermit/issues/3301); the 192 selected
-        // cells are still each reported once.
-        assert_eq!(nodes, 14);
+        // https://github.com/rrnewton/hermit/issues/3301); +1 for
+        // privileged-e2e.manifest_system_utils. The 192 selected cells are
+        // still each reported once.
+        assert_eq!(nodes, 15);
         let lines = reported.values().map(Vec::len).sum::<usize>();
         assert_eq!((selection.len(), lines), (192, 192));
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
