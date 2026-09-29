@@ -57,11 +57,20 @@ static unsigned char byte_read(int fd) {
   return value;
 }
 
-#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
+#ifdef NONLEADER_EXEC_PREEMPT
 /* PAUSE is a nonblocking spin hint: the thread stays runnable while retiring
- * branches less densely than a bare LOOP. Keep the same finite branch count
- * and expose the consumed loop counter to C. This also slows worker samples. */
-static uint64_t runnable_work(uint64_t iterations) {
+ * branches less densely than a bare LOOP. LOOP decrements RCX and
+ * conditionally branches in one instruction, and the read/write RCX constraint
+ * exposes the consumed loop counter to C, so the finite branch count is the
+ * same as a bare LOOP's.
+ *
+ * Hermit asks for each precise PMU timer interrupt a fixed number of branches
+ * (the skid margin) before its target and single-steps the rest of the way,
+ * one step per instruction. The interrupt lands some time late. A bare LOOP
+ * retires so many branches in that time that it overran a 1,000-RCB margin,
+ * which Hermit refuses with exit 122. With PAUSE the same timers land a few
+ * branches late. This also slows worker samples. */
+static uint64_t spin_work(uint64_t iterations) {
   CHECK(iterations != 0);
   uint64_t remaining = iterations;
   __asm__ volatile("1: pause\n loop 1b" : "+c"(remaining));
@@ -79,18 +88,9 @@ static uint64_t samples(const char *phase, int round, uint64_t previous) {
     /* The small-timeslice variants must execute enough actual branches for a
      * PMU timer, not merely yield when a syscall advances logical time. */
     /* A branch costs 10ns: 120k actual branches exceed the 100k-RCB timer at
-     * 1ms. Compact work bounds precise-timer single-step TRACE output. */
+     * 1ms. Two instructions per branch bound the single steps per timer. */
     uint64_t iterations = index == 0 ? 120000 : 2000 + index * 200;
-#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
-    work = runnable_work(iterations);
-#else
-    uint64_t remaining = iterations;
-    /* LOOP decrements RCX and conditionally branches in one instruction. The
-     * read/write RCX constraint makes the finite counter visible to C. */
-    __asm__ volatile("1: loop 1b" : "+c"(remaining));
-    CHECK(remaining == 0);
-    work += 3 * (iterations - remaining);
-#endif
+    work = spin_work(iterations);
 #else
     for (unsigned i = 0; i < 10000 + index * 1000; ++i) {
       if (i & 1)
@@ -174,7 +174,7 @@ static void start_round(void) {
   for (;;) {
     /* After the one release this leader executes no blocking calls. The
      * initial 120k branches force a timer before it releases the worker. */
-    (void)runnable_work(120000);
+    (void)spin_work(120000);
     if (!announced) {
       CHECK(pthread_mutex_lock(&mutex) == 0);
       leader_spinning = 1;

@@ -449,19 +449,25 @@ fn run_fixture(scenario: Scenario) {
             // change can reintroduce exit 122 at this timer.
             args.insert(8, "--skid-margin=512");
         } else if preempted {
-            // The PMU interrupt is requested this many RCBs before the exact
-            // target, and every RCB of the margin that skid does not use is one
-            // single step. Each execution takes six precise timers. At the old
-            // 3,072 RCBs they cost about 17,900 steps per execution, which put
-            // this case over its 22 CPU-second budget on a loaded host.
+            // Hermit requests each precise PMU timer interrupt this many RCBs
+            // before its target and single-steps the rest of the way, one step
+            // per instruction. A skid past the margin is refused with exit 122,
+            // never delivered late, and the exit status assertion below does
+            // not change. The value is explicit so the case costs the same on
+            // hosts whose default margin is 10,000 RCBs.
             //
-            // 1,000 RCBs is the product's calibrated default for EPYC 9D85
-            // (reverie `pmu.rs`, which cites a p99 skid of 384 RCBs). Across 72
-            // timers of this case at 3,072 RCBs on that host, the largest skid
-            // was 391 RCBs. The value is explicit so the case costs the same on
-            // hosts whose default margin is 10,000 RCBs. A skid past the margin
-            // is still refused with exit 122, never delivered late; the exit
-            // status assertion below does not change.
+            // Each execution takes six precise timers: four in the fixture's
+            // spin loops and two in the replacement image's dynamic loader, at
+            // targets 138,460 and 142,760. With bare LOOP spins at
+            // 3,072 RCBs the single steps took about 1.6 s of every execution,
+            // and the case used 14.8-18.8 CPU-seconds of its 22 on a loaded
+            // host. At 1,000 RCBs a bare LOOP skidded up to 4,666 RCBs and 4 of
+            // 8 loaded runs refused, all at spin-loop timers. The spins now
+            // PAUSE (`spin_work` in the fixture), and their timers skidded at
+            // most 13 RCBs across 36 executions. 1,000 RCBs is the product's
+            // calibrated default for EPYC 9D85 (reverie `pmu.rs`). The two
+            // loader timers skidded at most 573 and 159 RCBs across 138
+            // executions, and they take more than half of the single-step time.
             args.insert(8, "--skid-margin=1000");
         }
         let mut command = traced_hermit_command(&args);
