@@ -1515,6 +1515,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
+        // KVM validates the replacement image before refusing a worker's
+        // promotion to group leader. Diagnose that refusal only after normal
+        // failed-exec rollback, preserving errors such as ENOENT and ENOEXEC.
+        if self.cfg.backend_is_kvm && dettid != detpid && errno == Errno::ENOSYS {
+            tracing::error!(
+                "[detcore, dtid {dettid}] KVM nonleader exec is unsupported; \
+                 the replacement image did not run"
+            );
+            if !self.cfg.panic_on_unsupported_syscalls {
+                crate::tool_global::report_unsupported_syscall(guest, call.number()).await;
+            }
+            return self
+                .refuse_unserviceable_operation(guest, call.number(), errno)
+                .await;
+        }
+
         Err(errno.into())
     }
 
@@ -2596,7 +2612,217 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::os::fd::AsRawFd;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+    use reverie::Tool;
+
     use super::*;
+    use crate::config::Config;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalState;
+    use crate::types::MmId;
+
+    struct FailedExecStack;
+    struct FailedExecStackGuard;
+
+    impl Drop for FailedExecStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for FailedExecStack {
+        type StackGuard = FailedExecStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("failed exec must not use the guest stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("failed exec must not use the guest stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("failed exec must not use the guest stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("failed exec must not use the guest stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("failed exec must not use the guest stack")
+        }
+    }
+
+    // Inject only the backend's errno. Preparation, rollback, cancellation,
+    // unsupported reporting and the configured refusal policy are real code.
+    struct FailedExecGuest<'a> {
+        config: &'a Config,
+        global: &'a GlobalState,
+        thread: crate::ThreadState<()>,
+        sender: Tid,
+        process: Tid,
+        old_mm: MmId,
+        errno: Errno,
+        injections: usize,
+        requests: Mutex<Vec<GlobalRequest>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for FailedExecGuest<'_> {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            assert_eq!(message.1, self.old_mm, "RPC follows restored exec identity");
+            self.requests.lock().unwrap().push(message.2.clone());
+            self.global.receive_rpc(self.sender, message).await
+        }
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for FailedExecGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = FailedExecStack;
+
+        fn tid(&self) -> Tid {
+            self.sender
+        }
+        fn pid(&self) -> Tid {
+            self.process
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            panic!("failed exec rollback must not read guest memory")
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("failed exec rollback must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("failed exec rollback must not use a guest stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("failed exec rollback must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            assert_eq!(call.number(), syscalls::Sysno::execveat);
+            assert_eq!(
+                self.thread.mm_id,
+                self.old_mm.for_exec(self.thread.detpid.unwrap())
+            );
+            assert_eq!(self.thread.robust_list_head, None);
+            self.injections += 1;
+            Err(self.errno)
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("failed exec must not retire a live guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("failed exec rollback must not replace the timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("failed exec rollback must not replace the timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("failed exec rollback must not sample the clock")
+        }
+    }
+
+    #[tokio::test]
+    async fn kvm_nonleader_exec_refusal_preserves_failed_exec_rollback_and_policy() {
+        let process = DetPid::from_raw(17);
+        let worker = DetTid::from_raw(18);
+        for (backend_is_kvm, caller, errno, fail_closed, refused, reported) in [
+            (true, worker, Errno::ENOSYS, true, true, false),
+            (true, worker, Errno::ENOSYS, false, false, true),
+            (true, worker, Errno::ENOENT, true, false, false),
+            (true, worker, Errno::ENOEXEC, true, false, false),
+            (true, worker, Errno::EFAULT, true, false, false),
+            (true, worker, Errno::EACCES, true, false, false),
+            (true, worker, Errno::EOPNOTSUPP, true, false, false),
+            (true, process, Errno::ENOSYS, true, false, false),
+            (false, worker, Errno::ENOSYS, true, false, false),
+        ] {
+            let mut report = tempfile::tempfile().unwrap();
+            let config = Config {
+                backend_is_kvm,
+                sequentialize_threads: false,
+                panic_on_unsupported_syscalls: fail_closed,
+                exit_on_unsupported_syscall: true,
+                shutdown_on_unsupported_syscall: false,
+                unsupported_syscall_report_fd: Some(report.as_raw_fd()),
+                ..Config::default()
+            };
+            let global = GlobalState::init_global_state(&config).await;
+            let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+            let mut thread = crate::ThreadState::new(caller, &config, ());
+            thread.detpid = Some(process);
+            thread.mm_id = MmId::initial(process);
+            thread.record_robust_list_head(Some(0x12340));
+            thread.thread_logical_time.add_syscall_with_cost(123);
+            let old_time = thread.thread_logical_time.as_nanos();
+            let old_files = Arc::clone(&thread.file_metadata);
+            let old_memory = Arc::clone(&thread.memory_metadata);
+            let old_mm = thread.mm_id;
+            let mut guest = FailedExecGuest {
+                config: &config,
+                global: &global,
+                thread,
+                sender: Tid::from_raw(caller.as_raw()),
+                process: Tid::from_raw(process.as_raw()),
+                old_mm,
+                errno,
+                injections: 0,
+                requests: Mutex::new(Vec::new()),
+            };
+            let result = tool
+                .handle_execveat(&mut guest, syscalls::Execveat::new())
+                .await;
+            match result {
+                Err(Error::Tool(error)) if refused => assert_eq!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .unwrap()
+                        .0,
+                    syscalls::Sysno::execveat
+                ),
+                Err(Error::Errno(actual)) if !refused => assert_eq!(actual, errno),
+                result => panic!("wrong failed-exec policy: {result:?}"),
+            }
+            assert_eq!(guest.injections, 1, "backend preflight must run first");
+            assert_eq!(guest.thread.dettid, caller);
+            assert_eq!(guest.thread.detpid, Some(process));
+            assert_eq!(guest.thread.mm_id, old_mm);
+            assert_eq!(guest.thread.robust_list_head, Some(0x12340));
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), old_time);
+            assert!(Arc::ptr_eq(&guest.thread.file_metadata, &old_files));
+            assert!(Arc::ptr_eq(&guest.thread.memory_metadata, &old_memory));
+            let requests = guest.requests.lock().unwrap();
+            assert!(matches!(requests[0], GlobalRequest::PrepareExec(..)));
+            assert!(matches!(requests[1], GlobalRequest::CancelExec(..)));
+            assert_eq!(requests.len(), if reported { 3 } else { 2 });
+            if reported {
+                assert!(
+                    matches!(&requests[2], GlobalRequest::ReportUnsupportedSyscall(name) if name == "execveat")
+                );
+            }
+            report.rewind().unwrap();
+            let mut aggregate = String::new();
+            report.read_to_string(&mut aggregate).unwrap();
+            assert_eq!(aggregate, if reported { "execveat\n" } else { "" });
+        }
+    }
 
     #[test]
     fn kernel_blocked_mask_preserves_libc_signal_membership() {

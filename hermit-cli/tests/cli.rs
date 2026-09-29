@@ -18,6 +18,9 @@ mod kvm_cancellation;
 #[path = "common/kvm_itimer.rs"]
 mod kvm_itimer;
 
+#[path = "common/kvm_nonleader_exec.rs"]
+mod kvm_nonleader_exec;
+
 #[path = "common/kvm_orphan_reparenting.rs"]
 mod kvm_orphan_reparenting;
 
@@ -32,6 +35,9 @@ mod liteinst_runtime;
 
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
+
+#[path = "common/nonleader_exec.rs"]
+mod nonleader_exec;
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -5008,6 +5014,36 @@ fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
         "expected a determinism verdict from --verify:\n{}",
         stderr(&output),
     );
+}
+
+#[test]
+fn run_ptrace_nonleader_exec_preserves_identity_and_time() {
+    nonleader_exec::run();
+}
+
+#[test]
+fn run_ptrace_nonleader_exec_exit_only() {
+    nonleader_exec::run_exit_only();
+}
+
+#[test]
+fn run_ptrace_nonleader_exec_preserves_preemption() {
+    nonleader_exec::run_preempted();
+}
+
+#[test]
+fn run_ptrace_nonleader_exec_displaces_runnable_leader() {
+    nonleader_exec::run_runnable_leader();
+}
+
+#[test]
+fn run_ptrace_nonleader_exec_refuses_preemption_artifacts() {
+    nonleader_exec::run_preemption_artifacts();
+}
+
+#[test]
+fn run_kvm_nonleader_exec_is_policy_refusal() {
+    kvm_nonleader_exec::run();
 }
 
 /// `--log-file` must resolve on the HOST, exactly like a shell redirect.

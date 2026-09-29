@@ -1718,6 +1718,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // A nonleader exec preserves the survivor's state and PMU counter, but
+        // Linux changes its TID. Bind that state before any image callback RPC.
+        match tool_global::reconnect_exec(guest).await {
+            Err(Errno::EOPNOTSUPP) => {
+                let message = "unsupported: preemption recording and replay across nonleader exec";
+                error!("{message}");
+                // Report even when logging is disabled or redirected. The
+                // ordinary refusal helper preserves the policy exit class;
+                // reconnect already bound identity, so its diagnostic RPC is
+                // authenticated and cannot silently retire an unbound owner.
+                let _ = writeln!(crate::util::RetryingStderr, "{message}");
+                tool_global::unrecoverable_shutdown(
+                    guest,
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                )
+                .await;
+            }
+            result => result?,
+        }
         guest.thread_state_mut().past_global_first_execve = true;
         // Only a successful exec reaches this callback. Delete the old image's
         // POSIX timer IDs while exec still owns its scheduler turn; the global
@@ -2873,6 +2892,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
+        // Cancellation can consume the backend's transferred state before the
+        // successful-exec callback has rebound its logical identity.
+        let current = DetTid::from_raw(tid.as_raw());
+        let transferred_exec = current != dettid;
         debug!(
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",
             dettid
@@ -2917,7 +2940,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.detpid
             );
         }
-        if dettid == detpid {
+        // The transferred survivor is the final leader even if cancellation
+        // precedes local rebinding. Its snapshot includes the worker's tail;
+        // the earlier displaced-leader snapshot is only a prefix.
+        if current == detpid {
             thread_state.record_exited_child_process_cpu_time(detpid);
         } else {
             thread_state.account_process_cpu_time();
@@ -2931,13 +2957,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // counting that owner in the complete physical-exit barrier. Otherwise
         // the group's maximum could be charged to whichever callback finishes
         // last, followed by a backwards update from its real deregistration.
-        let exit_time_accounted = !thread_state.has_matching_robust_list_exit(exit_signal)
-            || acknowledge_robust_list_exit_time(
-                thread_state.thread_logical_time.clone(),
-                global_state,
-                mm_id,
-            )
-            .await;
+        // Exec preparation already cleared the old image's robust list. An
+        // unbound transfer must authenticate its consuming cleanup before any
+        // ordinary RPC can publish the survivor's clock under the leader TID.
+        let exit_time_accounted = !transferred_exec
+            && (!thread_state.has_matching_robust_list_exit(exit_signal)
+                || acknowledge_robust_list_exit_time(
+                    thread_state.thread_logical_time.clone(),
+                    global_state,
+                    mm_id,
+                )
+                .await);
         if !exit_time_accounted {
             // Preserve benign cleanup for a retired incarnation without
             // acknowledging an unaccounted owner or releasing its staged wakes.
@@ -2968,21 +2998,32 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
         }
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
-        deregister_thread(
-            thread_state.thread_logical_time.clone(),
-            &self.cfg,
-            global_state,
-            ThreadDeregistration {
-                dettid,
-                detpid,
-                mm: mm_id,
-                thread_start_entered: thread_state.thread_start_entered,
-                timeslice_stats: thread_state.stats.timeslice_stats,
-                syscall_count: thread_state.stats.syscall_count,
-                chaos_epochs: pending_chaos_epochs,
-            },
-        )
-        .await;
+        let deregistration = ThreadDeregistration {
+            dettid,
+            detpid,
+            mm: mm_id,
+            thread_start_entered: thread_state.thread_start_entered,
+            timeslice_stats: thread_state.stats.timeslice_stats,
+            syscall_count: thread_state.stats.syscall_count,
+            chaos_epochs: pending_chaos_epochs,
+        };
+        if transferred_exec {
+            tool_global::retire_exec(
+                thread_state.thread_logical_time.clone(),
+                global_state,
+                deregistration,
+                exit_status.signal().is_some(),
+            )
+            .await?;
+        } else {
+            deregister_thread(
+                thread_state.thread_logical_time.clone(),
+                &self.cfg,
+                global_state,
+                deregistration,
+            )
+            .await;
+        }
 
         self.record_or_replay
             .on_exit_thread(
