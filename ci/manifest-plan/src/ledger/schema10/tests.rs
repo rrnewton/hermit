@@ -817,7 +817,7 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(hosted_cells.len(), 855 - 242);
+    assert_eq!(hosted_cells.len(), 853 - 241);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -850,7 +850,7 @@ fn generated_plan_populations_preserve_command_policy() {
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            855,
+            853,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();

@@ -4070,7 +4070,7 @@ sys.exit(1 if failed else 0)
             );
             direct += 1;
         }
-        assert_eq!((pinned, direct), (18, 15));
+        assert_eq!((pinned, direct), (20, 16));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -4123,7 +4123,7 @@ sys.exit(1 if failed else 0)
                 explicitly.entry(cell).or_default().push(step.tag());
             }
         }
-        assert_eq!(nodes, 15);
+        assert_eq!(nodes, 16);
         let lines = reported.values().map(Vec::len).sum::<usize>();
         assert_eq!((selection.len(), lines), (192, 192));
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);

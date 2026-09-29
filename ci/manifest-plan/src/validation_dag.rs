@@ -226,8 +226,8 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 270,
-        selected_steps: 271,
+        direct_steps: 271,
+        selected_steps: 272,
     },
     Profile {
         label: "portable",
@@ -246,8 +246,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: "privileged",
-        direct_steps: 11,
-        selected_steps: 19,
+        direct_steps: 12,
+        selected_steps: 20,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -256,8 +256,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
-        direct_steps: 12,
-        selected_steps: 12,
+        direct_steps: 13,
+        selected_steps: 13,
     },
 ];
 
@@ -1336,9 +1336,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 106 {
+    if expected.len() != 109 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 106",
+            "structured result producer registry has {} entries, expected 109",
             expected.len()
         ));
     }
@@ -1473,7 +1473,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [67, 33, 2, 2, 2] {
+    if actual_group_counts != [67, 36, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1785,9 +1785,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1606 {
+    if cfg.steps.len() != 1609 {
         return Err(format!(
-            "superset has {} steps, expected 1606",
+            "superset has {} steps, expected 1609",
             cfg.steps.len()
         ));
     }
@@ -2141,6 +2141,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 "privileged-only-cpuid.faulting_on_host",
                 "privileged-only-e2e.manifest_applications_on_host",
                 "privileged-only-e2e.manifest_backend_parity_c_on_host",
+                "privileged-only-e2e.manifest_system_utils_on_host",
                 "privileged-only-pmu.preemption_on_host",
                 "privileged-only-test.cli_kvm_on_host",
                 "privileged-only-test.pmu_buck_chaos_cases_on_host",
@@ -2172,6 +2173,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 ("privileged-only-e2e.manifest_applications_on_host", 7200),
                 (
                     "privileged-only-e2e.manifest_backend_parity_c_on_host",
+                    7200,
+                ),
+                (
+                    "privileged-only-e2e.manifest_system_utils_on_host",
                     7200,
                 ),
                 ("privileged-only-test.cli_kvm_on_host", 7200),
