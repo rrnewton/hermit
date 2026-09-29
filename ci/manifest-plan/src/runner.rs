@@ -4002,14 +4002,15 @@ fn spawn_process(
         .stdout(stdout_file)
         .stderr(stderr_file);
     command.envs(identity.env_overrides.iter());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // The child leads its own process group so live CPU accounting and
+    // stop_process_group cover exactly its descendants. `process_group(0)`
+    // performs the same setpgid(0, 0) before exec, but unlike a `pre_exec`
+    // closure it keeps std on its posix_spawn path (CLONE_VM | CLONE_VFORK).
+    // A closure forces fork(), which write-locks and copies this process's
+    // page tables; in a multi-threaded caller that stalls every sibling
+    // thread's page faults, including a concurrent /proc scan, for the length
+    // of the copy (https://github.com/rrnewton/hermit/issues/3377).
+    command.process_group(0);
     match command.spawn() {
         Ok(child) => {
             observation.launch = LaunchObservation::Spawned { pid: child.id() };
@@ -7073,6 +7074,11 @@ mod tests {
 
     #[test]
     fn live_cpu_accounting_excludes_an_unrelated_process_group() {
+        if run_in_private_pid_namespace(
+            "runner::tests::live_cpu_accounting_excludes_an_unrelated_process_group",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-owned-cpu-accounting-{}",
             std::process::id()
@@ -7081,14 +7087,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut command = Command::new("/bin/sleep");
         command.arg("3");
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // Same group setup as spawn_process, without forcing fork() from the
+        // multi-threaded test process.
+        command.process_group(0);
         let child = command.spawn().unwrap();
         let pid = child.id();
         let reader = dagrun::proccpu::ProcessGroupCpu::new(pid).unwrap();
@@ -7134,6 +7135,157 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    const PRIVATE_PID_NAMESPACE_PARENT: &str = "HERMIT_TEST_PRIVATE_PID_NAMESPACE_PARENT";
+    const PRIVATE_PID_NAMESPACE_PARENT_SIGIGN: &str =
+        "HERMIT_TEST_PRIVATE_PID_NAMESPACE_PARENT_SIGIGN";
+
+    /// Runs the live-CPU test `case` in a private PID namespace, which is how
+    /// validate runs it: `test.regular_crates` runs this crate under nextest
+    /// inside the pinned-root container, and that container's /proc lists only
+    /// its own processes.
+    ///
+    /// Each live CPU sample (`dagrun::proccpu`) opens `/proc/<pid>/stat` for
+    /// every process that /proc lists, within a 1 s scan deadline. One missed
+    /// sample stops the cell. On a shared host, that census alone can exceed
+    /// the deadline: about 5,000 processes at roughly 130 us per open. A test
+    /// run there measures the host's process count instead of the accounting
+    /// it asserts (https://github.com/rrnewton/hermit/issues/3377). Inside the
+    /// namespace, the census holds only this test's own processes. The product
+    /// code, the deadline, and every assertion stay the same.
+    ///
+    /// In the parent test, this runs `case` alone in a child test process. It
+    /// requires that child to pass exactly one test, then returns true, and the
+    /// caller returns. It returns false when the caller should run the body
+    /// itself. That happens in the child, after checking that the child really
+    /// is in another PID namespace and restoring the parent's ignored-signal
+    /// set. It also happens on a host that cannot create a namespace; the
+    /// reason goes to stderr, and the test runs in the host namespace as it did
+    /// before.
+    fn run_in_private_pid_namespace(case: &str) -> bool {
+        static SUPPORT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        let namespace = pid_namespace_link();
+        if let Some(parent) = std::env::var_os(PRIVATE_PID_NAMESPACE_PARENT) {
+            assert_ne!(
+                namespace,
+                parent.to_string_lossy(),
+                "{case} must run in a PID namespace other than its parent's"
+            );
+            // `unshare --fork` ignores SIGINT and SIGTERM while it waits, and
+            // the namespace inherits that. Undo it, or stop_process_group's
+            // SIGTERM would not stop a cell here as it does outside.
+            let parent_ignored = u64::from_str_radix(
+                &std::env::var(PRIVATE_PID_NAMESPACE_PARENT_SIGIGN).unwrap(),
+                16,
+            )
+            .unwrap();
+            let inherited = ignored_signals() & !parent_ignored;
+            for signal in 1..=64 {
+                if inherited & (1 << (signal - 1)) != 0 {
+                    assert_ne!(
+                        unsafe { libc::signal(signal, libc::SIG_DFL) },
+                        libc::SIG_ERR,
+                        "cannot restore signal {signal}"
+                    );
+                }
+            }
+            assert_eq!(ignored_signals() & !parent_ignored, 0);
+            return false;
+        }
+        let support = SUPPORT.get_or_init(|| {
+            match private_pid_namespace_command().arg("/bin/true").output() {
+                Ok(output) if output.status.success() => Ok(()),
+                Ok(output) => Err(format!(
+                    "{}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => Err(error.to_string()),
+            }
+        });
+        if let Err(reason) = support {
+            eprintln!("{case}: running in the host PID namespace; unshare failed: {reason}");
+            return false;
+        }
+        // Several tests name their roots after their own PID, which is small
+        // and repeated inside a namespace. A per-child TMPDIR keeps those
+        // roots apart from every other run on the host. Keep it short: one
+        // test binds a Unix socket below it, and sun_path holds 108 bytes.
+        let tmpdir = short_unique_temp_dir("hermit-pidns-");
+        let output = private_pid_namespace_command()
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(PRIVATE_PID_NAMESPACE_PARENT, &namespace)
+            .env(
+                PRIVATE_PID_NAMESPACE_PARENT_SIGIGN,
+                format!("{:x}", ignored_signals()),
+            )
+            .env("TMPDIR", &tmpdir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{case} did not pass as the only test in its PID namespace ({}); its files are in {}",
+            output.status,
+            tmpdir.display()
+        );
+        fs::remove_dir_all(tmpdir).unwrap();
+        true
+    }
+
+    fn short_unique_temp_dir(prefix: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        let template = std::env::temp_dir().join(format!("{prefix}XXXXXX"));
+        let mut template = std::ffi::CString::new(template.into_os_string().into_vec())
+            .unwrap()
+            .into_bytes_with_nul();
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(
+            !made.is_null(),
+            "mkdtemp: {}",
+            std::io::Error::last_os_error()
+        );
+        template.pop();
+        PathBuf::from(std::ffi::OsString::from_vec(template))
+    }
+
+    fn ignored_signals() -> u64 {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .unwrap();
+        u64::from_str_radix(mask.trim(), 16).unwrap()
+    }
+
+    fn pid_namespace_link() -> String {
+        fs::read_link("/proc/self/ns/pid")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// `unshare` with a fresh /proc for the new namespace. The shell stays PID
+    /// 1 and reaps reparented orphans, as init does outside the namespace, and
+    /// `--kill-child` ends the namespace if `unshare` itself is killed.
+    fn private_pid_namespace_command() -> Command {
+        let mut command = Command::new("unshare");
+        command.args([
+            "--map-current-user",
+            "--pid",
+            "--fork",
+            "--kill-child",
+            "--mount-proc",
+            "/bin/sh",
+            "-c",
+            "\"$0\" \"$@\"; status=$?; exit $status",
+        ]);
+        command
     }
 
     fn spawn_cpu_reader_fixture(
@@ -7282,6 +7434,11 @@ mod tests {
 
     #[test]
     fn owned_cpu_reader_lives_until_each_invocation_is_reaped() {
+        if run_in_private_pid_namespace(
+            "runner::tests::owned_cpu_reader_lives_until_each_invocation_is_reaped",
+        ) {
+            return;
+        }
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -7507,6 +7664,11 @@ mod tests {
 
     #[test]
     fn a_valid_cpu_sample_resets_the_unavailable_grace() {
+        if run_in_private_pid_namespace(
+            "runner::tests::a_valid_cpu_sample_resets_the_unavailable_grace",
+        ) {
+            return;
+        }
         let root = cpu_reader_test_root("reader-grace-reset");
         let done = root.join("done");
         let (child, started, mut observation) = spawn_cpu_reader_fixture(
@@ -7761,6 +7923,11 @@ mod tests {
 
     #[test]
     fn native_zombie_then_reaped_child_has_no_double_cpu_charge() {
+        if run_in_private_pid_namespace(
+            "runner::tests::native_zombie_then_reaped_child_has_no_double_cpu_charge",
+        ) {
+            return;
+        }
         use std::io::Read;
         use std::os::unix::net::UnixListener;
 
@@ -7972,6 +8139,9 @@ int main(int argc, char **argv) {
 
     #[test]
     fn cpu_burner_is_stopped_by_the_cpu_budget() {
+        if run_in_private_pid_namespace("runner::tests::cpu_burner_is_stopped_by_the_cpu_budget") {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-live-cpu-budget-{}",
             std::process::id()
@@ -8065,6 +8235,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn sleeping_process_is_stopped_by_the_wall_backstop() {
+        if run_in_private_pid_namespace(
+            "runner::tests::sleeping_process_is_stopped_by_the_wall_backstop",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-live-wall-budget-{}",
             std::process::id()
@@ -8096,13 +8271,21 @@ int main(int argc, char **argv) {
         );
         let observation = &observations[0];
         assert_eq!(observation.termination, TerminationPath::WallBudgetStop);
+        let raw_status = match observation.final_wait {
+            FinalWaitObservation::Reaped { raw_status, .. } => raw_status,
+            _ => panic!("missing reap"),
+        };
+        // The backstop must stop the sleeper, not outlast it. If the stop
+        // signal is ignored, `sleep 5` exits 0 within the stop grace period
+        // and every assertion above still holds.
+        assert!(
+            ExitStatus::from_raw(raw_status).signal().is_some(),
+            "the wall backstop did not stop the sleeper: raw wait status {raw_status:#x}"
+        );
         assert_process_observation(
             observation,
             &ProcessOutput {
-                status: ExitStatus::from_raw(match observation.final_wait {
-                    FinalWaitObservation::Reaped { raw_status, .. } => raw_status,
-                    _ => panic!("missing reap"),
-                }),
+                status: ExitStatus::from_raw(raw_status),
                 timeout: Some(ProcessTimeout::Wall),
                 cpu_usage_usec: attempt.cpu_usage_usec.unwrap(),
             },
@@ -8112,6 +8295,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn descheduled_process_may_exceed_the_old_wall_bound_and_pass() {
+        if run_in_private_pid_namespace(
+            "runner::tests::descheduled_process_may_exceed_the_old_wall_bound_and_pass",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-descheduled-process-{}",
             std::process::id()
@@ -8137,6 +8325,9 @@ int main(int argc, char **argv) {
 
     #[test]
     fn live_cpu_budget_counts_descendant_work() {
+        if run_in_private_pid_namespace("runner::tests::live_cpu_budget_counts_descendant_work") {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-descendant-cpu-budget-{}",
             std::process::id()
@@ -8157,6 +8348,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn repeated_processes_share_one_aggregate_cpu_budget() {
+        if run_in_private_pid_namespace(
+            "runner::tests::repeated_processes_share_one_aggregate_cpu_budget",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-aggregate-cpu-budget-{}",
             std::process::id()
@@ -8199,6 +8395,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn ptrace_golden_normalization_is_bounded_and_accounts_a_timeout() {
+        if run_in_private_pid_namespace(
+            "runner::tests::ptrace_golden_normalization_is_bounded_and_accounts_a_timeout",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-normalization-budget-{}",
             std::process::id()
@@ -8227,7 +8428,9 @@ int main(int argc, char **argv) {
         let error = normalized
             .result
             .expect_err("normalization must obey the shared CPU budget");
-        assert!(error.contains("CPU"), "{error}");
+        // The wall-backstop reason also names the CPU budget, so match the
+        // CPU-timeout reason itself.
+        assert!(error.contains("cell exceeded 1 CPU s"), "{error}");
         assert!(
             normalized
                 .cpu_usage_usec
@@ -8240,6 +8443,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn sleeping_repeated_invocations_do_not_consume_the_cpu_budget() {
+        if run_in_private_pid_namespace(
+            "runner::tests::sleeping_repeated_invocations_do_not_consume_the_cpu_budget",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-cell-deadline-{}",
             std::process::id()
@@ -12546,6 +12754,11 @@ cp "{}" "$verdict"
 
     #[test]
     fn preparation_does_not_consume_the_guest_execution_budget() {
+        if run_in_private_pid_namespace(
+            "runner::tests::preparation_does_not_consume_the_guest_execution_budget",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-separate-preparation-budget-{}",
             std::process::id()
