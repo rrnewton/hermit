@@ -4894,10 +4894,9 @@ impl RunOpts {
         let comparison_options = self.verification_comparison_options();
         let success_message = if !comparison_options.compare_io_buffers {
             // The "Determinism verified" marker is RETAINED verbatim and the
-            // qualification appended after it. That is not politeness: ~110
-            // files in this repository assert on that exact substring -- Rust
-            // integration tests, tests/e2e/lib/**/*.sh, and the backend-parity
-            // Python harnesses -- so replacing the sentence would be a
+            // qualification appended after it. That is not politeness: ~95
+            // Rust integration-test files under hermit-cli/tests assert on
+            // that exact substring, so replacing the sentence would be a
             // project-wide contract change rather than a wording fix. Appending
             // keeps every consumer working while the reader still learns the
             // limit.
