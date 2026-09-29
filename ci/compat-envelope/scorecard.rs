@@ -25972,7 +25972,34 @@ mod catalogue_ledger_tests {
             );
         }
         drop(stdout_writer);
-        assert!(snapshot_pipe_diagnostic(&stdout).contains("retained=0; end=EOF"));
+        // Closing our descriptor is not yet EOF. Every other test in this
+        // process that spawns a child forks first, and until that child execs
+        // it holds a copy of this writer; O_CLOEXEC closes the copy only at the
+        // exec. Wait until the kernel reports that no writer remains, then
+        // require the diagnostic to report EOF. The diagnostic itself still
+        // never waits, and the open-writer cases above and below are unchanged.
+        let mut hangup = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd; `stdout` keeps its descriptor open.
+        let ready = unsafe { libc::poll(&mut hangup, 1, 60_000) };
+        assert_eq!(
+            ready,
+            1,
+            "waiting for the last stdout writer to close: poll returned {ready} ({}); \
+             0 means a writer was still open after 60 s",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            hangup.revents & libc::POLLHUP,
+            0,
+            "poll reported revents {:#x} without POLLHUP",
+            hangup.revents
+        );
+        let closed = snapshot_pipe_diagnostic(&stdout);
+        assert!(closed.contains("retained=0; end=EOF"), "{closed}");
 
         // A full prefix must be labelled capped even if no further byte is
         // currently queued. The still-open writer cannot force a wait for EOF.
