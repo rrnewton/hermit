@@ -28,6 +28,7 @@ mod threads;
 /// it commits a wake for a parked precise-mode futex waiter.
 #[cfg(test)]
 pub(crate) use threads::KernelSignalState;
+pub(crate) use threads::complete_skipped_syscall_restart;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) mod time;
 
