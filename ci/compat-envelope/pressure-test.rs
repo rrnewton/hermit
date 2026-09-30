@@ -17261,6 +17261,198 @@ mod pressure_sample_tests {
         );
     }
 
+    /// system-utils/sh-exit-status exits 23 on purpose, and the manifest
+    /// declares that exit for its verify cells. Ten retained PASS repetitions
+    /// of its dbt verify cell, each written as the runner writes a declared
+    /// cell, go through the real summarize(). Every repetition qualifies when
+    /// the matched report and Hermit both end with code 23, and none does when
+    /// Hermit exits 24. The rows are built only from fixtures that predate the
+    /// declared-exit rule, so this test also runs unchanged on a tree without
+    /// that rule, where its first case fails.
+    #[test]
+    fn summary_qualifies_sh_exit_status_dbt_verify_only_for_the_declared_exit_23() {
+        let root = checkout_root();
+        let checked = check_scorecard(&root).unwrap();
+        let manifests = ManifestSet::load(&root).unwrap();
+        let declaration = manifests
+            .all_tests()
+            .find(|(.., test)| test.id == "system-utils/sh-exit-status")
+            .and_then(|(.., test)| test.modes.get("verify"))
+            .and_then(|verify| verify.expected_guest_exit.clone())
+            .expect("the manifest declares the exit of sh-exit-status's verify cells");
+        assert_eq!((declaration.code, declaration.signal), (Some(23), None));
+        let available = pressure_cells(
+            &root,
+            &CellSelection {
+                green: true,
+                repetitions: Some(PROMOTION_REPETITIONS),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap();
+        let cell = available
+            .selected
+            .iter()
+            .find(|cell| {
+                cell.id.test == "system-utils/sh-exit-status"
+                    && cell.id.mode == "verify"
+                    && cell.id.backend == "dbt"
+            })
+            .expect("the green population selects system-utils/sh-exit-status verify dbt");
+
+        // Retain ten repetitions whose matched report records guest exit code
+        // `report` and whose Hermit process exited `hermit`, then summarize.
+        let summarize_repetitions = |label: &str, report: i32, hermit: i32| {
+            let results = env::temp_dir().join(format!(
+                "hermit-pressure-summary-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&results).unwrap();
+            let cleanup = SelfTestDirectory::new(results.clone());
+            let selection = CellSelection {
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: Some(cell.id.backend.clone()),
+                repetitions: Some(PROMOTION_REPETITIONS),
+                run_id_prefix: Some(label.to_owned()),
+                run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                green: true,
+                ..CellSelection::default()
+            };
+            let (mut metadata, _) = write_plan_after_scorecard_check(
+                &checked,
+                &results,
+                &results.join("dag.json"),
+                &selection,
+            )
+            .unwrap();
+            metadata.source_tree_dirty = false;
+            fs::write(
+                results.join("run.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            // The runner runs a declared verify cell under
+            // --verify-allow=failure and copies the manifest's declaration
+            // into each row.
+            let mut inner = comparison_attempt("verify", report);
+            inner.status = Some(hermit);
+            inner.argv.push("--verify-allow=failure".into());
+            inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+            let mut evidence = BTreeMap::new();
+            for repetition in 1..=PROMOTION_REPETITIONS {
+                let slug = cell_run_slug(&cell.id, Some(repetition));
+                let run_id = cell_evidence_run_id(
+                    &cell.id,
+                    Some(repetition),
+                    metadata.run_id_prefix.as_deref(),
+                );
+                let cell_dir = results.join("cells").join(&slug);
+                fs::create_dir_all(&cell_dir).unwrap();
+                fs::write(cell_dir.join("harness-status"), "0\n").unwrap();
+                let artifact = results.join("runs").join(&run_id).join("attempt-1");
+                let logs = artifact.join("verify-logs/verify-1");
+                fs::create_dir_all(&logs).unwrap();
+                fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
+                fs::write(logs.join("run2_log_fixture.log"), "INFO second\n").unwrap();
+                fs::write(
+                    verification_report_path(&artifact),
+                    inner.verification_report.as_ref().unwrap(),
+                )
+                .unwrap();
+                let mut row = history_row(&cell.id.mode, "PASS", 1, vec![inner.clone()]);
+                row.run_id = run_id;
+                row.run_index = Some(repetition as u64);
+                row.hermit_sha = metadata.hermit_sha.clone();
+                row.test = cell.id.test.clone();
+                row.category = cell.id.category.clone();
+                row.lane = cell.id.lane.clone();
+                row.backend = Some(cell.id.backend.clone());
+                row.classification = "required".into();
+                row.argv = inner.argv.clone();
+                row.guest_argv = inner.guest_argv.clone();
+                row.env = inner.env.clone();
+                row.cwd = inner.cwd.clone();
+                row.shell_command = inner.shell_command.clone();
+                row.expected_guest_exit = Some(declaration.clone());
+                row.timeout_seconds = 57;
+                row.execution_cpu_timeout_seconds = Some(22);
+                row.execution_wall_timeout_seconds = Some(57);
+                row.artifact_dir = artifact.to_string_lossy().into_owned();
+                fs::write(
+                    cell_dir.join("results.jsonl"),
+                    format!("{}\n", serde_json::to_string(&row).unwrap()),
+                )
+                .unwrap();
+                evidence.insert(
+                    format!("cell.{slug}"),
+                    RunnerEvidence {
+                        seen: true,
+                        ok: true,
+                        ..RunnerEvidence::default()
+                    },
+                );
+            }
+            let outcome = summarize(&root, &results, false, Some(&evidence), true);
+            let summary: JsonValue =
+                serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap();
+            cleanup.remove().unwrap();
+            (outcome, summary)
+        };
+
+        // The report and Hermit both end with the declared code 23.
+        let (outcome, summary) = summarize_repetitions("sh-exit-status-23", 23, 23);
+        let repeated = &summary["repeated_cells"][0];
+        assert_eq!(
+            repeated["cell"]["test"], "system-utils/sh-exit-status",
+            "{summary}"
+        );
+        assert_eq!(repeated["cell"]["backend"], "dbt", "{summary}");
+        assert_eq!(repeated["passes"], PROMOTION_REPETITIONS, "{summary}");
+        assert_eq!(
+            repeated["qualifying_passes"], PROMOTION_REPETITIONS,
+            "{summary}"
+        );
+        assert_eq!(repeated["unknown_history_repetitions"], 0, "{summary}");
+        outcome.unwrap();
+
+        // Hermit exits 24: once under a report that records the declared 23,
+        // and once under a report that records 24 too. summarize() credits no
+        // PASS in either case, since Hermit's status does not match the row's
+        // declaration, and pressure refuses the history of every repetition.
+        for (label, report, refusal) in [
+            (
+                "sh-exit-status-hermit-24",
+                23,
+                "pressure_evidence matched report contradicts its inner process disposition",
+            ),
+            (
+                "sh-exit-status-report-and-hermit-24",
+                24,
+                "inner matched report's guest disposition differs from the declared expected exit",
+            ),
+        ] {
+            let (_, summary) = summarize_repetitions(label, report, 24);
+            let repeated = &summary["repeated_cells"][0];
+            assert_eq!(
+                repeated["cell"]["test"], "system-utils/sh-exit-status",
+                "{label}: {summary}"
+            );
+            assert_eq!(repeated["cell"]["backend"], "dbt", "{label}: {summary}");
+            assert_eq!(repeated["passes"], 0, "{label}: {summary}");
+            assert_eq!(repeated["qualifying_passes"], 0, "{label}: {summary}");
+            assert_eq!(
+                repeated["unknown_history_repetitions"], PROMOTION_REPETITIONS,
+                "{label}: {summary}"
+            );
+            assert!(summary.to_string().contains(refusal), "{label}: {summary}");
+        }
+    }
+
     #[test]
     fn host_prerequisite_requires_exact_cell_and_complete_nonproduct_counts() {
         let path = env::temp_dir().join(format!(
