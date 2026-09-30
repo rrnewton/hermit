@@ -391,7 +391,8 @@ fn test_harness_refuses_the_removed_parity_reference_flag() {
 /// cannot turn into a vacuous pass.
 #[test]
 fn test_harness_selftest_refuses_anything_but_one_known_name() {
-    const NAMES: &str = "scorecard, pressure_test, validate_rs, manifest_cli, dbt_budget";
+    const NAMES: &str =
+        "scorecard, scorecard_commands, pressure_test, validate_rs, manifest_cli, dbt_budget";
     let harness = env!("CARGO_BIN_EXE_test-harness");
     let directory = non_repository_dir("selftest-refusals");
     for (arguments, refusal) in [
@@ -416,6 +417,41 @@ fn test_harness_selftest_refuses_anything_but_one_known_name() {
             refusal,
             "{arguments:?}"
         );
+    }
+    std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
+}
+
+/// selftest.scorecard runs the `hermit-manifest-plan` binary built beside
+/// test-harness instead of building one with Cargo inside its CPU cap. When
+/// that binary is missing, or is not a file, the self-test is refused before
+/// the scorecard starts, rather than falling back to a Cargo build.
+#[test]
+fn test_harness_selftest_scorecard_refuses_a_missing_helper() {
+    const REFUSAL: &str = "test-harness: self-test scorecard needs the hermit-manifest-plan \
+         binary built beside test-harness; build both with \
+         `cargo build -p hermit-manifest-plan --bins`\n";
+    let directory = non_repository_dir("selftest-missing-helper");
+    // A copy, not a symlink: the helper is looked up beside the resolved
+    // executable, and a symlink resolves to the build directory.
+    let harness = directory.join("test-harness");
+    let built = env!("CARGO_BIN_EXE_test-harness");
+    std::fs::hard_link(built, &harness)
+        .or_else(|_| std::fs::copy(built, &harness).map(|_| ()))
+        .expect("place test-harness without its helper");
+    let harness = harness.to_str().expect("UTF-8 temporary path");
+    for helper_is_a_directory in [false, true] {
+        if helper_is_a_directory {
+            std::fs::create_dir(directory.join("hermit-manifest-plan"))
+                .expect("create a directory in the helper's place");
+        }
+        let output = run_from(harness, &["selftest", "scorecard"], Some(&directory));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "helper is a directory: {helper_is_a_directory}: {output:?}"
+        );
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), REFUSAL);
     }
     std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
 }

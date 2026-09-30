@@ -34,6 +34,7 @@
     "check.script_sigpipe",
     "lint.rustfmt",
     "selftest.scorecard",
+    "selftest.scorecard_commands",
     "selftest.pressure_test",
     "selftest.validate_rs",
     "selftest.manifest_cli",

@@ -8100,7 +8100,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "712",
+        "NEXTEST_EXPECTED_EXECUTED": "721",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -20822,14 +20822,49 @@
     {
       "group": "selftest",
       "job": "scorecard",
-      "desc": "Compatibility scorecard self-test and tracked-output check",
-      "description": "TOOL SELF-TEST NODE 2026-09-29: this self-test used to run inside gate.manifest, which every product node waits on; the local validation of Hermit 98a621f42935d585e1306262b11d64488dd51614 was killed there by the gate's 900-second CPU cap. It now runs as this leaf node through `test-harness selftest scorecard`: a failure still makes the validation red, and no node depends on it. It keeps the gate's admitted two-core width (preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, no appended -j). Measurements below were taken 2026-09-29 between 20:39Z and 21:05Z on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\") at Hermit 98a621f4 plus this change, at load average 215-233, with the telemetry git wrapper first on PATH and the other self-tests running at the same time; they are the worst samples available, not typical ones. `ci/compat-envelope/scorecard.rs self-test-and-check` took 1183.84 s wall and 914.53 CPU seconds (254.81 user, 659.72 system). The user CPU matches the 254.6-256.6 seconds recorded at 81ca8822, b280bc48 and 1bd45c15; the growth is system CPU spent creating processes (the gate.manifest description records 3182 git commands per scorecard run and 51-85 ms of wrapper CPU per call). Across 39 retained gate logs this audit's wall peaked at 608.7 s with a mean of 288.3 s. The 1800-second wall is 1.52 times the largest measured 1183.84 s; the 1500 CPU seconds are 1.64 times the largest measured 914.53. Memory keeps the 5-GiB bound that previously held all seven audits together in the gate. KNOWN WALL RISK, NOT MEASURED: the self-test runs `cargo build` and `cargo run -p hermit-manifest-plan` against the checkout's target directory (and forces CARGO_TARGET_DIR=<checkout>/target for its result commands), so it now waits on Cargo's build-directory lock whenever a concurrent product build such as build.workspace, setup.nextest, lint.clippy or doc.* holds it. The wait costs wall time, not CPU; the 1800-second wall has not been measured against that contention.",
+      "desc": "Compatibility scorecard regression-tier self-test and tracked-output check",
+      "description": "TOOL SELF-TEST NODE, REGRESSION TIER 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): runs `ci/compat-envelope/scorecard.rs self-test-and-check` through `test-harness selftest scorecard`, which is the scorecard's in-process brackets followed by the tracked-output check. The brackets create no scratch Git repository, run none of the scorecard's own commands and read no ledger; they read only this checkout's commits and the checked-in fixture under ci/compat-envelope/testdata/series-snapshot, with 57 git commands per run (the undivided self-test ran 3182). The brackets that do build scratch repositories (the command-line, retained-history and series-worktree brackets) run in selftest.scorecard_commands. This node is a leaf: a failure makes the validation red and no node depends on it. It keeps the gate's admitted two-core width (preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, no appended -j). NO CARGO: the tracked-output check derives the manifest-plan rows with the `hermit-manifest-plan` binary that setup.manifest_plan built beside test-harness; test-harness passes it through HERMIT_MANIFEST_PLAN_BIN (ToolSelfTest.manifest_plan_helper), and the hosted checks job unpacks both from one tarball. So this node runs no Cargo command: with a `cargo` first on PATH that fails when called and an empty CARGO_TARGET_DIR, it passed three times and `cargo` was never called. Before this it ran `cargo build -p hermit-manifest-plan`. The hosted tarball carries no Cargo fingerprints, so that build was cold there: 48.30 s wall and 89.53 CPU seconds at two jobs and load average 93, six times this node's CPU cap. Locally it waited on Cargo's target/debug lock while a concurrent debug build held it (in the full local validation of Hermit 84da7b816939, build.workspace held it from 379.0 to 997.9 seconds after the start, and the undivided selftest.scorecard started at 383.0 seconds). If the helper beside test-harness is missing, test-harness fails the node instead of building one. The Cargo-built path is still exercised by selftest.scorecard_commands and by the scorecard.compatibility nodes. Measured 2026-09-29 on the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\", at Hermit 1017bd88 plus this change, with the prepared release scorecard binary: the node's command took 2.58-2.78 s wall and 2.56-2.77 CPU seconds over three runs at load average 81-84. Earlier samples with the telemetry git wrapper first on PATH: `self-test` alone took 1.95-6.90 s wall and 1.95-3.82 CPU seconds over sixteen runs at load average 57-163, and 8.40 and 13.32 s wall with 2.59 and 2.74 CPU seconds while a workspace `cargo doc` ran beside it; the wall varies with the host, the CPU does not. Before the split the undivided command took 1183.84 s wall and 914.53 CPU seconds at load average 215-233. CAPS: 15 CPU seconds is 1.5 times the 10-second goal of https://github.com/rrnewton/hermit/issues/3381, and 3.9 times the largest CPU sample (3.82 s); the telemetry git wrapper's system CPU varies with host state (the gate recorded 32 to 374 system seconds for unchanged work, 2026-09-22 to 2026-09-28). The wall cap is 120 seconds: up to 30 seconds waiting for the scorecard write lock, which the check takes, plus 90 seconds, 6.8 times the largest wall sample (13.32 s), because the wall of the same work varied 6.8-fold with host load. Memory keeps the 5-GiB bound the seven audits shared in the gate.",
       "labels": [
         "full",
         "hosted-portable",
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest scorecard",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 120,
+      "cpu_timeout": 15,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 0.0,
+        "rss_baseline_bytes": 5368709120,
+        "hard_mem_max_bytes": 5368709120,
+        "classification": "light",
+        "preferred_inner_jobs": 2,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "selftest.scorecard"
+    },
+    {
+      "group": "selftest",
+      "job": "scorecard_commands",
+      "desc": "Compatibility scorecard commands-tier self-test, when its paths change",
+      "description": "TOOL SELF-TEST NODE, COMMANDS TIER 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): runs `ci/compat-envelope/scorecard.rs self-test-commands` through `test-harness selftest scorecard_commands`: the regression-tier brackets of selftest.scorecard again, then the brackets that run the scorecard's own commands against a scratch clone of this checkout, a scratch ledger repository and a scratch reverie repository (the command-line, retained-history and series-worktree brackets, including the empty-result command, the replacement-ref guard, the dirty-worktree refusal and the missing-tree refusal). It needs the pinned ledger corpus through DEV_HERMIT_TEST_LEDGER_ROOT. WHEN IT RUNS: test-harness decides before starting it (ci/manifest-plan/src/self_test_selection.rs). It runs when any path changed since the merge base with origin/main, committed or not, is under one of its known inputs (SCORECARD_INPUTS in ci/manifest-plan/src/validation_dag.rs: the directories ci/compat-envelope/, ci/manifest-plan/, detcore-model/, ci/rust-script-bin/ and tests/e2e/manifests/, and the paths agent-utils (a submodule, whose commit moving counts), .gitmodules, Cargo.toml, Cargo.lock, rust-toolchain.toml, scripts/lib/rust_script_prelude.rs, ci/prepare-rust-scripts.sh, ci/prepare-scorecard-self-test-corpus.sh and ci/expected-e2e-plan.json; a deleted or renamed path counts under its old and its new name); it always runs when HEAD is contained in main (refs/heads/main or any refs/remotes/*/main); it also runs when the change set cannot be resolved (a shallow clone, no origin/main, an empty change set, any git failure) and when HERMIT_SELFTEST_SELECTION=all. Otherwise it prints one line containing \"NOT RUN by file selection:\" that names the merge base and the changed paths, and passes; that line is the node's summary. This node is a leaf: a failure makes the validation red and no node depends on it. It keeps the gate's admitted two-core width. Measured 2026-09-29 on the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\", at Hermit 84da7b81 plus this change, load average 158 falling to 89, with the prepared release scorecard binary: 480.80 s wall and 459.65 CPU seconds (220.42 user, 239.23 system). Earlier the same brackets, inside the undivided self-test, took 1183.84 s wall and 914.53 CPU seconds at load average 215-233 with the telemetry git wrapper first on PATH; that is the largest sample, and the 1800-second wall and 1500 CPU seconds are 1.52 and 1.64 times it. The cost is process creation (system CPU) for the scratch repositories' git commands; removing those repositories is the remaining step recorded in https://github.com/rrnewton/hermit/issues/3381. It does not take the prepared helper that selftest.scorecard uses: it refuses HERMIT_MANIFEST_PLAN_BIN, because its command-line brackets check the helper that Cargo builds in the shared target directory. KNOWN WALL RISK, NOT MEASURED: it runs `cargo build` and `cargo run -p hermit-manifest-plan` against the checkout's target directory, and forces CARGO_TARGET_DIR=<checkout>/target for its result commands, so it waits on Cargo's build-directory lock while a concurrent product build holds it. In the full local validation of Hermit 84da7b816939, build.workspace held that directory for 618.8 seconds (379.0 to 997.9 s after the start); that window plus the 480.80-second sample is 1099.6 seconds, inside the 1800-second wall. Memory keeps the 5-GiB bound the seven audits shared in the gate.",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest scorecard_commands",
       "result_manifests": [],
       "deps": [
         "gate.manifest",
@@ -20852,7 +20887,7 @@
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
-      "fail_fast_family": "selftest.scorecard"
+      "fail_fast_family": "selftest.scorecard_commands"
     },
     {
       "group": "selftest",
@@ -61547,7 +61582,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "712",
+        "NEXTEST_EXPECTED_EXECUTED": "721",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -69241,13 +69276,47 @@
     {
       "group": "quick-super-selftest",
       "job": "scorecard",
-      "desc": "Compatibility scorecard self-test and tracked-output check",
-      "description": "TOOL SELF-TEST NODE 2026-09-29: this self-test used to run inside gate.manifest, which every product node waits on; the local validation of Hermit 98a621f42935d585e1306262b11d64488dd51614 was killed there by the gate's 900-second CPU cap. It now runs as this leaf node through `test-harness selftest scorecard`: a failure still makes the validation red, and no node depends on it. It keeps the gate's admitted two-core width (preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, no appended -j). Measurements below were taken 2026-09-29 between 20:39Z and 21:05Z on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\") at Hermit 98a621f4 plus this change, at load average 215-233, with the telemetry git wrapper first on PATH and the other self-tests running at the same time; they are the worst samples available, not typical ones. `ci/compat-envelope/scorecard.rs self-test-and-check` took 1183.84 s wall and 914.53 CPU seconds (254.81 user, 659.72 system). The user CPU matches the 254.6-256.6 seconds recorded at 81ca8822, b280bc48 and 1bd45c15; the growth is system CPU spent creating processes (the gate.manifest description records 3182 git commands per scorecard run and 51-85 ms of wrapper CPU per call). Across 39 retained gate logs this audit's wall peaked at 608.7 s with a mean of 288.3 s. The 1800-second wall is 1.52 times the largest measured 1183.84 s; the 1500 CPU seconds are 1.64 times the largest measured 914.53. Memory keeps the 5-GiB bound that previously held all seven audits together in the gate. KNOWN WALL RISK, NOT MEASURED: the self-test runs `cargo build` and `cargo run -p hermit-manifest-plan` against the checkout's target directory (and forces CARGO_TARGET_DIR=<checkout>/target for its result commands), so it now waits on Cargo's build-directory lock whenever a concurrent product build such as build.workspace, setup.nextest, lint.clippy or doc.* holds it. The wait costs wall time, not CPU; the 1800-second wall has not been measured against that contention.",
+      "desc": "Compatibility scorecard regression-tier self-test and tracked-output check",
+      "description": "TOOL SELF-TEST NODE, REGRESSION TIER 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): runs `ci/compat-envelope/scorecard.rs self-test-and-check` through `test-harness selftest scorecard`, which is the scorecard's in-process brackets followed by the tracked-output check. The brackets create no scratch Git repository, run none of the scorecard's own commands and read no ledger; they read only this checkout's commits and the checked-in fixture under ci/compat-envelope/testdata/series-snapshot, with 57 git commands per run (the undivided self-test ran 3182). The brackets that do build scratch repositories (the command-line, retained-history and series-worktree brackets) run in selftest.scorecard_commands. This node is a leaf: a failure makes the validation red and no node depends on it. It keeps the gate's admitted two-core width (preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, no appended -j). NO CARGO: the tracked-output check derives the manifest-plan rows with the `hermit-manifest-plan` binary that setup.manifest_plan built beside test-harness; test-harness passes it through HERMIT_MANIFEST_PLAN_BIN (ToolSelfTest.manifest_plan_helper), and the hosted checks job unpacks both from one tarball. So this node runs no Cargo command: with a `cargo` first on PATH that fails when called and an empty CARGO_TARGET_DIR, it passed three times and `cargo` was never called. Before this it ran `cargo build -p hermit-manifest-plan`. The hosted tarball carries no Cargo fingerprints, so that build was cold there: 48.30 s wall and 89.53 CPU seconds at two jobs and load average 93, six times this node's CPU cap. Locally it waited on Cargo's target/debug lock while a concurrent debug build held it (in the full local validation of Hermit 84da7b816939, build.workspace held it from 379.0 to 997.9 seconds after the start, and the undivided selftest.scorecard started at 383.0 seconds). If the helper beside test-harness is missing, test-harness fails the node instead of building one. The Cargo-built path is still exercised by selftest.scorecard_commands and by the scorecard.compatibility nodes. Measured 2026-09-29 on the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\", at Hermit 1017bd88 plus this change, with the prepared release scorecard binary: the node's command took 2.58-2.78 s wall and 2.56-2.77 CPU seconds over three runs at load average 81-84. Earlier samples with the telemetry git wrapper first on PATH: `self-test` alone took 1.95-6.90 s wall and 1.95-3.82 CPU seconds over sixteen runs at load average 57-163, and 8.40 and 13.32 s wall with 2.59 and 2.74 CPU seconds while a workspace `cargo doc` ran beside it; the wall varies with the host, the CPU does not. Before the split the undivided command took 1183.84 s wall and 914.53 CPU seconds at load average 215-233. CAPS: 15 CPU seconds is 1.5 times the 10-second goal of https://github.com/rrnewton/hermit/issues/3381, and 3.9 times the largest CPU sample (3.82 s); the telemetry git wrapper's system CPU varies with host state (the gate recorded 32 to 374 system seconds for unchanged work, 2026-09-22 to 2026-09-28). The wall cap is 120 seconds: up to 30 seconds waiting for the scorecard write lock, which the check takes, plus 90 seconds, 6.8 times the largest wall sample (13.32 s), because the wall of the same work varied 6.8-fold with host load. Memory keeps the 5-GiB bound the seven audits shared in the gate.",
       "labels": [
         "quick",
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest scorecard",
+      "result_manifests": [],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 120,
+      "cpu_timeout": 15,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 0.0,
+        "rss_baseline_bytes": 5368709120,
+        "hard_mem_max_bytes": 5368709120,
+        "classification": "light",
+        "preferred_inner_jobs": 2,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "quick-super-selftest.scorecard"
+    },
+    {
+      "group": "quick-super-selftest",
+      "job": "scorecard_commands",
+      "desc": "Compatibility scorecard commands-tier self-test, when its paths change",
+      "description": "TOOL SELF-TEST NODE, COMMANDS TIER 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): runs `ci/compat-envelope/scorecard.rs self-test-commands` through `test-harness selftest scorecard_commands`: the regression-tier brackets of selftest.scorecard again, then the brackets that run the scorecard's own commands against a scratch clone of this checkout, a scratch ledger repository and a scratch reverie repository (the command-line, retained-history and series-worktree brackets, including the empty-result command, the replacement-ref guard, the dirty-worktree refusal and the missing-tree refusal). It needs the pinned ledger corpus through DEV_HERMIT_TEST_LEDGER_ROOT. WHEN IT RUNS: test-harness decides before starting it (ci/manifest-plan/src/self_test_selection.rs). It runs when any path changed since the merge base with origin/main, committed or not, is under one of its known inputs (SCORECARD_INPUTS in ci/manifest-plan/src/validation_dag.rs: the directories ci/compat-envelope/, ci/manifest-plan/, detcore-model/, ci/rust-script-bin/ and tests/e2e/manifests/, and the paths agent-utils (a submodule, whose commit moving counts), .gitmodules, Cargo.toml, Cargo.lock, rust-toolchain.toml, scripts/lib/rust_script_prelude.rs, ci/prepare-rust-scripts.sh, ci/prepare-scorecard-self-test-corpus.sh and ci/expected-e2e-plan.json; a deleted or renamed path counts under its old and its new name); it always runs when HEAD is contained in main (refs/heads/main or any refs/remotes/*/main); it also runs when the change set cannot be resolved (a shallow clone, no origin/main, an empty change set, any git failure) and when HERMIT_SELFTEST_SELECTION=all. Otherwise it prints one line containing \"NOT RUN by file selection:\" that names the merge base and the changed paths, and passes; that line is the node's summary. This node is a leaf: a failure makes the validation red and no node depends on it. It keeps the gate's admitted two-core width. Measured 2026-09-29 on the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\", at Hermit 84da7b81 plus this change, load average 158 falling to 89, with the prepared release scorecard binary: 480.80 s wall and 459.65 CPU seconds (220.42 user, 239.23 system). Earlier the same brackets, inside the undivided self-test, took 1183.84 s wall and 914.53 CPU seconds at load average 215-233 with the telemetry git wrapper first on PATH; that is the largest sample, and the 1800-second wall and 1500 CPU seconds are 1.52 and 1.64 times it. The cost is process creation (system CPU) for the scratch repositories' git commands; removing those repositories is the remaining step recorded in https://github.com/rrnewton/hermit/issues/3381. It does not take the prepared helper that selftest.scorecard uses: it refuses HERMIT_MANIFEST_PLAN_BIN, because its command-line brackets check the helper that Cargo builds in the shared target directory. KNOWN WALL RISK, NOT MEASURED: it runs `cargo build` and `cargo run -p hermit-manifest-plan` against the checkout's target directory, and forces CARGO_TARGET_DIR=<checkout>/target for its result commands, so it waits on Cargo's build-directory lock while a concurrent product build holds it. In the full local validation of Hermit 84da7b816939, build.workspace held that directory for 618.8 seconds (379.0 to 997.9 s after the start); that window plus the 480.80-second sample is 1099.6 seconds, inside the 1800-second wall. Memory keeps the 5-GiB bound the seven audits shared in the gate.",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest scorecard_commands",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
@@ -69270,7 +69339,7 @@
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
-      "fail_fast_family": "quick-super-selftest.scorecard"
+      "fail_fast_family": "quick-super-selftest.scorecard_commands"
     },
     {
       "group": "quick-super-selftest",
