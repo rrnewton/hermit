@@ -12849,6 +12849,97 @@ fn git_no_replace_rev_parse(root: &Path, revision: &str) -> Result<String, Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// `git rev-parse` answered from this clone's object store alone. In a clone
+/// with a promisor remote, Git otherwise fetches a missing object before it
+/// reports the object absent. On the shared development clone that costs four
+/// local fetches and about one CPU-second per absent name, and it made the
+/// 15 CPU-second `selftest.scorecard` step time out.
+fn git_local_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", revision])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot run git rev-parse {revision}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("git rev-parse {revision} failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod local_rev_parse_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = fixture_git()
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+            .args(args)
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn a_missing_commit_is_reported_absent_without_a_promisor_fetch() {
+        // The provider is a tiny owned fixture, never a network service.
+        let provider = tempfile::tempdir().unwrap();
+        git(provider.path(), &["init", "--quiet"]);
+        git(
+            provider.path(),
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "promised",
+            ],
+        );
+        let promised = git(provider.path(), &["rev-parse", "HEAD"]);
+        git(
+            provider.path(),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        let clone = tempfile::tempdir().unwrap();
+        git(clone.path(), &["init", "--quiet"]);
+        let provider_url = format!("file://{}", provider.path().display());
+        git(clone.path(), &["remote", "add", "origin", &provider_url]);
+        git(clone.path(), &["config", "remote.origin.promisor", "true"]);
+        git(
+            clone.path(),
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+        );
+        let revision = format!("{promised}^{{commit}}");
+
+        assert!(git_local_rev_parse(clone.path(), &revision).is_err());
+        let still_missing = fixture_git()
+            .args(["cat-file", "-e", &promised])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .current_dir(clone.path())
+            .output()
+            .unwrap();
+        assert!(
+            !still_missing.status.success(),
+            "the probe must leave the commit absent"
+        );
+        // Positive opponent: the same rev-parse without the guard really does
+        // fetch this commit from the promisor and report it present.
+        assert_eq!(git(clone.path(), &["rev-parse", &revision]), promised);
+        assert_eq!(git_local_rev_parse(clone.path(), &revision), Ok(promised));
+    }
+}
+
 fn read_result_candidates(
     root: &Path,
     head: &str,
@@ -25002,8 +25093,8 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     .map(String::from)
     .chain([fixture_hermit_tree.clone()])
     .collect::<Vec<_>>();
-    if git_rev_parse(&root, &format!("{UNRESOLVABLE_COMMIT}^{{commit}}")).is_ok()
-        || git_rev_parse(&root, &format!("{fixture_hermit_tree}^{{commit}}")).is_err()
+    if git_local_rev_parse(&root, &format!("{UNRESOLVABLE_COMMIT}^{{commit}}")).is_ok()
+        || git_local_rev_parse(&root, &format!("{fixture_hermit_tree}^{{commit}}")).is_err()
     {
         return Err(format!(
             "object-store independence needs {UNRESOLVABLE_COMMIT} to be absent from this \
