@@ -58,6 +58,7 @@ use std::io::Read;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
@@ -1839,7 +1840,37 @@ pub fn mark_running(config: &PostPassConfig, scope: &BTreeSet<ParityCellId>) -> 
     write_status(config, &PostPassStatus::running(config, scope))
 }
 
-fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+/// Remove the previous outputs ([`clear_outputs`]) and mark the post-pass
+/// `failed` with `error`, for a caller whose post-pass failed outside
+/// [`post_pass`]: a scope that could not be resolved, or a panic before
+/// [`post_pass`] took over. `scope` is every cell the post-pass owed, so
+/// [`node_ledger_sources`] reports each as `record-missing` with the error
+/// rather than reading the failure as an empty report. An empty `scope`
+/// means the cells it owed are unknown; such a status yields no row, so a
+/// caller that reads it must report the failure in its own words.
+///
+/// The failed status is written even when the previous outputs cannot all
+/// be removed, so an earlier `complete` status never outlives the failure;
+/// the error returned then names what could not be removed.
+pub fn mark_failed(
+    config: &PostPassConfig,
+    scope: &BTreeSet<ParityCellId>,
+    error: &str,
+) -> Result<(), String> {
+    let cleared = clear_outputs(config);
+    let mut status = PostPassStatus::running(config, scope);
+    status.state = PostPassState::Failed;
+    status.error = Some(error.to_string());
+    let written = write_status(config, &status);
+    match (cleared, written) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(cleared), Err(written)) => Err(format!("{cleared}; {written}")),
+    }
+}
+
+/// The text of a panic payload, for the status or the line that reports it.
+pub fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
     panic
         .downcast_ref::<&str>()
         .map(|text| text.to_string())
@@ -4658,24 +4689,28 @@ pub fn ledger_row_counts(rows: &[ParityLedgerSource]) -> String {
 /// decides nothing, so no outcome here is an error for the caller.
 ///
 /// - The writer is probed with `append-parity --help`, which exits 0 only
-///   on a writer that has the subcommand (dev-hermit's `series.py` answers
-///   an unknown one with its usage and exit 2). A writer without it is
-///   named, and the rows are left where they are.
-/// - The rows reach the writer's stdin from an unlinked temporary file,
-///   never a pipe: a script whose prelude turns `SIGPIPE` into `_exit(0)`
-///   would otherwise end, reporting success, the moment a writer exited
-///   before reading them.
+///   on a writer that has the subcommand. Exit status 2 is dev-hermit's
+///   `series.py` answering an unknown subcommand with its usage, so only
+///   that status names the writer as having no `append-parity`. Any other
+///   failure of the probe (a traceback, a signal), a missing writer and one
+///   that cannot be started are `ERROR:` lines, the probe's with its
+///   stderr. In each case the rows are left where they are.
+/// - The rows reach the writer's stdin from an unlinked temporary file
+///   ([`unlinked_input`]), never a pipe: a script whose prelude turns
+///   `SIGPIPE` into `_exit(0)` would otherwise end, reporting success, the
+///   moment a writer exited before reading them.
 /// - Each call is bounded by [`AppendBounds`]; a writer still running at its
 ///   bound is killed with its process group, and the line says so.
 /// - At most [`APPEND_OUTPUT_LIMIT_BYTES`] of each of its outputs is kept.
+/// - Exit status 0 is the writer's acceptance, and the line says only that:
+///   dev-hermit's writer exits 0 both when it wrote the rows to the parent's
+///   unpublished spool and when it had already recorded them identically,
+///   so the line ends with the writer's own words, which say which.
 pub fn append_ledger_rows(
     append: &LedgerAppend<'_>,
     rows: &[ParityLedgerSource],
     bounds: AppendBounds,
 ) -> String {
-    use std::io::Seek;
-    use std::io::Write;
-
     let counts = ledger_row_counts(rows);
     let left = |why: &str| {
         format!(
@@ -4686,12 +4721,14 @@ pub fn append_ledger_rows(
     };
     let series = append.series;
     if !series.is_file() {
-        return left(&format!("{} does not exist", series.display()));
+        return left(&format!("ERROR: {} does not exist", series.display()));
     }
     let mut probe = Command::new("python3");
     probe.arg(series).args(["append-parity", "--help"]);
     match run_bounded_capturing(&mut probe, Stdio::null(), bounds.probe) {
-        Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
+        Err(error) => {
+            return left(&format!("ERROR: cannot run {}: {error}", series.display()));
+        }
         Ok(Captured { status: None, .. }) => {
             return left(&format!(
                 "ERROR: `{} append-parity --help` did not finish within {:?} and was killed",
@@ -4702,43 +4739,37 @@ pub fn append_ledger_rows(
         Ok(Captured {
             status: Some(status),
             ..
-        }) if !status.success() => {
+        }) if status.code() == Some(2) => {
             return left(&format!(
                 "the series writer {} has no append-parity (`append-parity --help` {status})",
                 series.display()
             ));
         }
+        Ok(Captured {
+            status: Some(status),
+            stderr,
+            ..
+        }) if !status.success() => {
+            return left(&format!(
+                "ERROR: `{} append-parity --help` failed ({status}): {}",
+                series.display(),
+                String::from_utf8_lossy(&stderr).trim()
+            ));
+        }
         Ok(_) => {}
     }
-    static STAGED: AtomicUsize = AtomicUsize::new(0);
-    let staged = std::env::temp_dir().join(format!(
-        "hermit-parity-append-{}-{}.jsonl",
-        std::process::id(),
-        STAGED.fetch_add(1, Ordering::Relaxed)
-    ));
-    let input = fs::File::options()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .and_then(|mut file| {
-            // Unlinked at once: the open descriptor is all the writer needs,
-            // and nothing is left behind whatever happens next.
-            fs::remove_file(&staged)?;
-            for row in rows {
-                serde_json::to_writer(&mut file, row).map_err(std::io::Error::other)?;
-                file.write_all(b"\n")?;
-            }
-            file.rewind()?;
-            Ok(file)
-        });
-    let input = match input {
+    let mut payload = Vec::new();
+    for row in rows {
+        if let Err(error) = serde_json::to_writer(&mut payload, row) {
+            return left(&format!("ERROR: cannot encode a parity row: {error}"));
+        }
+        payload.push(b'\n');
+    }
+    let input = match unlinked_input(&payload) {
         Ok(input) => input,
         Err(error) => {
-            let _ = fs::remove_file(&staged);
             return left(&format!(
-                "cannot stage the rows for append-parity in {}: {error}",
-                staged.display()
+                "ERROR: cannot stage the rows for append-parity: {error}"
             ));
         }
     };
@@ -4766,7 +4797,9 @@ pub fn append_ledger_rows(
         stderr,
     } = match run_bounded_capturing(&mut command, Stdio::from(input), bounds.append) {
         Ok(outcome) => outcome,
-        Err(error) => return left(&format!("cannot run {}: {error}", series.display())),
+        Err(error) => {
+            return left(&format!("ERROR: cannot run {}: {error}", series.display()));
+        }
     };
     let Some(status) = status else {
         return left(&format!(
@@ -4781,12 +4814,111 @@ pub fn append_ledger_rows(
             String::from_utf8_lossy(&stderr).trim()
         ));
     }
+    let said = String::from_utf8_lossy(&stdout);
+    let said = said.trim();
     format!(
-        "parity: appended {} row(s) from {} ({counts}): {}",
+        "parity: append-parity accepted {} row(s) from {} ({counts}): {}",
         rows.len(),
         append.source.display(),
-        String::from_utf8_lossy(&stdout).trim()
+        if said.is_empty() {
+            "it printed nothing"
+        } else {
+            said
+        }
     )
+}
+
+/// A file holding `bytes`, positioned at its start and already unlinked, to
+/// hand a child as its stdin. Unlike a pipe it never fails the sender when
+/// the child exits without reading (a script whose prelude turns `SIGPIPE`
+/// into `_exit(0)` would otherwise end on the spot, reporting success), it
+/// never blocks the sender, and nothing is left on disk whatever happens
+/// next.
+pub fn unlinked_input(bytes: &[u8]) -> Result<fs::File, String> {
+    static STAGED: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "hermit-child-stdin-{}-{}",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    unlinked_input_at(&path, bytes)
+}
+
+/// [`unlinked_input`] at `path`, which must not exist yet. A file already
+/// there is someone else's: staging is refused and that file is left alone.
+fn unlinked_input_at(path: &Path, bytes: &[u8]) -> Result<fs::File, String> {
+    use std::io::Seek;
+    use std::io::Write;
+
+    let mut file = fs::File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    // Only a file this call created is removed, and at once: the open
+    // descriptor is all a reader needs.
+    fs::remove_file(path).map_err(|error| format!("cannot unlink {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.rewind())
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    Ok(file)
+}
+
+/// A child process that leads its own process group, so that a bounded
+/// wait can kill it together with everything it started. The cost of its
+/// own group: a terminal's job-control signals (Ctrl-C, Ctrl-Z) go to the
+/// foreground group only, so they no longer reach it; it ends on its own or
+/// at the bound of [`GroupChild::wait_bounded`].
+pub struct GroupChild {
+    child: Child,
+    group: libc::pid_t,
+}
+
+impl GroupChild {
+    /// Spawn `command` as the leader of a new process group.
+    pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+
+        let child = command.process_group(0).spawn()?;
+        let group = child.id() as libc::pid_t;
+        Ok(Self { child, group })
+    }
+
+    fn kill_group(&self) {
+        // SAFETY: kill(2) only sends a signal; a negative pid names the
+        // process group the child leads, which nothing else joins. Once the
+        // group is empty the call fails with ESRCH, which is harmless.
+        unsafe {
+            libc::kill(-self.group, libc::SIGKILL);
+        }
+    }
+
+    /// Wait at most `timeout` for the leader; `None` means the group was
+    /// killed at `timeout`. Once the leader has ended, whatever it left
+    /// running in its group is killed too, so a straggler holding a pipe
+    /// cannot hold the caller.
+    pub fn wait_bounded(mut self, timeout: Duration) -> Result<Option<ExitStatus>, String> {
+        let started = Instant::now();
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if started.elapsed() >= timeout => {
+                    self.kill_group();
+                    let _ = self.child.wait();
+                    break None;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    self.kill_group();
+                    let _ = self.child.wait();
+                    return Err(error.to_string());
+                }
+            }
+        };
+        self.kill_group();
+        Ok(status)
+    }
 }
 
 /// Keep at most `limit` bytes of `pipe`, reading it to its end so the writer
@@ -4827,50 +4959,21 @@ fn run_bounded_capturing(
     stdin: Stdio,
     timeout: Duration,
 ) -> Result<Captured, String> {
-    use std::os::unix::process::CommandExt;
-
-    let mut child = command
-        .stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let group = child.id() as libc::pid_t;
-    let kill_group = || {
-        // SAFETY: kill(2) only sends a signal; a negative pid names the
-        // process group the child leads, which nothing else joins. Once the
-        // group is empty the call fails with ESRCH, which is harmless.
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
-        }
+    let mut child = GroupChild::spawn(
+        command
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|error| error.to_string())?;
+    let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take())
+    else {
+        let _ = child.wait_bounded(Duration::ZERO);
+        return Err("an output pipe of the child is missing".to_string());
     };
-    let stdout = capped_reader(
-        child.stdout.take().ok_or("stdout pipe is missing")?,
-        APPEND_OUTPUT_LIMIT_BYTES,
-    );
-    let stderr = capped_reader(
-        child.stderr.take().ok_or("stderr pipe is missing")?,
-        APPEND_OUTPUT_LIMIT_BYTES,
-    );
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() >= timeout => {
-                kill_group();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                kill_group();
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-        }
-    };
-    kill_group();
+    let stdout = capped_reader(stdout, APPEND_OUTPUT_LIMIT_BYTES);
+    let stderr = capped_reader(stderr, APPEND_OUTPUT_LIMIT_BYTES);
+    let status = child.wait_bounded(timeout)?;
     Ok(Captured {
         status,
         stdout: stdout.join().unwrap_or_default(),
@@ -9467,7 +9570,10 @@ mod tests {
 
     /// The rows reach `append-parity` on its stdin with the run's identity
     /// and its tree state on its command line, and the writer's own words
-    /// end the line.
+    /// end the line, which claims only the writer's acceptance: exit status
+    /// 0 also means the writer had already recorded the rows and wrote
+    /// nothing (review A Low 1 of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
     #[test]
     fn appended_rows_reach_the_writer_with_the_runs_identity() {
         let root = result_root("append-ok");
@@ -9486,7 +9592,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): wrote 2 rows",
+                "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+                 wrote 2 rows",
                 root.display()
             )
         );
@@ -9534,10 +9641,40 @@ mod tests {
                 serde_json::json!("true")
             ]
         );
+
+        // A writer that had already recorded the rows exits 0 as well; the
+        // line reports its acceptance in its own words, never an append.
+        let recorded = fake_series(
+            &root,
+            "if help:\n    sys.exit(0)\nsys.stdin.read()\n\
+             print('2 parity row(s) already recorded (batch fixture); nothing written')",
+        );
+        assert_eq!(
+            append_ledger_rows(&append_to(&recorded, &root), &rows, AppendBounds::default()),
+            format!(
+                "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+                 2 parity row(s) already recorded (batch fixture); nothing written",
+                root.display()
+            )
+        );
+        let silent = fake_series(&root, "if help:\n    sys.exit(0)\nsys.stdin.read()");
+        assert_eq!(
+            append_ledger_rows(&append_to(&silent, &root), &rows, AppendBounds::default()),
+            format!(
+                "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+                 it printed nothing",
+                root.display()
+            )
+        );
     }
 
-    /// A writer without `append-parity`, a missing writer and a refusing
-    /// writer are each named, and the rows are left where they are.
+    /// A writer without `append-parity`, a missing writer, a probe that
+    /// fails and a refusing writer are each named, and the rows are left
+    /// where they are. Only the probe's exit status 2, dev-hermit's usage
+    /// exit for an unknown subcommand, reads as a writer without
+    /// `append-parity`; a missing writer and a probe that fails any other
+    /// way are `ERROR:` lines, the probe's with its stderr (review A Low 2
+    /// of <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
     #[test]
     fn a_writer_that_cannot_append_is_named_and_leaves_the_rows() {
         let root = result_root("append-refused");
@@ -9563,7 +9700,39 @@ mod tests {
         let missing = root.join("absent/series.py");
         assert_eq!(
             append_ledger_rows(&append_to(&missing, &root), &rows, AppendBounds::default()),
-            format!("parity: {} does not exist{left}", missing.display())
+            format!("parity: ERROR: {} does not exist{left}", missing.display())
+        );
+        // A probe that dies with a traceback is not a writer without the
+        // subcommand, and the traceback is in the line.
+        let broken = root.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        let broken = fake_series(
+            &broken,
+            "if help:\n    raise RuntimeError('fixture probe failure')",
+        );
+        let line = append_ledger_rows(&append_to(&broken, &root), &rows, AppendBounds::default());
+        assert!(
+            line.starts_with(&format!(
+                "parity: ERROR: `{} append-parity --help` failed (exit status: 1): Traceback",
+                broken.display()
+            )) && line.contains("RuntimeError: fixture probe failure")
+                && line.ends_with(&left),
+            "{line}"
+        );
+        // So is a probe ended by a signal.
+        let killed = root.join("killed");
+        fs::create_dir_all(&killed).unwrap();
+        let killed = fake_series(
+            &killed,
+            "if help:\n    os.kill(os.getpid(), 9)\nsys.exit(0)",
+        );
+        let line = append_ledger_rows(&append_to(&killed, &root), &rows, AppendBounds::default());
+        assert!(
+            line.starts_with(&format!(
+                "parity: ERROR: `{} append-parity --help` failed (signal: 9",
+                killed.display()
+            )) && line.ends_with(&left),
+            "{line}"
         );
         let refusing = fake_series(
             &root,
@@ -9640,11 +9809,39 @@ mod tests {
                 AppendBounds::default()
             ),
             format!(
-                "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): wrote 2 rows",
+                "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+                 wrote 2 rows",
                 root.display()
             )
         );
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// A staging path that already exists belongs to someone else: staging
+    /// there is refused and that file is left as it was. Before review A's
+    /// Info finding of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>
+    /// the error path removed it. A free path is staged, unlinked at once,
+    /// and reads back from its start.
+    #[test]
+    fn staging_input_never_removes_a_file_it_did_not_create() {
+        use std::io::Read;
+
+        let root = result_root("stage-exists");
+        let taken = root.join("taken");
+        fs::write(&taken, "someone else's").unwrap();
+        let error = unlinked_input_at(&taken, b"rows\n").unwrap_err();
+        assert!(
+            error.starts_with(&format!("cannot create {}: ", taken.display())),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "someone else's");
+        let free = root.join("free");
+        let mut file = unlinked_input_at(&free, b"rows\n").unwrap();
+        assert!(!free.exists(), "a staged input is unlinked at once");
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "rows\n");
     }
 
     /// A record that breaks a credit invariant is refused with its message,
@@ -9683,6 +9880,72 @@ mod tests {
         write_node(&node, Some(&status), Some(&[other]));
         let error = ledger_sources(&root, None).unwrap_err();
         assert!(error.contains("belongs to run another-run"), "{error}");
+    }
+
+    /// A post-pass that failed outside [`post_pass`] leaves a failed status
+    /// naming the cells it owed and no earlier records, so each owed cell is
+    /// a record-missing row with the error rather than an empty report
+    /// (review A Low 6 of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    /// With no known scope the failed status names no cell and yields no row.
+    #[test]
+    fn a_post_pass_failed_outside_post_pass_owes_its_scope() {
+        let fixture = Fixture::new("mark-failed");
+        let config = fixture.config();
+        let scope = BTreeSet::from([
+            parity_cell("fx/one", ParityBackend::Kvm),
+            parity_cell("fx/two", ParityBackend::Liteinst),
+        ]);
+        fs::write(&config.output, "stale\n").unwrap();
+        mark_failed(&config, &scope, "the scope panicked").unwrap();
+        assert!(!config.output.exists(), "a stale parity.jsonl survived");
+        let failed = status(&config);
+        assert_eq!(failed.state, PostPassState::Failed);
+        assert_eq!(failed.error.as_deref(), Some("the scope panicked"));
+        assert_eq!(failed.summary, None);
+        assert_eq!(
+            failed.scope,
+            Some(vec![
+                "fx/one@kvm".to_string(),
+                "fx/two@liteinst".to_string()
+            ])
+        );
+        let rows = node_ledger_sources(&config.output_dir, "lane", "node", None).unwrap();
+        let seen = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.cell.as_str(),
+                    row.verdict.as_str(),
+                    row.reason.as_deref().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "fx/one@kvm",
+                    "record-missing",
+                    "parity post-pass failed: the scope panicked"
+                ),
+                (
+                    "fx/two@liteinst",
+                    "record-missing",
+                    "parity post-pass failed: the scope panicked"
+                ),
+            ]
+        );
+        mark_failed(&config, &BTreeSet::new(), "no scope").unwrap();
+        let failed = status(&config);
+        assert_eq!(failed.state, PostPassState::Failed);
+        assert_eq!((failed.cells, failed.scope), (0, Some(Vec::new())));
+        assert_eq!(failed.error.as_deref(), Some("no scope"));
+        assert!(
+            node_ledger_sources(&config.output_dir, "lane", "node", None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The real post-pass output reads back as one row per record, and a
