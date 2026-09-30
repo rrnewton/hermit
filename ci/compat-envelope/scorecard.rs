@@ -4166,6 +4166,11 @@ fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
             Some(PlanDirectory(directory))
         }
     };
+    if directory.is_none() {
+        if let Some(plan) = in_process_manifest_plan(root) {
+            return plan;
+        }
+    }
     match (&program, &directory) {
         (Some(program), Some(directory)) => {
             cached_manifest_plan(program, directory, root).map(|(plan, _)| plan)
@@ -4177,6 +4182,97 @@ fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
         }
         #[cfg(not(test))]
         _ => run_manifest_plan(program.as_deref(), root),
+    }
+}
+
+/// A helper, the SHA-256 of its bytes, and a plan directory; see
+/// [`InProcessPlans`].
+struct InProcessPlan {
+    program: PathBuf,
+    program_sha256: String,
+    directory: PathBuf,
+}
+
+thread_local! {
+    static IN_PROCESS_PLANS: std::cell::RefCell<Option<InProcessPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, a derive on this thread that no [`MANIFEST_PLAN_CACHE_ENV`]
+/// names a directory for plans with `program` and files each plan in
+/// `directory`. Only `self-test-commands` installs it, for the commands it
+/// runs in its own process after its first child has checked the Cargo-built
+/// helper: about 36 derives of fixture trees whose inputs rarely change, each
+/// a Cargo fingerprint check and a 0.4 s helper run (measured 2026-09-30).
+///
+/// A plan is filed under a digest of the helper's bytes, the ROOT argument and
+/// [`manifest_plan_cache_key`], which hashes the full contents of every file
+/// the helper reads. The helper's bytes are hashed once, by the caller, which
+/// must check that they are unchanged when it is done; per derive the helper
+/// is identified by its file metadata, whose change time moves on any write.
+struct InProcessPlans;
+
+impl InProcessPlans {
+    fn install(program: PathBuf, program_sha256: String, directory: PathBuf) -> Self {
+        IN_PROCESS_PLANS.with(|plans| {
+            *plans.borrow_mut() = Some(InProcessPlan {
+                program,
+                program_sha256,
+                directory,
+            })
+        });
+        InProcessPlans
+    }
+}
+
+impl Drop for InProcessPlans {
+    fn drop(&mut self) {
+        IN_PROCESS_PLANS.with(|plans| *plans.borrow_mut() = None);
+    }
+}
+
+/// The plan for `root` through the installed [`InProcessPlans`], or `None`
+/// when none is installed on this thread.
+fn in_process_manifest_plan(root: &Path) -> Option<Result<Vec<u8>, String>> {
+    IN_PROCESS_PLANS.with(|plans| {
+        let plans = plans.borrow();
+        let plan = plans.as_ref()?;
+        let store = ScopedPlanDirectory {
+            directory: PlanDirectory(plan.directory.clone()),
+            scope: [
+                plan.program_sha256.as_bytes(),
+                root.as_os_str().as_encoded_bytes(),
+            ],
+        };
+        Some(cached_manifest_plan(&plan.program, &store, root).map(|(plan, _)| plan))
+    })
+}
+
+/// A [`PlanDirectory`] that files each key under a digest of the key and
+/// `scope`, so that a plan is found again only for the same scope.
+struct ScopedPlanDirectory<'a> {
+    directory: PlanDirectory,
+    scope: [&'a [u8]; 2],
+}
+
+impl ScopedPlanDirectory<'_> {
+    fn name(&self, key: &str) -> String {
+        let mut hasher = Sha256::new();
+        for field in self.scope.iter().copied().chain([key.as_bytes()]) {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+impl PlanStore for ScopedPlanDirectory<'_> {
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.directory.load(&self.name(key))
+    }
+
+    fn save(&self, key: &str, plan: &[u8]) -> Result<(), String> {
+        self.directory.save(&self.name(key), plan)
     }
 }
 
@@ -15398,6 +15494,52 @@ mod prepared_manifest_plan_tests {
     }
 
     #[test]
+    fn in_process_plans_replan_when_an_input_or_the_helper_changes() {
+        let (inputs, helper) = stub_plan();
+        let root = inputs.path();
+        let directory = tempfile::tempdir().unwrap();
+        let stored = || -> Vec<PathBuf> {
+            fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect()
+        };
+        let plan = || manifest_plan_matrix(root).unwrap();
+        let manifest = root.join("tests/e2e/manifests/sample.yaml");
+        {
+            let _plans =
+                InProcessPlans::install(helper.clone(), "helper-a".into(), directory.path().into());
+            assert_eq!(plan(), b"bucket: sample\n", "empty directory");
+            let [first] = stored().try_into().unwrap();
+            // A hit returns what was filed, so a marker proves the lookup.
+            fs::write(&first, "filed plan\n").unwrap();
+            assert_eq!(plan(), b"filed plan\n", "same tree");
+            fs::write(&manifest, "bucket: changed\n").unwrap();
+            assert_eq!(
+                plan(),
+                b"bucket: changed\n",
+                "a changed input must be planned again, not served the filed plan"
+            );
+            assert_eq!(stored().len(), 2);
+            fs::write(&manifest, "bucket: sample\n").unwrap();
+            assert_eq!(plan(), b"filed plan\n", "tree restored");
+        }
+        assert!(
+            in_process_manifest_plan(root).is_none(),
+            "dropping the guard uninstalls it"
+        );
+        let _plans =
+            InProcessPlans::install(helper.clone(), "helper-b".into(), directory.path().into());
+        assert_eq!(plan(), b"bucket: sample\n", "another helper digest");
+        assert_eq!(stored().len(), 3);
+        // A helper rewritten in place under the same digest is found by its
+        // file metadata.
+        fs::write(&helper, "#!/bin/sh\necho rewritten\n").unwrap();
+        assert_eq!(plan(), b"rewritten\n", "a rewritten helper");
+        assert_eq!(stored().len(), 4);
+    }
+
+    #[test]
     fn unit_tests_plan_with_one_helper_that_cargo_or_the_caller_built() {
         let prepared = prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref());
         let (program, _) = unit_test_manifest_plan(prepared.unwrap()).unwrap();
@@ -18871,6 +19013,17 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         }
         require_shared_clone_helper()?;
         child_helper_via_cargo.set(false);
+        // This process's own commands plan with the same checked helper, in a
+        // cache of their own so that the check of the children's cache at the
+        // end still shows that the children used it.
+        let in_process_plan_cache = tempfile::tempdir()
+            .map_err(|e| format!("cannot create the in-process manifest plan cache: {e}"))?;
+        // require_shared_clone_helper checks these bytes again at the end.
+        let _in_process_plans = InProcessPlans::install(
+            prepared_command_helper.clone(),
+            command_helper_before.clone(),
+            in_process_plan_cache.path().to_owned(),
+        );
         let first_observe = read_history_files(&result_command_root)?;
         fs::write(reverie_root.join("fixture"), "advanced\n").map_err(|e| e.to_string())?;
         commit("advance sibling")?;
@@ -22208,6 +22361,14 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             .count();
         if cached_plans == 0 {
             return Err("no child command stored a manifest plan in the shared cache".into());
+        }
+        // Likewise for this process's own commands.
+        if fs::read_dir(in_process_plan_cache.path())
+            .map_err(|e| format!("cannot read the in-process manifest plan cache: {e}"))?
+            .next()
+            .is_none()
+        {
+            return Err("no in-process command stored a manifest plan in its cache".into());
         }
         // The restored fixture tree must still find its plan in the cache, and
         // that plan must be exactly what the helper prints for it now.
