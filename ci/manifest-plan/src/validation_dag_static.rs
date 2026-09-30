@@ -318,10 +318,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/3354).
     // Seven captured-clock output/codec controls; 758 prior identities
     // retained: 758 + 7 = 765 (`cargo nextest list --profile ci` measured 765).
-    // Five captured-clock EFAULT/replay-verification controls; 765 prior
+    // Eight captured-clock EFAULT/replay-verification controls; 765 prior
     // identities (main's 758 plus the seven above) retained:
-    // 765 + 5 = 770 (`cargo nextest list --profile ci` measured 770).
-    ("test.hermit_unit", 770),
+    // 765 + 8 = 773 (`cargo nextest list --profile ci` measured 773).
+    ("test.hermit_unit", 773),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -408,7 +408,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.recorded_clocks_on_host", 6),
-    ("test.hermit_unit_on_host", 770),
+    ("test.hermit_unit_on_host", 773),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
