@@ -401,9 +401,9 @@ jobs:
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           ./ci/prepare-rust-scripts.sh --check
-      # selftest.scorecard and check.lint_checks (which runs every rust-script
-      # test suite) both read the pinned ledger corpus and never fetch, so this
-      # job prepares it. Run 36485831200 omitted it here: the corpus test failed
+      # selftest.scorecard_commands and check.lint_checks (which runs every
+      # rust-script test suite) both read the pinned ledger corpus and never
+      # fetch, so this job prepares it. Run 36485831200 omitted it here: the corpus test failed
       # and 14 unrelated scorecard tests failed behind it on the poisoned
       # fixture lock.
       - name: Prepare pinned scorecard self-test corpus

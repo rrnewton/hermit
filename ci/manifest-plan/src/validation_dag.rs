@@ -80,7 +80,39 @@ pub struct ToolSelfTest {
     /// The program, relative to the repository root.
     pub program: &'static str,
     pub args: &'static [&'static str],
+    /// `None` runs the self-test in every validation. `Some(triggers)` runs
+    /// it on main and whenever a path changed since the merge base with
+    /// `origin/main` is under one of the triggers (a trigger ending in `/` is
+    /// a directory; any other trigger is one tracked path, a file or a
+    /// submodule); otherwise the node prints a NOT RUN line
+    /// (`self_test_selection`) and passes.
+    pub run_when_changed: Option<&'static [&'static str]>,
+    /// `test-harness selftest` passes the `hermit-manifest-plan` binary that
+    /// its own build wrote beside it through `HERMIT_MANIFEST_PLAN_BIN`, so the
+    /// program runs that binary instead of building one with Cargo inside the
+    /// node's CPU cap. Only the scorecard reads it.
+    pub manifest_plan_helper: bool,
 }
+
+/// The paths whose change selects the scorecard's commands tier; see
+/// `scorecard_commands` in [`TOOL_SELF_TESTS`]. Every entry must name a tracked
+/// path (`self_test_selection`'s tests check it).
+pub const SCORECARD_INPUTS: &[&str] = &[
+    "ci/compat-envelope/",
+    "ci/manifest-plan/",
+    "detcore-model/",
+    "agent-utils",
+    ".gitmodules",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "scripts/lib/rust_script_prelude.rs",
+    "ci/rust-script-bin/",
+    "ci/prepare-rust-scripts.sh",
+    "ci/prepare-scorecard-self-test-corpus.sh",
+    "ci/expected-e2e-plan.json",
+    "tests/e2e/manifests/",
+];
 
 /// The tool self-tests the validation DAG runs as `selftest.<name>` leaf nodes.
 /// They test the repository's own tooling, not a precondition of any product
@@ -92,11 +124,34 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         name: "scorecard",
         program: "ci/compat-envelope/scorecard.rs",
         args: &["self-test-and-check"],
+        run_when_changed: None,
+        manifest_plan_helper: true,
+    },
+    // The scorecard's commands tier runs its commands against a scratch
+    // clone, ledger and reverie repository, and costs minutes; the regression
+    // tier above runs in seconds. It runs when one of its known inputs
+    // changes, and always on main, which also catches a change elsewhere that
+    // it reads: the scorecard's own directory; the manifest-plan crate it
+    // builds and runs, with that crate's path dependencies (detcore-model/,
+    // and agent-utils, a gitlink that `git diff` lists without a trailing
+    // slash, and .gitmodules, which says where it comes from) and Cargo.lock;
+    // the rust-script prelude it includes and the
+    // prepared rust-script launchers; the script that pins its ledger corpus;
+    // and the E2E manifests its cells and its `system-utils/record-getpid`
+    // command fixture come from.
+    ToolSelfTest {
+        name: "scorecard_commands",
+        program: "ci/compat-envelope/scorecard.rs",
+        args: &["self-test-commands"],
+        run_when_changed: Some(SCORECARD_INPUTS),
+        manifest_plan_helper: false,
     },
     ToolSelfTest {
         name: "pressure_test",
         program: "ci/compat-envelope/pressure-test.rs",
         args: &["self-test"],
+        run_when_changed: None,
+        manifest_plan_helper: false,
     },
     // The removed shell front door accumulated plan/scheduler/receipt guards
     // that now belong to the Rust validate driver. Exercise those brackets
@@ -105,11 +160,15 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         name: "validate_rs",
         program: "scripts/validate.rs",
         args: &["--self-test"],
+        run_when_changed: None,
+        manifest_plan_helper: false,
     },
     ToolSelfTest {
         name: "manifest_cli",
         program: "tests/manifest-cli.rs",
         args: &["self-test"],
+        run_when_changed: None,
+        manifest_plan_helper: false,
     },
     // The DBT budget wrapper gates roughly twenty portable nodes and fails
     // CLOSED on a pin it is not calibrated for. Nothing else notices: a
@@ -119,6 +178,8 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         name: "dbt_budget",
         program: "ci/run-with-reverie-dbt-budget-test.sh",
         args: &[],
+        run_when_changed: None,
+        manifest_plan_helper: false,
     },
 ];
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
@@ -293,27 +354,30 @@ struct Profile {
 // each, for the privileged system-utils nodes: 271/272, 11/19 and 12/12
 // before. full, portable, quick, super and hosted-portable then gained the five
 // selftest.* nodes (the quick/super variants for quick and super) split out of
-// gate.manifest: 272/273, 259/260, 15/16, 145/146 and 250/250 before.
+// gate.manifest: 272/273, 259/260, 15/16, 145/146 and 250/250 before. The
+// same five profiles then gained selftest.scorecard_commands (its quick/super
+// variant for quick and super): 277/278, 264/265, 20/21, 150/151 and 255/255
+// before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 277,
-        selected_steps: 278,
+        direct_steps: 278,
+        selected_steps: 279,
     },
     Profile {
         label: "portable",
-        direct_steps: 264,
-        selected_steps: 265,
+        direct_steps: 265,
+        selected_steps: 266,
     },
     Profile {
         label: "quick",
-        direct_steps: 20,
-        selected_steps: 21,
+        direct_steps: 21,
+        selected_steps: 22,
     },
     Profile {
         label: "super",
-        direct_steps: 150,
-        selected_steps: 151,
+        direct_steps: 151,
+        selected_steps: 152,
     },
     Profile {
         label: "privileged",
@@ -322,8 +386,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 255,
-        selected_steps: 255,
+        direct_steps: 256,
+        selected_steps: 256,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1963,10 +2027,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
     // since check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes; +10 for the five selftest.* nodes and their
-    // quick/super variants.
-    if cfg.steps.len() != 1618 {
+    // quick/super variants; +2 for selftest.scorecard_commands and its
+    // quick/super variant.
+    if cfg.steps.len() != 1620 {
         return Err(format!(
-            "superset has {} steps, expected 1618",
+            "superset has {} steps, expected 1620",
             cfg.steps.len()
         ));
     }
@@ -3503,11 +3568,12 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 256 since selftest.scorecard_commands split from selftest.scorecard;
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 255);
+        assert_eq!(selected.steps.len(), 256);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3664,11 +3730,12 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 254 = the 255 hosted-portable direct steps since the five
-            // selftest.<name> nodes left gate.manifest
+            // 255 = the 256 hosted-portable direct steps since the five
+            // selftest.<name> nodes left gate.manifest and
+            // selftest.scorecard_commands split from selftest.scorecard
             // (https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 254 direct steps"),
+            error.contains("hosted-portable label has 255 direct steps"),
             "{error}"
         );
     }
@@ -4002,6 +4069,23 @@ sys.exit(37)
         assert!(
             error.contains("build.rust_scripts") && error.contains("before opening"),
             "{error}"
+        );
+    }
+
+    /// Only the scorecard's regression tier takes the prepared helper: its
+    /// tracked-output check would otherwise build `hermit-manifest-plan`
+    /// with Cargo inside selftest.scorecard's 15-CPU-second cap, and the
+    /// commands tier refuses the variable because its brackets check the
+    /// helper Cargo builds.
+    #[test]
+    fn only_the_scorecard_regression_tier_takes_the_prepared_helper() {
+        assert_eq!(
+            TOOL_SELF_TESTS
+                .iter()
+                .filter(|tool| tool.manifest_plan_helper)
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["scorecard"]
         );
     }
 

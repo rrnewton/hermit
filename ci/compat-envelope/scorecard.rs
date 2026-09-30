@@ -166,12 +166,19 @@ Commands:
       were omitted; it must match at least one selected cell. The hosted
       portable profile uses it for kvm because GitHub-hosted runners have no PMU.
   self-test
-      Exercise accepting and refusing result sets without running a guest.
-      Requires the pinned full-corpus archive in hermit_test_ledger; use
-      DEV_HERMIT_TEST_LEDGER_ROOT to select that existing checkout. Missing
-      archive objects are an error; the test does not fetch or use live history.
+      Run the regression tier: exercise accepting and refusing result sets
+      in process. It runs no guest, none of this tool's commands, no ledger
+      and no scratch Git repository; it only reads this checkout's commits.
+  self-test-commands
+      Run the regression tier, then the commands tier: the command-line,
+      retained-history, and series-worktree brackets, which run this tool's
+      commands against scratch checkouts and repositories. Requires the pinned
+      full-corpus archive in hermit_test_ledger; use DEV_HERMIT_TEST_LEDGER_ROOT
+      to select that existing checkout. Missing archive objects are an error;
+      the test does not fetch or use live history.
   self-test-and-check
-      Run the self-test and exact tracked-file check in one forced compilation.
+      Run the regression tier and exact tracked-file check in one forced
+      compilation.
   --help
       Show this text.
 
@@ -3851,6 +3858,18 @@ fn run() -> Result<(), String> {
             no_more(&mut args)?;
             without_inherited_repository_location(self_test)?;
         }
+        "self-test-commands" => {
+            no_more(&mut args)?;
+            // Its command-line brackets check the helper that Cargo builds in
+            // the shared target directory; a prepared helper would bypass them.
+            if env::var_os(MANIFEST_PLAN_BIN_ENV).is_some() {
+                return Err(format!(
+                    "self-test-commands tests the Cargo-built manifest-plan helper; \
+                     unset {MANIFEST_PLAN_BIN_ENV}"
+                ));
+            }
+            without_inherited_repository_location(self_test_commands)?;
+        }
         "self-test-and-check" => {
             no_more(&mut args)?;
             without_inherited_repository_location(self_test)?;
@@ -3924,6 +3943,38 @@ fn manifest_plan_cargo(subcommand: &str) -> Result<Command, String> {
     Ok(command)
 }
 
+/// Names a `hermit-manifest-plan` binary that the caller built from this
+/// checkout. When it is set, `derive` runs that binary and nothing runs Cargo.
+/// `test-harness selftest` sets it to the `hermit-manifest-plan` that the same
+/// `cargo build --bins` wrote beside `test-harness`: setup.manifest_plan builds
+/// both, and the hosted checks job unpacks both from one tarball that carries
+/// no Cargo fingerprints, so a `cargo build` there recompiled the helper and
+/// its dependencies inside selftest.scorecard's 15-CPU-second cap.
+const MANIFEST_PLAN_BIN_ENV: &str = "HERMIT_MANIFEST_PLAN_BIN";
+
+/// The prepared helper named by [`MANIFEST_PLAN_BIN_ENV`], or `None` when the
+/// variable is unset. A set value must be an absolute path to a file, so a
+/// wrong value is refused instead of falling back to a Cargo build.
+fn prepared_manifest_plan(value: Option<&std::ffi::OsStr>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{MANIFEST_PLAN_BIN_ENV}={} is not an absolute path",
+            path.display()
+        ));
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "{MANIFEST_PLAN_BIN_ENV}={} is not a file",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
+}
+
 /// Compile the manifest-plan helper that `derive` runs, so that a caller can
 /// pay for a cold build BEFORE it takes the scorecard write-back lock. The
 /// lock waits at most 30 s, and a cold debug build of the helper takes longer
@@ -3933,6 +3984,9 @@ fn manifest_plan_cargo(subcommand: &str) -> Result<Command, String> {
 /// without a deadline, and `derive`'s `cargo run` of the same binary is then
 /// a fingerprint check.
 fn build_manifest_plan() -> Result<(), String> {
+    if prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref())?.is_some() {
+        return Ok(());
+    }
     let output = manifest_plan_cargo("build")?
         .output()
         .map_err(|e| format!("cannot build hermit-manifest-plan: {e}"))?;
@@ -3946,8 +4000,16 @@ fn build_manifest_plan() -> Result<(), String> {
 }
 
 fn derive(root: &Path) -> Result<Derived, String> {
-    let output = manifest_plan_cargo("run")?
-        .args(["--", "--root"])
+    let mut command = match prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref())? {
+        Some(program) => Command::new(program),
+        None => {
+            let mut command = manifest_plan_cargo("run")?;
+            command.arg("--");
+            command
+        }
+    };
+    let output = command
+        .arg("--root")
         .arg(root)
         .args(["--format", "matrix-json"])
         .current_dir(root)
@@ -12756,6 +12818,11 @@ fn git_head(root: &Path) -> Result<String, String> {
     git_rev_parse(root, "HEAD")
 }
 
+/// A well-formed Hermit commit name that no clone contains. The regression
+/// tier's object-store-independence bracket projects a row naming it against
+/// this checkout, the shape of a base-only clone.
+const UNRESOLVABLE_COMMIT: &str = "5ca1ab1e0000000000000000000000000000dead";
+
 fn git_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
     let output = Command::new("git")
         .args(["rev-parse", revision])
@@ -14387,6 +14454,24 @@ impl Drop for HistoryFixtureEnvironment {
     }
 }
 
+/// State the commands tier of the self-test builds once and a few later
+/// brackets reuse. Fields drop in declaration order: the fixture ledger
+/// environment is restored before its lock and directory go away.
+struct CommandsFixture {
+    _history_environment: HistoryFixtureEnvironment,
+    _publication_lock: File,
+    _directory: tempfile::TempDir,
+    result_command_root: PathBuf,
+    before_publication: TrackedCells,
+    replay_id: CellId,
+    replay_row: ResultRow,
+}
+
+/// The regression tier must not read or write any ledger. It points the
+/// ledger root at a path that cannot exist, so a bracket that starts to need
+/// history fails loudly instead of reading the caller's ledger.
+const REGRESSION_TIER_LEDGER_ROOT: &str = "/nonexistent/scorecard-self-test-regression-tier-has-no-ledger";
+
 // Failure diagnostics must not wait for EOF: a surviving descendant can still
 // hold the pipe's writer after the direct child has been killed and reaped.
 fn snapshot_pipe_diagnostic(pipe: &impl AsRawFd) -> String {
@@ -14557,6 +14642,33 @@ fn fixture_git() -> Command {
 }
 
 #[cfg(test)]
+mod prepared_manifest_plan_tests {
+    use super::*;
+
+    #[test]
+    fn a_prepared_helper_must_be_an_absolute_path_to_a_file() {
+        assert_eq!(prepared_manifest_plan(None), Ok(None));
+        let file = env::current_exe().unwrap();
+        assert_eq!(
+            prepared_manifest_plan(Some(file.as_os_str())),
+            Ok(Some(file.clone()))
+        );
+        for refused in [
+            std::ffi::OsString::new(),
+            "target/debug/hermit-manifest-plan".into(),
+            file.parent().unwrap().as_os_str().to_owned(),
+            file.with_file_name("no-such-hermit-manifest-plan")
+                .into_os_string(),
+        ] {
+            assert!(
+                prepared_manifest_plan(Some(&refused)).is_err(),
+                "accepted {refused:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod without_variables_tests {
     use super::*;
 
@@ -14576,7 +14688,179 @@ mod without_variables_tests {
     }
 }
 
+/// Runs git in a commands-tier scratch repository.
+fn commands_tier_git(repo: &Path, args: &[&str]) -> Result<(), String> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .map_err(|e| format!("cannot run git {}: {e}", args.join(" ")))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("git {} failed", args.join(" ")))
+}
+
+/// The series-snapshot refusals that need a worktree to change under a
+/// committed source: an untracked directory has no tree, a replacement ref
+/// must not redirect the recorded commit, a snapshot must not reread a
+/// mutated worktree, and a changed or untracked shard is refused. Each needs
+/// a scratch repository, so the regression tier leaves them to the commands
+/// tier.
+fn series_snapshot_worktree_brackets(source_row: &SeriesRow) -> Result<(), String> {
+    let git_ok = commands_tier_git;
+    let source_fixture =
+        tempfile::tempdir().map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
+    let source_repo = source_fixture.path();
+    git_ok(source_repo, &["init", "--quiet"])?;
+    let source_dir = source_repo.join("series/hermit/fixture");
+    fs::create_dir_all(&source_dir)
+        .map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
+    let first_shard = source_dir.join("2026-08-a.jsonl");
+    let second_shard = source_dir.join("2026-08-b.jsonl");
+    let source_json = serde_json::to_string(source_row)
+        .map_err(|e| format!("cannot encode series snapshot fixture: {e}"))?;
+    fs::write(&first_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot write first series snapshot shard: {e}"))?;
+    fs::write(&second_shard, format!("  {source_json}  \n"))
+        .map_err(|e| format!("cannot write duplicate series snapshot shard: {e}"))?;
+    let commit_source = |message: &str| -> Result<(), String> {
+        git_ok(source_repo, &["add", "series"])?;
+        git_ok(
+            source_repo,
+            &[
+                "-c",
+                "user.name=scorecard fixture",
+                "-c",
+                "user.email=scorecard@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ],
+        )
+    };
+    commit_source("identical duplicate rows")?;
+
+    let source_snapshot = snapshot_series_source(&source_repo.join("series"))?;
+    let expected_source_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
+    let expected_source_tree =
+        git_rev_parse(source_repo, &format!("{expected_source_commit}:series"))?;
+    if source_snapshot.source_commit != expected_source_commit
+        || source_snapshot.source_tree != expected_source_tree
+    {
+        return Err(format!(
+            "series snapshot recorded commit {} tree {} instead of {expected_source_commit} {expected_source_tree}",
+            source_snapshot.source_commit, source_snapshot.source_tree
+        ));
+    }
+
+    let missing_tree = source_repo.join("empty-untracked-series");
+    fs::create_dir(&missing_tree)
+        .map_err(|e| format!("cannot create missing-tree fixture: {e}"))?;
+    let missing_tree_error = snapshot_series_source(&missing_tree)
+        .expect_err("an uncommitted empty source directory acquired a Git tree identity");
+    if !missing_tree_error.contains("rev-parse") {
+        return Err(format!(
+            "missing-tree refusal did not name the failed Git lookup: {missing_tree_error}"
+        ));
+    }
+
+    let mut replacement_row = source_row.clone();
+    replacement_row.event_id = "fixture-replacement-event".into();
+    let replacement_json = serde_json::to_string(&replacement_row)
+        .map_err(|e| format!("cannot encode replacement-ref series row: {e}"))?;
+    fs::write(&first_shard, format!("{replacement_json}\n"))
+        .map_err(|e| format!("cannot write replacement-ref series shard: {e}"))?;
+    fs::write(&second_shard, format!("{replacement_json}\n"))
+        .map_err(|e| format!("cannot write replacement-ref duplicate shard: {e}"))?;
+    commit_source("replacement tree")?;
+    let replacement_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
+    git_ok(
+        source_repo,
+        &[
+            "--no-replace-objects",
+            "reset",
+            "--hard",
+            "--quiet",
+            &expected_source_commit,
+        ],
+    )?;
+    git_ok(
+        source_repo,
+        &["replace", &expected_source_commit, &replacement_commit],
+    )?;
+    let replacement_guarded = snapshot_series_source(&source_repo.join("series"))?;
+    let replacement_guarded_rows = read_series_rows(&replacement_guarded)?;
+    if replacement_guarded.source_commit != expected_source_commit
+        || replacement_guarded.source_tree != expected_source_tree
+        || replacement_guarded_rows.len() != 1
+        || replacement_guarded_rows[0].event_id != source_row.event_id
+    {
+        return Err(
+            "series snapshot followed a Git replacement ref instead of the recorded commit".into(),
+        );
+    }
+    let replacement_ref = format!("refs/replace/{expected_source_commit}");
+    git_ok(source_repo, &["update-ref", "-d", &replacement_ref])?;
+
+    fs::write(&first_shard, "{worktree mutated after snapshot}\n")
+        .map_err(|e| format!("cannot mutate snapshotted series shard: {e}"))?;
+    let captured_rows = read_series_rows(&source_snapshot)?;
+    if captured_rows.len() != 1 || captured_rows[0].event_id != source_row.event_id {
+        return Err(format!(
+            "immutable snapshot did not collapse identical event IDs to one captured row: {:?}",
+            captured_rows
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
+    let dirty_error = snapshot_series_source(&source_repo.join("series"))
+        .expect_err("a changed worktree shard was accepted as its committed snapshot");
+    if !dirty_error.contains("differs from the committed snapshot")
+        || !dirty_error.contains("2026-08-a.jsonl")
+    {
+        return Err(format!(
+            "changed-shard refusal did not name the mismatch and shard: {dirty_error}"
+        ));
+    }
+
+    fs::write(&first_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot restore first series snapshot shard: {e}"))?;
+    fs::write(&second_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot restore duplicate series snapshot shard: {e}"))?;
+    commit_source("restore canonical rows")?;
+    let untracked_shard = source_dir.join("untracked.jsonl");
+    fs::write(&untracked_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot write untracked series snapshot shard: {e}"))?;
+    let untracked_error = snapshot_series_source(&source_repo.join("series"))
+        .expect_err("an untracked JSONL shard entered the source population");
+    if !untracked_error.contains("worktree-only JSONL shard")
+        || !untracked_error.contains("untracked.jsonl")
+    {
+        return Err(format!(
+            "untracked-shard refusal did not identify the population mismatch: {untracked_error}"
+        ));
+    }
+    Ok(())
+}
+
 fn self_test() -> Result<(), String> {
+    self_test_tier(false)
+}
+
+/// The commands tier: every regression check plus the brackets that drive the
+/// real CLI commands against a cloned checkout, a fixture ledger and a sibling
+/// Reverie repository, and the Git-level series-snapshot checks that must
+/// change a repository.
+fn self_test_commands() -> Result<(), String> {
+    self_test_tier(true)
+}
+
+fn self_test_tier(include_commands: bool) -> Result<(), String> {
+    let _regression_ledger = (!include_commands)
+        .then(|| HistoryFixtureEnvironment::set(Path::new(REGRESSION_TIER_LEDGER_ROOT), -1));
     let (summary_paths, retained) = parse_update_observations_args(
         [
             "--summary",
@@ -17500,6 +17784,7 @@ fn self_test() -> Result<(), String> {
         );
     }
 
+    let commands_fixture = if include_commands {
     let command_root = repo_root()?;
     // Resolve and authenticate the fixed complete corpus before installing the
     // private fixture ledger environment. Catalogue-only source has no history.
@@ -21099,6 +21384,18 @@ fn self_test() -> Result<(), String> {
     );
     fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
     restore_generated()?;
+        Some(CommandsFixture {
+            _history_environment,
+            _publication_lock: publication_lock,
+            _directory: result_command_fixture,
+            result_command_root,
+            before_publication,
+            replay_id,
+            replay_row,
+        })
+    } else {
+        None
+    };
 
     for (staged_clean, unrelated_clean, allowed) in [
         (true, true, true),
@@ -23919,19 +24216,22 @@ fn self_test() -> Result<(), String> {
     current_validate_row.run_id = canonical.run_id.clone();
     current_validate_row.event_id = "fixture-stable-mapped-event".into();
 
+    // The retained invocation below comes from the combined CLI fixture, so
+    // this bracket runs only in the commands tier.
+    if let Some(fixture) = &commands_fixture {
     // Faithful retained-history shape: the current corpus's duplicate direct
     // keys come from two DISTINCT legacy invocations inside ONE observation.
     // Their omitted outer-attempt and evidence identities collapse to the same
     // compact run/result key even though the invocation payloads differ.
-    let mut legacy_invocation = before_publication
+    let mut legacy_invocation = fixture.before_publication
         .cells
         .iter()
-        .find(|cell| cell.id == replay_id)
+        .find(|cell| cell.id == fixture.replay_id)
         .and_then(|cell| {
             cell.observations
                 .iter()
                 .flat_map(|observation| &observation.invocations)
-                .find(|invocation| invocation.run_id == replay_row.run_id)
+                .find(|invocation| invocation.run_id == fixture.replay_row.run_id)
         })
         .cloned()
         .ok_or("combined result fixture retained no direct invocation")?;
@@ -23972,7 +24272,7 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    let generated_before_legacy_mapping = read_history_files(&result_command_root)?;
+    let generated_before_legacy_mapping = read_history_files(&fixture.result_command_root)?;
     let mut claimed_source_row = current_validate_row.clone();
     claimed_source_row.producer = SeriesProducer::PressureTest;
     claimed_source_row.run_id = legacy_run_id.into();
@@ -23987,7 +24287,7 @@ fn self_test() -> Result<(), String> {
     )?;
     if !unrelated_representation.represented_event_ids.is_empty()
         || !unrelated_representation.has_unrepresented_direct_evidence
-        || read_history_files(&result_command_root)? != generated_before_legacy_mapping
+        || read_history_files(&fixture.result_command_root)? != generated_before_legacy_mapping
     {
         return Err(
             "unclaimed duplicate retained evidence changed a generated file or was not preserved as opaque history"
@@ -24001,11 +24301,12 @@ fn self_test() -> Result<(), String> {
     )
     .expect_err("a source event claimed duplicate retained direct evidence");
     if !claimed_duplicate_error.contains("2 records for that exact identity")
-        || read_history_files(&result_command_root)? != generated_before_legacy_mapping
+        || read_history_files(&fixture.result_command_root)? != generated_before_legacy_mapping
     {
         return Err(format!(
             "claimed duplicate retained-evidence refusal changed a generated file or lost its cause: {claimed_duplicate_error}"
         ));
+    }
     }
 
     let preserved = apply_series_rows(&root, &mut preserve_import, &[current_validate_row], None)?;
@@ -24141,15 +24442,10 @@ fn self_test() -> Result<(), String> {
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
     // Stored projected observations need the same complete source identity as
-    // the production writer. Commit the actual fixture rows and read them back
-    // through its immutable snapshot path before applying and encoding them.
-    let projection_source_fixture =
-        tempfile::tempdir().map_err(|e| format!("cannot create no-verdict series fixture: {e}"))?;
-    let projection_source_repo = projection_source_fixture.path();
-    git_ok(projection_source_repo, &["init", "--quiet"])?;
-    let projection_source_dir = projection_source_repo.join("series");
-    fs::create_dir(&projection_source_dir)
-        .map_err(|e| format!("cannot create no-verdict series directory: {e}"))?;
+    // the production writer. The fixture rows are serialized into an in-memory
+    // snapshot shard and read back through the same row parser the committed
+    // snapshot path uses before they are applied and encoded. Resolving a
+    // committed snapshot from Git is the series-snapshot bracket's subject.
     let project_series_fixture =
         |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
             let mut shard = String::new();
@@ -24157,24 +24453,16 @@ fn self_test() -> Result<(), String> {
                 shard.push_str(&serde_json::to_string(row).map_err(|e| e.to_string())?);
                 shard.push('\n');
             }
-            fs::write(projection_source_dir.join("fixture.jsonl"), shard)
-                .map_err(|e| format!("cannot write no-verdict series fixture: {e}"))?;
-            git_ok(projection_source_repo, &["add", "series"])?;
-            git_ok(
-                projection_source_repo,
-                &[
-                    "-c",
-                    "user.name=scorecard fixture",
-                    "-c",
-                    "user.email=scorecard@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "--allow-empty",
-                    "-m",
-                    "no-verdict series fixture",
-                ],
-            )?;
-            let snapshot = snapshot_series_source(&projection_source_dir)?;
+            let snapshot = SeriesSourceSnapshot {
+                source: "series".into(),
+                source_repository: None,
+                source_commit: "a".repeat(40),
+                source_tree: "b".repeat(40),
+                shards: vec![SeriesSourceShard {
+                    display_path: PathBuf::from("series/fixture.jsonl"),
+                    bytes: shard.into_bytes(),
+                }],
+            };
             let captured_rows = read_series_rows(&snapshot)?;
             let mut tracked = TrackedCells {
                 schema: SCHEMA,
@@ -24650,11 +24938,18 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    // Projection must be a pure fold of the recorded rows. These are the six
-    // historical Hermit commits whose presence in one developer's object store
-    // used to admit 2,129 rows that an empty or base-only clone skipped. Replace
-    // refs make the exact names resolvable in the `full` fixture without having
-    // to retain those unrelated commit objects in this repository forever.
+    // Projection must be a pure fold of the recorded rows. The first six are
+    // the historical Hermit commits whose presence in one developer's object
+    // store used to admit 2,129 rows that an empty or base-only clone skipped;
+    // whether they resolve here depends on which refs this clone fetched. The
+    // seventh is a well-formed commit that exists in no clone, and the last
+    // is this checkout's HEAD, which resolves in every clone, including a
+    // shallow one; both are checked below. Projecting against an empty
+    // directory and against this checkout (and, in the commands tier, a
+    // repository with no commit) must give identical bytes and keep every
+    // row, so a projector that consulted the object store would see a
+    // resolvable commit and an unresolvable one inside a repository, and fail
+    // on either. The projector takes the root only to prove it ignores it.
     let ambient_commits = [
         "0ecc03c0fd710c599392429d2b8a2d066365c578",
         "35aae1f65126480d5ff1ec6e4cefbe8ab59bbddd",
@@ -24662,35 +24957,31 @@ fn self_test() -> Result<(), String> {
         "d452986e9871c875f1e5c3c2c66cd8ff593467df",
         "dcdf94ac6bd7a6daa36c6f32d72852a4e7214882",
         "e6e60d8b7c9b61791195b16454b5057a93caee71",
-    ];
+        UNRESOLVABLE_COMMIT,
+    ]
+    .into_iter()
+    .map(String::from)
+    .chain([fixture_hermit_tree.clone()])
+    .collect::<Vec<_>>();
+    if git_rev_parse(&root, &format!("{UNRESOLVABLE_COMMIT}^{{commit}}")).is_ok()
+        || git_rev_parse(&root, &format!("{fixture_hermit_tree}^{{commit}}")).is_err()
+    {
+        return Err(format!(
+            "object-store independence needs {UNRESOLVABLE_COMMIT} to be absent from this \
+             checkout and HEAD {fixture_hermit_tree} to resolve in it"
+        ));
+    }
     let object_store_fixture = tempfile::tempdir().map_err(|e| e.to_string())?;
     let empty_store = object_store_fixture.path().join("empty");
-    let base_store = object_store_fixture.path().join("base");
-    let full_store = object_store_fixture.path().join("full");
     fs::create_dir_all(&empty_store).map_err(|e| e.to_string())?;
-    for store in [&base_store, &full_store] {
-        fs::create_dir_all(store).map_err(|e| e.to_string())?;
-        git_ok(store, &["init", "--quiet"])?;
-    }
-    fs::create_dir_all(full_store.join("detcore")).map_err(|e| e.to_string())?;
-    fs::write(full_store.join("detcore/identity"), "fixture\n").map_err(|e| e.to_string())?;
-    git_ok(&full_store, &["add", "detcore/identity"])?;
-    git_ok(
-        &full_store,
-        &[
-            "-c",
-            "user.name=x",
-            "-c",
-            "user.email=x",
-            "commit",
-            "-qm",
-            "fixture",
-        ],
-    )?;
-    let full_commit = git_rev_parse(&full_store, "HEAD^{commit}")?;
-    for commit in ambient_commits {
-        let replace_ref = format!("refs/replace/{commit}");
-        git_ok(&full_store, &["update-ref", &replace_ref, &full_commit])?;
+    let mut stores = vec![empty_store.clone(), root.clone()];
+    if include_commands {
+        // A repository with no commit: HEAD itself does not resolve. It
+        // needs `git init`, so only the commands tier projects against it.
+        let unborn_store = object_store_fixture.path().join("unborn");
+        fs::create_dir_all(&unborn_store).map_err(|e| e.to_string())?;
+        commands_tier_git(&unborn_store, &["init", "--quiet"])?;
+        stores.push(unborn_store);
     }
 
     let procfs_cell = "c-programs/procfs-positioned-probe/verify/ptrace";
@@ -24708,7 +24999,7 @@ fn self_test() -> Result<(), String> {
         row.event_id = format!("ambient-event-{key}");
         row.run_id = format!("ambient-run-{key}");
         row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
-        row.series.tree = (*commit).into();
+        row.series.tree = commit.clone();
         row.series.result = None;
         row.series.failure_class = None;
         row
@@ -24717,8 +25008,12 @@ fn self_test() -> Result<(), String> {
         .map(|index| legacy_row(index, SeriesOutcome::Passed, None))
         .collect::<Vec<_>>();
     ambient_rows.extend([
-        legacy_row(6, SeriesOutcome::Diverged, None),
-        legacy_row(7, SeriesOutcome::Passed, Some(ambient_commits[0].into())),
+        legacy_row(ambient_commits.len(), SeriesOutcome::Diverged, None),
+        legacy_row(
+            ambient_commits.len() + 1,
+            SeriesOutcome::Passed,
+            Some(ambient_commits[0].clone()),
+        ),
     ]);
 
     let source_commit = "a".repeat(40);
@@ -24730,7 +25025,7 @@ fn self_test() -> Result<(), String> {
     prior_observation.results = BTreeSet::from([ObservedResult::Pass]);
     let mut object_store_outputs = Vec::new();
     let mut projected_fixture = None;
-    for store in [&empty_store, &base_store, &full_store] {
+    for store in &stores {
         let mut target_cell = boundary_cell(vec![prior_observation.clone()], CellStatus::Red);
         target_cell.id.test = "c-programs/procfs-positioned-probe".into();
         let mut target = TrackedCells {
@@ -24760,7 +25055,14 @@ fn self_test() -> Result<(), String> {
         .windows(2)
         .any(|pair| pair[0].as_bytes() != pair[1].as_bytes())
     {
-        return Err("empty/base/full object stores changed projection bytes".into());
+        return Err(format!(
+            "projecting against {} changed projection bytes",
+            if include_commands {
+                "an empty directory, this checkout and a repository with no commit"
+            } else {
+                "an empty directory and this checkout"
+            }
+        ));
     }
     let projected_fixture = projected_fixture.expect("one object-store fixture was projected");
     let cell = &projected_fixture.cells[0];
@@ -24769,7 +25071,7 @@ fn self_test() -> Result<(), String> {
         || !ambient_commits.iter().all(|commit| {
             cell.observations.iter().any(|observation| {
                 observation.detcore_tree.is_none()
-                    && observation.hermit_shas == BTreeSet::from([(*commit).into()])
+                    && observation.hermit_shas == BTreeSet::from([commit.clone()])
             })
         })
     {
@@ -24778,7 +25080,7 @@ fn self_test() -> Result<(), String> {
     if !cell
         .observations
         .iter()
-        .any(|observation| observation.detcore_tree.as_deref() == Some(ambient_commits[0]))
+        .any(|observation| observation.detcore_tree.as_deref() == Some(ambient_commits[0].as_str()))
         || cell.observations.len() != ambient_commits.len() + 2
     {
         return Err("explicit Detcore identity aliased a recorded Hermit identity".into());
@@ -24990,17 +25292,8 @@ fn self_test() -> Result<(), String> {
 
     // The projection source is ONE immutable snapshot: resolve a commit,
     // capture its bytes, prove the worktree matches, and never reread the
-    // mutable worktree while parsing. The fixture also pins canonical event
+    // mutable worktree while parsing. The checks also pin canonical event
     // identity, loud malformed-input refusal, and exact shard population.
-    let source_fixture =
-        tempfile::tempdir().map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
-    let source_repo = source_fixture.path();
-    git_ok(source_repo, &["init", "--quiet"])?;
-    let source_dir = source_repo.join("series/hermit/fixture");
-    fs::create_dir_all(&source_dir)
-        .map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
-    let first_shard = source_dir.join("2026-08-a.jsonl");
-    let second_shard = source_dir.join("2026-08-b.jsonl");
     let mut source_row = series_row(
         "fixture/boundary/verify/ptrace",
         SeriesOutcome::Passed,
@@ -25013,74 +25306,186 @@ fn self_test() -> Result<(), String> {
     source_row.source.clear();
     let source_json = serde_json::to_string(&source_row)
         .map_err(|e| format!("cannot encode series snapshot fixture: {e}"))?;
-    fs::write(&first_shard, format!("{source_json}\n"))
-        .map_err(|e| format!("cannot write first series snapshot shard: {e}"))?;
-    fs::write(&second_shard, format!("  {source_json}  \n"))
-        .map_err(|e| format!("cannot write duplicate series snapshot shard: {e}"))?;
-    let commit_source = |message: &str| -> Result<(), String> {
-        git_ok(source_repo, &["add", "series"])?;
-        git_ok(
-            source_repo,
-            &[
-                "-c",
-                "user.name=scorecard fixture",
-                "-c",
-                "user.email=scorecard@example.invalid",
-                "commit",
-                "--quiet",
-                "-m",
-                message,
-            ],
-        )
-    };
-    commit_source("identical duplicate rows")?;
 
-    let source_snapshot = snapshot_series_source(&source_repo.join("series"))?;
-    let expected_source_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
+    // Row parsing is a pure function of the captured shard bytes, so its
+    // checks run on in-memory snapshots with the shard names a committed
+    // source would record.
+    let memory_snapshot = |first: String, second: String| SeriesSourceSnapshot {
+        source: "series".into(),
+        source_repository: None,
+        source_commit: "a".repeat(40),
+        source_tree: "b".repeat(40),
+        shards: vec![
+            SeriesSourceShard {
+                display_path: PathBuf::from("series/hermit/fixture/2026-08-a.jsonl"),
+                bytes: first.into_bytes(),
+            },
+            SeriesSourceShard {
+                display_path: PathBuf::from("series/hermit/fixture/2026-08-b.jsonl"),
+                bytes: second.into_bytes(),
+            },
+        ],
+    };
+    let captured_rows = read_series_rows(&memory_snapshot(
+        format!("{source_json}\n"),
+        format!("  {source_json}  \n"),
+    ))?;
+    if captured_rows.len() != 1 || captured_rows[0].event_id != source_row.event_id {
+        return Err(format!(
+            "snapshot did not collapse identical event IDs to one captured row: {:?}",
+            captured_rows
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    let mut conflicting_row = source_row.clone();
+    conflicting_row.emitted_at = "2026-08-27T05:00:01Z".into();
+    let conflicting_json = serde_json::to_string(&conflicting_row)
+        .map_err(|e| format!("cannot encode conflicting series row: {e}"))?;
+    let conflicting_error = read_series_rows(&memory_snapshot(
+        format!("{source_json}\n"),
+        format!("{conflicting_json}\n"),
+    ))
+    .expect_err("conflicting rows under one event_id were collapsed");
+    if !conflicting_error.contains("conflicting series rows")
+        || !conflicting_error.contains("fixture-source-event")
+        || !conflicting_error.contains("2026-08-a.jsonl:1")
+        || !conflicting_error.contains("2026-08-b.jsonl:1")
+    {
+        return Err(format!(
+            "conflicting event_id refusal did not name both rows: {conflicting_error}"
+        ));
+    }
+
+    let malformed_error = read_series_rows(&memory_snapshot(
+        format!("{source_json}\n"),
+        "{not valid json}\n".into(),
+    ))
+    .expect_err("a malformed committed series row was skipped");
+    if !malformed_error.contains("malformed series row")
+        || !malformed_error.contains("2026-08-b.jsonl:1")
+    {
+        return Err(format!(
+            "malformed-row refusal did not identify its source: {malformed_error}"
+        ));
+    }
+
+    let truncated_error =
+        read_series_rows(&memory_snapshot(format!("{source_json}\n"), source_json.clone()))
+            .expect_err("a nonempty shard without a trailing newline was accepted");
+    if !truncated_error.contains("must end in a newline")
+        || !truncated_error.contains("2026-08-b.jsonl")
+    {
+        return Err(format!(
+            "truncated-shard refusal did not identify its source: {truncated_error}"
+        ));
+    }
+
+    let mut invalid_row = source_row.clone();
+    invalid_row.series.kernel_version = None;
+    let invalid_json = serde_json::to_string(&invalid_row)
+        .map_err(|e| format!("cannot encode invalid series row: {e}"))?;
+    let invalid_error = read_series_rows(&memory_snapshot(
+        format!("{source_json}\n"),
+        format!("{invalid_json}\n"),
+    ))
+    .expect_err("a row rejected by the shared read boundary was admitted");
+    if !invalid_error.contains("invalid series row")
+        || !invalid_error.contains("2026-08-b.jsonl:1")
+        || !invalid_error.contains("missing kernel_version")
+    {
+        return Err(format!(
+            "read-invalid row refusal did not identify its source and reason: {invalid_error}"
+        ));
+    }
+
+    // Commit, tree, and shard resolution run against series directories
+    // committed in this checkout, so no Git repository is built here. The
+    // checked-in rows carry fixed tree identities; everything else matches
+    // `source_row`. A snapshot of an uncommitted edit to these files is
+    // refused, so commit a change to them before running the self-test.
+    let checked_in_relative = "ci/compat-envelope/testdata/series-snapshot";
+    let checked_in = root.join(checked_in_relative);
+    let checked_in_row = |event_id: &str| {
+        let mut row = source_row.clone();
+        row.event_id = event_id.into();
+        row.series.tree = "c".repeat(40);
+        row.series.detcore_tree = Some("d".repeat(40));
+        row
+    };
+    let checked_in_series = checked_in.join("series");
+    let checked_in_snapshot = snapshot_series_source(&checked_in_series)?;
+    let expected_source_commit = git_rev_parse(&root, "HEAD^{commit}")?;
+    let expected_source =
+        format!("{checked_in_relative}/series");
     let expected_source_tree =
-        git_rev_parse(source_repo, &format!("{expected_source_commit}:series"))?;
-    if source_snapshot.source_commit != expected_source_commit {
+        git_rev_parse(&root, &format!("{expected_source_commit}:{expected_source}"))?;
+    if checked_in_snapshot.source_commit != expected_source_commit {
         return Err(format!(
             "series snapshot recorded {} instead of resolved commit {expected_source_commit}",
-            source_snapshot.source_commit
+            checked_in_snapshot.source_commit
         ));
     }
-    if source_snapshot.source != "series" || source_snapshot.source_tree != expected_source_tree {
+    if checked_in_snapshot.source != expected_source
+        || checked_in_snapshot.source_tree != expected_source_tree
+    {
         return Err(format!(
-            "series snapshot recorded source {:?} at tree {} instead of repository-relative series at {expected_source_tree}",
-            source_snapshot.source, source_snapshot.source_tree
+            "series snapshot recorded source {:?} at tree {} instead of repository-relative {expected_source} at {expected_source_tree}",
+            checked_in_snapshot.source, checked_in_snapshot.source_tree
         ));
     }
-
-    let missing_tree = source_repo.join("empty-untracked-series");
-    fs::create_dir(&missing_tree)
-        .map_err(|e| format!("cannot create missing-tree fixture: {e}"))?;
-    let missing_tree_error = snapshot_series_source(&missing_tree)
-        .expect_err("an uncommitted empty source directory acquired a Git tree identity");
-    if !missing_tree_error.contains("rev-parse") {
+    let canonical_root = fs::canonicalize(&root)
+        .map_err(|e| format!("cannot resolve checkout {}: {e}", root.display()))?;
+    let expected_shards = ["2026-08-a.jsonl", "2026-08-b.jsonl"]
+        .map(|name| canonical_root.join(format!("{expected_source}/hermit/fixture/{name}")));
+    if checked_in_snapshot.shards.len() != expected_shards.len()
+        || !checked_in_snapshot
+            .shards
+            .iter()
+            .zip(&expected_shards)
+            .all(|(shard, expected)| {
+                shard.display_path == *expected
+                    && fs::read(expected).is_ok_and(|bytes| bytes == shard.bytes)
+            })
+    {
         return Err(format!(
-            "missing-tree refusal did not name the failed Git lookup: {missing_tree_error}"
+            "series snapshot did not capture exactly the committed shards {expected_shards:?}: {:?}",
+            checked_in_snapshot
+                .shards
+                .iter()
+                .map(|shard| &shard.display_path)
+                .collect::<Vec<_>>()
+        ));
+    }
+    let checked_in_rows = read_series_rows(&checked_in_snapshot)?;
+    let mut checked_in_captured = checked_in_rows.first().cloned();
+    if let Some(row) = &mut checked_in_captured {
+        row.source.clear();
+    }
+    if checked_in_rows.len() != 1
+        || checked_in_captured != Some(checked_in_row("fixture-checked-in-event"))
+    {
+        return Err(format!(
+            "committed duplicate shards did not collapse to their one recorded row: {checked_in_rows:?}"
         ));
     }
 
     // Equivalent caller spellings and symlinks must all reduce to the same
     // repository-relative path and immutable tree object.
-    let direct_hermit = source_repo.join("hermit");
-    let standalone_hermit = source_repo.join("worktrees/standalone");
-    fs::create_dir_all(&direct_hermit)
-        .map_err(|e| format!("cannot create direct Hermit path fixture: {e}"))?;
-    fs::create_dir_all(&standalone_hermit)
-        .map_err(|e| format!("cannot create standalone Hermit path fixture: {e}"))?;
-    let series_link = source_repo.join("series-link");
-    std::os::unix::fs::symlink(source_repo.join("series"), &series_link)
+    let spelling_fixture = tempfile::tempdir()
+        .map_err(|e| format!("cannot create series symlink fixture: {e}"))?;
+    let series_link = spelling_fixture.path().join("series-link");
+    std::os::unix::fs::symlink(&checked_in_series, &series_link)
         .map_err(|e| format!("cannot create series symlink fixture: {e}"))?;
     for spelling in [
-        direct_hermit.join("../series"),
-        standalone_hermit.join("../../series"),
+        root.join("ci/compat-envelope/testdata/../testdata/series-snapshot/series"),
+        root.join("ci/../ci/compat-envelope/testdata/series-snapshot/series"),
         series_link,
     ] {
         let equivalent = snapshot_series_source(&spelling)?;
-        if equivalent.source != "series"
+        if equivalent.source != expected_source
             || equivalent.source_commit != expected_source_commit
             || equivalent.source_tree != expected_source_tree
         {
@@ -25094,37 +25499,12 @@ fn self_test() -> Result<(), String> {
         }
     }
 
-    let alternate_dir = source_repo.join("alternate-series/hermit/fixture");
-    fs::create_dir_all(&alternate_dir)
-        .map_err(|e| format!("cannot create alternate series fixture: {e}"))?;
-    let mut alternate_row = source_row.clone();
-    alternate_row.event_id = "fixture-alternate-event".into();
-    fs::write(
-        alternate_dir.join("2026-08.jsonl"),
-        format!(
-            "{}\n",
-            serde_json::to_string(&alternate_row)
-                .map_err(|e| format!("cannot encode alternate series row: {e}"))?
-        ),
-    )
-    .map_err(|e| format!("cannot write alternate series shard: {e}"))?;
-    git_ok(source_repo, &["add", "alternate-series"])?;
-    git_ok(
-        source_repo,
-        &[
-            "-c",
-            "user.name=scorecard fixture",
-            "-c",
-            "user.email=scorecard@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "alternate series",
-        ],
-    )?;
-    let alternate_snapshot = snapshot_series_source(&source_repo.join("alternate-series"))?;
-    if alternate_snapshot.source != "alternate-series"
+    let alternate_snapshot = snapshot_series_source(&checked_in.join("alternate-series"))?;
+    let alternate_rows = read_series_rows(&alternate_snapshot)?;
+    if alternate_snapshot.source != format!("{checked_in_relative}/alternate-series")
         || alternate_snapshot.source_tree == expected_source_tree
+        || alternate_rows.len() != 1
+        || alternate_rows[0].event_id != "fixture-checked-in-alternate-event"
     {
         return Err(format!(
             "alternate tracked source was not distinguished: source={:?} tree={}",
@@ -25132,160 +25512,10 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    git_ok(
-        source_repo,
-        &[
-            "--no-replace-objects",
-            "reset",
-            "--hard",
-            "--quiet",
-            &expected_source_commit,
-        ],
-    )?;
-
-    let mut replacement_row = source_row.clone();
-    replacement_row.event_id = "fixture-replacement-event".into();
-    let replacement_json = serde_json::to_string(&replacement_row)
-        .map_err(|e| format!("cannot encode replacement-ref series row: {e}"))?;
-    fs::write(&first_shard, format!("{replacement_json}\n"))
-        .map_err(|e| format!("cannot write replacement-ref series shard: {e}"))?;
-    fs::write(&second_shard, format!("{replacement_json}\n"))
-        .map_err(|e| format!("cannot write replacement-ref duplicate shard: {e}"))?;
-    commit_source("replacement tree")?;
-    let replacement_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
-    git_ok(
-        source_repo,
-        &[
-            "--no-replace-objects",
-            "reset",
-            "--hard",
-            "--quiet",
-            &expected_source_commit,
-        ],
-    )?;
-    git_ok(
-        source_repo,
-        &["replace", &expected_source_commit, &replacement_commit],
-    )?;
-    let replacement_guarded = snapshot_series_source(&source_repo.join("series"))?;
-    let replacement_guarded_rows = read_series_rows(&replacement_guarded)?;
-    if replacement_guarded.source_commit != expected_source_commit
-        || replacement_guarded.source_tree != expected_source_tree
-        || replacement_guarded_rows.len() != 1
-        || replacement_guarded_rows[0].event_id != source_row.event_id
-    {
-        return Err(
-            "series snapshot followed a Git replacement ref instead of the recorded commit".into(),
-        );
-    }
-    let replacement_ref = format!("refs/replace/{expected_source_commit}");
-    git_ok(source_repo, &["update-ref", "-d", &replacement_ref])?;
-
-    fs::write(&first_shard, "{worktree mutated after snapshot}\n")
-        .map_err(|e| format!("cannot mutate snapshotted series shard: {e}"))?;
-    let captured_rows = read_series_rows(&source_snapshot)?;
-    if captured_rows.len() != 1 || captured_rows[0].event_id != source_row.event_id {
-        return Err(format!(
-            "immutable snapshot did not collapse identical event IDs to one captured row: {:?}",
-            captured_rows
-                .iter()
-                .map(|row| row.event_id.as_str())
-                .collect::<Vec<_>>()
-        ));
-    }
-    let dirty_error = snapshot_series_source(&source_repo.join("series"))
-        .expect_err("a changed worktree shard was accepted as its committed snapshot");
-    if !dirty_error.contains("differs from the committed snapshot")
-        || !dirty_error.contains("2026-08-a.jsonl")
-    {
-        return Err(format!(
-            "changed-shard refusal did not name the mismatch and shard: {dirty_error}"
-        ));
-    }
-
-    let mut conflicting_row = source_row.clone();
-    conflicting_row.emitted_at = "2026-08-27T05:00:01Z".into();
-    let conflicting_json = serde_json::to_string(&conflicting_row)
-        .map_err(|e| format!("cannot encode conflicting series row: {e}"))?;
-    fs::write(&first_shard, format!("{source_json}\n"))
-        .map_err(|e| format!("cannot restore first series snapshot shard: {e}"))?;
-    fs::write(&second_shard, format!("{conflicting_json}\n"))
-        .map_err(|e| format!("cannot write conflicting series snapshot shard: {e}"))?;
-    commit_source("conflicting duplicate rows")?;
-    let conflicting_snapshot = snapshot_series_source(&source_repo.join("series"))?;
-    let conflicting_error = read_series_rows(&conflicting_snapshot)
-        .expect_err("conflicting rows under one event_id were collapsed");
-    if !conflicting_error.contains("conflicting series rows")
-        || !conflicting_error.contains("fixture-source-event")
-        || !conflicting_error.contains("2026-08-a.jsonl:1")
-        || !conflicting_error.contains("2026-08-b.jsonl:1")
-    {
-        return Err(format!(
-            "conflicting event_id refusal did not name both rows: {conflicting_error}"
-        ));
-    }
-
-    fs::write(&second_shard, "{not valid json}\n")
-        .map_err(|e| format!("cannot write malformed series snapshot shard: {e}"))?;
-    commit_source("malformed row")?;
-    let malformed_snapshot = snapshot_series_source(&source_repo.join("series"))?;
-    let malformed_error = read_series_rows(&malformed_snapshot)
-        .expect_err("a malformed committed series row was skipped");
-    if !malformed_error.contains("malformed series row")
-        || !malformed_error.contains("2026-08-b.jsonl:1")
-    {
-        return Err(format!(
-            "malformed-row refusal did not identify its source: {malformed_error}"
-        ));
-    }
-
-    fs::write(&second_shard, &source_json)
-        .map_err(|e| format!("cannot write truncated series snapshot shard: {e}"))?;
-    commit_source("truncated row")?;
-    let truncated_snapshot = snapshot_series_source(&source_repo.join("series"))?;
-    let truncated_error = read_series_rows(&truncated_snapshot)
-        .expect_err("a nonempty shard without a trailing newline was accepted");
-    if !truncated_error.contains("must end in a newline")
-        || !truncated_error.contains("2026-08-b.jsonl")
-    {
-        return Err(format!(
-            "truncated-shard refusal did not identify its source: {truncated_error}"
-        ));
-    }
-
-    let mut invalid_row = source_row.clone();
-    invalid_row.series.kernel_version = None;
-    let invalid_json = serde_json::to_string(&invalid_row)
-        .map_err(|e| format!("cannot encode invalid series row: {e}"))?;
-    fs::write(&second_shard, format!("{invalid_json}\n"))
-        .map_err(|e| format!("cannot write invalid series snapshot shard: {e}"))?;
-    commit_source("read-invalid row")?;
-    let invalid_snapshot = snapshot_series_source(&source_repo.join("series"))?;
-    let invalid_error = read_series_rows(&invalid_snapshot)
-        .expect_err("a row rejected by the shared read boundary was admitted");
-    if !invalid_error.contains("invalid series row")
-        || !invalid_error.contains("2026-08-b.jsonl:1")
-        || !invalid_error.contains("missing kernel_version")
-    {
-        return Err(format!(
-            "read-invalid row refusal did not identify its source and reason: {invalid_error}"
-        ));
-    }
-
-    fs::write(&second_shard, format!("{source_json}\n"))
-        .map_err(|e| format!("cannot restore duplicate series snapshot shard: {e}"))?;
-    commit_source("restore canonical rows")?;
-    let untracked_shard = source_dir.join("untracked.jsonl");
-    fs::write(&untracked_shard, format!("{source_json}\n"))
-        .map_err(|e| format!("cannot write untracked series snapshot shard: {e}"))?;
-    let untracked_error = snapshot_series_source(&source_repo.join("series"))
-        .expect_err("an untracked JSONL shard entered the source population");
-    if !untracked_error.contains("worktree-only JSONL shard")
-        || !untracked_error.contains("untracked.jsonl")
-    {
-        return Err(format!(
-            "untracked-shard refusal did not identify the population mismatch: {untracked_error}"
-        ));
+    // Refusals that need a worktree to change under a committed source build
+    // a scratch repository, so they run in the commands tier.
+    if include_commands {
+        series_snapshot_worktree_brackets(&source_row)?;
     }
 
     // A legacy file with no `projection` key must still load -- the demotion is
@@ -25612,9 +25842,15 @@ fn self_test() -> Result<(), String> {
         );
     }
 
-    println!(
-        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
-    );
+    if include_commands {
+        println!(
+            "compatibility scorecard self-test (regression and commands tiers): retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, command-line, retained-history, series-worktree, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        );
+    } else {
+        println!(
+            "compatibility scorecard self-test (regression tier): retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass; `self-test-commands` runs the command-line, retained-history, and series-worktree brackets"
+        );
+    }
     Ok(())
 }
 

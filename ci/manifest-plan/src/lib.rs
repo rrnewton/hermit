@@ -22,6 +22,7 @@ pub mod parity;
 mod proc_locks_lease;
 pub mod retired_ids;
 pub mod runner;
+pub mod self_test_selection;
 pub mod service_result;
 pub mod stress_series;
 pub mod timeouts;

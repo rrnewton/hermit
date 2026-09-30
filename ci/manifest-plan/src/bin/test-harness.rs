@@ -36,6 +36,7 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::write_junit;
+use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapability;
@@ -779,7 +780,46 @@ fn run_tool_self_test(values: &[String]) -> ExitCode {
         });
     let root = root();
     let started = std::time::Instant::now();
-    run_audit(&root, &root.join(tool.program), tool.args);
+    if let Some(triggers) = tool.run_when_changed {
+        // The NOT RUN message is one line and the node's last, so the
+        // scheduler keeps it as the node's summary.
+        let selection = std::env::var(self_test_selection::SELECTION_ENV).ok();
+        match self_test_selection::decide(
+            selection.as_deref(),
+            self_test_selection::change_set(&root),
+            triggers,
+        ) {
+            self_test_selection::Decision::Skip { base, changed } => {
+                println!(
+                    "{}",
+                    self_test_selection::not_run_line(tool.name, &base, &changed, triggers)
+                );
+                return ExitCode::SUCCESS;
+            }
+            self_test_selection::Decision::Run(reason) => println!(
+                "test-harness: self-test {} selected ({:.3}s): {reason}",
+                tool.name,
+                started.elapsed().as_secs_f64()
+            ),
+        }
+    }
+    // Hand the helper this build wrote beside us to a program that would
+    // otherwise build it with Cargo inside the node's CPU cap (see
+    // MANIFEST_PLAN_BIN_ENV in ci/compat-envelope/scorecard.rs).
+    let mut envs = Vec::new();
+    if tool.manifest_plan_helper {
+        let helper = sibling_manifest_plan()
+            .filter(|helper| helper.is_file())
+            .unwrap_or_else(|| {
+                fail(format!(
+                    "self-test {} needs the hermit-manifest-plan binary built beside \
+                     test-harness; build both with `cargo build -p hermit-manifest-plan --bins`",
+                    tool.name
+                ))
+            });
+        envs.push((MANIFEST_PLAN_BIN_ENV, helper));
+    }
+    run_audit_with_env(&root, &root.join(tool.program), tool.args, &envs);
     println!(
         "test-harness: self-test {} passed: {}; elapsed={:.3}s",
         tool.name,
@@ -860,13 +900,8 @@ fn audit_cli_brackets(root: &Path) {
 }
 
 fn run_manifest_plan(root: &Path) {
-    let manifest_plan = std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.parent()
-                .map(|parent| parent.join("hermit-manifest-plan"))
-        })
-        .unwrap_or_else(|| root.join("target/debug/hermit-manifest-plan"));
+    let manifest_plan =
+        sibling_manifest_plan().unwrap_or_else(|| root.join("target/debug/hermit-manifest-plan"));
     let status = Command::new(&manifest_plan)
         .args(["--format", "json"])
         .current_dir(root)
@@ -1053,9 +1088,26 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     cell_count
 }
 
+/// Read by ci/compat-envelope/scorecard.rs: a prepared `hermit-manifest-plan`
+/// binary to run instead of `cargo run`.
+const MANIFEST_PLAN_BIN_ENV: &str = "HERMIT_MANIFEST_PLAN_BIN";
+
+/// The `hermit-manifest-plan` binary beside this executable.
+fn sibling_manifest_plan() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|path| {
+        path.parent()
+            .map(|parent| parent.join("hermit-manifest-plan"))
+    })
+}
+
 fn run_audit(root: &Path, program: &Path, args: &[&str]) {
+    run_audit_with_env(root, program, args, &[]);
+}
+
+fn run_audit_with_env(root: &Path, program: &Path, args: &[&str], envs: &[(&str, PathBuf)]) {
     let status = Command::new(program)
         .args(args)
+        .envs(envs.iter().map(|(name, value)| (name, value)))
         .current_dir(root)
         .status()
         .unwrap_or_else(|error| fail(format!("cannot execute {}: {error}", program.display())));
