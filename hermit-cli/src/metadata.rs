@@ -433,6 +433,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         kvm_shared_dequeue_timers: false,
         backend_supports_parked_write_signal_interruption: true,
         backend_supports_blocked_wait_signal_interruption: false,
+        backend_may_skip_kernel_syscall_restart: false,
         backend_virtualizes_capability_prctls: false,
         backend_defers_vfork_child_registration: false,
         has_uts_namespace: true,
