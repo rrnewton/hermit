@@ -43,6 +43,15 @@
 //!            violation". Distinct from the pin being off-history.
 //!   * `ls-remote` cannot resolve the authority tip
 //!         -> BLOCKED rc=1 (pre-existing behaviour, kept).
+//!   * Git configuration would send the authority URL somewhere else -- a
+//!     `url.<base>.insteadOf` rule in ANY scope (system, global, repository,
+//!     environment), or a `remote.<name>.url` named after the URL -- so the
+//!     answer would come from a repository nobody named
+//!         -> BLOCKED rc=1 at the tip query, CHECKER ERROR rc=2 at the graph
+//!            fetch. Never answered from the rewritten target: on 2026-09-30
+//!            a global rewrite to a local mirror whose `main` was 2 commits
+//!            behind GitHub made this gate call a correct pin off-history
+//!            (https://github.com/rrnewton/hermit/issues/3398).
 //!   * the monotonicity BASE cannot be resolved (no such ref, a depth-1 clone
 //!     with no `origin/main`, an incoherent base pinning two revisions)
 //!         -> CHECKER ERROR rc=2 unless `--no-base` is passed. An unevaluated
@@ -92,7 +101,21 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie.git";
+/// The authority: the URL whose `refs/heads/main` defines "Reverie main".
+///
+/// DELIBERATELY WITHOUT `.git`. GitHub serves both spellings, but hosts in
+/// this fleet carry a global `url.<local mirror>.insteadOf
+/// https://github.com/rrnewton/reverie.git`, and `insteadOf` is a prefix match,
+/// so the `.git` spelling is silently answered by a local mirror that can be
+/// hours behind (https://github.com/rrnewton/hermit/issues/3398). That rewrite
+/// does not match this spelling, and neither do the forward-proxy wrapper's
+/// environment rewrites. The spelling is only the first line of defence:
+/// [`refuse_rewritten_authority_url`] asks Git for the effective URL before
+/// every authority command and refuses if ANY configuration rewrites this one.
+///
+/// Manifests keep the `.git` spelling; that is Cargo's source identity and is
+/// matched separately (`is_reverie_git_source`), never compared to this.
+const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie";
 const MAIN_REF: &str = "refs/heads/main";
 const DEFAULT_BASE_REF: &str = "origin/main";
 struct Config {
@@ -684,8 +707,10 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
     }
     let graph = GuardedGitRepo::open(&cache, root)?;
     // The fetch below contacts `remote`, and what it brings back is the graph
-    // every ancestry answer is read from. Same authority, same check.
-    refuse_rewritten_authority_url(remote)?;
+    // every ancestry answer is read from. Same authority, same check -- scoped
+    // to the CACHE, because the fetch runs with `--git-dir <cache>` and obeys
+    // the cache's configuration, not the checkout's.
+    refuse_rewritten_authority_url(graph.scope(), remote)?;
     // `--filter=blob:none` is a BANDWIDTH optimization, not a correctness
     // requirement: ancestry needs commits, never blobs. It is also not
     // universally supported -- a local-PATH remote rejects it outright
@@ -840,7 +865,7 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     if head == candidate {
         return Ok(0); // CASE 1: no pin edit in this commit.
     }
-    let main = query_main(remote)?;
+    let main = query_main(root, remote)?;
     if candidate == main {
         return Ok(0); // CASE 2: bumped all the way.
     }
@@ -869,12 +894,19 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     Ok(1)
 }
 
-fn query_main(remote: &str) -> Result<String, String> {
+/// Ask the authority for its `main` tip.
+///
+/// Runs as `git -C <root>`, so the repository configuration this query obeys is
+/// the checkout's, stated rather than inherited from whatever directory the
+/// process happened to start in -- and the rewrite probe below is built with
+/// the SAME scope, so it inspects exactly the configuration the query obeys.
+fn query_main(root: &Path, remote: &str) -> Result<String, String> {
+    let scope = AuthorityScope::Checkout(root);
     // The tip this returns IS the authority: every later comparison is against
     // it. Prove the URL is the one named before asking it anything.
-    refuse_rewritten_authority_url(remote)?;
+    refuse_rewritten_authority_url(scope, remote)?;
     let output = under_git_env(|| {
-        authority_git_command()?
+        authority_git_command_in(scope)?
             .args(["ls-remote", "--exit-code", remote, MAIN_REF])
             .output()
             .map_err(|error| format!("could not run git ls-remote: {error}"))
@@ -1031,6 +1063,36 @@ fn authority_git_command() -> Result<Command, String> {
     // Set after environment isolation so the effective override cannot be
     // cleared or inherited from a caller. No repository/global config changes.
     command.env("GIT_GRAFT_FILE", "/dev/null");
+    // TEST SEAM, compiled out of the real checker: lets a test hand the child
+    // a fixture GLOBAL configuration file, which is where the 2026-09-30
+    // rewrite lived, without mutating this process's environment.
+    #[cfg(test)]
+    tests::apply_fixture_global_config(&mut command);
+    Ok(command)
+}
+
+/// The repository whose configuration an authority command obeys.
+///
+/// A URL rewrite can live in the repository's own config as well as in the
+/// system, global and environment scopes, so "the effective URL" is only
+/// defined relative to a repository. The query and the probe that vets it must
+/// therefore agree on the repository, and they agree by construction: both are
+/// built from the same `AuthorityScope` by [`authority_git_command_in`].
+#[derive(Clone, Copy, Debug)]
+enum AuthorityScope<'a> {
+    /// `git -C <checkout>`: the Hermit checkout under judgement.
+    Checkout(&'a Path),
+    /// `git --git-dir <cache>`: the guarded Reverie graph cache.
+    GitDir(&'a Path),
+}
+
+/// [`authority_git_command`] aimed at `scope`.
+fn authority_git_command_in(scope: AuthorityScope) -> Result<Command, String> {
+    let mut command = authority_git_command()?;
+    match scope {
+        AuthorityScope::Checkout(dir) => command.arg("-C").arg(dir),
+        AuthorityScope::GitDir(git_dir) => command.arg("--git-dir").arg(git_dir),
+    };
     Ok(command)
 }
 
@@ -1038,9 +1100,7 @@ fn authority_git_command() -> Result<Command, String> {
 /// setup/mutation commands on git_in, but read the recorded base immutably.
 fn authority_git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     under_git_env(|| {
-        authority_git_command()?
-            .arg("-C")
-            .arg(dir)
+        authority_git_command_in(AuthorityScope::Checkout(dir))?
             .args(args)
             .output()
             .map_err(|error| format!("could not read immutable Git base: {error}"))
@@ -1115,7 +1175,23 @@ fn rewritten_remote(remote: &str, rewrites: &[(String, String)]) -> Option<Strin
 /// touch the authority URL is left alone, and one that CHANGES it is refused,
 /// loudly, naming both URLs. Refusing rather than stripping keeps the proxy
 /// working and makes the redirection impossible to mistake for a network error.
-fn refuse_rewritten_authority_url(remote: &str) -> Result<(), String> {
+///
+/// TWO LAYERS, because the environment is not the only place a rewrite lives.
+/// [`refuse_env_rewritten_authority_url`] names the environment spelling
+/// precisely; [`refuse_config_rewritten_authority_url`] then asks Git itself,
+/// in the command's own `scope`, which URL it would really contact. The second
+/// layer is the one that closes the hole: the first only ever parsed
+/// `GIT_CONFIG_COUNT`, and on 2026-09-30 the redirect came from `~/.gitconfig`
+/// (https://github.com/rrnewton/hermit/issues/3398).
+fn refuse_rewritten_authority_url(scope: AuthorityScope, remote: &str) -> Result<(), String> {
+    refuse_env_rewritten_authority_url(remote)?;
+    refuse_config_rewritten_authority_url(scope, remote)
+}
+
+/// The environment layer: rewrites carried by `GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_PARAMETERS`, named by variable. Runs no Git, which is what lets
+/// the tests drive it under `with_config_override`.
+fn refuse_env_rewritten_authority_url(remote: &str) -> Result<(), String> {
     if let Some(rewritten) = rewritten_remote(remote, &env_url_rewrites()) {
         return Err(format!(
             "REFUSING to resolve the Reverie authority through a rewritten URL: an inherited \
@@ -1141,6 +1217,119 @@ fn refuse_rewritten_authority_url(remote: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The configuration layer: ask Git which URL it would really contact.
+///
+/// `git ls-remote --get-url <url>` prints the URL after every rewrite Git
+/// applies -- `insteadOf` from the system, global, repository and environment
+/// scopes, longest match first, and a `remote.<name>.url` whose name is the URL
+/// itself -- without contacting anything. It is built by
+/// [`authority_git_command_in`] from the SAME `scope`, inside the same
+/// [`under_git_env`] guard, as the command it vets, so it reads exactly the
+/// configuration that command will obey. Re-deriving Git's rules here instead
+/// is how the environment-only check came to miss a config-file rewrite.
+///
+/// FAILS CLOSED: if Git cannot answer, the URL is unproven and the caller is
+/// refused rather than allowed to take the verdict from an unproven URL.
+fn refuse_config_rewritten_authority_url(
+    scope: AuthorityScope,
+    remote: &str,
+) -> Result<(), String> {
+    let output = under_git_env(|| {
+        authority_git_command_in(scope)?
+            .args(["ls-remote", "--get-url", remote])
+            .output()
+            .map_err(|error| format!("could not run git ls-remote --get-url: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "REFUSING to resolve the Reverie authority: `git ls-remote --get-url {remote}` failed \
+             {}, so the URL Git would actually contact is unknown: {}",
+            scope.describe(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let effective = stdout.strip_suffix('\n').unwrap_or(&stdout);
+    if effective == remote {
+        return Ok(());
+    }
+    Err(format!(
+        "REFUSING to resolve the Reverie authority through a rewritten URL: Git configuration \
+         {} redirects {remote} to {effective}. That repository, not the authority, would \
+         answer, while every message here still named {remote}. {} Remove or narrow the rule \
+         (see `git config --show-origin --get-regexp '^url\\.'`), then rerun.",
+        scope.describe(),
+        rewrite_sources(scope, remote)
+    ))
+}
+
+/// Name the `insteadOf` entries that match `remote` in `scope`, with the scope
+/// and file each comes from, for the refusal message. Diagnostic only: the
+/// refusal has already been decided, and nothing here can reverse it.
+fn rewrite_sources(scope: AuthorityScope, remote: &str) -> String {
+    let listed = under_git_env(|| {
+        authority_git_command_in(scope)?
+            .args([
+                "config",
+                "--show-scope",
+                "--show-origin",
+                "--null",
+                "--get-regexp",
+                r"^url\..*\.insteadof$",
+            ])
+            .output()
+            .map_err(|error| format!("could not run git config: {error}"))
+    });
+    let output = match listed {
+        Ok(output) => output,
+        Err(error) => return format!("(Could not list the responsible rules: {error}.)"),
+    };
+    // Exit 1 with no output is `--get-regexp`'s "no match"; anything else is
+    // a failure worth showing.
+    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
+        return format!(
+            "(Could not list the responsible rules: {}.)",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    // `--null` with both `--show-*` flags emits, per entry, three NUL-ended
+    // fields: scope, origin, and `key\nvalue`.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<&str> = stdout.split('\0').collect();
+    let matching: Vec<String> = fields
+        .chunks(3)
+        .filter_map(|entry| match entry {
+            [scope_name, origin, key_value] => {
+                let (key, pattern) = key_value.split_once('\n')?;
+                (!pattern.is_empty() && remote.starts_with(pattern))
+                    .then(|| format!("[{scope_name}] {origin}: {key} = {pattern}"))
+            }
+            _ => None,
+        })
+        .collect();
+    if matching.is_empty() {
+        format!(
+            "No url.<base>.insteadOf rule matches {remote}, so another mechanism is redirecting \
+             it -- for example a remote.<name>.url entry whose name is this URL (`git config \
+             --show-origin --get-regexp '^remote\\.'` lists them)."
+        )
+    } else {
+        format!("Matching rule(s): {}.", matching.join("; "))
+    }
+}
+
+impl AuthorityScope<'_> {
+    /// Where the configuration was read from, for messages.
+    fn describe(&self) -> String {
+        match self {
+            AuthorityScope::Checkout(dir) => format!("as seen from the checkout {}", dir.display()),
+            AuthorityScope::GitDir(git_dir) => {
+                format!("as seen from the Reverie graph cache {}", git_dir.display())
+            }
+        }
+    }
 }
 
 fn isolated_git_in(dir: &Path, args: &[&str]) -> Result<Output, String> {
@@ -1325,14 +1514,19 @@ impl GuardedGitRepo {
         })
     }
 
+    /// The repository scope every command against this cache runs in. The graph
+    /// fetch's rewrite probe uses it too, so the probe reads exactly the
+    /// configuration the fetch obeys.
+    fn scope(&self) -> AuthorityScope<'_> {
+        AuthorityScope::GitDir(&self.git_dir)
+    }
+
     /// Every graph query runs through here, so every ancestry answer is
     /// computed with replacement refs and grafts disabled -- see
     /// [`authority_git_command`]. This is the method that decides the verdict.
     fn run(&self, args: &[&str]) -> Result<Output, String> {
         under_git_env(|| {
-            authority_git_command()?
-                .arg("--git-dir")
-                .arg(&self.git_dir)
+            authority_git_command_in(self.scope())?
                 .args(args)
                 .output()
                 .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
@@ -2411,7 +2605,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     #[cfg(test)]
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
     let base_ref = config.base_ref.as_str();
-    let main_result = query_main(remote);
+    let main_result = query_main(&root, remote);
 
     let main = match main_result {
         Ok(main) => main,
@@ -4871,6 +5065,12 @@ mod tests {
     /// comment that it had guarded them all. Do not restate the coverage without
     /// recounting it: the failure mode of a partial guard is that it looks like
     /// a total one.
+    ///
+    /// DELTA, not a recount (2026-09-30,
+    /// https://github.com/rrnewton/hermit/issues/3398): two git fork sites were
+    /// added after the count above -- `ls-remote --get-url` in
+    /// `refuse_config_rewritten_authority_url` and `config --get-regexp` in
+    /// `rewrite_sources` -- and both run inside `under_git_env`.
     static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     /// Hold the read side across a git invocation, so no writer can publish a
@@ -4884,6 +5084,39 @@ mod tests {
         ENV_LOCK
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    thread_local! {
+        /// Fixture GLOBAL Git configuration for authority commands built on
+        /// this thread. `None` (the default) leaves the child on the real one.
+        static FIXTURE_GLOBAL_CONFIG: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The seam `authority_git_command` calls. It sets a variable on the CHILD
+    /// only; this process's environment is never touched, so it needs no lock
+    /// and cannot leak into a concurrently running test.
+    pub(super) fn apply_fixture_global_config(command: &mut Command) {
+        FIXTURE_GLOBAL_CONFIG.with(|slot| {
+            if let Some(path) = slot.borrow().as_ref() {
+                command.env("GIT_CONFIG_GLOBAL", path);
+            }
+        });
+    }
+
+    /// Run `body` with every authority command built on this thread reading
+    /// `config` as its global (`~/.gitconfig`) configuration, the scope the
+    /// 2026-09-30 rewrite lived in. Reset on the way out, panic included.
+    fn with_fixture_global_config<T>(config: &Path, body: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FIXTURE_GLOBAL_CONFIG.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        FIXTURE_GLOBAL_CONFIG.with(|slot| *slot.borrow_mut() = Some(config.to_path_buf()));
+        let _reset = Reset;
+        body()
     }
 
     /// Set the numbered Git config override variables, run `body`, and restore
@@ -5001,8 +5234,12 @@ mod tests {
     #[test]
     fn an_inherited_url_rewrite_of_the_authority_is_refused() {
         let remote = "https://github.com/rrnewton/reverie.git";
+        // The ENVIRONMENT layer is driven directly: `with_config_override` holds
+        // the write lock, and the configuration layer runs Git, which takes the
+        // read lock and would hang here. The configuration layer has its own
+        // tests below, which need no environment mutation at all.
         let error = with_config_override(&[("url./tmp/evil.git.insteadOf", remote)], || {
-            refuse_rewritten_authority_url(remote)
+            refuse_env_rewritten_authority_url(remote)
                 .expect_err("a redirected authority URL must be refused")
         });
         assert!(
@@ -5015,10 +5252,382 @@ mod tests {
         with_config_override(
             &[("url.https://github.com/.insteadOf", "git@github.com:")],
             || {
-                refuse_rewritten_authority_url(remote)
+                refuse_env_rewritten_authority_url(remote)
                     .expect("a rewrite that does not touch the authority URL must be allowed")
             },
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // CONFIGURATION-FILE REWRITES (https://github.com/rrnewton/hermit/issues/3398)
+    //
+    // On 2026-09-30 `~/.gitconfig` carried
+    //   url.<local mirror>.insteadof https://github.com/rrnewton/reverie.git
+    // and the environment-only check above never saw it. The mirror's `main`
+    // was 2 commits behind GitHub, so a correct pin was reported off-history.
+    // Every test below puts the rewrite in a configuration FILE -- the
+    // checkout's, the graph cache's, or a global one -- never in the
+    // environment, and points it at a real local repository with a stale or
+    // off-history `main`, so the unguarded code has a wrong answer to give.
+    // ---------------------------------------------------------------------
+
+    /// A bare copy of `authority` whose `main` is forced to `tip`: the stale
+    /// host mirror.
+    fn mirror_with_main(label: &str, authority: &Path, tip: &str) -> PathBuf {
+        let mirror = temp_path(label);
+        let cloned = fixture_git()
+            .args(["clone", "--quiet", "--bare"])
+            .arg(authority)
+            .arg(&mirror)
+            .output()
+            .expect("clone the mirror fixture");
+        assert!(
+            cloned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        assert!(
+            git_in(&mirror, &["update-ref", "refs/heads/main", tip])
+                .unwrap()
+                .status
+                .success()
+        );
+        mirror
+    }
+
+    /// A global configuration file whose only content is one `insteadOf`.
+    fn global_config_redirecting(label: &str, pattern: &str, target: &Path) -> PathBuf {
+        let config = temp_path(label);
+        fs::write(
+            &config,
+            format!("[url \"{}\"]\n\tinsteadOf = {pattern}\n", target.display()),
+        )
+        .expect("write fixture global config");
+        config
+    }
+
+    /// The tip the UNGUARDED authority command would report, so each test can
+    /// prove its rewrite is live -- i.e. that there is a wrong answer on offer
+    /// and the refusal is what withholds it, not a fixture that never rewrote.
+    fn unguarded_tip(scope: AuthorityScope, remote: &str) -> String {
+        let output = under_git_env(|| {
+            authority_git_command_in(scope)?
+                .args(["ls-remote", "--exit-code", remote, MAIN_REF])
+                .output()
+                .map_err(|error| error.to_string())
+        })
+        .expect("run the unguarded ls-remote");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The tip query refuses a rewrite written into the CHECKOUT's own
+    /// `.git/config`, names both URLs and the rule's origin, and never returns
+    /// the mirror's stale tip. A non-matching rule in the same file is allowed.
+    #[test]
+    fn a_checkout_config_rewrite_of_the_authority_is_refused_by_the_tip_query() {
+        let (authority, old, latest, _off) = shared_reverie();
+        let remote = authority.to_str().expect("UTF-8 fixture path");
+        let mirror = mirror_with_main("checkout-rewrite-mirror", authority, old);
+        let root = temp_path("checkout-rewrite-hermit");
+        init_fixture_repo(&root);
+        let scope = AuthorityScope::Checkout(&root);
+
+        // POSITIVE CONTROLS: no rule, then a rule that matches something else.
+        assert_eq!(query_main(&root, remote).as_deref(), Ok(latest.as_str()));
+        let unrelated = format!("url.{}.insteadOf", mirror.display());
+        assert!(
+            git_in(&root, &["config", &unrelated, "/no/such/authority"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            query_main(&root, remote).as_deref(),
+            Ok(latest.as_str()),
+            "an insteadOf that does not match the authority must be left alone"
+        );
+
+        // THE INCIDENT, in repository scope.
+        assert!(
+            git_in(&root, &["config", "--add", &unrelated, remote])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            &unguarded_tip(scope, remote),
+            old,
+            "fixture must actually redirect the authority to the stale mirror"
+        );
+        let error = query_main(&root, remote)
+            .expect_err("a config-file rewrite of the authority must be refused, not believed");
+        assert!(
+            error.contains("REFUSING to resolve the Reverie authority through a rewritten URL")
+                && error.contains(&format!("redirects {remote} to {}", mirror.display()))
+                && error.contains("[local]"),
+            "the refusal must name both URLs and the rule's scope: {error}"
+        );
+
+        fs::remove_dir_all(&root).expect("remove Hermit fixture");
+        fs::remove_dir_all(&mirror).expect("remove mirror fixture");
+    }
+
+    /// The graph fetch refuses a rewrite written into the CACHE's config, and
+    /// the cache's `main` is not moved to the mirror's tip.
+    #[test]
+    fn a_graph_cache_config_rewrite_of_the_authority_is_refused_before_the_fetch() {
+        let (authority, old, latest, _off) = shared_reverie();
+        let remote = authority.to_str().expect("UTF-8 fixture path");
+        let mirror = mirror_with_main("cache-rewrite-mirror", authority, old);
+        let root = temp_path("cache-rewrite-hermit");
+        init_fixture_repo(&root);
+        commit_file(&root, "README", "fixture\n");
+
+        let graph = reverie_graph(&root, remote).expect("POSITIVE CONTROL: unrewritten fetch");
+        let cache = graph.git_dir.clone();
+        let cache_main = |graph: &GuardedGitRepo| {
+            String::from_utf8_lossy(&graph.run(&["rev-parse", MAIN_REF]).unwrap().stdout)
+                .trim()
+                .to_string()
+        };
+        assert_eq!(&cache_main(&graph), latest);
+
+        let configured = fixture_git()
+            .arg("--git-dir")
+            .arg(&cache)
+            .args([
+                "config",
+                &format!("url.{}.insteadOf", mirror.display()),
+                remote,
+            ])
+            .output()
+            .expect("write the cache rewrite");
+        assert!(configured.status.success());
+        assert_eq!(
+            &unguarded_tip(graph.scope(), remote),
+            old,
+            "fixture must actually redirect the cache's fetch to the stale mirror"
+        );
+
+        let error = reverie_graph(&root, remote)
+            .expect_err("a rewrite in the graph cache's config must be refused");
+        assert!(
+            error.contains("REFUSING to resolve the Reverie authority through a rewritten URL")
+                && error.contains("Reverie graph cache")
+                && error.contains(&mirror.display().to_string()),
+            "the refusal must say which repository's config redirected and where to: {error}"
+        );
+        assert_eq!(
+            &cache_main(&graph),
+            latest,
+            "the refused fetch must not have force-moved the cache's main to the mirror's tip"
+        );
+
+        fs::remove_dir_all(&root).expect("remove Hermit fixture");
+        fs::remove_dir_all(&mirror).expect("remove mirror fixture");
+    }
+
+    /// RUN 1973's shape end to end, in GLOBAL scope, in the dangerous
+    /// direction: the mirror's `main` is an OFF-HISTORY commit and the pin
+    /// names it. Unguarded, both the tip query and the graph fetch go to the
+    /// mirror, the pin is its own ancestor, and the gate PASSES (rc 0). It
+    /// must block instead.
+    #[test]
+    fn a_global_config_rewrite_cannot_certify_an_off_history_pin() {
+        let (authority, _old, _latest, off) = shared_reverie();
+        let remote = authority.to_str().expect("UTF-8 fixture path");
+        let mirror = mirror_with_main("global-rewrite-mirror", authority, off);
+        let global = global_config_redirecting("global-rewrite-config", remote, &mirror);
+        let root = hermit_fixture("global-rewrite-hermit", off, off);
+        let run = || {
+            run_with_config(Config {
+                repo: Some(root.clone()),
+                remote: Some(remote.to_string()),
+                no_base: true,
+                ..Config::default()
+            })
+        };
+
+        // CONTROL: against the real authority the pin is off-history.
+        assert_eq!(run(), Ok(1), "the off-history pin is refused unrewritten");
+
+        with_fixture_global_config(&global, || {
+            assert_eq!(
+                &unguarded_tip(AuthorityScope::Checkout(&root), remote),
+                off,
+                "fixture must actually redirect the authority to the mirror"
+            );
+            let error = refuse_rewritten_authority_url(AuthorityScope::Checkout(&root), remote)
+                .expect_err("the global rewrite must be refused");
+            assert!(
+                error.contains("[global]")
+                    && error.contains(&format!("redirects {remote} to {}", mirror.display())),
+                "the refusal must name the global rule and both URLs: {error}"
+            );
+            assert_eq!(
+                run(),
+                Ok(1),
+                "a rewrite to a mirror whose main is the pin must BLOCK, never PASS"
+            );
+        });
+
+        fs::remove_dir_all(&root).expect("remove Hermit fixture");
+        fs::remove_dir_all(&mirror).expect("remove mirror fixture");
+        fs::remove_file(&global).expect("remove fixture global config");
+    }
+
+    /// `--update-to-latest` writes whatever tip the authority query returns,
+    /// with no ordering check. Behind a rewrite to a stale mirror that is a
+    /// silent DOWNGRADE of every manifest; it must refuse and write nothing.
+    #[test]
+    fn update_to_latest_never_writes_a_rewritten_mirror_tip() {
+        let (authority, old, latest, _off) = shared_reverie();
+        let remote = authority.to_str().expect("UTF-8 fixture path");
+        let mirror = mirror_with_main("update-rewrite-mirror", authority, old);
+        let global = global_config_redirecting("update-rewrite-config", remote, &mirror);
+        let root = hermit_fixture("update-rewrite-hermit", latest, latest);
+        let before = fs::read(root.join("Cargo.toml")).expect("read manifest");
+
+        let outcome = with_fixture_global_config(&global, || {
+            run_with_config(Config {
+                repo: Some(root.clone()),
+                remote: Some(remote.to_string()),
+                update_to_latest: true,
+                skip_verify_build: true,
+                no_base: true,
+                ..Config::default()
+            })
+        });
+        assert_eq!(
+            outcome,
+            Ok(1),
+            "an update behind a rewritten authority must block"
+        );
+        assert_eq!(
+            fs::read(root.join("Cargo.toml")).expect("reread manifest"),
+            before,
+            "no manifest may be rewritten to the stale mirror's tip {old}"
+        );
+
+        fs::remove_dir_all(&root).expect("remove Hermit fixture");
+        fs::remove_dir_all(&mirror).expect("remove mirror fixture");
+        fs::remove_file(&global).expect("remove fixture global config");
+    }
+
+    /// A `remote.<name>.url` whose name IS the authority URL redirects it as
+    /// surely as an `insteadOf` -- `git fetch --filter` has written such
+    /// sections by itself (https://github.com/rrnewton/hermit/issues/3397) --
+    /// and parsing `insteadOf` rules cannot see it. Asking Git can. The global
+    /// scope is pinned to an empty fixture so the host's own rules cannot
+    /// decide this test.
+    #[test]
+    fn a_remote_named_after_the_authority_url_is_refused() {
+        let cache = temp_path("remote-name-cache");
+        let init = fixture_git()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&cache)
+            .output()
+            .expect("init cache fixture");
+        assert!(init.status.success());
+        let empty = temp_path("remote-name-empty-global");
+        fs::write(&empty, "").expect("write empty global config");
+        let scope = AuthorityScope::GitDir(&cache);
+
+        with_fixture_global_config(&empty, || {
+            refuse_rewritten_authority_url(scope, DEFAULT_REMOTE)
+                .expect("POSITIVE CONTROL: nothing redirects the authority yet");
+            let named = fixture_git()
+                .arg("--git-dir")
+                .arg(&cache)
+                .args([
+                    "config",
+                    &format!("remote.{DEFAULT_REMOTE}.url"),
+                    "/stale/local/mirror",
+                ])
+                .output()
+                .expect("name a remote after the authority");
+            assert!(named.status.success());
+            let error = refuse_rewritten_authority_url(scope, DEFAULT_REMOTE)
+                .expect_err("a remote named after the authority URL must be refused");
+            assert!(
+                error.contains(&format!(
+                    "redirects {DEFAULT_REMOTE} to /stale/local/mirror"
+                )) && error.contains("No url.<base>.insteadOf rule matches"),
+                "the refusal must name the target and say no insteadOf rule did it: {error}"
+            );
+        });
+
+        fs::remove_dir_all(&cache).expect("remove cache fixture");
+        fs::remove_file(&empty).expect("remove fixture global config");
+    }
+
+    /// FAIL CLOSED: when Git cannot say which URL it would contact, the
+    /// authority is unproven and the probe refuses rather than waving it on.
+    #[test]
+    fn an_unanswerable_rewrite_probe_refuses() {
+        let missing = temp_path("rewrite-probe-missing");
+        let error =
+            refuse_rewritten_authority_url(AuthorityScope::Checkout(&missing), DEFAULT_REMOTE)
+                .expect_err("a probe that cannot run must refuse");
+        assert!(
+            error.contains("REFUSING to resolve the Reverie authority")
+                && error.contains("--get-url"),
+            "the refusal must say the effective URL could not be established: {error}"
+        );
+    }
+
+    /// The authority spelling is itself a defence: the fleet's global rule
+    /// rewrites the `.git` spelling to a local mirror, and must not match the
+    /// one this checker asks. Checked through real Git with that exact rule in
+    /// a fixture global config, and against the forward-proxy wrapper's shape.
+    #[test]
+    fn the_fleet_mirror_rule_does_not_match_the_authority_spelling() {
+        let dotgit = "https://github.com/rrnewton/reverie.git";
+        assert_ne!(DEFAULT_REMOTE, dotgit);
+        let root = temp_path("spelling-hermit");
+        init_fixture_repo(&root);
+        let host_rule = global_config_redirecting(
+            "spelling-config",
+            dotgit,
+            Path::new("/home/newton/work/dev-hermit/hermit/.git/modules/reverie"),
+        );
+        with_fixture_global_config(&host_rule, || {
+            let scope = AuthorityScope::Checkout(&root);
+            refuse_rewritten_authority_url(scope, DEFAULT_REMOTE)
+                .expect("the host's mirror rule must not match the authority spelling");
+            // BRACKET: the same rule DOES capture the `.git` spelling, so the
+            // pass above is the spelling's doing, not an inert fixture.
+            let error = refuse_rewritten_authority_url(scope, dotgit)
+                .expect_err("the host's mirror rule rewrites the .git spelling");
+            assert!(error.contains("[global]"), "{error}");
+        });
+        let proxy = vec![
+            (
+                "git@github.com:".to_string(),
+                "https://github.com/".to_string(),
+            ),
+            (
+                "ssh://git@github.com/".to_string(),
+                "https://github.com/".to_string(),
+            ),
+            (
+                "git://github.com/".to_string(),
+                "https://github.com/".to_string(),
+            ),
+        ];
+        assert_eq!(rewritten_remote(DEFAULT_REMOTE, &proxy), None);
+
+        fs::remove_dir_all(&root).expect("remove Hermit fixture");
+        fs::remove_file(&host_rule).expect("remove fixture global config");
     }
 
     /// ITEM 2. A replacement ref re-parents a commit, and that changes the
