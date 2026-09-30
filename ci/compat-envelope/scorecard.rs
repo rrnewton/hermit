@@ -3999,8 +3999,186 @@ fn build_manifest_plan() -> Result<(), String> {
     Ok(())
 }
 
-fn derive(root: &Path) -> Result<Derived, String> {
-    let mut command = match prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref())? {
+/// Names a directory where `derive` keeps each successful output of the
+/// prepared helper, filed under [`manifest_plan_cache_key`]. Only
+/// `self-test-commands` sets it, for its child commands: about 150 of them
+/// derive fixture trees whose manifest inputs rarely change, at 0.4 s of
+/// helper time per derive (measured 2026-09-30).
+const MANIFEST_PLAN_CACHE_ENV: &str = "HERMIT_MANIFEST_PLAN_CACHE";
+
+/// The files that `hermit-manifest-plan --format matrix-json` reads besides
+/// the `*.yaml` files in `tests/e2e/manifests`.
+const MANIFEST_PLAN_DATA_FILES: [&str; 4] = [
+    "tests/e2e/manifests/inventory/test-files.json",
+    "tests/e2e/manifests/inventory/retired-ids.json",
+    "ci/matrix-symmetry-baseline.json",
+    "ci/ci-reason-baseline.json",
+];
+
+/// A digest of everything that `program --root ROOT --format matrix-json`
+/// reads, or `None` when some input cannot be read, in which case the helper
+/// runs and reports the problem itself.
+///
+/// The helper reads the `*.yaml` files in `tests/e2e/manifests` (defaults
+/// included), [`MANIFEST_PLAN_DATA_FILES`], and the output of `git ls-files
+/// --cached --others --exclude-standard -- tests`, run here exactly as the
+/// helper runs it, so that the index, ignore rules and Git environment are
+/// covered. It also checks that each manifest program is a file or a symlink,
+/// and whether its target is a file. A successful plan requires every program
+/// to appear in that listing, so the digest records both facts for every
+/// listed path. The helper reads no environment variable, and its output
+/// does not name ROOT; ROOT must be absolute because the helper runs inside
+/// it. The helper itself is identified by its file metadata, not its bytes:
+/// hashing the 120 MB debug build would cost about as much as running it.
+fn manifest_plan_cache_key(program: &Path, root: &Path) -> Result<Option<String>, String> {
+    if !root.is_absolute() {
+        return Ok(None);
+    }
+    let Ok(listing) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "tests",
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return Ok(None);
+    };
+    if !listing.status.success() {
+        return Ok(None);
+    }
+    manifest_plan_input_digest(program, root, &listing.stdout)
+}
+
+/// [`manifest_plan_cache_key`] for a given `git ls-files` listing of `tests`.
+fn manifest_plan_input_digest(
+    program: &Path,
+    root: &Path,
+    tests_listing: &[u8],
+) -> Result<Option<String>, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(b"hermit-manifest-plan --format matrix-json inputs v1");
+    let Ok(helper) = fs::metadata(program) else {
+        return Ok(None);
+    };
+    field(program.as_os_str().as_bytes());
+    for number in [
+        helper.dev(),
+        helper.ino(),
+        helper.size(),
+        helper.mtime() as u64,
+        helper.mtime_nsec() as u64,
+        helper.ctime() as u64,
+        helper.ctime_nsec() as u64,
+    ] {
+        field(&number.to_le_bytes());
+    }
+
+    let manifests = root.join("tests/e2e/manifests");
+    let Ok(entries) = fs::read_dir(&manifests) else {
+        return Ok(None);
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Ok(None);
+        };
+        names.push(entry.file_name());
+    }
+    names.sort();
+    for name in &names {
+        field(name.as_bytes());
+        let path = manifests.join(name);
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "yaml")
+        {
+            let Ok(bytes) = fs::read(&path) else {
+                return Ok(None);
+            };
+            field(b"yaml");
+            field(&bytes);
+        } else {
+            field(b"unread");
+        }
+    }
+
+    for relative in MANIFEST_PLAN_DATA_FILES {
+        field(relative.as_bytes());
+        match fs::read(root.join(relative)) {
+            Ok(bytes) => {
+                field(b"present");
+                field(&bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => field(b"absent"),
+            Err(_) => return Ok(None),
+        }
+    }
+
+    // The helper parses the listing with `str::lines`; checking the same
+    // paths keeps a `\r` or a quoted name from splitting the two views.
+    let Ok(listing) = std::str::from_utf8(tests_listing) else {
+        return Ok(None);
+    };
+    field(tests_listing);
+    for listed in listing.lines() {
+        let path = root.join(listed);
+        let is_symlink =
+            fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+        field(&[u8::from(path.is_file()), u8::from(is_symlink)]);
+    }
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
+/// The helper's `matrix-json` output for `root`, reused from
+/// [`MANIFEST_PLAN_CACHE_ENV`] when an identical input was planned before.
+fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
+    let program = prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref())?;
+    let cache = match (env::var_os(MANIFEST_PLAN_CACHE_ENV), &program) {
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(format!(
+                "{MANIFEST_PLAN_CACHE_ENV} caches only a prepared helper; \
+                 {MANIFEST_PLAN_BIN_ENV} is unset"
+            ));
+        }
+        (Some(directory), Some(program)) => {
+            let directory = PathBuf::from(directory);
+            if !directory.is_absolute() || !directory.is_dir() {
+                return Err(format!(
+                    "{MANIFEST_PLAN_CACHE_ENV}={} is not an absolute path to a directory",
+                    directory.display()
+                ));
+            }
+            manifest_plan_cache_key(program, root)?.map(|key| (directory, key))
+        }
+    };
+    if let Some((directory, key)) = &cache {
+        match fs::read(directory.join(key)) {
+            Ok(stdout) => return Ok(stdout),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot read cached manifest plan {}: {error}",
+                    directory.join(key).display()
+                ));
+            }
+        }
+    }
+
+    let mut command = match &program {
         Some(program) => Command::new(program),
         None => {
             let mut command = manifest_plan_cargo("run")?;
@@ -4021,7 +4199,25 @@ fn derive(root: &Path) -> Result<Derived, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let rows: Vec<ManifestRow> = serde_json::from_slice(&output.stdout)
+
+    if let (Some((directory, key)), Some(program)) = (&cache, &program) {
+        // Keep the output only if no input changed while the helper ran.
+        if manifest_plan_cache_key(program, root)?.as_ref() == Some(key) {
+            let mut temporary = NamedTempFile::new_in(directory)
+                .map_err(|e| format!("cannot create a manifest plan cache file: {e}"))?;
+            temporary
+                .write_all(&output.stdout)
+                .map_err(|e| format!("cannot write a manifest plan cache file: {e}"))?;
+            temporary
+                .persist(directory.join(key))
+                .map_err(|e| format!("cannot store a manifest plan cache file: {}", e.error))?;
+        }
+    }
+    Ok(output.stdout)
+}
+
+fn derive(root: &Path) -> Result<Derived, String> {
+    let rows: Vec<ManifestRow> = serde_json::from_slice(&manifest_plan_matrix(root)?)
         .map_err(|e| format!("manifest-plan emitted invalid JSON: {e}"))?;
     let expected: ExpectedPlan = read_json(&root.join(EXPECTED_PLAN))?;
 
@@ -14753,6 +14949,128 @@ mod prepared_manifest_plan_tests {
             );
         }
     }
+
+    const PLAN_LISTING: &[u8] = b"tests/e2e/manifests/README.md\n\
+        tests/e2e/manifests/defaults.yaml\n\
+        tests/e2e/manifests/sample.yaml\n\
+        tests/e2e/sample/run.sh\n";
+
+    /// A plain directory holding every helper input that [`PLAN_LISTING`]
+    /// lists.
+    fn plan_inputs() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        for (relative, text) in [
+            ("tests/e2e/manifests/defaults.yaml", "schema: 1\n"),
+            ("tests/e2e/manifests/sample.yaml", "bucket: sample\n"),
+            ("tests/e2e/manifests/README.md", "not a manifest\n"),
+            ("tests/e2e/sample/run.sh", "#!/bin/sh\n"),
+        ]
+        .into_iter()
+        .chain(MANIFEST_PLAN_DATA_FILES.map(|relative| (relative, "{}\n")))
+        {
+            let path = directory.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        directory
+    }
+
+    #[test]
+    fn the_plan_cache_key_follows_every_helper_input_and_nothing_else() {
+        let helper = env::current_exe().unwrap();
+        let key = |root: &Path, listing: &[u8]| {
+            manifest_plan_input_digest(&helper, root, listing).unwrap()
+        };
+        let original = plan_inputs();
+        let expected = key(original.path(), PLAN_LISTING);
+        assert!(expected.is_some(), "readable inputs have a key");
+        // The same content in another directory plans the same matrix.
+        assert_eq!(key(plan_inputs().path(), PLAN_LISTING), expected);
+
+        let unchanged: [(&str, fn(&Path)); 1] =
+            [("non-YAML file in the manifest directory", |root| {
+                fs::write(root.join("tests/e2e/manifests/README.md"), "edited\n").unwrap()
+            })];
+        let mut changed: Vec<(String, Box<dyn Fn(&Path)>)> = vec![
+            (
+                "manifest content".into(),
+                Box::new(|root| {
+                    fs::write(root.join("tests/e2e/manifests/sample.yaml"), "bucket: b\n").unwrap()
+                }),
+            ),
+            (
+                "defaults content".into(),
+                Box::new(|root| {
+                    fs::write(
+                        root.join("tests/e2e/manifests/defaults.yaml"),
+                        "schema: 2\n",
+                    )
+                    .unwrap()
+                }),
+            ),
+            (
+                "an added manifest".into(),
+                Box::new(|root| {
+                    fs::write(root.join("tests/e2e/manifests/extra.yaml"), "").unwrap()
+                }),
+            ),
+            (
+                "a removed program".into(),
+                Box::new(|root| fs::remove_file(root.join("tests/e2e/sample/run.sh")).unwrap()),
+            ),
+            (
+                "a program replaced by a dangling symlink".into(),
+                Box::new(|root| {
+                    let program = root.join("tests/e2e/sample/run.sh");
+                    fs::remove_file(&program).unwrap();
+                    std::os::unix::fs::symlink("missing.sh", program).unwrap()
+                }),
+            ),
+        ];
+        for relative in MANIFEST_PLAN_DATA_FILES {
+            changed.push((
+                format!("edited {relative}"),
+                Box::new(move |root| fs::write(root.join(relative), "[]\n").unwrap()),
+            ));
+            changed.push((
+                format!("removed {relative}"),
+                Box::new(move |root| fs::remove_file(root.join(relative)).unwrap()),
+            ));
+        }
+        for (label, change) in unchanged {
+            let inputs = plan_inputs();
+            change(inputs.path());
+            assert_eq!(key(inputs.path(), PLAN_LISTING), expected, "{label}");
+        }
+        for (label, change) in changed {
+            let inputs = plan_inputs();
+            change(inputs.path());
+            assert_ne!(key(inputs.path(), PLAN_LISTING), expected, "{label}");
+        }
+
+        let mut untracked = PLAN_LISTING.to_vec();
+        untracked.extend_from_slice(b"tests/e2e/sample/new.sh\n");
+        assert_ne!(
+            key(original.path(), &untracked),
+            expected,
+            "a listed new file"
+        );
+        let other_helper = original.path().join("tests/e2e/sample/run.sh");
+        assert_ne!(
+            manifest_plan_input_digest(&other_helper, original.path(), PLAN_LISTING).unwrap(),
+            expected,
+            "another helper file"
+        );
+        assert_eq!(
+            key(original.path(), &[0xff, b'\n']),
+            None,
+            "a listing the helper would refuse has no key"
+        );
+        assert_eq!(
+            manifest_plan_cache_key(&helper, Path::new("relative/root")).unwrap(),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -18138,6 +18456,10 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         let prepared_command_helper = std::path::absolute(&command_helper)
             .map_err(|error| format!("cannot make the manifest helper path absolute: {error}"))?;
         let child_helper_via_cargo = std::cell::Cell::new(true);
+        // Those direct children share one plan cache, keyed by the content of
+        // every helper input, so an unchanged fixture tree is planned once.
+        let child_plan_cache = tempfile::tempdir()
+            .map_err(|e| format!("cannot create the manifest plan cache: {e}"))?;
         let run_result_command = |command: &str, summary: Option<&Path>| {
             let mut child = Command::new(&executable);
             child
@@ -18148,7 +18470,9 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 .env("CARGO_TARGET_DIR", command_root.join("target"))
                 .current_dir(&result_command_root);
             if !child_helper_via_cargo.get() {
-                child.env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper);
+                child
+                    .env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper)
+                    .env(MANIFEST_PLAN_CACHE_ENV, child_plan_cache.path());
             }
             if let Some(summary) = summary {
                 child.arg("--current-summary").arg(summary);
@@ -18294,6 +18618,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 .arg("--refreshed-at")
                 .arg("fixture-refresh")
                 .env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper)
+                .env(MANIFEST_PLAN_CACHE_ENV, child_plan_cache.path())
                 .current_dir(&result_command_root);
             command
         };
@@ -19287,6 +19612,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             .arg("--refreshed-at")
             .arg("fixture-refresh")
             .env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper)
+            .env(MANIFEST_PLAN_CACHE_ENV, child_plan_cache.path())
             .current_dir(&result_command_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -21531,6 +21857,15 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         // The children above ran this file directly; it must still hold the
         // bytes Cargo built.
         require_shared_clone_helper()?;
+        // A cache that no child wrote to would mean the children never saw it.
+        let cached_plans = fs::read_dir(child_plan_cache.path())
+            .map_err(|e| format!("cannot read the manifest plan cache: {e}"))?
+            .filter_map(Result::ok)
+            .filter(|entry| is_sha256(&entry.file_name().to_string_lossy()))
+            .count();
+        if cached_plans == 0 {
+            return Err("no child command stored a manifest plan in the shared cache".into());
+        }
         Some(CommandsFixture {
             _history_environment,
             _publication_lock: publication_lock,
