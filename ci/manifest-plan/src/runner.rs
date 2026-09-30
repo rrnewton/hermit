@@ -4756,7 +4756,12 @@ pub fn cell_artifact_path(
     result_root.join("runs").join(run_id).join(slug)
 }
 
-fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
+/// The verdict of `attempt`'s retained verification report, or `None` when it
+/// retains none or one that is not a current report. A `diverged` verdict
+/// here is what [`observed_result`] types a verify row
+/// `determinism-failure` from; the parity post-pass reads the same verdict
+/// from every attempt (`parity::records_mismatch`).
+pub(crate) fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
     let report = attempt.verification_report.as_deref()?;
     current_verification_report(report.as_bytes())
         .ok()
