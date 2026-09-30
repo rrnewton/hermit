@@ -4046,7 +4046,8 @@ sys.exit(1 if failed else 0)
         );
         assert!(
             five_stdout.contains(
-                "mean credit 1.0000 over 3 measured with equal inputs; none measured with \
+                "measured 3; no golden 1 (determinism-mismatch 1); not compared 1; unmeasured 0; \
+                 mean credit 1.0000 over 3 measured with equal inputs; none measured with \
                  unequal inputs"
             ),
             "{five_stdout}"
@@ -4062,7 +4063,7 @@ sys.exit(1 if failed else 0)
                 "parity/alpha@kvm=Matched",
                 "parity/alpha@liteinst=Matched",
                 "parity/beta@kvm=Matched",
-                "parity/beta@liteinst=Unavailable",
+                "parity/beta@liteinst=Nondeterministic",
             ]
         );
         assert!(
@@ -4081,7 +4082,7 @@ sys.exit(1 if failed else 0)
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
                 "parity/beta@kvm=Diverged",
-                "parity/beta@liteinst=Unavailable",
+                "parity/beta@liteinst=Nondeterministic",
             ]
         );
         // The harness launched every kvm and liteinst verify cell, and their
