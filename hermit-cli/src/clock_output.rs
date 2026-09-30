@@ -14,8 +14,11 @@
 //! timezone, and stops at the first store that faults. A post-call snapshot
 //! alone cannot distinguish those stores from bytes that were merely readable
 //! afterwards, so an `EFAULT` event also keeps the same readable prefix from
-//! before the call. A byte that differs between the two was stored by the
-//! call. Every other byte was not, and replay must not write it.
+//! before the call. A byte that differs between the two changed during the
+//! call: Linux stored it, normally through this destination, but possibly
+//! through another destination that shares its memory (a physical alias,
+//! described below). A byte that is the same in both snapshots did not
+//! change, and replay must not write it.
 //!
 //! Replay of an `EFAULT` event runs three phases across all of the call's
 //! destinations together. It first validates that guest memory still holds
@@ -29,9 +32,18 @@
 //! address: with the timeval in a writable mapping and the timezone in a
 //! read-only mapping of the same page, Linux stores the timeval and faults on
 //! the timezone, yet the timezone's snapshots differ. Restoring the timeval
-//! already restores those bytes, and writing them again through the read-only
-//! mapping would fail. Successful calls use the same phases, requiring readable
-//! destinations first and then writing every byte.
+//! restores those bytes only if replay still maps both addresses to one page.
+//! The Replayer passes shared anonymous memory through, including `mremap`
+//! copies of it, but replays every mapping of a file, a memfd included, as a
+//! separate anonymous copy, so an alias between file mappings does not
+//! survive. Before any write, replay therefore reads the guest's
+//! `/proc/<pid>/maps`, runs the write phase on a model in which two addresses
+//! share a byte only if they map the same object at the same offset, and
+//! refuses with [`UnreplayableClockOutput`] if the model would have to write a
+//! read-only byte. That refusal is a limitation of hermit replay, not a fault
+//! in the program (https://github.com/rrnewton/hermit/issues/3434). Successful
+//! calls use the same phases, requiring readable destinations first and then
+//! writing every byte.
 
 use std::collections::HashMap;
 use std::fmt;

@@ -63,6 +63,11 @@ impl Replayer {
         // Write permission is also needed to be able to write the recorded
         // bytes to the mapping. After the data has been written, it can be
         // reset to the original protection value with a call to `mprotect`.
+        //
+        // Each file mapping, a memfd included, becomes its own anonymous object
+        // here, so two shared mappings of one file no longer share memory in
+        // replay: a store through one is not visible through the other.
+        // https://github.com/rrnewton/hermit/issues/3434
         let ptr = guest
             .inject_with_retry(
                 syscall
