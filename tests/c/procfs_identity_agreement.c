@@ -43,8 +43,11 @@ static int fail(const char* what) {
 }
 
 // Find the mapping header covering `addr` and return its dev and inode.
-static int maps_identity(uintptr_t addr, unsigned* major_out, unsigned* minor_out,
-                         unsigned long* inode_out) {
+static int maps_identity(
+    uintptr_t addr,
+    unsigned* major_out,
+    unsigned* minor_out,
+    unsigned long* inode_out) {
   FILE* maps = fopen("/proc/self/maps", "r");
   if (!maps) {
     return -1;
@@ -55,8 +58,14 @@ static int maps_identity(uintptr_t addr, unsigned* major_out, unsigned* minor_ou
     unsigned major = 0, minor = 0;
     unsigned long inode = 0;
     // address perms offset dev inode pathname
-    if (sscanf(line, "%lx-%lx %*4s %*x %x:%x %lu", &start, &end, &major, &minor,
-               &inode) != 5) {
+    if (sscanf(
+            line,
+            "%lx-%lx %*4s %*x %x:%x %lu",
+            &start,
+            &end,
+            &major,
+            &minor,
+            &inode) != 5) {
       continue;
     }
     if (addr >= start && addr < end) {
@@ -113,7 +122,8 @@ int main(void) {
 
   unsigned maps_major = 0, maps_minor = 0;
   unsigned long maps_ino = 0;
-  if (maps_identity((uintptr_t)mapping, &maps_major, &maps_minor, &maps_ino) != 0) {
+  if (maps_identity((uintptr_t)mapping, &maps_major, &maps_minor, &maps_ino) !=
+      0) {
     return fail("no maps line covers the mapping");
   }
 
@@ -127,8 +137,13 @@ int main(void) {
     rc = 1;
   }
   if (maps_major != stat_major || maps_minor != stat_minor) {
-    fprintf(stderr, "DEVICE DISAGREES: maps=%x:%x stat=%x:%x\n",
-            maps_major, maps_minor, stat_major, stat_minor);
+    fprintf(
+        stderr,
+        "DEVICE DISAGREES: maps=%x:%x stat=%x:%x\n",
+        maps_major,
+        maps_minor,
+        stat_major,
+        stat_minor);
     rc = 1;
   }
 
@@ -137,15 +152,19 @@ int main(void) {
     return fail("read fdinfo inode");
   }
   if (fdinfo_ino != stat_ino) {
-    fprintf(stderr, "INODE DISAGREES: fdinfo=%lu stat=%lu\n", fdinfo_ino, stat_ino);
+    fprintf(
+        stderr, "INODE DISAGREES: fdinfo=%lu stat=%lu\n", fdinfo_ino, stat_ino);
     rc = 1;
   }
 
   munmap(mapping, 4096);
   close(fd);
   if (rc == 0) {
-    printf("maps and stat agree: device=%x:%x inode=%lu; fdinfo inode agrees\n",
-           maps_major, maps_minor, maps_ino);
+    printf(
+        "maps and stat agree: device=%x:%x inode=%lu; fdinfo inode agrees\n",
+        maps_major,
+        maps_minor,
+        maps_ino);
   }
   return rc;
 }

@@ -17,8 +17,12 @@ int main(void) {
   errno = 0;
   long result = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
   if (result != -1 || errno != EPERM) {
-    fprintf(stderr, "PTRACE_TRACEME returned %ld with errno %d (%s), expected EPERM\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "PTRACE_TRACEME returned %ld with errno %d (%s), expected EPERM\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
 

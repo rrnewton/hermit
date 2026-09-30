@@ -7,8 +7,10 @@
  * The fixture drives:
  *   1. pwritev2(fd, iov, 1, off=0,  flags=0) writes 6 bytes -> rc == 6
  *   2. pwritev2(fd, iov, 1, off=6,  flags=0) writes 6 bytes -> rc == 6
- *   3. preadv2(fd,  iov, 1, off=0,  flags=0) reads back chunk 1 -> rc == 6, match
- *   4. preadv2(fd,  iov, 1, off=6,  flags=0) reads back chunk 2 -> rc == 6, match
+ *   3. preadv2(fd,  iov, 1, off=0,  flags=0) reads back chunk 1 -> rc == 6,
+ * match
+ *   4. preadv2(fd,  iov, 1, off=6,  flags=0) reads back chunk 2 -> rc == 6,
+ * match
  *   5. pwritev2(fd, iov, 1, off=-1, RWF_APPEND) appends at EOF -> rc == 6
  *   6. preadv2(fd,  iov, 1, off=12, flags=0) reads the appended chunk -> match
  *
@@ -45,66 +47,66 @@
 #define EXPECTED_CHECKS 6
 
 int main(void) {
-    int ok = 0;
+  int ok = 0;
 
-    char path[] = "/tmp/preadv2_flags.XXXXXX";
-    int fd = mkstemp(path);
-    if (fd < 0) {
-        printf("preadv2 ok=0\n");
-        return 1;
-    }
+  char path[] = "/tmp/preadv2_flags.XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0) {
+    printf("preadv2 ok=0\n");
+    return 1;
+  }
 
-    char c0[6] = {'A', 'A', 'A', 'A', 'A', '\n'};
-    char c1[6] = {'B', 'B', 'B', 'B', 'B', '\n'};
-    char c2[6] = {'C', 'C', 'C', 'C', 'C', '\n'};
-    char r[6];
+  char c0[6] = {'A', 'A', 'A', 'A', 'A', '\n'};
+  char c1[6] = {'B', 'B', 'B', 'B', 'B', '\n'};
+  char c2[6] = {'C', 'C', 'C', 'C', 'C', '\n'};
+  char r[6];
 
-    struct iovec w0 = {c0, sizeof(c0)};
-    if (pwritev2(fd, &w0, 1, 0, 0) == (ssize_t)sizeof(c0)) {
-        ok += 1;
-    }
-    struct iovec w1 = {c1, sizeof(c1)};
-    if (pwritev2(fd, &w1, 1, (off_t)sizeof(c0), 0) == (ssize_t)sizeof(c1)) {
-        ok += 1;
-    }
+  struct iovec w0 = {c0, sizeof(c0)};
+  if (pwritev2(fd, &w0, 1, 0, 0) == (ssize_t)sizeof(c0)) {
+    ok += 1;
+  }
+  struct iovec w1 = {c1, sizeof(c1)};
+  if (pwritev2(fd, &w1, 1, (off_t)sizeof(c0), 0) == (ssize_t)sizeof(c1)) {
+    ok += 1;
+  }
 
-    memset(r, 0, sizeof(r));
-    struct iovec r0 = {r, sizeof(r)};
-    if (preadv2(fd, &r0, 1, 0, 0) == (ssize_t)sizeof(r) &&
-        memcmp(r, c0, sizeof(r)) == 0) {
-        ok += 1;
-    }
-    memset(r, 0, sizeof(r));
-    struct iovec r1 = {r, sizeof(r)};
-    if (preadv2(fd, &r1, 1, (off_t)sizeof(c0), 0) == (ssize_t)sizeof(r) &&
-        memcmp(r, c1, sizeof(r)) == 0) {
-        ok += 1;
-    }
+  memset(r, 0, sizeof(r));
+  struct iovec r0 = {r, sizeof(r)};
+  if (preadv2(fd, &r0, 1, 0, 0) == (ssize_t)sizeof(r) &&
+      memcmp(r, c0, sizeof(r)) == 0) {
+    ok += 1;
+  }
+  memset(r, 0, sizeof(r));
+  struct iovec r1 = {r, sizeof(r)};
+  if (preadv2(fd, &r1, 1, (off_t)sizeof(c0), 0) == (ssize_t)sizeof(r) &&
+      memcmp(r, c1, sizeof(r)) == 0) {
+    ok += 1;
+  }
 
-    /* RWF_APPEND ignores the supplied offset and writes at end-of-file. */
-    struct iovec w2 = {c2, sizeof(c2)};
-    if (pwritev2(fd, &w2, 1, -1, RWF_APPEND) == (ssize_t)sizeof(c2)) {
-        ok += 1;
-    }
-    memset(r, 0, sizeof(r));
-    struct iovec r2 = {r, sizeof(r)};
-    if (preadv2(fd, &r2, 1, (off_t)(2 * sizeof(c0)), 0) == (ssize_t)sizeof(r) &&
-        memcmp(r, c2, sizeof(r)) == 0) {
-        ok += 1;
-    }
+  /* RWF_APPEND ignores the supplied offset and writes at end-of-file. */
+  struct iovec w2 = {c2, sizeof(c2)};
+  if (pwritev2(fd, &w2, 1, -1, RWF_APPEND) == (ssize_t)sizeof(c2)) {
+    ok += 1;
+  }
+  memset(r, 0, sizeof(r));
+  struct iovec r2 = {r, sizeof(r)};
+  if (preadv2(fd, &r2, 1, (off_t)(2 * sizeof(c0)), 0) == (ssize_t)sizeof(r) &&
+      memcmp(r, c2, sizeof(r)) == 0) {
+    ok += 1;
+  }
 
-    close(fd);
-    unlink(path);
+  close(fd);
+  unlink(path);
 
-    printf("preadv2 ok=%d\n", ok);
-    /* Route a behavioural failure into the exit status. Without this the guest
-       exits 0 whatever `ok` reached, so a regression only lowered the printed
-       number -- and under --verify both runs lower it identically, so the
-       comparison still matches and the cell stays green. Every check above is
-       unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-        fprintf(stderr, "preadv2 completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-        return 1;
-    }
-    return 0;
+  printf("preadv2 ok=%d\n", ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "preadv2 completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
+  return 0;
 }

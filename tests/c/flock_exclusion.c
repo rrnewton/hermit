@@ -92,9 +92,9 @@
  * /tmp with a per-run isolated directory, so a driver that needs the host and
  * the guest to contend for ONE inode -- the record/replay side-effect probe --
  * must name a path outside /tmp. */
-static const char *lock_override = NULL;
+static const char* lock_override = NULL;
 
-static const char *lock_path(const char *scenario) {
+static const char* lock_path(const char* scenario) {
   static char buffer[512];
   if (lock_override != NULL) {
     return lock_override;
@@ -103,10 +103,9 @@ static const char *lock_path(const char *scenario) {
   return buffer;
 }
 
-static int open_lock(const char *path) {
+static int open_lock(const char* path) {
   return open(path, O_CREAT | O_RDWR, 0600);
 }
-
 
 static int send_fd(int socket_fd, int fd) {
   char payload = 'f';
@@ -119,7 +118,7 @@ static int send_fd(int socket_fd, int fd) {
       .msg_control = control,
       .msg_controllen = sizeof(control),
   };
-  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
   header->cmsg_level = SOL_SOCKET;
   header->cmsg_type = SCM_RIGHTS;
   header->cmsg_len = CMSG_LEN(sizeof(fd));
@@ -137,7 +136,7 @@ static int send_fd_mmsg(int socket_fd, int fd) {
   message.msg_hdr.msg_iovlen = 1;
   message.msg_hdr.msg_control = control;
   message.msg_hdr.msg_controllen = sizeof(control);
-  struct cmsghdr *header = CMSG_FIRSTHDR(&message.msg_hdr);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message.msg_hdr);
   header->cmsg_level = SOL_SOCKET;
   header->cmsg_type = SCM_RIGHTS;
   header->cmsg_len = CMSG_LEN(sizeof(fd));
@@ -159,7 +158,7 @@ static int receive_fd(int socket_fd) {
   if (recvmsg(socket_fd, &message, 0) != 1) {
     return -1;
   }
-  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
   if (header == NULL || header->cmsg_level != SOL_SOCKET ||
       header->cmsg_type != SCM_RIGHTS ||
       header->cmsg_len != CMSG_LEN(sizeof(int))) {
@@ -172,7 +171,7 @@ static int receive_fd(int socket_fd) {
 }
 
 static int scenario_exclusion(void) {
-  const char *path = lock_path("exclusion");
+  const char* path = lock_path("exclusion");
   int first = open_lock(path);
   int second = open_lock(path);
   if (first < 0 || second < 0) {
@@ -194,8 +193,9 @@ static int scenario_exclusion(void) {
     return 1;
   }
   if (errno != EWOULDBLOCK) {
-    printf("FAIL: second open file description got errno=%d, wanted EWOULDBLOCK\n",
-           errno);
+    printf(
+        "FAIL: second open file description got errno=%d, wanted EWOULDBLOCK\n",
+        errno);
     return 1;
   }
   printf("flock-second-open-excluded\n");
@@ -221,7 +221,8 @@ static int scenario_exclusion(void) {
     return HARNESS_FAILURE;
   }
   if (!WIFEXITED(status)) {
-    printf("FAIL: contending process did not exit normally (status=%d)\n", status);
+    printf(
+        "FAIL: contending process did not exit normally (status=%d)\n", status);
     return HARNESS_FAILURE;
   }
   if (WEXITSTATUS(status) == HARNESS_FAILURE) {
@@ -250,7 +251,7 @@ static int scenario_exclusion(void) {
 }
 
 static int scenario_upgrade(void) {
-  const char *path = lock_path("upgrade");
+  const char* path = lock_path("upgrade");
   int held = open_lock(path);
   int contender = open_lock(path);
   if (held < 0 || contender < 0) {
@@ -304,11 +305,12 @@ static int scenario_upgrade(void) {
 }
 
 static int scenario_received(void) {
-  const char *path = lock_path("received");
+  const char* path = lock_path("received");
   int holder = open_lock(path);
   if (holder < 0 || flock(holder, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish the shared lock to transfer (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not establish the shared lock to transfer (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
 
@@ -333,8 +335,9 @@ static int scenario_received(void) {
     }
     errno = 0;
     if (flock(received, 0) != -1 || errno != EINVAL) {
-      printf("FAIL: invalid flock operation on received fd did not return EINVAL (errno=%d)\n",
-             errno);
+      printf(
+          "FAIL: invalid flock operation on received fd did not return EINVAL (errno=%d)\n",
+          errno);
       _exit(1);
     }
 
@@ -347,8 +350,10 @@ static int scenario_received(void) {
     int upgraded = flock(received, LOCK_EX);
     int upgrade_errno = errno;
     if (upgraded == 0 || upgrade_errno != ENOLCK) {
-      printf("FAIL: blocking upgrade on received fd returned %d errno=%d\n",
-             upgraded, upgrade_errno);
+      printf(
+          "FAIL: blocking upgrade on received fd returned %d errno=%d\n",
+          upgraded,
+          upgrade_errno);
       _exit(1);
     }
     printf("flock-received-upgrade-refused errno=%d\n", upgrade_errno);
@@ -361,7 +366,8 @@ static int scenario_received(void) {
     }
     errno = 0;
     if (flock(probe, LOCK_EX | LOCK_NB) == 0) {
-      printf("FAIL: probing an unknown received fd destroyed its shared lock\n");
+      printf(
+          "FAIL: probing an unknown received fd destroyed its shared lock\n");
       _exit(1);
     }
     if (errno != EWOULDBLOCK) {
@@ -375,15 +381,18 @@ static int scenario_received(void) {
 
   close(sockets[1]);
   if (send_fd(sockets[0], holder) != 0) {
-    printf("FAIL: sendmsg could not transfer the locked fd (errno=%d)\n", errno);
+    printf(
+        "FAIL: sendmsg could not transfer the locked fd (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
   close(sockets[0]);
 
   int status = 0;
   if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status)) {
-    printf("FAIL: received-fd child did not exit normally (status=%d errno=%d)\n",
-           status, errno);
+    printf(
+        "FAIL: received-fd child did not exit normally (status=%d errno=%d)\n",
+        status,
+        errno);
     return HARNESS_FAILURE;
   }
   close(holder);
@@ -391,7 +400,7 @@ static int scenario_received(void) {
 }
 
 static int scenario_fork_blocking_refusal(void) {
-  const char *path = lock_path("fork-blocking-refusal");
+  const char* path = lock_path("fork-blocking-refusal");
   int holder = open_lock(path);
   if (holder < 0 || flock(holder, LOCK_SH | LOCK_NB) != 0) {
     printf("FAIL: could not establish parent shared lock (errno=%d)\n", errno);
@@ -409,21 +418,25 @@ static int scenario_fork_blocking_refusal(void) {
     errno = 0;
     int result = contender < 0 ? -2 : flock(contender, LOCK_EX);
     if (result != -1 || errno != ENOLCK) {
-      dprintf(STDOUT_FILENO,
-              "FAIL: copied fork child blocking flock returned %d errno=%d\n",
-              result, errno);
+      dprintf(
+          STDOUT_FILENO,
+          "FAIL: copied fork child blocking flock returned %d errno=%d\n",
+          result,
+          errno);
       _exit(1);
     }
-    dprintf(STDOUT_FILENO, "flock-fork-child-blocking-refused errno=%d\n",
-            errno);
+    dprintf(
+        STDOUT_FILENO, "flock-fork-child-blocking-refused errno=%d\n", errno);
     _exit(0);
   }
 
   int status = 0;
   if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: copied fork child did not fail closed (status=%d errno=%d)\n",
-           status, errno);
+    printf(
+        "FAIL: copied fork child did not fail closed (status=%d errno=%d)\n",
+        status,
+        errno);
     return HARNESS_FAILURE;
   }
   printf("flock-fork-child-refusal-ok\n");
@@ -433,10 +446,11 @@ static int scenario_fork_blocking_refusal(void) {
 }
 
 static int scenario_fork_safe_operations(void) {
-  const char *path = lock_path("fork-safe-operations");
+  const char* path = lock_path("fork-safe-operations");
   int inherited = open_lock(path);
   if (inherited < 0 || flock(inherited, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish inherited shared lock (errno=%d)\n", errno);
+    printf(
+        "FAIL: could not establish inherited shared lock (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
 
@@ -449,8 +463,10 @@ static int scenario_fork_safe_operations(void) {
   if (child == 0) {
     errno = 0;
     if (flock(inherited, 0) != -1 || errno != EINVAL) {
-      dprintf(STDOUT_FILENO,
-              "FAIL: copied child malformed flock returned errno=%d\n", errno);
+      dprintf(
+          STDOUT_FILENO,
+          "FAIL: copied child malformed flock returned errno=%d\n",
+          errno);
       _exit(1);
     }
     dprintf(STDOUT_FILENO, "flock-fork-child-malformed-einval\n");
@@ -458,23 +474,28 @@ static int scenario_fork_safe_operations(void) {
     errno = 0;
     if (contender < 0 || flock(contender, LOCK_EX | LOCK_NB) != -1 ||
         (errno != EWOULDBLOCK && errno != EAGAIN)) {
-      dprintf(STDOUT_FILENO,
-              "FAIL: copied child nonblocking contention returned errno=%d\n",
-              errno);
+      dprintf(
+          STDOUT_FILENO,
+          "FAIL: copied child nonblocking contention returned errno=%d\n",
+          errno);
       _exit(1);
     }
-    dprintf(STDOUT_FILENO,
-            "flock-fork-child-nonblocking-contended errno=%d\n", errno);
+    dprintf(
+        STDOUT_FILENO,
+        "flock-fork-child-nonblocking-contended errno=%d\n",
+        errno);
     close(contender);
     if (flock(inherited, LOCK_SH | LOCK_NB) != 0) {
-      dprintf(STDOUT_FILENO,
-              "FAIL: copied child nonblocking flock failed errno=%d\n", errno);
+      dprintf(
+          STDOUT_FILENO,
+          "FAIL: copied child nonblocking flock failed errno=%d\n",
+          errno);
       _exit(1);
     }
     dprintf(STDOUT_FILENO, "flock-fork-child-nonblocking-ok\n");
     if (flock(inherited, LOCK_UN) != 0) {
-      dprintf(STDOUT_FILENO, "FAIL: copied child unlock failed errno=%d\n",
-              errno);
+      dprintf(
+          STDOUT_FILENO, "FAIL: copied child unlock failed errno=%d\n", errno);
       _exit(1);
     }
     dprintf(STDOUT_FILENO, "flock-fork-child-unlock-ok\n");
@@ -484,14 +505,17 @@ static int scenario_fork_safe_operations(void) {
   int status = 0;
   if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: copied fork child safe-operation run failed (status=%d errno=%d)\n",
-           status, errno);
+    printf(
+        "FAIL: copied fork child safe-operation run failed (status=%d errno=%d)\n",
+        status,
+        errno);
     return HARNESS_FAILURE;
   }
   int probe = open_lock(path);
   if (probe < 0 || flock(probe, LOCK_EX | LOCK_NB) != 0) {
-    printf("FAIL: copied child unlock did not release inherited lock (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: copied child unlock did not release inherited lock (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-fork-child-safe-operations-ok\n");
@@ -502,14 +526,15 @@ static int scenario_fork_safe_operations(void) {
 }
 
 static int scenario_fork_vfork_blocking(void) {
-  const char *path = lock_path("fork-vfork-blocking");
+  const char* path = lock_path("fork-vfork-blocking");
   int inherited = open_lock(path);
   int contender = open_lock(path);
   if (inherited < 0 || contender < 0 ||
       flock(inherited, LOCK_SH | LOCK_NB) != 0 ||
       flock(contender, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish nested vfork contention (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not establish nested vfork contention (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
 
@@ -523,8 +548,10 @@ static int scenario_fork_vfork_blocking(void) {
     dprintf(STDOUT_FILENO, "flock-fork-vfork-child-entered\n");
     pid_t vfork_child = vfork();
     if (vfork_child < 0) {
-      dprintf(STDOUT_FILENO,
-              "FAIL: copied fork child vfork returned errno=%d\n", errno);
+      dprintf(
+          STDOUT_FILENO,
+          "FAIL: copied fork child vfork returned errno=%d\n",
+          errno);
       _exit(1);
     }
     if (vfork_child == 0) {
@@ -551,9 +578,11 @@ static int scenario_fork_vfork_blocking(void) {
     int vfork_status = 0;
     if (waitpid(vfork_child, &vfork_status, 0) != vfork_child ||
         !WIFEXITED(vfork_status) || WEXITSTATUS(vfork_status) != 0) {
-      dprintf(STDOUT_FILENO,
-              "FAIL: nested vfork child did not fail closed (status=%d errno=%d)\n",
-              vfork_status, errno);
+      dprintf(
+          STDOUT_FILENO,
+          "FAIL: nested vfork child did not fail closed (status=%d errno=%d)\n",
+          vfork_status,
+          errno);
       _exit(1);
     }
     _exit(0);
@@ -562,8 +591,8 @@ static int scenario_fork_vfork_blocking(void) {
   int status = 0;
   if (waitpid(fork_child, &status, 0) != fork_child || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: copied fork child failed (status=%d errno=%d)\n", status,
-           errno);
+    printf(
+        "FAIL: copied fork child failed (status=%d errno=%d)\n", status, errno);
     return HARNESS_FAILURE;
   }
   printf("flock-fork-vfork-copied-policy-ok\n");
@@ -575,7 +604,7 @@ static int scenario_fork_vfork_blocking(void) {
 }
 
 static int scenario_failed_clone(void) {
-  const char *path = lock_path("failed-clone");
+  const char* path = lock_path("failed-clone");
   int fd = open_lock(path);
   if (fd < 0) {
     printf("FAIL: could not open %s (errno=%d)\n", path, errno);
@@ -585,14 +614,17 @@ static int scenario_failed_clone(void) {
   errno = 0;
   long result = syscall(SYS_clone, CLONE_SIGHAND, NULL, NULL, NULL, 0);
   if (result != -1 || errno != EINVAL) {
-    printf("FAIL: invalid process clone returned %ld errno=%d\n", result, errno);
+    printf(
+        "FAIL: invalid process clone returned %ld errno=%d\n", result, errno);
     return 1;
   }
   printf("flock-failed-clone-rejected errno=%d\n", errno);
 
   errno = 0;
   if (flock(fd, LOCK_EX) != 0) {
-    printf("FAIL: uncontended blocking LOCK_EX after failed clone was refused (errno=%d)\n", errno);
+    printf(
+        "FAIL: uncontended blocking LOCK_EX after failed clone was refused (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-after-failed-clone-acquired\n");
@@ -606,13 +638,13 @@ static int scenario_failed_clone(void) {
 }
 
 static int scenario_pidfd_getfd(void) {
-  const char *path = lock_path("pidfd-getfd");
+  const char* path = lock_path("pidfd-getfd");
   int source = open_lock(path);
   int contender = open_lock(path);
-  if (source < 0 || contender < 0 ||
-      flock(source, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish pidfd_getfd source lock (errno=%d)\n",
-           errno);
+  if (source < 0 || contender < 0 || flock(source, LOCK_SH | LOCK_NB) != 0) {
+    printf(
+        "FAIL: could not establish pidfd_getfd source lock (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
 
@@ -633,14 +665,15 @@ static int scenario_pidfd_getfd(void) {
   printf("flock-pidfd-duplicate-unlocked\n");
 
   if (flock(contender, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: pidfd_getfd contender could not take LOCK_SH (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: pidfd_getfd contender could not take LOCK_SH (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   errno = 0;
   if (flock(source, LOCK_EX) != -1 || errno != ENOLCK) {
-    printf("FAIL: pidfd_getfd source blocking upgrade returned errno=%d\n",
-           errno);
+    printf(
+        "FAIL: pidfd_getfd source blocking upgrade returned errno=%d\n", errno);
     return 1;
   }
   printf("flock-pidfd-source-upgrade-refused errno=%d\n", errno);
@@ -651,8 +684,9 @@ static int scenario_pidfd_getfd(void) {
   }
   int fresh = open_lock(path);
   if (fresh < 0 || flock(fresh, LOCK_EX | LOCK_NB) != 0) {
-    printf("FAIL: pidfd_getfd stale source cache restored a released lock (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: pidfd_getfd stale source cache restored a released lock (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-pidfd-stale-restore-absent\n");
@@ -662,99 +696,112 @@ static int scenario_pidfd_getfd(void) {
   close(contender);
   close(source);
 
-  const char *failed_path = lock_path("pidfd-getfd-failed");
+  const char* failed_path = lock_path("pidfd-getfd-failed");
   int failed_source = open_lock(failed_path);
   if (failed_source < 0 || flock(failed_source, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish failed-pidfd_getfd source lock (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not establish failed-pidfd_getfd source lock (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   errno = 0;
   if (syscall(SYS_pidfd_getfd, pidfd, -1, 0) != -1 || errno != EBADF) {
-    printf("FAIL: invalid pidfd_getfd did not return EBADF (errno=%d)\n", errno);
+    printf(
+        "FAIL: invalid pidfd_getfd did not return EBADF (errno=%d)\n", errno);
     return 1;
   }
   if (flock(failed_source, LOCK_EX) != 0) {
-    printf("FAIL: failed pidfd_getfd discarded source authority (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: failed pidfd_getfd discarded source authority (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-pidfd-failed-getfd-preserved errno=%d\n", EBADF);
   flock(failed_source, LOCK_UN);
 
   if (flock(failed_source, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish invalid-flags source lock (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not establish invalid-flags source lock (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   errno = 0;
   if (syscall(SYS_pidfd_getfd, pidfd, failed_source, 1) != -1 ||
       errno != EINVAL) {
-    printf("FAIL: nonzero-flags valid-pidfd/valid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: nonzero-flags valid-pidfd/valid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
+        errno);
     return 1;
   }
-  printf("flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=%d\n",
-         EINVAL);
+  printf(
+      "flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=%d\n",
+      EINVAL);
 
   errno = 0;
   if (syscall(SYS_pidfd_getfd, pidfd, -1, 1) != -1 || errno != EINVAL) {
-    printf("FAIL: nonzero-flags valid-pidfd/invalid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: nonzero-flags valid-pidfd/invalid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
+        errno);
     return 1;
   }
-  printf("flock-pidfd-valid-pidfd-invalid-targetfd-flags-precedence errno=%d\n",
-         EINVAL);
+  printf(
+      "flock-pidfd-valid-pidfd-invalid-targetfd-flags-precedence errno=%d\n",
+      EINVAL);
 
   errno = 0;
-  if (syscall(SYS_pidfd_getfd, -1, failed_source, 1) != -1 ||
-      errno != EINVAL) {
-    printf("FAIL: nonzero-flags invalid-pidfd/valid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
-           errno);
+  if (syscall(SYS_pidfd_getfd, -1, failed_source, 1) != -1 || errno != EINVAL) {
+    printf(
+        "FAIL: nonzero-flags invalid-pidfd/valid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
+        errno);
     return 1;
   }
-  printf("flock-pidfd-invalid-pidfd-valid-targetfd-flags-precedence errno=%d\n",
-         EINVAL);
+  printf(
+      "flock-pidfd-invalid-pidfd-valid-targetfd-flags-precedence errno=%d\n",
+      EINVAL);
 
   errno = 0;
   if (syscall(SYS_pidfd_getfd, -1, -1, 1) != -1 || errno != EINVAL) {
-    printf("FAIL: nonzero-flags invalid-pidfd/invalid-targetfd pidfd_getfd did not preserve EINVAL precedence (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: nonzero-flags invalid-pidfd/invalid-targetfd pidfd_getfd did not preserve EINVAL precedence (errno=%d)\n",
+        errno);
     return 1;
   }
-  printf("flock-pidfd-invalid-pidfd-invalid-targetfd-flags-precedence errno=%d\n",
-         EINVAL);
+  printf(
+      "flock-pidfd-invalid-pidfd-invalid-targetfd-flags-precedence errno=%d\n",
+      EINVAL);
 
   if (flock(failed_source, LOCK_EX) != 0) {
-    printf("FAIL: invalid-flags pidfd_getfd discarded source authority (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: invalid-flags pidfd_getfd discarded source authority (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-pidfd-recorded-failure-preserved errno=%d\n", EINVAL);
   flock(failed_source, LOCK_UN);
   close(failed_source);
 
-  const char *unrelated_path = lock_path("pidfd-getfd-unrelated");
+  const char* unrelated_path = lock_path("pidfd-getfd-unrelated");
   char duplicated_path[512];
-  snprintf(duplicated_path, sizeof(duplicated_path), "%s-duplicate",
-           unrelated_path);
+  snprintf(
+      duplicated_path, sizeof(duplicated_path), "%s-duplicate", unrelated_path);
   int authoritative = open_lock(unrelated_path);
   int unrelated = open_lock(duplicated_path);
   if (authoritative < 0 || unrelated < 0 ||
       flock(authoritative, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish unrelated-authority bracket (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not establish unrelated-authority bracket (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
-  int unrelated_duplicate =
-      (int)syscall(SYS_pidfd_getfd, pidfd, unrelated, 0);
+  int unrelated_duplicate = (int)syscall(SYS_pidfd_getfd, pidfd, unrelated, 0);
   if (unrelated_duplicate < 0) {
     printf("FAIL: unrelated pidfd_getfd failed (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
   if (flock(authoritative, LOCK_EX) != 0) {
-    printf("FAIL: unrelated pidfd_getfd discarded authoritative flock state (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: unrelated pidfd_getfd discarded authoritative flock state (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-pidfd-unrelated-authority-preserved\n");
@@ -766,8 +813,9 @@ static int scenario_pidfd_getfd(void) {
   int ready[2];
   int release[2];
   if (pipe(ready) != 0 || pipe(release) != 0) {
-    printf("FAIL: could not create foreign-pidfd synchronization pipes (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not create foreign-pidfd synchronization pipes (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   pid_t child = fork();
@@ -792,8 +840,9 @@ static int scenario_pidfd_getfd(void) {
   close(release[0]);
   int foreign = -1;
   if (read(ready[0], &foreign, sizeof(foreign)) != sizeof(foreign)) {
-    printf("FAIL: child did not publish its foreign descriptor (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: child did not publish its foreign descriptor (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   int child_pidfd = (int)syscall(SYS_pidfd_open, child, 0);
@@ -804,8 +853,7 @@ static int scenario_pidfd_getfd(void) {
   errno = 0;
   if (syscall(SYS_pidfd_getfd, child_pidfd, foreign, 0) != -1 ||
       errno != EOPNOTSUPP) {
-    printf("FAIL: foreign pidfd_getfd did not fail closed (errno=%d)\n",
-           errno);
+    printf("FAIL: foreign pidfd_getfd did not fail closed (errno=%d)\n", errno);
     return 1;
   }
   printf("flock-pidfd-foreign-source-refused errno=%d\n", errno);
@@ -817,8 +865,10 @@ static int scenario_pidfd_getfd(void) {
   int status = 0;
   if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: foreign-pidfd child failed (status=%d errno=%d)\n", status,
-           errno);
+    printf(
+        "FAIL: foreign-pidfd child failed (status=%d errno=%d)\n",
+        status,
+        errno);
     return HARNESS_FAILURE;
   }
   close(child_pidfd);
@@ -832,8 +882,9 @@ static int scenario_pidfd_getfd(void) {
 static int scenario_pidfd_getfd_record(void) {
   int source = open_lock(lock_path("pidfd-getfd-record"));
   if (source < 0 || lseek(source, 17, SEEK_SET) != 17) {
-    printf("FAIL: could not prepare recorded pidfd_getfd source (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: could not prepare recorded pidfd_getfd source (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
 
@@ -846,8 +897,9 @@ static int scenario_pidfd_getfd_record(void) {
   if (duplicate < 0 || lseek(duplicate, 0, SEEK_CUR) != 17 ||
       lseek(duplicate, 31, SEEK_SET) != 31 ||
       lseek(source, 0, SEEK_CUR) != 31) {
-    printf("FAIL: recorded pidfd_getfd did not reproduce one OFD (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: recorded pidfd_getfd did not reproduce one OFD (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   printf("flock-pidfd-record-success-shared-ofd\n");
@@ -855,8 +907,9 @@ static int scenario_pidfd_getfd_record(void) {
 
   errno = 0;
   if (syscall(SYS_pidfd_getfd, pidfd, -1, 0) != -1 || errno != EBADF) {
-    printf("FAIL: recorded invalid targetfd did not return EBADF (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: recorded invalid targetfd did not return EBADF (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-pidfd-record-validation-failure errno=%d\n", EBADF);
@@ -867,8 +920,10 @@ static int scenario_pidfd_getfd_record(void) {
     errno = 0;
     if (syscall(SYS_pidfd_getfd, pidfds[i], targets[i], 1) != -1 ||
         errno != EINVAL) {
-      printf("FAIL: recorded reserved flags case %zu did not return EINVAL (errno=%d)\n",
-             i, errno);
+      printf(
+          "FAIL: recorded reserved flags case %zu did not return EINVAL (errno=%d)\n",
+          i,
+          errno);
       return 1;
     }
   }
@@ -883,16 +938,17 @@ static int scenario_pidfd_getfd_record(void) {
 static int scenario_pidfd_getfd_relaxed_refusal(void) {
   errno = 0;
   if (syscall(SYS_pidfd_getfd, -1, -1, 0) != -1 || errno != EOPNOTSUPP) {
-    printf("FAIL: relaxed pidfd_getfd did not fail before validation (errno=%d)\n",
-           errno);
+    printf(
+        "FAIL: relaxed pidfd_getfd did not fail before validation (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-pidfd-relaxed-refused errno=%d\n", errno);
   return 0;
 }
 
-static int scenario_sent_after_fork(const char *scenario, int batched) {
-  const char *path = lock_path(scenario);
+static int scenario_sent_after_fork(const char* scenario, int batched) {
+  const char* path = lock_path(scenario);
   int sockets[2];
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) {
     printf("FAIL: socketpair failed (errno=%d)\n", errno);
@@ -921,8 +977,10 @@ static int scenario_sent_after_fork(const char *scenario, int batched) {
     return HARNESS_FAILURE;
   }
   printf("flock-sender-locked-after-fork\n");
-  if ((batched ? send_fd_mmsg(sockets[0], sent) : send_fd(sockets[0], sent)) != 0) {
-    printf("FAIL: sendmsg could not transfer post-fork lock (errno=%d)\n", errno);
+  if ((batched ? send_fd_mmsg(sockets[0], sent) : send_fd(sockets[0], sent)) !=
+      0) {
+    printf(
+        "FAIL: sendmsg could not transfer post-fork lock (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
   close(sockets[0]);
@@ -930,15 +988,19 @@ static int scenario_sent_after_fork(const char *scenario, int batched) {
   int status = 0;
   if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: receiver could not unlock transferred fd (status=%d errno=%d)\n",
-           status, errno);
+    printf(
+        "FAIL: receiver could not unlock transferred fd (status=%d errno=%d)\n",
+        status,
+        errno);
     return HARNESS_FAILURE;
   }
   printf("flock-receiver-unlocked-transferred-lock\n");
 
   int contender = open_lock(path);
   if (contender < 0 || flock(contender, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish post-transfer contender (errno=%d)\n", errno);
+    printf(
+        "FAIL: could not establish post-transfer contender (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
   errno = 0;
@@ -952,7 +1014,9 @@ static int scenario_sent_after_fork(const char *scenario, int batched) {
   close(contender);
   int probe = open_lock(path);
   if (probe < 0 || flock(probe, LOCK_EX | LOCK_NB) != 0) {
-    printf("FAIL: sender restored stale lock after receiver unlocked it (errno=%d)\n", errno);
+    printf(
+        "FAIL: sender restored stale lock after receiver unlocked it (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-transfer-release-remained-unlocked\n");
@@ -963,7 +1027,7 @@ static int scenario_sent_after_fork(const char *scenario, int batched) {
 }
 
 static int scenario_failed_send_preserves_state(void) {
-  const char *path = lock_path("failed-send");
+  const char* path = lock_path("failed-send");
   int fd = open_lock(path);
   if (fd < 0 || flock(fd, LOCK_SH | LOCK_NB) != 0) {
     printf("FAIL: could not establish failed-send lock (errno=%d)\n", errno);
@@ -979,7 +1043,7 @@ static int scenario_failed_send_preserves_state(void) {
   message.msg_iovlen = 1;
   message.msg_control = control;
   message.msg_controllen = sizeof(control);
-  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
   header->cmsg_level = SOL_SOCKET;
   header->cmsg_type = SCM_RIGHTS;
   header->cmsg_len = CMSG_LEN(sizeof(fd));
@@ -992,7 +1056,8 @@ static int scenario_failed_send_preserves_state(void) {
   }
   printf("flock-failed-send-rejected errno=%d\n", errno);
   if (flock(fd, LOCK_EX) != 0) {
-    printf("FAIL: failed sendmsg discarded known flock state (errno=%d)\n", errno);
+    printf(
+        "FAIL: failed sendmsg discarded known flock state (errno=%d)\n", errno);
     return 1;
   }
   printf("flock-after-failed-send-acquired\n");
@@ -1002,7 +1067,7 @@ static int scenario_failed_send_preserves_state(void) {
 }
 
 static int scenario_partial_sendmmsg(void) {
-  const char *first_path = lock_path("partial-sendmmsg-first");
+  const char* first_path = lock_path("partial-sendmmsg-first");
   char second_path[512];
   snprintf(second_path, sizeof(second_path), "%s-second", first_path);
   int sockets[2];
@@ -1030,7 +1095,8 @@ static int scenario_partial_sendmmsg(void) {
   int second = open(second_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
   if (first < 0 || second < 0 || flock(first, LOCK_SH | LOCK_NB) != 0 ||
       flock(second, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish partial-sendmmsg locks (errno=%d)\n", errno);
+    printf(
+        "FAIL: could not establish partial-sendmmsg locks (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
 
@@ -1046,14 +1112,14 @@ static int scenario_partial_sendmmsg(void) {
   messages[0].msg_hdr.msg_iovlen = 1;
   messages[0].msg_hdr.msg_control = control;
   messages[0].msg_hdr.msg_controllen = sizeof(control);
-  struct cmsghdr *header = CMSG_FIRSTHDR(&messages[0].msg_hdr);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&messages[0].msg_hdr);
   header->cmsg_level = SOL_SOCKET;
   header->cmsg_type = SCM_RIGHTS;
   header->cmsg_len = CMSG_LEN(sizeof(first));
   memcpy(CMSG_DATA(header), &first, sizeof(first));
   messages[1].msg_hdr.msg_iov = &iov[1];
   messages[1].msg_hdr.msg_iovlen = 1;
-  messages[1].msg_hdr.msg_control = (void *)1;
+  messages[1].msg_hdr.msg_control = (void*)1;
   messages[1].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(second));
 
   int sent = sendmmsg(sockets[0], messages, 2, 0);
@@ -1066,7 +1132,8 @@ static int scenario_partial_sendmmsg(void) {
   int status = 0;
   if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: partial receiver failed (status=%d errno=%d)\n", status, errno);
+    printf(
+        "FAIL: partial receiver failed (status=%d errno=%d)\n", status, errno);
     return HARNESS_FAILURE;
   }
 
@@ -1077,7 +1144,9 @@ static int scenario_partial_sendmmsg(void) {
   }
   errno = 0;
   if (flock(second, LOCK_EX) != -1 || errno != ENOLCK) {
-    printf("FAIL: partial sendmmsg did not conservatively invalidate unsent state (errno=%d)\n", errno);
+    printf(
+        "FAIL: partial sendmmsg did not conservatively invalidate unsent state (errno=%d)\n",
+        errno);
     return 1;
   }
   printf("flock-partial-sendmmsg-invalidated-all\n");
@@ -1097,9 +1166,9 @@ static int scenario_vfork_no_flock_state(void) {
     _exit(0);
   int status = 0;
   return waitpid(child, &status, 0) == child && WIFEXITED(status) &&
-                 WEXITSTATUS(status) == 0
-             ? 0
-             : HARNESS_FAILURE;
+          WEXITSTATUS(status) == 0
+      ? 0
+      : HARNESS_FAILURE;
 }
 
 enum vfork_form {
@@ -1115,8 +1184,8 @@ enum clone_files_form {
 
 static pid_t start_clone_files_process(enum clone_files_form form) {
   if (form == CLONE_FILES_SYSCALL)
-    return (pid_t)syscall(SYS_clone, (unsigned long)(CLONE_FILES | SIGCHLD),
-                          NULL, NULL, NULL, 0);
+    return (pid_t)syscall(
+        SYS_clone, (unsigned long)(CLONE_FILES | SIGCHLD), NULL, NULL, NULL, 0);
   struct clone_args args = {
       .flags = CLONE_FILES,
       .exit_signal = SIGCHLD,
@@ -1125,13 +1194,16 @@ static pid_t start_clone_files_process(enum clone_files_form form) {
 }
 
 static int scenario_clone_files_process(enum clone_files_form form) {
-  const char *name = form == CLONE_FILES_SYSCALL ? "clone-files-process"
+  const char* name = form == CLONE_FILES_SYSCALL ? "clone-files-process"
                                                  : "clone3-files-process";
   char target_path[256];
   char replacement_path[256];
   snprintf(target_path, sizeof(target_path), "/tmp/hermit-%s-target", name);
-  snprintf(replacement_path, sizeof(replacement_path),
-           "/tmp/hermit-%s-replacement", name);
+  snprintf(
+      replacement_path,
+      sizeof(replacement_path),
+      "/tmp/hermit-%s-replacement",
+      name);
   int target = open(target_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
   int replacement = open(replacement_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
   if (target < 0 || replacement < 0 || write(replacement, "R", 1) != 1 ||
@@ -1155,14 +1227,16 @@ static int scenario_clone_files_process(enum clone_files_form form) {
   int status = 0;
   if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
-    printf("FAIL: %s child failed (status=%d errno=%d)\n", name, status,
-           errno);
+    printf("FAIL: %s child failed (status=%d errno=%d)\n", name, status, errno);
     return HARNESS_FAILURE;
   }
   char observed = 0;
   if (read(target, &observed, 1) != 1 || observed != 'R') {
-    printf("FAIL: %s did not share the replaced descriptor slot (byte=%d errno=%d)\n",
-           name, observed, errno);
+    printf(
+        "FAIL: %s did not share the replaced descriptor slot (byte=%d errno=%d)\n",
+        name,
+        observed,
+        errno);
     return 1;
   }
   printf("flock-%s-shared-mutation-observed\n", name);
@@ -1175,8 +1249,8 @@ static pid_t start_vfork_form(enum vfork_form form) {
   if (form == VFORK_SYSCALL)
     return vfork();
   if (form == CLONE_VFORK_SYSCALL)
-    return (pid_t)syscall(SYS_clone, (unsigned long)(CLONE_VFORK | SIGCHLD),
-                          NULL, NULL, NULL, 0);
+    return (pid_t)syscall(
+        SYS_clone, (unsigned long)(CLONE_VFORK | SIGCHLD), NULL, NULL, NULL, 0);
   struct clone_args args = {
       .flags = CLONE_VFORK,
       .exit_signal = SIGCHLD,
@@ -1185,13 +1259,15 @@ static pid_t start_vfork_form(enum vfork_form form) {
 }
 
 static int scenario_vfork_upgrade(int make_unknown, enum vfork_form form) {
-  const char *path = lock_path("vfork-upgrade");
+  const char* path = lock_path("vfork-upgrade");
   int inherited = open_lock(path);
   int contender = open_lock(path);
   if (inherited < 0 || contender < 0 ||
       flock(inherited, LOCK_SH | LOCK_NB) != 0 ||
       flock(contender, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish vfork upgrade contention (errno=%d)\n", errno);
+    printf(
+        "FAIL: could not establish vfork upgrade contention (errno=%d)\n",
+        errno);
     return HARNESS_FAILURE;
   }
 
@@ -1218,13 +1294,14 @@ static int scenario_vfork_upgrade(int make_unknown, enum vfork_form form) {
     (void)flock(inherited, LOCK_EX);
     _exit(1);
   }
-  printf("FAIL: copied vfork child returned from blocking flock (status=%ld)\n",
-         (long)child);
+  printf(
+      "FAIL: copied vfork child returned from blocking flock (status=%ld)\n",
+      (long)child);
   return 1;
 }
 
 static int scenario_holder(void) {
-  const char *path = lock_path("holder");
+  const char* path = lock_path("holder");
   int fd = lock_override != NULL ? open(path, O_RDONLY) : open_lock(path);
   if (fd < 0) {
     printf("FAIL: could not open %s (errno=%d)\n", path, errno);
@@ -1245,9 +1322,9 @@ static int scenario_holder(void) {
   return 0;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
-  const char *scenario = (argc > 1) ? argv[1] : "exclusion";
+  const char* scenario = (argc > 1) ? argv[1] : "exclusion";
   if (argc > 2) {
     lock_override = argv[2];
   }

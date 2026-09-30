@@ -29,28 +29,30 @@
 #define PR_GET_NO_NEW_PRIVS 39
 #endif
 
-static int refused(int op, unsigned long arg2)
-{
-	errno = 0;
-	int r = prctl(op, arg2, 0UL, 0UL, 0UL);
-	return (r == -1 && errno == ENOSYS) ? 1 : 0;
+static int refused(int op, unsigned long arg2) {
+  errno = 0;
+  int r = prctl(op, arg2, 0UL, 0UL, 0UL);
+  return (r == -1 && errno == ENOSYS) ? 1 : 0;
 }
 
-int main(void)
-{
-	/* Each refusal is reported separately. Summing three into one scalar
-	 * meant a backend that leaked the initial query and a backend that
-	 * recorded state on the SET (so the second query answered) both printed
-	 * "nnp ok=2" and compared equal -- and the second-query check exists
-	 * precisely to catch state being recorded, so collapsing it defeated the
-	 * point of having it. The observables are refusals, so this fixture is
-	 * de-aliased rather than value-printing. */
-	int query1_refused = refused(PR_GET_NO_NEW_PRIVS, 0);
-	int set_refused = refused(PR_SET_NO_NEW_PRIVS, 1);
-	int query2_refused = refused(PR_GET_NO_NEW_PRIVS, 0);
+int main(void) {
+  /* Each refusal is reported separately. Summing three into one scalar
+   * meant a backend that leaked the initial query and a backend that
+   * recorded state on the SET (so the second query answered) both printed
+   * "nnp ok=2" and compared equal -- and the second-query check exists
+   * precisely to catch state being recorded, so collapsing it defeated the
+   * point of having it. The observables are refusals, so this fixture is
+   * de-aliased rather than value-printing. */
+  int query1_refused = refused(PR_GET_NO_NEW_PRIVS, 0);
+  int set_refused = refused(PR_SET_NO_NEW_PRIVS, 1);
+  int query2_refused = refused(PR_GET_NO_NEW_PRIVS, 0);
 
-	int ok = query1_refused + set_refused + query2_refused;
-	printf("nnp ok=%d query1_refused=%d set_refused=%d query2_refused=%d\n",
-	       ok, query1_refused, set_refused, query2_refused);
-	return ok == 3 ? 0 : 1;
+  int ok = query1_refused + set_refused + query2_refused;
+  printf(
+      "nnp ok=%d query1_refused=%d set_refused=%d query2_refused=%d\n",
+      ok,
+      query1_refused,
+      set_refused,
+      query2_refused);
+  return ok == 3 ? 0 : 1;
 }

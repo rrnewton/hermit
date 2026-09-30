@@ -39,9 +39,15 @@ mod user_access_tests {
             panic!("random copy fell back to debugger write")
         }
 
-        fn write_with_user_access(&mut self, addr: AddrMut<u8>, bytes: &[u8]) -> Result<usize, Errno> {
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, Errno> {
             self.calls.push((addr.as_raw(), bytes.to_vec()));
-            addr.as_raw().checked_add(bytes.len()).ok_or(Errno::EFAULT)?;
+            addr.as_raw()
+                .checked_add(bytes.len())
+                .ok_or(Errno::EFAULT)?;
             let action = self.actions.pop_front().unwrap_or(Copy::Count(bytes.len()));
             let (n, result) = match action {
                 Copy::Count(n) => (n, Ok(n)),
@@ -73,7 +79,10 @@ mod user_access_tests {
             panic!("terminal copy failure became guest-visible: {error:?}");
         };
         assert_eq!(
-            error.downcast_ref::<RandomCopyFailure>().expect("typed original error").errno(),
+            error
+                .downcast_ref::<RandomCopyFailure>()
+                .expect("typed original error")
+                .errno(),
             expected
         );
     }
@@ -90,13 +99,23 @@ mod user_access_tests {
             let mut actual = root_prng(17);
             let mut memory = CapabilityMemory::new(length + 1, []);
             let result = super::super::getrandom(
-                &mut actual, &mut memory, DetTid::from_raw(1), call(0x1000, length, 0),
+                &mut actual,
+                &mut memory,
+                DetTid::from_raw(1),
+                call(0x1000, length, 0),
             );
             assert_eq!(result.unwrap(), length as i64);
             let (expected, bytes) = attempted_bytes(&draws);
             assert_eq!(&memory.bytes[..length], bytes);
             assert_eq!(memory.bytes[length], 0xa5);
-            assert_eq!(memory.calls.iter().map(|(_, bytes)| bytes.len()).collect::<Vec<_>>(), copies);
+            assert_eq!(
+                memory
+                    .calls
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .collect::<Vec<_>>(),
+                copies
+            );
             same_state(&actual, &expected);
         }
     }
@@ -122,21 +141,54 @@ mod user_access_tests {
         let cases = [
             (7, vec![7], vec![Copy::FailAfter(3, Errno::EIO)], 3, vec![7]),
             (7, vec![7], vec![Copy::FailAfter(7, Errno::EIO)], 7, vec![7]),
-            (8, vec![8], vec![Copy::Count(4), Copy::FailAfter(2, Errno::EIO)], 6, vec![4, 4]),
-            (4104, vec![4096, 8], vec![Copy::Count(4096), Copy::FailAfter(4, Errno::EIO)], 4100, vec![4096, 4]),
-            (4104, vec![4096, 8], vec![Copy::Count(4096), Copy::Count(4), Copy::FailAfter(4, Errno::EIO)], 4104, vec![4096, 4, 4]),
+            (
+                8,
+                vec![8],
+                vec![Copy::Count(4), Copy::FailAfter(2, Errno::EIO)],
+                6,
+                vec![4, 4],
+            ),
+            (
+                4104,
+                vec![4096, 8],
+                vec![Copy::Count(4096), Copy::FailAfter(4, Errno::EIO)],
+                4100,
+                vec![4096, 4],
+            ),
+            (
+                4104,
+                vec![4096, 8],
+                vec![
+                    Copy::Count(4096),
+                    Copy::Count(4),
+                    Copy::FailAfter(4, Errno::EIO),
+                ],
+                4104,
+                vec![4096, 4, 4],
+            ),
         ];
         for (length, draws, actions, changed, copies) in cases {
             let mut actual = root_prng(17);
             let mut memory = CapabilityMemory::new(length + 1, actions);
             let error = super::super::getrandom(
-                &mut actual, &mut memory, DetTid::from_raw(1), call(0x1000, length, 0),
-            ).unwrap_err();
+                &mut actual,
+                &mut memory,
+                DetTid::from_raw(1),
+                call(0x1000, length, 0),
+            )
+            .unwrap_err();
             terminal(error, Errno::EIO);
             let (expected, bytes) = attempted_bytes(&draws);
             assert_eq!(&memory.bytes[..changed], &bytes[..changed]);
             assert!(memory.bytes[changed..].iter().all(|byte| *byte == 0xa5));
-            assert_eq!(memory.calls.iter().map(|(_, bytes)| bytes.len()).collect::<Vec<_>>(), copies);
+            assert_eq!(
+                memory
+                    .calls
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .collect::<Vec<_>>(),
+                copies
+            );
             same_state(&actual, &expected);
         }
     }
@@ -144,21 +196,39 @@ mod user_access_tests {
     #[test]
     fn guest_faults_and_short_copies_keep_exact_prefix_semantics() {
         for (actions, expected, changed, calls) in [
-            (vec![Copy::FailAfter(0, Errno::EFAULT)], Err(Errno::EFAULT), 0, 1),
+            (
+                vec![Copy::FailAfter(0, Errno::EFAULT)],
+                Err(Errno::EFAULT),
+                0,
+                1,
+            ),
             (vec![Copy::Count(0)], Err(Errno::EFAULT), 0, 1),
             (vec![Copy::Count(3)], Ok(3), 3, 1),
-            (vec![Copy::Count(4096), Copy::FailAfter(0, Errno::EFAULT)], Ok(4096), 4096, 2),
+            (
+                vec![Copy::Count(4096), Copy::FailAfter(0, Errno::EFAULT)],
+                Ok(4096),
+                4096,
+                2,
+            ),
         ] {
             let mut actual = root_prng(17);
             let mut memory = CapabilityMemory::new(4105, actions);
             let result = super::super::getrandom(
-                &mut actual, &mut memory, DetTid::from_raw(1), call(0x1000, 4104, 0),
-            ).map_err(|error| match error {
+                &mut actual,
+                &mut memory,
+                DetTid::from_raw(1),
+                call(0x1000, 4104, 0),
+            )
+            .map_err(|error| match error {
                 Error::Errno(error) => error,
                 other => panic!("guest-fault companion became terminal: {other:?}"),
             });
             assert_eq!(result, expected);
-            let draws = if calls == 1 { vec![4096] } else { vec![4096, 8] };
+            let draws = if calls == 1 {
+                vec![4096]
+            } else {
+                vec![4096, 8]
+            };
             let (expected, bytes) = attempted_bytes(&draws);
             assert_eq!(&memory.bytes[..changed], &bytes[..changed]);
             assert!(memory.bytes[changed..].iter().all(|byte| *byte == 0xa5));
@@ -173,7 +243,10 @@ mod user_access_tests {
         let mut memory = CapabilityMemory::new(9, []);
         memory.base = usize::MAX - 2;
         let result = super::super::getrandom(
-            &mut actual, &mut memory, DetTid::from_raw(1), call(usize::MAX - 2, 9, 0),
+            &mut actual,
+            &mut memory,
+            DetTid::from_raw(1),
+            call(usize::MAX - 2, 9, 0),
         );
         assert!(matches!(result, Err(Error::Errno(Errno::EFAULT))));
         assert_eq!(memory.calls.len(), 1);
@@ -182,7 +255,10 @@ mod user_access_tests {
 
         let mut actual = root_prng(17);
         let result = super::super::getrandom(
-            &mut actual, &mut memory, DetTid::from_raw(1), call(0, 9, usize::MAX),
+            &mut actual,
+            &mut memory,
+            DetTid::from_raw(1),
+            call(0, 9, usize::MAX),
         );
         assert!(matches!(result, Err(Error::Errno(Errno::EINVAL))));
         assert_eq!(memory.calls.len(), 1);

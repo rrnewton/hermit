@@ -18,7 +18,7 @@
 #include <string.h>
 
 int main(void) {
-  FILE *mountinfo = fopen("/proc/self/mountinfo", "r");
+  FILE* mountinfo = fopen("/proc/self/mountinfo", "r");
   if (mountinfo == NULL) {
     return 1;
   }
@@ -34,14 +34,14 @@ int main(void) {
 
   struct statx statx_result;
   memset(&statx_result, 0, sizeof(statx_result));
-  if (syscall(SYS_statx, AT_FDCWD, "/", 0, STATX_BASIC_STATS,
-              &statx_result) != 0) {
+  if (syscall(SYS_statx, AT_FDCWD, "/", 0, STATX_BASIC_STATS, &statx_result) !=
+      0) {
     return 1;
   }
 
   printf("MOUNTINFO %s", row);
   printf("STAT %u:%u\n", major(stat_result.st_dev), minor(stat_result.st_dev));
-  printf("STATX %u:%u\n", statx_result.stx_dev_major,
-         statx_result.stx_dev_minor);
+  printf(
+      "STATX %u:%u\n", statx_result.stx_dev_major, statx_result.stx_dev_minor);
   return 0;
 }

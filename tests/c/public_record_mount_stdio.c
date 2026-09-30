@@ -30,7 +30,7 @@ static int copy_fd(int fd) {
   }
 }
 
-static int section(const char *name, int fd) {
+static int section(const char* name, int fd) {
   if (dprintf(STDOUT_FILENO, "__%s__\n", name) < 0 || copy_fd(fd) < 0 ||
       dprintf(STDOUT_FILENO, "__END_%s__\n", name) < 0) {
     return -1;
@@ -38,7 +38,7 @@ static int section(const char *name, int fd) {
   return 0;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc != 2) {
     return 2;
   }
@@ -50,7 +50,9 @@ int main(int argc, char **argv) {
   }
 
   char fdinfo_path[64];
-  if (snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/self/fdinfo/%d", mounted) < 0) {
+  if (snprintf(
+          fdinfo_path, sizeof(fdinfo_path), "/proc/self/fdinfo/%d", mounted) <
+      0) {
     return 4;
   }
   int fdinfo = open(fdinfo_path, O_RDONLY);

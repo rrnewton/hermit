@@ -12,8 +12,8 @@
  * Built `-static -nostdlib -nostartfiles`, so the binary has no dynamic loader,
  * no PLT, and no shared libc. EVERY instruction it executes -- including every
  * syscall instruction -- lives in the main ELF. That is the whole address space
- * a main-ELF rewriter is responsible for, with nothing hidden behind a PLT thunk
- * into libc.so, so a rewriter that misses sites here has nowhere to hide.
+ * a main-ELF rewriter is responsible for, with nothing hidden behind a PLT
+ * thunk into libc.so, so a rewriter that misses sites here has nowhere to hide.
  *
  * WHY NOT `-static` WITH GLIBC. That would be the ideal shape -- libc's OWN
  * syscall instructions linked into the main ELF, a program form people actually
@@ -33,68 +33,68 @@
 typedef long ssize_t_;
 
 static long sys3(long nr, long a, long b, long c) {
-    long ret;
-    __asm__ volatile("syscall"
-                     : "=a"(ret)
-                     : "a"(nr), "D"(a), "S"(b), "d"(c)
-                     : "rcx", "r11", "memory");
-    return ret;
+  long ret;
+  __asm__ volatile("syscall"
+                   : "=a"(ret)
+                   : "a"(nr), "D"(a), "S"(b), "d"(c)
+                   : "rcx", "r11", "memory");
+  return ret;
 }
 
 static long sys0(long nr) {
-    long ret;
-    __asm__ volatile("syscall" : "=a"(ret) : "a"(nr) : "rcx", "r11", "memory");
-    return ret;
+  long ret;
+  __asm__ volatile("syscall" : "=a"(ret) : "a"(nr) : "rcx", "r11", "memory");
+  return ret;
 }
 
-static unsigned long slen(const char *s) {
-    unsigned long n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
-    return n;
+static unsigned long slen(const char* s) {
+  unsigned long n = 0;
+  while (s[n] != '\0') {
+    n++;
+  }
+  return n;
 }
 
-static long emit(const char *s) {
-    return sys3(1 /*write*/, 1 /*stdout*/, (long)s, (long)slen(s));
+static long emit(const char* s) {
+  return sys3(1 /*write*/, 1 /*stdout*/, (long)s, (long)slen(s));
 }
 
 /* Decimal rendering without libc, so the checksum is printable. */
 static void emit_ulong(unsigned long v) {
-    char buf[24];
-    int i = (int)sizeof(buf);
-    buf[--i] = '\n';
-    if (v == 0) {
-        buf[--i] = '0';
-    }
-    while (v > 0) {
-        buf[--i] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    sys3(1, 1, (long)&buf[i], (long)((int)sizeof(buf) - i));
+  char buf[24];
+  int i = (int)sizeof(buf);
+  buf[--i] = '\n';
+  if (v == 0) {
+    buf[--i] = '0';
+  }
+  while (v > 0) {
+    buf[--i] = (char)('0' + (v % 10));
+    v /= 10;
+  }
+  sys3(1, 1, (long)&buf[i], (long)((int)sizeof(buf) - i));
 }
 
 void _start(void) {
-    unsigned long checksum = 0;
+  unsigned long checksum = 0;
 
-    /* Several distinct, repeatedly executed sites. A rewriter must patch a hot
-     * site re-entrantly, not merely find it once. */
-    for (int i = 0; i < 6; i++) {
-        long w = emit("freestanding: site\n");
-        checksum = checksum * 131u + (unsigned long)w;
-        long y = sys0(24 /*sched_yield*/);
-        checksum = checksum * 131u + (unsigned long)y;
-    }
+  /* Several distinct, repeatedly executed sites. A rewriter must patch a hot
+   * site re-entrantly, not merely find it once. */
+  for (int i = 0; i < 6; i++) {
+    long w = emit("freestanding: site\n");
+    checksum = checksum * 131u + (unsigned long)w;
+    long y = sys0(24 /*sched_yield*/);
+    checksum = checksum * 131u + (unsigned long)y;
+  }
 
-    /* A site whose result is deliberately discarded and never printed. */
-    (void)sys0(39 /*getpid*/);
+  /* A site whose result is deliberately discarded and never printed. */
+  (void)sys0(39 /*getpid*/);
 
-    emit("freestanding: checksum=");
-    emit_ulong(checksum);
+  emit("freestanding: checksum=");
+  emit_ulong(checksum);
 
-    sys3(231 /*exit_group*/, 0, 0, 0);
-    /* exit_group does not return; loop keeps the compiler's noreturn analysis
-     * happy without pulling in libc's __builtin_unreachable machinery. */
-    for (;;) {
-    }
+  sys3(231 /*exit_group*/, 0, 0, 0);
+  /* exit_group does not return; loop keeps the compiler's noreturn analysis
+   * happy without pulling in libc's __builtin_unreachable machinery. */
+  for (;;) {
+  }
 }

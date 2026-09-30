@@ -7,13 +7,14 @@
  */
 
 /*
- * Path-based file-operation parity probe: truncate(2) and access(2)/faccessat(2).
+ * Path-based file-operation parity probe: truncate(2) and
+ * access(2)/faccessat(2).
  *
  * A single process drives one temporary path through operations that resolve
- * the file by name rather than by an open descriptor, checking the deterministic
- * semantics Detcore's file model must preserve identically on every backend.
- * This complements the fd-based ftruncate row (which truncates through an open
- * descriptor) by exercising the path-resolving variants:
+ * the file by name rather than by an open descriptor, checking the
+ * deterministic semantics Detcore's file model must preserve identically on
+ * every backend. This complements the fd-based ftruncate row (which truncates
+ * through an open descriptor) by exercising the path-resolving variants:
  *
  *   - truncate(path, N) shrinks the file to N bytes.
  *   - truncate(path, M) with M > N grows it, zero-filling the new hole.
@@ -34,8 +35,8 @@
  *
  *   path_file_ops size=8 checksum=293 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -47,12 +48,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
 
-static off_t path_size(const char *path) {
+static off_t path_size(const char* path) {
   struct stat st;
   if (stat(path, &st) != 0)
     fail("stat");
@@ -113,16 +114,23 @@ int main(void) {
   if (unlink(template) != 0)
     fail("unlink");
 
-  printf("path_file_ops size=%ld checksum=%ld ok=%d\n", (long)final_size,
-         checksum, ok);
+  printf(
+      "path_file_ops size=%ld checksum=%ld ok=%d\n",
+      (long)final_size,
+      checksum,
+      ok);
   /* Route a behavioural failure into the exit status. Without this the guest
      exits 0 whatever `ok` reached, so a regression only lowered the printed
      number -- and under --verify both runs lower it identically, so the
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "path_file_ops completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr,
+        "path_file_ops completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

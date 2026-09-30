@@ -16,7 +16,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -28,7 +28,7 @@ static void on_sigchld(int signal_number) {
   ++sigchld_count;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   int require_sigchld = 1;
   if (argc == 2 && strcmp(argv[1], "--accounting-only") == 0) {
     require_sigchld = 0;

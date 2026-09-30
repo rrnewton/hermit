@@ -16,8 +16,8 @@ static int open_test_fd(void) {
   }
   return fd;
 #elif FD_SOURCE == 2
-  return openat(AT_FDCWD, "/tmp/hermit-proc-fdinfo-openat",
-                O_CREAT | O_RDONLY, 0600);
+  return openat(
+      AT_FDCWD, "/tmp/hermit-proc-fdinfo-openat", O_CREAT | O_RDONLY, 0600);
 #elif FD_SOURCE == 3
   return memfd_create("hermit-proc-fdinfo", MFD_CLOEXEC);
 #else
@@ -32,7 +32,7 @@ int main(void) {
     return 1;
   }
 
-  FILE *info = fopen(path, "r");
+  FILE* info = fopen(path, "r");
   if (info == NULL) {
     return 1;
   }

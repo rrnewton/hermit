@@ -22,7 +22,7 @@
 #define EXPECTED_CHECKS 5
 
 /* Return the low permission bits (st_mode & 07777) for a path, or -1. */
-static int perm_bits(const char *path) {
+static int perm_bits(const char* path) {
   struct stat st;
   if (stat(path, &st) != 0) {
     return -1;
@@ -36,9 +36,9 @@ int main(void) {
   char root[] = "/tmp/umaskXXXXXX";
 #ifdef HERMIT_TEST_UMASK_SETUP_FAILURE
   errno = EACCES;
-  char *created_root = NULL;
+  char* created_root = NULL;
 #else
-  char *created_root = mkdtemp(root);
+  char* created_root = mkdtemp(root);
 #endif
   if (created_root == NULL) {
     fprintf(stderr, "umask setup failed: mkdtemp: %s\n", strerror(errno));

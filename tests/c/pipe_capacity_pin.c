@@ -19,14 +19,17 @@ int main(void) {
 
   int read_capacity = fcntl(fds[0], F_GETPIPE_SZ);
   int write_capacity = fcntl(fds[1], F_GETPIPE_SZ);
-  printf("pipe-capacity-pin read=%d write=%d expected=%d\n", read_capacity,
-         write_capacity, EXPECTED_PIPE_CAPACITY);
+  printf(
+      "pipe-capacity-pin read=%d write=%d expected=%d\n",
+      read_capacity,
+      write_capacity,
+      EXPECTED_PIPE_CAPACITY);
 
   close(fds[0]);
   close(fds[1]);
 
   return read_capacity == EXPECTED_PIPE_CAPACITY &&
-                 write_capacity == EXPECTED_PIPE_CAPACITY
-             ? EXIT_SUCCESS
-             : EXIT_FAILURE;
+          write_capacity == EXPECTED_PIPE_CAPACITY
+      ? EXIT_SUCCESS
+      : EXIT_FAILURE;
 }

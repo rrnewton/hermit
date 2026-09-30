@@ -12,9 +12,9 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -35,14 +35,18 @@ def load(name: str, filename: str | Path):
 class BackendParityTemporaryPathTest(unittest.TestCase):
     def test_pinned_root_dbt_commands_use_the_fixed_test_workdir(self) -> None:
         run_matrix = load("hermetic_dbt_run_matrix", "run_matrix.py")
-        with tempfile.TemporaryDirectory() as raw, mock.patch.dict(
-            os.environ,
-            {run_matrix.ISOLATED_WORKDIR_ENV: run_matrix.HERMETIC_TEST_WORKDIR},
-        ), mock.patch.object(
-            run_matrix.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0, b"", b""),
-        ) as smoke_run:
+        with (
+            tempfile.TemporaryDirectory() as raw,
+            mock.patch.dict(
+                os.environ,
+                {run_matrix.ISOLATED_WORKDIR_ENV: run_matrix.HERMETIC_TEST_WORKDIR},
+            ),
+            mock.patch.object(
+                run_matrix.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, b"", b""),
+            ) as smoke_run,
+        ):
             self.assertIsNone(run_matrix.backend_block("dbt", Path("/hermit"), True))
             smoke_command = smoke_run.call_args.args[0]
             self.assertIn("--base-env=minimal", smoke_command)
@@ -52,22 +56,32 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             for backend in ("dbt", "ptrace", "kvm"):
                 with self.subTest(backend=backend):
                     command = run_matrix.hermit_command(
-                        Path("/hermit"), backend, ["/bin/true"], "true", True, Path(raw),
+                        Path("/hermit"),
+                        backend,
+                        ["/bin/true"],
+                        "true",
+                        True,
+                        Path(raw),
                     )
                     self.assertIn("--base-env=minimal", command)
                     self.assertIn("--workdir=/test", command)
-                    self.assertEqual("--mount=type=tmpfs,target=/test" in command, backend != "dbt")
+                    self.assertEqual(
+                        "--mount=type=tmpfs,target=/test" in command, backend != "dbt"
+                    )
                     boundary = command.index("--workdir=/test")
-                    self.assertIn("--", command[boundary + 1:])
+                    self.assertIn("--", command[boundary + 1 :])
 
     def test_pinned_root_dbt_workdir_refuses_an_unrecognised_value(self) -> None:
         run_matrix = load("invalid_hermetic_dbt_run_matrix", "run_matrix.py")
-        with mock.patch.dict(
-            os.environ,
-            {run_matrix.ISOLATED_WORKDIR_ENV: "/somewhere-else"},
-        ), self.assertRaisesRegex(
-            run_matrix.MatrixError,
-            "HERMIT_E2E_EMPTY_WORKDIR must be /test",
+        with (
+            mock.patch.dict(
+                os.environ,
+                {run_matrix.ISOLATED_WORKDIR_ENV: "/somewhere-else"},
+            ),
+            self.assertRaisesRegex(
+                run_matrix.MatrixError,
+                "HERMIT_E2E_EMPTY_WORKDIR must be /test",
+            ),
         ):
             run_matrix.hermit_command(
                 Path("/hermit"),
@@ -113,7 +127,9 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)",
         )
 
-    def test_old_host_tmp_overwrites_and_all_commands_accept_private_roots(self) -> None:
+    def test_old_host_tmp_overwrites_and_all_commands_accept_private_roots(
+        self,
+    ) -> None:
         run_matrix = load("parallel_run_matrix", "run_matrix.py")
         e9patch = load("parallel_e9patch_corpus", "e9patch_corpus.py")
         mutation = load("parallel_fixture_mutation", FIXTURE_MUTATION)
@@ -202,9 +218,7 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
 
             escaped = tmp_a.parent / "etc" / "hosts"
             self.assertEqual(
-                fixtures_a.expose_tmp_paths(
-                    "ptrace", ["/tmp/../etc/hosts"], tmp_a
-                ),
+                fixtures_a.expose_tmp_paths("ptrace", ["/tmp/../etc/hosts"], tmp_a),
                 ["/tmp/../etc/hosts"],
             )
             self.assertFalse(escaped.exists())
@@ -261,8 +275,8 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             fake_hermit.write_text(
                 "#!/bin/sh\n"
                 "set -eu\n"
-                "test \"$TMPDIR\" = /tmp\n"
-                "test \"$(cat \"$(dirname \"$0\")/../install_pkg/rsrcs/marker\")\" "
+                'test "$TMPDIR" = /tmp\n'
+                'test "$(cat "$(dirname "$0")/../install_pkg/rsrcs/marker")" '
                 "= resource-ok\n"
                 "for arg do\n"
                 "  case $arg in\n"
@@ -352,7 +366,6 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             self.assertEqual((tmp_a / fixed_name).read_text(), "run-a\n")
             self.assertEqual((tmp_b / fixed_name).read_text(), "run-b\n")
 
-
     def test_shadow_proxy_receives_the_private_tmp_stage_outside_it(self) -> None:
         """safehermit must not start inside run_matrix's user namespace.
 
@@ -382,9 +395,10 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             inner = official[official.index(str(proxy)) :]
             stage = official[: official.index(str(proxy))]
 
-            with mock.patch.dict(
-                os.environ, {run_matrix.MATRIX_PROXY_ENV: "1"}
-            ), mock.patch.object(run_matrix, "MATRIX_PROXY", proxy):
+            with (
+                mock.patch.dict(os.environ, {run_matrix.MATRIX_PROXY_ENV: "1"}),
+                mock.patch.object(run_matrix, "MATRIX_PROXY", proxy),
+            ):
                 handed = run_matrix.hermit_command(
                     proxy, "dbt", guest, "exit_zero", True, host_tmp
                 )

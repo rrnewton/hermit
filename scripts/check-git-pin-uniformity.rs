@@ -251,9 +251,9 @@ fn run() -> Result<ExitCode, String> {
     // quietly permit a future regression.
     let mut stale = Vec::new();
     for (dep, _) in KNOWN_FLOATING {
-        let still_floats = by_dep.get(*dep).is_some_and(|pins| {
-            pins.keys().any(|pin| matches!(pin, Pin::Floating(_)))
-        });
+        let still_floats = by_dep
+            .get(*dep)
+            .is_some_and(|pins| pins.keys().any(|pin| matches!(pin, Pin::Floating(_))));
         if !still_floats {
             stale.push(*dep);
         }
@@ -285,7 +285,9 @@ fn run() -> Result<ExitCode, String> {
             "check-git-pin-uniformity.rs: REFUSED -- {} git dependency/ies pinned at more than one revision.",
             split.len()
         );
-        eprintln!("  A split pin lets a mechanism be HALF PRESENT: the build succeeds, the tests pass,");
+        eprintln!(
+            "  A split pin lets a mechanism be HALF PRESENT: the build succeeds, the tests pass,"
+        );
         eprintln!("  and the half that actually runs is the wrong one. Nothing else reports this.");
         eprintln!();
         eprintln!("  ⚠️ IF A SUBMODULE AND A CARGO PIN DISAGREE, THE FIX IS NOT TO DELETE ONE.");
@@ -328,7 +330,9 @@ fn run() -> Result<ExitCode, String> {
         );
         eprintln!("  ⚠️ THIS IS WORSE THAN A STALE PIN, NOT BETTER. An old revision is at least");
         eprintln!("  reproducible; a branch moves under you, and the lockfile becomes the only");
-        eprintln!("  record of what was actually built. Nothing else in this repository reports it.");
+        eprintln!(
+            "  record of what was actually built. Nothing else in this repository reports it."
+        );
         eprintln!("  Pin it to a revision, or add it to KNOWN_FLOATING with a dated reason.");
         for (url, how, pins) in &floating {
             eprintln!();
@@ -366,7 +370,6 @@ fn run() -> Result<ExitCode, String> {
     }
     Ok(ExitCode::from(1))
 }
-
 
 /// Every submodule as a pin on its own URL: the recorded gitlink, or a Floating
 /// marker when `.gitmodules` names a branch or tag.
@@ -420,10 +423,14 @@ fn submodule_pins(root: &Path) -> Result<Vec<(PathBuf, String, Pin)>, String> {
             continue;
         }
         let Some(sha) = parts.next() else { continue };
-        let Some(path) = line.split('\t').nth(1) else { continue };
+        let Some(path) = line.split('\t').nth(1) else {
+            continue;
+        };
         // A gitlink with no .gitmodules entry cannot be attributed to a
         // dependency, so it is skipped rather than guessed at.
-        let Some(url) = url_for.get(path) else { continue };
+        let Some(url) = url_for.get(path) else {
+            continue;
+        };
         let pin = match float_for.get(path) {
             Some(what) => Pin::Floating(what.clone()),
             None => Pin::Revision(sha.to_string()),
@@ -579,10 +586,9 @@ mod tests {
             r#"reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "13cf8bcb" }"#,
         )
         .expect("manifest pin");
-        let lock = extract(
-            r#"source = "git+https://github.com/rrnewton/reverie?rev=13cf8bcb#13cf8bcb""#,
-        )
-        .expect("lock pin");
+        let lock =
+            extract(r#"source = "git+https://github.com/rrnewton/reverie?rev=13cf8bcb#13cf8bcb""#)
+                .expect("lock pin");
         // If these ever disagree the gate silently stops working: a split pin
         // lands in two single-revision buckets and reports OK.
         assert_eq!(manifest.0, lock.0);

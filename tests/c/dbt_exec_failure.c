@@ -11,10 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
-extern char **environ;
+extern char** environ;
 
 int main(void) {
-  char *const arguments[] = {"/definitely/missing", NULL};
+  char* const arguments[] = {"/definitely/missing", NULL};
 
   errno = 0;
   if (execve(arguments[0], arguments, environ) != -1)

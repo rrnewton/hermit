@@ -15,7 +15,7 @@ static pthread_mutex_t a = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t b = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t held;
 
-static void *thread_one(void *unused) {
+static void* thread_one(void* unused) {
   (void)unused;
   pthread_mutex_lock(&a);
   pthread_barrier_wait(&held);
@@ -23,7 +23,7 @@ static void *thread_one(void *unused) {
   return NULL;
 }
 
-static void *thread_two(void *unused) {
+static void* thread_two(void* unused) {
   (void)unused;
   pthread_mutex_lock(&b);
   pthread_barrier_wait(&held);

@@ -25,8 +25,11 @@ int main(void) {
   errno = 0;
   long invalid_result = syscall(SYS_syslog, 11, NULL, 0);
   if (invalid_result != -1 || errno != EINVAL) {
-    fprintf(stderr, "invalid syslog returned %ld/%d, expected EINVAL\n",
-            invalid_result, errno);
+    fprintf(
+        stderr,
+        "invalid syslog returned %ld/%d, expected EINVAL\n",
+        invalid_result,
+        errno);
     return 1;
   }
   printf("syslog-ok size=%ld\n", result);

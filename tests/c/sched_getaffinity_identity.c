@@ -37,7 +37,8 @@
 
 /* Detcore's VIRTUAL_CPUSET_BYTES: the fixed cpumask size it reports. */
 #define VIRTUAL_CPUSET_BYTES 16
-/* Poison sentinel: if detcore fails to overwrite a byte, the check catches it. */
+/* Poison sentinel: if detcore fails to overwrite a byte, the check catches it.
+ */
 #define SENTINEL 0x7fu
 
 int main(void) {
@@ -49,7 +50,8 @@ int main(void) {
       mask[b] = SENTINEL;
     }
 
-    long ret = syscall(SYS_sched_getaffinity, 0, (size_t)VIRTUAL_CPUSET_BYTES, mask);
+    long ret =
+        syscall(SYS_sched_getaffinity, 0, (size_t)VIRTUAL_CPUSET_BYTES, mask);
 
     /*
      * Report the OBSERVED return value and mask, then branch on them. Printing
@@ -67,23 +69,32 @@ int main(void) {
     printf("\n");
 
     if (ret != VIRTUAL_CPUSET_BYTES) {
-      fprintf(stderr,
-              "iter %d: sched_getaffinity returned %ld, expected %d\n",
-              i, ret, VIRTUAL_CPUSET_BYTES);
+      fprintf(
+          stderr,
+          "iter %d: sched_getaffinity returned %ld, expected %d\n",
+          i,
+          ret,
+          VIRTUAL_CPUSET_BYTES);
       return 1;
     }
 
     /* CPU 0 must be the only online CPU in the virtualized mask. */
     if (mask[0] != 1) {
-      fprintf(stderr, "iter %d: mask byte 0 = 0x%02x, expected 0x01 (CPU 0 only)\n",
-              i, mask[0]);
+      fprintf(
+          stderr,
+          "iter %d: mask byte 0 = 0x%02x, expected 0x01 (CPU 0 only)\n",
+          i,
+          mask[0]);
       return 1;
     }
     for (int b = 1; b < VIRTUAL_CPUSET_BYTES; b++) {
       if (mask[b] != 0) {
-        fprintf(stderr,
-                "iter %d: mask byte %d = 0x%02x, expected 0x00 (no CPU beyond 0)\n",
-                i, b, mask[b]);
+        fprintf(
+            stderr,
+            "iter %d: mask byte %d = 0x%02x, expected 0x00 (no CPU beyond 0)\n",
+            i,
+            b,
+            mask[b]);
         return 1;
       }
     }

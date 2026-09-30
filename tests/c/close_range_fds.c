@@ -25,13 +25,14 @@
  *   - descriptor 103 is still open and still reads the file's contents.
  *
  * Over a file containing the six bytes "abcdef" the invariants are a size of 6
- * and a content checksum of 'a'+'b'+'c'+'d'+'e'+'f' = 597, read back through the
- * surviving descriptor. Only invariants are printed:
+ * and a content checksum of 'a'+'b'+'c'+'d'+'e'+'f' = 597, read back through
+ * the surviving descriptor. Only invariants are printed:
  *
  *   close_range_fds size=6 checksum=597 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, inode, device, uid, gid, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, inode, device, uid, gid, or address is
+ * observed.
  */
 
 #define _GNU_SOURCE
@@ -45,7 +46,7 @@
 #define PAYLOAD "abcdef"
 #define PAYLOAD_LEN 6
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -115,8 +116,9 @@ int main(void) {
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "close_range completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr, "close_range completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

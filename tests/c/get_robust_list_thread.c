@@ -17,14 +17,14 @@
 static int tid_pipe[2];
 static int release_pipe[2];
 
-static void *worker(void *unused) {
+static void* worker(void* unused) {
   (void)unused;
   pid_t tid = (pid_t)syscall(SYS_gettid);
   char release = 0;
 
   if (write(tid_pipe[1], &tid, sizeof(tid)) != sizeof(tid) ||
       read(release_pipe[0], &release, sizeof(release)) != sizeof(release)) {
-    return (void *)1;
+    return (void*)1;
   }
   return NULL;
 }
@@ -32,7 +32,7 @@ static void *worker(void *unused) {
 int main(void) {
   pthread_t thread;
   pid_t tid = 0;
-  struct robust_list_head *head = NULL;
+  struct robust_list_head* head = NULL;
   size_t length = 0;
 
   if (pipe(tid_pipe) != 0 || pipe(release_pipe) != 0 ||
@@ -56,7 +56,7 @@ int main(void) {
     return 1;
   }
 
-  void *result = NULL;
+  void* result = NULL;
   if (pthread_join(thread, &result) != 0 || result != NULL) {
     fprintf(stderr, "worker failed\n");
     return 1;

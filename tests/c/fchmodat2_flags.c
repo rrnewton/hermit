@@ -24,53 +24,59 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static long fchmodat2(int dfd, const char *p, unsigned mode, unsigned flags) {
-    return syscall(452, dfd, p, mode, flags);
+static long fchmodat2(int dfd, const char* p, unsigned mode, unsigned flags) {
+  return syscall(452, dfd, p, mode, flags);
 }
 
-static unsigned mode_of(const char *p) {
-    struct stat st;
-    if (stat(p, &st) != 0) return 0xFFFF;
-    return st.st_mode & 07777;
+static unsigned mode_of(const char* p) {
+  struct stat st;
+  if (stat(p, &st) != 0)
+    return 0xFFFF;
+  return st.st_mode & 07777;
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 5 };
-    char dir[] = "/tmp/fchmodat2_flags.XXXXXX";
-    if (!mkdtemp(dir)) {
-        printf("fchmodat2 MKDTEMP_FAIL\n");
-        return 1;
-    }
-    char path[256];
-    snprintf(path, sizeof(path), "%s/f", dir);
-    int fd = open(path, O_CREAT | O_WRONLY, 0600);
-    if (fd >= 0) close(fd);
+  enum { EXPECTED_CHECKS = 5 };
+  char dir[] = "/tmp/fchmodat2_flags.XXXXXX";
+  if (!mkdtemp(dir)) {
+    printf("fchmodat2 MKDTEMP_FAIL\n");
+    return 1;
+  }
+  char path[256];
+  snprintf(path, sizeof(path), "%s/f", dir);
+  int fd = open(path, O_CREAT | O_WRONLY, 0600);
+  if (fd >= 0)
+    close(fd);
 
-    int ok = 0;
+  int ok = 0;
 
-    // (1) Set mode 0640 with flags 0.
-    if (fchmodat2(AT_FDCWD, path, 0640, 0) == 0 && mode_of(path) == 0640) ok++;
+  // (1) Set mode 0640 with flags 0.
+  if (fchmodat2(AT_FDCWD, path, 0640, 0) == 0 && mode_of(path) == 0640)
+    ok++;
 
-    // (2) Replace with 0600 (deterministic, repeatable state change).
-    if (fchmodat2(AT_FDCWD, path, 0600, 0) == 0 && mode_of(path) == 0600) ok++;
+  // (2) Replace with 0600 (deterministic, repeatable state change).
+  if (fchmodat2(AT_FDCWD, path, 0600, 0) == 0 && mode_of(path) == 0600)
+    ok++;
 
-    // (3) AT_SYMLINK_NOFOLLOW on a regular file succeeds -> 0644.
-    if (fchmodat2(AT_FDCWD, path, 0644, AT_SYMLINK_NOFOLLOW) == 0 &&
-        mode_of(path) == 0644)
-        ok++;
+  // (3) AT_SYMLINK_NOFOLLOW on a regular file succeeds -> 0644.
+  if (fchmodat2(AT_FDCWD, path, 0644, AT_SYMLINK_NOFOLLOW) == 0 &&
+      mode_of(path) == 0644)
+    ok++;
 
-    // (4) Faithful: a missing path yields ENOENT.
-    char miss[256];
-    snprintf(miss, sizeof(miss), "%s/nope", dir);
-    errno = 0;
-    if (fchmodat2(AT_FDCWD, miss, 0600, 0) == -1 && errno == ENOENT) ok++;
+  // (4) Faithful: a missing path yields ENOENT.
+  char miss[256];
+  snprintf(miss, sizeof(miss), "%s/nope", dir);
+  errno = 0;
+  if (fchmodat2(AT_FDCWD, miss, 0600, 0) == -1 && errno == ENOENT)
+    ok++;
 
-    // (5) Faithful: an invalid flags word yields EINVAL.
-    errno = 0;
-    if (fchmodat2(AT_FDCWD, path, 0600, 0xFFFFu) == -1 && errno == EINVAL) ok++;
+  // (5) Faithful: an invalid flags word yields EINVAL.
+  errno = 0;
+  if (fchmodat2(AT_FDCWD, path, 0600, 0xFFFFu) == -1 && errno == EINVAL)
+    ok++;
 
-    unlink(path);
-    rmdir(dir);
-    printf("fchmodat2 ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  unlink(path);
+  rmdir(dir);
+  printf("fchmodat2 ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

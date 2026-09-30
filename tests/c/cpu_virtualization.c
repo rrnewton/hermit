@@ -24,38 +24,40 @@
 #include <unistd.h>
 
 int main(void) {
-    /* getcpu: Detcore always reports CPU 0 / NUMA node 0. */
-    unsigned int cpu = 0xffffffffu;
-    unsigned int node = 0xffffffffu;
-    long rc = syscall(SYS_getcpu, &cpu, &node, (void *)0);
-    if (rc != 0) {
-        fprintf(stderr, "getcpu failed: rc=%ld\n", rc);
-        return 1;
-    }
-    if (cpu != 0 || node != 0) {
-        fprintf(stderr, "getcpu leaked topology: cpu=%u node=%u\n", cpu, node);
-        return 2;
-    }
+  /* getcpu: Detcore always reports CPU 0 / NUMA node 0. */
+  unsigned int cpu = 0xffffffffu;
+  unsigned int node = 0xffffffffu;
+  long rc = syscall(SYS_getcpu, &cpu, &node, (void*)0);
+  if (rc != 0) {
+    fprintf(stderr, "getcpu failed: rc=%ld\n", rc);
+    return 1;
+  }
+  if (cpu != 0 || node != 0) {
+    fprintf(stderr, "getcpu leaked topology: cpu=%u node=%u\n", cpu, node);
+    return 2;
+  }
 
-    /* sched_getaffinity: Detcore reports a single-CPU affinity mask (only
-     * CPU 0 set), independent of the host's real CPU count. */
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    rc = syscall(SYS_sched_getaffinity, (pid_t)0, sizeof(mask), &mask);
-    if (rc <= 0) {
-        fprintf(stderr, "sched_getaffinity failed: rc=%ld\n", rc);
-        return 3;
-    }
-    if (!CPU_ISSET(0, &mask)) {
-        fprintf(stderr, "sched_getaffinity: CPU 0 not set\n");
-        return 4;
-    }
-    if (CPU_COUNT(&mask) != 1) {
-        fprintf(stderr, "sched_getaffinity leaked topology: count=%d\n",
-                CPU_COUNT(&mask));
-        return 5;
-    }
+  /* sched_getaffinity: Detcore reports a single-CPU affinity mask (only
+   * CPU 0 set), independent of the host's real CPU count. */
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  rc = syscall(SYS_sched_getaffinity, (pid_t)0, sizeof(mask), &mask);
+  if (rc <= 0) {
+    fprintf(stderr, "sched_getaffinity failed: rc=%ld\n", rc);
+    return 3;
+  }
+  if (!CPU_ISSET(0, &mask)) {
+    fprintf(stderr, "sched_getaffinity: CPU 0 not set\n");
+    return 4;
+  }
+  if (CPU_COUNT(&mask) != 1) {
+    fprintf(
+        stderr,
+        "sched_getaffinity leaked topology: count=%d\n",
+        CPU_COUNT(&mask));
+    return 5;
+  }
 
-    printf("cpu-virtualization-ok\n");
-    return 0;
+  printf("cpu-virtualization-ok\n");
+  return 0;
 }

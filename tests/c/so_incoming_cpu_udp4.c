@@ -15,7 +15,7 @@
 #define SO_INCOMING_CPU 49
 #endif
 
-static int fail(const char *operation) {
+static int fail(const char* operation) {
   perror(operation);
   return 1;
 }
@@ -30,11 +30,11 @@ int main(void) {
       .sin_family = AF_INET,
       .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
   };
-  if (bind(receiver, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (bind(receiver, (struct sockaddr*)&address, sizeof(address)) < 0) {
     return fail("bind");
   }
   socklen_t address_len = sizeof(address);
-  if (getsockname(receiver, (struct sockaddr *)&address, &address_len) < 0) {
+  if (getsockname(receiver, (struct sockaddr*)&address, &address_len) < 0) {
     return fail("getsockname");
   }
 
@@ -43,8 +43,13 @@ int main(void) {
     return fail("socket sender");
   }
   const char byte = 'x';
-  if (sendto(sender, &byte, sizeof(byte), 0, (struct sockaddr *)&address,
-             sizeof(address)) != sizeof(byte)) {
+  if (sendto(
+          sender,
+          &byte,
+          sizeof(byte),
+          0,
+          (struct sockaddr*)&address,
+          sizeof(address)) != sizeof(byte)) {
     return fail("sendto");
   }
   char received = 0;

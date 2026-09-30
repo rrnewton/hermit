@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc != 2) {
     fputs("usage: socket_ioctl_timestamp v4-us|v4-ns|v6-us\n", stderr);
     return 1;
@@ -37,21 +37,20 @@ int main(int argc, char **argv) {
   struct sockaddr_storage address = {0};
   socklen_t address_len;
   if (family == AF_INET) {
-    struct sockaddr_in *address4 = (struct sockaddr_in *)&address;
+    struct sockaddr_in* address4 = (struct sockaddr_in*)&address;
     address4->sin_family = AF_INET;
     address4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address_len = sizeof(*address4);
   } else {
-    struct sockaddr_in6 *address6 = (struct sockaddr_in6 *)&address;
+    struct sockaddr_in6* address6 = (struct sockaddr_in6*)&address;
     address6->sin6_family = AF_INET6;
     address6->sin6_addr = in6addr_loopback;
     address_len = sizeof(*address6);
   }
   if (receiver < 0 || sender < 0 ||
-      bind(receiver, (struct sockaddr *)&address, address_len) != 0 ||
-      getsockname(receiver, (struct sockaddr *)&address, &address_len) != 0 ||
-      sendto(sender, "x", 1, 0, (struct sockaddr *)&address, address_len) !=
-          1) {
+      bind(receiver, (struct sockaddr*)&address, address_len) != 0 ||
+      getsockname(receiver, (struct sockaddr*)&address, &address_len) != 0 ||
+      sendto(sender, "x", 1, 0, (struct sockaddr*)&address, address_len) != 1) {
     perror("setup");
     return 2;
   }
@@ -82,7 +81,7 @@ int main(int argc, char **argv) {
       return 6;
     }
     usleep(2000);
-    if (sendto(sender, "y", 1, 0, (struct sockaddr *)&address, address_len) !=
+    if (sendto(sender, "y", 1, 0, (struct sockaddr*)&address, address_len) !=
             1 ||
         recv(receiver, &byte, 1, 0) != 1) {
       perror("second receive");
@@ -114,7 +113,7 @@ int main(int argc, char **argv) {
       return 6;
     }
     usleep(2000);
-    if (sendto(sender, "y", 1, 0, (struct sockaddr *)&address, address_len) !=
+    if (sendto(sender, "y", 1, 0, (struct sockaddr*)&address, address_len) !=
             1 ||
         recv(receiver, &byte, 1, 0) != 1) {
       perror("second receive");

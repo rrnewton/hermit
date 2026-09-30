@@ -15,7 +15,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static void print_link(const char *label, const char *path, size_t capacity) {
+static void print_link(const char* label, const char* path, size_t capacity) {
   char buffer[128];
   ssize_t count = readlink(path, buffer, capacity);
   if (count < 0) {
@@ -26,7 +26,7 @@ static void print_link(const char *label, const char *path, size_t capacity) {
 }
 
 int main(void) {
-  const char *target = "/tmp/hermit-proc-fd-link-aliases";
+  const char* target = "/tmp/hermit-proc-fd-link-aliases";
   int target_fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
   if (target_fd < 0) {
     perror("open target");
@@ -38,14 +38,18 @@ int main(void) {
   char dev_fd_path[64];
   char lexical_path[64];
   char fd_name[16];
-  int canonical_written = snprintf(canonical_path, sizeof(canonical_path),
-                                   "/proc/self/fd/%d", target_fd);
-  int numeric_written = snprintf(numeric_path, sizeof(numeric_path),
-                                 "/proc/%ld/fd/%d", (long)getpid(), target_fd);
+  int canonical_written = snprintf(
+      canonical_path, sizeof(canonical_path), "/proc/self/fd/%d", target_fd);
+  int numeric_written = snprintf(
+      numeric_path,
+      sizeof(numeric_path),
+      "/proc/%ld/fd/%d",
+      (long)getpid(),
+      target_fd);
   int dev_fd_written =
       snprintf(dev_fd_path, sizeof(dev_fd_path), "/dev/fd/%d", target_fd);
-  int lexical_written = snprintf(lexical_path, sizeof(lexical_path),
-                                 "/proc/self/fd/../fd/%d", target_fd);
+  int lexical_written = snprintf(
+      lexical_path, sizeof(lexical_path), "/proc/self/fd/../fd/%d", target_fd);
   int fd_name_written = snprintf(fd_name, sizeof(fd_name), "%d", target_fd);
   if (canonical_written < 0 ||
       (size_t)canonical_written >= sizeof(canonical_path) ||

@@ -173,7 +173,10 @@ def main() -> int:
             ),
             (
                 "missing declared column",
-                [make_row("ok"), {k: v for k, v in make_row("bad").items() if k != "detail"}],
+                [
+                    make_row("ok"),
+                    {k: v for k, v in make_row("bad").items() if k != "detail"},
+                ],
                 "detail",
             ),
         ):

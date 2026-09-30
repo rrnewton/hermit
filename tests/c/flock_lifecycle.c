@@ -61,9 +61,9 @@ int main(void) {
        number -- and under --verify both runs lower it identically, so the
        comparison still matches and the cell stays green. Every check above is
        unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-        fprintf(stderr, "flock completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-        return 1;
-    }
-    return 0;
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "flock completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
+  return 0;
 }

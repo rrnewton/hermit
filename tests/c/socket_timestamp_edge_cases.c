@@ -27,9 +27,10 @@ static int send_byte(int fd, char byte) {
   return 0;
 }
 
-static int check_timespec_message(const struct msghdr *message,
-                                  struct timespec *timestamp) {
-  struct cmsghdr *header = CMSG_FIRSTHDR(message);
+static int check_timespec_message(
+    const struct msghdr* message,
+    struct timespec* timestamp) {
+  struct cmsghdr* header = CMSG_FIRSTHDR(message);
   if (header == NULL || header->cmsg_level != SOL_SOCKET ||
       header->cmsg_type != SO_TIMESTAMPNS ||
       header->cmsg_len < CMSG_LEN(sizeof(*timestamp))) {
@@ -44,8 +45,9 @@ int main(void) {
   int sockets[2];
   int enabled = 1;
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0 ||
-      setsockopt(sockets[1], SOL_SOCKET, SO_TIMESTAMPNS, &enabled,
-                 sizeof(enabled)) != 0) {
+      setsockopt(
+          sockets[1], SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) !=
+          0) {
     perror("setup");
     return 1;
   }
@@ -71,15 +73,15 @@ int main(void) {
     fputs("truncated timestamp omitted MSG_CTRUNC\n", stderr);
     return 4;
   }
-  struct cmsghdr *truncated_header = CMSG_FIRSTHDR(&truncated_message);
+  struct cmsghdr* truncated_header = CMSG_FIRSTHDR(&truncated_message);
   if (truncated_header == NULL || truncated_header->cmsg_level != SOL_SOCKET ||
       truncated_header->cmsg_type != SO_TIMESTAMPNS) {
     fputs("truncated timestamp omitted its control header\n", stderr);
     return 5;
   }
   int32_t timestamp_prefix;
-  memcpy(&timestamp_prefix, CMSG_DATA(truncated_header),
-         sizeof(timestamp_prefix));
+  memcpy(
+      &timestamp_prefix, CMSG_DATA(truncated_header), sizeof(timestamp_prefix));
   struct timespec observed_now;
   if (clock_gettime(CLOCK_REALTIME, &observed_now) != 0) {
     perror("clock_gettime");
@@ -87,10 +89,12 @@ int main(void) {
   }
   if (timestamp_prefix < 0 || (time_t)timestamp_prefix > observed_now.tv_sec ||
       observed_now.tv_sec - (time_t)timestamp_prefix > 1) {
-    fprintf(stderr,
-            "truncated timestamp prefix escaped logical time: "
-            "timestamp=%d now=%ld\n",
-            timestamp_prefix, (long)observed_now.tv_sec);
+    fprintf(
+        stderr,
+        "truncated timestamp prefix escaped logical time: "
+        "timestamp=%d now=%ld\n",
+        timestamp_prefix,
+        (long)observed_now.tv_sec);
     return 7;
   }
 
@@ -116,8 +120,8 @@ int main(void) {
       {.iov_base = &byte, .iov_len = sizeof(byte)},
       {.iov_base = &byte, .iov_len = sizeof(byte)},
   };
-  unsigned char controls[MESSAGE_COUNT]
-                        [CMSG_SPACE(sizeof(struct timespec))] = {0};
+  unsigned char controls[MESSAGE_COUNT][CMSG_SPACE(sizeof(struct timespec))] = {
+      0};
   for (int index = 0; index < MESSAGE_COUNT; ++index) {
     messages[index].msg_hdr.msg_iov = &iovecs[index];
     messages[index].msg_hdr.msg_iovlen = 1;
@@ -140,11 +144,13 @@ int main(void) {
   }
   if (timestamps[0].tv_sec != timestamp_prefix ||
       timestamps[1].tv_sec != timestamp_prefix) {
-    fprintf(stderr,
-            "batched timestamps escaped the fixed logical epoch: %ld,%ld != "
-            "%d\n",
-            (long)timestamps[0].tv_sec, (long)timestamps[1].tv_sec,
-            timestamp_prefix);
+    fprintf(
+        stderr,
+        "batched timestamps escaped the fixed logical epoch: %ld,%ld != "
+        "%d\n",
+        (long)timestamps[0].tv_sec,
+        (long)timestamps[1].tv_sec,
+        timestamp_prefix);
     return 13;
   }
 

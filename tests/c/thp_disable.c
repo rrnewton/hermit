@@ -18,15 +18,15 @@
  * reads it back again. It is a pure per-process boolean register with no
  * host-derived state -- setting a value and reading back the value just set is
  * deterministic across repeated runs and backends, exactly like the
- * PR_SET_DUMPABLE / PR_GET_DUMPABLE round-trip in the process-identity contract.
- * It touches no memory mapping, allocation, signal, scheduling, or timing
- * channel; the flag is a policy hint the kernel records but the fixture never
- * relies on any hugepage-backing side effect.
+ * PR_SET_DUMPABLE / PR_GET_DUMPABLE round-trip in the process-identity
+ * contract. It touches no memory mapping, allocation, signal, scheduling, or
+ * timing channel; the flag is a policy hint the kernel records but the fixture
+ * never relies on any hugepage-backing side effect.
  *
- * ptrace and DBT drive the full round-trip; KVM's ElfExecutor does not implement
- * the PR_*_THP_DISABLE requests and refuses them with ENOSYS (recorded as a KVM
- * gap in matrix.tsv), so this row runs on ptrace and DBT. The fixture prints
- * only a check count.
+ * ptrace and DBT drive the full round-trip; KVM's ElfExecutor does not
+ * implement the PR_*_THP_DISABLE requests and refuses them with ENOSYS
+ * (recorded as a KVM gap in matrix.tsv), so this row runs on ptrace and DBT.
+ * The fixture prints only a check count.
  */
 
 #ifndef PR_SET_THP_DISABLE
@@ -40,8 +40,8 @@
  * THE READ-BACK FLAG VALUES ARE EMITTED. This is a set/read-back round trip, so
  * the flag the guest reads back after each set IS the observation, and
  * "thp ok=4" hid it. A backend that ignored the set and one that returned a
- * garbage flag value were indistinguishable, and the values went only to stderr,
- * which the cell observation excludes.
+ * garbage flag value were indistinguishable, and the values went only to
+ * stderr, which the cell observation excludes.
  *
  * The read-backs are guest-determined -- the guest set the flag to those exact
  * values one call earlier -- so emitting them adds no host state.

@@ -20,37 +20,37 @@
 static char altbuf[65536]; /* fixed size: avoid host-dependent SIGSTKSZ */
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 4 };
-    stack_t ss, old;
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 4 };
+  stack_t ss, old;
+  int ok = 0;
 
-    memset(&old, 0, sizeof old);
-    if (sigaltstack(NULL, &old) == 0 && (old.ss_flags & SS_DISABLE)) {
-        ok++;
-    }
+  memset(&old, 0, sizeof old);
+  if (sigaltstack(NULL, &old) == 0 && (old.ss_flags & SS_DISABLE)) {
+    ok++;
+  }
 
-    memset(&ss, 0, sizeof ss);
-    ss.ss_sp = altbuf;
-    ss.ss_size = sizeof altbuf;
-    ss.ss_flags = 0;
-    if (sigaltstack(&ss, NULL) == 0) {
-        ok++;
-    }
+  memset(&ss, 0, sizeof ss);
+  ss.ss_sp = altbuf;
+  ss.ss_size = sizeof altbuf;
+  ss.ss_flags = 0;
+  if (sigaltstack(&ss, NULL) == 0) {
+    ok++;
+  }
 
-    memset(&old, 0, sizeof old);
-    if (sigaltstack(NULL, &old) == 0 && old.ss_sp == altbuf &&
-        old.ss_size == sizeof altbuf && !(old.ss_flags & SS_DISABLE)) {
-        ok++;
-    }
+  memset(&old, 0, sizeof old);
+  if (sigaltstack(NULL, &old) == 0 && old.ss_sp == altbuf &&
+      old.ss_size == sizeof altbuf && !(old.ss_flags & SS_DISABLE)) {
+    ok++;
+  }
 
-    memset(&ss, 0, sizeof ss);
-    ss.ss_flags = SS_DISABLE;
-    memset(&old, 0, sizeof old);
-    if (sigaltstack(&ss, NULL) == 0 && sigaltstack(NULL, &old) == 0 &&
-        (old.ss_flags & SS_DISABLE)) {
-        ok++;
-    }
+  memset(&ss, 0, sizeof ss);
+  ss.ss_flags = SS_DISABLE;
+  memset(&old, 0, sizeof old);
+  if (sigaltstack(&ss, NULL) == 0 && sigaltstack(NULL, &old) == 0 &&
+      (old.ss_flags & SS_DISABLE)) {
+    ok++;
+  }
 
-    printf("sigaltstack ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  printf("sigaltstack ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

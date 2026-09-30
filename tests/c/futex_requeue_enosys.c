@@ -17,9 +17,12 @@ int main(void) {
   errno = 0;
   long result = syscall(SYS_futex_requeue, NULL, 0, 0, 0);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "futex_requeue returned %ld with errno %d (%s), expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "futex_requeue returned %ld with errno %d (%s), expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
   puts("futex-requeue-enosys-ok");

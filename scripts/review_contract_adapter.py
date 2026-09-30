@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import argparse
-from functools import cache
 import hashlib
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from functools import cache
+from pathlib import Path
 from types import ModuleType
-from typing import Callable, Sequence, cast
+from typing import Callable, cast, Sequence
 
 
 AUTHORITY_COMMIT = "9f9517bb94354c307de7324d507ff24af7974560"
@@ -96,7 +96,7 @@ def _fetch_pinned_source() -> bytes:
         detail = result.stderr.decode(errors="replace").strip() or "no error output"
         if _is_transport_failure(detail):
             raise AuthorityUnavailable(
-                "cannot fetch the pinned review-label contract: " f"{detail}"
+                f"cannot fetch the pinned review-label contract: {detail}"
             )
         raise AuthorityRefused(
             "the pinned review-label contract was reached and refused: "
@@ -149,7 +149,9 @@ def lint_records() -> tuple[str, ...]:
     if not isinstance(records, tuple) or not records:
         raise RuntimeError("canonical review-label contract returned no lint records")
     if not all(isinstance(record, str) and record for record in records):
-        raise RuntimeError("canonical review-label contract returned malformed lint records")
+        raise RuntimeError(
+            "canonical review-label contract returned malformed lint records"
+        )
     return cast(tuple[str, ...], records)
 
 

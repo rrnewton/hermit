@@ -16,16 +16,19 @@ struct thread_result {
   pid_t tid;
 };
 
-static void *thread_main(void *opaque) {
-  struct thread_result *result = opaque;
+static void* thread_main(void* opaque) {
+  struct thread_result* result = opaque;
   result->pid = getpid();
   result->tid = (pid_t)syscall(SYS_gettid);
   return NULL;
 }
 
 int main(void) {
-  printf("root pid=%ld ppid=%ld tid=%ld\n", (long)getpid(), (long)getppid(),
-         syscall(SYS_gettid));
+  printf(
+      "root pid=%ld ppid=%ld tid=%ld\n",
+      (long)getpid(),
+      (long)getppid(),
+      syscall(SYS_gettid));
 
   pthread_t threads[THREADS];
   struct thread_result results[THREADS] = {0};
@@ -39,8 +42,11 @@ int main(void) {
         results[id].tid == getpid()) {
       return 2;
     }
-    printf("thread[%d] pid=%ld tid=%ld\n", id, (long)results[id].pid,
-           (long)results[id].tid);
+    printf(
+        "thread[%d] pid=%ld tid=%ld\n",
+        id,
+        (long)results[id].pid,
+        (long)results[id].tid);
   }
 
   int pipe_fds[2];
@@ -69,7 +75,10 @@ int main(void) {
       identity[1] != getpid() || identity[2] != child) {
     return 5;
   }
-  printf("child pid=%ld ppid=%ld tid=%ld\n", (long)identity[0],
-         (long)identity[1], (long)identity[2]);
+  printf(
+      "child pid=%ld ppid=%ld tid=%ld\n",
+      (long)identity[0],
+      (long)identity[1],
+      (long)identity[2]);
   return 0;
 }

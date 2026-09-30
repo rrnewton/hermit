@@ -18,69 +18,69 @@
 static volatile int g_dummy;
 
 static void plain_handler(int sig) {
-    g_dummy = sig;
+  g_dummy = sig;
 }
 
-static void siginfo_handler(int sig, siginfo_t *info, void *ucontext) {
-    (void)info;
-    (void)ucontext;
-    g_dummy = sig;
+static void siginfo_handler(int sig, siginfo_t* info, void* ucontext) {
+  (void)info;
+  (void)ucontext;
+  g_dummy = sig;
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 5 };
-    struct sigaction act;
-    struct sigaction old;
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 5 };
+  struct sigaction act;
+  struct sigaction old;
+  int ok = 0;
 
-    /* check 1: USR1 starts at its default disposition. */
-    memset(&old, 0, sizeof old);
-    if (sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
-        ok++;
-    }
+  /* check 1: USR1 starts at its default disposition. */
+  memset(&old, 0, sizeof old);
+  if (sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
+    ok++;
+  }
 
-    /* check 2: install SIG_IGN and read it back. */
-    memset(&act, 0, sizeof act);
-    act.sa_handler = SIG_IGN;
-    sigemptyset(&act.sa_mask);
-    memset(&old, 0, sizeof old);
-    if (sigaction(SIGUSR1, &act, NULL) == 0 &&
-        sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == SIG_IGN) {
-        ok++;
-    }
+  /* check 2: install SIG_IGN and read it back. */
+  memset(&act, 0, sizeof act);
+  act.sa_handler = SIG_IGN;
+  sigemptyset(&act.sa_mask);
+  memset(&old, 0, sizeof old);
+  if (sigaction(SIGUSR1, &act, NULL) == 0 &&
+      sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == SIG_IGN) {
+    ok++;
+  }
 
-    /* check 3: install a plain handler and read it back. */
-    memset(&act, 0, sizeof act);
-    act.sa_handler = plain_handler;
-    sigemptyset(&act.sa_mask);
-    memset(&old, 0, sizeof old);
-    if (sigaction(SIGUSR1, &act, NULL) == 0 &&
-        sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == plain_handler) {
-        ok++;
-    }
+  /* check 3: install a plain handler and read it back. */
+  memset(&act, 0, sizeof act);
+  act.sa_handler = plain_handler;
+  sigemptyset(&act.sa_mask);
+  memset(&old, 0, sizeof old);
+  if (sigaction(SIGUSR1, &act, NULL) == 0 &&
+      sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == plain_handler) {
+    ok++;
+  }
 
-    /* check 4: SA_SIGINFO|SA_RESTART round-trip via sa_sigaction. */
-    memset(&act, 0, sizeof act);
-    act.sa_sigaction = siginfo_handler;
-    act.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigemptyset(&act.sa_mask);
-    memset(&old, 0, sizeof old);
-    if (sigaction(SIGUSR1, &act, NULL) == 0 &&
-        sigaction(SIGUSR1, NULL, &old) == 0 && (old.sa_flags & SA_SIGINFO) &&
-        old.sa_sigaction == siginfo_handler) {
-        ok++;
-    }
+  /* check 4: SA_SIGINFO|SA_RESTART round-trip via sa_sigaction. */
+  memset(&act, 0, sizeof act);
+  act.sa_sigaction = siginfo_handler;
+  act.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&act.sa_mask);
+  memset(&old, 0, sizeof old);
+  if (sigaction(SIGUSR1, &act, NULL) == 0 &&
+      sigaction(SIGUSR1, NULL, &old) == 0 && (old.sa_flags & SA_SIGINFO) &&
+      old.sa_sigaction == siginfo_handler) {
+    ok++;
+  }
 
-    /* check 5: restore the default disposition. */
-    memset(&act, 0, sizeof act);
-    act.sa_handler = SIG_DFL;
-    sigemptyset(&act.sa_mask);
-    memset(&old, 0, sizeof old);
-    if (sigaction(SIGUSR1, &act, NULL) == 0 &&
-        sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
-        ok++;
-    }
+  /* check 5: restore the default disposition. */
+  memset(&act, 0, sizeof act);
+  act.sa_handler = SIG_DFL;
+  sigemptyset(&act.sa_mask);
+  memset(&old, 0, sizeof old);
+  if (sigaction(SIGUSR1, &act, NULL) == 0 &&
+      sigaction(SIGUSR1, NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
+    ok++;
+  }
 
-    printf("sigaction ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  printf("sigaction ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

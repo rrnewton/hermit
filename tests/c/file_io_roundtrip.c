@@ -42,7 +42,7 @@
 #define PAYLOAD 1024
 #define PATH "/tmp/hermit_file_io_roundtrip.bin"
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -55,10 +55,14 @@ static void fail(const char *message) {
  */
 static int violations;
 
-static void expect(const char *name, long long observed, long long wanted) {
+static void expect(const char* name, long long observed, long long wanted) {
   if (observed != wanted) {
-    fprintf(stderr, "invariant %s: observed %lld, wanted %lld\n", name, observed,
-            wanted);
+    fprintf(
+        stderr,
+        "invariant %s: observed %lld, wanted %lld\n",
+        name,
+        observed,
+        wanted);
     violations++;
   }
 }
@@ -130,8 +134,13 @@ int main(void) {
   expect("end", (long long)end_off, 1024);
   expect("stat", (long long)stat_size, 1024);
   expect("shrunk", (long long)shrunk, 512);
-  printf("fileio wrote=%zu read=%zu checksum=%lu end=%lld stat=%lld shrunk=%lld\n",
-         written, read_bytes, checksum, (long long)end_off, (long long)stat_size,
-         (long long)shrunk);
+  printf(
+      "fileio wrote=%zu read=%zu checksum=%lu end=%lld stat=%lld shrunk=%lld\n",
+      written,
+      read_bytes,
+      checksum,
+      (long long)end_off,
+      (long long)stat_size,
+      (long long)shrunk);
   return violations == 0 ? 0 : 1;
 }

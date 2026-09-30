@@ -24,21 +24,30 @@
 static int native;
 static int expected_seed;
 
-#define CHECK(condition)                                                     \
-  do {                                                                       \
-    if (!(condition)) {                                                      \
-      fprintf(stderr, "%s:%d: %s (errno=%d)\n", __FILE__, __LINE__, #condition, \
-              errno);                                                        \
-      exit(1);                                                               \
-    }                                                                        \
+#define CHECK(condition)            \
+  do {                              \
+    if (!(condition)) {             \
+      fprintf(                      \
+          stderr,                   \
+          "%s:%d: %s (errno=%d)\n", \
+          __FILE__,                 \
+          __LINE__,                 \
+          #condition,               \
+          errno);                   \
+      exit(1);                      \
+    }                               \
   } while (0)
 
 static long raw_readv(int fd, const void* iov, unsigned long count) {
   return syscall(SYS_readv, fd, iov, count);
 }
 
-static void result(int fd, const void* iov, unsigned long count, long expected,
-                   int expected_errno) {
+static void result(
+    int fd,
+    const void* iov,
+    unsigned long count,
+    long expected,
+    int expected_errno) {
   errno = 0;
   long actual = raw_readv(fd, iov, count);
   CHECK(actual == expected);
@@ -62,17 +71,18 @@ static void control(const char* path, uint8_t* bytes, size_t length) {
     CHECK(fd >= 0);
     CHECK(read(fd, bytes, length) == (ssize_t)length);
     /* A literal oracle independent of either Hermit read implementation. */
-    const uint8_t seed0[] = {41, 114, 187, 4, 77, 150, 223, 40,
-                             113, 186, 3, 76, 149, 222, 39, 112};
-    const uint8_t seed17[] = {56, 114, 187, 4, 77, 150, 223, 40,
-                              96, 186, 3, 76, 149, 222, 39, 112};
+    const uint8_t seed0[] = {
+        41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112};
+    const uint8_t seed17[] = {
+        56, 114, 187, 4, 77, 150, 223, 40, 96, 186, 3, 76, 149, 222, 39, 112};
     size_t checked = length < sizeof(seed0) ? length : sizeof(seed0);
     CHECK(memcmp(bytes, expected_seed == 17 ? seed17 : seed0, checked) == 0);
     CHECK(close(fd) == 0);
   }
 }
 
-static void equal(const uint8_t* actual, const uint8_t* expected, size_t length) {
+static void
+equal(const uint8_t* actual, const uint8_t* expected, size_t length) {
   if (!native) {
     CHECK(memcmp(actual, expected, length) == 0);
   }
@@ -97,7 +107,12 @@ static void mixed_stream(const char* path) {
 }
 
 static void long_stream(const char* path) {
-  enum { PREFIX = 7, VECTOR = 65553, SUFFIX = 3, TOTAL = PREFIX + VECTOR + SUFFIX };
+  enum {
+    PREFIX = 7,
+    VECTOR = 65553,
+    SUFFIX = 3,
+    TOTAL = PREFIX + VECTOR + SUFFIX
+  };
   uint8_t* expected = calloc(TOTAL, 1);
   uint8_t* actual = calloc(TOTAL, 1);
   CHECK(expected != NULL && actual != NULL);
@@ -105,8 +120,8 @@ static void long_stream(const char* path) {
   int fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
   CHECK(read(fd, actual, PREFIX) == PREFIX);
-  struct iovec iov[] = {{actual + PREFIX, 65529},
-                        {actual + PREFIX + 65529, VECTOR - 65529}};
+  struct iovec iov[] = {
+      {actual + PREFIX, 65529}, {actual + PREFIX + 65529, VECTOR - 65529}};
   result(fd, iov, 2, VECTOR, 0);
   CHECK(read(fd, actual + PREFIX + VECTOR, SUFFIX) == SUFFIX);
   equal(actual, expected, TOTAL);
@@ -126,8 +141,8 @@ static void child_read(int fd, int output) {
   _exit(0);
 }
 
-static void inherited_stream(const char* path, const char* executable,
-                             int with_exec) {
+static void
+inherited_stream(const char* path, const char* executable, int with_exec) {
   uint8_t expected[15] = {0};
   uint8_t actual[15] = {0};
   control(path, expected, sizeof(expected));
@@ -148,8 +163,13 @@ static void inherited_stream(const char* path, const char* executable,
       char output_arg[32];
       CHECK(snprintf(input_arg, sizeof(input_arg), "%d", alias) > 0);
       CHECK(snprintf(output_arg, sizeof(output_arg), "%d", channel[1]) > 0);
-      execl(executable, executable, "--exec-child", input_arg, output_arg,
-            (char*)NULL);
+      execl(
+          executable,
+          executable,
+          "--exec-child",
+          input_arg,
+          output_arg,
+          (char*)NULL);
       CHECK(0);
     }
     child_read(alias, channel[1]);
@@ -173,7 +193,8 @@ struct stream {
   uint8_t expected[8192];
 };
 
-/* Every rejected/short request is followed by this independent cursor oracle. */
+/* Every rejected/short request is followed by this independent cursor oracle.
+ */
 static void next_scalar(struct stream* stream) {
   uint8_t actual[3];
   CHECK(stream->offset + sizeof(actual) <= sizeof(stream->expected));
@@ -299,9 +320,15 @@ static void import_and_faults(const char* path) {
   CHECK(page_size >= 4096);
   size_t page = (size_t)page_size;
   /* Low non-fixed hint plus an explicit bound makes the single-vector clamp
-     range valid on both four-level and LA57 hosts, without replacing mappings. */
-  uint8_t* mapping = mmap((void*)0x100000000ULL, 2 * page, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     range valid on both four-level and LA57 hosts, without replacing mappings.
+   */
+  uint8_t* mapping = mmap(
+      (void*)0x100000000ULL,
+      2 * page,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   CHECK(mapping != MAP_FAILED);
   CHECK((uintptr_t)mapping <= (1ULL << 47) - 4096 - 2 * page - 0x7ffff000ULL);
   memset(mapping, 0xa5, 2 * page);
@@ -375,7 +402,8 @@ static void import_and_faults(const char* path) {
       CHECK(mapping[page + i] == 0xa5);
     }
   }
-  /* Every 4096-byte scatter chunk, including an 8-byte tail, honors protection. */
+  /* Every 4096-byte scatter chunk, including an 8-byte tail, honors protection.
+   */
   memset(mapping + page - 4096, 0xa5, 4096);
   iov[0] = (struct iovec){mapping + page - 4096, 4096 + 8};
   result(stream.fd, iov, 1, 4096, 0);
@@ -399,13 +427,14 @@ static void import_and_faults(const char* path) {
   CHECK(good[5] == 0xa5);
   next_scalar(&stream);
 
-  /* Import the whole array before writing: segment zero overwrites segment one. */
+  /* Import the whole array before writing: segment zero overwrites segment one.
+   */
   memset(good, 0xa5, sizeof(good));
   iov[0] = (struct iovec){&iov[1], sizeof(iov[1])};
   iov[1] = (struct iovec){good, 3};
   result(stream.fd, iov, 2, sizeof(iov[1]) + 3, 0);
-  equal((const uint8_t*)&iov[1], stream.expected + stream.offset,
-        sizeof(iov[1]));
+  equal(
+      (const uint8_t*)&iov[1], stream.expected + stream.offset, sizeof(iov[1]));
   stream.offset += sizeof(iov[1]);
   equal(good, stream.expected + stream.offset, 3);
   stream.offset += 3;
@@ -415,12 +444,24 @@ static void import_and_faults(const char* path) {
 }
 
 /* x86-64 uses a full signed offset in arg3; arg4 is ignored padding. */
-static void positioned_result(int version2, int fd, const void* iov,
-                              unsigned long count, int64_t offset, int flags,
-                              long expected, int expected_errno) {
+static void positioned_result(
+    int version2,
+    int fd,
+    const void* iov,
+    unsigned long count,
+    int64_t offset,
+    int flags,
+    long expected,
+    int expected_errno) {
   errno = 0;
-  long actual = syscall(version2 ? SYS_preadv2 : SYS_preadv, fd, iov, count,
-                        (uint64_t)offset, 0x123456789abcdef0UL, flags);
+  long actual = syscall(
+      version2 ? SYS_preadv2 : SYS_preadv,
+      fd,
+      iov,
+      count,
+      (uint64_t)offset,
+      0x123456789abcdef0UL,
+      flags);
   CHECK(actual == expected);
   CHECK(errno == expected_errno);
 }
@@ -470,8 +511,8 @@ static void positioned_errors(const char* path) {
   struct iovec empty[2] = {{NULL, 0}, {NULL, 0}};
   for (int version2 = 0; version2 <= 1; ++version2) {
     positioned_result(version2, -1, invalid, 1025, -2, 0, -1, EINVAL);
-    positioned_result(version2, -1, invalid, 1025, -1, 0, -1,
-                      version2 ? EBADF : EINVAL);
+    positioned_result(
+        version2, -1, invalid, 1025, -1, 0, -1, version2 ? EBADF : EINVAL);
     positioned_result(version2, -1, invalid, 1025, 0, 0, -1, EBADF);
     const int modes[] = {O_WRONLY, O_PATH};
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
@@ -501,11 +542,22 @@ static void positioned_errors(const char* path) {
     int flags;
     int error;
   } cases[] = {
-      {1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}, {256, 0},
-      {256 | 8, 0}, {64, EOPNOTSUPP}, {128, EOPNOTSUPP},
-      {0x40000000, EOPNOTSUPP}, {16 | 32, EINVAL},
-      {0x40000000 | 16 | 32, EOPNOTSUPP}, {64 | 16 | 32, EINVAL},
-      {256 | 16 | 32, EINVAL}, {256 | 0x40000000, EOPNOTSUPP},
+      {1, 0},
+      {2, 0},
+      {4, 0},
+      {8, 0},
+      {16, 0},
+      {32, 0},
+      {256, 0},
+      {256 | 8, 0},
+      {64, EOPNOTSUPP},
+      {128, EOPNOTSUPP},
+      {0x40000000, EOPNOTSUPP},
+      {16 | 32, EINVAL},
+      {0x40000000 | 16 | 32, EOPNOTSUPP},
+      {64 | 16 | 32, EINVAL},
+      {256 | 16 | 32, EINVAL},
+      {256 | 0x40000000, EOPNOTSUPP},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     int flags = cases[i].flags, error = cases[i].error;
@@ -521,8 +573,8 @@ static void positioned_errors(const char* path) {
     positioned_result(1, stream.fd, invalid, 0, 0, flags, 0, 0);
     positioned_result(1, stream.fd, empty, 2, INT64_MAX, flags, 0, 0);
     struct iovec bad = {(void*)1, 1};
-    positioned_result(1, stream.fd, &bad, 1, 0, flags, -1,
-                      error ? error : EFAULT);
+    positioned_result(
+        1, stream.fd, &bad, 1, 0, flags, -1, error ? error : EFAULT);
     next_scalar(&stream);
   }
   struct iovec noncanonical = {(void*)UINTPTR_MAX, 0};
@@ -540,8 +592,13 @@ static void positioned_faults(const char* path) {
   control(path, stream.expected, sizeof(stream.expected));
   size_t page = (size_t)sysconf(_SC_PAGESIZE);
   CHECK(page >= 4096);
-  uint8_t* mapping = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  uint8_t* mapping = mmap(
+      NULL,
+      2 * page,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   CHECK(mapping != MAP_FAILED);
   CHECK(mprotect(mapping + page, page, PROT_NONE) == 0);
   for (int mode = 0; mode < 3; ++mode) {
@@ -580,8 +637,8 @@ static void positioned_faults(const char* path) {
     iov[0] = (struct iovec){&iov[1], sizeof(iov[1])};
     iov[1] = (struct iovec){good, 3};
     start = current ? stream.offset : 19;
-    positioned_result(version2, stream.fd, iov, 2, offset, 0,
-                      sizeof(iov[1]) + 3, 0);
+    positioned_result(
+        version2, stream.fd, iov, 2, offset, 0, sizeof(iov[1]) + 3, 0);
     equal((const uint8_t*)&iov[1], stream.expected + start, sizeof(iov[1]));
     equal(good, stream.expected + start + sizeof(iov[1]), 3);
     CHECK(good[3] == 0xa5);
@@ -613,12 +670,14 @@ int main(int argc, char** argv) {
       CHECK(0);
     }
   }
-  CHECK(strcmp(selected, "all") == 0 || strcmp(selected, "mixed") == 0 ||
-        strcmp(selected, "long") == 0 || strcmp(selected, "faults") == 0 ||
-        strcmp(selected, "aliases") == 0 || strcmp(selected, "access") == 0 ||
-        strcmp(selected, "positioned") == 0);
-  CHECK(strcmp(device, "all") == 0 || strcmp(device, "random") == 0 ||
-        strcmp(device, "urandom") == 0);
+  CHECK(
+      strcmp(selected, "all") == 0 || strcmp(selected, "mixed") == 0 ||
+      strcmp(selected, "long") == 0 || strcmp(selected, "faults") == 0 ||
+      strcmp(selected, "aliases") == 0 || strcmp(selected, "access") == 0 ||
+      strcmp(selected, "positioned") == 0);
+  CHECK(
+      strcmp(device, "all") == 0 || strcmp(device, "random") == 0 ||
+      strcmp(device, "urandom") == 0);
   const char* devices[] = {"/dev/random", "/dev/urandom"};
   for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); ++i) {
     if (strcmp(device, "all") != 0 && strcmp(device, devices[i] + 5) != 0) {

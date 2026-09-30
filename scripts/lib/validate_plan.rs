@@ -61,8 +61,7 @@ use crate::validate_corpus::CorpusPaths;
 /// The manifest audit is an executable consumer, so its producer is part of
 /// the always-on preflight spine rather than an incidental lane root.
 pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
-pub const MANIFEST_PLAN_BUILD_COMMAND: &str =
-    "cargo build -p hermit-manifest-plan --bins";
+pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
 pub const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 
 /// CPU fallback for synthetic configs used by generator and self-test fixtures.
@@ -144,14 +143,24 @@ impl CompatMode {
                 s("--"),
             ],
             CompatMode::Sabre => {
-                vec![s("run"), s("--backend"), s("sabre"), s("--strict"), s("--verify"), s("--")]
+                vec![
+                    s("run"),
+                    s("--backend"),
+                    s("sabre"),
+                    s("--strict"),
+                    s("--verify"),
+                    s("--"),
+                ]
             }
             CompatMode::E9patch => {
                 let mut v = vec![s("run"), s("--backend"), s("e9patch")];
                 // These rows query owner names the host may delegate to an async
                 // identity daemon; pin just them to the files-only NSS fixture
                 // (validate.sh:2981).
-                if matches!(label, "whoami" | "groups" | "pinky" | "logname" | "tar" | "chown") {
+                if matches!(
+                    label,
+                    "whoami" | "groups" | "pinky" | "logname" | "tar" | "chown"
+                ) {
                     v.push(format!(
                         "--mount=type=bind,source={nsswitch},target=/etc/nsswitch.conf,readonly"
                     ));
@@ -164,7 +173,13 @@ impl CompatMode {
             // rr rows are driven through `hermit record start --verify`, matching
             // rr_compatibility_probe rather than the plain run path.
             CompatMode::Rr => {
-                vec![s("record"), s("start"), s("--verify"), s("--verify-strict"), s("--")]
+                vec![
+                    s("record"),
+                    s("start"),
+                    s("--verify"),
+                    s("--verify-strict"),
+                    s("--"),
+                ]
             }
         }
     }
@@ -215,7 +230,10 @@ impl CompatDisposition {
     /// is deliberately blocking: a listed row under `PortableStrict` was already blocking before
     /// the reason was printed, and printing it must not change that.
     pub fn is_blocking(self) -> bool {
-        matches!(self, CompatDisposition::KnownFailClosedBlocking | CompatDisposition::Blocking)
+        matches!(
+            self,
+            CompatDisposition::KnownFailClosedBlocking | CompatDisposition::Blocking
+        )
     }
 }
 
@@ -422,8 +440,18 @@ mod tests {
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
-            ("build.rust_scripts".to_string(), 900, 7200, Some(6_442_450_944)),
-            ("setup.manifest_plan".to_string(), 300, 7200, Some(2_147_483_648)),
+            (
+                "build.rust_scripts".to_string(),
+                900,
+                7200,
+                Some(6_442_450_944),
+            ),
+            (
+                "setup.manifest_plan".to_string(),
+                300,
+                7200,
+                Some(2_147_483_648),
+            ),
             ("gate.manifest".to_string(), 900, 120, Some(5_368_709_120)),
         ];
         let check = |candidate: &[Step]| {
@@ -566,11 +594,7 @@ pub fn lane_host_capability_requirements(
             continue;
         }
         for capability in [HostCapability::CpuidFaulting, HostCapability::Kvm] {
-            if step
-                .labels
-                .iter()
-                .any(|label| label == capability.value())
-            {
+            if step.labels.iter().any(|label| label == capability.value()) {
                 out.insert(step.tag(), capability);
             }
         }
@@ -612,18 +636,17 @@ pub fn partition_host_inapplicable(
     for step in steps {
         let tag = step.tag();
         match requirements.get(&tag) {
-            Some(capability) if absent.contains_key(capability) => withheld.push(
-                HostInapplicableNode {
+            Some(capability) if absent.contains_key(capability) => {
+                withheld.push(HostInapplicableNode {
                     tag,
                     capability: *capability,
                     evidence: absent[capability].clone(),
-                },
-            ),
+                })
+            }
             _ => keep.push(step),
         }
     }
-    let gone: std::collections::BTreeSet<&str> =
-        withheld.iter().map(|n| n.tag.as_str()).collect();
+    let gone: std::collections::BTreeSet<&str> = withheld.iter().map(|n| n.tag.as_str()).collect();
     let mut orphaned = Vec::new();
     for step in &keep {
         for dep in &step.deps {
@@ -660,7 +683,9 @@ pub fn compat_nodes(
     paths: &CorpusPaths,
     gate_dep: Option<&str>,
 ) -> Result<Vec<Step>, String> {
-    compat_nodes_for(root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None)
+    compat_nodes_for(
+        root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None,
+    )
 }
 
 /// [`compat_nodes`] with two extra knobs used by the `super` suite's
@@ -717,7 +742,11 @@ pub fn compat_nodes_for(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.display_name(), row.label),
-            format!("{} {} </dev/null", shell_join(&argv), compat_guest_command(&row, paths)),
+            format!(
+                "{} {} </dev/null",
+                shell_join(&argv),
+                compat_guest_command(&row, paths)
+            ),
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),
@@ -803,33 +832,64 @@ pub fn config_from(steps: Vec<Step>, description: &str) -> DagConfig {
 pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<(), String> {
     let mut bad: Vec<String> = Vec::new();
     if base.resource_caps != derived.resource_caps {
-        bad.push(format!("resource_caps {:?} != {:?}", base.resource_caps, derived.resource_caps));
+        bad.push(format!(
+            "resource_caps {:?} != {:?}",
+            base.resource_caps, derived.resource_caps
+        ));
     }
     if base.mem_cap_factor != derived.mem_cap_factor {
-        bad.push(format!("mem_cap_factor {} != {}", base.mem_cap_factor, derived.mem_cap_factor));
+        bad.push(format!(
+            "mem_cap_factor {} != {}",
+            base.mem_cap_factor, derived.mem_cap_factor
+        ));
     }
     if base.mem_cap_floor_bytes != derived.mem_cap_floor_bytes {
-        bad.push(format!("mem_cap_floor_bytes {} != {}", base.mem_cap_floor_bytes, derived.mem_cap_floor_bytes));
+        bad.push(format!(
+            "mem_cap_floor_bytes {} != {}",
+            base.mem_cap_floor_bytes, derived.mem_cap_floor_bytes
+        ));
     }
     if base.outer_mem_safety_factor != derived.outer_mem_safety_factor {
-        bad.push(format!("outer_mem_safety_factor {} != {}", base.outer_mem_safety_factor, derived.outer_mem_safety_factor));
+        bad.push(format!(
+            "outer_mem_safety_factor {} != {}",
+            base.outer_mem_safety_factor, derived.outer_mem_safety_factor
+        ));
     }
     if base.default_step_timeout != derived.default_step_timeout {
-        bad.push(format!("default_step_timeout {} != {}", base.default_step_timeout, derived.default_step_timeout));
+        bad.push(format!(
+            "default_step_timeout {} != {}",
+            base.default_step_timeout, derived.default_step_timeout
+        ));
     }
     if base.default_jobs_flag != derived.default_jobs_flag {
-        bad.push(format!("default_jobs_flag {:?} != {:?}", base.default_jobs_flag, derived.default_jobs_flag));
+        bad.push(format!(
+            "default_jobs_flag {:?} != {:?}",
+            base.default_jobs_flag, derived.default_jobs_flag
+        ));
     }
     if base.default_jobs_env != derived.default_jobs_env {
-        bad.push(format!("default_jobs_env {:?} != {:?}", base.default_jobs_env, derived.default_jobs_env));
+        bad.push(format!(
+            "default_jobs_env {:?} != {:?}",
+            base.default_jobs_env, derived.default_jobs_env
+        ));
     }
     if base.default_step_mem_cap_bytes != derived.default_step_mem_cap_bytes {
-        bad.push(format!("default_step_mem_cap_bytes {:?} != {:?}", base.default_step_mem_cap_bytes, derived.default_step_mem_cap_bytes));
+        bad.push(format!(
+            "default_step_mem_cap_bytes {:?} != {:?}",
+            base.default_step_mem_cap_bytes, derived.default_step_mem_cap_bytes
+        ));
     }
     if base.default_step_cpu_count != derived.default_step_cpu_count {
-        bad.push(format!("default_step_cpu_count {:?} != {:?}", base.default_step_cpu_count, derived.default_step_cpu_count));
+        bad.push(format!(
+            "default_step_cpu_count {:?} != {:?}",
+            base.default_step_cpu_count, derived.default_step_cpu_count
+        ));
     }
-    if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join("; "))
+    }
 }
 
 /// FAIL CLOSED on capacity that can never be granted.
@@ -844,7 +904,10 @@ pub fn ungrantable_resources(cfg: &DagConfig) -> Vec<String> {
         for (r, n) in &s.hint.resources {
             let cap = cfg.resource_caps.get(r).copied().unwrap_or(0);
             if cap < *n {
-                bad.push(format!("{} demands {r}={n} but resource_caps grants {cap}", s.tag()));
+                bad.push(format!(
+                    "{} demands {r}={n} but resource_caps grants {cap}",
+                    s.tag()
+                ));
             }
         }
     }

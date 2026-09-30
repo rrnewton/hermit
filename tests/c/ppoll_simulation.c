@@ -39,11 +39,11 @@ static int run_raw_timeout_copyout(void) {
   }
   struct pollfd ready = {.fd = pipefd[0], .events = POLLIN};
 
-  const struct timespec raw_ready_input = {
-      .tv_sec = 3, .tv_nsec = 456789123};
+  const struct timespec raw_ready_input = {.tv_sec = 3, .tv_nsec = 456789123};
   struct timespec raw_ready_timeout = raw_ready_input;
-  if (syscall(SYS_ppoll, &ready, 1, &raw_ready_timeout, NULL,
-              sizeof(uint64_t)) != 1 ||
+  if (syscall(
+          SYS_ppoll, &ready, 1, &raw_ready_timeout, NULL, sizeof(uint64_t)) !=
+          1 ||
       !(ready.revents & POLLIN) || raw_ready_timeout.tv_sec < 0 ||
       raw_ready_timeout.tv_nsec < 0 ||
       raw_ready_timeout.tv_nsec >= 1000000000 ||
@@ -51,11 +51,14 @@ static int run_raw_timeout_copyout(void) {
       raw_ready_timeout.tv_sec > raw_ready_input.tv_sec ||
       (raw_ready_timeout.tv_sec == raw_ready_input.tv_sec &&
        raw_ready_timeout.tv_nsec >= raw_ready_input.tv_nsec)) {
-    fprintf(stderr,
-            "raw ready ppoll did not preserve a positive irregular remainder: "
-            "%ld.%09ld errno=%d revents=%d\n",
-            raw_ready_timeout.tv_sec, raw_ready_timeout.tv_nsec, errno,
-            ready.revents);
+    fprintf(
+        stderr,
+        "raw ready ppoll did not preserve a positive irregular remainder: "
+        "%ld.%09ld errno=%d revents=%d\n",
+        raw_ready_timeout.tv_sec,
+        raw_ready_timeout.tv_nsec,
+        errno,
+        ready.revents);
     return 1;
   }
 
@@ -64,8 +67,13 @@ static int run_raw_timeout_copyout(void) {
     perror("sysconf page size");
     return 1;
   }
-  void* timeout_page = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* timeout_page = mmap(
+      NULL,
+      (size_t)page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (timeout_page == MAP_FAILED) {
     perror("mmap readonly timeout");
     return 1;
@@ -82,9 +90,13 @@ static int run_raw_timeout_copyout(void) {
   struct pollfd ready_before_timeout_fault = {
       .fd = pipefd[0], .events = POLLIN};
   errno = 0;
-  long timeout_fault_result =
-      syscall(SYS_ppoll, &ready_before_timeout_fault, 1, readonly_timeout,
-              NULL, sizeof(uint64_t));
+  long timeout_fault_result = syscall(
+      SYS_ppoll,
+      &ready_before_timeout_fault,
+      1,
+      readonly_timeout,
+      NULL,
+      sizeof(uint64_t));
   int timeout_fault_errno = errno;
   int timeout_fault_revents = ready_before_timeout_fault.revents;
   struct timespec timeout_after_write_fault = *readonly_timeout;
@@ -96,13 +108,16 @@ static int run_raw_timeout_copyout(void) {
       !(timeout_fault_revents & POLLIN) ||
       timeout_after_write_fault.tv_sec != raw_ready_input.tv_sec ||
       timeout_after_write_fault.tv_nsec != raw_ready_input.tv_nsec) {
-    fprintf(stderr,
-            "raw ready ppoll did not preserve its result across timeout "
-            "writeback failure: result=%ld errno=%d revents=%d "
-            "timeout=%ld.%09ld\n",
-            timeout_fault_result, timeout_fault_errno, timeout_fault_revents,
-            timeout_after_write_fault.tv_sec,
-            timeout_after_write_fault.tv_nsec);
+    fprintf(
+        stderr,
+        "raw ready ppoll did not preserve its result across timeout "
+        "writeback failure: result=%ld errno=%d revents=%d "
+        "timeout=%ld.%09ld\n",
+        timeout_fault_result,
+        timeout_fault_errno,
+        timeout_fault_revents,
+        timeout_after_write_fault.tv_sec,
+        timeout_after_write_fault.tv_nsec);
     return 1;
   }
 
@@ -127,12 +142,14 @@ static int run_invalid_nfds(void) {
 
   nfds_t nfds = (nfds_t)limit.rlim_cur + 1;
   errno = 0;
-  long result = syscall(SYS_ppoll, (void*)1, nfds, NULL, NULL,
-                        sizeof(uint64_t));
+  long result =
+      syscall(SYS_ppoll, (void*)1, nfds, NULL, NULL, sizeof(uint64_t));
   if (result != -1 || errno != EINVAL) {
-    fprintf(stderr,
-            "invalid nfds ppoll did not return EINVAL: result=%ld errno=%d\n",
-            result, errno);
+    fprintf(
+        stderr,
+        "invalid nfds ppoll did not return EINVAL: result=%ld errno=%d\n",
+        result,
+        errno);
     return 1;
   }
   return 0;
@@ -160,8 +177,8 @@ static int run_zero_timeout_alias(void) {
   } aliased;
   memset(&aliased, 0, sizeof(aliased));
   errno = 0;
-  long result = syscall(SYS_ppoll, &aliased.pfd, 1, &aliased.timeout, NULL,
-                        sizeof(uint64_t));
+  long result = syscall(
+      SYS_ppoll, &aliased.pfd, 1, &aliased.timeout, NULL, sizeof(uint64_t));
   int observed_errno = errno;
   short observed_revents = aliased.pfd.revents;
 
@@ -170,10 +187,13 @@ static int run_zero_timeout_alias(void) {
     return 1;
   }
   if (result != 1 || observed_errno != 0 || !(observed_revents & POLLHUP)) {
-    fprintf(stderr,
-            "zero timeout alias ppoll diverged: result=%ld errno=%d "
-            "revents=%d\n",
-            result, observed_errno, observed_revents);
+    fprintf(
+        stderr,
+        "zero timeout alias ppoll diverged: result=%ld errno=%d "
+        "revents=%d\n",
+        result,
+        observed_errno,
+        observed_revents);
     return 1;
   }
   return 0;
@@ -191,9 +211,13 @@ static int run_masked_readonly_timeout(void) {
     perror("sysconf page size");
     return 1;
   }
-  void* timeout_page = mmap(NULL, (size_t)page_size,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* timeout_page = mmap(
+      NULL,
+      (size_t)page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (timeout_page == MAP_FAILED) {
     perror("mmap masked readonly timeout");
     return 1;
@@ -214,8 +238,7 @@ static int run_masked_readonly_timeout(void) {
   sigaddset(&mask, SIGUSR1);
   struct pollfd ready = {.fd = pipefd[0], .events = POLLIN};
   errno = 0;
-  long result = syscall(SYS_ppoll, &ready, 1, timeout, &mask,
-                        sizeof(uint64_t));
+  long result = syscall(SYS_ppoll, &ready, 1, timeout, &mask, sizeof(uint64_t));
   int observed_errno = errno;
   struct timespec observed_timeout = *timeout;
 
@@ -230,11 +253,15 @@ static int run_masked_readonly_timeout(void) {
   if (result != 1 || observed_errno != 0 || !(ready.revents & POLLIN) ||
       observed_timeout.tv_sec != input.tv_sec ||
       observed_timeout.tv_nsec != input.tv_nsec) {
-    fprintf(stderr,
-            "masked readonly timeout ppoll diverged: result=%ld errno=%d "
-            "revents=%d timeout=%ld.%09ld\n",
-            result, observed_errno, ready.revents, observed_timeout.tv_sec,
-            observed_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "masked readonly timeout ppoll diverged: result=%ld errno=%d "
+        "revents=%d timeout=%ld.%09ld\n",
+        result,
+        observed_errno,
+        ready.revents,
+        observed_timeout.tv_sec,
+        observed_timeout.tv_nsec);
     return 1;
   }
   return 0;
@@ -252,9 +279,13 @@ static int run_masked_readonly_zero_timeout(void) {
     perror("sysconf page size");
     return 1;
   }
-  void* timeout_page = mmap(NULL, (size_t)page_size,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* timeout_page = mmap(
+      NULL,
+      (size_t)page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (timeout_page == MAP_FAILED) {
     perror("mmap masked readonly zero timeout");
     return 1;
@@ -275,8 +306,7 @@ static int run_masked_readonly_zero_timeout(void) {
   sigaddset(&mask, SIGUSR1);
   struct pollfd ready = {.fd = pipefd[0], .events = POLLIN};
   errno = 0;
-  long result = syscall(SYS_ppoll, &ready, 1, timeout, &mask,
-                        sizeof(uint64_t));
+  long result = syscall(SYS_ppoll, &ready, 1, timeout, &mask, sizeof(uint64_t));
   int observed_errno = errno;
   struct timespec observed_timeout = *timeout;
 
@@ -291,11 +321,15 @@ static int run_masked_readonly_zero_timeout(void) {
   if (result != 1 || observed_errno != 0 || !(ready.revents & POLLIN) ||
       observed_timeout.tv_sec != input.tv_sec ||
       observed_timeout.tv_nsec != input.tv_nsec) {
-    fprintf(stderr,
-            "masked readonly zero timeout ppoll diverged: result=%ld "
-            "errno=%d revents=%d timeout=%ld.%09ld\n",
-            result, observed_errno, ready.revents, observed_timeout.tv_sec,
-            observed_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "masked readonly zero timeout ppoll diverged: result=%ld "
+        "errno=%d revents=%d timeout=%ld.%09ld\n",
+        result,
+        observed_errno,
+        ready.revents,
+        observed_timeout.tv_sec,
+        observed_timeout.tv_nsec);
     return 1;
   }
   return 0;
@@ -313,8 +347,7 @@ static int run_masked_fail_closed(void) {
   sigaddset(&mask, SIGUSR1);
   struct pollfd fd = {.fd = pipefd[0], .events = POLLIN};
   struct timespec ready_timeout = {.tv_sec = 1, .tv_nsec = 0};
-  if (ppoll(&fd, 1, &ready_timeout, &mask) != 1 ||
-      !(fd.revents & POLLIN)) {
+  if (ppoll(&fd, 1, &ready_timeout, &mask) != 1 || !(fd.revents & POLLIN)) {
     perror("masked ready ppoll");
     return 1;
   }
@@ -328,9 +361,11 @@ static int run_masked_fail_closed(void) {
   struct timespec blocked_timeout = {.tv_sec = 0, .tv_nsec = 1000000};
   errno = 0;
   if (ppoll(&fd, 1, &blocked_timeout, &mask) != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "blocking masked ppoll did not fail closed: errno=%d revents=%d\n",
-            errno, fd.revents);
+    fprintf(
+        stderr,
+        "blocking masked ppoll did not fail closed: errno=%d revents=%d\n",
+        errno,
+        fd.revents);
     return 1;
   }
 
@@ -347,8 +382,13 @@ static int run_inaccessible_mask_kernel_wait(void) {
     perror("sysconf page size");
     return 1;
   }
-  void* mask_page = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* mask_page = mmap(
+      NULL,
+      (size_t)page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (mask_page == MAP_FAILED) {
     perror("mmap inaccessible ppoll mask");
     return 1;
@@ -363,18 +403,20 @@ static int run_inaccessible_mask_kernel_wait(void) {
 
   struct timespec timeout = {.tv_sec = 0, .tv_nsec = 1};
   errno = 0;
-  long result = syscall(SYS_ppoll, NULL, 0, &timeout, mask_page,
-                        sizeof(uint64_t));
+  long result =
+      syscall(SYS_ppoll, NULL, 0, &timeout, mask_page, sizeof(uint64_t));
   int observed_errno = errno;
   if (munmap(mask_page, (size_t)page_size) != 0) {
     perror("munmap inaccessible ppoll mask");
     return 1;
   }
   if (result != -1 || observed_errno != EFAULT) {
-    fprintf(stderr,
-            "inaccessible ppoll mask did not return EFAULT: result=%ld "
-            "errno=%d\n",
-            result, observed_errno);
+    fprintf(
+        stderr,
+        "inaccessible ppoll mask did not return EFAULT: result=%ld "
+        "errno=%d\n",
+        result,
+        observed_errno);
     return 1;
   }
   return 0;
@@ -421,8 +463,11 @@ static int run_default_workload(void) {
   struct timespec raw_timeout = {.tv_sec = 0, .tv_nsec = 5000000};
   if (syscall(SYS_ppoll, NULL, 0, &raw_timeout, NULL, sizeof(uint64_t)) != 0 ||
       raw_timeout.tv_sec != 0 || raw_timeout.tv_nsec != 0) {
-    fprintf(stderr, "raw ppoll timeout was not consumed: %ld.%09ld\n",
-            raw_timeout.tv_sec, raw_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "raw ppoll timeout was not consumed: %ld.%09ld\n",
+        raw_timeout.tv_sec,
+        raw_timeout.tv_nsec);
     return 1;
   }
 
@@ -444,8 +489,8 @@ static int run_default_workload(void) {
   struct timespec masked_timeout = {.tv_sec = 0, .tv_nsec = 1000000};
   errno = 0;
   if (ppoll(&ready, 1, &masked_timeout, &mask) != -1 || errno != ENOSYS) {
-    fprintf(stderr, "blocking masked ppoll did not fail closed: errno=%d\n",
-            errno);
+    fprintf(
+        stderr, "blocking masked ppoll did not fail closed: errno=%d\n", errno);
     return 1;
   }
 
@@ -483,11 +528,12 @@ int main(int argc, char** argv) {
     return run_default_workload();
   }
   if (argc != 2) {
-    fprintf(stderr,
-            "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
-            "masked-readonly-zero-timeout|masked-fail-closed|"
-            "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
-            argv[0]);
+    fprintf(
+        stderr,
+        "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
+        "masked-readonly-zero-timeout|masked-fail-closed|"
+        "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
+        argv[0]);
     return 2;
   }
   if (strcmp(argv[1], "raw-timeout-copyout") == 0) {
@@ -540,10 +586,11 @@ int main(int argc, char** argv) {
     return result;
   }
 
-  fprintf(stderr,
-          "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
-          "masked-readonly-zero-timeout|masked-fail-closed|"
-          "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
-          argv[0]);
+  fprintf(
+      stderr,
+      "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
+      "masked-readonly-zero-timeout|masked-fail-closed|"
+      "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
+      argv[0]);
   return 2;
 }

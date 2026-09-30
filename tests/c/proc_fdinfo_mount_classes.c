@@ -17,12 +17,12 @@
 #include <stdio.h>
 #include <string.h>
 
-static int print_fdinfo(const char *name, int fd) {
+static int print_fdinfo(const char* name, int fd) {
   char path[64];
   if (snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd) < 0) {
     return 1;
   }
-  FILE *file = fopen(path, "r");
+  FILE* file = fopen(path, "r");
   if (file == NULL) {
     return 1;
   }
@@ -33,7 +33,7 @@ static int print_fdinfo(const char *name, int fd) {
   return fclose(file) != 0;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "--mount-namespace-only") == 0) {
     int namespace_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
     return namespace_fd < 0 || print_fdinfo("mount-namespace", namespace_fd);
@@ -52,9 +52,9 @@ int main(int argc, char **argv) {
   }
 
   int result = print_fdinfo("pipe", pipe_fds[0]) ||
-               print_fdinfo("socket", socket_fds[0]) ||
-               print_fdinfo("eventfd", event_fd) ||
-               print_fdinfo("mount-namespace", namespace_fd);
+      print_fdinfo("socket", socket_fds[0]) ||
+      print_fdinfo("eventfd", event_fd) ||
+      print_fdinfo("mount-namespace", namespace_fd);
   if (pid_fd >= 0) {
     result = result || print_fdinfo("pidfd", pid_fd);
   } else if (pid_fd_errno != ENOSYS) {

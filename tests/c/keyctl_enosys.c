@@ -22,14 +22,17 @@
 
 int main(void) {
   errno = 0;
-  long result = syscall(SYS_keyctl, KEYCTL_GET_KEYRING_ID,
-                        KEY_SPEC_SESSION_KEYRING, 0, 0, 0);
+  long result = syscall(
+      SYS_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0, 0, 0);
   if (result == -1 && errno == ENOSYS) {
     puts("keyctl deterministically unavailable");
     return 0;
   }
 
-  fprintf(stderr, "keyctl: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "keyctl: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

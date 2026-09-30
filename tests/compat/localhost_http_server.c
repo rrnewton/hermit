@@ -20,7 +20,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static int write_all(int fd, const char *buf, size_t len) {
+static int write_all(int fd, const char* buf, size_t len) {
   while (len != 0) {
     ssize_t written = write(fd, buf, len);
     if (written < 0) {
@@ -34,12 +34,12 @@ static int write_all(int fd, const char *buf, size_t len) {
   return 0;
 }
 
-static int request_complete(const char *buf, size_t len) {
+static int request_complete(const char* buf, size_t len) {
   return (len >= 4 && memmem(buf, len, "\r\n\r\n", 4) != NULL) ||
-         (len >= 2 && memmem(buf, len, "\n\n", 2) != NULL);
+      (len >= 2 && memmem(buf, len, "\n\n", 2) != NULL);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc != 3) {
     fprintf(stderr, "usage: %s PORT_FILE RESPONSE_FILE\n", argv[0]);
     return 2;
@@ -61,12 +61,12 @@ int main(int argc, char **argv) {
       .sin_port = htons(0),
       .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
   };
-  if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0) {
+  if (bind(listener, (struct sockaddr*)&address, sizeof(address)) != 0) {
     perror("bind");
     return 1;
   }
   socklen_t address_len = sizeof(address);
-  if (getsockname(listener, (struct sockaddr *)&address, &address_len) != 0) {
+  if (getsockname(listener, (struct sockaddr*)&address, &address_len) != 0) {
     perror("getsockname");
     return 1;
   }
@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
   }
 
   size_t port_path_len = strlen(argv[1]) + sizeof(".tmp");
-  char *port_path = malloc(port_path_len);
+  char* port_path = malloc(port_path_len);
   if (port_path == NULL ||
       snprintf(port_path, port_path_len, "%s.tmp", argv[1]) < 0) {
     perror("prepare port path");
@@ -114,8 +114,8 @@ int main(int argc, char **argv) {
   size_t request_len = 0;
   while (!request_complete(request, request_len)) {
     if (request_len == sizeof(request)) {
-      fprintf(stderr, "HTTP request headers exceeded %zu bytes\n",
-              sizeof(request));
+      fprintf(
+          stderr, "HTTP request headers exceeded %zu bytes\n", sizeof(request));
       return 1;
     }
     ssize_t got =

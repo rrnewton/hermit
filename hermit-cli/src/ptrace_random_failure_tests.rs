@@ -137,15 +137,31 @@ mod real_random {
             return;
         }
         let parent_tid = unsafe { libc::syscall(libc::SYS_gettid) };
-        let _parent = credentials(&format!("/proc/self/task/{parent_tid}"), "outer-before-isolation");
+        let _parent = credentials(
+            &format!("/proc/self/task/{parent_tid}"),
+            "outer-before-isolation",
+        );
         let fixture = tempfile::tempdir().unwrap();
         let compile = |name: &str, bytes: &[u8]| {
             let source = fixture.path().join(format!("{name}.c"));
             let binary = fixture.path().join(name);
             std::fs::write(&source, bytes).unwrap();
             let status = Command::new("timeout")
-                .args(["--kill-after=1s", "10s", "cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
-                .arg(&source).arg("-o").arg(&binary).status().unwrap();
+                .args([
+                    "--kill-after=1s",
+                    "10s",
+                    "cc",
+                    "-O2",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .unwrap();
             assert!(status.success(), "{name} fixture compile failed: {status}");
             binary
         };
@@ -155,12 +171,21 @@ mod real_random {
                 assert!(binary.is_absolute() && binary.is_file());
                 binary
             }
-            None => compile("guest", include_bytes!("../tests/fixtures/random_copy_fatal.c")),
+            None => compile(
+                "guest",
+                include_bytes!("../tests/fixtures/random_copy_fatal.c"),
+            ),
         };
-        let probe = compile("permission-probe", include_bytes!("../tests/fixtures/ptrace_copy_permission.c"));
+        let probe = compile(
+            "permission-probe",
+            include_bytes!("../tests/fixtures/ptrace_copy_permission.c"),
+        );
         isolated_with_child_setup(
             name,
-            &[("HERMIT_RANDOM_FAILURE_GUEST", &binary), ("HERMIT_RANDOM_PERMISSION_PROBE", &probe)],
+            &[
+                ("HERMIT_RANDOM_FAILURE_GUEST", &binary),
+                ("HERMIT_RANDOM_PERMISSION_PROBE", &probe),
+            ],
             restrict_ptrace_copy,
             || unreachable!(),
         );
@@ -173,9 +198,16 @@ mod real_random {
             .unwrap();
         let (original_tid, original_credentials) = restricted_thread_credentials("before-runtime");
         let probe = Command::new(std::env::var_os("HERMIT_RANDOM_PERMISSION_PROBE").unwrap())
-            .status().unwrap();
-        assert!(probe.success(), "native copy-permission discriminator failed: {probe}");
-        assert!(monotonic_ns() < deadline, "native discriminator exceeded original deadline");
+            .status()
+            .unwrap();
+        assert!(
+            probe.success(),
+            "native copy-permission discriminator failed: {probe}"
+        );
+        assert!(
+            monotonic_ns() < deadline,
+            "native discriminator exceeded original deadline"
+        );
         // This isolated process owns natural-parent waits after product facts
         // are sealed. It never creates a second ptrace waiter.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
@@ -278,7 +310,8 @@ mod real_random {
                             let event =
                                 format!("[detcore, dtid {child}] inbound timer preemption event");
                             if text.contains(&event) {
-                                let (tid, observed) = restricted_thread_credentials("actual-tracer-before-gate");
+                                let (tid, observed) =
+                                    restricted_thread_credentials("actual-tracer-before-gate");
                                 assert_eq!(tid, original_tid);
                                 assert_eq!(observed, original_credentials);
                                 assert_tracee_credentials(root, tid, &observed);
@@ -412,23 +445,28 @@ mod real_random {
             assert!(!summary.exists());
             let inbound = format!("inbound syscall: {}(", operation.name());
             let tail = text.rsplit_once(&inbound).unwrap().1;
-            let arguments = tail.lines().next().unwrap().split_once(" DETLOG_RECORD=").unwrap().0;
+            let arguments = tail
+                .lines()
+                .next()
+                .unwrap()
+                .split_once(" DETLOG_RECORD=")
+                .unwrap()
+                .0;
             match operation {
                 Operation::Getrandom => assert!(arguments.contains(", 7, 0)")),
                 Operation::Readv => {
                     let (fd, vector_and_count) = arguments.split_once(", ").unwrap();
                     assert!(fd.parse::<i32>().unwrap() >= 0);
                     let (vector, count) = vector_and_count.split_once(", ").unwrap();
-                    assert!(usize::from_str_radix(vector.strip_prefix("0x").unwrap(), 16).unwrap() > 0);
+                    assert!(
+                        usize::from_str_radix(vector.strip_prefix("0x").unwrap(), 16).unwrap() > 0
+                    );
                     assert_eq!(count, "1) = ?");
                 }
             }
             assert!(tail.contains("backend failure"));
-            assert!(
-                !tail
-                    .lines()
-                    .any(|line| line.contains("finish syscall #") && line.contains(&format!("{}(", operation.name())))
-            );
+            assert!(!tail.lines().any(|line| line.contains("finish syscall #")
+                && line.contains(&format!("{}(", operation.name()))));
             assert!(
                 !tail
                     .lines()

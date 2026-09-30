@@ -138,84 +138,103 @@ static long syscall5(long n, long a1, long a2, long a3, long a4, long a5) {
   return rax;
 }
 
-static unsigned long slen(const char *s) {
+static unsigned long slen(const char* s) {
   unsigned long n = 0;
-  while (s[n]) ++n;
+  while (s[n])
+    ++n;
   return n;
 }
-static void out(const char *s) { syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, slen(s)); }
-static void outn(const char *s, long n) { syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, n); }
+static void out(const char* s) {
+  syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, slen(s));
+}
+static void outn(const char* s, long n) {
+  syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, n);
+}
 
 /* Append a signed decimal to buf at *pos. */
-static void put_dec(char *buf, int *pos, long v) {
+static void put_dec(char* buf, int* pos, long v) {
   char tmp[24];
   int t = 0;
   if (v < 0) {
     buf[(*pos)++] = '-';
     v = -v;
   }
-  if (v == 0) tmp[t++] = '0';
+  if (v == 0)
+    tmp[t++] = '0';
   while (v > 0) {
     tmp[t++] = (char)('0' + (v % 10));
     v /= 10;
   }
-  while (t > 0) buf[(*pos)++] = tmp[--t];
+  while (t > 0)
+    buf[(*pos)++] = tmp[--t];
 }
 
-static void mzero(void *p, unsigned long n) {
-  u8 *b = (u8 *)p;
-  for (unsigned long i = 0; i < n; ++i) b[i] = 0;
-}
-static void mcopy(void *d, const void *s, unsigned long n) {
-  u8 *dd = (u8 *)d;
-  const u8 *ss = (const u8 *)s;
-  for (unsigned long i = 0; i < n; ++i) dd[i] = ss[i];
-}
-static int seq_eq(const char *a, const char *b, unsigned long n) {
+static void mzero(void* p, unsigned long n) {
+  u8* b = (u8*)p;
   for (unsigned long i = 0; i < n; ++i)
-    if (a[i] != b[i]) return 0;
+    b[i] = 0;
+}
+static void mcopy(void* d, const void* s, unsigned long n) {
+  u8* dd = (u8*)d;
+  const u8* ss = (const u8*)s;
+  for (unsigned long i = 0; i < n; ++i)
+    dd[i] = ss[i];
+}
+static int seq_eq(const char* a, const char* b, unsigned long n) {
+  for (unsigned long i = 0; i < n; ++i)
+    if (a[i] != b[i])
+      return 0;
   return 1;
 }
 /* Return 1 if haystack[0..hlen) contains needle. */
-static int contains(const char *hay, unsigned long hlen, const char *needle) {
+static int contains(const char* hay, unsigned long hlen, const char* needle) {
   unsigned long nlen = slen(needle);
-  if (nlen == 0) return 1;
-  if (hlen < nlen) return 0;
+  if (nlen == 0)
+    return 1;
+  if (hlen < nlen)
+    return 0;
   for (unsigned long i = 0; i + nlen <= hlen; ++i)
-    if (seq_eq(hay + i, needle, nlen)) return 1;
+    if (seq_eq(hay + i, needle, nlen))
+      return 1;
   return 0;
 }
 
-static u16 be16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
+static u16 be16(u16 v) {
+  return (u16)((v << 8) | (v >> 8));
+}
 
-/* Build a 16-byte sockaddr_in {AF_INET, port(host order), ipv4(network order)}. */
-static void make_sin(u8 *sa, u16 port, u32 ipnet) {
+/* Build a 16-byte sockaddr_in {AF_INET, port(host order), ipv4(network order)}.
+ */
+static void make_sin(u8* sa, u16 port, u32 ipnet) {
   mzero(sa, 16);
-  sa[0] = AF_INET;          /* sin_family low byte */
-  sa[1] = 0;                /* sin_family high byte */
-  *(u16 *)(sa + 2) = be16(port);
-  *(u32 *)(sa + 4) = ipnet; /* already network byte order */
+  sa[0] = AF_INET; /* sin_family low byte */
+  sa[1] = 0; /* sin_family high byte */
+  *(u16*)(sa + 2) = be16(port);
+  *(u32*)(sa + 4) = ipnet; /* already network byte order */
 }
 
 /*
  * Parse a dotted-decimal IPv4 from s (len bytes) into a network-order u32.
  * Returns 0 on success, -1 on parse error.
  */
-static int inet_aton_net(const char *s, unsigned long len, u32 *out_net) {
+static int inet_aton_net(const char* s, unsigned long len, u32* out_net) {
   u32 parts[4];
   int pi = 0;
   unsigned long i = 0;
   while (pi < 4) {
-    if (i >= len || s[i] < '0' || s[i] > '9') return -1;
+    if (i >= len || s[i] < '0' || s[i] > '9')
+      return -1;
     u32 acc = 0;
     while (i < len && s[i] >= '0' && s[i] <= '9') {
       acc = acc * 10 + (u32)(s[i] - '0');
       ++i;
     }
-    if (acc > 255) return -1;
+    if (acc > 255)
+      return -1;
     parts[pi++] = acc;
     if (pi < 4) {
-      if (i >= len || s[i] != '.') return -1;
+      if (i >= len || s[i] != '.')
+        return -1;
       ++i;
     }
   }
@@ -228,17 +247,23 @@ static int inet_aton_net(const char *s, unsigned long len, u32 *out_net) {
  * Finds the line whose fields include `name` and returns its first token
  * (the address) copied into ip_out plus its length. Returns 0 on success.
  */
-static int resolve_hosts(const char *name, char *ip_out, int *ip_len) {
+static int resolve_hosts(const char* name, char* ip_out, int* ip_len) {
   char buf[4096];
   long fd = syscall3(SYS_OPEN, (long)"/etc/hosts", O_RDONLY, 0);
-  if (fd < 0) return -1;
+  if (fd < 0)
+    return -1;
   long total = 0;
   for (;;) {
-    long r = syscall3(SYS_READ, fd, (long)(buf + total),
-                      (long)(sizeof(buf) - 1 - (unsigned long)total));
-    if (r <= 0) break;
+    long r = syscall3(
+        SYS_READ,
+        fd,
+        (long)(buf + total),
+        (long)(sizeof(buf) - 1 - (unsigned long)total));
+    if (r <= 0)
+      break;
     total += r;
-    if ((unsigned long)total >= sizeof(buf) - 1) break;
+    if ((unsigned long)total >= sizeof(buf) - 1)
+      break;
   }
   syscall1(SYS_CLOSE, fd);
   buf[total] = 0;
@@ -247,23 +272,30 @@ static int resolve_hosts(const char *name, char *ip_out, int *ip_len) {
   long i = 0;
   while (i < total) {
     long ls = i;
-    while (i < total && buf[i] != '\n') ++i;
+    while (i < total && buf[i] != '\n')
+      ++i;
     long le = i; /* [ls,le) is one line */
-    if (i < total) ++i;
+    if (i < total)
+      ++i;
     /* skip comments */
     long p = ls;
-    while (p < le && (buf[p] == ' ' || buf[p] == '\t')) ++p;
-    if (p >= le || buf[p] == '#') continue;
+    while (p < le && (buf[p] == ' ' || buf[p] == '\t'))
+      ++p;
+    if (p >= le || buf[p] == '#')
+      continue;
     /* first token = address */
     long as = p;
-    while (p < le && buf[p] != ' ' && buf[p] != '\t') ++p;
+    while (p < le && buf[p] != ' ' && buf[p] != '\t')
+      ++p;
     long ae = p; /* [as,ae) address token */
     /* scan remaining tokens for name */
     int matched = 0;
     while (p < le) {
-      while (p < le && (buf[p] == ' ' || buf[p] == '\t')) ++p;
+      while (p < le && (buf[p] == ' ' || buf[p] == '\t'))
+        ++p;
       long ts = p;
-      while (p < le && buf[p] != ' ' && buf[p] != '\t') ++p;
+      while (p < le && buf[p] != ' ' && buf[p] != '\t')
+        ++p;
       long te = p;
       if (te - ts == (long)nlen && seq_eq(buf + ts, name, nlen)) {
         matched = 1;
@@ -272,7 +304,8 @@ static int resolve_hosts(const char *name, char *ip_out, int *ip_len) {
     }
     if (matched) {
       int n = (int)(ae - as);
-      if (n <= 0 || n >= 64) return -1;
+      if (n <= 0 || n >= 64)
+        return -1;
       mcopy(ip_out, buf + as, (unsigned long)n);
       ip_out[n] = 0;
       *ip_len = n;
@@ -285,13 +318,15 @@ static int resolve_hosts(const char *name, char *ip_out, int *ip_len) {
 static void power_off(void) {
   syscall0(SYS_SYNC);
   syscall4(SYS_REBOOT, REBOOT_MAGIC1, REBOOT_MAGIC2, REBOOT_CMD_POWER_OFF, 0);
-  for (;;) syscall0(34 /* SYS_pause */);
+  for (;;)
+    syscall0(34 /* SYS_pause */);
 }
 
 /* Bring the loopback interface up and assign 127.0.0.1/8. Returns 0 on ok. */
 static long lo_up(void) {
   long fd = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
-  if (fd < 0) return fd;
+  if (fd < 0)
+    return fd;
   u8 ifr[40];
 
   /* address 127.0.0.1 */
@@ -300,7 +335,10 @@ static long lo_up(void) {
   ifr[1] = 'o';
   make_sin(ifr + 16, 0, 0x0100007f /* 127.0.0.1 net order */);
   long r = syscall3(SYS_IOCTL, fd, SIOCSIFADDR, (long)ifr);
-  if (r < 0 && r != -114 /* EEXIST-ish */) { syscall1(SYS_CLOSE, fd); return r; }
+  if (r < 0 && r != -114 /* EEXIST-ish */) {
+    syscall1(SYS_CLOSE, fd);
+    return r;
+  }
 
   /* netmask 255.0.0.0 */
   mzero(ifr, sizeof(ifr));
@@ -313,7 +351,7 @@ static long lo_up(void) {
   mzero(ifr, sizeof(ifr));
   ifr[0] = 'l';
   ifr[1] = 'o';
-  *(u16 *)(ifr + 16) = IFF_UP | IFF_RUNNING;
+  *(u16*)(ifr + 16) = IFF_UP | IFF_RUNNING;
   r = syscall3(SYS_IOCTL, fd, SIOCSIFFLAGS, (long)ifr);
   syscall1(SYS_CLOSE, fd);
   return r;
@@ -347,7 +385,7 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
       line[pos++] = '\n';
       outn(line, pos);
     } else {
-      const char *msg = "PING";
+      const char* msg = "PING";
       syscall3(SYS_WRITE, sv[0], (long)msg, 4);
       char rb[8];
       long got = syscall3(SYS_READ, sv[1], (long)rb, 8);
@@ -357,7 +395,8 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
       mcopy(line, "QEMU_NET_SOCKETPAIR_OK bytes=", 29);
       pos = 29;
       put_dec(line, &pos, got);
-      if (got == 4 && seq_eq(rb, "PING", 4)) mcopy(line + pos, " data=PING", 10), pos += 10;
+      if (got == 4 && seq_eq(rb, "PING", 4))
+        mcopy(line + pos, " data=PING", 10), pos += 10;
       line[pos++] = '\n';
       outn(line, pos);
     }
@@ -399,7 +438,8 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
   }
   out("QEMU_NET_LO_UP\n");
 
-  /* 4 + 5. AF_INET TCP + HTTP over 127.0.0.1:8080. Listen, then fork a client. */
+  /* 4 + 5. AF_INET TCP + HTTP over 127.0.0.1:8080. Listen, then fork a client.
+   */
   long lsock = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
   if (lsock < 0) {
     out("QEMU_NET_TCP_SOCKET_FAILED\n");
@@ -422,25 +462,33 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
   if (pid == 0) {
     /* CLIENT: connect, send HTTP request, read + verify response. */
     long cs = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
-    if (cs < 0) syscall1(SYS_EXIT, 21);
+    if (cs < 0)
+      syscall1(SYS_EXIT, 21);
     u8 dst[16];
     make_sin(dst, 8080, ipnet);
-    if (syscall3(SYS_CONNECT, cs, (long)dst, 16) < 0) syscall1(SYS_EXIT, 22);
-    const char *req = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    if (syscall3(SYS_CONNECT, cs, (long)dst, 16) < 0)
+      syscall1(SYS_EXIT, 22);
+    const char* req = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
     syscall3(SYS_WRITE, cs, (long)req, (long)slen(req));
     char resp[512];
     long total = 0;
     for (;;) {
-      long r = syscall3(SYS_READ, cs, (long)(resp + total),
-                        (long)(sizeof(resp) - (unsigned long)total));
-      if (r <= 0) break;
+      long r = syscall3(
+          SYS_READ,
+          cs,
+          (long)(resp + total),
+          (long)(sizeof(resp) - (unsigned long)total));
+      if (r <= 0)
+        break;
       total += r;
-      if ((unsigned long)total >= sizeof(resp)) break;
+      if ((unsigned long)total >= sizeof(resp))
+        break;
     }
     syscall1(SYS_CLOSE, cs);
     int ok_status = contains(resp, total, "HTTP/1.0 200");
     int ok_body = contains(resp, total, "HELLO");
-    if (ok_status && ok_body) syscall1(SYS_EXIT, 0);
+    if (ok_status && ok_body)
+      syscall1(SYS_EXIT, 0);
     syscall1(SYS_EXIT, 23);
   }
 
@@ -450,8 +498,9 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
   if (conn >= 0) {
     char rb[512];
     long got = syscall3(SYS_READ, conn, (long)rb, sizeof(rb));
-    if (got > 0 && contains(rb, got, "GET /")) req_ok = 1;
-    const char *resp =
+    if (got > 0 && contains(rb, got, "GET /"))
+      req_ok = 1;
+    const char* resp =
         "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHELLO";
     syscall3(SYS_WRITE, conn, (long)resp, (long)slen(resp));
     syscall1(SYS_CLOSE, conn);
@@ -462,10 +511,13 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
   syscall4(SYS_WAIT4, pid, (long)&status, 0, 0);
   int client_ok = ((status & 0x7f) == 0) && (((status >> 8) & 0xff) == 0);
 
-  if (req_ok) out("QEMU_NET_TCP_OK proto=tcp addr=127.0.0.1:8080\n");
-  else out("QEMU_NET_TCP_REQ_MISMATCH\n");
+  if (req_ok)
+    out("QEMU_NET_TCP_OK proto=tcp addr=127.0.0.1:8080\n");
+  else
+    out("QEMU_NET_TCP_REQ_MISMATCH\n");
 
-  if (client_ok) out("QEMU_NET_HTTP_OK status=200 body=HELLO\n");
+  if (client_ok)
+    out("QEMU_NET_HTTP_OK status=200 body=HELLO\n");
   else {
     pos = 0;
     mcopy(line, "QEMU_NET_HTTP_FAILED wstatus=", 29);
@@ -503,16 +555,17 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
         } else if (syscall3(SYS_CONNECT, uc, (long)server_addr, 16) < 0) {
           out("QEMU_NET_UDP_CLIENT_CONNECT_FAILED\n");
         } else {
-          const char *ping = "PING";
+          const char* ping = "PING";
           char request[8];
           long sent = syscall3(SYS_WRITE, uc, (long)ping, 4);
-          long received = syscall3(SYS_READ, us, (long)request, sizeof(request));
+          long received =
+              syscall3(SYS_READ, us, (long)request, sizeof(request));
           if (sent != 4 || received != 4 || !seq_eq(request, "PING", 4)) {
             out("QEMU_NET_UDP_REQUEST_MISMATCH\n");
           } else if (syscall3(SYS_CONNECT, us, (long)client_addr, 16) < 0) {
             out("QEMU_NET_UDP_SERVER_CONNECT_FAILED\n");
           } else {
-            const char *pong = "PONG";
+            const char* pong = "PONG";
             char response[8];
             long replied = syscall3(SYS_WRITE, us, (long)pong, 4);
             long got = syscall3(SYS_READ, uc, (long)response, sizeof(response));
@@ -527,11 +580,15 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
       }
     }
   }
-  if (uc >= 0) syscall1(SYS_CLOSE, uc);
-  if (us >= 0) syscall1(SYS_CLOSE, us);
+  if (uc >= 0)
+    syscall1(SYS_CLOSE, uc);
+  if (us >= 0)
+    syscall1(SYS_CLOSE, us);
 
-  if (req_ok && client_ok && udp_ok) out("QEMU_NET_ALL_OK\n");
-  else out("QEMU_NET_PARTIAL\n");
+  if (req_ok && client_ok && udp_ok)
+    out("QEMU_NET_ALL_OK\n");
+  else
+    out("QEMU_NET_PARTIAL\n");
 
   power_off();
 }

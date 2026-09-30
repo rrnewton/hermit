@@ -13,16 +13,16 @@
  * Every checked operation reads back a value the guest itself just set (or a
  * fixed post-exec default), so the observable result depends only on the
  * program, not on the host task's inherited name, dumpable flag, keepcaps bit,
- * or parent-death signal. That makes the contract byte-identical across repeated
- * runs and across the ptrace, DBT, and KVM backends. It uses no threads, no
- * blocking I/O, and no signal delivery, so it is safe under the DBT
+ * or parent-death signal. That makes the contract byte-identical across
+ * repeated runs and across the ptrace, DBT, and KVM backends. It uses no
+ * threads, no blocking I/O, and no signal delivery, so it is safe under the DBT
  * no-preemption scheduler.
  *
  * EMISSION CONTRACT: the fixture prints every value it read back, not the bare
- * success token "prctl-identity-ok" it used to print. Every emitted value is one
- * the guest itself installed (or the fixed post-exec pdeathsig default), so the
- * line stays host-independent while making a wrong read-back visible in the byte
- * stream. The old token carried no observation at all -- strictly less
+ * success token "prctl-identity-ok" it used to print. Every emitted value is
+ * one the guest itself installed (or the fixed post-exec pdeathsig default), so
+ * the line stays host-independent while making a wrong read-back visible in the
+ * byte stream. The old token carried no observation at all -- strictly less
  * informative than a tally, which at least reports how many checks passed.
  */
 
@@ -32,7 +32,7 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 
-static int fail(const char *what) {
+static int fail(const char* what) {
   fprintf(stderr, "prctl-identity: %s failed: %s\n", what, strerror(errno));
   return 1;
 }
@@ -40,7 +40,7 @@ static int fail(const char *what) {
 int main(void) {
   /* PR_SET_NAME / PR_GET_NAME: the thread name is capped at 16 bytes including
    * the terminator and must read back exactly what we set. */
-  const char *wanted = "hermit-probe";
+  const char* wanted = "hermit-probe";
   if (prctl(PR_SET_NAME, wanted, 0, 0, 0) != 0)
     return fail("PR_SET_NAME");
   char name[16] = {0};
@@ -93,9 +93,14 @@ int main(void) {
   }
 
   /* Emit every read-back value rather than a success token. */
-  printf("prctl-identity name=%s dumpable_after_clear=%d dumpable_after_set=%d "
-         "keepcaps_after_set=%d keepcaps_after_clear=%d pdeathsig_initial=%d\n",
-         name, dumpable_after_clear, dumpable_after_set, keepcaps_after_set,
-         keepcaps_after_clear, pdeath);
+  printf(
+      "prctl-identity name=%s dumpable_after_clear=%d dumpable_after_set=%d "
+      "keepcaps_after_set=%d keepcaps_after_clear=%d pdeathsig_initial=%d\n",
+      name,
+      dumpable_after_clear,
+      dumpable_after_set,
+      keepcaps_after_set,
+      keepcaps_after_clear,
+      pdeath);
   return 0;
 }

@@ -30,17 +30,19 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-/* Poison sentinel: if detcore fails to write the output, the check catches it. */
+/* Poison sentinel: if detcore fails to write the output, the check catches it.
+ */
 #define SENTINEL 0x7fu
 
-static int query(unsigned *cpu_out, unsigned *node_out) {
+static int query(unsigned* cpu_out, unsigned* node_out) {
   if (cpu_out) {
     *cpu_out = SENTINEL;
   }
   if (node_out) {
     *node_out = SENTINEL;
   }
-  /* Third argument (tcache) has been ignored by the kernel since Linux 2.6.24. */
+  /* Third argument (tcache) has been ignored by the kernel since Linux 2.6.24.
+   */
   return (int)syscall(SYS_getcpu, cpu_out, node_out, NULL);
 }
 
@@ -58,22 +60,34 @@ int main(void) {
       return 1;
     }
     if (cpu != 0 || node != 0) {
-      fprintf(stderr, "iter %d: getcpu(cpu,node) reported cpu=%u node=%u, expected 0/0\n",
-              i, cpu, node);
+      fprintf(
+          stderr,
+          "iter %d: getcpu(cpu,node) reported cpu=%u node=%u, expected 0/0\n",
+          i,
+          cpu,
+          node);
       return 1;
     }
 
     /* cpu only (node pointer NULL): handler must still write cpu=0. */
     cpu = SENTINEL;
     if (query(&cpu, NULL) != 0 || cpu != 0) {
-      fprintf(stderr, "iter %d: getcpu(cpu,NULL) reported cpu=%u, expected 0\n", i, cpu);
+      fprintf(
+          stderr,
+          "iter %d: getcpu(cpu,NULL) reported cpu=%u, expected 0\n",
+          i,
+          cpu);
       return 1;
     }
 
     /* node only (cpu pointer NULL): handler must still write node=0. */
     node = SENTINEL;
     if (query(NULL, &node) != 0 || node != 0) {
-      fprintf(stderr, "iter %d: getcpu(NULL,node) reported node=%u, expected 0\n", i, node);
+      fprintf(
+          stderr,
+          "iter %d: getcpu(NULL,node) reported node=%u, expected 0\n",
+          i,
+          node);
       return 1;
     }
   }

@@ -32,8 +32,8 @@
 
 int main(void) {
   errno = 0;
-  long result = syscall(SYS_keyctl, KEYCTL_GET_KEYRING_ID,
-                        KEY_SPEC_SESSION_KEYRING, 0, 0, 0);
+  long result = syscall(
+      SYS_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0, 0, 0);
   int is_enosys = (result == -1 && errno == ENOSYS) ? 1 : 0;
   printf("keyctl_enosys=%d\n", is_enosys);
   return 0;

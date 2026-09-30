@@ -18,9 +18,9 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <stdio.h>
-#include <sys/sendfile.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -42,9 +42,12 @@ static int write_all(int fd, const char* bytes, size_t length) {
   return 0;
 }
 
-static int sendfile_through_regular_sink(int sink_fd, int source_fd,
-                                        off_t source_offset,
-                                        const char* expected, size_t length) {
+static int sendfile_through_regular_sink(
+    int sink_fd,
+    int source_fd,
+    off_t source_offset,
+    const char* expected,
+    size_t length) {
   if (ftruncate(sink_fd, 0) != 0 || lseek(sink_fd, 0, SEEK_SET) != 0) {
     return -1;
   }
@@ -212,12 +215,13 @@ int main(void) {
       return fail("seek cloned extent");
     }
     printf("clone extent: %lld %lld\n", (long long)data, (long long)hole);
-    if (sendfile_through_regular_sink(sendfile_sink_fd, clone_fd, 4096,
-                                     "payload", 7) != 0) {
+    if (sendfile_through_regular_sink(
+            sendfile_sink_fd, clone_fd, 4096, "payload", 7) != 0) {
       return fail("sendfile(clone)");
     }
-  } else if (errno == EOPNOTSUPP || errno == ENOTTY || errno == EXDEV ||
-             errno == EINVAL) {
+  } else if (
+      errno == EOPNOTSUPP || errno == ENOTTY || errno == EXDEV ||
+      errno == EINVAL) {
     printf("clone unsupported\n");
   } else {
     return fail("ioctl(FICLONE)");
@@ -241,8 +245,10 @@ int main(void) {
       return fail("fstat(write-only clone)");
     }
     if ((clone_stat.st_mode & 0777) != 0200) {
-      fprintf(stderr, "write-only clone permissions changed: %#o\n",
-              clone_stat.st_mode & 0777);
+      fprintf(
+          stderr,
+          "write-only clone permissions changed: %#o\n",
+          clone_stat.st_mode & 0777);
       return 1;
     }
     if (close(write_only_fd) != 0 || chmod(write_only_clone, 0600) != 0) {
@@ -270,8 +276,8 @@ int main(void) {
     return fail("close(sendfile sink)");
   }
   if ((clone_supported && unlink(write_only_clone) != 0) ||
-      unlink(sendfile_sink) != 0 || unlink(clone) != 0 ||
-      unlink(source) != 0 || rmdir(dir) != 0) {
+      unlink(sendfile_sink) != 0 || unlink(clone) != 0 || unlink(source) != 0 ||
+      rmdir(dir) != 0) {
     return fail("cleanup");
   }
 

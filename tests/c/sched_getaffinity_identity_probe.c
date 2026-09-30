@@ -37,8 +37,9 @@ int main(void) {
   /* Pick the CPU to pin to from the CPUs this process may already use. */
   cpu_set_t inherited;
   CPU_ZERO(&inherited);
-  parity_check(sched_getaffinity(0, sizeof(inherited), &inherited) == 0,
-               "sched_getaffinity(inherited)");
+  parity_check(
+      sched_getaffinity(0, sizeof(inherited), &inherited) == 0,
+      "sched_getaffinity(inherited)");
   int target = -1;
   for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
     if (CPU_ISSET(cpu, &inherited)) {
@@ -54,21 +55,27 @@ int main(void) {
   cpu_set_t want;
   CPU_ZERO(&want);
   CPU_SET(target, &want);
-  parity_check(sched_setaffinity(0, sizeof(want), &want) == 0,
-               "sched_setaffinity(lowest inherited cpu)");
+  parity_check(
+      sched_setaffinity(0, sizeof(want), &want) == 0,
+      "sched_setaffinity(lowest inherited cpu)");
 
   cpu_set_t got;
   CPU_ZERO(&got);
-  parity_check(sched_getaffinity(0, sizeof(got), &got) == 0,
-               "sched_getaffinity(readback)");
+  parity_check(
+      sched_getaffinity(0, sizeof(got), &got) == 0,
+      "sched_getaffinity(readback)");
 
   /* Observe the population count through the mutation seam, then assert on and
    * emit it: "affinity_count" is the load-bearing field. */
-  uint64_t count = parity_mutate_u64("affinity_count", (uint64_t)CPU_COUNT(&got));
+  uint64_t count =
+      parity_mutate_u64("affinity_count", (uint64_t)CPU_COUNT(&got));
   parity_check(count == 1, "affinity is exactly one cpu");
   parity_check(CPU_ISSET(target, &got), "pinned cpu present in mask");
 
-  parity_emit("sched-getaffinity-identity cpu%d=%d count=%llu\n", target,
-              CPU_ISSET(target, &got) ? 1 : 0, (unsigned long long)count);
+  parity_emit(
+      "sched-getaffinity-identity cpu%d=%d count=%llu\n",
+      target,
+      CPU_ISSET(target, &got) ? 1 : 0,
+      (unsigned long long)count);
   return parity_finish();
 }

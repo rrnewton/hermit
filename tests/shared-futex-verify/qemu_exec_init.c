@@ -81,50 +81,62 @@ static long syscall4(long n, long a1, long a2, long a3, long a4) {
   return rax;
 }
 
-static unsigned long slen(const char *s) {
+static unsigned long slen(const char* s) {
   unsigned long n = 0;
-  while (s[n]) ++n;
+  while (s[n])
+    ++n;
   return n;
 }
-static void out(const char *s) { syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, slen(s)); }
-static void outn(const char *s, long n) { syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, n); }
-static void put_dec(char *buf, int *pos, long v) {
+static void out(const char* s) {
+  syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, slen(s));
+}
+static void outn(const char* s, long n) {
+  syscall3(SYS_WRITE, STDOUT_FILENO, (long)s, n);
+}
+static void put_dec(char* buf, int* pos, long v) {
   char tmp[24];
   int t = 0;
   if (v < 0) {
     buf[(*pos)++] = '-';
     v = -v;
   }
-  if (v == 0) tmp[t++] = '0';
+  if (v == 0)
+    tmp[t++] = '0';
   while (v > 0) {
     tmp[t++] = (char)('0' + (v % 10));
     v /= 10;
   }
-  while (t > 0) buf[(*pos)++] = tmp[--t];
+  while (t > 0)
+    buf[(*pos)++] = tmp[--t];
 }
 
 static void power_off(void) {
   syscall0(SYS_SYNC);
   syscall4(SYS_REBOOT, REBOOT_MAGIC1, REBOOT_MAGIC2, REBOOT_CMD_POWER_OFF, 0);
-  for (;;) syscall0(SYS_PAUSE);
+  for (;;)
+    syscall0(SYS_PAUSE);
 }
 
 #ifdef SCENARIO_BUSYBOX
 #ifndef BUSYBOX_SCRIPT
-#define BUSYBOX_SCRIPT "echo QEMU_BUSYBOX_HELLO from $(busybox uname -s); exit 5"
+#define BUSYBOX_SCRIPT \
+  "echo QEMU_BUSYBOX_HELLO from $(busybox uname -s); exit 5"
 #endif
-static const char *g_path = "/bin/busybox";
-static char *const g_argv[] = {(char *)"busybox", (char *)"sh", (char *)"-c",
-                               (char *)BUSYBOX_SCRIPT, 0};
-static const char *g_name = "busybox-sh";
+static const char* g_path = "/bin/busybox";
+static char* const g_argv[] =
+    {(char*)"busybox", (char*)"sh", (char*)"-c", (char*)BUSYBOX_SCRIPT, 0};
+static const char* g_name = "busybox-sh";
 #else
-static const char *g_path = "/hello";
-static char *const g_argv[] = {(char *)"/hello", 0};
-static const char *g_name = "hello";
+static const char* g_path = "/hello";
+static char* const g_argv[] = {(char*)"/hello", 0};
+static const char* g_name = "hello";
 #endif
 
-static char *const g_envp[] = {(char *)"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-                               (char *)"HOME=/", (char *)"TERM=linux", 0};
+static char* const g_envp[] = {
+    (char*)"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+    (char*)"HOME=/",
+    (char*)"TERM=linux",
+    0};
 
 void _start(void) {
   char line[256];
@@ -171,17 +183,21 @@ void _start(void) {
 
   pos = 0;
   {
-    const char *p = "QEMU_USERSPACE_EXIT prog=";
-    for (unsigned long i = 0; p[i]; ++i) line[pos++] = p[i];
+    const char* p = "QEMU_USERSPACE_EXIT prog=";
+    for (unsigned long i = 0; p[i]; ++i)
+      line[pos++] = p[i];
   }
-  for (unsigned long i = 0; g_name[i]; ++i) line[pos++] = g_name[i];
+  for (unsigned long i = 0; g_name[i]; ++i)
+    line[pos++] = g_name[i];
   if (exited) {
-    const char *p = " exited=1 status=";
-    for (unsigned long i = 0; p[i]; ++i) line[pos++] = p[i];
+    const char* p = " exited=1 status=";
+    for (unsigned long i = 0; p[i]; ++i)
+      line[pos++] = p[i];
     put_dec(line, &pos, code);
   } else {
-    const char *p = " exited=0 signal=";
-    for (unsigned long i = 0; p[i]; ++i) line[pos++] = p[i];
+    const char* p = " exited=0 signal=";
+    for (unsigned long i = 0; p[i]; ++i)
+      line[pos++] = p[i];
     put_dec(line, &pos, sig);
   }
   line[pos++] = '\n';

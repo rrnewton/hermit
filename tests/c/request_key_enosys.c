@@ -21,14 +21,21 @@
 
 int main(void) {
   errno = 0;
-  long result = syscall(SYS_request_key, "user", "hermit-missing-key", NULL,
-                        KEY_SPEC_PROCESS_KEYRING);
+  long result = syscall(
+      SYS_request_key,
+      "user",
+      "hermit-missing-key",
+      NULL,
+      KEY_SPEC_PROCESS_KEYRING);
   if (result == -1 && errno == ENOSYS) {
     puts("request_key deterministically unavailable");
     return 0;
   }
 
-  fprintf(stderr, "request_key: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "request_key: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

@@ -41,14 +41,14 @@
 
 #define STREAM_BYTES 256
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
 
 /* Write the whole iovec set, tolerating short writes by advancing past the
  * bytes already sent. */
-static int writev_all(int fd, struct iovec *iov, int iovcnt) {
+static int writev_all(int fd, struct iovec* iov, int iovcnt) {
   while (iovcnt > 0) {
     ssize_t n = writev(fd, iov, iovcnt);
     if (n < 0) {
@@ -63,7 +63,7 @@ static int writev_all(int fd, struct iovec *iov, int iovcnt) {
       --iovcnt;
     }
     if (iovcnt > 0 && n > 0) {
-      iov[0].iov_base = (char *)iov[0].iov_base + n;
+      iov[0].iov_base = (char*)iov[0].iov_base + n;
       iov[0].iov_len -= (size_t)n;
     }
   }
@@ -123,8 +123,8 @@ int main(void) {
       /* The two destination buffers are contiguous in logical order: the
        * first sizeof(dst_a) bytes land in dst_a, the rest in dst_b. */
       uint8_t byte = (i < (ssize_t)sizeof(dst_a))
-                         ? dst_a[i]
-                         : dst_b[i - (ssize_t)sizeof(dst_a)];
+          ? dst_a[i]
+          : dst_b[i - (ssize_t)sizeof(dst_a)];
 #ifdef HERMIT_TEST_VECTORED_IO_CORRUPT_BYTE
       if (bytes == 0)
         byte ^= 1;
@@ -145,10 +145,13 @@ int main(void) {
   printf("vectored_io bytes=%ld checksum=%ld\n", bytes, checksum);
 
   if (bytes != STREAM_BYTES || !stream_matches) {
-    fprintf(stderr,
-            "vectored_io contract mismatch: bytes=%ld (expected %d), "
-            "stream_matches=%d\n",
-            bytes, STREAM_BYTES, stream_matches);
+    fprintf(
+        stderr,
+        "vectored_io contract mismatch: bytes=%ld (expected %d), "
+        "stream_matches=%d\n",
+        bytes,
+        STREAM_BYTES,
+        stream_matches);
     return 1;
   }
   return 0;

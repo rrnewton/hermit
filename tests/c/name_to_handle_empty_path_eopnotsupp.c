@@ -22,7 +22,7 @@ int main(void) {
     return 1;
   }
 
-  struct file_handle *handle = calloc(1, sizeof(*handle) + 128);
+  struct file_handle* handle = calloc(1, sizeof(*handle) + 128);
   if (handle == NULL) {
     int allocation_errno = errno;
     close(fd);
@@ -42,10 +42,13 @@ int main(void) {
     return 1;
   }
   if (result != -1 || call_errno != EOPNOTSUPP) {
-    fprintf(stderr,
-            "AT_EMPTY_PATH name_to_handle_at returned %d with errno %d (%s), "
-            "expected EOPNOTSUPP\n",
-            result, call_errno, strerror(call_errno));
+    fprintf(
+        stderr,
+        "AT_EMPTY_PATH name_to_handle_at returned %d with errno %d (%s), "
+        "expected EOPNOTSUPP\n",
+        result,
+        call_errno,
+        strerror(call_errno));
     return 1;
   }
 

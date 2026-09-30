@@ -44,7 +44,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -61,7 +61,7 @@ static int temp_file(void) {
 }
 
 /* Write exactly n bytes, retrying short writes. */
-static void write_all(int fd, const char *buf, size_t n) {
+static void write_all(int fd, const char* buf, size_t n) {
   size_t done = 0;
   while (done < n) {
     ssize_t w = write(fd, buf + done, n - done);
@@ -166,8 +166,10 @@ int main(void) {
   char appended_bytes[50];
   size_t appended_got = 0;
   while (appended_got < sizeof(appended_bytes)) {
-    ssize_t r = read(dst, appended_bytes + appended_got,
-                     sizeof(appended_bytes) - appended_got);
+    ssize_t r = read(
+        dst,
+        appended_bytes + appended_got,
+        sizeof(appended_bytes) - appended_got);
     if (r < 0) {
       if (errno == EINTR)
         continue;
@@ -181,8 +183,7 @@ int main(void) {
   if (appended_got > 0)
     appended_bytes[0] ^= 1;
 #endif
-  int appended_matches =
-      appended_got == sizeof(appended_bytes) &&
+  int appended_matches = appended_got == sizeof(appended_bytes) &&
       memcmp(appended_bytes, src_bytes, sizeof(appended_bytes)) == 0;
 #ifdef HERMIT_TEST_SENDFILE_BAD_POSITION
   pos--;
@@ -199,16 +200,24 @@ int main(void) {
   if (close(dst) != 0)
     fail("close dst");
 
-  printf("sendfile copied=%zu checksum=%ld pos=%ld own_offset_kept=%d\n", copied,
-         checksum, (long)pos, own_offset_kept);
+  printf(
+      "sendfile copied=%zu checksum=%ld pos=%ld own_offset_kept=%d\n",
+      copied,
+      checksum,
+      (long)pos,
+      own_offset_kept);
 
   if (!destination_matches || !appended_matches || final_size != 306 ||
       pos != 50 || !own_offset_kept) {
-    fprintf(stderr,
-            "sendfile contract mismatch: destination_matches=%d "
-            "appended_matches=%d final_size=%ld pos=%ld own_offset_kept=%d\n",
-            destination_matches, appended_matches, (long)final_size, (long)pos,
-            own_offset_kept);
+    fprintf(
+        stderr,
+        "sendfile contract mismatch: destination_matches=%d "
+        "appended_matches=%d final_size=%ld pos=%ld own_offset_kept=%d\n",
+        destination_matches,
+        appended_matches,
+        (long)final_size,
+        (long)pos,
+        own_offset_kept);
     return 1;
   }
   return 0;

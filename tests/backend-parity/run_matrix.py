@@ -9,13 +9,13 @@ import hashlib
 import json
 import os
 import shlex
-import signal
-from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import NamedTuple
 
 
@@ -192,6 +192,7 @@ def scorecard_fieldnames(actual_header, path):
         )
     return actual, parity_column
 
+
 # `--verify` evidence kinds, ordered weakest to strongest. "gap" means the
 # contract cannot currently be verified on that backend. "guest" means the two
 # runs produced identical stdout+exit but the internal trace is not compared
@@ -267,8 +268,7 @@ DEFAULT_VERIFY_POLICY = VerifyPolicy.checked(
     hermit_flags=("--verify", "--verify-allow", "both"),
     expected_non_kvm_tier="stripped",
     comparison_claim=(
-        "Stripped DETLOG comparison "
-        "(numbers/addresses/paths normalized; NOT bitwise)"
+        "Stripped DETLOG comparison (numbers/addresses/paths normalized; NOT bitwise)"
     ),
 )
 
@@ -336,7 +336,9 @@ def command_in_private_tmp(
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.touch()
         else:
-            raise MatrixError(f"cannot preserve unsupported path beneath /tmp: {source}")
+            raise MatrixError(
+                f"cannot preserve unsupported path beneath /tmp: {source}"
+            )
         mounts.extend((str(resolved_source), str(destination)))
     return [
         "unshare",
@@ -370,7 +372,13 @@ def dbt_private_tmp_command(
             f"{MATRIX_PROXY}, not {command[0]}"
         )
     stage = wrapped[: len(wrapped) - len(command)]
-    return [command[0], MATRIX_PRIVATE_TMP_HANDOFF, str(len(stage)), *stage, *command[1:]]
+    return [
+        command[0],
+        MATRIX_PRIVATE_TMP_HANDOFF,
+        str(len(stage)),
+        *stage,
+        *command[1:],
+    ]
 
 
 def compile_fixture(source: Path, output: Path, *flags: str) -> Path:
@@ -406,11 +414,7 @@ class Fixtures:
 
     def host_tmp(self, backend: str, name: str) -> Path:
         self._host_tmp_sequence += 1
-        path = (
-            self.root
-            / "host-tmp"
-            / f"{backend}-{name}-{self._host_tmp_sequence}"
-        )
+        path = self.root / "host-tmp" / f"{backend}-{name}-{self._host_tmp_sequence}"
         path.mkdir(parents=True)
         return path
 
@@ -978,7 +982,9 @@ def parse_host_capabilities(raw: bytes) -> dict[str, dict[str, object]]:
     try:
         report = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise MatrixError(f"host-capabilities record is not valid JSON: {error}") from error
+        raise MatrixError(
+            f"host-capabilities record is not valid JSON: {error}"
+        ) from error
     if not isinstance(report, dict) or report.get("schema") != 1:
         raise MatrixError("host-capabilities record must use schema 1")
     capabilities = report.get("host_capabilities")
@@ -1159,7 +1165,10 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
         return None
     infrastructure_error = ""
     if record.get("verdict") == "infrastructure_error":
-        if record.get("verified") is not False or record.get("bitwise_parity") is not False:
+        if (
+            record.get("verified") is not False
+            or record.get("bitwise_parity") is not False
+        ):
             print(
                 f"run_matrix: REFUSED infrastructure_error receipt {path}: "
                 "verified and bitwise_parity must both be false",
@@ -1174,7 +1183,11 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
             )
             return None
         count = cause.get("count")
-        if cause.get("kind") != "skid_overshoot" or type(count) is not int or count <= 0:
+        if (
+            cause.get("kind") != "skid_overshoot"
+            or type(count) is not int
+            or count <= 0
+        ):
             print(
                 f"run_matrix: REFUSED infrastructure_error receipt {path}: "
                 f"invalid cause {cause!r}",
@@ -1223,7 +1236,9 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     if record.get("bitwise_parity") and not bitwise:
         why = []
         if record.get("bitwise_parity") is not True:
-            why.append(f"bitwise_parity is {record.get('bitwise_parity')!r}, not a JSON true")
+            why.append(
+                f"bitwise_parity is {record.get('bitwise_parity')!r}, not a JSON true"
+            )
         if record.get("verified") is not True:
             why.append(f"verified is {record.get('verified')!r}")
         if record.get("verdict") != "matched":
@@ -1236,7 +1251,9 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
                 "claimed over a log stream that was not compared"
             )
         if not positive_count:
-            why.append(f"compared counts are {left!r}|{right!r}, not equal positive integers")
+            why.append(
+                f"compared counts are {left!r}|{right!r}, not equal positive integers"
+            )
         print(
             f"run_matrix: REFUSED the bitwise tier for {path}: the record claims "
             f"bitwise_parity but {'; '.join(why)}.",
@@ -1374,7 +1391,9 @@ def run_case(
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     if host_capabilities is None:
-        raise MatrixError("run_case requires the producer-owned host-capabilities record")
+        raise MatrixError(
+            "run_case requires the producer-owned host-capabilities record"
+        )
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     reference_guest = [*guest]
     if evidence is not None:
@@ -1443,7 +1462,9 @@ def run_case(
             return "FAIL", reference_problem, time.monotonic() - started
     ptrace_random = (
         root_random_output(reference_stdout)
-        if backend == "dbt" and name == "random_sources" and reference_stdout is not None
+        if backend == "dbt"
+        and name == "random_sources"
+        and reference_stdout is not None
         else None
     )
     for iteration in range(RUNS):
@@ -1588,9 +1609,7 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
                 f"{', '.join(missing)}; refusing to write a partial "
                 f"{path} -- {len(results)} row(s) would have been lost"
             )
-        unexpected = sorted(
-            set(row) - set(RESULT_COLUMNS) - NON_COLUMN_RESULT_KEYS
-        )
+        unexpected = sorted(set(row) - set(RESULT_COLUMNS) - NON_COLUMN_RESULT_KEYS)
         if unexpected:
             raise MatrixError(
                 f"result row {index} ({row['backend']}/{row['test_name']}) "
@@ -1637,8 +1656,7 @@ def write_structured_test_results(
     rows = [
         {
             "id": (
-                f"backend-parity/{result['test_name']} "
-                f"[{result['backend']}/{mode}]"
+                f"backend-parity/{result['test_name']} [{result['backend']}/{mode}]"
             ),
             "result": "pass" if result["result"] in {"PASS", "XPASS"} else "fail",
             "attempts": 1,
@@ -1719,6 +1737,7 @@ def is_tracked_current_scorecard(path: Path, compat_dir: Path | None) -> bool:
     shape is itself sufficient.  A discovered parent remains the stronger
     identity check and also covers a symlinked spelling of the directory.
     """
+
     def has_current_shape(candidate: Path) -> bool:
         return (
             candidate.name == "scorecard.csv"
@@ -1926,8 +1945,7 @@ def record_parent_observations(
     if not explicit and compat_dir is not None:
         print(
             "TRACKING: per-run artifact only; current scorecard unchanged. "
-            "After review, publish with:\n  "
-            + fold_in_command(compat_dir, destination)
+            "After review, publish with:\n  " + fold_in_command(compat_dir, destination)
         )
     return destination
 
@@ -2027,9 +2045,7 @@ def main() -> int:
         verified = baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
         tier_counts = {"stripped": 0, "guest": 0, "bitwise": 0}
         tier = (
-            "guest"
-            if backend == "kvm"
-            else DEFAULT_VERIFY_POLICY.expected_non_kvm_tier
+            "guest" if backend == "kvm" else DEFAULT_VERIFY_POLICY.expected_non_kvm_tier
         )
         tier_counts[tier] = verified
         print(

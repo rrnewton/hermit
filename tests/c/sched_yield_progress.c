@@ -39,7 +39,8 @@ static atomic_ullong g_value = 0;
 static void* worker(void* arg) {
   (void)arg;
   /* A bit of real work so the worker cannot complete in the same turn it is
-   * created; this widens the window in which the main thread would starve it. */
+   * created; this widens the window in which the main thread would starve it.
+   */
   unsigned long long acc = 0;
   for (unsigned long long i = 0; i < 2000000ULL; i++) {
     acc += i;
@@ -66,7 +67,8 @@ static int run_progress(void) {
     return 3;
   }
 
-  unsigned long long value = atomic_load_explicit(&g_value, memory_order_seq_cst);
+  unsigned long long value =
+      atomic_load_explicit(&g_value, memory_order_seq_cst);
   printf("sched-yield-progress-ok %llu\n", value);
   return 0;
 }

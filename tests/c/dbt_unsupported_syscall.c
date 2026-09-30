@@ -7,7 +7,8 @@
  */
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review unsupported policy across root, fork, and exec.
+// TODO-HUMAN-REVIEW(PR-644): Review unsupported policy across root, fork, and
+// exec.
 
 #define _GNU_SOURCE
 #include <stddef.h>
@@ -25,7 +26,7 @@
 // the fixture also covers a classified call before returning.
 static int call_unsupported(void) {
   (void)syscall(SYS_restart_syscall);
-  void *robust_head = NULL;
+  void* robust_head = NULL;
   size_t robust_len = 0;
   if (syscall(SYS_get_robust_list, 0, &robust_head, &robust_len) < 0) {
     perror("get_robust_list");
@@ -34,7 +35,7 @@ static int call_unsupported(void) {
   return 0;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "replay-control") == 0) {
     puts("dbt-supported-replay-control");
     return 0;
@@ -49,8 +50,8 @@ int main(int argc, char **argv) {
   }
 
   if (argc == 2 && strcmp(argv[1], "exec-empty") == 0) {
-    char *next_argv[] = {argv[0], "after-exec", NULL};
-    char *next_env[] = {NULL};
+    char* next_argv[] = {argv[0], "after-exec", NULL};
+    char* next_env[] = {NULL};
     execve(argv[0], next_argv, next_env);
     perror("execve");
     return 1;
@@ -72,8 +73,9 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (argc == 2 && (strcmp(argv[1], "fork") == 0 ||
-                    strcmp(argv[1], "fork-report-tamper") == 0)) {
+  if (argc == 2 &&
+      (strcmp(argv[1], "fork") == 0 ||
+       strcmp(argv[1], "fork-report-tamper") == 0)) {
     pid_t child = fork();
     if (child < 0) {
       perror("fork");
@@ -101,8 +103,9 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (argc == 2 && (strcmp(argv[1], "fork-exec") == 0 ||
-                    strcmp(argv[1], "fork-setsid-exec") == 0)) {
+  if (argc == 2 &&
+      (strcmp(argv[1], "fork-exec") == 0 ||
+       strcmp(argv[1], "fork-setsid-exec") == 0)) {
     pid_t child = fork();
     if (child < 0) {
       perror("fork");
@@ -118,8 +121,8 @@ int main(int argc, char **argv) {
         perror("setsid");
       }
 
-      char *next_argv[] = {argv[0], "after-exec", NULL};
-      char *next_env[] = {NULL};
+      char* next_argv[] = {argv[0], "after-exec", NULL};
+      char* next_env[] = {NULL};
       execve(argv[0], next_argv, next_env);
       perror("execve");
       _exit(127);

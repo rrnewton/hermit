@@ -16,7 +16,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static void require_zero(long result, const char *name) {
+static void require_zero(long result, const char* name) {
   if (result != 0) {
     perror(name);
     exit(1);
@@ -26,7 +26,7 @@ static void require_zero(long result, const char *name) {
 /* A path that a rename or unlink should have removed must be GONE, and gone for
  * the right reason: `stat` failing for any other errno is not evidence of
  * removal. */
-static void require_absent(const char *path, const char *name) {
+static void require_absent(const char* path, const char* name) {
   struct stat gone;
   errno = 0;
   if (stat(path, &gone) == 0) {
@@ -50,14 +50,17 @@ static void require_absent(const char *path, const char *name) {
  * and the region `truncate` grew must read as zeros, which is the behaviour
  * POSIX requires of a file extended by truncation.
  */
-static void require_content(const char *path, const char *payload,
-                            size_t payload_len, size_t expected_size) {
+static void require_content(
+    const char* path,
+    const char* payload,
+    size_t payload_len,
+    size_t expected_size) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) {
     perror("open for readback");
     exit(1);
   }
-  char *buffer = calloc(1, expected_size + 1);
+  char* buffer = calloc(1, expected_size + 1);
   if (buffer == NULL) {
     fprintf(stderr, "readback: out of memory\n");
     exit(1);
@@ -76,21 +79,34 @@ static void require_content(const char *path, const char *payload,
   }
   require_zero(close(fd), "close after readback");
   if (got != expected_size) {
-    fprintf(stderr, "readback %s: read %zu bytes, want %zu\n", path, got,
-            expected_size);
+    fprintf(
+        stderr,
+        "readback %s: read %zu bytes, want %zu\n",
+        path,
+        got,
+        expected_size);
     exit(1);
   }
   if (memcmp(buffer, payload, payload_len) != 0) {
-    fprintf(stderr, "readback %s: payload mismatch, got \"%.*s\" want \"%.*s\"\n",
-            path, (int)payload_len, buffer, (int)payload_len, payload);
+    fprintf(
+        stderr,
+        "readback %s: payload mismatch, got \"%.*s\" want \"%.*s\"\n",
+        path,
+        (int)payload_len,
+        buffer,
+        (int)payload_len,
+        payload);
     exit(1);
   }
   for (size_t at = payload_len; at < expected_size; ++at) {
     if (buffer[at] != 0) {
-      fprintf(stderr,
-              "readback %s: byte %zu is 0x%02x, want 0 (truncate must extend "
-              "with zeros)\n",
-              path, at, (unsigned char)buffer[at]);
+      fprintf(
+          stderr,
+          "readback %s: byte %zu is 0x%02x, want 0 (truncate must extend "
+          "with zeros)\n",
+          path,
+          at,
+          (unsigned char)buffer[at]);
       exit(1);
     }
   }
@@ -137,8 +153,9 @@ int main(void) {
 
   require_zero(syscall(SYS_rename, original, renamed), "rename");
   require_absent(original, "after rename");
-  require_zero(syscall(SYS_renameat, AT_FDCWD, renamed, AT_FDCWD, renamed_at),
-               "renameat");
+  require_zero(
+      syscall(SYS_renameat, AT_FDCWD, renamed, AT_FDCWD, renamed_at),
+      "renameat");
   require_absent(renamed, "after renameat");
 
   /* The point of doing this HERE: the bytes must have survived both renames,
@@ -149,8 +166,8 @@ int main(void) {
   require_zero(symlinkat(renamed_at, AT_FDCWD, link_path), "symlinkat");
 
   char target[128] = {0};
-  long length = syscall(SYS_readlinkat, AT_FDCWD, link_path, target,
-                        sizeof(target) - 1);
+  long length =
+      syscall(SYS_readlinkat, AT_FDCWD, link_path, target, sizeof(target) - 1);
   if (length < 0) {
     perror("readlinkat");
     return 1;

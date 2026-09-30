@@ -35,8 +35,8 @@ fn fnv1a(s: &str) -> u64 {
 
 fn main() {
     let words = [
-        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
-        "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi",
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        "lambda", "mu", "nu", "xi", "omicron", "pi",
     ];
 
     // HashSet iteration order is RandomState-seed sensitive.
@@ -59,8 +59,7 @@ fn main() {
 
     // BTreeMap is canonically ordered: a stable cross-check independent of
     // hashing, so its output is identical natively and under Hermit.
-    let btree: BTreeMap<&str, usize> =
-        words.iter().enumerate().map(|(i, w)| (*w, i)).collect();
+    let btree: BTreeMap<&str, usize> = words.iter().enumerate().map(|(i, w)| (*w, i)).collect();
     let btree_order = btree
         .iter()
         .map(|(k, v)| format!("{}:{}", k, v))

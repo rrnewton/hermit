@@ -22,8 +22,9 @@ int main(void) {
   int sockets[2];
   int enabled = 1;
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0 ||
-      setsockopt(sockets[1], SOL_SOCKET, SO_TIMESTAMPNS, &enabled,
-                 sizeof(enabled)) != 0 ||
+      setsockopt(
+          sockets[1], SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) !=
+          0 ||
       send(sockets[0], "x", 1, 0) != 1) {
     perror("setup");
     return 1;
@@ -42,7 +43,7 @@ int main(void) {
     perror("recvmsg");
     return 2;
   }
-  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
   if (header == NULL || header->cmsg_level != SOL_SOCKET ||
       header->cmsg_type != SO_TIMESTAMPNS ||
       header->cmsg_len < CMSG_LEN(sizeof(struct timespec))) {
@@ -61,11 +62,14 @@ int main(void) {
       observed_now.tv_sec - value.tv_sec > 1 ||
       (value.tv_sec == observed_now.tv_sec &&
        value.tv_nsec > observed_now.tv_nsec)) {
-    fprintf(stderr,
-            "SCM_TIMESTAMPNS escaped logical time: timestamp=%ld.%09ld "
-            "now=%ld.%09ld\n",
-            (long)value.tv_sec, value.tv_nsec, (long)observed_now.tv_sec,
-            observed_now.tv_nsec);
+    fprintf(
+        stderr,
+        "SCM_TIMESTAMPNS escaped logical time: timestamp=%ld.%09ld "
+        "now=%ld.%09ld\n",
+        (long)value.tv_sec,
+        value.tv_nsec,
+        (long)observed_now.tv_sec,
+        observed_now.tv_nsec);
     return 5;
   }
   puts("timestampns=ok");

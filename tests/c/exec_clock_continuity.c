@@ -55,7 +55,8 @@ static int read_clock_nanos(uint64_t* out) {
  * value for every sample and is rejected here; checking only the first sample
  * would accept it.
  */
-static int sample_trajectory(const char* phase, uint64_t* first, uint64_t* last) {
+static int
+sample_trajectory(const char* phase, uint64_t* first, uint64_t* last) {
   uint64_t previous = 0;
   int advanced = 0;
 

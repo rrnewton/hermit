@@ -1195,7 +1195,7 @@ test:
         ci:
           ptrace: false
         ci_disabled_reason:
-          ptrace: {"result": "unavailable", "evidence": "tests/c/dbt_unsupported_syscall.c:21", "reason": "This fixture intentionally invokes restart_syscall, which strict ptrace execution rejects as Unsupported and fails closed; the cell needs an expected-refusal contract or syscall support before it can be required validation."}
+          ptrace: {"result": "unavailable", "evidence": "tests/c/dbt_unsupported_syscall.c:22", "reason": "This fixture intentionally invokes restart_syscall, which strict ptrace execution rejects as Unsupported and fails closed; the cell needs an expected-refusal contract or syscall support before it can be required validation."}
         backends_enabled:
           - ptrace
         backends_disabled:

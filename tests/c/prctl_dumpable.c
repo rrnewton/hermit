@@ -38,8 +38,8 @@ int main(void) {
 
   errno = 0;
   if (prctl(PR_SET_DUMPABLE, 2) != -1 || errno != EINVAL) {
-    fprintf(stderr, "invalid dumpable value: result/errno mismatch (%d)\n",
-            errno);
+    fprintf(
+        stderr, "invalid dumpable value: result/errno mismatch (%d)\n", errno);
     return 4;
   }
   puts("dumpable=1->0->1 invalid=EINVAL");

@@ -12,11 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-static long read_kb(const char *wanted) {
-  FILE *file = fopen("/proc/meminfo", "r");
+static long read_kb(const char* wanted) {
+  FILE* file = fopen("/proc/meminfo", "r");
   if (file == NULL)
     return -1;
-  char *line = NULL;
+  char* line = NULL;
   size_t capacity = 0;
   long value = -1;
   while (getline(&line, &capacity, file) >= 0) {
@@ -33,8 +33,8 @@ int main(void) {
   long total = read_kb("MemTotal:");
   long cached = read_kb("Cached:");
   if (total != 976562 || cached != 0) {
-    fprintf(stderr, "MemTotal=%ld Cached=%ld, expected 976562/0\n", total,
-            cached);
+    fprintf(
+        stderr, "MemTotal=%ld Cached=%ld, expected 976562/0\n", total, cached);
     return 1;
   }
   puts("Cached is deterministic");

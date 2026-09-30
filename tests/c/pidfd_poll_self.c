@@ -24,8 +24,11 @@ int main(void) {
   struct pollfd item = {.fd = fd, .events = POLLIN};
   int result = poll(&item, 1, 0);
   if (result != 0 || item.revents != 0) {
-    fprintf(stderr, "live self pidfd was ready: result=%d revents=%d\n",
-            result, item.revents);
+    fprintf(
+        stderr,
+        "live self pidfd was ready: result=%d revents=%d\n",
+        result,
+        item.revents);
     close(fd);
     return 1;
   }

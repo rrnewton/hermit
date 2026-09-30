@@ -11,16 +11,17 @@
  * deterministic and independent of host process state.
  *
  * The guest installs and queries signal handlers (rt_sigaction) and the blocked
- * signal mask (rt_sigprocmask) and reads back exactly what it set. Every checked
- * value depends only on the program's own prior calls, not on the host's
- * inherited disposition or mask, so the observable result is byte-identical
- * across repeated runs and across the ptrace, DBT, and KVM backends.
+ * signal mask (rt_sigprocmask) and reads back exactly what it set. Every
+ * checked value depends only on the program's own prior calls, not on the
+ * host's inherited disposition or mask, so the observable result is
+ * byte-identical across repeated runs and across the ptrace, DBT, and KVM
+ * backends.
  *
  * This is deliberately pure signal *state*: no signal is ever raised or
  * delivered, so it exercises no handler frame, no cross-thread delivery, and no
  * scheduler wakeup. It uses a single thread and no blocking I/O, so it is safe
- * under the DBT no-preemption scheduler. It also avoids rt_sigpending, which the
- * KVM ElfExecutor personality does not implement.
+ * under the DBT no-preemption scheduler. It also avoids rt_sigpending, which
+ * the KVM ElfExecutor personality does not implement.
  *
  * Feature-test macros come from the compiler flags (-D_GNU_SOURCE); do not
  * redefine them here or -Werror rejects the redefinition.
@@ -36,7 +37,7 @@ static void handler(int signo) {
   unused_marker = signo;
 }
 
-static int fail(const char *what) {
+static int fail(const char* what) {
   fprintf(stderr, "signal-disposition: %s failed: %s\n", what, strerror(errno));
   return 1;
 }
@@ -83,7 +84,8 @@ int main(void) {
     return 1;
   }
 
-  /* Blocked-mask round-trip: block SIGUSR2, confirm, then unblock and confirm. */
+  /* Blocked-mask round-trip: block SIGUSR2, confirm, then unblock and confirm.
+   */
   sigset_t block, current;
   sigemptyset(&block);
   sigaddset(&block, SIGUSR2);

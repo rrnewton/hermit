@@ -17,7 +17,8 @@ int main(void) {
     }
 
     int status = 0;
-    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
       fprintf(stderr, "child at depth %d failed: status=%d\n", depth, status);
       return 1;
     }

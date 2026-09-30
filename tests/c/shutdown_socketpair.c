@@ -31,41 +31,41 @@
 #include <unistd.h>
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 5 };
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        printf("shutdown ok=0 [stream socketpair fail]\n");
-        return 1;
-    }
+  enum { EXPECTED_CHECKS = 5 };
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    printf("shutdown ok=0 [stream socketpair fail]\n");
+    return 1;
+  }
 
-    int shut_rd = shutdown(sv[0], SHUT_RD) == 0;      // (1) half-close read side.
-    int shut_wr = shutdown(sv[0], SHUT_WR) == 0;      // (2) half-close write side.
-    int shut_rdwr = shutdown(sv[1], SHUT_RDWR) == 0;  // (3) full-close other end.
-    close(sv[0]);
-    close(sv[1]);
+  int shut_rd = shutdown(sv[0], SHUT_RD) == 0; // (1) half-close read side.
+  int shut_wr = shutdown(sv[0], SHUT_WR) == 0; // (2) half-close write side.
+  int shut_rdwr = shutdown(sv[1], SHUT_RDWR) == 0; // (3) full-close other end.
+  close(sv[0]);
+  close(sv[1]);
 
-    int dv[2];
-    int dgram_pair = socketpair(AF_UNIX, SOCK_DGRAM, 0, dv) == 0;
-    int shut_dgram = 0;
-    if (dgram_pair) {
-        shut_dgram = shutdown(dv[0], SHUT_RDWR) == 0;  // (4) datagram endpoint.
-        close(dv[0]);
-        close(dv[1]);
-    }
+  int dv[2];
+  int dgram_pair = socketpair(AF_UNIX, SOCK_DGRAM, 0, dv) == 0;
+  int shut_dgram = 0;
+  if (dgram_pair) {
+    shut_dgram = shutdown(dv[0], SHUT_RDWR) == 0; // (4) datagram endpoint.
+    close(dv[0]);
+    close(dv[1]);
+  }
 
-    // (5) shutdown on an invalid descriptor fails deterministically with EBADF.
-    int ebadf = shutdown(-1, SHUT_RDWR) == -1 && errno == EBADF;
+  // (5) shutdown on an invalid descriptor fails deterministically with EBADF.
+  int ebadf = shutdown(-1, SHUT_RDWR) == -1 && errno == EBADF;
 
-    int ok = shut_rd + shut_wr + shut_rdwr + shut_dgram + ebadf;
-    printf(
-        "shutdown ok=%d shut_rd=%d shut_wr=%d shut_rdwr=%d dgram_pair=%d "
-        "shut_dgram=%d ebadf=%d\n",
-        ok,
-        shut_rd,
-        shut_wr,
-        shut_rdwr,
-        dgram_pair,
-        shut_dgram,
-        ebadf);
-    return ok == EXPECTED_CHECKS ? 0 : 1;
+  int ok = shut_rd + shut_wr + shut_rdwr + shut_dgram + ebadf;
+  printf(
+      "shutdown ok=%d shut_rd=%d shut_wr=%d shut_rdwr=%d dgram_pair=%d "
+      "shut_dgram=%d ebadf=%d\n",
+      ok,
+      shut_rd,
+      shut_wr,
+      shut_rdwr,
+      dgram_pair,
+      shut_dgram,
+      ebadf);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }

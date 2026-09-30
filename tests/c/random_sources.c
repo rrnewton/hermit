@@ -7,8 +7,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -52,8 +52,8 @@ static int fill_raw_getrandom(uint8_t buffer[BYTES]) {
 static int check_getrandom_flags(void) {
   /*
    * Check Linux syscall semantics directly. glibc 2.42 may satisfy getrandom
-   * through __vdso_getrandom, whose return behavior can differ from the syscall.
-   * Normal libc sampling and explicit vDSO coverage remain below.
+   * through __vdso_getrandom, whose return behavior can differ from the
+   * syscall. Normal libc sampling and explicit vDSO coverage remain below.
    */
   static const unsigned int valid_flags[] = {
       GRND_NONBLOCK,
@@ -82,16 +82,16 @@ static int check_getrandom_flags(void) {
   }
 
   errno = 0;
-  if (raw_getrandom(
-          buffer, sizeof(buffer), (1ULL << 32) | 0x80000000ULL) != -1 ||
+  if (raw_getrandom(buffer, sizeof(buffer), (1ULL << 32) | 0x80000000ULL) !=
+          -1 ||
       errno != EINVAL) {
     return -1;
   }
 
 #ifdef GRND_INSECURE
   errno = 0;
-  if (raw_getrandom(buffer, sizeof(buffer),
-                    GRND_RANDOM | GRND_INSECURE) != -1 ||
+  if (raw_getrandom(buffer, sizeof(buffer), GRND_RANDOM | GRND_INSECURE) !=
+          -1 ||
       errno != EINVAL) {
     return -1;
   }
@@ -108,8 +108,7 @@ static int check_getrandom_flags(void) {
 
 static int check_getrandom_faults(void) {
   errno = 0;
-  if (syscall(SYS_getrandom, (void*)1, SIZE_MAX, 0) != -1 ||
-      errno != EFAULT) {
+  if (syscall(SYS_getrandom, (void*)1, SIZE_MAX, 0) != -1 || errno != EFAULT) {
     return -1;
   }
 
@@ -118,9 +117,13 @@ static int check_getrandom_faults(void) {
     return -1;
   }
   size_t page = (size_t)page_size;
-  uint8_t* mapping =
-      mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
-           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  uint8_t* mapping = mmap(
+      NULL,
+      page * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (mapping == MAP_FAILED) {
     return -1;
   }
@@ -130,11 +133,9 @@ static int check_getrandom_faults(void) {
   }
 
   long result = syscall(SYS_getrandom, mapping + page - 8, 16, 0);
-  long later_chunk_result =
-      syscall(SYS_getrandom, mapping, page + 8, 0);
+  long later_chunk_result = syscall(SYS_getrandom, mapping, page + 8, 0);
   int unmap_result = munmap(mapping, page * 2);
-  if (result != 8 || later_chunk_result != (long)page ||
-      unmap_result != 0) {
+  if (result != 8 || later_chunk_result != (long)page || unmap_result != 0) {
     return -1;
   }
 
@@ -179,8 +180,8 @@ static int fill_device(const char* path, uint8_t buffer[BYTES]) {
 #define MAP_DROPPABLE 0x08
 #endif
 
-typedef ssize_t (*vdso_getrandom_fn)(void*, size_t, unsigned int, void*,
-                                     size_t);
+typedef ssize_t (
+    *vdso_getrandom_fn)(void*, size_t, unsigned int, void*, size_t);
 
 /* Filled by the kernel on the query call; layout from the vDSO contract. */
 struct vdso_getrandom_params {
@@ -252,21 +253,26 @@ static int fill_vdso_getrandom(uint8_t samples[SAMPLES][BYTES]) {
     return 0;
   }
   size_t state_size = params.size_of_opaque_state != 0
-                          ? (size_t)params.size_of_opaque_state
-                          : (size_t)query;
+      ? (size_t)params.size_of_opaque_state
+      : (size_t)query;
   if (state_size == 0) {
     return 0;
   }
-  int prot = params.mmap_prot != 0 ? (int)params.mmap_prot
-                                   : (PROT_READ | PROT_WRITE);
+  int prot =
+      params.mmap_prot != 0 ? (int)params.mmap_prot : (PROT_READ | PROT_WRITE);
   int flags = params.mmap_flags != 0
-                  ? (int)params.mmap_flags | MAP_PRIVATE | MAP_ANONYMOUS
-                  : (MAP_DROPPABLE | MAP_PRIVATE | MAP_ANONYMOUS);
+      ? (int)params.mmap_flags | MAP_PRIVATE | MAP_ANONYMOUS
+      : (MAP_DROPPABLE | MAP_PRIVATE | MAP_ANONYMOUS);
   void* state = mmap(NULL, state_size, prot, flags, -1, 0);
   if (state == MAP_FAILED) {
     /* MAP_DROPPABLE is not universal; a plain private mapping works too. */
-    state = mmap(NULL, state_size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    state = mmap(
+        NULL,
+        state_size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0);
     if (state == MAP_FAILED) {
       return -1;
     }
@@ -289,9 +295,8 @@ static int fill_vdso_getrandom(uint8_t samples[SAMPLES][BYTES]) {
   return 1;
 }
 
-static void print_bytes(const char* source,
-                        int index,
-                        const uint8_t buffer[BYTES]) {
+static void
+print_bytes(const char* source, int index, const uint8_t buffer[BYTES]) {
   printf("%s[%d]=", source, index);
   for (int byte = 0; byte < BYTES; byte++) {
     printf("%02x", buffer[byte]);
@@ -353,8 +358,9 @@ int main(int argc, char** argv) {
 
   if (!root_only) {
     for (int thread = 0; thread < THREADS; thread++) {
-      if (pthread_create(&threads[thread], NULL, thread_main,
-                         &thread_results[thread]) != 0) {
+      if (pthread_create(
+              &threads[thread], NULL, thread_main, &thread_results[thread]) !=
+          0) {
         return 3;
       }
     }
@@ -364,9 +370,10 @@ int main(int argc, char** argv) {
         return 4;
       }
       for (int previous = 0; previous < thread; previous++) {
-        if (memcmp(&thread_results[thread].sample,
-                   &thread_results[previous].sample,
-                   sizeof(struct sample)) == 0) {
+        if (memcmp(
+                &thread_results[thread].sample,
+                &thread_results[previous].sample,
+                sizeof(struct sample)) == 0) {
           return 5;
         }
       }
@@ -387,10 +394,14 @@ int main(int argc, char** argv) {
   }
   if (!root_only) {
     for (int thread = 0; thread < THREADS; thread++) {
-      print_bytes("thread-getrandom", thread,
-                  thread_results[thread].sample.getrandom_bytes);
-      print_bytes("thread-urandom", thread,
-                  thread_results[thread].sample.urandom_bytes);
+      print_bytes(
+          "thread-getrandom",
+          thread,
+          thread_results[thread].sample.getrandom_bytes);
+      print_bytes(
+          "thread-urandom",
+          thread,
+          thread_results[thread].sample.urandom_bytes);
     }
   }
   return 0;

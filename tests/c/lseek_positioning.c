@@ -19,8 +19,8 @@
  *   - SEEK_CUR adds a signed delta to the current offset.
  *   - SEEK_END adds a signed delta to the file size, so it can report the size
  *     (delta 0) or address the last byte (delta -1).
- *   - Seeking past end-of-file and writing leaves a zero-filled hole between the
- *     old end and the new data; the file size grows to cover the written range.
+ *   - Seeking past end-of-file and writing leaves a zero-filled hole between
+ * the old end and the new data; the file size grows to cover the written range.
  *
  * The sequence over the initial contents "0123456789" (size 10) is:
  *   lseek(0, SEEK_END)  -> 10   (size via seek)
@@ -37,8 +37,8 @@
  *
  *   lseek_positioning size=16 checksum=702 ok=11
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -50,13 +50,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
 
 /* Read exactly n bytes at the current offset into buf (advances the offset). */
-static void read_exact(int fd, char *buf, size_t n) {
+static void read_exact(int fd, char* buf, size_t n) {
   size_t got = 0;
   while (got < n) {
     ssize_t r = read(fd, buf + got, n - got);
@@ -72,7 +72,7 @@ static void read_exact(int fd, char *buf, size_t n) {
 }
 
 /* Read exactly n bytes at absolute offset off into buf (offset-independent). */
-static void pread_exact(int fd, char *buf, size_t n, off_t off) {
+static void pread_exact(int fd, char* buf, size_t n, off_t off) {
   size_t got = 0;
   while (got < n) {
     ssize_t r = pread(fd, buf + got, n - got, off + (off_t)got);
@@ -88,7 +88,7 @@ static void pread_exact(int fd, char *buf, size_t n, off_t off) {
 }
 
 /* Return 1 if buf[from..to) are all zero. */
-static int all_zero(const char *buf, size_t from, size_t to) {
+static int all_zero(const char* buf, size_t from, size_t to) {
   for (size_t i = from; i < to; i++)
     if (buf[i] != 0)
       return 0;
@@ -161,7 +161,10 @@ int main(void) {
   if (close(fd) != 0)
     fail("close");
 
-  printf("lseek_positioning size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
-         checksum, ok);
+  printf(
+      "lseek_positioning size=%ld checksum=%ld ok=%d\n",
+      (long)st.st_size,
+      checksum,
+      ok);
   return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

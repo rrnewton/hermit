@@ -208,7 +208,11 @@ fn format_row(id: &str, verdict: Verdict, got: &[String], expected: usize) -> St
         verdict.label(),
         got.len(),
         expected,
-        if got.is_empty() { "no rows".to_string() } else { got.join(",") }
+        if got.is_empty() {
+            "no rows".to_string()
+        } else {
+            got.join(",")
+        }
     )
 }
 
@@ -253,9 +257,9 @@ impl Repro {
     fn guidance(self, category: &str) -> String {
         match self {
             Repro::Standalone => "bisect with --test (cheap probe is faithful)".to_string(),
-            Repro::SuiteOnly => format!(
-                "⚠️ bisect with --category {category}; a --test probe finds NOTHING here"
-            ),
+            Repro::SuiteOnly => {
+                format!("⚠️ bisect with --category {category}; a --test probe finds NOTHING here")
+            }
             Repro::AloneOnly => {
                 "⚠️ DO NOT BISECT YET: fails alone but passes in category, so the probe is \
                  measuring something the node does not"
@@ -348,8 +352,7 @@ fn round_outcome(
         .filter(|id| verdicts_at_boundary.get(*id) == Some(&Verdict::Fail))
         .cloned()
         .collect();
-    let still_pending: BTreeSet<String> =
-        pending.difference(&culprits).cloned().collect();
+    let still_pending: BTreeSet<String> = pending.difference(&culprits).cloned().collect();
     (culprits, still_pending)
 }
 
@@ -385,7 +388,9 @@ fn midpoint_any_fail(
     if !unmeasured.is_empty() {
         return Err(unmeasured);
     }
-    Ok(pending.iter().any(|id| verdicts.get(id) == Some(&Verdict::Fail)))
+    Ok(pending
+        .iter()
+        .any(|id| verdicts.get(id) == Some(&Verdict::Fail)))
 }
 
 /// Name every pending id whose measured result changed between the boundary
@@ -459,7 +464,9 @@ fn enumerate(root: &Path, harness: &Path, lane: &str, ids: &BTreeSet<String>) ->
     let text = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| fail(&format!("could not parse plan output as JSON: {e}")));
-    let rows = parsed.as_array().unwrap_or_else(|| fail("plan output was not a JSON array"));
+    let rows = parsed
+        .as_array()
+        .unwrap_or_else(|| fail("plan output was not a JSON array"));
 
     let mut counts: BTreeMap<String, usize> = ids.iter().map(|id| (id.clone(), 0)).collect();
     let mut category_of: BTreeMap<String, String> = BTreeMap::new();
@@ -487,7 +494,11 @@ fn enumerate(root: &Path, harness: &Path, lane: &str, ids: &BTreeSet<String>) ->
             }
         }
     }
-    Plan { counts, category_of, category_size }
+    Plan {
+        counts,
+        category_of,
+        category_size,
+    }
 }
 
 /// Remove the previous result before asking `test-harness` to append new rows.
@@ -544,7 +555,16 @@ fn run_selection(
     }
     let status = Command::new(harness)
         .current_dir(root)
-        .args(["run", "--lane", lane, select_flag, select_value, "--prebuilt", "--jobs", jobs])
+        .args([
+            "run",
+            "--lane",
+            lane,
+            select_flag,
+            select_value,
+            "--prebuilt",
+            "--jobs",
+            jobs,
+        ])
         .arg("--results")
         .arg(&results)
         .stdout(std::process::Stdio::null())
@@ -595,8 +615,16 @@ fn repro_check(
         let unknown = String::from("<unknown>");
         let category = categories.get(id).unwrap_or(&unknown).clone();
 
-        let alone_out =
-            run_selection(root, harness, lane, jobs, "--test", id, &BTreeSet::from([id.clone()]), "alone");
+        let alone_out = run_selection(
+            root,
+            harness,
+            lane,
+            jobs,
+            "--test",
+            id,
+            &BTreeSet::from([id.clone()]),
+            "alone",
+        );
         let (_, alone, _, _) = report_row(id, counts, &alone_out);
 
         // The whole category, exactly as the node runs it, then read back only this
@@ -667,7 +695,10 @@ fn repro_check(
 /// the guard off silently, which is the failure this whole function exists to stop.
 fn is_primary_checkout(root: &Path) -> bool {
     let dir = git(root, &["rev-parse", "--absolute-git-dir"]);
-    let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let common = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
     match (dir, common) {
         (Ok(dir), Ok(common)) => git_dirs_are_primary(&dir, &common),
         _ => true,
@@ -795,8 +826,20 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 /// parents would offer commits that were never a state of `main` and can neither be
 /// built nor blamed.
 fn commit_range(root: &Path, good: &str, bad: &str) -> Result<Vec<String>, String> {
-    let text = git(root, &["rev-list", "--first-parent", "--reverse", &format!("{good}..{bad}")])?;
-    Ok(text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+    let text = git(
+        root,
+        &[
+            "rev-list",
+            "--first-parent",
+            "--reverse",
+            &format!("{good}..{bad}"),
+        ],
+    )?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Check out one commit, run the build, and probe every pending id there.
@@ -891,7 +934,14 @@ fn bisect(
         eprintln!("bisect-probe: cannot check out bad={bad}: {e}");
         return RC_UNUSABLE;
     }
-    if !Command::new("sh").current_dir(root).arg("-c").arg(build).status().map(|s| s.success()).unwrap_or(false) {
+    if !Command::new("sh")
+        .current_dir(root)
+        .arg("-c")
+        .arg(build)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
         eprintln!("bisect-probe: build FAILED at bad={bad}; nothing can be established");
         return RC_UNUSABLE;
     }
@@ -903,12 +953,34 @@ fn bisect(
     for id in ids {
         let unknown = String::from("<unknown>");
         let cat = bad_plan.category_of.get(id).unwrap_or(&unknown);
-        let alone = run_selection(root, harness, lane, jobs, "--test", id, &BTreeSet::from([id.clone()]), "alone");
+        let alone = run_selection(
+            root,
+            harness,
+            lane,
+            jobs,
+            "--test",
+            id,
+            &BTreeSet::from([id.clone()]),
+            "alone",
+        );
         let (_, a, _, _) = report_row(id, &bad_plan.counts, &alone);
-        let incat = run_selection(root, harness, lane, jobs, "--category", cat, &BTreeSet::from([id.clone()]), "incat");
+        let incat = run_selection(
+            root,
+            harness,
+            lane,
+            jobs,
+            "--category",
+            cat,
+            &BTreeSet::from([id.clone()]),
+            "incat",
+        );
         let (_, c, _, _) = report_row(id, &bad_plan.counts, &incat);
         let repro = classify_repro(a, c);
-        println!("{}\t{id}\tat bad={bad}: {}", repro.label(), repro.guidance(cat));
+        println!(
+            "{}\t{id}\tat bad={bad}: {}",
+            repro.label(),
+            repro.guidance(cat)
+        );
         let _ = std::io::stdout().flush();
         reproductions.insert(id.clone(), repro);
     }
@@ -953,7 +1025,10 @@ fn bisect(
         eprintln!("bisect-probe: REFUSED: {good}..{bad} contains no first-parent commits");
         return RC_UNUSABLE;
     }
-    eprintln!("bisect-probe: {} candidate commit(s) in {good}..{bad}", candidates.len());
+    eprintln!(
+        "bisect-probe: {} candidate commit(s) in {good}..{bad}",
+        candidates.len()
+    );
 
     let mut cache: BTreeMap<String, BTreeMap<String, Verdict>> = BTreeMap::new();
     let mut resolved: Vec<(String, String)> = Vec::new();
@@ -1155,12 +1230,39 @@ fn main() {
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--lane" => lane = it.next().unwrap_or_else(|| fail("--lane needs a value")).clone(),
-            "--jobs" => jobs = it.next().unwrap_or_else(|| fail("--jobs needs a value")).clone(),
+            "--lane" => {
+                lane = it
+                    .next()
+                    .unwrap_or_else(|| fail("--lane needs a value"))
+                    .clone()
+            }
+            "--jobs" => {
+                jobs = it
+                    .next()
+                    .unwrap_or_else(|| fail("--jobs needs a value"))
+                    .clone()
+            }
             "--repro-check" => repro_only = true,
-            "--good" => good = Some(it.next().unwrap_or_else(|| fail("--good needs a value")).clone()),
-            "--bad" => bad = Some(it.next().unwrap_or_else(|| fail("--bad needs a value")).clone()),
-            "--build" => build = it.next().unwrap_or_else(|| fail("--build needs a value")).clone(),
+            "--good" => {
+                good = Some(
+                    it.next()
+                        .unwrap_or_else(|| fail("--good needs a value"))
+                        .clone(),
+                )
+            }
+            "--bad" => {
+                bad = Some(
+                    it.next()
+                        .unwrap_or_else(|| fail("--bad needs a value"))
+                        .clone(),
+                )
+            }
+            "--build" => {
+                build = it
+                    .next()
+                    .unwrap_or_else(|| fail("--build needs a value"))
+                    .clone()
+            }
             other if other.starts_with("--") => fail(&format!("unknown option {other}")),
             other => {
                 ids.insert(other.to_string());
@@ -1214,7 +1316,11 @@ fn main() {
     // starting revision cannot describe a historical commit.
     let plan = enumerate(&root, &harness, &lane, &ids);
     let counts = plan.counts.clone();
-    let unselected: Vec<&String> = counts.iter().filter(|(_, n)| **n == 0).map(|(k, _)| k).collect();
+    let unselected: Vec<&String> = counts
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(k, _)| k)
+        .collect();
     if !unselected.is_empty() {
         for id in &unselected {
             println!("UNSELECTED\t{id}\t0 cells -- matched nothing in lane {lane}");
@@ -1227,7 +1333,11 @@ fn main() {
              yet unusable for a bisection. Nothing was run; fix the list and re-probe.",
             unselected.len(),
             ids.len(),
-            unselected.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            unselected
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         std::process::exit(RC_NOT_MEASURED);
     }
@@ -1248,9 +1358,13 @@ fn main() {
     // One `run` per id, because `--test` is singular and exact. Concurrency comes from
     // `--jobs` inside each invocation; the ~0.42s per-process overhead is noise beside
     // a 3.5s median cell, which is why this is a loop and not a harness change.
-    let mut outcomes: BTreeMap<String, Vec<String>> = ids.iter().map(|i| (i.clone(), vec![])).collect();
+    let mut outcomes: BTreeMap<String, Vec<String>> =
+        ids.iter().map(|i| (i.clone(), vec![])).collect();
     for id in &ids {
-        let results = root.join(format!("target/bisect-probe-{}.jsonl", id.replace('/', "-")));
+        let results = root.join(format!(
+            "target/bisect-probe-{}.jsonl",
+            id.replace('/', "-")
+        ));
         let cleared = match clear_results_file(&results) {
             Ok(()) => true,
             Err(error) => {
@@ -1265,7 +1379,16 @@ fn main() {
         } else {
             let status = Command::new(&harness)
                 .current_dir(&root)
-                .args(["run", "--lane", &lane, "--test", id, "--prebuilt", "--jobs", &jobs])
+                .args([
+                    "run",
+                    "--lane",
+                    &lane,
+                    "--test",
+                    id,
+                    "--prebuilt",
+                    "--jobs",
+                    &jobs,
+                ])
                 .arg("--results")
                 .arg(&results)
                 // The child's own PASS/FAIL chatter would interleave with this driver's
@@ -1397,7 +1520,9 @@ fn self_test() -> i32 {
             bad.push("the shared-primary guard must RECOGNISE equal git directories".into());
         }
         if git_dirs_are_primary("/repo/.git/worktrees/review", "/repo/.git") {
-            bad.push("the shared-primary guard must NOT reject unequal worktree directories".into());
+            bad.push(
+                "the shared-primary guard must NOT reject unequal worktree directories".into(),
+            );
         }
 
         // Exercise the checkout we are actually running from and the primary
@@ -1423,7 +1548,9 @@ fn self_test() -> i32 {
         }
         // ⚠️ AND FAIL SAFE: an unreadable repository must READ AS the primary, so a
         // broken git refuses rather than silently disarming the guard.
-        if !is_primary_checkout(Path::new("/nonexistent-checkout-for-bisect-probe-self-test")) {
+        if !is_primary_checkout(Path::new(
+            "/nonexistent-checkout-for-bisect-probe-self-test",
+        )) {
             bad.push("a checkout git cannot read must be treated as the primary".into());
         }
     }
@@ -1515,7 +1642,11 @@ fn self_test() -> i32 {
     // The ordinary round: the boundary belongs to B alone; A and C keep searching.
     let (culprits, rest) = round_outcome(
         &pend(&["A", "B", "C"]),
-        &at(&[("A", Verdict::Pass), ("B", Verdict::Fail), ("C", Verdict::Pass)]),
+        &at(&[
+            ("A", Verdict::Pass),
+            ("B", Verdict::Fail),
+            ("C", Verdict::Pass),
+        ]),
     );
     if culprits != pend(&["B"]) {
         bad.push("only the ids FAILING at the boundary are localised there".into());
@@ -1545,7 +1676,9 @@ fn self_test() -> i32 {
         bad.push("no id failing at the boundary must yield NO culprits".into());
     }
     if rest != pend(&["A", "B"]) {
-        bad.push("a contradictory round must leave pending untouched so the caller can stop".into());
+        bad.push(
+            "a contradictory round must leave pending untouched so the caller can stop".into(),
+        );
     }
 
     // ⚠️ AN ID NOT IN `pending` MUST NEVER BE RESOLVED, even if it fails at the
@@ -1564,7 +1697,11 @@ fn self_test() -> i32 {
     let start = pend(&["A", "B", "C"]);
     let (c, r) = round_outcome(
         &start,
-        &at(&[("A", Verdict::Fail), ("B", Verdict::Pass), ("C", Verdict::Pass)]),
+        &at(&[
+            ("A", Verdict::Fail),
+            ("B", Verdict::Pass),
+            ("C", Verdict::Pass),
+        ]),
     );
     if !c.is_empty() && r.len() >= start.len() {
         bad.push("a round that resolves anything must shrink the pending set".into());
@@ -1572,28 +1709,25 @@ fn self_test() -> i32 {
 
     // PASS and FAIL are the only midpoint values that can choose a half.
     let two = pend(&["A", "B"]);
-    if midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Pass)]))
-        != Ok(false)
-    {
+    if midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Pass)])) != Ok(false) {
         bad.push("an all-pass midpoint must choose the later half".into());
     }
-    if midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Fail)]))
-        != Ok(true)
-    {
+    if midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Fail)])) != Ok(true) {
         bad.push("a fully measured midpoint with a failure must choose the earlier half".into());
     }
     let mixed = midpoint_any_fail(&two, &at(&[("A", Verdict::Fail), ("B", Verdict::Error)]));
     if !matches!(mixed, Err(ref rows) if rows == &["B=ERROR".to_string()]) {
-        bad.push(format!("an ERROR must refuse the midpoint even beside a FAIL, got {mixed:?}"));
+        bad.push(format!(
+            "an ERROR must refuse the midpoint even beside a FAIL, got {mixed:?}"
+        ));
     }
     let missing = midpoint_any_fail(&two, &at(&[("A", Verdict::Pass)]));
     if !matches!(missing, Err(ref rows) if rows == &["B=NO-VERDICT".to_string()]) {
-        bad.push(format!("a missing pending verdict must refuse the midpoint, got {missing:?}"));
+        bad.push(format!(
+            "a missing pending verdict must refuse the midpoint, got {missing:?}"
+        ));
     }
-    let skipped = midpoint_any_fail(
-        &two,
-        &at(&[("A", Verdict::Pass), ("B", Verdict::Skipped)]),
-    );
+    let skipped = midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Skipped)]));
     if !matches!(skipped, Err(ref rows) if rows == &["B=SKIPPED".to_string()]) {
         bad.push(format!(
             "a host-inapplicable midpoint must refuse rather than choose a half, got {skipped:?}"
@@ -1620,10 +1754,12 @@ fn self_test() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
 
     struct GitFixture {
         root: PathBuf,
@@ -1681,8 +1817,7 @@ mod tests {
                 if build_ok { "yes\n" } else { "no\n" },
             )
             .expect("write build state");
-            fs::write(self.root.join("outcome"), format!("{outcome}\n"))
-                .expect("write outcome");
+            fs::write(self.root.join("outcome"), format!("{outcome}\n")).expect("write outcome");
             self.git(&["add", "plan-count", "build-ok", "outcome"]);
             self.git(&["commit", "-q", "-m", message]);
             self.git(&["rev-parse", "HEAD"])
@@ -1898,7 +2033,10 @@ esac
              converging on a set it never ran"
         );
         let seen: BTreeSet<String> = rows.iter().map(|(id, _, _, _)| id.clone()).collect();
-        assert_eq!(seen, requested, "the reported ids must be the requested ids");
+        assert_eq!(
+            seen, requested,
+            "the reported ids must be the requested ids"
+        );
     }
 
     /// A requested id that matches nothing is UNSELECTED and PRESENT in the output.
@@ -1906,7 +2044,10 @@ esac
     #[test]
     fn an_unmatched_id_is_unselected_and_still_reported() {
         let requested = ids(&["real/one", "typo/xyz"]);
-        let counts = BTreeMap::from([("real/one".to_string(), 1usize), ("typo/xyz".to_string(), 0)]);
+        let counts = BTreeMap::from([
+            ("real/one".to_string(), 1usize),
+            ("typo/xyz".to_string(), 0),
+        ]);
         let outcomes = BTreeMap::from([("real/one".to_string(), vec!["PASS".to_string()])]);
         let rows = report_rows(&requested, &counts, &outcomes);
         let typo = rows.iter().find(|(id, _, _, _)| id == "typo/xyz");
@@ -1929,7 +2070,10 @@ esac
     #[test]
     fn an_all_real_all_passing_list_exits_zero() {
         let requested = ids(&["real/one", "real/two"]);
-        let counts = BTreeMap::from([("real/one".to_string(), 1usize), ("real/two".to_string(), 1)]);
+        let counts = BTreeMap::from([
+            ("real/one".to_string(), 1usize),
+            ("real/two".to_string(), 1),
+        ]);
         let outcomes = BTreeMap::from([
             ("real/one".to_string(), vec!["PASS".to_string()]),
             ("real/two".to_string(), vec!["PASS".to_string()]),
@@ -2172,11 +2316,8 @@ printf '%s\n' '{"test":"a","outcome":"PASS"}' >> "$results"
         fs::set_permissions(&target, target_permissions)
             .expect("restore target directory permissions");
 
-        let (_, verdict, _, _) = report_row(
-            "a",
-            &BTreeMap::from([("a".to_string(), 1usize)]),
-            &outcomes,
-        );
+        let (_, verdict, _, _) =
+            report_row("a", &BTreeMap::from([("a".to_string(), 1usize)]), &outcomes);
         assert_eq!(
             verdict,
             Verdict::Error,

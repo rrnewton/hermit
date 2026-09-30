@@ -50,8 +50,10 @@ int main(void) {
   siginfo_t info = {0};
   errno = 0;
   if (waitid(P_PIDFD, (id_t)fd, &info, WEXITED) != -1 || errno != EAGAIN) {
-    fprintf(stderr, "nonblocking waitid returned errno=%d, expected EAGAIN\n",
-            errno);
+    fprintf(
+        stderr,
+        "nonblocking waitid returned errno=%d, expected EAGAIN\n",
+        errno);
     close(fd);
     return 1;
   }
@@ -66,8 +68,8 @@ int main(void) {
   int status;
   if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 42) {
-    fprintf(stderr, "unexpected child wait status=%d errno=%d\n", status,
-            errno);
+    fprintf(
+        stderr, "unexpected child wait status=%d errno=%d\n", status, errno);
     close(fd);
     return 1;
   }

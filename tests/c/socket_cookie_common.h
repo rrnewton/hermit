@@ -29,7 +29,8 @@ static int read_socket_cookie(int fd, uint64_t* cookie) {
   return 0;
 }
 
-static int verify_socket_cookies(int first_fd, int second_fd, const char* label) {
+static int
+verify_socket_cookies(int first_fd, int second_fd, const char* label) {
   uint64_t first;
   uint64_t second;
   if (read_socket_cookie(first_fd, &first) != 0 ||

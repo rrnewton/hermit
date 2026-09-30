@@ -235,7 +235,8 @@ def _self_test() -> int:
     entries, pruned, _ = merge([doc(entry("tests/a.c")), stale], present)
     expect(
         "renamed-away path is pruned, not resurrected",
-        [e["path"] for e in entries] == ["tests/a.c"] and pruned == ["tests/dbi_gone.c"],
+        [e["path"] for e in entries] == ["tests/a.c"]
+        and pruned == ["tests/dbi_gone.c"],
     )
 
     # And the hazard is real: without pruning the phantom survives. This proves
@@ -279,7 +280,9 @@ def _self_test() -> int:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("inputs", nargs="*", type=Path, help="inventories to merge")
-    parser.add_argument("-o", "--output", type=Path, help="destination (default: stdout)")
+    parser.add_argument(
+        "-o", "--output", type=Path, help="destination (default: stdout)"
+    )
     parser.add_argument("--check", type=Path, help="verify an inventory is canonical")
     parser.add_argument("--self-test", action="store_true", help="run the self-test")
     parser.add_argument(

@@ -33,7 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 
-static const char PAYLOAD[] = "ABCDEFGHIJKL"; /* 12 bytes, no NUL read/written */
+static const char PAYLOAD[] =
+    "ABCDEFGHIJKL"; /* 12 bytes, no NUL read/written */
 #define PAYLOAD_LEN 12
 
 int main(void) {
@@ -88,8 +89,11 @@ int main(void) {
   struct timespec zero = {.tv_sec = 0, .tv_nsec = 0};
   int timed_out = ppoll(&empty, 1, &zero, NULL);
   if (timed_out != 0) {
-    fprintf(stderr, "ppoll(timeout): ret=%d revents=%d\n", timed_out,
-            empty.revents);
+    fprintf(
+        stderr,
+        "ppoll(timeout): ret=%d revents=%d\n",
+        timed_out,
+        empty.revents);
     return 1;
   }
 

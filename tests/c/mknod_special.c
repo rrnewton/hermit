@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 /* Return the raw st_mode for a path via lstat, or -1 on error. */
-static int lmode(const char *path) {
+static int lmode(const char* path) {
   struct stat st;
   if (lstat(path, &st) != 0) {
     return -1;
@@ -91,8 +91,8 @@ int main(void) {
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "mknod completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(stderr, "mknod completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

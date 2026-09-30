@@ -3,10 +3,10 @@
  *
  * The io_uring fallback row only checks that epoll_create1 succeeds. This row
  * exercises the full non-blocking readiness cycle: register a pre-armed eventfd
- * with epoll_ctl, observe it ready via a zero-timeout epoll_wait, deregister it,
- * and observe the empty set. epoll_wait is called with timeout 0 throughout, so
- * it never blocks -- a blocking wait would livelock the single-threaded DBT
- * backend against the deterministic scheduler.
+ * with epoll_ctl, observe it ready via a zero-timeout epoll_wait, deregister
+ * it, and observe the empty set. epoll_wait is called with timeout 0
+ * throughout, so it never blocks -- a blocking wait would livelock the
+ * single-threaded DBT backend against the deterministic scheduler.
  *
  * THE READY COUNTS ARE PRINTED. "epoll ok=6" collapsed six checks into one
  * scalar, so a backend that reported the wrong number of ready descriptors and

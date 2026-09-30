@@ -26,7 +26,10 @@ int main(void) {
     return 0;
   }
 
-  fprintf(stderr, "ustat: expected ENOSYS, got result=%ld errno=%d\n", result,
-          errno);
+  fprintf(
+      stderr,
+      "ustat: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

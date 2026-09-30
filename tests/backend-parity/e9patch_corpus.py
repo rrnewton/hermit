@@ -120,7 +120,9 @@ def compile_guest(name: str, out_dir: Path) -> Path:
     command = [compiler, *FREESTANDING_FLAGS, str(source), "-o", str(output)]
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        raise CorpusError(f"compile failed: {command!r}\n{result.stdout}{result.stderr}")
+        raise CorpusError(
+            f"compile failed: {command!r}\n{result.stdout}{result.stderr}"
+        )
     return output
 
 
@@ -160,9 +162,7 @@ def run(command: list[str], timeout: int) -> tuple[int, bytes, bytes]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def detlog_syscalls(
-    hermit: Path, e9: bool, guest: Path, host_tmp: Path
-) -> list[str]:
+def detlog_syscalls(hermit: Path, e9: bool, guest: Path, host_tmp: Path) -> list[str]:
     """Canonical guest-syscall sequence from a --log=info plain --strict run.
 
     Uses the "inbound syscall:" lines (they include exit_group, which has no
@@ -191,7 +191,9 @@ def e9patch_engagement(path: Path) -> tuple[int, int, int]:
     try:
         report = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
-        raise CorpusError(f"e9patch engagement record is unavailable: {error}") from error
+        raise CorpusError(
+            f"e9patch engagement record is unavailable: {error}"
+        ) from error
     if not isinstance(report, dict) or set(report) != {"schema", "engagement"}:
         raise CorpusError("e9patch engagement record has unexpected fields")
     if report.get("schema") != 2:
@@ -202,8 +204,13 @@ def e9patch_engagement(path: Path) -> tuple[int, int, int]:
         raise CorpusError("e9patch engagement value is incomplete")
     if engagement.get("backend") != "e9patch":
         raise CorpusError("e9patch engagement record names another backend")
-    values = tuple(engagement[name] for name in ("candidate_sites", "mapped_sites", "b0_sites"))
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+    values = tuple(
+        engagement[name] for name in ("candidate_sites", "mapped_sites", "b0_sites")
+    )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in values
+    ):
         raise CorpusError("e9patch engagement counts must be nonnegative integers")
     return values
 
@@ -225,7 +232,9 @@ def e9patch_feature_from_build_info(raw: bytes) -> bool:
     try:
         report = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CorpusError(f"hermit version record is not valid JSON: {error}") from error
+        raise CorpusError(
+            f"hermit version record is not valid JSON: {error}"
+        ) from error
     if not isinstance(report, dict) or report.get("schema") != 1:
         raise CorpusError("hermit version record must use schema 1")
     features = report.get("features")
@@ -325,10 +334,16 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
         return "FAIL", f"golden stdout {gout!r}, expected {expected_stdout!r}"
     golden_matched, golden_reason = verification_matched(hermit, golden_report)
     if not golden_matched:
-        return "FAIL", f"golden typed verification report did not match: {golden_reason}"
+        return (
+            "FAIL",
+            f"golden typed verification report did not match: {golden_reason}",
+        )
     e9patch_matched, e9patch_reason = verification_matched(hermit, e9patch_report)
     if not e9patch_matched:
-        return "FAIL", f"e9patch typed verification report did not match: {e9patch_reason}"
+        return (
+            "FAIL",
+            f"e9patch typed verification report did not match: {e9patch_reason}",
+        )
 
     try:
         cand, mapped, b0 = e9patch_engagement(engagement_report)

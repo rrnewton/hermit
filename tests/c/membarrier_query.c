@@ -23,21 +23,21 @@
 #include <unistd.h>
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 2, CANONICAL_QUERY_MASK = 31 };
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 2, CANONICAL_QUERY_MASK = 31 };
+  int ok = 0;
 
-    long mask = syscall(SYS_membarrier, MEMBARRIER_CMD_QUERY, 0, 0);
-    if (mask == CANONICAL_QUERY_MASK) {
-        ok++;
-    }
+  long mask = syscall(SYS_membarrier, MEMBARRIER_CMD_QUERY, 0, 0);
+  if (mask == CANONICAL_QUERY_MASK) {
+    ok++;
+  }
 
-    if (syscall(SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) == 0) {
-        ok++;
-    }
+  if (syscall(SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) == 0) {
+    ok++;
+  }
 
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
-    ok--; /* plant one failed contract check to bracket the exit oracle */
+  ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("memb ok=%d q=%ld\n", ok, mask);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  printf("memb ok=%d q=%ld\n", ok, mask);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

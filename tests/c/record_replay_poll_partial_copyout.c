@@ -35,8 +35,7 @@ static int partial_copyout(const char* mode, int use_ppoll) {
   int first_pipe[2];
   int second_pipe[2];
   if (pipe(first_pipe) != 0 || pipe(second_pipe) != 0 ||
-      write(first_pipe[1], "a", 1) != 1 ||
-      write(second_pipe[1], "b", 1) != 1) {
+      write(first_pipe[1], "a", 1) != 1 || write(second_pipe[1], "b", 1) != 1) {
     perror("prepare ready pipes");
     return 1;
   }
@@ -47,8 +46,13 @@ static int partial_copyout(const char* mode, int use_ppoll) {
     return 1;
   }
 
-  void* pages = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* pages = mmap(
+      NULL,
+      (size_t)page_size * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (pages == MAP_FAILED) {
     perror("mmap pollfd pages");
     return 1;
@@ -56,8 +60,8 @@ static int partial_copyout(const char* mode, int use_ppoll) {
 
   struct pollfd* fds =
       (struct pollfd*)((unsigned char*)pages + page_size - sizeof(*fds));
-  fds[0] = (struct pollfd){
-      .fd = first_pipe[0], .events = POLLIN, .revents = 0x1234};
+  fds[0] =
+      (struct pollfd){.fd = first_pipe[0], .events = POLLIN, .revents = 0x1234};
   fds[1] = (struct pollfd){
       .fd = second_pipe[0], .events = POLLIN, .revents = 0x5678};
 
@@ -65,8 +69,9 @@ static int partial_copyout(const char* mode, int use_ppoll) {
    * Both entries remain readable inputs, but only fds[0].revents is writable.
    * Linux writes that first result, faults on the second, and returns EFAULT.
    */
-  if (mprotect((unsigned char*)pages + page_size, (size_t)page_size,
-               PROT_READ) != 0) {
+  if (mprotect(
+          (unsigned char*)pages + page_size, (size_t)page_size, PROT_READ) !=
+      0) {
     perror("mprotect second pollfd page");
     return 1;
   }
@@ -84,8 +89,10 @@ static int partial_copyout(const char* mode, int use_ppoll) {
   int second_revents = fds[1].revents;
   struct timespec observed_timeout = timeout;
 
-  if (mprotect((unsigned char*)pages + page_size, (size_t)page_size,
-               PROT_READ | PROT_WRITE) != 0) {
+  if (mprotect(
+          (unsigned char*)pages + page_size,
+          (size_t)page_size,
+          PROT_READ | PROT_WRITE) != 0) {
     perror("restore second pollfd page");
     return 1;
   }
@@ -99,17 +106,28 @@ static int partial_copyout(const char* mode, int use_ppoll) {
   }
 
   /* Fixed widths keep the write syscall shape identical if a value diverges. */
-  printf("mode=%s result=%011ld errno=%011d revents0=%011d "
-         "revents1=%011d timeout=%011ld.%09ld\n",
-         mode, result, observed_errno, first_revents, second_revents,
-         (long)observed_timeout.tv_sec, observed_timeout.tv_nsec);
+  printf(
+      "mode=%s result=%011ld errno=%011d revents0=%011d "
+      "revents1=%011d timeout=%011ld.%09ld\n",
+      mode,
+      result,
+      observed_errno,
+      first_revents,
+      second_revents,
+      (long)observed_timeout.tv_sec,
+      observed_timeout.tv_nsec);
 
-  if (result != -1 || observed_errno != EFAULT ||
-      first_revents != POLLIN || second_revents != 0x5678) {
-    fprintf(stderr,
-            "%s partial copyout mismatch: result=%ld errno=%d "
-            "revents0=%d revents1=%d\n",
-            mode, result, observed_errno, first_revents, second_revents);
+  if (result != -1 || observed_errno != EFAULT || first_revents != POLLIN ||
+      second_revents != 0x5678) {
+    fprintf(
+        stderr,
+        "%s partial copyout mismatch: result=%ld errno=%d "
+        "revents0=%d revents1=%d\n",
+        mode,
+        result,
+        observed_errno,
+        first_revents,
+        second_revents);
     return 1;
   }
   if (use_ppoll &&
@@ -117,8 +135,11 @@ static int partial_copyout(const char* mode, int use_ppoll) {
        observed_timeout.tv_nsec < 0 || observed_timeout.tv_nsec >= 1000000000 ||
        (observed_timeout.tv_sec == 3 &&
         observed_timeout.tv_nsec > 456789123))) {
-    fprintf(stderr, "invalid ppoll remaining timeout: %ld.%09ld\n",
-            observed_timeout.tv_sec, observed_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "invalid ppoll remaining timeout: %ld.%09ld\n",
+        observed_timeout.tv_sec,
+        observed_timeout.tv_nsec);
     return 1;
   }
   return 0;
@@ -142,25 +163,36 @@ static int invalid_nfds(void) {
 
   struct timespec timeout = {.tv_sec = 3, .tv_nsec = 456789123};
   errno = 0;
-  long ppoll_result =
-      syscall(SYS_ppoll, (void*)(uintptr_t)1, nfds, &timeout, NULL,
-              sizeof(uint64_t));
+  long ppoll_result = syscall(
+      SYS_ppoll, (void*)(uintptr_t)1, nfds, &timeout, NULL, sizeof(uint64_t));
   int ppoll_errno = errno;
 
-  printf("mode=invalid-nfds nfds=%020llu poll=%011ld errno=%011d "
-         "ppoll=%011ld errno=%011d timeout=%011ld.%09ld\n",
-         (unsigned long long)nfds, poll_result, poll_errno, ppoll_result,
-         ppoll_errno, (long)timeout.tv_sec, timeout.tv_nsec);
+  printf(
+      "mode=invalid-nfds nfds=%020llu poll=%011ld errno=%011d "
+      "ppoll=%011ld errno=%011d timeout=%011ld.%09ld\n",
+      (unsigned long long)nfds,
+      poll_result,
+      poll_errno,
+      ppoll_result,
+      ppoll_errno,
+      (long)timeout.tv_sec,
+      timeout.tv_nsec);
 
   if (poll_result != -1 || poll_errno != EINVAL || ppoll_result != -1 ||
       ppoll_errno != EINVAL || timeout.tv_sec < 0 || timeout.tv_sec > 3 ||
       timeout.tv_nsec < 0 || timeout.tv_nsec >= 1000000000 ||
       (timeout.tv_sec == 3 && timeout.tv_nsec > 456789123)) {
-    fprintf(stderr,
-            "invalid-nfds mismatch: poll=%ld/%d ppoll=%ld/%d nfds=%llu "
-            "timeout=%ld.%09ld\n",
-            poll_result, poll_errno, ppoll_result, ppoll_errno,
-            (unsigned long long)nfds, timeout.tv_sec, timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "invalid-nfds mismatch: poll=%ld/%d ppoll=%ld/%d nfds=%llu "
+        "timeout=%ld.%09ld\n",
+        poll_result,
+        poll_errno,
+        ppoll_result,
+        ppoll_errno,
+        (unsigned long long)nfds,
+        timeout.tv_sec,
+        timeout.tv_nsec);
     return 1;
   }
   return 0;

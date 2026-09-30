@@ -47,8 +47,8 @@
  * redefinition error under -Werror. */
 
 #include <elf.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/auxv.h>
 

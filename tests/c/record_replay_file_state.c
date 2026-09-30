@@ -12,9 +12,9 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <stdio.h>
-#include <sys/sendfile.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -167,8 +167,9 @@ int main(void) {
     if (write_all(STDOUT_FILENO, "\n", 1) != 0) {
       return fail("write(clone separator)");
     }
-  } else if (errno == EOPNOTSUPP || errno == ENOTTY || errno == EXDEV ||
-             errno == EINVAL) {
+  } else if (
+      errno == EOPNOTSUPP || errno == ENOTTY || errno == EXDEV ||
+      errno == EINVAL) {
     printf("clone unsupported\n");
   } else {
     return fail("ioctl(FICLONE)");
@@ -192,8 +193,10 @@ int main(void) {
       return fail("fstat(write-only clone)");
     }
     if ((clone_stat.st_mode & 0777) != 0200) {
-      fprintf(stderr, "write-only clone permissions changed: %#o\n",
-              clone_stat.st_mode & 0777);
+      fprintf(
+          stderr,
+          "write-only clone permissions changed: %#o\n",
+          clone_stat.st_mode & 0777);
       return 1;
     }
     if (close(write_only_fd) != 0 || chmod(write_only_clone, 0600) != 0) {

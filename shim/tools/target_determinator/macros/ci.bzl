@@ -14,7 +14,8 @@ def _lbl(*_args):
 def _package(
     *_values,
     # starlark-lint-disable unused-argument
-    overwrite = False):  # @unused
+    overwrite = False,
+):  # @unused
     pass
 
 def _labels(*args):

@@ -15,7 +15,7 @@
 #define SO_INCOMING_CPU 49
 #endif
 
-static int fail(const char *operation) {
+static int fail(const char* operation) {
   perror(operation);
   return 1;
 }
@@ -30,11 +30,11 @@ int main(void) {
       .sin6_family = AF_INET6,
       .sin6_addr = IN6ADDR_LOOPBACK_INIT,
   };
-  if (bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (bind(listener, (struct sockaddr*)&address, sizeof(address)) < 0) {
     return fail("bind");
   }
   socklen_t address_len = sizeof(address);
-  if (getsockname(listener, (struct sockaddr *)&address, &address_len) < 0) {
+  if (getsockname(listener, (struct sockaddr*)&address, &address_len) < 0) {
     return fail("getsockname");
   }
   if (listen(listener, 1) < 0) {
@@ -45,7 +45,7 @@ int main(void) {
   if (client < 0) {
     return fail("socket client");
   }
-  if (connect(client, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (connect(client, (struct sockaddr*)&address, sizeof(address)) < 0) {
     return fail("connect");
   }
   int accepted = accept(listener, NULL, NULL);

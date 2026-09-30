@@ -73,14 +73,14 @@ mod validate_envelope;
 #[path = "lib/validate_history.rs"]
 mod validate_history;
 
-#[path = "lib/validate_cell_results.rs"]
-mod validate_cell_results;
 #[path = "lib/validate_artifacts.rs"]
 mod validate_artifacts;
-#[path = "lib/validate_test_results.rs"]
-mod validate_test_results;
+#[path = "lib/validate_cell_results.rs"]
+mod validate_cell_results;
 #[path = "lib/validate_evidence.rs"]
 mod validate_evidence;
+#[path = "lib/validate_test_results.rs"]
+mod validate_test_results;
 
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
@@ -103,10 +103,12 @@ mod validate_runtime;
 #[path = "lib/validate_classification.rs"]
 mod validate_classification;
 
-use validate_classification::{
-    NodeClassification, attempt_classification, classify_run, node_classification,
-    validation_completeness_detail, validation_is_complete,
-};
+use validate_classification::NodeClassification;
+use validate_classification::attempt_classification;
+use validate_classification::classify_run;
+use validate_classification::node_classification;
+use validate_classification::validation_completeness_detail;
+use validate_classification::validation_is_complete;
 
 #[path = "lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
@@ -129,11 +131,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
-use sha2::Digest;
-use sha2::Sha256;
+
+use dagrun::TestResult;
+use dagrun::TestResults;
 use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::cgroup::is_in_scope;
 use dagrun::cgroup::observe_own_containment;
+use dagrun::container_core_budget;
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
 use dagrun::model::CmdType;
@@ -144,40 +148,38 @@ use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 use dagrun::model::StructuredTestResultsManifest;
-use dagrun::TestResult;
-use dagrun::TestResults;
-use dagrun::container_core_budget;
 use dagrun::perflog::append_step_profiles;
+use dagrun::scheduler::BoxedCgroups;
+use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
+use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use dagrun::scheduler::steps_violating_run_timeout;
-use dagrun::scheduler::BoxedCgroups;
-use dagrun::scheduler::monotonic_now_ns;
-use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use hermit_manifest_plan::ledger::HistoryRow;
-use hermit_manifest_plan::runner::ManifestSet;
-use hermit_manifest_plan::runner::Population;
-use hermit_manifest_plan::runner::resolved_cell_timeouts;
-use hermit_manifest_plan::runner::Selection;
-use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
+use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::ManifestSet;
+use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::Selection;
+use hermit_manifest_plan::runner::resolved_cell_timeouts;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
+#[cfg(test)]
+use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
 use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
-use hermit_manifest_plan::timeouts::scale_timeout_seconds;
-use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
+use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
 use hermit_manifest_plan::timeouts::TimeoutMultipliers;
 use hermit_manifest_plan::timeouts::parse_timeout_multiplier;
-use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
 #[cfg(test)]
-use hermit_manifest_plan::timeouts::{
-    DEFAULT_TEST_CPU_TIMEOUT_SECONDS, resolve_test_timeouts,
-};
-
-use validate_plan::CompatMode;
+use hermit_manifest_plan::timeouts::resolve_test_timeouts;
+use hermit_manifest_plan::timeouts::scale_timeout_seconds;
+use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
+use sha2::Digest;
+use sha2::Sha256;
 use validate_plan::CompatDisposition;
+use validate_plan::CompatMode;
 
 /// Current receipt schema. Unknown scalar evidence is represented by explicit
 /// nulls; optional collections stay type-safe by being omitted when inapplicable
@@ -209,8 +211,8 @@ const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
 // portable while its value says full is the same defect one layer down.
 const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
-const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
-
+const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str =
+    r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
 fn integration_artifact_producer(step: &Step) -> &'static str {
     if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
@@ -305,7 +307,8 @@ fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
         wrong_dependency.deps.push(other_producer.into());
         if hermit_integration_uses_published_artifact(&wrong_dependency) {
             return Err(
-                "full-plan bracket: the other execution root's artifact producer was accepted".into(),
+                "full-plan bracket: the other execution root's artifact producer was accepted"
+                    .into(),
             );
         }
     }
@@ -392,24 +395,32 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             .ok_or_else(|| format!("release-artifact bracket: missing {tag}"))
     };
     let buck = step("build.buck_release_artifact")?;
-    if !buck.cmd.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
+    if !buck
+        .cmd
+        .contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
         || !buck
             .cmd
             .contains("build-buck-release.rs --validate-dag-build --dotslash")
         || buck.cmd.contains("target/release/hermit")
     {
-        return Err("release-artifact bracket: host Buck producer lost its closed mode branch".into());
+        return Err(
+            "release-artifact bracket: host Buck producer lost its closed mode branch".into(),
+        );
     }
-    for tag in ["build.runtime_release", "build.runtime_release_in_pinned_root"] {
+    for tag in [
+        "build.runtime_release",
+        "build.runtime_release_in_pinned_root",
+    ] {
         let runtime = step(tag)?;
         let source = guarded_command_source(&runtime.tag(), &runtime.cmd)?;
-        if !runtime.deps.iter().any(|dep| dep == "build.buck_release_artifact")
+        if !runtime
+            .deps
+            .iter()
+            .any(|dep| dep == "build.buck_release_artifact")
             || !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
             || !source.contains("build-buck-release.rs --validate-dag-install")
             || !source.contains("target/ci/hermit-strict")
-            || !source.contains(
-                "install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so",
-            )
+            || !source.contains("install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so")
             || !source.contains("sabre_before=$(sha256sum \"$sabre_source\"")
             || source
                 .matches("cargo clean --release -p reverie-dbt -p detcore-sabre")
@@ -417,7 +428,9 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
                 != 2
             || !source.contains("rm -rf target/install_pkg/rsrcs/hermit-runtime")
         {
-            return Err(format!("release-artifact bracket: {tag} can bypass the selected artifact"));
+            return Err(format!(
+                "release-artifact bracket: {tag} can bypass the selected artifact"
+            ));
         }
         if tag.ends_with("_in_pinned_root")
             && [RELEASE_BUILD_MODE_ENV, BUCK_DOTSLASH_ENV]
@@ -433,7 +446,9 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
         "build.e2e_artifact_in_pinned_root",
     ] {
         let Some(publisher) = cfg.steps.iter().find(|step| step.tag() == tag) else {
-            if tag == "build.e2e_artifact_on_host" { continue; }
+            if tag == "build.e2e_artifact_on_host" {
+                continue;
+            }
             return Err(format!("release-artifact bracket: missing {tag}"));
         };
         let source = guarded_command_source(&publisher.tag(), &publisher.cmd)?;
@@ -441,23 +456,34 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             || !source.contains("cargo) hermit_payload=target/debug/hermit ;;")
             || !source.contains("buck) hermit_payload=target/ci/hermit-strict ;;")
             || !source.contains("*) echo \"unknown Hermit release build mode:")
-            || !source.contains("publish-hermit-e2e-artifact.sh \"$hermit_payload\" target/ci/hermit-e2e-artifacts")
+            || !source.contains(
+                "publish-hermit-e2e-artifact.sh \"$hermit_payload\" target/ci/hermit-e2e-artifacts",
+            )
             || source.contains("target/release/hermit")
         {
-            return Err(format!("release-artifact bracket: {tag} publishes the wrong binary"));
+            return Err(format!(
+                "release-artifact bracket: {tag} publishes the wrong binary"
+            ));
         }
     }
     let mut direct_consumers = 0;
     for tag in [
-        "test.cli", "test.cli_on_host", "test.liteinst_strict",
-        "test.liteinst_strict_on_host", "test.sabre_examples",
+        "test.cli",
+        "test.cli_on_host",
+        "test.liteinst_strict",
+        "test.liteinst_strict_on_host",
+        "test.sabre_examples",
         "test.sabre_examples_on_host",
     ] {
-        let Some(consumer) = cfg.steps.iter().find(|step| step.tag() == tag) else { continue; };
+        let Some(consumer) = cfg.steps.iter().find(|step| step.tag() == tag) else {
+            continue;
+        };
         direct_consumers += 1;
         let source = guarded_command_source(&consumer.tag(), &consumer.cmd)?;
         if !source.contains("target/ci/hermit-strict") || source.contains("target/release/hermit") {
-            return Err(format!("release-artifact bracket: {tag} bypasses the staged artifact"));
+            return Err(format!(
+                "release-artifact bracket: {tag} bypasses the staged artifact"
+            ));
         }
     }
     // The full plan carries exactly 3 of these (test.cli,
@@ -465,15 +491,25 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     // hosted-portable only. It carried 4 until slice S13 of
     // https://github.com/rrnewton/hermit/issues/3301 retired test.dbt_parity.
     if direct_consumers < 3 {
-        return Err(format!("release-artifact bracket: inspected only {direct_consumers} direct consumers"));
+        return Err(format!(
+            "release-artifact bracket: inspected only {direct_consumers} direct consumers"
+        ));
     }
-    for selected in cfg.steps.iter().filter(|step| step.labels.iter().any(|label| label == "full")) {
+    for selected in cfg
+        .steps
+        .iter()
+        .filter(|step| step.labels.iter().any(|label| label == "full"))
+    {
         let source = guarded_command_source(&selected.tag(), &selected.cmd)?;
         if !matches!(
             selected.tag().as_str(),
             "build.runtime_release" | "build.runtime_release_in_pinned_root"
-        ) && source.contains("target/release/hermit") {
-            return Err(format!("release-artifact bracket: full consumer {} names mutable target/release/hermit", selected.tag()));
+        ) && source.contains("target/release/hermit")
+        {
+            return Err(format!(
+                "release-artifact bracket: full consumer {} names mutable target/release/hermit",
+                selected.tag()
+            ));
         }
     }
     Ok(())
@@ -510,23 +546,51 @@ mod artifact_plan_tests {
             assert!(error.contains(required), "{error}");
         }
         for (tag, from, to) in [
-            ("build.e2e_artifact", "cargo) hermit_payload=target/debug/hermit", "cargo) hermit_payload=target/ci/hermit-strict"),
-            ("build.e2e_artifact", "buck) hermit_payload=target/ci/hermit-strict", "buck) hermit_payload=target/debug/hermit"),
-            ("test.sabre_examples", "target/ci/hermit-strict", "target/release/hermit"),
-            ("build.runtime_release", "target/ci/libdetcore_sabre.so", "target/ci/libdetcore_sabre-decoy.so"),
+            (
+                "build.e2e_artifact",
+                "cargo) hermit_payload=target/debug/hermit",
+                "cargo) hermit_payload=target/ci/hermit-strict",
+            ),
+            (
+                "build.e2e_artifact",
+                "buck) hermit_payload=target/ci/hermit-strict",
+                "buck) hermit_payload=target/debug/hermit",
+            ),
+            (
+                "test.sabre_examples",
+                "target/ci/hermit-strict",
+                "target/release/hermit",
+            ),
+            (
+                "build.runtime_release",
+                "target/ci/libdetcore_sabre.so",
+                "target/ci/libdetcore_sabre-decoy.so",
+            ),
             ("build.runtime_release", "sabre_before", "sabre_decoy"),
-            ("build.runtime_release", "rm -rf target/install_pkg/rsrcs/hermit-runtime", "true"),
+            (
+                "build.runtime_release",
+                "rm -rf target/install_pkg/rsrcs/hermit-runtime",
+                "true",
+            ),
         ] {
             let mut changed = cfg.clone();
-            let step = changed.steps.iter_mut().find(|step| step.tag() == tag).unwrap();
+            let step = changed
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
             step.cmd = step.cmd.replacen(from, to, 1);
             let error = release_artifact_plan_bracket(&changed).unwrap_err();
             assert!(error.contains(tag), "{error}");
         }
         let mut missing_edge = cfg.clone();
-        missing_edge.steps.iter_mut()
-            .find(|step| step.tag() == "build.runtime_release_in_pinned_root").unwrap()
-            .deps.retain(|dep| dep != "build.buck_release_artifact");
+        missing_edge
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.runtime_release_in_pinned_root")
+            .unwrap()
+            .deps
+            .retain(|dep| dep != "build.buck_release_artifact");
         assert!(release_artifact_plan_bracket(&missing_edge).is_err());
     }
 }
@@ -637,12 +701,23 @@ enum Focused {
     PrivilegedOnly,
     HostedPortable,
     HostedPrivileged,
-    RequalifyCell { test: String, mode: String, backend: String },
-    Only { lane: String, nodes: String },
-    Selective { shallow: bool },
+    RequalifyCell {
+        test: String,
+        mode: String,
+        backend: String,
+    },
+    Only {
+        lane: String,
+        nodes: String,
+    },
+    Selective {
+        shallow: bool,
+    },
     /// `--envelope-only`, plus `--envelope-compare FILE` which is the same
     /// measurement followed by a monotonicity check (validate.sh:172-176).
-    Envelope { baseline: Option<PathBuf> },
+    Envelope {
+        baseline: Option<PathBuf>,
+    },
 }
 
 impl Focused {
@@ -777,7 +852,8 @@ mod e2e_payload_identity_tests {
     #[test]
     fn artifact_node_publishes_each_recorded_path() {
         let root = test_source_root();
-        let dag: serde_json::Value = serde_json::from_str(&read(&root, "ci/dag/validate.json")).unwrap();
+        let dag: serde_json::Value =
+            serde_json::from_str(&read(&root, "ci/dag/validate.json")).unwrap();
         let nodes: Vec<&serde_json::Value> = dag["steps"]
             .as_array()
             .unwrap()
@@ -787,9 +863,15 @@ mod e2e_payload_identity_tests {
         assert_eq!(nodes.len(), 1, "exactly one build.e2e_artifact node");
         let cmd = nodes[0]["cmd"].as_str().unwrap();
         for builder in [RELEASE_BUILDER_CARGO, RELEASE_BUILDER_BUCK] {
-            let path = e2e_payload_identity(builder)["path"].as_str().unwrap().to_string();
+            let path = e2e_payload_identity(builder)["path"]
+                .as_str()
+                .unwrap()
+                .to_string();
             let arm = format!("{builder}) hermit_payload={path} ;;");
-            assert!(cmd.contains(&arm), "build.e2e_artifact must publish {path} for {builder}: {cmd}");
+            assert!(
+                cmd.contains(&arm),
+                "build.e2e_artifact must publish {path} for {builder}: {cmd}"
+            );
         }
     }
 
@@ -798,15 +880,31 @@ mod e2e_payload_identity_tests {
         let buck = e2e_payload_identity(RELEASE_BUILDER_BUCK);
         assert_eq!(buck["profile"], "release");
         let shim = read(&test_source_root(), "shim/BUCK");
-        let start = shim.find("HERMIT_RELEASE_RUSTC_FLAGS = [").expect("release flag list");
+        let start = shim
+            .find("HERMIT_RELEASE_RUSTC_FLAGS = [")
+            .expect("release flag list");
         let flags = &shim[start..start + shim[start..].find(']').unwrap()];
         for (field, on, off) in [
-            ("debug_assertions", "\"-Cdebug-assertions=yes\"", "\"-Cdebug-assertions=no\""),
-            ("overflow_checks", "\"-Coverflow-checks=yes\"", "\"-Coverflow-checks=no\""),
+            (
+                "debug_assertions",
+                "\"-Cdebug-assertions=yes\"",
+                "\"-Cdebug-assertions=no\"",
+            ),
+            (
+                "overflow_checks",
+                "\"-Coverflow-checks=yes\"",
+                "\"-Coverflow-checks=no\"",
+            ),
         ] {
             let recorded = buck[field].as_bool().unwrap();
-            assert!(flags.contains(if recorded { on } else { off }), "{field}={recorded} vs {flags}");
-            assert!(!flags.contains(if recorded { off } else { on }), "{field} contradicted by {flags}");
+            assert!(
+                flags.contains(if recorded { on } else { off }),
+                "{field}={recorded} vs {flags}"
+            );
+            assert!(
+                !flags.contains(if recorded { off } else { on }),
+                "{field} contradicted by {flags}"
+            );
         }
         // The release target's own rustc_flags come after the toolchain's and
         // would override them, in either the one- or two-token spelling.
@@ -828,7 +926,8 @@ mod e2e_payload_identity_tests {
         let manifest = read(&root, "Cargo.toml");
         for line in manifest.lines().map(str::trim) {
             assert!(
-                !(line.starts_with("[profile.dev]") || line.starts_with("[profile.dev.package.\"*\"]")),
+                !(line.starts_with("[profile.dev]")
+                    || line.starts_with("[profile.dev.package.\"*\"]")),
                 "Cargo.toml overrides the whole dev profile: {line}"
             );
             // Anywhere on the line, not only as a leading key: a dotted
@@ -841,11 +940,22 @@ mod e2e_payload_identity_tests {
             );
         }
         for config in [".cargo/config.toml", ".cargo/config"] {
-            assert!(!root.join(config).exists(), "{config} could override the dev profile or RUSTFLAGS");
+            assert!(
+                !root.join(config).exists(),
+                "{config} could override the dev profile or RUSTFLAGS"
+            );
         }
         let dag = read(&root, "ci/dag/validate.json");
-        for token in ["RUSTFLAGS", "CARGO_PROFILE_", "debug-assertions", "overflow-checks"] {
-            assert!(!dag.contains(token), "ci/dag/validate.json mentions {token}");
+        for token in [
+            "RUSTFLAGS",
+            "CARGO_PROFILE_",
+            "debug-assertions",
+            "overflow-checks",
+        ] {
+            assert!(
+                !dag.contains(token),
+                "ci/dag/validate.json mentions {token}"
+            );
         }
     }
 }
@@ -1012,7 +1122,11 @@ fn parse_verbosity(value: &str) -> Result<i64, u8> {
 fn env_verbosity() -> Result<i64, u8> {
     match std::env::var("VALIDATE_VERBOSITY") {
         Ok(v) if !v.is_empty() => parse_verbosity(&v),
-        _ => Ok(if env_flag("VALIDATE_VERBOSE", "1") { 2 } else { 1 }),
+        _ => Ok(if env_flag("VALIDATE_VERBOSE", "1") {
+            2
+        } else {
+            1
+        }),
     }
 }
 
@@ -1117,7 +1231,11 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                     eprintln!("validate: --requalify-cell needs TEST MODE BACKEND");
                     return Err(2);
                 }
-                focused.push(Focused::RequalifyCell { test, mode, backend });
+                focused.push(Focused::RequalifyCell {
+                    test,
+                    mode,
+                    backend,
+                });
                 i += 3;
             }
             // `--envelope-only` and `--envelope-compare` are ONE mode in
@@ -1274,7 +1392,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 let nodes = argv.get(i + 2).cloned().unwrap_or_default();
                 if lane.is_empty() || nodes.is_empty() {
                     eprintln!("validate: --only needs <lane> <group.job>[,<group.job>...]");
-                    eprintln!("          e.g. ./scripts/validate.rs --only portable test.sabre_examples");
+                    eprintln!(
+                        "          e.g. ./scripts/validate.rs --only portable test.sabre_examples"
+                    );
                     return Err(2);
                 }
                 focused.push(Focused::Only { lane, nodes });
@@ -1295,7 +1415,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         focused.push(Focused::Selective { shallow });
     }
     if envelope {
-        focused.push(Focused::Envelope { baseline: envelope_baseline });
+        focused.push(Focused::Envelope {
+            baseline: envelope_baseline,
+        });
     }
     if focused.len() > 1 {
         eprintln!("validate: choose only one focused validation mode");
@@ -1312,8 +1434,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         && (args.selected.is_some()
             || !matches!(
                 (&args.focused, args.level),
-                (None, Level::Full | Level::PortableOnly)
-                    | (Some(Focused::HostedPortable), _)
+                (None, Level::Full | Level::PortableOnly) | (Some(Focused::HostedPortable), _)
             ))
     {
         eprintln!(
@@ -1334,8 +1455,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     if matches!(
         args.focused,
         Some(Focused::HostedPortable | Focused::HostedPrivileged)
-    )
-        && !args.allow_local_off_the_record_run
+    ) && !args.allow_local_off_the_record_run
         && !args.show_plan
     {
         eprintln!("validate: hosted selections are off-record shard execution modes");
@@ -1366,7 +1486,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         return Err(2);
     }
     if shallow && args.baseline.is_some() {
-        eprintln!("validate: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline");
+        eprintln!(
+            "validate: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline"
+        );
         return Err(2);
     }
     Ok(args)
@@ -1409,11 +1531,18 @@ fn nested_scope_probe_step(
     timeout_s: i64,
 ) -> dagrun::model::Step {
     let mut step = step_with_caps(
-        "safe_ci_scope_self_test", job, "Exercise nested per-step cgroup containment",
-        cmd, Vec::new(), timeout_s, timeout_s, 512 * 1024 * 1024,
+        "safe_ci_scope_self_test",
+        job,
+        "Exercise nested per-step cgroup containment",
+        cmd,
+        Vec::new(),
+        timeout_s,
+        timeout_s,
+        512 * 1024 * 1024,
     );
     if let Some(mode) = mode {
-        step.env.insert(NESTED_SCOPE_SELF_TEST_ENV.into(), mode.into());
+        step.env
+            .insert(NESTED_SCOPE_SELF_TEST_ENV.into(), mode.into());
     }
     step.env.insert("DAGRUN_NO_STEP_LOGS".into(), "1".into());
     step.hint.preferred_inner_jobs = Some(1);
@@ -1442,7 +1571,9 @@ fn nested_scope_probe_step(
 /// intended fail-closed behavior — the fix there is the step's declaration, not a
 /// wider number here.
 fn scheduler_cpu_budget() -> i64 {
-    container_core_budget().min(aggregate_slice_max_cpus()).max(1)
+    container_core_budget()
+        .min(aggregate_slice_max_cpus())
+        .max(1)
 }
 
 fn run_one_nested_scope_probe_step(
@@ -1456,10 +1587,20 @@ fn run_one_nested_scope_probe_step(
     };
     cfg.steps.push(step);
     let result = run_dag_boxed_deadline(
-        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+        &cfg,
+        1,
+        true,
+        2,
+        cgroups,
+        None,
+        Some(1),
+        Some(run_timeout_s),
     );
-    if !result.ok || result.run_timed_out || !result.skipped.is_empty()
-        || result.outcomes.len() != 1 || !result.outcomes[0].ok
+    if !result.ok
+        || result.run_timed_out
+        || !result.skipped.is_empty()
+        || result.outcomes.len() != 1
+        || !result.outcomes[0].ok
     {
         return Err(format!(
             "nested cgroup step did not pass exactly once: ok={} timed_out={} outcomes={:?} skipped={:?}",
@@ -1480,9 +1621,18 @@ fn run_one_nested_scope_signal_step(
     };
     cfg.steps.push(step);
     let result = run_dag_boxed_deadline(
-        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+        &cfg,
+        1,
+        true,
+        2,
+        cgroups,
+        None,
+        Some(1),
+        Some(run_timeout_s),
     );
-    if result.ok || result.run_timed_out || !result.skipped.is_empty()
+    if result.ok
+        || result.run_timed_out
+        || !result.skipped.is_empty()
         || result.outcomes.len() != 1
         || result.outcomes[0].ok
         || result.outcomes[0].returncode != Some(-libc::SIGTERM as i64)
@@ -1502,17 +1652,24 @@ fn run_nested_scope_probe() -> Result<String, String> {
     match std::env::var(NESTED_SCOPE_SELF_TEST_ENV).as_deref() {
         Ok(NESTED_SCOPE_OUTER) => {
             let cgroups = safe_ci_scope::resolve_cgroups(
-                "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
-            ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
+                "safe-ci nested self-test outer",
+                false,
+                Some(NESTED_SCOPE_RUNTIME_S),
+                true,
+            )
+            .map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
             let exe = std::env::current_exe()
                 .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
-            let exe = exe.to_str()
+            let exe = exe
+                .to_str()
                 .ok_or_else(|| "self-test executable path is not UTF-8".to_string())?;
             let command = format!("{} --self-test", validate_plan::shell_quote(exe));
             run_one_nested_scope_probe_step(
                 cgroups.clone(),
                 nested_scope_probe_step(
-                    "outer_child", command.clone(), Some(NESTED_SCOPE_INNER),
+                    "outer_child",
+                    command.clone(),
+                    Some(NESTED_SCOPE_INNER),
                     NESTED_OUTER_CHILD_STEP_S,
                 ),
                 NESTED_OUTER_CHILD_RUN_S,
@@ -1520,14 +1677,20 @@ fn run_nested_scope_probe() -> Result<String, String> {
             run_one_nested_scope_signal_step(
                 cgroups.clone(),
                 nested_scope_probe_step(
-                    "signal_child", command, Some(NESTED_SCOPE_SIGNAL), NESTED_SIGNAL_STEP_S,
+                    "signal_child",
+                    command,
+                    Some(NESTED_SCOPE_SIGNAL),
+                    NESTED_SIGNAL_STEP_S,
                 ),
                 NESTED_SIGNAL_RUN_S,
             )?;
             run_one_nested_scope_probe_step(
                 cgroups,
                 nested_scope_probe_step(
-                    "surviving_sibling", "true".into(), None, NESTED_SURVIVOR_STEP_S,
+                    "surviving_sibling",
+                    "true".into(),
+                    None,
+                    NESTED_SURVIVOR_STEP_S,
                 ),
                 NESTED_SURVIVOR_RUN_S,
             )?;
@@ -1540,13 +1703,15 @@ fn run_nested_scope_probe() -> Result<String, String> {
             // This process inherited the outer scope's RuntimeMax; it did not
             // request a second systemd unit. Every other limit stays mandatory.
             let cgroups = safe_ci_scope::resolve_cgroups(
-                "safe-ci nested self-test inner", false, None, false,
-            ).map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
+                "safe-ci nested self-test inner",
+                false,
+                None,
+                false,
+            )
+            .map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
             run_one_nested_scope_probe_step(
                 cgroups,
-                nested_scope_probe_step(
-                    "inner_child", "true".into(), None, NESTED_INNER_STEP_S,
-                ),
+                nested_scope_probe_step("inner_child", "true".into(), None, NESTED_INNER_STEP_S),
                 NESTED_INNER_RUN_S,
             )?;
             Ok("nested child verified the outer scope and dispatched its own boxed step".into())
@@ -1561,14 +1726,22 @@ fn run_nested_scope_probe() -> Result<String, String> {
                 libc::signal(libc::SIGTERM, libc::SIG_DFL);
             }
             let _cgroups = safe_ci_scope::resolve_cgroups(
-                "safe-ci nested signal self-test", false, None, false,
-            ).map_err(|code| format!("nested signal cgroup setup refused with exit {code}"))?;
+                "safe-ci nested signal self-test",
+                false,
+                None,
+                false,
+            )
+            .map_err(|code| format!("nested signal cgroup setup refused with exit {code}"))?;
             eprintln!("nested signal child resolved inherited cgroups; delivering SIGTERM");
             let raised = unsafe { libc::raise(libc::SIGTERM) };
-            Err(format!("nested signal child survived SIGTERM (libc::raise rc={raised})"))
+            Err(format!(
+                "nested signal child survived SIGTERM (libc::raise rc={raised})"
+            ))
         }
         Ok(other) => Err(format!("unknown nested scope self-test mode {other:?}")),
-        Err(error) => Err(format!("nested scope self-test mode is unavailable: {error}")),
+        Err(error) => Err(format!(
+            "nested scope self-test mode is unavailable: {error}"
+        )),
     }
 }
 
@@ -1581,7 +1754,8 @@ fn nested_scope_self_test() -> Result<String, String> {
     command
         .arg("--kill-after=5s")
         .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
-        .arg(exe).arg("--self-test")
+        .arg(exe)
+        .arg("--self-test")
         .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_OUTER)
         .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
         .env("DAGRUN_NO_STEP_LOGS", "1")
@@ -1609,7 +1783,8 @@ fn nested_scope_self_test() -> Result<String, String> {
     if !output.status.success() {
         return Err(format!(
             "real nested scope self-test failed with {}\nstdout:\n{}\nstderr:\n{}",
-            output.status, String::from_utf8_lossy(&output.stdout),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -1646,7 +1821,9 @@ fn nested_scope_self_test() -> Result<String, String> {
             nested_scope_placement_evidence(&combined, false)?
         ),
     };
-    Ok(format!("safe-ci scope: real outer -> step child -> nested boxed step passed{placement}"))
+    Ok(format!(
+        "safe-ci scope: real outer -> step child -> nested boxed step passed{placement}"
+    ))
 }
 
 /// Inert two-sided bracket for [`nested_scope_placement_evidence`].
@@ -1670,7 +1847,9 @@ fn nested_scope_placement_bracket() -> Result<String, String> {
             }
         }
         if nested_scope_placement_evidence(&format!("{outer}\n{outside}\n"), required).is_ok() {
-            return Err(format!("an applied placement the nested step escaped was accepted (required={required})"));
+            return Err(format!(
+                "an applied placement the nested step escaped was accepted (required={required})"
+            ));
         }
         if nested_scope_placement_evidence(&format!("{outer}\n"), required).is_ok() {
             return Err(format!(
@@ -1680,11 +1859,17 @@ fn nested_scope_placement_bracket() -> Result<String, String> {
     }
     match nested_scope_placement_evidence(&format!("{not_applied}\n{within}\n"), false) {
         Ok(line) if !line.contains("APPLIED to the scope") => {}
-        other => return Err(format!("an unrequested, unapplied placement was not left as a non-gate: {other:?}")),
+        other => {
+            return Err(format!(
+                "an unrequested, unapplied placement was not left as a non-gate: {other:?}"
+            ));
+        }
     }
     for stderr in [format!("{not_applied}\n{within}\n"), String::new()] {
         if nested_scope_placement_evidence(&stderr, true).is_ok() {
-            return Err(format!("a required placement the outer scope did not apply was accepted: {stderr:?}"));
+            return Err(format!(
+                "a required placement the outer scope did not apply was accepted: {stderr:?}"
+            ));
         }
     }
     Ok("nested scope CPU placement: APPLIED requires the nested step inside it; a required placement must be APPLIED; an unrequested one is not a gate".into())
@@ -1711,14 +1896,19 @@ fn nested_scope_placement_evidence(output: &str, required: bool) -> Result<Strin
             None => Err(format!(
                 "the outer scope reported CPU placement APPLIED but the nested step reported no inherited \
                  placement; placement lines seen: {:?}",
-                output.lines().filter(|line| line.contains("CPU placement")).collect::<Vec<_>>()
+                output
+                    .lines()
+                    .filter(|line| line.contains("CPU placement"))
+                    .collect::<Vec<_>>()
             )),
         };
     }
     if required {
         let outer = output
             .lines()
-            .find(|line| line.contains("safe-ci nested self-test outer: ") && line.contains("CPU placement"))
+            .find(|line| {
+                line.contains("safe-ci nested self-test outer: ") && line.contains("CPU placement")
+            })
             .unwrap_or("no outer CPU placement line");
         return Err(format!(
             "the self-test requested a CPU placement on a host whose user manager enforces AllowedCPUs=, \
@@ -1929,10 +2119,13 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 metadata.ctime_nsec(),
             )
         };
-        let ledger_before = std::fs::symlink_metadata(ledger)
-            .map_err(|error| format!("submodule service result: cannot inspect private ledger: {error}"))?;
+        let ledger_before = std::fs::symlink_metadata(ledger).map_err(|error| {
+            format!("submodule service result: cannot inspect private ledger: {error}")
+        })?;
         if !ledger_before.is_file() || ledger_before.len() != 0 {
-            return Err("submodule service result: private ledger must be an empty regular file".into());
+            return Err(
+                "submodule service result: private ledger must be an empty regular file".into(),
+            );
         }
         let mut command = Command::new("timeout");
         // The child validate finds this fixture checkout from its working
@@ -1993,8 +2186,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         let output = command
             .output()
             .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))?;
-        let ledger_after = std::fs::symlink_metadata(ledger)
-            .map_err(|error| format!("submodule service result: cannot reread private ledger: {error}"))?;
+        let ledger_after = std::fs::symlink_metadata(ledger).map_err(|error| {
+            format!("submodule service result: cannot reread private ledger: {error}")
+        })?;
         if ledger_identity(&ledger_after) != ledger_identity(&ledger_before) {
             return Err("submodule service result: child modified the private ledger".into());
         }
@@ -2019,8 +2213,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 
     let fixture = tempfile::tempdir()
         .map_err(|error| format!("submodule service result: cannot create fixture: {error}"))?;
-    let ledger = tempfile::NamedTempFile::new_in(fixture.path())
-        .map_err(|error| format!("submodule service result: cannot create private ledger: {error}"))?;
+    let ledger = tempfile::NamedTempFile::new_in(fixture.path()).map_err(|error| {
+        format!("submodule service result: cannot create private ledger: {error}")
+    })?;
     let checkout = fixture.path().join("hermit");
     // The bracket needs the current tree and recorded AU API, not unrelated
     // branch history. Keep transport copying (--no-local), so the disposable
@@ -2028,8 +2223,14 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     checked_command(
         scratch_git()
             .args([
-                "clone", "--quiet", "--no-local", "--no-recurse-submodules",
-                "--depth", "1", "--single-branch", "--no-tags",
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--no-recurse-submodules",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--no-tags",
             ])
             .arg(root)
             .arg(&checkout),
@@ -2099,8 +2300,13 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     checked_command(
         scratch_git()
             .args([
-                "clone", "--quiet", "--no-local",
-                "--depth", "1", "--single-branch", "--no-tags",
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--no-tags",
             ])
             .arg(root.join("agent-utils"))
             .arg(checkout.join("agent-utils")),
@@ -2169,8 +2375,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 /// warm-cache scheduling estimate; it is not the hard safety ceiling.
 fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     const MIB: i64 = 1024 * 1024;
-    const EXPECTED: (i64, Option<i64>, Option<i64>) =
-        (600, Some(64 * MIB), Some(1024 * MIB));
+    const EXPECTED: (i64, Option<i64>, Option<i64>) = (600, Some(64 * MIB), Some(1024 * MIB));
     fn policy(step: &Step) -> (i64, Option<i64>, Option<i64>) {
         (
             step.timeout,
@@ -2179,7 +2384,10 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
         )
     }
     let cfg = validate_plan::lane_config(root, "portable")?;
-    let mut matches = cfg.steps.iter().filter(|step| step.tag() == "check.shard_coverage");
+    let mut matches = cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "check.shard_coverage");
     let shipped = matches
         .next()
         .ok_or("shard-coverage resource policy: portable DAG lost check.shard_coverage")?;
@@ -2200,7 +2408,9 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     old_cap.hint.hard_mem_max_bytes = Some(512 * MIB);
     for (name, mutated) in [("60s timeout", old_timeout), ("512 MiB hard cap", old_cap)] {
         if policy(&mutated) == EXPECTED {
-            return Err(format!("shard-coverage resource policy: planted {name} was accepted"));
+            return Err(format!(
+                "shard-coverage resource policy: planted {name} was accepted"
+            ));
         }
     }
 
@@ -2213,7 +2423,8 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
 // This marker selects only a small child of the existing --self-test entrypoint.
 // An ordinary validation invocation never consults it.
 const RUNNER_LOG_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_RUNNER_LOG_SELF_TEST";
-const RUNNER_LOG_SELF_TEST_OK: &str = "runner log isolation: pass and exit 23 retained; outer bytes unchanged";
+const RUNNER_LOG_SELF_TEST_OK: &str =
+    "runner log isolation: pass and exit 23 retained; outer bytes unchanged";
 const RUNNER_LOG_SENTINEL: &[u8] = b"outer runner evidence\0must not change\xff\n";
 
 /// The standalone self-test owns its journal, including all in-process DAGs and
@@ -2225,7 +2436,9 @@ const RUNNER_LOG_SENTINEL: &[u8] = b"outer runner evidence\0must not change\xff\
 /// and subprocesses have joined before the environment is restored. Scope probe
 /// re-execs inherit this directory from their owning self-test; they do not
 /// create a new temporary owner that would be lost across exec.
-fn with_self_test_runner_logs<T>(run: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
+fn with_self_test_runner_logs<T>(
+    run: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
     struct RestoreLogDir(Option<std::ffi::OsString>);
     impl Drop for RestoreLogDir {
         fn drop(&mut self) {
@@ -2242,15 +2455,18 @@ fn with_self_test_runner_logs<T>(run: impl FnOnce(&Path) -> Result<T, String>) -
         .prefix("validate-self-test-runner-logs-")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
-        .map_err(|error| format!("self-test runner logs: cannot create private directory: {error}"))?;
+        .map_err(|error| {
+            format!("self-test runner logs: cannot create private directory: {error}")
+        })?;
     let restore = RestoreLogDir(std::env::var_os("DAGRUN_LOG_DIR"));
     // SAFETY: called at the serial self-test boundary, before fixture threads or
     // subprocesses start. No other environment variable or runner policy changes.
     unsafe { std::env::set_var("DAGRUN_LOG_DIR", logs.path()) };
     let result = run(logs.path());
     drop(restore);
-    let cleanup = logs.close()
-        .map_err(|error| format!("self-test runner logs: cannot remove private directory: {error}"));
+    let cleanup = logs.close().map_err(|error| {
+        format!("self-test runner logs: cannot remove private directory: {error}")
+    });
     match (result, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -2261,63 +2477,125 @@ fn with_self_test_runner_logs<T>(run: impl FnOnce(&Path) -> Result<T, String>) -
 
 fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
     if logs == outer || std::env::var_os("DAGRUN_LOG_DIR").as_deref() != Some(logs.as_os_str()) {
-        return Err("runner log isolation: self-test did not replace the inherited directory".into());
+        return Err(
+            "runner log isolation: self-test did not replace the inherited directory".into(),
+        );
     }
-    let read = |path: &Path| std::fs::read(path)
-        .map_err(|error| format!("runner log isolation: cannot read {}: {error}", path.display()));
-    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|error| {
+            format!(
+                "runner log isolation: cannot read {}: {error}",
+                path.display()
+            )
+        })
+    };
+    for name in [
+        "journal.jsonl",
+        "pre.submodules.log",
+        "setup.manifest_plan.log",
+    ] {
         if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
-            return Err(format!("runner log isolation: outer {name} changed before dispatch"));
+            return Err(format!(
+                "runner log isolation: outer {name} changed before dispatch"
+            ));
         }
     }
 
     // The child inherits the redirected environment without a command-local
     // override, just like raw run-dag and the missing-submodule validator.
     let child = Command::new("sh")
-        .args(["-c", "printf '%s' \"$DAGRUN_LOG_DIR\" > \"$DAGRUN_LOG_DIR/child-directory\"; exit 23"])
+        .args([
+            "-c",
+            "printf '%s' \"$DAGRUN_LOG_DIR\" > \"$DAGRUN_LOG_DIR/child-directory\"; exit 23",
+        ])
         .output()
         .map_err(|error| format!("runner log isolation: cannot launch child: {error}"))?;
-    if child.status.code() != Some(23) || !child.stdout.is_empty() || !child.stderr.is_empty()
+    if child.status.code() != Some(23)
+        || !child.stdout.is_empty()
+        || !child.stderr.is_empty()
         || read(&logs.join("child-directory"))? != logs.as_os_str().as_bytes()
     {
-        return Err(format!("runner log isolation: child environment/status changed: {:?}", child.status));
+        return Err(format!(
+            "runner log isolation: child environment/status changed: {:?}",
+            child.status
+        ));
     }
 
-    let step = |group: &str, job: &str, command: &str| step_with_caps(
-        group, job, "runner log isolation fixture", command.into(), Vec::new(),
-        10, 10, 64 * 1024 * 1024,
-    );
+    let step = |group: &str, job: &str, command: &str| {
+        step_with_caps(
+            group,
+            job,
+            "runner log isolation fixture",
+            command.into(),
+            Vec::new(),
+            10,
+            10,
+            64 * 1024 * 1024,
+        )
+    };
     // Real production labels deliberately collide with the seeded outer files.
     let mut skipped = step("post", "must_not_run", "exit 99");
     skipped.deps = vec!["setup.manifest_plan".into()];
-    let cfg = validate_plan::config_from(vec![
-        step("pre", "submodules", "printf 'fixture pass\\n'"),
-        step("setup", "manifest_plan", "printf 'fixture failure\\n'; exit 23"),
-        skipped,
-    ], "runner log isolation fixture");
-    let result = run_lane_once(&cfg, 1, true, 0, None, &logs.join("driver.log"), None, false);
-    if result.complete || result.ok || result.run_timed_out
+    let cfg = validate_plan::config_from(
+        vec![
+            step("pre", "submodules", "printf 'fixture pass\\n'"),
+            step(
+                "setup",
+                "manifest_plan",
+                "printf 'fixture failure\\n'; exit 23",
+            ),
+            skipped,
+        ],
+        "runner log isolation fixture",
+    );
+    let result = run_lane_once(
+        &cfg,
+        1,
+        true,
+        0,
+        None,
+        &logs.join("driver.log"),
+        None,
+        false,
+    );
+    if result.complete
+        || result.ok
+        || result.run_timed_out
         || result.skipped != ["post.must_not_run".to_string()]
-        || result.outcomes.len() != 2 || result.attempts.len() != 2
+        || result.outcomes.len() != 2
+        || result.attempts.len() != 2
     {
-        return Err(format!("runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
-            result.complete, result.ok, result.outcomes, result.skipped));
+        return Err(format!(
+            "runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
+            result.complete, result.ok, result.outcomes, result.skipped
+        ));
     }
     for (tag, code, bytes) in [
         ("pre.submodules", 0, b"fixture pass\n".as_slice()),
         ("setup.manifest_plan", 23, b"fixture failure\n".as_slice()),
     ] {
-        let outcomes = result.outcomes.iter().filter(|row| row.tag == tag).collect::<Vec<_>>();
-        if outcomes.len() != 1 || outcomes[0].returncode != Some(code)
-            || outcomes[0].ok != (code == 0) || outcomes[0].aborted
-            || outcomes[0].timed_out || outcomes[0].cpu_timed_out
+        let outcomes = result
+            .outcomes
+            .iter()
+            .filter(|row| row.tag == tag)
+            .collect::<Vec<_>>();
+        if outcomes.len() != 1
+            || outcomes[0].returncode != Some(code)
+            || outcomes[0].ok != (code == 0)
+            || outcomes[0].aborted
+            || outcomes[0].timed_out
+            || outcomes[0].cpu_timed_out
             || read(&logs.join(format!("{tag}.log")))? != bytes
         {
-            return Err(format!("runner log isolation: wrong outcome or step bytes for {tag}"));
+            return Err(format!(
+                "runner log isolation: wrong outcome or step bytes for {tag}"
+            ));
         }
     }
     let journal = read(&logs.join("journal.jsonl"))?;
-    let rows = journal.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
+    let rows = journal
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
         .map(serde_json::from_slice::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("runner log isolation: malformed private journal: {error}"))?;
@@ -2329,42 +2607,73 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
     {
         return Err("runner log isolation: string `false` journal verdict was accepted".into());
     }
-    let ends = rows.iter().filter(|row| row["event"] == "step_end").collect::<Vec<_>>();
-    let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
-    let terminal_steps = ends.iter().chain(&skips)
+    let ends = rows
+        .iter()
+        .filter(|row| row["event"] == "step_end")
+        .collect::<Vec<_>>();
+    let skips = rows
+        .iter()
+        .filter(|row| row["event"] == "step_skip")
+        .collect::<Vec<_>>();
+    let terminal_steps = ends
+        .iter()
+        .chain(&skips)
         .filter_map(|row| row["step"].as_str())
         .collect::<BTreeSet<_>>();
-    let expected_terminal_steps = [
-        "pre.submodules",
-        "setup.manifest_plan",
-        "post.must_not_run",
-    ].into_iter().collect::<BTreeSet<_>>();
+    let expected_terminal_steps = ["pre.submodules", "setup.manifest_plan", "post.must_not_run"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     if ends.len() + skips.len() != expected_terminal_steps.len()
         || terminal_steps != expected_terminal_steps
     {
-        return Err(format!("runner log isolation: incomplete terminal accounting: {terminal_steps:?}"));
+        return Err(format!(
+            "runner log isolation: incomplete terminal accounting: {terminal_steps:?}"
+        ));
     }
     for (tag, ok) in [("pre.submodules", true), ("setup.manifest_plan", false)] {
-        let starts = rows.iter().filter(|row| row["event"] == "step_start" && row["step"] == tag).count();
-        let matching_ends = ends.iter().filter(|row| row["step"] == tag).collect::<Vec<_>>();
-        let observed_ok = matching_ends.first()
+        let starts = rows
+            .iter()
+            .filter(|row| row["event"] == "step_start" && row["step"] == tag)
+            .count();
+        let matching_ends = ends
+            .iter()
+            .filter(|row| row["step"] == tag)
+            .collect::<Vec<_>>();
+        let observed_ok = matching_ends
+            .first()
             .ok_or_else(|| format!("runner log isolation: no terminal journal record for {tag}"))
-            .and_then(|row| dagrun::require_step_end_ok(row)
-                .map_err(|error| format!("runner log isolation: {tag}: {error}")))?;
-        if starts != 1 || matching_ends.len() != 1 || observed_ok != ok
-            || matching_ends[0]["timed_out"] != "false" || matching_ends[0]["cpu_timed_out"] != "false"
+            .and_then(|row| {
+                dagrun::require_step_end_ok(row)
+                    .map_err(|error| format!("runner log isolation: {tag}: {error}"))
+            })?;
+        if starts != 1
+            || matching_ends.len() != 1
+            || observed_ok != ok
+            || matching_ends[0]["timed_out"] != "false"
+            || matching_ends[0]["cpu_timed_out"] != "false"
         {
-            return Err(format!("runner log isolation: missing or changed start/end record for {tag}"));
+            return Err(format!(
+                "runner log isolation: missing or changed start/end record for {tag}"
+            ));
         }
     }
-    if skips.len() != 1 || skips[0]["step"] != "post.must_not_run"
+    if skips.len() != 1
+        || skips[0]["step"] != "post.must_not_run"
         || skips[0]["reason"] != "dependency_failed"
     {
-        return Err(format!("runner log isolation: missing or changed skip record: {skips:?}"));
+        return Err(format!(
+            "runner log isolation: missing or changed skip record: {skips:?}"
+        ));
     }
-    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+    for name in [
+        "journal.jsonl",
+        "pre.submodules.log",
+        "setup.manifest_plan.log",
+    ] {
         if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
-            return Err(format!("runner log isolation: outer {name} changed after dispatch"));
+            return Err(format!(
+                "runner log isolation: outer {name} changed after dispatch"
+            ));
         }
     }
 
@@ -2373,16 +2682,25 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
     let previous = std::env::var_os("DAGRUN_LOG_DIR");
     for fail in [false, true] {
         let nested = with_self_test_runner_logs(|inner| {
-            if inner == logs || std::env::var_os("DAGRUN_LOG_DIR").as_deref() != Some(inner.as_os_str()) {
+            if inner == logs
+                || std::env::var_os("DAGRUN_LOG_DIR").as_deref() != Some(inner.as_os_str())
+            {
                 return Err("runner log isolation: nested directory was not selected".into());
             }
-            if fail { Err("intentional fixture error".into()) } else { Ok(inner.to_path_buf()) }
+            if fail {
+                Err("intentional fixture error".into())
+            } else {
+                Ok(inner.to_path_buf())
+            }
         });
         if std::env::var_os("DAGRUN_LOG_DIR") != previous
             || (!fail && !nested.as_ref().is_ok_and(|path| !path.exists()))
-            || (fail && nested.as_ref().err().map(String::as_str) != Some("intentional fixture error"))
+            || (fail
+                && nested.as_ref().err().map(String::as_str) != Some("intentional fixture error"))
         {
-            return Err("runner log isolation: success/error did not restore the inherited value".into());
+            return Err(
+                "runner log isolation: success/error did not restore the inherited value".into(),
+            );
         }
     }
     // This probe is single-threaded again after run_lane_once has joined.
@@ -2402,22 +2720,33 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
 }
 
 fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
-    let outer = tempfile::Builder::new().prefix("validate-runner-log-outer-")
+    let outer = tempfile::Builder::new()
+        .prefix("validate-runner-log-outer-")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(|error| format!("runner log isolation: cannot create outer fixture: {error}"))?;
-    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+    for name in [
+        "journal.jsonl",
+        "pre.submodules.log",
+        "setup.manifest_plan.log",
+    ] {
         std::fs::write(outer.path().join(name), RUNNER_LOG_SENTINEL)
             .map_err(|error| format!("runner log isolation: cannot seed {name}: {error}"))?;
-        std::fs::set_permissions(outer.path().join(name), std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("runner log isolation: cannot make {name} private: {error}"))?;
+        std::fs::set_permissions(
+            outer.path().join(name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .map_err(|error| format!("runner log isolation: cannot make {name} private: {error}"))?;
     }
     let inherited = std::env::var_os("DAGRUN_LOG_DIR");
     // Command-local environment keeps this test from mutating its caller. Use
     // the actual standalone entrypoint, including the isolation dispatch.
     let output = Command::new("timeout")
         .args(["--kill-after=2s", "60s"])
-        .arg(std::env::current_exe().map_err(|error| format!("runner log isolation: executable: {error}"))?)
+        .arg(
+            std::env::current_exe()
+                .map_err(|error| format!("runner log isolation: executable: {error}"))?,
+        )
         .arg("--self-test")
         .env(RUNNER_LOG_SELF_TEST_ENV, outer.path())
         .env("DAGRUN_LOG_DIR", outer.path())
@@ -2426,21 +2755,38 @@ fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
         .output()
         .map_err(|error| format!("runner log isolation: cannot launch CLI probe: {error}"))?;
     if !output.status.success()
-        || !String::from_utf8_lossy(&output.stdout).lines().any(|line| line == RUNNER_LOG_SELF_TEST_OK)
+        || !String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == RUNNER_LOG_SELF_TEST_OK)
         || std::env::var_os("DAGRUN_LOG_DIR") != inherited
     {
-        return Err(format!("runner log isolation: CLI probe failed: status={} stdout={} stderr={}",
-            output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "runner log isolation: CLI probe failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+    for name in [
+        "journal.jsonl",
+        "pre.submodules.log",
+        "setup.manifest_plan.log",
+    ] {
         if std::fs::read(outer.path().join(name))
-            .map_err(|error| format!("runner log isolation: cannot reread {name}: {error}"))? != RUNNER_LOG_SENTINEL
+            .map_err(|error| format!("runner log isolation: cannot reread {name}: {error}"))?
+            != RUNNER_LOG_SENTINEL
         {
-            return Err(format!("runner log isolation: CLI probe changed outer {name}"));
+            return Err(format!(
+                "runner log isolation: CLI probe changed outer {name}"
+            ));
         }
     }
-    if std::fs::read_dir(outer.path()).map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?.len() != 3
+    if std::fs::read_dir(outer.path())
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .len()
+        != 3
     {
         return Err("runner log isolation: CLI probe wrote extra outer evidence".into());
     }
@@ -2459,7 +2805,10 @@ fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
     run_state_path_bracket()?;
-    println!("  {}", committed_validation_execution_bracket(&repo_root())?);
+    println!(
+        "  {}",
+        committed_validation_execution_bracket(&repo_root())?
+    );
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_engine_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
@@ -2476,15 +2825,57 @@ fn self_test() -> Result<(), String> {
         let cases: &[(CompatMode, bool, bool, bool, D, bool)] = &[
             // PortableStrict: the whole point of this change. A listed failure is REPORTED and
             // STILL BLOCKS; a listed pass is reported as a stale expectation.
-            (CompatMode::PortableStrict, false, true, false, D::KnownFailClosedBlocking, true),
-            (CompatMode::PortableStrict, true, true, false, D::PassedButListedFailClosed, false),
+            (
+                CompatMode::PortableStrict,
+                false,
+                true,
+                false,
+                D::KnownFailClosedBlocking,
+                true,
+            ),
+            (
+                CompatMode::PortableStrict,
+                true,
+                true,
+                false,
+                D::PassedButListedFailClosed,
+                false,
+            ),
             // ...and an UNLISTED failure is unaffected.
-            (CompatMode::PortableStrict, false, false, false, D::Blocking, true),
+            (
+                CompatMode::PortableStrict,
+                false,
+                false,
+                false,
+                D::Blocking,
+                true,
+            ),
             // Bounded portable diagnostics keep their existing nonblocking treatment.
-            (CompatMode::PortableStrict, false, false, true, D::PortableDiagnostic, false),
+            (
+                CompatMode::PortableStrict,
+                false,
+                false,
+                true,
+                D::PortableDiagnostic,
+                false,
+            ),
             // Strict keeps its historical exemption, and only Strict has it.
-            (CompatMode::Strict, false, true, false, D::KnownFailClosedExempt, false),
-            (CompatMode::Strict, true, true, false, D::PassedButListedFailClosed, false),
+            (
+                CompatMode::Strict,
+                false,
+                true,
+                false,
+                D::KnownFailClosedExempt,
+                false,
+            ),
+            (
+                CompatMode::Strict,
+                true,
+                true,
+                false,
+                D::PassedButListedFailClosed,
+                false,
+            ),
             (CompatMode::Strict, false, false, false, D::Blocking, true),
             // No other mode consults either table: a failure blocks whatever the tables say.
             (CompatMode::Sabre, false, true, false, D::Blocking, true),
@@ -2639,8 +3030,13 @@ fn self_test() -> Result<(), String> {
                 "PortableStrict nonblocking failures did not come from the same typed disposition as the verdict: {nonblocking:?}"
             ));
         }
-        if blocking.iter().any(|l| l == "listed_passes" || l == "plain_passes") {
-            return Err(format!("a PASSING row was reported as blocking: blocking={blocking:?}"));
+        if blocking
+            .iter()
+            .any(|l| l == "listed_passes" || l == "plain_passes")
+        {
+            return Err(format!(
+                "a PASSING row was reported as blocking: blocking={blocking:?}"
+            ));
         }
 
         // A scheduler record is not evidence that the program ran. Spawn and
@@ -2690,7 +3086,6 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
-
 
     // Strict-execution bracket for the legacy below-L2 compatibility modes.
     // `--strict` must be a Hermit option before the first guest `--`; these
@@ -2839,14 +3234,15 @@ fn self_test() -> Result<(), String> {
     if (writeback_failed.verdict, writeback_failed.exit_code)
         != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
         || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: PASSED")
-        || !lines.iter().any(|line| line.contains("validation verdict above is unchanged"))
+        || !lines
+            .iter()
+            .any(|line| line.contains("validation verdict above is unchanged"))
     {
         return Err(format!(
             "summary: a required scorecard write-back failure did not preserve the validation \
              verdict, fail the command distinctly, and remain before the final status: \
              verdict={:?} command_exit={} lines={lines:?}",
-            writeback_failed.verdict,
-            writeback_failed.exit_code,
+            writeback_failed.verdict, writeback_failed.exit_code,
         ));
     }
     let writeback_result_dir = tempfile::tempdir()
@@ -2927,12 +3323,8 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    let mut failed_summary = RunSummary::new(
-        Verdict::Fail,
-        1,
-        "full",
-        vec!["product test failed".into()],
-    );
+    let mut failed_summary =
+        RunSummary::new(Verdict::Fail, 1, "full", vec!["product test failed".into()]);
     failed_summary.nodes_executed = 1;
     failed_summary.executed_tests = Some(2);
     failed_summary.passed_tests = Some(1);
@@ -2971,23 +3363,19 @@ fn self_test() -> Result<(), String> {
     {
         return Err(format!(
             "summary: permissionless service-result publication did not fail clearly as COULD_NOT_RUN: {permission_error}; verdict={:?}; exit={}",
-            permissionless_summary.verdict,
-            permissionless_summary.exit_code,
+            permissionless_summary.verdict, permissionless_summary.exit_code,
         ));
     }
-    let failure_publish_error = publish_validation_service_result_or_refuse(
-        Some(permissionless_path),
-        &mut failed_summary,
-    )
-    .expect_err("failed service result unexpectedly wrote beneath /proc/self");
+    let failure_publish_error =
+        publish_validation_service_result_or_refuse(Some(permissionless_path), &mut failed_summary)
+            .expect_err("failed service result unexpectedly wrote beneath /proc/self");
     if !failure_publish_error.contains("cannot create validation service result beside")
         || failed_summary.verdict != Verdict::Fail
         || failed_summary.exit_code != 1
     {
         return Err(format!(
             "summary: publication failure overwrote a genuine product failure: {failure_publish_error}; verdict={:?}; exit={}",
-            failed_summary.verdict,
-            failed_summary.exit_code,
+            failed_summary.verdict, failed_summary.exit_code,
         ));
     }
     if !usage().contains("COULD_NOT_RUN service result carries the ordered refusal detail") {
@@ -3036,12 +3424,8 @@ fn self_test() -> Result<(), String> {
         },
     });
     let cache_summary = |row: &serde_json::Value| -> Result<RunSummary, String> {
-        let hit = validate_history::cache_lookup(
-            std::slice::from_ref(row),
-            "pass",
-            &cache_key,
-        )
-        .ok_or_else(|| "summary: planted cache row did not produce a cache hit".to_string())?;
+        let hit = validate_history::cache_lookup(std::slice::from_ref(row), "pass", &cache_key)
+            .ok_or_else(|| "summary: planted cache row did not produce a cache hit".to_string())?;
         cache_hit_run_summary(
             &hit,
             "full",
@@ -3081,24 +3465,26 @@ fn self_test() -> Result<(), String> {
             format!("summary: {label} cached passed_tests produced a service-result PASS")
         })?;
         if !refusal.contains("cannot publish a current validation service result") {
-            return Err(format!("summary: {label} cached count refusal was unclear: {refusal}"));
+            return Err(format!(
+                "summary: {label} cached count refusal was unclear: {refusal}"
+            ));
         }
     }
     if validate_evidence::ENABLED {
         let mut schema7_cache_row = cache_row.clone();
-        schema7_cache_row["schema_version"] =
-            serde_json::json!(7);
+        schema7_cache_row["schema_version"] = serde_json::json!(7);
         let refusal = cache_summary(&schema7_cache_row).err().ok_or_else(|| {
             "summary: a schema-7 cache row produced a current service-result PASS".to_string()
         })?;
         if !refusal.contains("cannot publish a current validation service result") {
-            return Err(format!("summary: schema-7 cache refusal was unclear: {refusal}"));
+            return Err(format!(
+                "summary: schema-7 cache refusal was unclear: {refusal}"
+            ));
         }
     }
     let mut legacy_cache_row = cache_row.clone();
-    legacy_cache_row["schema_version"] = serde_json::json!(
-        validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION - 1
-    );
+    legacy_cache_row["schema_version"] =
+        serde_json::json!(validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION - 1);
     if cache_summary(&legacy_cache_row).is_ok() {
         return Err("summary: a legacy cache row produced a current service-result PASS".into());
     }
@@ -3272,7 +3658,9 @@ fn self_test() -> Result<(), String> {
             &mut latest_refused,
         );
         if !latest_not_launched.contains(&retry_tag) || latest_refused.contains(&retry_tag) {
-            return Err("a scheduler not-launched result must be recorded for the latest attempt".into());
+            return Err(
+                "a scheduler not-launched result must be recorded for the latest attempt".into(),
+            );
         }
         update_not_run_explanations(
             &planned,
@@ -3284,9 +3672,7 @@ fn self_test() -> Result<(), String> {
             &mut latest_refused,
         );
         if latest_not_launched.contains(&retry_tag) || !latest_refused.contains(&retry_tag) {
-            return Err(
-                "a retry refusal must replace the earlier not-launched explanation".into(),
-            );
+            return Err("a retry refusal must replace the earlier not-launched explanation".into());
         }
         update_not_run_explanations(
             &planned,
@@ -3316,7 +3702,9 @@ fn self_test() -> Result<(), String> {
             ));
         }
         if ceiling < 1 {
-            return Err(format!("derived wall ceiling {ceiling}s is not a usable budget"));
+            return Err(format!(
+                "derived wall ceiling {ceiling}s is not a usable budget"
+            ));
         }
     }
     if derived_wall_ceiling(441) >= 480 {
@@ -3332,22 +3720,23 @@ fn self_test() -> Result<(), String> {
     {
         return Err("cold strict-compat release build lost its declared eight-job width".into());
     }
-    let reused_compat = build_release_hermit_node(
-        "gate.manifest",
-        "/tmp/target/ci/hermit-strict",
-    );
+    let reused_compat = build_release_hermit_node("gate.manifest", "/tmp/target/ci/hermit-strict");
     if reused_compat.hint.preferred_inner_jobs.is_some()
         || reused_compat.hint.classification != dagrun::model::StepClass::Light
         || !reused_compat.cmd.starts_with("test -x ")
     {
-        return Err("prebuilt strict-compat path stopped being a lightweight existence check".into());
+        return Err(
+            "prebuilt strict-compat path stopped being a lightweight existence check".into(),
+        );
     }
     if parse_git_depth(" 42\n")? != 42 {
         return Err("git-depth parser changed the measured value".into());
     }
     for bad in ["", "0", "-1", "not-a-depth", "1 2"] {
         if parse_git_depth(bad).is_ok() {
-            return Err(format!("git-depth parser accepted invalid measurement {bad:?}"));
+            return Err(format!(
+                "git-depth parser accepted invalid measurement {bad:?}"
+            ));
         }
     }
     let head = git_sha();
@@ -3390,27 +3779,12 @@ fn self_test() -> Result<(), String> {
     if deadline_from_sources(Some(600), true, false, None, None, now_ns).is_ok() {
         return Err("nested timeout accepted a missing scheduler-owned start epoch".into());
     }
-    if deadline_from_sources(
-        Some(600),
-        true,
-        false,
-        Some(now_ns + 1),
-        None,
-        now_ns,
-    )
-    .is_ok()
-    {
+    if deadline_from_sources(Some(600), true, false, Some(now_ns + 1), None, now_ns).is_ok() {
         return Err("nested timeout accepted a future scheduler-owned start epoch".into());
     }
     for nested in [false, true] {
-        if deadline_from_sources(
-            Some(600),
-            nested,
-            false,
-            Some(started_ns),
-            None,
-            now_ns,
-        )? != Some(d1)
+        if deadline_from_sources(Some(600), nested, false, Some(started_ns), None, now_ns)?
+            != Some(d1)
         {
             return Err("scheduler epoch did not bind both top-level and nested deadlines".into());
         }
@@ -3508,7 +3882,9 @@ fn self_test() -> Result<(), String> {
     if !exported.show_plan
         || exported.write_constructed_dag.as_deref() != Some(Path::new("/tmp/constructed.json"))
     {
-        return Err("constructed DAG export: parser lost the output path or inert-plan mode".into());
+        return Err(
+            "constructed DAG export: parser lost the output path or inert-plan mode".into(),
+        );
     }
     let source = parse_argv(&[
         "full".into(),
@@ -3537,7 +3913,9 @@ fn self_test() -> Result<(), String> {
         ])
         .is_ok()
     {
-        return Err("constructed DAG export: malformed or competing output forms were accepted".into());
+        return Err(
+            "constructed DAG export: malformed or competing output forms were accepted".into(),
+        );
     }
     let cargo_default = parse_argv(&["full".into()])
         .map_err(|code| format!("release mode: Cargo default refused with exit {code}"))?;
@@ -3545,17 +3923,26 @@ fn self_test() -> Result<(), String> {
         return Err("release mode: Cargo is not the default".into());
     }
     let buck = parse_argv(&[
-        "full".into(), "--buck-release".into(), "/tmp/public-dotslash".into(),
+        "full".into(),
+        "--buck-release".into(),
+        "/tmp/public-dotslash".into(),
     ])
     .map_err(|code| format!("release mode: explicit Buck opt-in refused with exit {code}"))?;
     if buck.buck_release_dotslash.as_deref() != Some(Path::new("/tmp/public-dotslash"))
         || parse_argv(&[
-            "quick".into(), "--buck-release".into(), "/tmp/public-dotslash".into(),
-        ]).is_ok()
+            "quick".into(),
+            "--buck-release".into(),
+            "/tmp/public-dotslash".into(),
+        ])
+        .is_ok()
         || parse_argv(&[
-            "full".into(), "--buck-release".into(), "/tmp/one".into(),
-            "--buck-release".into(), "/tmp/two".into(),
-        ]).is_ok()
+            "full".into(),
+            "--buck-release".into(),
+            "/tmp/one".into(),
+            "--buck-release".into(),
+            "/tmp/two".into(),
+        ])
+        .is_ok()
     {
         return Err("release mode: opt-in parsing/refusal drifted".into());
     }
@@ -3581,7 +3968,9 @@ fn self_test() -> Result<(), String> {
             .map_err(|e| format!("shell-quote bracket: cannot run bash: {e}"))?;
         let got = String::from_utf8_lossy(&out.stdout);
         if got != probe {
-            return Err(format!("shell-quote bracket: {probe:?} round-tripped as {got:?}"));
+            return Err(format!(
+                "shell-quote bracket: {probe:?} round-tripped as {got:?}"
+            ));
         }
     }
     // Corpus tables must still match the counts the bash declared. This is the
@@ -3707,8 +4096,7 @@ fn self_test() -> Result<(), String> {
         let root = repo_root();
         for lane in ["portable", "privileged"] {
             let mut base = validate_plan::lane_config(&root, lane)?;
-            base.default_jobs_env =
-                format!("VALIDATE_CARRY_{}_JOBS", lane.to_ascii_uppercase());
+            base.default_jobs_env = format!("VALIDATE_CARRY_{}_JOBS", lane.to_ascii_uppercase());
             // POSITIVE: a real lane's own config must carry, and must be grantable.
             let steps = base.steps.clone();
             let carried = validate_plan::config_from_base(&base, steps, "bracket");
@@ -3716,12 +4104,11 @@ fn self_test() -> Result<(), String> {
                 .map_err(|e| format!("carry bracket: lane {lane} did not carry its config: {e}"))?;
             let mut missing_jobs_env = carried.clone();
             missing_jobs_env.default_jobs_env.clear();
-            let jobs_env_error =
-                validate_plan::assert_config_carried(&base, &missing_jobs_env)
-                    .err()
-                    .ok_or_else(|| {
-                        format!("carry bracket: lane {lane} accepted a dropped default_jobs_env")
-                    })?;
+            let jobs_env_error = validate_plan::assert_config_carried(&base, &missing_jobs_env)
+                .err()
+                .ok_or_else(|| {
+                    format!("carry bracket: lane {lane} accepted a dropped default_jobs_env")
+                })?;
             if !jobs_env_error.contains("default_jobs_env") {
                 return Err(format!(
                     "carry bracket: lane {lane} dropped jobs env but named {jobs_env_error}"
@@ -3731,7 +4118,10 @@ fn self_test() -> Result<(), String> {
             if !bad.is_empty() {
                 return Err(format!(
                     "grantable bracket: lane {lane} carried its caps yet still reports {} \
-                     ungrantable demand(s): {:?}", bad.len(), &bad[..bad.len().min(3)]));
+                     ungrantable demand(s): {:?}",
+                    bad.len(),
+                    &bad[..bad.len().min(3)]
+                ));
             }
             for unsupported in ["hermit_guest", "kvm"] {
                 if base.resource_caps.contains_key(unsupported)
@@ -3763,7 +4153,8 @@ fn self_test() -> Result<(), String> {
                 if starved.is_empty() {
                     return Err(format!(
                         "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
-                         ungrantable -- the check is inert and would not have caught the stall"));
+                         ungrantable -- the check is inert and would not have caught the stall"
+                    ));
                 }
                 let named = base
                     .resource_caps
@@ -3782,11 +4173,16 @@ fn self_test() -> Result<(), String> {
             if validate_plan::assert_config_carried(&base, &defaulted).is_ok() {
                 return Err(format!(
                     "carry bracket: lane {lane} rebuilt from Default::default() compared EQUAL to \
-                     its file config -- the assertion cannot detect the bug it exists for"));
+                     its file config -- the assertion cannot detect the bug it exists for"
+                ));
             }
-            println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
+            println!(
+                "  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
 cleared-caps refusal names {} starved step(s)",
-                     base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
+                base.resource_caps.len(),
+                base.default_step_timeout,
+                cleared_cap_starvation
+            );
         }
     }
     // The full hot path selects the committed full-labelled graph and pays the
@@ -3794,7 +4190,8 @@ cleared-caps refusal names {} starved step(s)",
     // and the explicit refusal of the removed sequential-lanes spelling.
     {
         let root = repo_root();
-        let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
         let mut full = build_plan(&root, &full_args, &tmp)?;
@@ -3811,8 +4208,7 @@ cleared-caps refusal names {} starved step(s)",
         }
         if steps_violating_run_timeout(&full.cfg, 1).is_empty() {
             return Err(
-                "full-plan bracket: an impossible real execution timeout no longer refuses"
-                    .into(),
+                "full-plan bracket: an impossible real execution timeout no longer refuses".into(),
             );
         }
         if full.second.is_some() {
@@ -3877,24 +4273,23 @@ cleared-caps refusal names {} starved step(s)",
                 validate_plan::MANIFEST_PLAN_BUILD_COMMAND
             )
             || manifest_producer.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
-            || manifest_producer.deps.iter().any(|dependency| dependency == "gate.manifest")
+            || manifest_producer
+                .deps
+                .iter()
+                .any(|dependency| dependency == "gate.manifest")
         {
             return Err(format!(
                 "full-plan bracket: committed manifest-plan producer is not directly after the rust-script producer: cmd={} deps={:?}",
                 manifest_producer.cmd, manifest_producer.deps
             ));
         }
-        if manifest_audit.cmd
-            != format!("{RUST_SCRIPT_COMMAND_PREFIX}{MANIFEST_AUDIT_COMMAND}")
-        {
+        if manifest_audit.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}{MANIFEST_AUDIT_COMMAND}") {
             return Err(format!(
                 "full-plan bracket: manifest audit has unexpected invocation: {}",
                 manifest_audit.cmd
             ));
         }
-        if manifest_audit.deps
-            != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
-        {
+        if manifest_audit.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()] {
             return Err(format!(
                 "full-plan bracket: manifest audit can run without its binary producer: deps={:?}",
                 manifest_audit.deps
@@ -3911,9 +4306,7 @@ cleared-caps refusal names {} starved step(s)",
             &pinned_manifest_producer.cmd,
         )?;
         if pinned_manifest_command
-            != format!(
-                "{RUST_SCRIPT_COMMAND_PREFIX}cargo build -p hermit-manifest-plan --bins"
-            )
+            != format!("{RUST_SCRIPT_COMMAND_PREFIX}cargo build -p hermit-manifest-plan --bins")
         {
             return Err(format!(
                 "full-plan bracket: pinned-root manifest producer can reacquire the shared dagrun cache lock or lost its manifest build: {pinned_manifest_command}"
@@ -3938,7 +4331,8 @@ cleared-caps refusal names {} starved step(s)",
             }
         }
         if full.cfg.steps.iter().any(|step| {
-            step.cmd.contains("scripts/validate.rs --portable-strict-compat-only")
+            step.cmd
+                .contains("scripts/validate.rs --portable-strict-compat-only")
                 || step.cmd.contains("pressure-test.rs")
                 || step.cmd.contains("dagrun run")
                 || step.cmd.contains("run_dag_boxed")
@@ -3950,8 +4344,7 @@ cleared-caps refusal names {} starved step(s)",
         }
         if full.compat != Some(CompatMode::PortableStrict) {
             return Err(
-                "full-plan bracket: flattened portable compatibility lost its typed verdict"
-                    .into(),
+                "full-plan bracket: flattened portable compatibility lost its typed verdict".into(),
             );
         }
         let workspace_build = full
@@ -3960,11 +4353,15 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "build.workspace")
             .ok_or("full-plan bracket: workspace fat build disappeared")?;
-        if !workspace_build.cmd.contains("cargo build --workspace --all-targets")
+        if !workspace_build
+            .cmd
+            .contains("cargo build --workspace --all-targets")
             || !workspace_build.cmd.contains("cargo build -p hermit")
             || !workspace_build.cmd.contains("--bin hermit")
         {
-            return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
+            return Err(
+                "full-plan bracket: fat build does not finish the debug Hermit producer".into(),
+            );
         }
         let artifact = full
             .cfg
@@ -3980,8 +4377,7 @@ cleared-caps refusal names {} starved step(s)",
                 .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
         {
             return Err(
-                "full-plan bracket: E2E publisher is not a complete binary+resource barrier"
-                    .into(),
+                "full-plan bracket: E2E publisher is not a complete binary+resource barrier".into(),
             );
         }
         release_artifact_plan_bracket(&full.cfg)?;
@@ -4041,27 +4437,23 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag()
                 )
             })?;
-            let result_path = format!(
-                "\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"",
-                consumer.job
-            );
-            let junit_path = format!(
-                "\"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
-                consumer.job
-            );
+            let result_path = format!("\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"", consumer.job);
+            let junit_path = format!("\"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"", consumer.job);
             if consumer.cmd.matches("--results").count() != 1
                 || !consumer.cmd.contains(&format!("--results {result_path}"))
                 || !results_paths.insert(result_path)
             {
                 return Err(format!(
                     "full-plan bracket: {} does not have one unique result path: {}",
-                    consumer.tag(), consumer.cmd
+                    consumer.tag(),
+                    consumer.cmd
                 ));
             }
             if consumer.env.contains_key("E2E_ATTEMPT") {
                 return Err(format!(
                     "full-plan bracket: {} still receives the outer E2E_ATTEMPT variable: {:?}",
-                    consumer.tag(), consumer.env
+                    consumer.tag(),
+                    consumer.env
                 ));
             }
             if consumer.cmd.matches("--junit").count() != 1
@@ -4070,7 +4462,8 @@ cleared-caps refusal names {} starved step(s)",
             {
                 return Err(format!(
                     "full-plan bracket: {} does not have one unique JUnit path: {}",
-                    consumer.tag(), consumer.cmd
+                    consumer.tag(),
+                    consumer.cmd
                 ));
             }
             if !consumer
@@ -4080,7 +4473,8 @@ cleared-caps refusal names {} starved step(s)",
             {
                 return Err(format!(
                     "full-plan bracket: {} is not a committed pinned-root consumer of the published Hermit artifact: {}",
-                    consumer.tag(), consumer.cmd
+                    consumer.tag(),
+                    consumer.cmd
                 ));
             }
             let producer = if lane == "portable" {
@@ -4122,9 +4516,13 @@ cleared-caps refusal names {} starved step(s)",
         // privileged selection must already be prepared -- only the set it is
         // asked of is now the one that exists.
         let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "full")?;
-        for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
+        for required in
+            hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys()
+        {
             if !prepared.contains_key(required) {
-                return Err(format!("full-plan bracket: full preparation omits privileged Cargo selection {required}"));
+                return Err(format!(
+                    "full-plan bracket: full preparation omits privileged Cargo selection {required}"
+                ));
             }
         }
         if ["test.cli", "test.hermit_modes"]
@@ -4155,14 +4553,18 @@ cleared-caps refusal names {} starved step(s)",
             &full.cfg.resource_caps,
         )
         .is_ok()
-            || assert_committed_shared_integration_test_serialization(&full.cfg.steps, &missing_shared_cap)
-                .is_ok()
+            || assert_committed_shared_integration_test_serialization(
+                &full.cfg.steps,
+                &missing_shared_cap,
+            )
+            .is_ok()
         {
-            return Err("full-plan bracket: missing shared-test resource demand/cap was accepted".into());
+            return Err(
+                "full-plan bracket: missing shared-test resource demand/cap was accepted".into(),
+            );
         }
         let committed = validate_plan::validation_config(&root)?;
-        let local_privileged =
-            dagrun::select_steps_by_labels(&committed, &["privileged".into()])?;
+        let local_privileged = dagrun::select_steps_by_labels(&committed, &["privileged".into()])?;
         let selected = dagrun::select_steps_by_tags(
             &local_privileged,
             &[
@@ -4172,7 +4574,10 @@ cleared-caps refusal names {} starved step(s)",
             false,
         )?;
         let tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
-        if ["test.cli", "test.hermit_modes"].iter().any(|tag| tags.contains(*tag)) {
+        if ["test.cli", "test.hermit_modes"]
+            .iter()
+            .any(|tag| tags.contains(*tag))
+        {
             return Err(format!(
                 "full-plan bracket: selected privileged tests acquired a portable-test dependency: {tags:?}"
             ));
@@ -4194,8 +4599,7 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         let deps_of = |tag: &str| {
-            full
-                .cfg
+            full.cfg
                 .steps
                 .iter()
                 .find(|step| step.tag() == tag)
@@ -4228,7 +4632,8 @@ cleared-caps refusal names {} starved step(s)",
             {
                 return Err(format!(
                     "full-plan bracket: pinned-root node {} can start without the build-dependency assertion: {}",
-                    step.tag(), step.cmd
+                    step.tag(),
+                    step.cmd
                 ));
             }
         }
@@ -4351,8 +4756,12 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
         std::process::id(),
         epoch_now()
     ));
-    std::fs::create_dir(&tmp)
-        .map_err(|error| format!("manifest producer bracket: cannot create {}: {error}", tmp.display()))?;
+    std::fs::create_dir(&tmp).map_err(|error| {
+        format!(
+            "manifest producer bracket: cannot create {}: {error}",
+            tmp.display()
+        )
+    })?;
 
     let result = (|| -> Result<(), String> {
         let required = [
@@ -4368,7 +4777,9 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
                     .steps
                     .iter()
                     .find(|step| step.tag() == tag)
-                    .ok_or_else(|| format!("manifest producer bracket: production plan lost {tag}"))?;
+                    .ok_or_else(|| {
+                        format!("manifest producer bracket: production plan lost {tag}")
+                    })?;
                 let mut step = step_with_caps(
                     &source.group,
                     &source.job,
@@ -4384,7 +4795,8 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
                     30,
                     64 * 1024 * 1024,
                 );
-                step.deps.retain(|dependency| required.contains(&dependency.as_str()));
+                step.deps
+                    .retain(|dependency| required.contains(&dependency.as_str()));
                 steps.push(step);
             }
             Ok(validate_plan::config_from(
@@ -4395,9 +4807,12 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
 
         let output = tmp.join("target/debug/test-harness");
         let gate_ran = tmp.join("gate-ran");
-        let output_parent = output
-            .parent()
-            .ok_or_else(|| format!("manifest producer bracket: {} has no parent", output.display()))?;
+        let output_parent = output.parent().ok_or_else(|| {
+            format!(
+                "manifest producer bracket: {} has no parent",
+                output.display()
+            )
+        })?;
         let positive = fixture(
             format!(
                 "mkdir -p {parent} && printf '#!/bin/sh\\nexit 0\\n' > {output} && chmod +x {output}",
@@ -4442,10 +4857,18 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
             ));
         }
 
-        std::fs::remove_file(&output)
-            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", output.display()))?;
-        std::fs::remove_file(&gate_ran)
-            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", gate_ran.display()))?;
+        std::fs::remove_file(&output).map_err(|error| {
+            format!(
+                "manifest producer bracket: cannot remove {}: {error}",
+                output.display()
+            )
+        })?;
+        std::fs::remove_file(&gate_ran).map_err(|error| {
+            format!(
+                "manifest producer bracket: cannot remove {}: {error}",
+                gate_ran.display()
+            )
+        })?;
         let negative = fixture(
             "exit 23".to_string(),
             format!(
@@ -4490,8 +4913,12 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
         Ok(())
     })();
 
-    let cleanup = std::fs::remove_dir_all(&tmp)
-        .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", tmp.display()));
+    let cleanup = std::fs::remove_dir_all(&tmp).map_err(|error| {
+        format!(
+            "manifest producer bracket: cannot remove {}: {error}",
+            tmp.display()
+        )
+    });
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(
             "manifest producer edge: absent output built before gate; producer failure dependency-skips gate"
@@ -4509,9 +4936,7 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
 ///
 /// A missing or malformed coverage judgement stays explicit `null`. It must not
 /// cause a new row to masquerade as a grandfathered schema-4 receipt.
-fn ledger_schema_and_coverage(
-    coverage: serde_json::Value,
-) -> (i64, serde_json::Value) {
+fn ledger_schema_and_coverage(coverage: serde_json::Value) -> (i64, serde_json::Value) {
     let has_real_judgement = coverage
         .get("planned_test_nodes")
         .and_then(serde_json::Value::as_u64)
@@ -4555,7 +4980,8 @@ fn coverage_schema_bracket() -> Result<(), String> {
         let (schema, carried) = ledger_schema_and_coverage(unresolved);
         if schema != COVERAGE_LEDGER_SCHEMA_VERSION || !carried.is_null() {
             return Err(
-                "coverage schema: unresolved evidence must remain schema 5 with null coverage".into(),
+                "coverage schema: unresolved evidence must remain schema 5 with null coverage"
+                    .into(),
             );
         }
     }
@@ -4581,8 +5007,7 @@ fn cell_results_schema_bracket() -> Result<(), String> {
             "cell-results schema: current payload must emit schema 7, got {current}"
         ));
     }
-    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None)
-        != COVERAGE_LEDGER_SCHEMA_VERSION
+    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None) != COVERAGE_LEDGER_SCHEMA_VERSION
     {
         return Err("cell-results schema: a row without cell results changed schema".into());
     }
@@ -4601,17 +5026,40 @@ fn cell_results_schema_bracket() -> Result<(), String> {
 fn self_output_bracket() -> Result<(), String> {
     // MUST be excused (validate's own output, in every shape a caller emits).
     let excused = [
-        (" M ci/validate-ledger/local.example-host.jsonl", "porcelain, modified, leading space intact"),
-        ("M ci/validate-ledger/local.example-host.jsonl", "porcelain whose leading space a trim ate"),
-        ("?? ci/validate-ledger/local.other.jsonl", "porcelain, untracked shard"),
-        ("ci/validate-ledger/local.example-host.jsonl", "bare path (git diff --name-only)"),
-        ("ignored/validate/validate-full-abc-1.log", "bare path, durable log"),
-        (" M \"ci/validate-ledger/has space.jsonl\"", "porcelain, quoted path"),
-        ("R  ci/validate-ledger/a.jsonl -> ci/validate-ledger/b.jsonl", "rename within the ledger dir"),
+        (
+            " M ci/validate-ledger/local.example-host.jsonl",
+            "porcelain, modified, leading space intact",
+        ),
+        (
+            "M ci/validate-ledger/local.example-host.jsonl",
+            "porcelain whose leading space a trim ate",
+        ),
+        (
+            "?? ci/validate-ledger/local.other.jsonl",
+            "porcelain, untracked shard",
+        ),
+        (
+            "ci/validate-ledger/local.example-host.jsonl",
+            "bare path (git diff --name-only)",
+        ),
+        (
+            "ignored/validate/validate-full-abc-1.log",
+            "bare path, durable log",
+        ),
+        (
+            " M \"ci/validate-ledger/has space.jsonl\"",
+            "porcelain, quoted path",
+        ),
+        (
+            "R  ci/validate-ledger/a.jsonl -> ci/validate-ledger/b.jsonl",
+            "rename within the ledger dir",
+        ),
     ];
     for (line, why) in excused {
         if !line_is_self_output(line) {
-            return Err(format!("self-output: {line:?} ({why}) must be excused as validate's own"));
+            return Err(format!(
+                "self-output: {line:?} ({why}) must be excused as validate's own"
+            ));
         }
     }
     // MUST NOT be excused. A predicate that excused everything would satisfy the
@@ -4621,14 +5069,28 @@ fn self_output_bracket() -> Result<(), String> {
         ("?? detcore/src/new_thing.rs", "a new untracked source file"),
         ("M  Cargo.lock", "a staged lockfile change"),
         ("scripts/lib/validate_plan.rs", "bare path, real source"),
-        ("R  detcore/src/a.rs -> ci/validate-ledger/a.rs", "a source file MOVED into the ledger dir"),
-        ("R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs", "a ledger file moved OUT into source"),
-        (" M ci/dag/validate.json", "a DAG change under ci/, but not the ledger"),
-        (" M ci/validate-ledger-notes.md", "a sibling whose name merely starts the same way"),
+        (
+            "R  detcore/src/a.rs -> ci/validate-ledger/a.rs",
+            "a source file MOVED into the ledger dir",
+        ),
+        (
+            "R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs",
+            "a ledger file moved OUT into source",
+        ),
+        (
+            " M ci/dag/validate.json",
+            "a DAG change under ci/, but not the ledger",
+        ),
+        (
+            " M ci/validate-ledger-notes.md",
+            "a sibling whose name merely starts the same way",
+        ),
     ];
     for (line, why) in foreign {
         if line_is_self_output(line) {
-            return Err(format!("self-output: {line:?} ({why}) must count as a DIRTY tree"));
+            return Err(format!(
+                "self-output: {line:?} ({why}) must count as a DIRTY tree"
+            ));
         }
     }
     // LIVE invariant, independent of the synthetic shapes above: whatever this
@@ -4716,10 +5178,14 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         .map_err(|error| format!("cannot dirty source fixture: {error}"))?;
     let dirty_source = worktree_dirty_at(scratch_git, &source);
     if !dirty_source || !dirty_worktree_requires_refusal(false, dirty_source, false) {
-        return Err("checkout attribution: a genuinely dirty in-place source did not refuse".into());
+        return Err(
+            "checkout attribution: a genuinely dirty in-place source did not refuse".into(),
+        );
     }
     if is_disposable_validate_checkout(&source, Some(&parent)) {
-        return Err("checkout attribution: the in-place source was classified as disposable".into());
+        return Err(
+            "checkout attribution: the in-place source was classified as disposable".into(),
+        );
     }
     let in_place_attribution = source_attribution(commit, false, true, false);
     if in_place_attribution.commit_anchored || !in_place_attribution.tree_dirty {
@@ -4793,7 +5259,9 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         }
     }
     if !admitted.lock_admitted || !admitted.disposable {
-        return Err("checkout attribution: canonical disposable + live lock was not admitted".into());
+        return Err(
+            "checkout attribution: canonical disposable + live lock was not admitted".into(),
+        );
     }
     std::fs::write(disposable.join(".hermit-verify-summary-fixture"), b"")
         .map_err(|error| format!("cannot plant Hermit summary fixture: {error}"))?;
@@ -4837,7 +5305,9 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         || lookalike_admitted.disposable
         || source_attribution(commit, false, true, lookalike_admitted.disposable).commit_anchored
     {
-        return Err("checkout attribution: an ordinary-slot lookalike was treated as disposable".into());
+        return Err(
+            "checkout attribution: an ordinary-slot lookalike was treated as disposable".into(),
+        );
     }
 
     println!(
@@ -4878,15 +5348,18 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         portable.steps.len(),
         SelectDecision::Nodes(requested),
     )?;
-    let expected =
-        dagrun::select_steps_by_tags(&portable, std::slice::from_ref(&child), false)?;
+    let expected = dagrun::select_steps_by_tags(&portable, std::slice::from_ref(&child), false)?;
     if dag_to_json(&selected) != dag_to_json(&expected) {
         return Err(
             "selective bracket: since-green selection differs from dagrun's typed ID selection"
                 .into(),
         );
     }
-    let selected_tags = selected.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let selected_tags = selected
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     if !selected_tags.contains(&child) || !selected_tags.contains(&parent) {
         return Err(format!(
             "selective bracket: dependency-closed selection lost child={child} or parent={parent}: {selected_tags:?}"
@@ -4904,7 +5377,11 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         portable.steps.len(),
         SelectDecision::Nodes([mapped_e2e.clone()].into_iter().collect()),
     )?;
-    let mapped_tags = mapped_plan.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let mapped_tags = mapped_plan
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     if !mapped_tags.contains(&mapped_e2e)
         || mapped_tags.contains("e2e.manifest_applications_on_host")
     {
@@ -4929,11 +5406,8 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         ));
     }
 
-    let skip = select_from_committed_decision(
-        &portable,
-        portable.steps.len(),
-        SelectDecision::Skip,
-    )?;
+    let skip =
+        select_from_committed_decision(&portable, portable.steps.len(), SelectDecision::Skip)?;
     let expected_skip = [
         "pre.submodules",
         PIN_GATE_TAG,
@@ -4968,7 +5442,11 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .map_err(|error| format!("only bracket: cannot read source DAG: {error}"))?;
     let committed = validate_plan::validation_config(root)?;
     let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])?;
-    let all_tags = portable.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let all_tags = portable
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     let (child, parent) = portable
         .steps
         .iter()
@@ -5017,7 +5495,12 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
-    let selected_tags = plan.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let selected_tags = plan
+        .cfg
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     if selected_tags != expected_tags {
         return Err(format!(
             "only bracket: selected IDs changed: expected={expected_tags:?} actual={selected_tags:?}"
@@ -5090,7 +5573,10 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         Ok(())
     };
     check_off_record_tags(&off_record_tags)?;
-    for required in ["build.rust_scripts_in_pinned_root", "setup.pinned_root_fetch"] {
+    for required in [
+        "build.rust_scripts_in_pinned_root",
+        "setup.pinned_root_fetch",
+    ] {
         let mut missing = off_record_tags.clone();
         if !missing.remove(required) || check_off_record_tags(&missing).is_ok() {
             return Err(format!(
@@ -5099,8 +5585,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         }
     }
     let mut unrelated = off_record_tags.clone();
-    if !unrelated.insert("setup.manifest_plan".into())
-        || check_off_record_tags(&unrelated).is_ok()
+    if !unrelated.insert("setup.manifest_plan".into()) || check_off_record_tags(&unrelated).is_ok()
     {
         return Err("only bracket: unrelated manifest producer was not refused".into());
     }
@@ -5203,8 +5688,12 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         &manifest_args,
         &std::env::temp_dir().join("validate-only-manifest-plan"),
     )?;
-    let manifest_tags: BTreeSet<String> =
-        manifest_plan.cfg.steps.iter().map(|step| step.tag()).collect();
+    let manifest_tags: BTreeSet<String> = manifest_plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| step.tag())
+        .collect();
     for required in [
         "build.manifest_guests",
         "setup.manifest_plan",
@@ -5266,7 +5755,9 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             .steps
             .iter()
             .find(|step| step.tag() == selected_cell)
-            .ok_or_else(|| format!("only bracket: focused manifest selection lost {selected_cell}"))?;
+            .ok_or_else(|| {
+                format!("only bracket: focused manifest selection lost {selected_cell}")
+            })?;
         if !step
             .deps
             .iter()
@@ -5285,23 +5776,49 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     }
 
     for (lane, target, producer, pin) in [
-        ("hosted-portable", "build.manifest_guests", "setup.manifest_plan", PIN_GATE_TAG),
-        ("hosted-privileged", "privileged-build.manifest_guests_on_host", "setup.manifest_plan_on_host", "pre.reverie_pin_on_host"),
+        (
+            "hosted-portable",
+            "build.manifest_guests",
+            "setup.manifest_plan",
+            PIN_GATE_TAG,
+        ),
+        (
+            "hosted-privileged",
+            "privileged-build.manifest_guests_on_host",
+            "setup.manifest_plan_on_host",
+            "pre.reverie_pin_on_host",
+        ),
     ] {
         for off_record in [false, true] {
             let mut argv = vec!["--only".into(), lane.into(), target.into()];
-            if off_record { argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()); }
-            let args = parse_argv(&argv).map_err(|code| format!("only bracket: {lane} parser exited {code}"))?;
+            if off_record {
+                argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into());
+            }
+            let args = parse_argv(&argv)
+                .map_err(|code| format!("only bracket: {lane} parser exited {code}"))?;
             let hosted = build_plan(root, &args, &std::env::temp_dir())?;
-            let tags = hosted.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-            if !tags.contains(target) || !tags.contains(producer) || !tags.contains(pin)
-                || tags.iter().any(|tag| tag.ends_with("_in_pinned_root") || tag == "setup.pinned_root_fetch")
+            let tags = hosted
+                .cfg
+                .steps
+                .iter()
+                .map(Step::tag)
+                .collect::<BTreeSet<_>>();
+            if !tags.contains(target)
+                || !tags.contains(producer)
+                || !tags.contains(pin)
+                || tags
+                    .iter()
+                    .any(|tag| tag.ends_with("_in_pinned_root") || tag == "setup.pinned_root_fetch")
                 || (off_record && tags.iter().any(|tag| tag.starts_with("gate.")))
             {
-                return Err(format!("only bracket: {lane} changed focused host preparation (off_record={off_record}): {tags:?}"));
+                return Err(format!(
+                    "only bracket: {lane} changed focused host preparation (off_record={off_record}): {tags:?}"
+                ));
             }
             if !dagrun::model::graph_structure_violations(&hosted.cfg).is_empty() {
-                return Err(format!("only bracket: {lane} focused host preparation is not dependency-closed"));
+                return Err(format!(
+                    "only bracket: {lane} focused host preparation is not dependency-closed"
+                ));
             }
         }
     }
@@ -5551,7 +6068,9 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     }
     for expected in 1..=5 {
         if level(&["--verbosity", &expected.to_string()])? != expected {
-            return Err(format!("verbosity: --verbosity {expected} did not round-trip"));
+            return Err(format!(
+                "verbosity: --verbosity {expected} did not round-trip"
+            ));
         }
     }
     for bad in ["0", "6", "loud"] {
@@ -5561,7 +6080,11 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     }
     let args = parse_argv(&["full".into(), "--no-label-pr".into()])
         .map_err(|code| format!("verbosity: full-plan argv refused with exit {code}"))?;
-    let mut plan = build_plan(root, &args, &std::env::temp_dir().join("validate-verbosity-bracket"))?;
+    let mut plan = build_plan(
+        root,
+        &args,
+        &std::env::temp_dir().join("validate-verbosity-bracket"),
+    )?;
     let envelope = plan
         .cfg
         .steps
@@ -5598,8 +6121,9 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
             "verbosity: {relative} no longer publishes structured test counts"
         ));
     }
-    let pinned_root_wrapper = std::fs::read_to_string(root.join("ci/hermetic/run-in-pinned-root.sh"))
-        .map_err(|error| format!("verbosity: cannot read pinned-root wrapper: {error}"))?;
+    let pinned_root_wrapper =
+        std::fs::read_to_string(root.join("ci/hermetic/run-in-pinned-root.sh"))
+            .map_err(|error| format!("verbosity: cannot read pinned-root wrapper: {error}"))?;
     for fixture in [
         "DAGRUN_TEST_COUNTS_PATH)",
         "destination=/dagrun-test-counts",
@@ -5641,16 +6165,24 @@ fn envelope_cli_bracket() -> Result<(), String> {
     // and produce a plan containing the L4 stress node — a parser that accepted
     // the flag and planned nothing would satisfy a weaker check.
     let mut accepted = 0usize;
-    for v in [vec!["--envelope-only"], vec!["--envelope-compare", "/nonexistent-baseline.json"]] {
+    for v in [
+        vec!["--envelope-only"],
+        vec!["--envelope-compare", "/nonexistent-baseline.json"],
+    ] {
         let args = parse_argv(&argv(&v))
             .map_err(|c| format!("envelope CLI: `{v:?}` was REFUSED with exit {c}"))?;
         if !matches!(args.focused, Some(Focused::Envelope { .. })) {
-            return Err(format!("envelope CLI: `{v:?}` did not select the envelope mode"));
+            return Err(format!(
+                "envelope CLI: `{v:?}` did not select the envelope mode"
+            ));
         }
         let plan = build_plan(&root, &args, &tmp)
             .map_err(|e| format!("envelope CLI: `{v:?}` could not build a plan: {e}"))?;
         if plan.profile != "envelope-only" {
-            return Err(format!("envelope CLI: `{v:?}` recorded profile {}", plan.profile));
+            return Err(format!(
+                "envelope CLI: `{v:?}` recorded profile {}",
+                plan.profile
+            ));
         }
         let tags: BTreeSet<String> = plan.cfg.steps.iter().map(|s| s.tag()).collect();
         for want in ["envelope.build", "envelope.true_l4", "envelope.date_rr"] {
@@ -5661,7 +6193,8 @@ fn envelope_cli_bracket() -> Result<(), String> {
         if !plan.force_keep_going {
             return Err("envelope CLI: the measurement must force keep-going".into());
         }
-        if plan.nonblocking.len() != validate_envelope::PROBES.len() * validate_envelope::LEVELS.len()
+        if plan.nonblocking.len()
+            != validate_envelope::PROBES.len() * validate_envelope::LEVELS.len()
         {
             return Err(format!(
                 "envelope CLI: {} probe node(s) must be nonblocking, found {}",
@@ -5685,10 +6218,22 @@ fn envelope_cli_bracket() -> Result<(), String> {
     // mode must not combine with a level, --all, or another focused mode.
     let mut refused = 0usize;
     for (why, v) in [
-        ("--envelope-compare with no FILE", vec!["--envelope-compare"]),
-        ("--envelope-only combined with a level", vec!["quick", "--envelope-only"]),
-        ("--envelope-only combined with --all", vec!["--all", "--envelope-only"]),
-        ("--envelope-only combined with another focused mode", vec!["--envelope-only", "--rr-compat-only"]),
+        (
+            "--envelope-compare with no FILE",
+            vec!["--envelope-compare"],
+        ),
+        (
+            "--envelope-only combined with a level",
+            vec!["quick", "--envelope-only"],
+        ),
+        (
+            "--envelope-only combined with --all",
+            vec!["--all", "--envelope-only"],
+        ),
+        (
+            "--envelope-only combined with another focused mode",
+            vec!["--envelope-only", "--rr-compat-only"],
+        ),
     ] {
         if parse_argv(&argv(&v)).is_ok() {
             return Err(format!("envelope CLI: {why} must be REFUSED"));
@@ -5704,8 +6249,10 @@ fn envelope_cli_bracket() -> Result<(), String> {
         Some(Focused::Envelope { baseline: Some(_) }) => accepted += 1,
         other => return Err(format!("envelope CLI: combined spellings gave {other:?}")),
     }
-    println!("  envelope CLI: {accepted} accepted form(s), {refused} refused misuse(s) (the \
-              refusal messages above are expected)");
+    println!(
+        "  envelope CLI: {accepted} accepted form(s), {refused} refused misuse(s) (the \
+              refusal messages above are expected)"
+    );
     Ok(())
 }
 
@@ -5729,10 +6276,14 @@ fn default_jobs() -> i64 {
                     return n;
                 }
             }
-            eprintln!("validate: CI_DAG_JOBS={v:?} is not a positive integer; using the host-adaptive default");
+            eprintln!(
+                "validate: CI_DAG_JOBS={v:?} is not a positive integer; using the host-adaptive default"
+            );
         }
     }
-    let host = std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1);
+    let host = std::thread::available_parallelism()
+        .map(|n| n.get() as i64)
+        .unwrap_or(1);
     (host / 8).clamp(2, 16)
 }
 
@@ -5825,12 +6376,8 @@ fn resolve_cgroups(
     if let Some(path) = service_result_path {
         std::env::set_var(VALIDATE_SERVICE_RESULT_PATH_ENV, path);
     }
-    let result = safe_ci_scope::resolve_cgroups(
-        "validate",
-        allow_failure,
-        scope_runtime_s,
-        owns_request,
-    );
+    let result =
+        safe_ci_scope::resolve_cgroups("validate", allow_failure, scope_runtime_s, owns_request);
     std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
     safe_ci_scope::propagate_result(result)
 }
@@ -5879,14 +6426,12 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
         _ => root.join("ignored").join("validate"),
     };
     let sha12: String = sha.chars().take(12).collect();
-    let supplied = std::env::var("E2E_RUN_ID")
-        .ok()
-        .filter(|value| {
-            !value.is_empty()
-                && value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._@:-".contains(c))
-        });
+    let supplied = std::env::var("E2E_RUN_ID").ok().filter(|value| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._@:-".contains(c))
+    });
     let run = supplied.unwrap_or_else(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6072,13 +6617,13 @@ mod ordinary_artifact_pointer_tests {
         assert_ne!(fixed_bundle, external_bundle);
         let fixed_bundle_path = Path::new(fixed_bundle.trim());
         assert!(!fixed_bundle_path.join("runtime-contract").exists());
-        assert!(!fixed_bundle_path
-            .join("install/rsrcs/hermit-runtime")
-            .exists());
+        assert!(
+            !fixed_bundle_path
+                .join("install/rsrcs/hermit-runtime")
+                .exists()
+        );
 
-        let undeclared_runtime = measured
-            .path()
-            .join("fixture-install/rsrcs/hermit-runtime");
+        let undeclared_runtime = measured.path().join("fixture-install/rsrcs/hermit-runtime");
         std::fs::create_dir_all(&undeclared_runtime).unwrap();
         for name in ["libunwind-x86_64.so.8", "libunwind.so.8"] {
             std::fs::write(undeclared_runtime.join(name), b"undeclared runtime\n").unwrap();
@@ -6092,8 +6637,7 @@ mod ordinary_artifact_pointer_tests {
             .unwrap();
         assert!(!refused.status.success());
         assert!(
-            String::from_utf8_lossy(&refused.stderr)
-                .contains("undeclared Hermit runtime closure"),
+            String::from_utf8_lossy(&refused.stderr).contains("undeclared Hermit runtime closure"),
             "{}",
             String::from_utf8_lossy(&refused.stderr)
         );
@@ -6235,14 +6779,16 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
     // so an omission cannot leak into a local profile's raw census.
     let exclusions = if selection.exclude_backends.is_empty() {
         String::new()
-    } else if step.labels.iter().map(String::as_str).eq(["hosted-portable"])
-        && selection
-            .exclude_backends
-            .iter()
-            .map(String::as_str)
-            .eq(hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
+    } else if step
+        .labels
+        .iter()
+        .map(String::as_str)
+        .eq(["hosted-portable"])
+        && selection.exclude_backends.iter().map(String::as_str).eq(
+            hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
                 .iter()
-                .copied())
+                .copied(),
+        )
     {
         selection
             .exclude_backends
@@ -6777,10 +7323,12 @@ mod concurrent_validate_path_tests {
         };
         let summary = unavailable_invocation_lock_summary("full", error);
         assert_eq!(summary.verdict, Verdict::Refused);
-        assert!(summary
-            .detail
-            .iter()
-            .any(|line| line.contains("refusing rather than running two validates")));
+        assert!(
+            summary
+                .detail
+                .iter()
+                .any(|line| line.contains("refusing rather than running two validates"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -7155,11 +7703,7 @@ fn sh(cmd: &str, args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Remove git's repository-location variables from a command that must act on
@@ -7233,7 +7777,11 @@ fn measure_git_depth(commit: &str) -> Result<u64, String> {
         return Err(format!(
             "git rev-list --count {commit} failed with {}{}",
             output.status,
-            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
         ));
     }
     parse_git_depth(&String::from_utf8_lossy(&output.stdout))
@@ -7488,7 +8036,9 @@ fn utc_now() -> String {
 }
 
 fn epoch_now() -> i64 {
-    sh("date", &["+%s"]).and_then(|s| s.parse().ok()).unwrap_or(0)
+    sh("date", &["+%s"])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Locate the dev-hermit parent by walking up for a `.gitmodules` whose `hermit`
@@ -7555,7 +8105,11 @@ fn lowercase_hex(value: &str, digits: usize) -> bool {
 }
 
 fn proc_fd_path(path: &Path) -> Option<(u32, u32)> {
-    let components: Vec<&[u8]> = path.as_os_str().as_bytes().split(|byte| *byte == b'/').collect();
+    let components: Vec<&[u8]> = path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .collect();
     if components.len() != 5
         || !components[0].is_empty()
         || components[1] != b"proc"
@@ -7600,11 +8154,10 @@ fn read_immutable_tool_authority(
     tool_root: &Path,
     state_root: &Path,
 ) -> Result<ImmutableToolAuthority, String> {
-    let (authority_pid, authority_fd_from_path) = proc_fd_path(authority_path).ok_or_else(|| {
-        format!(
-            "{TOOL_AUTHORITY_ENV} must be an exact /proc/<pid>/fd/<fd> capability"
-        )
-    })?;
+    let (authority_pid, authority_fd_from_path) =
+        proc_fd_path(authority_path).ok_or_else(|| {
+            format!("{TOOL_AUTHORITY_ENV} must be an exact /proc/<pid>/fd/<fd> capability")
+        })?;
     let (root_pid, root_fd_from_path) = proc_fd_path(tool_root).ok_or_else(|| {
         format!("{TOOL_ROOT_ENV} authority must be an exact /proc/<pid>/fd/<fd> capability")
     })?;
@@ -7625,15 +8178,11 @@ fn read_immutable_tool_authority(
         || authority_metadata.nlink() != 0
         || authority_metadata.mode() & 0o222 != 0
     {
-        return Err(
-            "immutable tool authority must be one anonymous read-only regular file".into(),
-        );
+        return Err("immutable tool authority must be one anonymous read-only regular file".into());
     }
     let seals = unsafe { libc::fcntl(authority_file.as_raw_fd(), libc::F_GET_SEALS) };
-    let required_seals = libc::F_SEAL_SEAL
-        | libc::F_SEAL_SHRINK
-        | libc::F_SEAL_GROW
-        | libc::F_SEAL_WRITE;
+    let required_seals =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     if seals < 0 || seals & required_seals != required_seals {
         return Err("immutable tool authority is not completely sealed".into());
     }
@@ -7843,40 +8392,61 @@ fn digest_length(hasher: &mut Sha256, value: usize) {
     hasher.update(u64::try_from(value).unwrap_or(u64::MAX).to_be_bytes());
 }
 
-fn digest_tool_entry(
-    path: &Path,
-    relative: &[u8],
-    hasher: &mut Sha256,
-) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect immutable tool entry {}: {error}", path.display()))?;
+fn digest_tool_entry(path: &Path, relative: &[u8], hasher: &mut Sha256) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect immutable tool entry {}: {error}",
+            path.display()
+        )
+    })?;
     let mode = metadata.mode() & 0o7777;
     let file_type = metadata.file_type();
     if file_type.is_dir() {
         if mode & 0o222 != 0 || metadata.nlink() < 1 {
-            return Err(format!("immutable tool directory is writable or unlinked: {}", path.display()));
+            return Err(format!(
+                "immutable tool directory is writable or unlinked: {}",
+                path.display()
+            ));
         }
         let held = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|error| format!("cannot retain immutable tool directory {}: {error}", path.display()))?;
+            .map_err(|error| {
+                format!(
+                    "cannot retain immutable tool directory {}: {error}",
+                    path.display()
+                )
+            })?;
         let held_metadata = held
             .metadata()
             .map_err(|error| format!("cannot inspect retained tool directory: {error}"))?;
         if !held_metadata.is_dir()
             || (held_metadata.dev(), held_metadata.ino()) != (metadata.dev(), metadata.ino())
         {
-            return Err(format!("immutable tool directory changed before hashing: {}", path.display()));
+            return Err(format!(
+                "immutable tool directory changed before hashing: {}",
+                path.display()
+            ));
         }
         hasher.update(b"d");
         digest_length(hasher, relative.len());
         hasher.update(relative);
         hasher.update(mode.to_be_bytes());
         let mut entries = std::fs::read_dir(path)
-            .map_err(|error| format!("cannot list immutable tool directory {}: {error}", path.display()))?
+            .map_err(|error| {
+                format!(
+                    "cannot list immutable tool directory {}: {error}",
+                    path.display()
+                )
+            })?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot list immutable tool directory {}: {error}", path.display()))?;
+            .map_err(|error| {
+                format!(
+                    "cannot list immutable tool directory {}: {error}",
+                    path.display()
+                )
+            })?;
         entries.sort_by(|left, right| {
             left.file_name()
                 .as_os_str()
@@ -7902,25 +8472,42 @@ fn digest_tool_entry(
         let after = std::fs::symlink_metadata(path)
             .map_err(|error| format!("cannot recheck immutable tool directory: {error}"))?;
         if (after.dev(), after.ino()) != (held_metadata.dev(), held_metadata.ino()) {
-            return Err(format!("immutable tool directory changed while hashing: {}", path.display()));
+            return Err(format!(
+                "immutable tool directory changed while hashing: {}",
+                path.display()
+            ));
         }
     } else if file_type.is_file() {
         if mode & 0o222 != 0 || metadata.nlink() != 1 {
-            return Err(format!("immutable tool file is writable or multiply linked: {}", path.display()));
+            return Err(format!(
+                "immutable tool file is writable or multiply linked: {}",
+                path.display()
+            ));
         }
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|error| format!("cannot open immutable tool file {}: {error}", path.display()))?;
+            .map_err(|error| {
+                format!(
+                    "cannot open immutable tool file {}: {error}",
+                    path.display()
+                )
+            })?;
         let held_metadata = file
             .metadata()
             .map_err(|error| format!("cannot inspect retained tool file: {error}"))?;
         if !held_metadata.is_file()
-            || (held_metadata.dev(), held_metadata.ino(), held_metadata.len())
-                != (metadata.dev(), metadata.ino(), metadata.len())
+            || (
+                held_metadata.dev(),
+                held_metadata.ino(),
+                held_metadata.len(),
+            ) != (metadata.dev(), metadata.ino(), metadata.len())
         {
-            return Err(format!("immutable tool file changed before hashing: {}", path.display()));
+            return Err(format!(
+                "immutable tool file changed before hashing: {}",
+                path.display()
+            ));
         }
         hasher.update(b"f");
         digest_length(hasher, relative.len());
@@ -7930,9 +8517,12 @@ fn digest_tool_entry(
         let mut observed = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let count = file
-                .read(&mut buffer)
-                .map_err(|error| format!("cannot read immutable tool file {}: {error}", path.display()))?;
+            let count = file.read(&mut buffer).map_err(|error| {
+                format!(
+                    "cannot read immutable tool file {}: {error}",
+                    path.display()
+                )
+            })?;
             if count == 0 {
                 break;
             }
@@ -7944,13 +8534,24 @@ fn digest_tool_entry(
             .map_err(|error| format!("cannot recheck retained tool file: {error}"))?;
         if observed != metadata.len()
             || (after.dev(), after.ino(), after.len())
-                != (held_metadata.dev(), held_metadata.ino(), held_metadata.len())
+                != (
+                    held_metadata.dev(),
+                    held_metadata.ino(),
+                    held_metadata.len(),
+                )
         {
-            return Err(format!("immutable tool file changed while hashing: {}", path.display()));
+            return Err(format!(
+                "immutable tool file changed while hashing: {}",
+                path.display()
+            ));
         }
     } else if file_type.is_symlink() {
-        let target = std::fs::read_link(path)
-            .map_err(|error| format!("cannot read immutable tool symlink {}: {error}", path.display()))?;
+        let target = std::fs::read_link(path).map_err(|error| {
+            format!(
+                "cannot read immutable tool symlink {}: {error}",
+                path.display()
+            )
+        })?;
         let target = target.as_os_str().as_bytes();
         hasher.update(b"l");
         digest_length(hasher, relative.len());
@@ -7959,14 +8560,21 @@ fn digest_tool_entry(
         digest_length(hasher, target.len());
         hasher.update(target);
     } else {
-        return Err(format!("immutable tool has unsupported entry type at {}", path.display()));
+        return Err(format!(
+            "immutable tool has unsupported entry type at {}",
+            path.display()
+        ));
     }
     Ok(())
 }
 
 fn immutable_tool_content_sha256(root: &Path) -> Result<String, String> {
-    let metadata = std::fs::metadata(root)
-        .map_err(|error| format!("cannot inspect immutable tool root {}: {error}", root.display()))?;
+    let metadata = std::fs::metadata(root).map_err(|error| {
+        format!(
+            "cannot inspect immutable tool root {}: {error}",
+            root.display()
+        )
+    })?;
     if !metadata.is_dir() || metadata.mode() & 0o222 != 0 {
         return Err("immutable tool root must be one read-only directory".into());
     }
@@ -8003,7 +8611,9 @@ fn configured_authority_tool_root(
 ) -> Result<(PathBuf, validate_admission::VerifiedStateRoot), String> {
     let authority_value = std::env::var_os(TOOL_AUTHORITY_ENV)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("immutable tool authority is incomplete: {TOOL_AUTHORITY_ENV} is absent"))?;
+        .ok_or_else(|| {
+            format!("immutable tool authority is incomplete: {TOOL_AUTHORITY_ENV} is absent")
+        })?;
     let authority_path = PathBuf::from(authority_value);
     if !authority_path.is_absolute() {
         return Err(format!("{TOOL_AUTHORITY_ENV} must be absolute"));
@@ -8014,7 +8624,10 @@ fn configured_authority_tool_root(
         (TOOL_PARENT_SHA_ENV, authority.parent_sha.as_str()),
         (TOOL_HERMIT_SHA_ENV, authority.hermit_sha.as_str()),
         (TOOL_AGENT_UTILS_SHA_ENV, authority.agent_utils_sha.as_str()),
-        (TOOL_BOOTSTRAP_SHA256_ENV, authority.bootstrap_sha256.as_str()),
+        (
+            TOOL_BOOTSTRAP_SHA256_ENV,
+            authority.bootstrap_sha256.as_str(),
+        ),
     ];
     for (name, expected) in required_environment {
         let observed = std::env::var(name)
@@ -8065,8 +8678,9 @@ fn make_self_test_tree_read_only(path: &Path) -> Result<(), String> {
             })?;
             make_self_test_tree_read_only(&entry.path())?;
         }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
-            .map_err(|error| format!("tool authority self-test cannot freeze directory: {error}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).map_err(
+            |error| format!("tool authority self-test cannot freeze directory: {error}"),
+        )?;
     } else if metadata.is_file() {
         // An executable is replaced by a fresh inode that no write descriptor
         // inherited by a concurrent spawn can name (see exec_safe_fs).
@@ -8075,7 +8689,7 @@ fn make_self_test_tree_read_only(path: &Path) -> Result<(), String> {
         } else {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
         }
-            .map_err(|error| format!("tool authority self-test cannot freeze file: {error}"))?;
+        .map_err(|error| format!("tool authority self-test cannot freeze file: {error}"))?;
     }
     Ok(())
 }
@@ -8108,12 +8722,8 @@ fn create_self_test_tool_authority(
         .map_err(|error| format!("tool authority self-test cannot retain state: {error}"))?;
     let name = std::ffi::CString::new("dev-hermit-tool-authority")
         .map_err(|error| format!("tool authority self-test memfd name failed: {error}"))?;
-    let raw_authority = unsafe {
-        libc::memfd_create(
-            name.as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
+    let raw_authority =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw_authority < 0 {
         return Err(format!(
             "tool authority self-test cannot create memfd: {}",
@@ -8137,12 +8747,8 @@ fn create_self_test_tool_authority(
         .map_err(|_| "tool authority self-test root fd is negative")?;
     let state_fd = u32::try_from(state_file.as_raw_fd())
         .map_err(|_| "tool authority self-test state fd is negative")?;
-    let target_fd = u32::try_from(
-        target_fd_override
-            .unwrap_or(&target_file)
-            .as_raw_fd(),
-    )
-    .map_err(|_| "tool authority self-test target fd is negative")?;
+    let target_fd = u32::try_from(target_fd_override.unwrap_or(&target_file).as_raw_fd())
+        .map_err(|_| "tool authority self-test target fd is negative")?;
     let authority_fd = u32::try_from(authority_file.as_raw_fd())
         .map_err(|_| "tool authority self-test authority fd is negative")?;
     let record = serde_json::json!({
@@ -8175,10 +8781,7 @@ fn create_self_test_tool_authority(
     authority_file
         .set_permissions(std::fs::Permissions::from_mode(0o400))
         .map_err(|error| format!("tool authority self-test cannot freeze record: {error}"))?;
-    let seals = libc::F_SEAL_SEAL
-        | libc::F_SEAL_SHRINK
-        | libc::F_SEAL_GROW
-        | libc::F_SEAL_WRITE;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     if unsafe { libc::fcntl(authority_file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
         return Err(format!(
             "tool authority self-test cannot seal record: {}",
@@ -8305,7 +8908,10 @@ fn configured_tool_selection(
         ));
     }
     let state = std::fs::canonicalize(state_root).map_err(|error| {
-        format!("cannot resolve canonical {PARENT_ENV} {}: {error}", state_root.display())
+        format!(
+            "cannot resolve canonical {PARENT_ENV} {}: {error}",
+            state_root.display()
+        )
     })?;
     let state_top = std::fs::canonicalize(git(&state, &["rev-parse", "--show-toplevel"])?)
         .map_err(|error| format!("cannot resolve state worktree top level: {error}"))?;
@@ -8317,7 +8923,10 @@ fn configured_tool_selection(
         ));
     }
     let common = |root: &Path| -> Result<PathBuf, String> {
-        let path = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        let path = git(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
         std::fs::canonicalize(&path)
             .map_err(|error| format!("cannot resolve Git common directory {path}: {error}"))
     };
@@ -8330,7 +8939,13 @@ fn configured_tool_selection(
     }
     if git(
         &resolved,
-        &["config", "-f", ".gitmodules", "--get", "submodule.hermit.path"],
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "--get",
+            "submodule.hermit.path",
+        ],
     )? != "hermit"
     {
         return Err(format!(
@@ -8340,7 +8955,12 @@ fn configured_tool_selection(
     }
     let dirty = git(
         &resolved,
-        &["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
     )?;
     if !dirty.is_empty() {
         return Err(format!(
@@ -8455,8 +9075,12 @@ fn requested_validate_args() -> String {
 
 /// `validation_slot_name` (validate.sh:37): which worktree slot this checkout is.
 fn slot_name(root: &Path, parent: Option<&Path>) -> String {
-    let Some(parent) = parent else { return "standalone".into() };
-    let Ok(rel) = root.strip_prefix(parent) else { return "standalone".into() };
+    let Some(parent) = parent else {
+        return "standalone".into();
+    };
+    let Ok(rel) = root.strip_prefix(parent) else {
+        return "standalone".into();
+    };
     let rel = rel.to_string_lossy();
     if rel == "hermit" {
         return "primary".into();
@@ -8497,11 +9121,26 @@ fn cache_state(root: &Path) -> &'static str {
 /// network reason) and it does not fire when the ref is absent — an unknown base
 /// is reported as unknown, never silently treated as fresh.
 fn rebase_freshness(force: bool) -> Result<String, String> {
-    if sh("git", &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"]).is_none() {
-        return Ok("base: origin/main not present locally; freshness UNKNOWN (not asserted)".into());
+    if sh(
+        "git",
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/main",
+        ],
+    )
+    .is_none()
+    {
+        return Ok(
+            "base: origin/main not present locally; freshness UNKNOWN (not asserted)".into(),
+        );
     }
-    let counts = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0\t0".into());
+    let counts = sh(
+        "git",
+        &["rev-list", "--left-right", "--count", "origin/main...HEAD"],
+    )
+    .unwrap_or_else(|| "0\t0".into());
     let mut it = counts.split_whitespace();
     let behind: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let ahead: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -8510,7 +9149,9 @@ fn rebase_freshness(force: bool) -> Result<String, String> {
 
 fn rebase_freshness_from_counts(behind: i64, ahead: i64, force: bool) -> Result<String, String> {
     if behind == 0 {
-        return Ok(format!("base: up to date with origin/main (ahead {ahead}, behind 0)"));
+        return Ok(format!(
+            "base: up to date with origin/main (ahead {ahead}, behind 0)"
+        ));
     }
     let msg = format!(
         "HEAD is {behind} commit(s) BEHIND origin/main (ahead {ahead}).\n  \
@@ -8523,7 +9164,9 @@ fn rebase_freshness_from_counts(behind: i64, ahead: i64, force: bool) -> Result<
          ci-hub validate-lock admission."
     );
     if force {
-        Ok(format!("base: STALE, {behind} behind origin/main — forced past the freshness gate"))
+        Ok(format!(
+            "base: STALE, {behind} behind origin/main — forced past the freshness gate"
+        ))
     } else {
         Err(msg)
     }
@@ -8681,7 +9324,9 @@ impl Default for Plan {
 fn require_committed_scheduler_input(plan: &Plan) -> Result<(), String> {
     let Some(expected) = plan.committed_selection.as_deref() else {
         if plan.committed_source.is_some() {
-            return Err("committed DAG source was recorded without a selected scheduler input".into());
+            return Err(
+                "committed DAG source was recorded without a selected scheduler input".into(),
+            );
         }
         return Ok(());
     };
@@ -8717,8 +9362,7 @@ const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
 const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; \
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
-const DAGRUN_PREPARE_BODY: &str =
-    "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
+const DAGRUN_PREPARE_BODY: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
 const RUST_SCRIPT_PRODUCER_BODY: &str =
     "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ./ci/prepare-rust-scripts.sh";
 
@@ -8889,7 +9533,7 @@ fn configure_prebuilt_rust_scripts(
                     "execution plan contains {} rust-script producer nodes ({}); exactly one may publish the script binaries",
                     tags.len(),
                     tags.join(", ")
-                ))
+                ));
             }
         };
         let has_pin = cfg.steps.iter().any(|step| step.tag() == PIN_GATE_TAG);
@@ -8936,7 +9580,16 @@ fn configure_prebuilt_rust_scripts(
 
 fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     let step = |job: &str, deps: Vec<String>| {
-        step_with_caps("fixture", job, "fixture", "true".into(), deps, 30, 30, 1024 * 1024)
+        step_with_caps(
+            "fixture",
+            job,
+            "fixture",
+            "true".into(),
+            deps,
+            30,
+            30,
+            1024 * 1024,
+        )
     };
     let mut plan = Plan {
         cfg: validate_plan::config_from(
@@ -8992,10 +9645,7 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         "{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh && {DAGRUN_PREPARE_BODY}"
     );
     let mut late = Plan {
-        cfg: validate_plan::config_from(
-            vec![late_prepare],
-            "late dagrun preparation bracket",
-        ),
+        cfg: validate_plan::config_from(vec![late_prepare], "late dagrun preparation bracket"),
         ..Default::default()
     };
     if configure_prebuilt_rust_scripts(root, &mut late, false).is_ok() {
@@ -9352,7 +10002,6 @@ fn manifest_bucket_of(step: &Step) -> Option<(String, String)> {
     Some((declared_lane.clone(), declared_category.clone()))
 }
 
-
 /// Read the exact checked-in required cell population and aggregate it by
 /// manifest bucket for the already-resolved absent capabilities.
 ///
@@ -9409,12 +10058,13 @@ fn read_bucket_cells(
                 let name = value.as_str().ok_or_else(|| {
                     format!("{} contains a non-string host capability", path.display())
                 })?;
-                let capability = validate_plan::HostCapability::from_value(name).ok_or_else(|| {
-                    format!(
-                        "{} contains unknown host capability {name:?}",
-                        path.display()
-                    )
-                })?;
+                let capability =
+                    validate_plan::HostCapability::from_value(name).ok_or_else(|| {
+                        format!(
+                            "{} contains unknown host capability {name:?}",
+                            path.display()
+                        )
+                    })?;
                 if absent.contains_key(&capability) {
                     cell_absent.insert(name.to_string());
                 }
@@ -9641,10 +10291,15 @@ fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<
             && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
     });
     if by_binary.len() != EXPECTED_SHARED_INTEGRATION_TESTS.len()
-        || EXPECTED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, consumers)| {
-            let expected = consumers.iter().map(|tag| (*tag).to_string()).collect::<Vec<_>>();
-            by_binary.get(binary) != Some(&expected)
-        })
+        || EXPECTED_SHARED_INTEGRATION_TESTS
+            .iter()
+            .any(|(binary, consumers)| {
+                let expected = consumers
+                    .iter()
+                    .map(|tag| (*tag).to_string())
+                    .collect::<Vec<_>>();
+                by_binary.get(binary) != Some(&expected)
+            })
     {
         return Err(format!(
             "committed shared integration-test consumers changed: expected={EXPECTED_SHARED_INTEGRATION_TESTS:?}, actual={by_binary:?}"
@@ -9665,7 +10320,9 @@ fn assert_committed_shared_integration_test_serialization(
         .collect::<BTreeSet<_>>()
         .len();
     if resource_count != EXPECTED_SHARED_INTEGRATION_TESTS.len() {
-        return Err(format!("fused shared integration-test resource count changed: {resource_count}"));
+        return Err(format!(
+            "fused shared integration-test resource count changed: {resource_count}"
+        ));
     }
     for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TESTS {
         let resource = format!("integration_test_binaries.{binary}");
@@ -9678,7 +10335,10 @@ fn assert_committed_shared_integration_test_serialization(
             .collect();
         actual.sort();
         if caps.get(&resource) != Some(&1) || actual != expected {
-            return Err(format!("fused shared-test resource {resource} has cap={:?}, demanders={actual:?}; expected cap=1, demanders={expected:?}", caps.get(&resource)));
+            return Err(format!(
+                "fused shared-test resource {resource} has cap={:?}, demanders={actual:?}; expected cap=1, demanders={expected:?}",
+                caps.get(&resource)
+            ));
         }
     }
     Ok(())
@@ -9688,8 +10348,8 @@ fn assert_committed_shared_integration_test_serialization(
 /// so the scheduler boundary can reject any intervening file mutation.
 fn load_committed_validation_dag(root: &Path) -> Result<(DagConfig, PathBuf, Vec<u8>), String> {
     let path = validate_plan::validation_dag_path(root);
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
     let cfg = dag_from_json(text)
@@ -9697,11 +10357,7 @@ fn load_committed_validation_dag(root: &Path) -> Result<(DagConfig, PathBuf, Vec
     Ok((cfg, path, bytes))
 }
 
-fn finish_committed_selection(
-    mut plan: Plan,
-    source_path: PathBuf,
-    source_bytes: Vec<u8>,
-) -> Plan {
+fn finish_committed_selection(mut plan: Plan, source_path: PathBuf, source_bytes: Vec<u8>) -> Plan {
     plan.committed_selection = Some(dag_to_json(&plan.cfg));
     plan.committed_source = Some((source_path, source_bytes));
     plan
@@ -9751,7 +10407,10 @@ fn expand_strict_compat_alias(
 const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 13] = [
     ("build.rust_scripts", "build.rust_scripts"),
     ("check.reverie_pin", "pre.reverie_pin"),
-    ("build.privileged_tests", "privileged-only-build.privileged_tests"),
+    (
+        "build.privileged_tests",
+        "privileged-only-build.privileged_tests",
+    ),
     ("cpuid.faulting", "privileged-only-cpuid.faulting"),
     ("pmu.preemption", "privileged-only-pmu.preemption"),
     (
@@ -9906,7 +10565,9 @@ fn select_from_committed_decision(
 /// dependency retained here is read from the committed source without rewriting.
 fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
     let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-    let twins = cfg.steps.iter()
+    let twins = cfg
+        .steps
+        .iter()
         .filter(|step| step.job == "manifest_guests" && tags.contains(&step.tag()))
         .map(|step| format!("{}_in_pinned_root", step.tag()))
         .filter(|twin| available.contains(twin))
@@ -9915,19 +10576,27 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
     let required_producer = |tag: &str| {
         let tag = tag.strip_prefix("quick-super-").unwrap_or(tag);
         let tag = tag.strip_suffix("_on_host").unwrap_or(tag);
-        matches!(tag,
-            "setup.manifest_plan" | "setup.manifest_plan_in_pinned_root"
-                | "build.rust_scripts" | "build.rust_scripts_in_pinned_root"
+        matches!(
+            tag,
+            "setup.manifest_plan"
+                | "setup.manifest_plan_in_pinned_root"
+                | "build.rust_scripts"
+                | "build.rust_scripts_in_pinned_root"
                 | "setup.pinned_root_fetch"
         )
     };
     loop {
-        let additions = cfg.steps.iter()
+        let additions = cfg
+            .steps
+            .iter()
             .filter(|step| tags.contains(&step.tag()))
             .flat_map(|step| step.deps.iter())
             .filter(|dependency| required_producer(dependency) && !tags.contains(*dependency))
-            .cloned().collect::<Vec<_>>();
-        if additions.is_empty() { break; }
+            .cloned()
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            break;
+        }
         tags.extend(additions);
     }
 }
@@ -9947,36 +10616,47 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
             ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
             ("hosted-privileged", false) => &[
-                "pre.reverie_pin_on_host", "build.rust_scripts_on_host",
-                "setup.manifest_plan_on_host", "gate.manifest_on_host",
+                "pre.reverie_pin_on_host",
+                "build.rust_scripts_on_host",
+                "setup.manifest_plan_on_host",
+                "gate.manifest_on_host",
             ],
             (_, true) => &["pre.submodules", PIN_GATE_TAG],
             (_, false) => &[
-                "pre.submodules", PIN_GATE_TAG, RUST_SCRIPT_PRODUCER_TAG,
-                validate_plan::MANIFEST_PLAN_PRODUCER_TAG, "gate.manifest",
+                "pre.submodules",
+                PIN_GATE_TAG,
+                RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                "gate.manifest",
             ],
         };
         tags.extend(preflight.iter().map(|tag| {
-            if matches!(lane.as_str(), "quick" | "super") && matches!(*tag,
-                RUST_SCRIPT_PRODUCER_TAG | validate_plan::MANIFEST_PLAN_PRODUCER_TAG | "gate.manifest"
-            ) {
+            if matches!(lane.as_str(), "quick" | "super")
+                && matches!(
+                    *tag,
+                    RUST_SCRIPT_PRODUCER_TAG
+                        | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+                        | "gate.manifest"
+                )
+            {
                 format!("quick-super-{tag}")
             } else {
                 (*tag).to_string()
             }
         }));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let cfg = dagrun::select_steps_by_tags(
-            &lane_cfg,
-            &tags.into_iter().collect::<Vec<_>>(),
-            true,
-        )?;
+        let cfg =
+            dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), true)?;
         let compat = (lane == "portable" && cfg.steps.iter().any(|step| step.group == "compat"))
             .then_some(CompatMode::PortableStrict);
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
-            profile: args.focused.as_ref().expect("matched focused mode").profile(),
+            profile: args
+                .focused
+                .as_ref()
+                .expect("matched focused mode")
+                .profile(),
             selection_mode: "only",
             compat,
             compat_prefix: compat.map(|_| "compat."),
@@ -9986,7 +10666,12 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         return Ok(finish_committed_selection(plan, source_path, source_bytes));
     }
 
-    if let Some(Focused::RequalifyCell { test, mode, backend }) = &args.focused {
+    if let Some(Focused::RequalifyCell {
+        test,
+        mode,
+        backend,
+    }) = &args.focused
+    {
         let matches = validate_cell_results::expected_plan(root)?
             .into_iter()
             .filter(|cell| {
@@ -10006,10 +10691,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             mode: Some(mode.clone()),
             backend: Some(backend.clone()),
         };
-        let lane_cfg = dagrun::select_steps_by_labels(
-            &committed,
-            std::slice::from_ref(&exact.lane),
-        )?;
+        let lane_cfg =
+            dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&exact.lane))?;
         let owner = dagrun::result_manifest_owner(&lane_cfg.steps, &exact)?;
         let owner_tag = owner.tag();
         let selected_population = owner
@@ -10059,9 +10742,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             )
         };
         match &baseline {
-            Some(value) => println!(
-                "Selective validation: last-known-green baseline = {value}"
-            ),
+            Some(value) => println!("Selective validation: last-known-green baseline = {value}"),
             None => println!(
                 "Selective validation: no trustworthy green baseline; running the FULL portable label."
             ),
@@ -10109,7 +10790,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         _ => None,
     };
     if let Some(label) = committed_label {
-        if label == "super" && validate_super::repetitions() != validate_super::SUPER_REPETITIONS_DEFAULT
+        if label == "super"
+            && validate_super::repetitions() != validate_super::SUPER_REPETITIONS_DEFAULT
         {
             return Err(format!(
                 "SUPER_REPETITIONS cannot change the committed super graph; regenerate ci/dag/validate.json to change its {} repetitions",
@@ -10488,7 +11170,11 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
     println!("----- selective coverage report (skipped nodes/shards/e2e cells + reasons) -----");
     println!("{}", report.trim_end());
     println!("-------------------------------------------------------------------------------");
-    match sel.get("decision").and_then(|d| d.as_str()).unwrap_or("full") {
+    match sel
+        .get("decision")
+        .and_then(|d| d.as_str())
+        .unwrap_or("full")
+    {
         "skip" => SelectDecision::Skip,
         "selective" => {
             let nodes: BTreeSet<String> = sel
@@ -10964,8 +11650,8 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .cloned()
         .ok_or("strict-compat flatten: coexistence fixture lost test.hermit_modes")?;
 
-    let expected = validate_corpus::STRICT_COMPAT_TOTAL
-        - validate_corpus::portable_super_only().len();
+    let expected =
+        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len();
     let probes: Vec<&Step> = first
         .steps
         .iter()
@@ -10984,7 +11670,8 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     {
         return Err(format!(
             "strict-compat flatten: wrong committed shape probes={} expected={expected} prep_deps={:?}",
-            probes.len(), prep.deps
+            probes.len(),
+            prep.deps
         ));
     }
     if first.resource_caps.contains_key("hermit_guest")
@@ -10998,7 +11685,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         );
     }
     let required_prefix = " run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- ";
-    if probes.iter().any(|probe| !probe.cmd.contains(required_prefix)) {
+    if probes
+        .iter()
+        .any(|probe| !probe.cmd.contains(required_prefix))
+    {
         return Err(
             "strict-compat flatten: a portable probe lost minimal base environment or /test working-directory isolation"
                 .into(),
@@ -11115,15 +11805,27 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // drop their source/gate ordering. Retain those five prerequisites here as
     // inert commands; the same three workload commands still must overlap.
     let fixture_preflight = [
-        "pre.submodules", PIN_GATE_TAG, RUST_SCRIPT_PRODUCER_TAG,
-        validate_plan::MANIFEST_PLAN_PRODUCER_TAG, "gate.manifest",
+        "pre.submodules",
+        PIN_GATE_TAG,
+        RUST_SCRIPT_PRODUCER_TAG,
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+        "gate.manifest",
     ];
     for tag in fixture_preflight {
-        let source = first.steps.iter().find(|step| step.tag() == tag)
+        let source = first
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("strict-compat flatten: missing committed preflight {tag}"))?;
         execution.steps.push(step_with_caps(
-            &source.group, &source.job, "inert committed preflight", "true".into(),
-            source.deps.clone(), 10, 10, 64 * 1024 * 1024,
+            &source.group,
+            &source.job,
+            "inert committed preflight",
+            "true".into(),
+            source.deps.clone(),
+            10,
+            10,
+            64 * 1024 * 1024,
         ));
     }
     let mut execution_prep = prep.clone();
@@ -11158,7 +11860,11 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
     let mut ordinary = ordinary;
     let ordinary_observed = barrier.join("ordinary.observed");
-    ordinary.deps = vec!["compatprep.fixtures".into(), PIN_GATE_TAG.into(), "gate.manifest".into()];
+    ordinary.deps = vec![
+        "compatprep.fixtures".into(),
+        PIN_GATE_TAG.into(),
+        "gate.manifest".into(),
+    ];
     ordinary.cmd = format!(
         "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":2,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
         tag = validate_plan::shell_quote(&ordinary.tag()),
@@ -11194,14 +11900,20 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .map(String::as_str)
         .chain(std::iter::once("test.hermit_modes"))
         .collect::<BTreeSet<_>>();
-    let expected_outcomes = fixture_preflight.into_iter()
+    let expected_outcomes = fixture_preflight
+        .into_iter()
         .chain(std::iter::once("compatprep.fixtures"))
         .chain(expected_observed.iter().copied())
         .collect::<BTreeSet<_>>();
     if !result.ok
         || !result.complete
         || result.outcomes.len() != 9
-        || result.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<BTreeSet<_>>() != expected_outcomes
+        || result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.tag.as_str())
+            .collect::<BTreeSet<_>>()
+            != expected_outcomes
         || !result.skipped.is_empty()
         || observed
             .iter()
@@ -11213,7 +11925,11 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             "strict-compat flatten: one outer scheduler did not execute two probes and one ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
             result.ok,
             result.complete,
-            result.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<Vec<_>>(),
+            result
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.tag.as_str())
+                .collect::<Vec<_>>(),
             result.skipped,
         ));
     }
@@ -11249,7 +11965,8 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         "executed_tests": 1,
         "filtered_tests": 0,
         "results": [{"id": "engine-fixture", "result": "pass", "attempts": 1}],
-    }).to_string();
+    })
+    .to_string();
     let mut step = step_with_caps(
         "fixture",
         "structured",
@@ -11270,7 +11987,10 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
     )]);
     std::fs::write(
         fixture_root.join("ci/dag/validate.json"),
-        dag_to_json(&validate_plan::config_from(vec![step], "structured result engine fixture")),
+        dag_to_json(&validate_plan::config_from(
+            vec![step],
+            "structured result engine fixture",
+        )),
     )
     .map_err(|error| format!("raw run-dag engine: cannot write committed fixture: {error}"))?;
     // This nested public launcher must retain the CPU width admitted for the
@@ -11323,7 +12043,12 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         command
             .args(["--kill-after=2s", "60s"])
             .arg(fixture_root.join("ci/run-dag.sh"))
-            .args(["portable", "--allow-cgroup-failure", "--allow-unwise-nest-dagruns", "-q"])
+            .args([
+                "portable",
+                "--allow-cgroup-failure",
+                "--allow-unwise-nest-dagruns",
+                "-q",
+            ])
             .current_dir(fixture_root)
             .env_remove("DAGRUN_BIN")
             .env_remove("DAGRUN_ENGINE")
@@ -11335,7 +12060,9 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         if let Some(engine) = engine {
             command.env("DAGRUN_ENGINE", engine);
         }
-        command.output().map_err(|error| format!("raw run-dag engine: cannot launch: {error}"))
+        command
+            .output()
+            .map_err(|error| format!("raw run-dag engine: cannot launch: {error}"))
     };
     let rust = launch(None)?;
     let rust_stderr = String::from_utf8_lossy(&rust.stderr);
@@ -11353,7 +12080,9 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         "run-dag.sh: lane=portable cargo-jobs=10 runner=fixture",
         "cargo-jobs=1",
     ) {
-        return Err("raw run-dag engine: exact cargo-jobs field accepted a prefix collision".into());
+        return Err(
+            "raw run-dag engine: exact cargo-jobs field accepted a prefix collision".into(),
+        );
     }
     if !rust.status.success()
         || !rust_stderr.contains("[dagrun] engine=rust")
@@ -11362,7 +12091,9 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
     {
         return Err(format!(
             "raw run-dag engine: default runner did not execute the structured committed fixture: status={} marker={} stdout={} stderr={rust_stderr}",
-            rust.status, marker.exists(), String::from_utf8_lossy(&rust.stdout),
+            rust.status,
+            marker.exists(),
+            String::from_utf8_lossy(&rust.stdout),
         ));
     }
     std::fs::remove_file(&marker)
@@ -11372,12 +12103,14 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
     if python.status.success()
         || !python_stderr.contains("[dagrun] engine=python")
         || !python_stderr.contains("REFUSING to run before any node starts")
-        || !python_stderr.contains("Python runner does not implement structured test-result capture")
+        || !python_stderr
+            .contains("Python runner does not implement structured test-result capture")
         || marker.exists()
     {
         return Err(format!(
             "raw run-dag engine: Python did not refuse structured results before execution: status={} marker={} stderr={python_stderr}",
-            python.status, marker.exists(),
+            python.status,
+            marker.exists(),
         ));
     }
     Ok("raw run-dag engine: default Rust executed the structured committed fixture; explicit Python refused before its marker could execute".into())
@@ -11500,14 +12233,36 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
     }
 
     for args in [
-        vec!["portable".to_owned(), "--dag".to_owned(), alternate.display().to_string()],
-        vec!["portable".to_owned(), format!("--dag={}", alternate.display())],
-        vec!["portable".to_owned(), "--labels".to_owned(), "full".to_owned()],
+        vec![
+            "portable".to_owned(),
+            "--dag".to_owned(),
+            alternate.display().to_string(),
+        ],
+        vec![
+            "portable".to_owned(),
+            format!("--dag={}", alternate.display()),
+        ],
+        vec![
+            "portable".to_owned(),
+            "--labels".to_owned(),
+            "full".to_owned(),
+        ],
         vec!["portable".to_owned(), "--labels=full".to_owned()],
-        vec!["portable".to_owned(), "--selected".to_owned(), "pre.submodules".to_owned()],
-        vec!["portable".to_owned(), "--selected=pre.submodules".to_owned()],
+        vec![
+            "portable".to_owned(),
+            "--selected".to_owned(),
+            "pre.submodules".to_owned(),
+        ],
+        vec![
+            "portable".to_owned(),
+            "--selected=pre.submodules".to_owned(),
+        ],
         vec!["portable".to_owned(), "--ignore-selected-deps".to_owned()],
-        vec!["portable".to_owned(), "--args".to_owned(), "echo".to_owned()],
+        vec![
+            "portable".to_owned(),
+            "--args".to_owned(),
+            "echo".to_owned(),
+        ],
         vec!["portable".to_owned(), "--args=echo".to_owned()],
         vec!["portable".to_owned(), "--stress".to_owned(), "2".to_owned()],
         vec!["portable".to_owned(), "--stress=2".to_owned()],
@@ -11521,10 +12276,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
             format!("--resource-caps-path={}", alternate.display()),
         ],
         vec!["portable".to_owned(), "--small-default-cap".to_owned()],
-        vec![
-            "portable".to_owned(),
-            "--small-default-cap=true".to_owned(),
-        ],
+        vec!["portable".to_owned(), "--small-default-cap=true".to_owned()],
     ] {
         let output = Command::new(root.join("ci/run-dag.sh"))
             .args(&args)
@@ -11570,11 +12322,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
 ///
 /// The `super` suite already builds a release Hermit under its own tag, so it
 /// hangs the fixtures off THAT node instead of adding a second identical build.
-fn prepare_fixtures_node_dep(
-    _tag: &str,
-    fixtures: &Path,
-    dep: &str,
-) -> dagrun::model::Step {
+fn prepare_fixtures_node_dep(_tag: &str, fixtures: &Path, dep: &str) -> dagrun::model::Step {
     step_with_caps(
         "compatprep",
         "fixtures",
@@ -11594,8 +12342,22 @@ fn prepare_fixtures_node_dep(
 /// host identity-daemon races out of the e9patch compatibility measurement.
 fn nsswitch_fixture_node(path: &Path) -> dagrun::model::Step {
     let entries = [
-        "aliases", "automount", "ethers", "group", "gshadow", "hosts", "initgroups", "netgroup",
-        "netmasks", "networks", "passwd", "protocols", "publickey", "rpc", "services", "shadow",
+        "aliases",
+        "automount",
+        "ethers",
+        "group",
+        "gshadow",
+        "hosts",
+        "initgroups",
+        "netgroup",
+        "netmasks",
+        "networks",
+        "passwd",
+        "protocols",
+        "publickey",
+        "rpc",
+        "services",
+        "shadow",
     ]
     .iter()
     .map(|k| format!("{k}: files"))
@@ -11724,10 +12486,12 @@ fn blocking_listing<'a>(
         .filter(|o| outcome_is_failure(o) && !nonblocking.contains(&o.tag))
         .map(|o| o.tag.as_str())
         .collect();
-    let unclassified = outcomes.iter()
+    let unclassified = outcomes
+        .iter()
         .filter(|outcome| !outcome.ok && !nonblocking.contains(&outcome.tag))
         .map(|outcome| outcome.tag.as_str())
-        .filter(|tag| !named.contains(tag)).collect();
+        .filter(|tag| !named.contains(tag))
+        .collect();
     format_blocking_listing(named, unclassified, effective_failures)
 }
 
@@ -11736,13 +12500,24 @@ fn classified_blocking_listing<'a>(
     nonblocking: &BTreeSet<String>,
     effective_failures: usize,
 ) -> (Vec<&'a str>, String) {
-    let named = classification.product_failure_nodes.iter()
-        .filter(|tag| !nonblocking.contains(*tag)).map(String::as_str).collect();
-    let unclassified = classification.no_result_nodes.iter()
-        .chain(classification.understood_infrastructure_failure_nodes.keys())
+    let named = classification
+        .product_failure_nodes
+        .iter()
+        .filter(|tag| !nonblocking.contains(*tag))
+        .map(String::as_str)
+        .collect();
+    let unclassified = classification
+        .no_result_nodes
+        .iter()
+        .chain(
+            classification
+                .understood_infrastructure_failure_nodes
+                .keys(),
+        )
         .chain(classification.understood_prerequisite_failure_nodes.iter())
         .filter(|tag| !nonblocking.contains(*tag))
-        .map(String::as_str).collect();
+        .map(String::as_str)
+        .collect();
     format_blocking_listing(named, unclassified, effective_failures)
 }
 
@@ -11815,7 +12590,10 @@ fn format_blocking_listing<'a>(
 fn execution_completeness_details(skipped: &[String], execution_complete: bool) -> Vec<String> {
     let mut detail = Vec::new();
     if !skipped.is_empty() {
-        detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
+        detail.push(format!(
+            "{} node(s) never ran because a dependency failed",
+            skipped.len()
+        ));
     }
     if !execution_complete {
         detail.push(
@@ -11928,7 +12706,9 @@ fn summary_listing_bracket() -> Result<String, String> {
     //    timed-out-node shape: counted somewhere, nameable from nothing.
     let (_n, listing) = blocking_listing(&nine, &none, 10);
     if !listing.contains("NOT NAMEABLE") {
-        return Err(format!("count exceeding the list was not announced: {listing}"));
+        return Err(format!(
+            "count exceeding the list was not announced: {listing}"
+        ));
     }
 
     // 5. THE OTHER PRODUCTION SHAPE: ten nodes not ok, nine classified as
@@ -11940,10 +12720,15 @@ fn summary_listing_bracket() -> Result<String, String> {
     ten.push(killed);
     let (named, listing) = blocking_listing(&ten, &none, 9);
     if named.len() != 9 {
-        return Err(format!("budget kill was absorbed into the failure count: {}", named.len()));
+        return Err(format!(
+            "budget kill was absorbed into the failure count: {}",
+            named.len()
+        ));
     }
     if !listing.contains("NO VERDICT") || !listing.contains("manifest_c_programs") {
-        return Err(format!("a node that did not pass went unreported: {listing}"));
+        return Err(format!(
+            "a node that did not pass went unreported: {listing}"
+        ));
     }
 
     // 6. A nonblocking row is excluded from BOTH halves, not just one.
@@ -11960,8 +12745,7 @@ fn summary_listing_bracket() -> Result<String, String> {
     //    ⚠️ CONTROL FIRST, AND IT MUST NOT ELIDE. Without a case that stays
     //    whole, a helper that appended "(+N more)" unconditionally -- or one
     //    that dropped everything -- would satisfy every remaining assertion.
-    let exactly_at_cap: Vec<String> =
-        (0..REFUSAL_ITEM_CAP).map(|i| format!("  a{i}")).collect();
+    let exactly_at_cap: Vec<String> = (0..REFUSAL_ITEM_CAP).map(|i| format!("  a{i}")).collect();
     let kept = capped_refusal_items(exactly_at_cap);
     if kept.len() != REFUSAL_ITEM_CAP || kept.iter().any(|l| l.contains("more not shown")) {
         return Err(format!(
@@ -11970,25 +12754,43 @@ fn summary_listing_bracket() -> Result<String, String> {
     }
 
     // 8. One over the cap: the remainder is STATED, and the arithmetic is right.
-    let over: Vec<String> = (0..REFUSAL_ITEM_CAP + 1).map(|i| format!("  b{i}")).collect();
+    let over: Vec<String> = (0..REFUSAL_ITEM_CAP + 1)
+        .map(|i| format!("  b{i}"))
+        .collect();
     let capped = capped_refusal_items(over);
     if capped.len() != REFUSAL_ITEM_CAP + 1 {
-        return Err(format!("cap produced {} lines, want {}", capped.len(), REFUSAL_ITEM_CAP + 1));
+        return Err(format!(
+            "cap produced {} lines, want {}",
+            capped.len(),
+            REFUSAL_ITEM_CAP + 1
+        ));
     }
-    if !capped.last().is_some_and(|l| l.contains("(+1 more not shown)")) {
-        return Err(format!("one over the cap did not declare its remainder: {capped:?}"));
+    if !capped
+        .last()
+        .is_some_and(|l| l.contains("(+1 more not shown)"))
+    {
+        return Err(format!(
+            "one over the cap did not declare its remainder: {capped:?}"
+        ));
     }
 
     // 9. Well over the cap: the elided count is total-minus-shown, not a guess.
-    let far_over: Vec<String> = (0..REFUSAL_ITEM_CAP + 7).map(|i| format!("  c{i}")).collect();
+    let far_over: Vec<String> = (0..REFUSAL_ITEM_CAP + 7)
+        .map(|i| format!("  c{i}"))
+        .collect();
     let capped = capped_refusal_items(far_over);
-    if !capped.last().is_some_and(|l| l.contains("(+7 more not shown)")) {
+    if !capped
+        .last()
+        .is_some_and(|l| l.contains("(+7 more not shown)"))
+    {
         return Err(format!("elided count is wrong: {capped:?}"));
     }
     //    And nothing above the cap is silently retained OR silently dropped: the
     //    shown items must be the FIRST ones, in order.
     if capped.first().map(String::as_str) != Some("  c0") {
-        return Err(format!("cap did not keep the first items in order: {capped:?}"));
+        return Err(format!(
+            "cap did not keep the first items in order: {capped:?}"
+        ));
     }
 
     // 10. The empty case says nothing at all -- no "(+0 more)" noise.
@@ -11996,12 +12798,14 @@ fn summary_listing_bracket() -> Result<String, String> {
         return Err("an empty list must produce no lines".to_string());
     }
 
-    Ok("summary listing: count and enumeration agree across 10 cases (the 9-failure \
+    Ok(
+        "summary listing: count and enumeration agree across 10 cases (the 9-failure \
 shape named in full, the cap states its remainder, a budget kill is counted \
 and named without being folded into the failure count, and the two refusal \
 sites' shared cap is whole at the cap, declares +1 and +7 above it, and is \
 silent when empty)"
-        .to_string())
+            .to_string(),
+    )
 }
 
 fn ledger_gate_result(outcome: &StepOutcome) -> &'static str {
@@ -12081,10 +12885,7 @@ fn print_super_stress_verdict(
             println!(
                 "  NO_RESULT {slug:<24} {}/{} product result(s) passed ({pct}%); {} of {} \
                  selected repetition(s) did not produce a product result",
-                rate.passed,
-                rate.ran,
-                without_product_result,
-                rate.planned,
+                rate.passed, rate.ran, without_product_result, rate.planned,
             );
         } else if rate.probe.nonblocking() {
             println!(
@@ -12133,7 +12934,10 @@ fn print_cost_table(
     host_inapplicable: &[validate_plan::HostInapplicableNode],
 ) {
     println!("\n=== per-node cost (dagrun) ===");
-    println!("{:<44} {:>9}  {:<8} reason/returncode", "node", "seconds", "status");
+    println!(
+        "{:<44} {:>9}  {:<8} reason/returncode",
+        "node", "seconds", "status"
+    );
     println!("{}", "-".repeat(84));
     let mut total = 0.0_f64;
     for o in outcomes {
@@ -12156,12 +12960,18 @@ fn print_cost_table(
         } else {
             String::new()
         };
-        println!("{:<44} {:>9.2}  {:<8} {}", o.tag, o.duration_s, status, detail);
+        println!(
+            "{:<44} {:>9.2}  {:<8} {}",
+            o.tag, o.duration_s, status, detail
+        );
     }
     println!("{}", "-".repeat(84));
     println!("{:<44} {:>9.2}  (sum of node wall)", "TOTAL", total);
     if !skipped.is_empty() {
-        println!("\nskipped (dependency failed, never ran): {}", skipped.join(", "));
+        println!(
+            "\nskipped (dependency failed, never ran): {}",
+            skipped.join(", ")
+        );
     }
     // Listed AFTER the TOTAL and outside the ok/FAIL/ABORTED column on purpose:
     // a host-inapplicable node has no status in that vocabulary. It did not
@@ -12228,7 +13038,9 @@ fn compat_summary_with_attempts(
     let mut nonblocking_failure_tags: BTreeSet<String> = BTreeSet::new();
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
-        let Some(label) = o.tag.strip_prefix(prefix) else { continue };
+        let Some(label) = o.tag.strip_prefix(prefix) else {
+            continue;
+        };
         let classification = node_classification(o, attempts);
         if classification == NodeClassification::NoResult {
             println!(
@@ -12236,7 +13048,11 @@ fn compat_summary_with_attempts(
             );
             continue;
         }
-        if matches!(classification, NodeClassification::UnderstoodInfrastructureFailure | NodeClassification::UnderstoodPrerequisiteFailure) {
+        if matches!(
+            classification,
+            NodeClassification::UnderstoodInfrastructureFailure
+                | NodeClassification::UnderstoodPrerequisiteFailure
+        ) {
             println!(
                 "  NO_RESULT {label} could not determine its condition; excluded from the measured denominator"
             );
@@ -12274,8 +13090,7 @@ fn compat_summary_with_attempts(
                 println!(
                     "  WARN {label} passed but is listed as known fail-closed under {} \
                      ({}); the EXPECTATION is STALE -- drop it from the known-failure table",
-                    mode_label,
-                    known[label]
+                    mode_label, known[label]
                 );
             }
             CompatDisposition::KnownFailClosedExempt => {
@@ -12291,12 +13106,14 @@ fn compat_summary_with_attempts(
                 println!(
                     "  FAIL {label} known fail-closed under {} ({}); STILL BLOCKING -- \
                      this mode does not exempt listed rows",
-                    mode_label,
-                    known[label]
+                    mode_label, known[label]
                 );
             }
             CompatDisposition::PortableDiagnostic => {
-                println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
+                println!(
+                    "  WARN {label} is a bounded portable diagnostic: {}",
+                    diag[label]
+                );
             }
             CompatDisposition::Blocking => {}
         }
@@ -12325,7 +13142,10 @@ fn compat_summary_with_attempts(
             );
         }
     }
-    println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.display_name());
+    println!(
+        "\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})",
+        mode.display_name()
+    );
     println!("{:<22} | {:>8} | {:>9}", "Category", "Programs", "passing");
     println!("{}", "-".repeat(46));
     for cat in validate_corpus::CATEGORIES {
@@ -12334,7 +13154,11 @@ fn compat_summary_with_attempts(
         }
     }
     println!("{}", "-".repeat(46));
-    println!("{:<22} | {measured:>8} | {:>9}", "TOTAL", format!("{passed}/{measured}"));
+    println!(
+        "{:<22} | {measured:>8} | {:>9}",
+        "TOTAL",
+        format!("{passed}/{measured}")
+    );
     println!("P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.");
     if mode == CompatMode::Rr {
         // Name the rows deliberately EXCLUDED from the R/R ratchet. A denominator
@@ -12348,7 +13172,12 @@ fn compat_summary_with_attempts(
             println!("  - {label}: {why}");
         }
     }
-    (passed, measured, blocking_failures, nonblocking_failure_tags)
+    (
+        passed,
+        measured,
+        blocking_failures,
+        nonblocking_failure_tags,
+    )
 }
 
 /// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
@@ -12429,7 +13258,11 @@ fn completed_verdict(exit_code: u8) -> Verdict {
 /// profile may allow a fully measured failing row, but no profile may turn a
 /// partial run into exit zero.
 fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
-    if execution_complete || exit_code != 0 { exit_code } else { NO_RESULT_EXIT_CODE as u8 }
+    if execution_complete || exit_code != 0 {
+        exit_code
+    } else {
+        NO_RESULT_EXIT_CODE as u8
+    }
 }
 
 /// A missing pin gate invalidates a passing receipt, not an explicitly
@@ -12483,9 +13316,7 @@ fn manifest_node_vacuity_profile_bracket(
         .iter()
         .find(|step| step.tag() == withheld_tag)
         .ok_or_else(|| format!("node vacuity: {label} selection lost bucket {withheld_tag}"))?;
-    if manifest_bucket_of(shipped)
-        != Some(("privileged".to_string(), "c-programs".to_string()))
-    {
+    if manifest_bucket_of(shipped) != Some(("privileged".to_string(), "c-programs".to_string())) {
         return Err(format!(
             "node vacuity: {withheld_tag} must bind to privileged/c-programs; got {:?}",
             manifest_bucket_of(shipped)
@@ -12557,13 +13388,17 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // POSITIVE — the bucket's only cell is withheld, so its node has nothing at
     // all left to run.
     if !bucket_runs_nothing(&bucket(1, 1)) {
-        return Err("node vacuity: a bucket whose every selected cell is withheld must \
+        return Err(
+            "node vacuity: a bucket whose every selected cell is withheld must \
                     withhold its node"
-            .into());
+                .into(),
+        );
     }
     // ...and the same at a larger size, so the rule is not "exactly one cell".
     if !bucket_runs_nothing(&bucket(78, 78)) {
-        return Err("node vacuity: an all-withheld bucket of 78 cells must withhold its node".into());
+        return Err(
+            "node vacuity: an all-withheld bucket of 78 cells must withhold its node".into(),
+        );
     }
 
     // THE UN-WITHHOLDING PROOF. One runnable cell in the bucket and the node
@@ -12593,9 +13428,11 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // `selected > 0` guard, `0 == 0` would make every empty bucket read as
     // host-inapplicable and quietly inflate the omission count.
     if bucket_runs_nothing(&bucket(0, 0)) {
-        return Err("node vacuity: a bucket that selected NO cells is empty-manifest-bucket, \
+        return Err(
+            "node vacuity: a bucket that selected NO cells is empty-manifest-bucket, \
                     never host-inapplicable"
-            .into());
+                .into(),
+        );
     }
 
     // THE NODE-TO-BUCKET BINDING. The typed manifest value is authoritative;
@@ -12611,9 +13448,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         let shipped = steps
             .iter()
             .find(|step| step.tag() == tag)
-            .ok_or_else(|| {
-                format!("node vacuity: {label} selection lost privileged bucket {tag}")
-            })?
+            .ok_or_else(|| format!("node vacuity: {label} selection lost privileged bucket {tag}"))?
             .clone();
         if manifest_bucket_of(&shipped)
             != Some(("privileged".to_string(), "c-programs".to_string()))
@@ -12706,9 +13541,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     }
     let present = read_bucket_cells(root, &BTreeMap::new())?;
     if present.iter().any(|bucket| bucket.withheld != 0) {
-        return Err(
-            "node vacuity: no bucket may be withheld when no capability is absent".into(),
-        );
+        return Err("node vacuity: no bucket may be withheld when no capability is absent".into());
     }
 
     // INTEGRATION: exercise both committed tag families through production
@@ -12725,13 +13558,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
             "privileged-scorecard.compatibility",
         ),
     ] {
-        manifest_node_vacuity_profile_bracket(
-            root,
-            &absent,
-            label,
-            withheld_tag,
-            scorecard_tag,
-        )?;
+        manifest_node_vacuity_profile_bracket(root, &absent, label, withheld_tag, scorecard_tag)?;
     }
 
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
@@ -12834,14 +13661,22 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         fail_fast_family: None,
     };
     let requirements: BTreeMap<String, HostCapability> =
-        [("cpuid.faulting".to_string(), HostCapability::CpuidFaulting)].into_iter().collect();
+        [("cpuid.faulting".to_string(), HostCapability::CpuidFaulting)]
+            .into_iter()
+            .collect();
     let absent: BTreeMap<HostCapability, String> =
-        [(HostCapability::CpuidFaulting, "planted".to_string())].into_iter().collect();
+        [(HostCapability::CpuidFaulting, "planted".to_string())]
+            .into_iter()
+            .collect();
     let present: BTreeMap<HostCapability, String> = BTreeMap::new();
     let plan = || {
         vec![
             step("cpuid", "faulting", vec!["build.privileged_tests".into()]),
-            step("test", "detcore_unit", vec!["build.privileged_tests".into()]),
+            step(
+                "test",
+                "detcore_unit",
+                vec!["build.privileged_tests".into()],
+            ),
             step("build", "privileged_tests", vec![]),
         ]
     };
@@ -12886,7 +13721,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
     dependent.push(step("e2e", "needs_cpuid", vec!["cpuid.faulting".into()]));
     if validate_plan::partition_host_inapplicable(dependent, &requirements, &absent).is_ok() {
         return Err(
-            "host capability: withholding a node with a retained dependent must REFUSE".into()
+            "host capability: withholding a node with a retained dependent must REFUSE".into(),
         );
     }
 
@@ -13014,7 +13849,9 @@ fn verdict_refusal_bracket() -> Result<(), String> {
     // blanket red rather than a predicate.
     let clean = verdict_refusals(Some(187), 0, Some(862));
     if !clean.is_empty() {
-        return Err(format!("verdict: a complete run must NOT refuse, got {clean:?}"));
+        return Err(format!(
+            "verdict: a complete run must NOT refuse, got {clean:?}"
+        ));
     }
     // NEGATIVE 2 — unknown counts are not a measured zero.
     if !verdict_refusals(None, 0, None).is_empty() {
@@ -13165,7 +14002,11 @@ fn clamp_cpu(plan: &mut Plan, cap: i64) {
             cap
         };
         for s in cfg.steps.iter_mut() {
-            s.cpu_timeout = if s.cpu_timeout > 0 { s.cpu_timeout.min(cap) } else { cap };
+            s.cpu_timeout = if s.cpu_timeout > 0 {
+                s.cpu_timeout.min(cap)
+            } else {
+                cap
+            };
         }
     }
 }
@@ -13224,9 +14065,18 @@ extern "C" fn on_stop_signal(sig: i32) {
 /// filtered by every reader; not writing it is strictly simpler.
 fn install_stop_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, on_stop_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_stop_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_stop_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -13409,8 +14259,14 @@ fn outcome_failure_class(outcome: &StepOutcome) -> Option<FailureClass> {
     }
 }
 
-fn terminal_attempt<'a>(outcome: &StepOutcome, attempts: &'a [NodeAttempt]) -> Option<&'a NodeAttempt> {
-    attempts.iter().rev().find(|attempt| attempt.tag == outcome.tag)
+fn terminal_attempt<'a>(
+    outcome: &StepOutcome,
+    attempts: &'a [NodeAttempt],
+) -> Option<&'a NodeAttempt> {
+    attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.tag == outcome.tag)
 }
 
 /// Nodes with at least one attempt that produced a child exit status.
@@ -13506,9 +14362,10 @@ fn latest_reported_failure_mut<'a>(
     attempts: &'a mut [NodeAttempt],
     tag: &str,
 ) -> Option<&'a mut NodeAttempt> {
-    attempts.iter_mut().rev().find(|attempt| {
-        attempt.tag == tag && attempt.reported && attempt_is_failure(attempt)
-    })
+    attempts
+        .iter_mut()
+        .rev()
+        .find(|attempt| attempt.tag == tag && attempt.reported && attempt_is_failure(attempt))
 }
 
 /// Attach one round's detail observation to the exact reported failure it came from.
@@ -13522,7 +14379,8 @@ fn stamp_attempt_detail(
     if let Some(attempt) = latest_reported_failure_mut(attempts, tag) {
         attempt.detail_observed = true;
         attempt.environmental_class = environmental_class.map(str::to_string);
-        attempt.understood_infrastructure_class = understood_infrastructure_class.map(str::to_string);
+        attempt.understood_infrastructure_class =
+            understood_infrastructure_class.map(str::to_string);
         if attempt.failure_class == Some(FailureClass::ProductFailure) {
             if let Some((failure_class, failure_detail)) = failure {
                 attempt.failure_class = Some(failure_class);
@@ -13556,7 +14414,10 @@ fn actual_rerun_after<'a>(
 fn environmental_assessment(
     attempts: &[NodeAttempt],
     classified: &NodeAttempt,
-) -> Option<(validate_runtime::EnvBlockVerdict, Option<validate_runtime::RefutedShape>)> {
+) -> Option<(
+    validate_runtime::EnvBlockVerdict,
+    Option<validate_runtime::RefutedShape>,
+)> {
     // NO GOALPOST LOWERING: this derives evidence after execution. It does not
     // alter retry eligibility, the terminal StepOutcome, LaneResult::ok, or
     // failure counts. Unknown execution can only tighten completeness and refuse
@@ -13717,28 +14578,29 @@ fn deadline_from_sources(
     let allowance_ns = (timeout_s as u64)
         .checked_mul(1_000_000_000)
         .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
-    let scheduler_deadline = match step_started_ns {
-        Some(start) if start > now_ns => {
-            return Err(format!(
-                "scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV} is in the future"
-            ));
-        }
-        Some(start) => Some(
-            start
-                .checked_add(allowance_ns)
-                .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?,
-        ),
-        None => None,
-    };
+    let scheduler_deadline =
+        match step_started_ns {
+            Some(start) if start > now_ns => {
+                return Err(format!(
+                    "scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV} is in the future"
+                ));
+            }
+            Some(start) => Some(start.checked_add(allowance_ns).ok_or_else(|| {
+                format!("run timeout {timeout_s}s overflows the monotonic deadline")
+            })?),
+            None => None,
+        };
     // Only the top-level same-logical-run re-exec owns this marker. A nested focused payload
     // inherits its parent's scope marker but owns the scheduler epoch for its own enclosing node.
     if in_scope && !nested {
         if let Some(owned) = owned_scope_deadline_ns {
-            let latest = now_ns
-                .checked_add(allowance_ns)
-                .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
+            let latest = now_ns.checked_add(allowance_ns).ok_or_else(|| {
+                format!("run timeout {timeout_s}s overflows the monotonic deadline")
+            })?;
             if owned > latest {
-                return Err("invocation-owned scope deadline exceeds a fresh full allowance".into());
+                return Err(
+                    "invocation-owned scope deadline exceeds a fresh full allowance".into(),
+                );
             }
             if scheduler_deadline.is_some_and(|scheduler| scheduler != owned) {
                 return Err("scheduler epoch and invocation-owned scope deadline disagree".into());
@@ -13800,11 +14662,7 @@ fn scheduler_refused_before_launching(
     not_launched: usize,
     intentional_skips: usize,
 ) -> bool {
-    planned > 0
-        && outcomes == 0
-        && skipped == 0
-        && not_launched == 0
-        && intentional_skips == 0
+    planned > 0 && outcomes == 0 && skipped == 0 && not_launched == 0 && intentional_skips == 0
 }
 
 /// Replace the recorded reason a planned node did not run with the latest scheduler attempt.
@@ -13878,20 +14736,22 @@ mod scheduler_explanation_tests {
         let mut refused = BTreeSet::new();
 
         update_not_run_explanations(
-            &planned, 0, 0, std::slice::from_ref(&tag), 0, &mut not_launched, &mut refused,
+            &planned,
+            0,
+            0,
+            std::slice::from_ref(&tag),
+            0,
+            &mut not_launched,
+            &mut refused,
         );
         assert!(not_launched.contains(&tag));
         assert!(!refused.contains(&tag));
 
-        update_not_run_explanations(
-            &planned, 0, 0, &[], 0, &mut not_launched, &mut refused,
-        );
+        update_not_run_explanations(&planned, 0, 0, &[], 0, &mut not_launched, &mut refused);
         assert!(!not_launched.contains(&tag));
         assert!(refused.contains(&tag));
 
-        update_not_run_explanations(
-            &planned, 1, 0, &[], 0, &mut not_launched, &mut refused,
-        );
+        update_not_run_explanations(&planned, 1, 0, &[], 0, &mut not_launched, &mut refused);
         assert!(!not_launched.contains(&tag));
         assert!(!refused.contains(&tag));
     }
@@ -13910,7 +14770,6 @@ mod scheduler_explanation_tests {
             "validate: 1 planned node(s) DID NOT RUN; the scheduler returned them in not_launched after it stopped admitting work (fail-fast or outer run budget): test.detcore_misc. They are accounted for, but the lane remains incomplete and cannot be green."
         );
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14117,10 +14976,15 @@ fn guarded_command_source(tag: &str, command: &str) -> Result<String, String> {
             .position(|arg| arg == "--")
             .ok_or_else(|| format!("retry bounds: {tag} has no pinned-root command boundary"))?;
         let tail = &argv[boundary..];
-        if tail.len() != 6 || tail[1] != "bash" || tail[2] != "-c" || tail[4] != "bash"
+        if tail.len() != 6
+            || tail[1] != "bash"
+            || tail[2] != "-c"
+            || tail[4] != "bash"
             || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
         {
-            return Err(format!("retry bounds: {tag} has an unrecognized pinned-root invocation"));
+            return Err(format!(
+                "retry bounds: {tag} has an unrecognized pinned-root invocation"
+            ));
         }
         source = tail[5].clone();
     }
@@ -14187,7 +15051,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             _ => {
                 return Err(format!(
                     "retry bounds: {tag} has an unmodeled harness argument {option:?}"
-                ))
+                ));
             }
         }
         index += 1;
@@ -14437,9 +15301,11 @@ mod nextest_timeout_tests {
             }]
         );
         assert!(manifest.lines().any(|line| line == "timeout_seconds: 57"));
-        assert!(manifest
-            .lines()
-            .any(|line| line == "cpu_timeout_seconds: 22"));
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line == "cpu_timeout_seconds: 22")
+        );
 
         let multiplier = 1.25;
         let scaled = render_scaled_nextest_config(&root, multiplier).unwrap();
@@ -14625,22 +15491,26 @@ mod nextest_timeout_tests {
             Some(836),
             "prebuilt zstd must not be charged for fixture preparation it skips"
         );
-        assert!(manifest_command_is_prebuilt(
-            "prebuilt-control",
-            &format!(
-                "{} --prebuilt",
-                manifest_command_source("quick.e2e_verify", &quick.cmd).unwrap()
+        assert!(
+            manifest_command_is_prebuilt(
+                "prebuilt-control",
+                &format!(
+                    "{} --prebuilt",
+                    manifest_command_source("quick.e2e_verify", &quick.cmd).unwrap()
+                )
             )
-        )
-        .unwrap());
-        assert!(manifest_command_is_prebuilt(
-            "duplicate-control",
-            &format!(
-                "{} --prebuilt --prebuilt",
-                manifest_command_source("quick.e2e_verify", &quick.cmd).unwrap()
+            .unwrap()
+        );
+        assert!(
+            manifest_command_is_prebuilt(
+                "duplicate-control",
+                &format!(
+                    "{} --prebuilt --prebuilt",
+                    manifest_command_source("quick.e2e_verify", &quick.cmd).unwrap()
+                )
             )
-        )
-        .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -14812,11 +15682,13 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             );
         }
         let base = "target/debug/test-harness run --lane portable --ci-only";
-        assert!(!manifest_command_is_prebuilt(
-            "quoted-path",
-            &format!("{base} --results '--prebuilt' --junit 'a b'")
-        )
-        .unwrap());
+        assert!(
+            !manifest_command_is_prebuilt(
+                "quoted-path",
+                &format!("{base} --results '--prebuilt' --junit 'a b'")
+            )
+            .unwrap()
+        );
         assert!(
             manifest_command_is_prebuilt("quoted-option", &format!("{base} '--prebuilt'")).unwrap()
         );
@@ -14830,9 +15702,11 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .unwrap()
             .clone();
         step.manifest.as_mut().unwrap().category = "applications".into();
-        assert!(manifest_step_policy(&step)
-            .unwrap_err()
-            .contains("disagrees"));
+        assert!(
+            manifest_step_policy(&step)
+                .unwrap_err()
+                .contains("disagrees")
+        );
         step.env
             .insert(TEST_CPU_TIMEOUT_MULTIPLIER_ENV.into(), "1.25".into());
         step.env
@@ -14866,16 +15740,18 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             (i64::MAX, 1, 2, 1, u64::MAX),
             (364, 86, 2, 10, 2),
         ] {
-            assert!(require_resolved_outer_timeout_headroom(
-                "invalid-control",
-                node,
-                inner,
-                windows,
-                grace,
-                attempts,
-                "fixture"
-            )
-            .is_err());
+            assert!(
+                require_resolved_outer_timeout_headroom(
+                    "invalid-control",
+                    node,
+                    inner,
+                    windows,
+                    grace,
+                    attempts,
+                    "fixture"
+                )
+                .is_err()
+            );
         }
         assert_eq!(
             require_resolved_outer_timeout_headroom(
@@ -15087,8 +15963,10 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
             let broken = vec!["bash".into(), "-c".into(), command.replace(&argument, "")];
             let output = run(&broken, Some("1.25"), Some("1.75"));
             assert_eq!(output.status.code(), Some(91));
-            assert!(String::from_utf8_lossy(&output.stderr)
-                .contains("MISSING_OR_DUPLICATED_TIMEOUT_PROPAGATION"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("MISSING_OR_DUPLICATED_TIMEOUT_PROPAGATION")
+            );
         }
         let copied_root = scratch.path().join("split-mutation");
         let copied_scripts = copied_root.join("ci/hermetic");
@@ -15140,8 +16018,10 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(String::from_utf8_lossy(&output.stderr)
-                .contains("MISSING_OR_DUPLICATED_TIMEOUT_PROPAGATION"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("MISSING_OR_DUPLICATED_TIMEOUT_PROPAGATION")
+            );
         }
     }
 }
@@ -15337,9 +16217,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
         ));
     }
-    let count_error =
-        require_expected_nextest_count("test.fixture", &BTreeMap::new(), 7)
-            .expect_err("missing exact-count declaration mutation must be refused");
+    let count_error = require_expected_nextest_count("test.fixture", &BTreeMap::new(), 7)
+        .expect_err("missing exact-count declaration mutation must be refused");
     if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
         return Err(format!(
             "retry bounds: exact-count mutation did not fail by node name: {count_error}"
@@ -15356,7 +16235,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
 
     let committed = validate_plan::validation_config(root)?;
-    let quick = committed.steps.iter().find(|step| step.tag() == "quick.e2e_verify")
+    let quick = committed
+        .steps
+        .iter()
+        .find(|step| step.tag() == "quick.e2e_verify")
         .ok_or("retry bounds: committed quick manifest node is absent")?;
     let manifests = ManifestSet::load(root)
         .map_err(|e| format!("retry bounds: cannot load E2E manifests: {e}"))?;
@@ -15401,12 +16283,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             Err(refusal) => {
                 return Err(format!(
                     "retry bounds: planted{suffix} was refused for the wrong reason: {refusal}"
-                ))
+                ));
             }
             Ok(_) => {
                 return Err(format!(
                     "retry bounds: planted{suffix} was accepted as a manifest command"
-                ))
+                ));
             }
         }
     }
@@ -15414,7 +16296,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     // `--parity-reference` until it stopped being modeled. Keep both covered
     // through options the policy still models, on the same accepted control.
     for (suffix, expected) in [
-        (" --mode", "retry bounds: parity-control lacks a value for --mode"),
+        (
+            " --mode",
+            "retry bounds: parity-control lacks a value for --mode",
+        ),
         (
             " --backend kvm --backend kvm",
             "retry bounds: parity-control supplies --backend more than once",
@@ -15437,12 +16322,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             Err(refusal) => {
                 return Err(format!(
                     "retry bounds: planted{suffix} was refused for the wrong reason: {refusal}"
-                ))
+                ));
             }
             Ok(_) => {
                 return Err(format!(
                     "retry bounds: planted{suffix} was accepted as a manifest command"
-                ))
+                ));
             }
         }
     }
@@ -15470,7 +16355,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .iter()
             .map(|cell| cell.id.backend.clone().unwrap_or_else(|| "native".into()))
             .collect::<BTreeSet<_>>();
-        if backends.iter().any(|backend| expected.contains(&backend.as_str())) {
+        if backends
+            .iter()
+            .any(|backend| expected.contains(&backend.as_str()))
+        {
             return Err(format!(
                 "retry bounds: {tag} still selects a cell of an excluded backend"
             ));
@@ -15496,21 +16384,20 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 "retry bounds: {tag} no longer has one --results boundary to plant into"
             ));
         }
-        planted.cmd = planted.cmd.replace(
-            " --results ",
-            " --parity-reference ptrace --results ",
-        );
+        planted.cmd = planted
+            .cmd
+            .replace(" --results ", " --parity-reference ptrace --results ");
         match normal_raw_result_path(&planted, "parity-control") {
             Err(refusal) if refusal == unmodeled(tag) => {}
             Err(refusal) => {
                 return Err(format!(
                     "retry bounds: planted parity on {tag} was refused for the wrong reason: {refusal}"
-                ))
+                ));
             }
             Ok(_) => {
                 return Err(format!(
                     "retry bounds: planted parity on {tag} was accepted as a normal publisher"
-                ))
+                ));
             }
         }
     }
@@ -15530,9 +16417,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 "retry bounds: {tag} no longer has one --prebuilt --results boundary to plant into"
             ));
         }
-        planted.cmd = planted
-            .cmd
-            .replace("--prebuilt --results", "--prebuilt --exclude-backend kvm --results");
+        planted.cmd = planted.cmd.replace(
+            "--prebuilt --results",
+            "--prebuilt --exclude-backend kvm --results",
+        );
         let expected = format!(
             "{tag} omits backend(s) [\"kvm\"] outside the hosted-portable exclusion contract"
         );
@@ -15541,31 +16429,43 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             Err(refusal) => {
                 return Err(format!(
                     "retry bounds: planted local exclusion on {tag} was refused for the wrong reason: {refusal}"
-                ))
+                ));
             }
             Ok(_) => {
                 return Err(format!(
                     "retry bounds: planted local exclusion on {tag} was accepted as a normal publisher"
-                ))
+                ));
             }
         }
     }
-    for step in committed.steps.iter()
+    for step in committed
+        .steps
+        .iter()
         .filter(|step| step.cmd.contains("target/debug/test-harness run "))
     {
         let (selection, prebuilt) = manifest_step_policy(step)?;
         let effective_multipliers = step_timeout_multipliers(step, timeout_multipliers)?;
         if let Some(headroom_s) = require_manifest_selection_headroom(
-            &manifests, &step.tag(), step.timeout, &selection,
-            effective_multipliers, prebuilt, attempts,
+            &manifests,
+            &step.tag(),
+            step.timeout,
+            &selection,
+            effective_multipliers,
+            prebuilt,
+            attempts,
             MANIFEST_TERMINATION_GRACE_S as u64,
         )? {
             checked_manifest_nodes += 1;
             tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
         }
         require_manifest_selection_headroom(
-            &manifests, &step.tag(), step.timeout, &selection,
-            representative_multipliers, prebuilt, attempts,
+            &manifests,
+            &step.tag(),
+            step.timeout,
+            &selection,
+            representative_multipliers,
+            prebuilt,
+            attempts,
             MANIFEST_TERMINATION_GRACE_S as u64,
         )?;
     }
@@ -15718,136 +16618,133 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     unsafe { std::env::set_var("DAGRUN_LOG_DIR", &evidence_dir) };
 
     let result = (|| -> Result<(), String> {
-    let step = |job: &str, cmd: &str| {
-        step_with_caps(
-            "fixture",
-            job,
-            "validate scheduler accounting fixture",
-            cmd.to_string(),
-            Vec::new(),
-            30,
-            30,
-            64 * 1024 * 1024,
-        )
-    };
-    let mut intentional_skip = step("intentional_skip", "exit 99");
-    intentional_skip.skip_reason = Some(
-        dagrun::model::IntentionalSkipReason::EmptyManifestBucket,
-    );
+        let step = |job: &str, cmd: &str| {
+            step_with_caps(
+                "fixture",
+                job,
+                "validate scheduler accounting fixture",
+                cmd.to_string(),
+                Vec::new(),
+                30,
+                30,
+                64 * 1024 * 1024,
+            )
+        };
+        let mut intentional_skip = step("intentional_skip", "exit 99");
+        intentional_skip.skip_reason =
+            Some(dagrun::model::IntentionalSkipReason::EmptyManifestBucket);
 
-    // A complete runnable plan plus a typed intentional skip is complete and
-    // green. The skipped command is `exit 99`, so executing it cannot accidentally
-    // satisfy the positive case.
-    let complete_cfg = DagConfig {
-        steps: vec![step("pass", "true"), intentional_skip.clone()],
-        ..Default::default()
-    };
-    let complete = run_lane_once(
-        &complete_cfg,
-        1,
-        true,
-        0,
-        None,
-        &tmp.join("complete.log"),
-        None,
-        false,
-    );
-    if !complete.complete
-        || !complete.ok
-        || completed_node_count(&complete.outcomes, &complete.attempts) != 1
-        || complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
-            != vec!["fixture.pass"]
-    {
-        return Err(format!(
-            "scheduler accounting: complete plan plus intentional skip was not accepted: complete={} ok={} outcomes={:?}",
-            complete.complete,
-            complete.ok,
-            complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
-        ));
-    }
+        // A complete runnable plan plus a typed intentional skip is complete and
+        // green. The skipped command is `exit 99`, so executing it cannot accidentally
+        // satisfy the positive case.
+        let complete_cfg = DagConfig {
+            steps: vec![step("pass", "true"), intentional_skip.clone()],
+            ..Default::default()
+        };
+        let complete = run_lane_once(
+            &complete_cfg,
+            1,
+            true,
+            0,
+            None,
+            &tmp.join("complete.log"),
+            None,
+            false,
+        );
+        if !complete.complete
+            || !complete.ok
+            || completed_node_count(&complete.outcomes, &complete.attempts) != 1
+            || complete
+                .outcomes
+                .iter()
+                .map(|o| o.tag.as_str())
+                .collect::<Vec<_>>()
+                != vec!["fixture.pass"]
+        {
+            return Err(format!(
+                "scheduler accounting: complete plan plus intentional skip was not accepted: complete={} ok={} outcomes={:?}",
+                complete.complete,
+                complete.ok,
+                complete
+                    .outcomes
+                    .iter()
+                    .map(|o| o.tag.as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
 
-    // A genuine failure must not be reclassified or retried, and the lane's
-    // completeness axis must report whether the rest of the plan was measured.
-    //
-    // These two runs are the same DAG under the two launch policies, and they are
-    // bracketed together because the difference between them is the whole point of
-    // the completeness axis. Until agent-utils 6a3c2d7 ("make --keep-going keep
-    // going") a `keep_going` run suppressed the eager reap of in-flight steps and
-    // then launched nothing further, so BOTH policies left the peers unmeasured and
-    // this bracket could not tell them apart. It now checks each one separately.
-    let failure_log = tmp.join("unclassified.log");
-    std::fs::write(
+        // A genuine failure must not be reclassified or retried, and the lane's
+        // completeness axis must report whether the rest of the plan was measured.
+        //
+        // These two runs are the same DAG under the two launch policies, and they are
+        // bracketed together because the difference between them is the whole point of
+        // the completeness axis. Until agent-utils 6a3c2d7 ("make --keep-going keep
+        // going") a `keep_going` run suppressed the eager reap of in-flight steps and
+        // then launched nothing further, so BOTH policies left the peers unmeasured and
+        // this bracket could not tell them apart. It now checks each one separately.
+        let failure_log = tmp.join("unclassified.log");
+        std::fs::write(
         &failure_log,
         "[fixture.fail] ----- detail -----\n[fixture.fail] ordinary test failure\n[fixture.fail] ----- end detail -----\n",
     )
     .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", failure_log.display()))?;
-    let failed_cfg = DagConfig {
-        steps: vec![
-            step("fail", "exit 1"),
-            step("pending_a", "true"),
-            step("pending_b", "true"),
-        ],
-        ..Default::default()
-    };
-    // Default eager-exit: with one worker both independent peers remain runnable but
-    // never launched, so the lane is a red that is ALSO incomplete, and the
-    // completeness axis must refuse to let it exit 0.
-    let failed = run_lane_once(
-        &failed_cfg,
-        1,
-        false,
-        0,
-        None,
-        &failure_log,
-        None,
-        false,
-    );
-    // One failed outer node gets one execution. Its independent peers remain
-    // explicitly unlaunched under eager exit, and no second graph can rewrite
-    // either fact.
-    if failed.complete
-        || failed.ok
-        || failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
-            != vec!["fixture.fail"]
-        || exit_code_with_execution_completeness(0, failed.complete) == 0
-    {
-        return Err(format!(
-            "scheduler accounting: a failed outer node must run once and remain an incomplete red: complete={} ok={} outcomes={:?}",
-            failed.complete,
-            failed.ok,
-            failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
-        ));
-    }
+        let failed_cfg = DagConfig {
+            steps: vec![
+                step("fail", "exit 1"),
+                step("pending_a", "true"),
+                step("pending_b", "true"),
+            ],
+            ..Default::default()
+        };
+        // Default eager-exit: with one worker both independent peers remain runnable but
+        // never launched, so the lane is a red that is ALSO incomplete, and the
+        // completeness axis must refuse to let it exit 0.
+        let failed = run_lane_once(&failed_cfg, 1, false, 0, None, &failure_log, None, false);
+        // One failed outer node gets one execution. Its independent peers remain
+        // explicitly unlaunched under eager exit, and no second graph can rewrite
+        // either fact.
+        if failed.complete
+            || failed.ok
+            || failed
+                .outcomes
+                .iter()
+                .map(|o| o.tag.as_str())
+                .collect::<Vec<_>>()
+                != vec!["fixture.fail"]
+            || exit_code_with_execution_completeness(0, failed.complete) == 0
+        {
+            return Err(format!(
+                "scheduler accounting: a failed outer node must run once and remain an incomplete red: complete={} ok={} outcomes={:?}",
+                failed.complete,
+                failed.ok,
+                failed
+                    .outcomes
+                    .iter()
+                    .map(|o| o.tag.as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
 
-    // Same failure under keep-going: still a red, and still not green,
-    // but now every peer is measured, so the lane is completely accounted for. The
-    // failure verdict must not soften just because coverage got wider.
-    let kept = run_lane_once(
-        &failed_cfg,
-        1,
-        true,
-        0,
-        None,
-        &failure_log,
-        None,
-        false,
-    );
-    let mut kept_tags: Vec<&str> = kept.outcomes.iter().map(|o| o.tag.as_str()).collect();
-    kept_tags.sort_unstable();
-    if !kept.complete
-        || kept.ok
-        || kept_tags != vec!["fixture.fail", "fixture.pending_a", "fixture.pending_b"]
-    {
-        return Err(format!(
-            "scheduler accounting: keep-going did not measure every independent peer while keeping the failure red: complete={} ok={} outcomes={kept_tags:?}",
-            kept.complete, kept.ok
-        ));
-    }
+        // Same failure under keep-going: still a red, and still not green,
+        // but now every peer is measured, so the lane is completely accounted for. The
+        // failure verdict must not soften just because coverage got wider.
+        let kept = run_lane_once(&failed_cfg, 1, true, 0, None, &failure_log, None, false);
+        let mut kept_tags: Vec<&str> = kept.outcomes.iter().map(|o| o.tag.as_str()).collect();
+        kept_tags.sort_unstable();
+        if !kept.complete
+            || kept.ok
+            || kept_tags != vec!["fixture.fail", "fixture.pending_a", "fixture.pending_b"]
+        {
+            return Err(format!(
+                "scheduler accounting: keep-going did not measure every independent peer while keeping the failure red: complete={} ok={} outcomes={kept_tags:?}",
+                kept.complete, kept.ok
+            ));
+        }
 
-    // A dependency skip is named by the scheduler but still did not execute.
-    // It cannot satisfy required-node completeness.
-    let dependency_log = tmp.join("dependency-failure.log");
-    std::fs::write(
+        // A dependency skip is named by the scheduler but still did not execute.
+        // It cannot satisfy required-node completeness.
+        let dependency_log = tmp.join("dependency-failure.log");
+        std::fs::write(
         &dependency_log,
         "[fixture.dependency_failure] ----- detail -----\n[fixture.dependency_failure] ordinary test failure\n[fixture.dependency_failure] ----- end detail -----\n",
     )
@@ -15857,90 +16754,92 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             dependency_log.display()
         )
     })?;
-    let dependency_runs = tmp.join("dependency-failure-runs");
-    let dependent_ran = tmp.join("dependency-dependent-ran");
-    let dependency_failure_cmd = format!(
-        "printf 'attempt\\n' >> {runs}; exit 1",
-        runs = validate_plan::shell_quote(&dependency_runs.to_string_lossy()),
-    );
-    let mut dependency_skipped = step(
-        "dependency_skipped",
-        &format!(
-            ": > {}",
-            validate_plan::shell_quote(&dependent_ran.to_string_lossy())
-        ),
-    );
-    dependency_skipped.deps = vec!["fixture.dependency_failure".into()];
-    let dependency_cfg = DagConfig {
-        steps: vec![
-            step("dependency_failure", &dependency_failure_cmd),
-            dependency_skipped,
-        ],
-        ..Default::default()
-    };
-    let dependency_result = run_lane_once(
-        &dependency_cfg,
-        1,
-        true,
-        0,
-        None,
-        &dependency_log,
-        None,
-        false,
-    );
-    let dependency_attempt_count = std::fs::read_to_string(&dependency_runs)
-        .unwrap_or_default()
-        .lines()
-        .count();
-    let dependency_failures = dependency_result
-        .outcomes
-        .iter()
-        .filter(|outcome| outcome_is_failure(outcome))
-        .count();
-    let (_named, listing) = blocking_listing(
-        &dependency_result.outcomes,
-        &BTreeSet::new(),
-        dependency_failures,
-    );
-    let mut summary_detail = vec![format!("{dependency_failures} blocking failure(s){listing}")];
-    summary_detail.extend(execution_completeness_details(
-        &dependency_result.skipped,
-        dependency_result.complete,
-    ));
-    let mut dependency_summary = RunSummary::new(Verdict::Fail, 1, "self-test", summary_detail);
-    dependency_summary.nodes_executed =
-        completed_node_count(&dependency_result.outcomes, &dependency_result.attempts);
-    dependency_summary.nodes_failed = dependency_failures;
-    dependency_summary.nodes_skipped = dependency_result.skipped.len();
-    dependency_summary.wall_s = Some(0.0);
-    let rendered_dependency_summary =
-        run_summary_lines(&dependency_summary, std::time::Instant::now()).join("\n");
-    if dependency_result.complete
-        || dependency_result.ok
-        || dependency_attempt_count != 1
-        || dependency_result.skipped != vec!["fixture.dependency_skipped"]
-        || dependent_ran.exists()
-        || exit_code_with_execution_completeness(0, dependency_result.complete) == 0
-        || !rendered_dependency_summary
-            .contains("1 blocking failure(s): fixture.dependency_failure")
-        || !rendered_dependency_summary
-            .contains("1 node(s) never ran because a dependency failed")
-        || !rendered_dependency_summary.contains("work made the run incomplete")
-        || !rendered_dependency_summary.ends_with("FINAL_VALIDATE_STATUS: FAILED")
-    {
-        return Err(format!(
-            "scheduler accounting: failed prerequisite was rerun or its failure/dependent skip was not preserved in the terminal summary: complete={} ok={} attempts={dependency_attempt_count} skipped={:?} dependent_ran={} summary={rendered_dependency_summary:?}",
+        let dependency_runs = tmp.join("dependency-failure-runs");
+        let dependent_ran = tmp.join("dependency-dependent-ran");
+        let dependency_failure_cmd = format!(
+            "printf 'attempt\\n' >> {runs}; exit 1",
+            runs = validate_plan::shell_quote(&dependency_runs.to_string_lossy()),
+        );
+        let mut dependency_skipped = step(
+            "dependency_skipped",
+            &format!(
+                ": > {}",
+                validate_plan::shell_quote(&dependent_ran.to_string_lossy())
+            ),
+        );
+        dependency_skipped.deps = vec!["fixture.dependency_failure".into()];
+        let dependency_cfg = DagConfig {
+            steps: vec![
+                step("dependency_failure", &dependency_failure_cmd),
+                dependency_skipped,
+            ],
+            ..Default::default()
+        };
+        let dependency_result = run_lane_once(
+            &dependency_cfg,
+            1,
+            true,
+            0,
+            None,
+            &dependency_log,
+            None,
+            false,
+        );
+        let dependency_attempt_count = std::fs::read_to_string(&dependency_runs)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let dependency_failures = dependency_result
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome_is_failure(outcome))
+            .count();
+        let (_named, listing) = blocking_listing(
+            &dependency_result.outcomes,
+            &BTreeSet::new(),
+            dependency_failures,
+        );
+        let mut summary_detail = vec![format!(
+            "{dependency_failures} blocking failure(s){listing}"
+        )];
+        summary_detail.extend(execution_completeness_details(
+            &dependency_result.skipped,
             dependency_result.complete,
-            dependency_result.ok,
-            dependency_result.skipped,
-            dependent_ran.exists(),
         ));
-    }
+        let mut dependency_summary = RunSummary::new(Verdict::Fail, 1, "self-test", summary_detail);
+        dependency_summary.nodes_executed =
+            completed_node_count(&dependency_result.outcomes, &dependency_result.attempts);
+        dependency_summary.nodes_failed = dependency_failures;
+        dependency_summary.nodes_skipped = dependency_result.skipped.len();
+        dependency_summary.wall_s = Some(0.0);
+        let rendered_dependency_summary =
+            run_summary_lines(&dependency_summary, std::time::Instant::now()).join("\n");
+        if dependency_result.complete
+            || dependency_result.ok
+            || dependency_attempt_count != 1
+            || dependency_result.skipped != vec!["fixture.dependency_skipped"]
+            || dependent_ran.exists()
+            || exit_code_with_execution_completeness(0, dependency_result.complete) == 0
+            || !rendered_dependency_summary
+                .contains("1 blocking failure(s): fixture.dependency_failure")
+            || !rendered_dependency_summary
+                .contains("1 node(s) never ran because a dependency failed")
+            || !rendered_dependency_summary.contains("work made the run incomplete")
+            || !rendered_dependency_summary.ends_with("FINAL_VALIDATE_STATUS: FAILED")
+        {
+            return Err(format!(
+                "scheduler accounting: failed prerequisite was rerun or its failure/dependent skip was not preserved in the terminal summary: complete={} ok={} attempts={dependency_attempt_count} skipped={:?} dependent_ran={} summary={rendered_dependency_summary:?}",
+                dependency_result.complete,
+                dependency_result.ok,
+                dependency_result.skipped,
+                dependent_ran.exists(),
+            ));
+        }
 
-    // Eager-exit reports a running peer as aborted. That typed outcome is not a
-    // completed required node and must likewise force a nonzero final exit.
-    let aborted_log = tmp.join("aborted-peer.log");
-    std::fs::write(
+        // Eager-exit reports a running peer as aborted. That typed outcome is not a
+        // completed required node and must likewise force a nonzero final exit.
+        let aborted_log = tmp.join("aborted-peer.log");
+        std::fs::write(
         &aborted_log,
         "[fixture.abort_failure] ----- detail -----\n[fixture.abort_failure] ordinary test failure\n[fixture.abort_failure] ----- end detail -----\n",
     )
@@ -15950,743 +16849,745 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             aborted_log.display()
         )
     })?;
-    let aborted_cfg = DagConfig {
-        steps: vec![
-            step("abort_failure", "sleep 0.1; exit 1"),
-            step("aborted_peer", "sleep 5"),
-        ],
-        ..Default::default()
-    };
-    let aborted_result = run_lane_once(
-        &aborted_cfg,
-        2,
-        false,
-        0,
-        None,
-        &aborted_log,
-        None,
-        false,
-    );
-    let aborted_peer_reported = aborted_result
-        .outcomes
-        .iter()
-        .any(|outcome| outcome.tag == "fixture.aborted_peer" && outcome.aborted);
-    if aborted_result.complete
-        || aborted_result.ok
-        || !aborted_peer_reported
-        || exit_code_with_execution_completeness(0, aborted_result.complete) == 0
-    {
-        return Err(format!(
-            "scheduler accounting: aborted required node did not force incomplete execution: complete={} ok={} aborted_peer_reported={aborted_peer_reported} outcomes={:?}",
-            aborted_result.complete,
-            aborted_result.ok,
-            aborted_result
-                .outcomes
-                .iter()
-                .map(|outcome| (outcome.tag.as_str(), outcome.aborted))
-                .collect::<Vec<_>>()
-        ));
-    }
+        let aborted_cfg = DagConfig {
+            steps: vec![
+                step("abort_failure", "sleep 0.1; exit 1"),
+                step("aborted_peer", "sleep 5"),
+            ],
+            ..Default::default()
+        };
+        let aborted_result =
+            run_lane_once(&aborted_cfg, 2, false, 0, None, &aborted_log, None, false);
+        let aborted_peer_reported = aborted_result
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.tag == "fixture.aborted_peer" && outcome.aborted);
+        if aborted_result.complete
+            || aborted_result.ok
+            || !aborted_peer_reported
+            || exit_code_with_execution_completeness(0, aborted_result.complete) == 0
+        {
+            return Err(format!(
+                "scheduler accounting: aborted required node did not force incomplete execution: complete={} ok={} aborted_peer_reported={aborted_peer_reported} outcomes={:?}",
+                aborted_result.complete,
+                aborted_result.ok,
+                aborted_result
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.tag.as_str(), outcome.aborted))
+                    .collect::<Vec<_>>()
+            ));
+        }
 
-    // Scoped eager-exit keeps BOTH promises in one run: the failing family is still cut short
-    // and its true dependent is skipped, while a different family completes. Checking only the
-    // independent pass would also accept a blanket keep-going implementation.
-    let scoped_log = tmp.join("scoped-eager-exit.log");
-    std::fs::write(
+        // Scoped eager-exit keeps BOTH promises in one run: the failing family is still cut short
+        // and its true dependent is skipped, while a different family completes. Checking only the
+        // independent pass would also accept a blanket keep-going implementation.
+        let scoped_log = tmp.join("scoped-eager-exit.log");
+        std::fs::write(
         &scoped_log,
         "[fixture.family_failure] ----- detail -----\n[fixture.family_failure] ordinary test failure\n[fixture.family_failure] ----- end detail -----\n",
     )
     .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", scoped_log.display()))?;
-    let mut family_failure = step("family_failure", "sleep 0.1; exit 1");
-    let mut family_peer = step("family_peer", "sleep 5");
-    let mut family_dependent = step("family_dependent", "true");
-    family_dependent.deps = vec!["fixture.family_failure".into()];
-    let marker = tmp.join("independent-family-completed");
-    let independent = step(
-        "independent_family",
-        &format!(
-            "sleep 0.3; : > {}",
-            validate_plan::shell_quote(&marker.to_string_lossy())
-        ),
-    );
-    for member in [&mut family_failure, &mut family_peer, &mut family_dependent] {
-        member.fail_fast_family = Some("fixture.failure-family".into());
-    }
-    let mut scoped_plan = Plan {
-        cfg: DagConfig {
-            steps: vec![family_failure, family_peer, family_dependent, independent],
+        let mut family_failure = step("family_failure", "sleep 0.1; exit 1");
+        let mut family_peer = step("family_peer", "sleep 5");
+        let mut family_dependent = step("family_dependent", "true");
+        family_dependent.deps = vec!["fixture.family_failure".into()];
+        let marker = tmp.join("independent-family-completed");
+        let independent = step(
+            "independent_family",
+            &format!(
+                "sleep 0.3; : > {}",
+                validate_plan::shell_quote(&marker.to_string_lossy())
+            ),
+        );
+        for member in [&mut family_failure, &mut family_peer, &mut family_dependent] {
+            member.fail_fast_family = Some("fixture.failure-family".into());
+        }
+        let mut scoped_plan = Plan {
+            cfg: DagConfig {
+                steps: vec![family_failure, family_peer, family_dependent, independent],
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    assign_fail_fast_families(&mut scoped_plan);
-    let scoped_families: BTreeMap<String, String> = scoped_plan
-        .cfg
-        .steps
-        .iter()
-        .map(|step| (step.tag(), step.fail_fast_family.clone().unwrap_or_default()))
-        .collect();
-    if scoped_families["fixture.family_peer"] != "fixture.failure-family"
-        || scoped_families["fixture.independent_family"] != "fixture.independent_family"
-    {
-        return Err(format!(
-            "scheduler accounting: plan family assignment changed an explicit family or failed to scope an ordinary node by its tag: {scoped_families:?}"
-        ));
-    }
-    let scoped = run_lane_once(
-        &scoped_plan.cfg,
-        3,
-        false,
-        0,
-        None,
-        &scoped_log,
-        None,
-        false,
-    );
-    let scoped_by_tag: BTreeMap<&str, &StepOutcome> = scoped
-        .outcomes
-        .iter()
-        .map(|outcome| (outcome.tag.as_str(), outcome))
-        .collect();
-    let same_family_aborted = scoped_by_tag
-        .get("fixture.family_peer")
-        .is_some_and(|outcome| outcome.aborted);
-    let independent_completed = scoped_by_tag
-        .get("fixture.independent_family")
-        .is_some_and(|outcome| outcome.ok && !outcome.aborted);
-    if scoped.ok
-        || scoped.complete
-        || !same_family_aborted
-        || scoped.skipped != ["fixture.family_dependent".to_string()]
-        || !independent_completed
-        || !marker.is_file()
-    {
-        return Err(format!(
-            "scheduler accounting: scoped eager-exit did not cancel its own family, skip its dependent, and complete an independent family: complete={} ok={} skipped={:?} outcomes={:?} marker={}",
-            scoped.complete,
-            scoped.ok,
-            scoped.skipped,
-            scoped
-                .outcomes
-                .iter()
-                .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.aborted))
-                .collect::<Vec<_>>(),
-            marker.is_file()
-        ));
-    }
+        };
+        assign_fail_fast_families(&mut scoped_plan);
+        let scoped_families: BTreeMap<String, String> = scoped_plan
+            .cfg
+            .steps
+            .iter()
+            .map(|step| {
+                (
+                    step.tag(),
+                    step.fail_fast_family.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        if scoped_families["fixture.family_peer"] != "fixture.failure-family"
+            || scoped_families["fixture.independent_family"] != "fixture.independent_family"
+        {
+            return Err(format!(
+                "scheduler accounting: plan family assignment changed an explicit family or failed to scope an ordinary node by its tag: {scoped_families:?}"
+            ));
+        }
+        let scoped = run_lane_once(
+            &scoped_plan.cfg,
+            3,
+            false,
+            0,
+            None,
+            &scoped_log,
+            None,
+            false,
+        );
+        let scoped_by_tag: BTreeMap<&str, &StepOutcome> = scoped
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.tag.as_str(), outcome))
+            .collect();
+        let same_family_aborted = scoped_by_tag
+            .get("fixture.family_peer")
+            .is_some_and(|outcome| outcome.aborted);
+        let independent_completed = scoped_by_tag
+            .get("fixture.independent_family")
+            .is_some_and(|outcome| outcome.ok && !outcome.aborted);
+        if scoped.ok
+            || scoped.complete
+            || !same_family_aborted
+            || scoped.skipped != ["fixture.family_dependent".to_string()]
+            || !independent_completed
+            || !marker.is_file()
+        {
+            return Err(format!(
+                "scheduler accounting: scoped eager-exit did not cancel its own family, skip its dependent, and complete an independent family: complete={} ok={} skipped={:?} outcomes={:?} marker={}",
+                scoped.complete,
+                scoped.ok,
+                scoped.skipped,
+                scoped
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.aborted))
+                    .collect::<Vec<_>>(),
+                marker.is_file()
+            ));
+        }
 
-    // A fully reported failing row can be allowed by a profile's existing
-    // policy. Completeness must not silently turn every raw node failure into a
-    // blocking failure.
-    let allowed_log = tmp.join("allowed-failure.log");
-    std::fs::write(
+        // A fully reported failing row can be allowed by a profile's existing
+        // policy. Completeness must not silently turn every raw node failure into a
+        // blocking failure.
+        let allowed_log = tmp.join("allowed-failure.log");
+        std::fs::write(
         &allowed_log,
         "[fixture.allowed_failure] ----- detail -----\n[fixture.allowed_failure] expected measured failure\n[fixture.allowed_failure] ----- end detail -----\n",
     )
     .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", allowed_log.display()))?;
-    let allowed_cfg = DagConfig {
-        steps: vec![step("allowed_failure", "exit 1"), intentional_skip],
-        ..Default::default()
-    };
-    let allowed = run_lane_once(
-        &allowed_cfg,
-        1,
-        true,
-        0,
-        None,
-        &allowed_log,
-        None,
-        false,
-    );
-    if !allowed.complete
-        || allowed.ok
-        || exit_code_with_execution_completeness(0, allowed.complete) != 0
-    {
-        return Err(format!(
-            "scheduler accounting: complete allowed failure was not kept distinct from incomplete execution: complete={} ok={}",
-            allowed.complete, allowed.ok
-        ));
-    }
+        let allowed_cfg = DagConfig {
+            steps: vec![step("allowed_failure", "exit 1"), intentional_skip],
+            ..Default::default()
+        };
+        let allowed = run_lane_once(&allowed_cfg, 1, true, 0, None, &allowed_log, None, false);
+        if !allowed.complete
+            || allowed.ok
+            || exit_code_with_execution_completeness(0, allowed.complete) != 0
+        {
+            return Err(format!(
+                "scheduler accounting: complete allowed failure was not kept distinct from incomplete execution: complete={} ok={}",
+                allowed.complete, allowed.ok
+            ));
+        }
 
-    // An environmental signature is recorded but does not launch a second DAG.
-    // The dependent is deliberately registered before its prerequisite so this
-    // also proves the original graph still honors its edge under keep-going.
-    let environmental_log = tmp.join("environmental.log");
-    let first_attempt = tmp.join("environmental-first-attempt");
-    let edge_ready = tmp.join("edge-ready");
-    let environmental_cmd = format!(
-        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+        // An environmental signature is recorded but does not launch a second DAG.
+        // The dependent is deliberately registered before its prerequisite so this
+        // also proves the original graph still honors its edge under keep-going.
+        let environmental_log = tmp.join("environmental.log");
+        let first_attempt = tmp.join("environmental-first-attempt");
+        let edge_ready = tmp.join("edge-ready");
+        let environmental_cmd = format!(
+            "if test ! -e {first}; then : > {first}; printf '%s\\n' \
          '[fixture.environmental] ----- detail -----' \
          '[fixture.environmental] An action was blocked on this server based on a security policy!' \
          '[fixture.environmental] ----- end detail -----' > {log}; exit 1; fi",
-        first = validate_plan::shell_quote(&first_attempt.to_string_lossy()),
-        log = validate_plan::shell_quote(&environmental_log.to_string_lossy()),
-    );
-    let mut dependent = step(
-        "dependent",
-        &format!(
-            "test -f {}",
-            validate_plan::shell_quote(&edge_ready.to_string_lossy())
-        ),
-    );
-    dependent.deps = vec!["fixture.prerequisite".into()];
-    let environmental_cfg = DagConfig {
-        steps: vec![
-            step("environmental", &environmental_cmd),
-            dependent,
-            step(
-                "prerequisite",
-                &format!(
-                    ": > {}",
-                    validate_plan::shell_quote(&edge_ready.to_string_lossy())
-                ),
-            ),
-        ],
-        ..Default::default()
-    };
-    let retried = run_lane_once(
-        &environmental_cfg,
-        1,
-        true,
-        0,
-        None,
-        &environmental_log,
-        None,
-        false,
-    );
-    let retried_tags: BTreeSet<&str> =
-        retried.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect();
-    let expected_tags: BTreeSet<&str> = [
-        "fixture.environmental",
-        "fixture.dependent",
-        "fixture.prerequisite",
-    ]
-    .into_iter()
-    .collect();
-    if !retried.complete
-        || retried.ok
-        || retried_tags != expected_tags
-        || !retried.skipped.is_empty()
-        || !edge_ready.is_file()
-    {
-        return Err(format!(
-            "scheduler accounting: one-shot environmental failure did not preserve its red verdict and original dependency execution: complete={} ok={} outcomes={retried_tags:?} skipped={:?} edge_ready={}",
-            retried.complete,
-            retried.ok,
-            retried.skipped,
-            edge_ready.is_file()
-        ));
-    }
-
-    // The one attempt remains a raw failure. Its environmental hypothesis
-    // stays unconfirmed without a rerun; the separately classified aggregate
-    // records the understood infrastructure cause without claiming a pass.
-    let environmental_attempts: Vec<&NodeAttempt> = retried
-        .attempts
-        .iter()
-        .filter(|attempt| attempt.tag == "fixture.environmental")
-        .collect();
-    let first_failed = environmental_attempts
-        .iter()
-        .any(|a| a.attempt == 1 && a.ok == Some(false) && a.reported);
-    let names_environment = environmental_attempts.iter().any(|attempt| {
-        attempt.attempt == 1
-            && attempt.retry_class.is_none()
-            && attempt.environmental_class.as_deref() == Some("bpfjailer-banner")
-    });
-    if environmental_attempts.len() != 1
-        || !first_failed
-        || !names_environment
-        || environmental_assessment(&retried.attempts, environmental_attempts[0])
-            != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
-    {
-        return Err(format!(
-            "scheduler accounting: a one-shot environmental failure was retried or lost its unconfirmed classification: attempts={:?}",
-            environmental_attempts
-                .iter()
-                .map(|a| (
-                    a.attempt,
-                    a.ok,
-                    a.reported,
-                    a.retry_class,
-                    a.environmental_class.as_deref(),
-                ))
-                .collect::<Vec<_>>()
-        ));
-    }
-    let environmental_outcome = retried
-        .outcomes
-        .iter()
-        .find(|outcome| outcome.tag == "fixture.environmental")
-        .ok_or("scheduler accounting: recovered environmental outcome disappeared")?;
-    let environmental_gate =
-        ledger_gate_with_attempts(environmental_outcome, &retried.attempts);
-    if environmental_gate["result"] != "no_result"
-        || environmental_gate["failure_class"] != "understood_infrastructure_failure"
-        || environmental_gate["raw_result"] != "fail"
-        || environmental_gate["raw_failure_class"] != "understood_infrastructure_failure"
-        || environmental_gate["exit_code"] != 1
-        || !environmental_gate["failure_origin"].is_null()
-        || environmental_gate.get("failed_substeps").is_some()
-        || environmental_gate["retries"] != 0
-        || environmental_gate["attempts"].as_array().map(Vec::len) != Some(1)
-        || environmental_gate["attempts"][0]["result"] != "fail"
-        || environmental_gate["attempts"][0]["exit_code"] != 1
-        || environmental_gate["attempts"][0]["reported"] != true
-        || environmental_gate["attempts"][0]["execution"] != "completed"
-        || environmental_gate["attempts"][0]["environmental_verdict"] != "unconfirmed"
-        || !environmental_gate["attempts"][0]["retry_class"].is_null()
-    {
-        return Err(format!(
-            "scheduler accounting: the ledger erased or misreported a one-shot environmental failure: {environmental_gate}"
-        ));
-    }
-    // ⚠️ THE FLAKY WARNING MUST APPEAR ON A RUN THAT PASSED, and this is the
-    // bracket that holds it there. `retried` above is GREEN — ok=true, no
-    // failures — and it contains a node that failed once and recovered. That is
-    // precisely the run on which a flake warning looks like noise and gets
-    // dropped, and precisely the run where it is the only warning anyone gets
-    // before the test fails for real.
-    //
-    // It also pins the two halves apart: the FLAKY block present, and the
-    // FAILURE banner ABSENT. A summary that printed both would be telling the
-    // reader a green run had failed.
-    {
-        let mut nextest_attempts = retried.attempts.clone();
-        let mut retry_pass = environmental_attempts[0].clone();
-        retry_pass.attempt = 2;
-        retry_pass.ok = Some(true);
-        retry_pass.returncode = Some(0);
-        retry_pass.reason.clear();
-        retry_pass.failure_class = None;
-        retry_pass.failure_detail = None;
-        retry_pass.environmental_class = None;
-        retry_pass.detail_observed = true;
-        nextest_attempts.push(retry_pass);
-        for attempt in &mut nextest_attempts {
-            if attempt.tag != "fixture.environmental" {
-                continue;
-            }
-            if attempt.attempt == 1 {
-                attempt.retry_class = Some(RetryClass::BpfjailerBanner);
-            }
-            attempt.test_results = Some(if attempt.attempt == 1 {
-                vec![
-                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
-                        .map_err(|error| format!("end-of-run summary: {error}"))?,
-                    dagrun::TestResult::new(
-                        "hermit::fixture$recovered_on_retry".into(), false, 1,
-                    )
-                    .map_err(|error| format!("end-of-run summary: {error}"))?,
-                ]
-            } else {
-                vec![
-                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
-                        .map_err(|error| format!("end-of-run summary: {error}"))?,
-                    dagrun::TestResult::new(
-                        "hermit::fixture$recovered_on_retry".into(), true, 1,
-                    )
-                    .map_err(|error| format!("end-of-run summary: {error}"))?,
-                ]
-            });
-        }
-        let nextest_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
-        let (observations, typed_errors) =
-            nextest_test_observations(&nextest_attempts, &nextest_nodes);
-        if !typed_errors.is_empty() || observations.len() != 4 {
-            return Err(format!(
-                "end-of-run summary: typed nextest results were not retained exactly: observations={observations:?}, errors={typed_errors:?}"
-            ));
-        }
-        let mut missing_results = nextest_attempts.clone();
-        missing_results[0].test_results = None;
-        let (_, missing_errors) = nextest_test_observations(&missing_results, &nextest_nodes);
-        if missing_errors.len() != 1
-            || !missing_errors[0].contains("individual nextest results are UNKNOWN")
-            || !missing_errors[0].contains("fixture.environmental attempt 1")
-        {
-            return Err(format!(
-                "end-of-run summary: missing typed nextest results did not fail by node and attempt: {missing_errors:?}"
-            ));
-        }
-        let mut unknown = RunSummary::new(Verdict::Pass, 0, "self-test", missing_errors);
-        unknown.wall_s = Some(0.0);
-        unknown.nodes_executed = 1;
-        let unknown_rendered = run_summary_lines(&unknown, std::time::Instant::now()).join("\n");
-        if !unknown_rendered.contains("retries and individual test results: UNKNOWN")
-            || unknown_rendered.contains("no retries, no flaky tests")
-        {
-            return Err(format!(
-                "end-of-run summary: missing typed results became a clean zero: {unknown_rendered}"
-            ));
-        }
-
-        let mut inner_retry = nextest_attempts
-            .iter()
-            .find(|attempt| attempt.tag == "fixture.environmental" && attempt.attempt == 2)
-            .cloned()
-            .ok_or("end-of-run summary: no completed nextest attempt for retry fixture")?;
-        inner_retry.tag = "fixture.nextest_inner".into();
-        inner_retry.retry_class = None;
-        inner_retry.test_results = Some(vec![
-            dagrun::TestResult::new("hermit::fixture$inner_retry".into(), true, 2)
-                .map_err(|error| format!("end-of-run summary: {error}"))?,
-        ]);
-        let inner_nodes = BTreeSet::from([inner_retry.tag.clone()]);
-        let (inner_observations, inner_errors) =
-            nextest_test_observations(std::slice::from_ref(&inner_retry), &inner_nodes);
-        let inner_summary = test_id_summary(inner_observations, &[], &BTreeSet::new());
-        if !inner_errors.is_empty()
-            || inner_summary.recovered.len() != 1
-            || inner_summary.recovered[0].inner_retry_occurrences != 1
-            || inner_summary.retry_occurrences != 1
-        {
-            return Err(format!(
-                "end-of-run summary: a nextest pass after an inner retry was not retained as one recovered retry: errors={inner_errors:?}, summary={inner_summary:?}"
-            ));
-        }
-        // A failed node that produced no individual result keeps its node-only
-        // fallback instead of gaining an invented test id. The retired
-        // test.dbt_parity log parser used to carry this case; it is a property
-        // of test_id_summary itself, so it stays asserted directly (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301).
-        let pre_result_death = test_id_summary(
-            Vec::new(),
-            &[],
-            &BTreeSet::from(["fixture.died_before_results".to_string()]),
+            first = validate_plan::shell_quote(&first_attempt.to_string_lossy()),
+            log = validate_plan::shell_quote(&environmental_log.to_string_lossy()),
         );
-        if pre_result_death.failed_nodes_without_test_ids != ["fixture.died_before_results"]
-            || !pre_result_death.failed.is_empty()
+        let mut dependent = step(
+            "dependent",
+            &format!(
+                "test -f {}",
+                validate_plan::shell_quote(&edge_ready.to_string_lossy())
+            ),
+        );
+        dependent.deps = vec!["fixture.prerequisite".into()];
+        let environmental_cfg = DagConfig {
+            steps: vec![
+                step("environmental", &environmental_cmd),
+                dependent,
+                step(
+                    "prerequisite",
+                    &format!(
+                        ": > {}",
+                        validate_plan::shell_quote(&edge_ready.to_string_lossy())
+                    ),
+                ),
+            ],
+            ..Default::default()
+        };
+        let retried = run_lane_once(
+            &environmental_cfg,
+            1,
+            true,
+            0,
+            None,
+            &environmental_log,
+            None,
+            false,
+        );
+        let retried_tags: BTreeSet<&str> = retried
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.tag.as_str())
+            .collect();
+        let expected_tags: BTreeSet<&str> = [
+            "fixture.environmental",
+            "fixture.dependent",
+            "fixture.prerequisite",
+        ]
+        .into_iter()
+        .collect();
+        if !retried.complete
+            || retried.ok
+            || retried_tags != expected_tags
+            || !retried.skipped.is_empty()
+            || !edge_ready.is_file()
         {
             return Err(format!(
-                "end-of-run summary: a node that died before its first result gained an \
-                 invented test id: {pre_result_death:?}"
+                "scheduler accounting: one-shot environmental failure did not preserve its red verdict and original dependency execution: complete={} ok={} outcomes={retried_tags:?} skipped={:?} edge_ready={}",
+                retried.complete,
+                retried.ok,
+                retried.skipped,
+                edge_ready.is_file()
             ));
         }
-        let e2e_root = tmp.join("summary-e2e");
-        std::fs::create_dir_all(&e2e_root)
-            .map_err(|e| format!("end-of-run summary: cannot create E2E fixture: {e}"))?;
-        std::fs::write(
+
+        // The one attempt remains a raw failure. Its environmental hypothesis
+        // stays unconfirmed without a rerun; the separately classified aggregate
+        // records the understood infrastructure cause without claiming a pass.
+        let environmental_attempts: Vec<&NodeAttempt> = retried
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.tag == "fixture.environmental")
+            .collect();
+        let first_failed = environmental_attempts
+            .iter()
+            .any(|a| a.attempt == 1 && a.ok == Some(false) && a.reported);
+        let names_environment = environmental_attempts.iter().any(|attempt| {
+            attempt.attempt == 1
+                && attempt.retry_class.is_none()
+                && attempt.environmental_class.as_deref() == Some("bpfjailer-banner")
+        });
+        if environmental_attempts.len() != 1
+            || !first_failed
+            || !names_environment
+            || environmental_assessment(&retried.attempts, environmental_attempts[0])
+                != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
+        {
+            return Err(format!(
+                "scheduler accounting: a one-shot environmental failure was retried or lost its unconfirmed classification: attempts={:?}",
+                environmental_attempts
+                    .iter()
+                    .map(|a| (
+                        a.attempt,
+                        a.ok,
+                        a.reported,
+                        a.retry_class,
+                        a.environmental_class.as_deref(),
+                    ))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let environmental_outcome = retried
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.tag == "fixture.environmental")
+            .ok_or("scheduler accounting: recovered environmental outcome disappeared")?;
+        let environmental_gate =
+            ledger_gate_with_attempts(environmental_outcome, &retried.attempts);
+        if environmental_gate["result"] != "no_result"
+            || environmental_gate["failure_class"] != "understood_infrastructure_failure"
+            || environmental_gate["raw_result"] != "fail"
+            || environmental_gate["raw_failure_class"] != "understood_infrastructure_failure"
+            || environmental_gate["exit_code"] != 1
+            || !environmental_gate["failure_origin"].is_null()
+            || environmental_gate.get("failed_substeps").is_some()
+            || environmental_gate["retries"] != 0
+            || environmental_gate["attempts"].as_array().map(Vec::len) != Some(1)
+            || environmental_gate["attempts"][0]["result"] != "fail"
+            || environmental_gate["attempts"][0]["exit_code"] != 1
+            || environmental_gate["attempts"][0]["reported"] != true
+            || environmental_gate["attempts"][0]["execution"] != "completed"
+            || environmental_gate["attempts"][0]["environmental_verdict"] != "unconfirmed"
+            || !environmental_gate["attempts"][0]["retry_class"].is_null()
+        {
+            return Err(format!(
+                "scheduler accounting: the ledger erased or misreported a one-shot environmental failure: {environmental_gate}"
+            ));
+        }
+        // ⚠️ THE FLAKY WARNING MUST APPEAR ON A RUN THAT PASSED, and this is the
+        // bracket that holds it there. `retried` above is GREEN — ok=true, no
+        // failures — and it contains a node that failed once and recovered. That is
+        // precisely the run on which a flake warning looks like noise and gets
+        // dropped, and precisely the run where it is the only warning anyone gets
+        // before the test fails for real.
+        //
+        // It also pins the two halves apart: the FLAKY block present, and the
+        // FAILURE banner ABSENT. A summary that printed both would be telling the
+        // reader a green run had failed.
+        {
+            let mut nextest_attempts = retried.attempts.clone();
+            let mut retry_pass = environmental_attempts[0].clone();
+            retry_pass.attempt = 2;
+            retry_pass.ok = Some(true);
+            retry_pass.returncode = Some(0);
+            retry_pass.reason.clear();
+            retry_pass.failure_class = None;
+            retry_pass.failure_detail = None;
+            retry_pass.environmental_class = None;
+            retry_pass.detail_observed = true;
+            nextest_attempts.push(retry_pass);
+            for attempt in &mut nextest_attempts {
+                if attempt.tag != "fixture.environmental" {
+                    continue;
+                }
+                if attempt.attempt == 1 {
+                    attempt.retry_class = Some(RetryClass::BpfjailerBanner);
+                }
+                attempt.test_results = Some(if attempt.attempt == 1 {
+                    vec![
+                        dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                            .map_err(|error| format!("end-of-run summary: {error}"))?,
+                        dagrun::TestResult::new(
+                            "hermit::fixture$recovered_on_retry".into(),
+                            false,
+                            1,
+                        )
+                        .map_err(|error| format!("end-of-run summary: {error}"))?,
+                    ]
+                } else {
+                    vec![
+                        dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                            .map_err(|error| format!("end-of-run summary: {error}"))?,
+                        dagrun::TestResult::new(
+                            "hermit::fixture$recovered_on_retry".into(),
+                            true,
+                            1,
+                        )
+                        .map_err(|error| format!("end-of-run summary: {error}"))?,
+                    ]
+                });
+            }
+            let nextest_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
+            let (observations, typed_errors) =
+                nextest_test_observations(&nextest_attempts, &nextest_nodes);
+            if !typed_errors.is_empty() || observations.len() != 4 {
+                return Err(format!(
+                    "end-of-run summary: typed nextest results were not retained exactly: observations={observations:?}, errors={typed_errors:?}"
+                ));
+            }
+            let mut missing_results = nextest_attempts.clone();
+            missing_results[0].test_results = None;
+            let (_, missing_errors) = nextest_test_observations(&missing_results, &nextest_nodes);
+            if missing_errors.len() != 1
+                || !missing_errors[0].contains("individual nextest results are UNKNOWN")
+                || !missing_errors[0].contains("fixture.environmental attempt 1")
+            {
+                return Err(format!(
+                    "end-of-run summary: missing typed nextest results did not fail by node and attempt: {missing_errors:?}"
+                ));
+            }
+            let mut unknown = RunSummary::new(Verdict::Pass, 0, "self-test", missing_errors);
+            unknown.wall_s = Some(0.0);
+            unknown.nodes_executed = 1;
+            let unknown_rendered =
+                run_summary_lines(&unknown, std::time::Instant::now()).join("\n");
+            if !unknown_rendered.contains("retries and individual test results: UNKNOWN")
+                || unknown_rendered.contains("no retries, no flaky tests")
+            {
+                return Err(format!(
+                    "end-of-run summary: missing typed results became a clean zero: {unknown_rendered}"
+                ));
+            }
+
+            let mut inner_retry = nextest_attempts
+                .iter()
+                .find(|attempt| attempt.tag == "fixture.environmental" && attempt.attempt == 2)
+                .cloned()
+                .ok_or("end-of-run summary: no completed nextest attempt for retry fixture")?;
+            inner_retry.tag = "fixture.nextest_inner".into();
+            inner_retry.retry_class = None;
+            inner_retry.test_results = Some(vec![
+                dagrun::TestResult::new("hermit::fixture$inner_retry".into(), true, 2)
+                    .map_err(|error| format!("end-of-run summary: {error}"))?,
+            ]);
+            let inner_nodes = BTreeSet::from([inner_retry.tag.clone()]);
+            let (inner_observations, inner_errors) =
+                nextest_test_observations(std::slice::from_ref(&inner_retry), &inner_nodes);
+            let inner_summary = test_id_summary(inner_observations, &[], &BTreeSet::new());
+            if !inner_errors.is_empty()
+                || inner_summary.recovered.len() != 1
+                || inner_summary.recovered[0].inner_retry_occurrences != 1
+                || inner_summary.retry_occurrences != 1
+            {
+                return Err(format!(
+                    "end-of-run summary: a nextest pass after an inner retry was not retained as one recovered retry: errors={inner_errors:?}, summary={inner_summary:?}"
+                ));
+            }
+            // A failed node that produced no individual result keeps its node-only
+            // fallback instead of gaining an invented test id. The retired
+            // test.dbt_parity log parser used to carry this case; it is a property
+            // of test_id_summary itself, so it stays asserted directly (slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301).
+            let pre_result_death = test_id_summary(
+                Vec::new(),
+                &[],
+                &BTreeSet::from(["fixture.died_before_results".to_string()]),
+            );
+            if pre_result_death.failed_nodes_without_test_ids != ["fixture.died_before_results"]
+                || !pre_result_death.failed.is_empty()
+            {
+                return Err(format!(
+                    "end-of-run summary: a node that died before its first result gained an \
+                 invented test id: {pre_result_death:?}"
+                ));
+            }
+            let e2e_root = tmp.join("summary-e2e");
+            std::fs::create_dir_all(&e2e_root)
+                .map_err(|e| format!("end-of-run summary: cannot create E2E fixture: {e}"))?;
+            std::fs::write(
             e2e_root.join("results.jsonl"),
             "{\"attempt\":1,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"FAIL\"}\n\
 {\"attempt\":2,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"PASS\"}\n",
         )
         .map_err(|e| format!("end-of-run summary: cannot write E2E fixture: {e}"))?;
-        let e2e = e2e_test_observations(&e2e_root)?;
-        if e2e.len() != 2
-            || e2e[0].node != "e2e.manifest_applications"
-            || e2e[0].id != "applications/example [ptrace/verify]"
-            || e2e[0].passed
-            || !e2e[1].passed
-        {
-            return Err(format!(
-                "end-of-run summary: E2E rows did not retain test id, backend, mode, attempt, \
-                node, and verdict: {e2e:?}"
-            ));
-        }
-        let e2e_retry_summary = test_id_summary(e2e, &[], &BTreeSet::new());
-        if e2e_retry_summary.recovered.len() != 1
-            || e2e_retry_summary.recovered[0].id != "applications/example [ptrace/verify]"
-            || e2e_retry_summary.recovered[0].retry_classes
-                != [RetryClass::AlwaysEligible]
-            || e2e_retry_summary.retry_occurrences != 1
-        {
-            return Err(format!(
-                "end-of-run summary: inner E2E fail-then-pass was not reported as one recovered retry: {e2e_retry_summary:?}"
-            ));
-        }
-        let mut e2e_green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
-        e2e_green.flaky = e2e_retry_summary.recovered.clone();
-        e2e_green.retry_occurrences = e2e_retry_summary.retry_occurrences;
-        e2e_green.individual_test_results_complete = true;
-        e2e_green.wall_s = Some(0.0);
-        e2e_green.nodes_executed = 1;
-        let e2e_rendered = run_summary_lines(&e2e_green, std::time::Instant::now()).join("\n");
-        if !e2e_rendered.contains(
-            "applications/example [ptrace/verify] (node e2e.manifest_applications)  (1 retry",
-        )
-            || !e2e_rendered
-                .contains("retries: 1 occurrence(s) recorded from scheduler and per-cell attempts")
-        {
-            return Err(format!(
-                "end-of-run summary: inner-only retry was not rendered with truthful provenance: \
-                 {e2e_rendered}"
-            ));
-        }
-        let failed_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
-        let split = test_id_summary(observations, &nextest_attempts, &failed_nodes);
-        if split.recovered.len() != 1
-            || split.recovered[0].id != "hermit::fixture$recovered_on_retry"
-            || split.recovered[0].retry_classes != [RetryClass::BpfjailerBanner]
-            || split.failed.len() != 1
-            || split.failed[0].id != "hermit::fixture$hard_failure"
-            || split.failed[0].retry_classes != [RetryClass::BpfjailerBanner]
-            || !split.failed_nodes_without_test_ids.is_empty()
-            || split.retry_occurrences != 1
-        {
-            return Err(format!(
-                "end-of-run summary: failed and recovered test ids were conflated, retry counts \
-                 did not come from attempts[].retry_class, or a node tag leaked into the test-id \
-                 list: {split:?}"
-            ));
-        }
-
-        // One test id can be emitted by more than one DAG node. The node is
-        // part of the producer's identity, so a passing peer must never erase a
-        // failing node merely because its tag sorts later. Exercise both lexical
-        // orders: the old id-only grouping failed one of these two cases.
-        for (failing_node, passing_node) in [("a.fail", "z.pass"), ("z.fail", "a.pass")] {
-            let shared_id = "shared::binary$same_test";
-            let peer_summary = test_id_summary(
-                vec![
-                    TestAttemptObservation {
-                        node: failing_node.into(),
-                        attempt: 1,
-                        id: shared_id.into(),
-                        passed: false,
-                        inner_attempts: 1,
-                    },
-                    TestAttemptObservation {
-                        node: passing_node.into(),
-                        attempt: 1,
-                        id: shared_id.into(),
-                        passed: true,
-                        inner_attempts: 1,
-                    },
-                ],
-                &[],
-                &BTreeSet::from([failing_node.to_string()]),
-            );
-            if peer_summary.failed.len() != 1
-                || peer_summary.failed[0].node != failing_node
-                || peer_summary.failed[0].id != shared_id
-                || !peer_summary.recovered.is_empty()
-                || !peer_summary.failed_nodes_without_test_ids.is_empty()
+            let e2e = e2e_test_observations(&e2e_root)?;
+            if e2e.len() != 2
+                || e2e[0].node != "e2e.manifest_applications"
+                || e2e[0].id != "applications/example [ptrace/verify]"
+                || e2e[0].passed
+                || !e2e[1].passed
             {
                 return Err(format!(
-                    "end-of-run summary: test id {shared_id} from peer node {passing_node} changed \
-                     the terminal result for failing node {failing_node}: {peer_summary:?}"
+                    "end-of-run summary: E2E rows did not retain test id, backend, mode, attempt, \
+                node, and verdict: {e2e:?}"
                 ));
             }
-        }
-        let mut red = RunSummary::new(Verdict::Fail, 1, "self-test", Vec::new());
-        red.flaky = split.recovered.clone();
-        red.failed_ids = split.failed.clone();
-        red.retry_occurrences = split.retry_occurrences;
-        red.individual_test_results_complete = true;
-        red.wall_s = Some(0.0);
-        red.nodes_executed = 1;
-        let red_rendered = run_summary_lines(&red, std::time::Instant::now()).join("\n");
-        if !red_rendered.contains(SUMMARY_FLAKY_HEADING)
-            || !red_rendered.contains("1 test id(s) recovered")
-            || !red_rendered.contains("1 test id(s) failed and did NOT recover")
-            || !red_rendered.contains(
-                "hermit::fixture$recovered_on_retry (node fixture.environmental)  (1 retry",
-            )
-            || !red_rendered.contains(
-                "hermit::fixture$hard_failure (node fixture.environmental)  (1 retry",
-            )
-            || !red_rendered.contains(
-                "retries: 1 occurrence(s) recorded from scheduler and per-cell attempts",
-            )
-        {
-            return Err(format!(
-                "end-of-run summary: one hard failure and one recovered test id were not shown \
-                 as separate counts with their retry counts: {red_rendered}"
-            ));
-        }
+            let e2e_retry_summary = test_id_summary(e2e, &[], &BTreeSet::new());
+            if e2e_retry_summary.recovered.len() != 1
+                || e2e_retry_summary.recovered[0].id != "applications/example [ptrace/verify]"
+                || e2e_retry_summary.recovered[0].retry_classes != [RetryClass::AlwaysEligible]
+                || e2e_retry_summary.retry_occurrences != 1
+            {
+                return Err(format!(
+                    "end-of-run summary: inner E2E fail-then-pass was not reported as one recovered retry: {e2e_retry_summary:?}"
+                ));
+            }
+            let mut e2e_green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+            e2e_green.flaky = e2e_retry_summary.recovered.clone();
+            e2e_green.retry_occurrences = e2e_retry_summary.retry_occurrences;
+            e2e_green.individual_test_results_complete = true;
+            e2e_green.wall_s = Some(0.0);
+            e2e_green.nodes_executed = 1;
+            let e2e_rendered = run_summary_lines(&e2e_green, std::time::Instant::now()).join("\n");
+            if !e2e_rendered.contains(
+                "applications/example [ptrace/verify] (node e2e.manifest_applications)  (1 retry",
+            ) || !e2e_rendered
+                .contains("retries: 1 occurrence(s) recorded from scheduler and per-cell attempts")
+            {
+                return Err(format!(
+                    "end-of-run summary: inner-only retry was not rendered with truthful provenance: \
+                 {e2e_rendered}"
+                ));
+            }
+            let failed_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
+            let split = test_id_summary(observations, &nextest_attempts, &failed_nodes);
+            if split.recovered.len() != 1
+                || split.recovered[0].id != "hermit::fixture$recovered_on_retry"
+                || split.recovered[0].retry_classes != [RetryClass::BpfjailerBanner]
+                || split.failed.len() != 1
+                || split.failed[0].id != "hermit::fixture$hard_failure"
+                || split.failed[0].retry_classes != [RetryClass::BpfjailerBanner]
+                || !split.failed_nodes_without_test_ids.is_empty()
+                || split.retry_occurrences != 1
+            {
+                return Err(format!(
+                    "end-of-run summary: failed and recovered test ids were conflated, retry counts \
+                 did not come from attempts[].retry_class, or a node tag leaked into the test-id \
+                 list: {split:?}"
+                ));
+            }
 
-        let mut green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
-        green.flaky = split.recovered.clone();
-        green.retry_occurrences = split.retry_occurrences;
-        green.individual_test_results_complete = true;
-        green.wall_s = Some(0.0);
-        green.nodes_executed = 1;
-        let rendered = run_summary_lines(&green, std::time::Instant::now()).join("\n");
-        let names_the_test = rendered.contains("hermit::fixture$recovered_on_retry");
-        let names_the_ground = rendered.contains("bpfjailer-banner");
-        if !rendered.contains(SUMMARY_FLAKY_HEADING)
-            || !names_the_test
-            || !names_the_ground
-            || rendered.contains("❌ FAILURE")
-        {
-            return Err(format!(
-                "end-of-run summary: a GREEN run carrying a recovered flake did not warn about \
+            // One test id can be emitted by more than one DAG node. The node is
+            // part of the producer's identity, so a passing peer must never erase a
+            // failing node merely because its tag sorts later. Exercise both lexical
+            // orders: the old id-only grouping failed one of these two cases.
+            for (failing_node, passing_node) in [("a.fail", "z.pass"), ("z.fail", "a.pass")] {
+                let shared_id = "shared::binary$same_test";
+                let peer_summary = test_id_summary(
+                    vec![
+                        TestAttemptObservation {
+                            node: failing_node.into(),
+                            attempt: 1,
+                            id: shared_id.into(),
+                            passed: false,
+                            inner_attempts: 1,
+                        },
+                        TestAttemptObservation {
+                            node: passing_node.into(),
+                            attempt: 1,
+                            id: shared_id.into(),
+                            passed: true,
+                            inner_attempts: 1,
+                        },
+                    ],
+                    &[],
+                    &BTreeSet::from([failing_node.to_string()]),
+                );
+                if peer_summary.failed.len() != 1
+                    || peer_summary.failed[0].node != failing_node
+                    || peer_summary.failed[0].id != shared_id
+                    || !peer_summary.recovered.is_empty()
+                    || !peer_summary.failed_nodes_without_test_ids.is_empty()
+                {
+                    return Err(format!(
+                        "end-of-run summary: test id {shared_id} from peer node {passing_node} changed \
+                     the terminal result for failing node {failing_node}: {peer_summary:?}"
+                    ));
+                }
+            }
+            let mut red = RunSummary::new(Verdict::Fail, 1, "self-test", Vec::new());
+            red.flaky = split.recovered.clone();
+            red.failed_ids = split.failed.clone();
+            red.retry_occurrences = split.retry_occurrences;
+            red.individual_test_results_complete = true;
+            red.wall_s = Some(0.0);
+            red.nodes_executed = 1;
+            let red_rendered = run_summary_lines(&red, std::time::Instant::now()).join("\n");
+            if !red_rendered.contains(SUMMARY_FLAKY_HEADING)
+                || !red_rendered.contains("1 test id(s) recovered")
+                || !red_rendered.contains("1 test id(s) failed and did NOT recover")
+                || !red_rendered.contains(
+                    "hermit::fixture$recovered_on_retry (node fixture.environmental)  (1 retry",
+                )
+                || !red_rendered
+                    .contains("hermit::fixture$hard_failure (node fixture.environmental)  (1 retry")
+                || !red_rendered.contains(
+                    "retries: 1 occurrence(s) recorded from scheduler and per-cell attempts",
+                )
+            {
+                return Err(format!(
+                    "end-of-run summary: one hard failure and one recovered test id were not shown \
+                 as separate counts with their retry counts: {red_rendered}"
+                ));
+            }
+
+            let mut green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+            green.flaky = split.recovered.clone();
+            green.retry_occurrences = split.retry_occurrences;
+            green.individual_test_results_complete = true;
+            green.wall_s = Some(0.0);
+            green.nodes_executed = 1;
+            let rendered = run_summary_lines(&green, std::time::Instant::now()).join("\n");
+            let names_the_test = rendered.contains("hermit::fixture$recovered_on_retry");
+            let names_the_ground = rendered.contains("bpfjailer-banner");
+            if !rendered.contains(SUMMARY_FLAKY_HEADING)
+                || !names_the_test
+                || !names_the_ground
+                || rendered.contains("❌ FAILURE")
+            {
+                return Err(format!(
+                    "end-of-run summary: a GREEN run carrying a recovered flake did not warn about \
                  it, or warned as a failure: flaky={:?} heading={} test={} \
                  ground={} failure_banner={}",
-                split.recovered,
-                rendered.contains(SUMMARY_FLAKY_HEADING),
-                names_the_test,
-                names_the_ground,
-                rendered.contains("❌ FAILURE"),
-            ));
-        }
-        // ⚠️ THE THIRD STATE, WHICH THE TWO CHECKS AROUND IT DO NOT COVER: a run
-        // with nothing to report must SAY nothing was found, not render nothing.
-        // Both blocks above are conditional with no else, so before this a clean
-        // run and a run whose retry accounting produced nothing were the same
-        // bytes -- absence readable as a result, on the one section the owner
-        // reads specifically to spot a flaky pass.
-        let mut clean = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
-        clean.wall_s = Some(0.0);
-        clean.nodes_executed = 3;
-        clean.individual_test_results_complete = true;
-        let clean_rendered = run_summary_lines(&clean, std::time::Instant::now()).join("\n");
-        if !clean_rendered.contains("no retries, no flaky tests, and no failed test ids")
-            || clean_rendered.contains(SUMMARY_FLAKY_HEADING)
-            || clean_rendered.contains("\u{274c} FAILURE")
-        {
-            return Err(format!(
-                "end-of-run summary: a CLEAN run must state that it found no retries and no \
+                    split.recovered,
+                    rendered.contains(SUMMARY_FLAKY_HEADING),
+                    names_the_test,
+                    names_the_ground,
+                    rendered.contains("❌ FAILURE"),
+                ));
+            }
+            // ⚠️ THE THIRD STATE, WHICH THE TWO CHECKS AROUND IT DO NOT COVER: a run
+            // with nothing to report must SAY nothing was found, not render nothing.
+            // Both blocks above are conditional with no else, so before this a clean
+            // run and a run whose retry accounting produced nothing were the same
+            // bytes -- absence readable as a result, on the one section the owner
+            // reads specifically to spot a flaky pass.
+            let mut clean = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+            clean.wall_s = Some(0.0);
+            clean.nodes_executed = 3;
+            clean.individual_test_results_complete = true;
+            let clean_rendered = run_summary_lines(&clean, std::time::Instant::now()).join("\n");
+            if !clean_rendered.contains("no retries, no flaky tests, and no failed test ids")
+                || clean_rendered.contains(SUMMARY_FLAKY_HEADING)
+                || clean_rendered.contains("\u{274c} FAILURE")
+            {
+                return Err(format!(
+                    "end-of-run summary: a CLEAN run must state that it found no retries and no \
                  flaky tests, so silence cannot be confused with the accounting having \
                  produced nothing: stated={} flaky_heading={} failure_banner={}",
-                clean_rendered.contains("no retries, no flaky tests, and no failed test ids"),
-                clean_rendered.contains(SUMMARY_FLAKY_HEADING),
-                clean_rendered.contains("\u{274c} FAILURE"),
+                    clean_rendered.contains("no retries, no flaky tests, and no failed test ids"),
+                    clean_rendered.contains(SUMMARY_FLAKY_HEADING),
+                    clean_rendered.contains("\u{274c} FAILURE"),
+                ));
+            }
+            // And it must NOT claim cleanliness before a DAG ran, which would be the
+            // same error inverted: nothing was counted, so nothing can be reported.
+            let mut nothing_ran = RunSummary::new(Verdict::Refused, 2, "self-test", Vec::new());
+            nothing_ran.wall_s = None;
+            let nothing_rendered =
+                run_summary_lines(&nothing_ran, std::time::Instant::now()).join("\n");
+            if nothing_rendered.contains("no retries, no flaky tests, and no failed test ids") {
+                return Err(
+                    "end-of-run summary: a run that stopped before the DAG claimed it found no \
+                 flaky tests; it counted nothing and must claim nothing"
+                        .to_string(),
+                );
+            }
+        }
+        // Manifest cells own their retries inside test-harness. Once a manifest
+        // node has executed, the outer scheduler must not run that node again: an
+        // outer retry would rerun passing peers and restart the inner attempt
+        // ordinals at one.
+        let e2e_attempts = tmp.join("e2e-attempts");
+        let e2e_log = tmp.join("e2e-attempts.log");
+        let structured_counts = serde_json::json!({
+            "schema": 2,
+            "executed_tests": 2,
+            "filtered_tests": 0,
+            "results": [
+                {"id": "failing-cell", "result": "fail", "attempts": 2},
+                {"id": "passing-peer", "result": "pass", "attempts": 1},
+            ],
+        })
+        .to_string();
+        let e2e_cmd = format!(
+            "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
+            validate_plan::shell_quote(&structured_counts),
+            validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
+        );
+        let mut e2e_step = step("manifest_attempt", &e2e_cmd);
+        e2e_step.group = "e2e".into();
+        e2e_step.job = "manifest_attempt".into();
+        let e2e_manifest = DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+            test: None,
+            mode: None,
+            backend: None,
+        };
+        e2e_step.manifest = Some(e2e_manifest.clone());
+        e2e_step.result_manifests = Some(vec![
+            dagrun::model::ResultManifest::ManifestCell(e2e_manifest),
+            dagrun::model::ResultManifest::StructuredTestResults(
+                dagrun::model::StructuredTestResultsManifest::current("e2e.manifest_attempt"),
+            ),
+        ]);
+        let e2e_retry = run_lane_once(
+            &DagConfig {
+                steps: vec![e2e_step],
+                ..Default::default()
+            },
+            1,
+            true,
+            0,
+            None,
+            &e2e_log,
+            None,
+            false,
+        );
+        let recorded_attempts = std::fs::read_to_string(&e2e_attempts)
+            .map_err(|e| format!("scheduler accounting: cannot read E2E attempt fixture: {e}"))?;
+        let e2e_node_attempts = e2e_retry
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.tag == "e2e.manifest_attempt")
+            .collect::<Vec<_>>();
+        let e2e_results = e2e_node_attempts
+            .first()
+            .and_then(|attempt| attempt.test_results.as_ref());
+        if e2e_retry.ok
+            || e2e_node_attempts.len() != 1
+            || e2e_results
+                != Some(&vec![
+                    dagrun::TestResult::new("failing-cell".into(), false, 2)?,
+                    dagrun::TestResult::new("passing-peer".into(), true, 1)?,
+                ])
+            || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
+        {
+            return Err(format!(
+                "scheduler accounting: manifest framework retry did not preserve the 2/1/1 proof: \
+             ok={} node_attempts={} results={e2e_results:?} rows={recorded_attempts:?}",
+                e2e_retry.ok,
+                e2e_node_attempts.len()
             ));
         }
-        // And it must NOT claim cleanliness before a DAG ran, which would be the
-        // same error inverted: nothing was counted, so nothing can be reported.
-        let mut nothing_ran = RunSummary::new(Verdict::Refused, 2, "self-test", Vec::new());
-        nothing_ran.wall_s = None;
-        let nothing_rendered =
-            run_summary_lines(&nothing_ran, std::time::Instant::now()).join("\n");
-        if nothing_rendered.contains("no retries, no flaky tests, and no failed test ids") {
-            return Err(
-                "end-of-run summary: a run that stopped before the DAG claimed it found no \
-                 flaky tests; it counted nothing and must claim nothing"
-                    .to_string(),
-            );
-        }
 
-    }
-    // Manifest cells own their retries inside test-harness. Once a manifest
-    // node has executed, the outer scheduler must not run that node again: an
-    // outer retry would rerun passing peers and restart the inner attempt
-    // ordinals at one.
-    let e2e_attempts = tmp.join("e2e-attempts");
-    let e2e_log = tmp.join("e2e-attempts.log");
-    let structured_counts = serde_json::json!({
-        "schema": 2,
-        "executed_tests": 2,
-        "filtered_tests": 0,
-        "results": [
-            {"id": "failing-cell", "result": "fail", "attempts": 2},
-            {"id": "passing-peer", "result": "pass", "attempts": 1},
-        ],
-    })
-    .to_string();
-    let e2e_cmd = format!(
-        "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
-        validate_plan::shell_quote(&structured_counts),
-        validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
-    );
-    let mut e2e_step = step("manifest_attempt", &e2e_cmd);
-    e2e_step.group = "e2e".into();
-    e2e_step.job = "manifest_attempt".into();
-    let e2e_manifest = DagManifest {
-        lane: "portable".into(),
-        category: "applications".into(),
-        test: None,
-        mode: None,
-        backend: None,
-    };
-    e2e_step.manifest = Some(e2e_manifest.clone());
-    e2e_step.result_manifests = Some(vec![
-        dagrun::model::ResultManifest::ManifestCell(e2e_manifest),
-        dagrun::model::ResultManifest::StructuredTestResults(
-            dagrun::model::StructuredTestResultsManifest::current("e2e.manifest_attempt"),
-        ),
-    ]);
-    let e2e_retry = run_lane_once(
-        &DagConfig { steps: vec![e2e_step], ..Default::default() },
-        1,
-        true,
-        0,
-        None,
-        &e2e_log,
-        None,
-        false,
-    );
-    let recorded_attempts = std::fs::read_to_string(&e2e_attempts)
-        .map_err(|e| format!("scheduler accounting: cannot read E2E attempt fixture: {e}"))?;
-    let e2e_node_attempts = e2e_retry
-        .attempts
-        .iter()
-        .filter(|attempt| attempt.tag == "e2e.manifest_attempt")
-        .collect::<Vec<_>>();
-    let e2e_results = e2e_node_attempts
-        .first()
-        .and_then(|attempt| attempt.test_results.as_ref());
-    if e2e_retry.ok
-        || e2e_node_attempts.len() != 1
-        || e2e_results
-            != Some(&vec![
-                dagrun::TestResult::new("failing-cell".into(), false, 2)?,
-                dagrun::TestResult::new("passing-peer".into(), true, 1)?,
-            ])
-        || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
-    {
-        return Err(format!(
-            "scheduler accounting: manifest framework retry did not preserve the 2/1/1 proof: \
-             ok={} node_attempts={} results={e2e_results:?} rows={recorded_attempts:?}",
-            e2e_retry.ok, e2e_node_attempts.len()
-        ));
-    }
-
-    // The same real scheduler node without typed manifest identity also gets
-    // one outer execution. Test frameworks may retry the failing test inside
-    // that execution; validate never repeats the enclosing node or its peers.
-    let ordinary_attempts = tmp.join("ordinary-structured-attempts");
-    let ordinary_log = tmp.join("ordinary-structured-attempts.log");
-    let ordinary_cmd = format!(
-        "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
-        validate_plan::shell_quote(&structured_counts),
-        validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
-    );
-    let mut ordinary_step = step("ordinary_structured", &ordinary_cmd);
-    ordinary_step.result_manifests = Some(vec![
-        dagrun::model::ResultManifest::StructuredTestResults(
-            dagrun::model::StructuredTestResultsManifest::current("fixture.ordinary_structured"),
-        ),
-    ]);
-    let ordinary_retry = run_lane_once(
-        &DagConfig { steps: vec![ordinary_step], ..Default::default() },
-        1,
-        true,
-        0,
-        None,
-        &ordinary_log,
-        None,
-        false,
-    );
-    let ordinary_node_attempts = ordinary_retry
-        .attempts
-        .iter()
-        .filter(|attempt| attempt.tag == "fixture.ordinary_structured")
-        .collect::<Vec<_>>();
-    let ordinary_runs = std::fs::read_to_string(&ordinary_attempts)
-        .map_err(|e| format!("scheduler accounting: cannot read ordinary retry fixture: {e}"))?;
-    if ordinary_retry.ok
-        || ordinary_node_attempts.len() != 1
-        || ordinary_node_attempts.iter().any(|attempt| {
-            attempt.test_results.as_ref().is_none_or(|results| {
-                results.iter().find(|result| result.id == "passing-peer").is_none_or(|peer| {
-                    !peer.passed || peer.attempts != 1
+        // The same real scheduler node without typed manifest identity also gets
+        // one outer execution. Test frameworks may retry the failing test inside
+        // that execution; validate never repeats the enclosing node or its peers.
+        let ordinary_attempts = tmp.join("ordinary-structured-attempts");
+        let ordinary_log = tmp.join("ordinary-structured-attempts.log");
+        let ordinary_cmd = format!(
+            "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
+            validate_plan::shell_quote(&structured_counts),
+            validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
+        );
+        let mut ordinary_step = step("ordinary_structured", &ordinary_cmd);
+        ordinary_step.result_manifests =
+            Some(vec![dagrun::model::ResultManifest::StructuredTestResults(
+                dagrun::model::StructuredTestResultsManifest::current(
+                    "fixture.ordinary_structured",
+                ),
+            )]);
+        let ordinary_retry = run_lane_once(
+            &DagConfig {
+                steps: vec![ordinary_step],
+                ..Default::default()
+            },
+            1,
+            true,
+            0,
+            None,
+            &ordinary_log,
+            None,
+            false,
+        );
+        let ordinary_node_attempts = ordinary_retry
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.tag == "fixture.ordinary_structured")
+            .collect::<Vec<_>>();
+        let ordinary_runs = std::fs::read_to_string(&ordinary_attempts).map_err(|e| {
+            format!("scheduler accounting: cannot read ordinary retry fixture: {e}")
+        })?;
+        if ordinary_retry.ok
+            || ordinary_node_attempts.len() != 1
+            || ordinary_node_attempts.iter().any(|attempt| {
+                attempt.test_results.as_ref().is_none_or(|results| {
+                    results
+                        .iter()
+                        .find(|result| result.id == "passing-peer")
+                        .is_none_or(|peer| !peer.passed || peer.attempts != 1)
                 })
             })
-        })
-        || ordinary_runs.lines().count() != 1
-    {
-        return Err(format!(
-            "scheduler accounting: ordinary-node control received an outer retry or lost its structured results: \
+            || ordinary_runs.lines().count() != 1
+        {
+            return Err(format!(
+                "scheduler accounting: ordinary-node control received an outer retry or lost its structured results: \
              ok={} node_attempts={} rows={ordinary_runs:?}",
-            ordinary_retry.ok,
-            ordinary_node_attempts.len()
-        ));
-    }
+                ordinary_retry.ok,
+                ordinary_node_attempts.len()
+            ));
+        }
 
-    Ok(())
+        Ok(())
     })();
 
     match prior_dagrun_log_dir {
@@ -16705,9 +17606,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ),
         (Err(problem), Ok(())) => Err(problem),
         (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
-        (Err(problem), Err(cleanup_problem)) => Err(format!(
-            "{problem}; cleanup also failed: {cleanup_problem}"
-        )),
+        (Err(problem), Err(cleanup_problem)) => {
+            Err(format!("{problem}; cleanup also failed: {cleanup_problem}"))
+        }
     }
 }
 
@@ -16816,12 +17717,14 @@ fn run_lane_once(
                 let class = validate_runtime::environmental_block_class(&detail);
                 let failure = validate_runtime::failure_class_from_detail(&detail);
                 stamp_attempt_detail(
-                    &mut attempts, &outcome.tag, class,
-                    validate_runtime::understood_infrastructure_class(&detail), failure,
+                    &mut attempts,
+                    &outcome.tag,
+                    class,
+                    validate_runtime::understood_infrastructure_class(&detail),
+                    failure,
                 );
                 if class.is_some() {
-                    if let Some(line) =
-                        terminal_environmental_observation(&attempts, &outcome.tag)
+                    if let Some(line) = terminal_environmental_observation(&attempts, &outcome.tag)
                     {
                         println!("{line}");
                     }
@@ -16831,8 +17734,7 @@ fn run_lane_once(
     }
 
     let (refused_before_launching, remaining) = partition_unreported(&unreported, &refused);
-    let (not_launched, unaccounted) =
-        partition_unreported(&remaining, &scheduler_not_launched);
+    let (not_launched, unaccounted) = partition_unreported(&remaining, &scheduler_not_launched);
     if !not_launched.is_empty() {
         eprintln!("{}", scheduler_not_launched_message(&not_launched));
     }
@@ -16965,7 +17867,10 @@ fn terminal_environmental_observation(attempts: &[NodeAttempt], tag: &str) -> Op
 fn print_retry_ledger(attempts: &[NodeAttempt]) {
     let mut retried: BTreeMap<&str, Vec<&NodeAttempt>> = BTreeMap::new();
     for attempt in attempts {
-        retried.entry(attempt.tag.as_str()).or_default().push(attempt);
+        retried
+            .entry(attempt.tag.as_str())
+            .or_default()
+            .push(attempt);
     }
     retried.retain(|_, rows| {
         rows.len() > 1
@@ -17483,8 +18388,7 @@ fn validate_lock_status_admits(
     boot_id: Option<&str>,
     identity_in_ancestry: &mut dyn FnMut(i32, u64) -> bool,
 ) -> bool {
-    validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry)
-        .is_ok()
+    validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry).is_ok()
 }
 
 /// The single implementation of the admission decision, reporting WHICH
@@ -17575,7 +18479,10 @@ fn validate_lock_status_reason(
     let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
         return Err("the authority reports a holder but no owner record".into());
     };
-    if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64)
+        != Some(1)
     {
         return Err("the authority response is not schema_version 1".into());
     }
@@ -17719,9 +18626,23 @@ fn validate_lock_status_reason(
 /// an admission bypass.
 fn product_front_door_bracket() -> Result<(), String> {
     let policy_cases = [
-        (true, true, false, false, true, "dev-hermit top-level product run"),
+        (
+            true,
+            true,
+            false,
+            false,
+            true,
+            "dev-hermit top-level product run",
+        ),
         (false, false, false, false, false, "standalone clone"),
-        (true, false, false, false, false, "generic Hermit superproject"),
+        (
+            true,
+            false,
+            false,
+            false,
+            false,
+            "generic Hermit superproject",
+        ),
         (true, true, true, false, true, "nested focused payload"),
         (true, true, false, true, false, "show-plan"),
     ];
@@ -17772,8 +18693,7 @@ fn product_front_door_bracket() -> Result<(), String> {
     let mut frozen_authority = authority.clone();
     frozen_authority["lock_admissible"] = serde_json::json!(true);
     frozen_authority["admissible"] = serde_json::json!(false);
-    frozen_authority["reason_code"] =
-        serde_json::json!("canonical-holder-kind-not-validate");
+    frozen_authority["reason_code"] = serde_json::json!("canonical-holder-kind-not-validate");
     frozen_authority["holder"]["kind"] = serde_json::json!("frozen-validate");
     if !validate_lock_status_admits(
         &encode(&frozen_authority),
@@ -17863,7 +18783,9 @@ fn product_front_door_bracket() -> Result<(), String> {
             Some(boot_id),
             &mut (|pid, ticks| pid == 4242 && ticks == 987654),
         ) {
-            return Err(format!("product front door accepted weakened authority: {label}"));
+            return Err(format!(
+                "product front door accepted weakened authority: {label}"
+            ));
         }
     }
     if validate_lock_status_admits(
@@ -17925,7 +18847,9 @@ fn product_front_door_bracket() -> Result<(), String> {
         || !refusal.contains("--only portable test.cli")
         || !refusal.contains("cannot be cited as validation evidence")
     {
-        return Err(format!("product front-door refusal lost remediation detail: {refusal}"));
+        return Err(format!(
+            "product front-door refusal lost remediation detail: {refusal}"
+        ));
     }
     if product_front_door_refusal(
         &parent,
@@ -17952,7 +18876,9 @@ fn product_front_door_bracket() -> Result<(), String> {
     if !unavailable.contains("launcher is unavailable")
         || unavailable.contains("validate-run --checkout")
     {
-        return Err(format!("missing-launcher refusal printed a false remedy: {unavailable}"));
+        return Err(format!(
+            "missing-launcher refusal printed a false remedy: {unavailable}"
+        ));
     }
 
     let focused = parse_argv(&[
@@ -18086,13 +19012,12 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                         launcher.display()
                     )
                 })?;
-                exec_safe_fs::set_executable(&launcher, 0o755)
-                    .map_err(|error| {
-                        format!(
-                            "front-door process bracket: cannot chmod {}: {error}",
-                            launcher.display()
-                        )
-                    })?;
+                exec_safe_fs::set_executable(&launcher, 0o755).map_err(|error| {
+                    format!(
+                        "front-door process bracket: cannot chmod {}: {error}",
+                        launcher.display()
+                    )
+                })?;
             }
 
             let mut command = Command::new(&executable);
@@ -18114,7 +19039,10 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                     .env(validate_runtime::ACTIVE_ENV, std::process::id().to_string())
                     .env(E2E_MACHINE_SHORTNAME_ENV, "fixture-host")
                     .env(E2E_KERNEL_VERSION_ENV, "fixture-kernel")
-                    .env("CI_HUB_VALIDATE_LOCK_OWNER_PID", std::process::id().to_string())
+                    .env(
+                        "CI_HUB_VALIDATE_LOCK_OWNER_PID",
+                        std::process::id().to_string(),
+                    )
                     .env(
                         "CI_HUB_VALIDATE_LOCK_OWNER_FILE",
                         parent.join("caller-forged-owner"),
@@ -18124,17 +19052,12 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 format!("front-door process bracket: cannot launch {label}: {error}")
             })?;
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let rendered = format!(
-                "{}{}",
-                stdout,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let rendered = format!("{}{}", stdout, String::from_utf8_lossy(&output.stderr));
             if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
                 || !rendered.contains("choose whether this is iterative testing or publishing")
                 || !rendered.contains(expected_remediation)
                 || !rendered.contains("--only portable test.cli")
-                || stdout.lines().last()
-                    != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+                || stdout.lines().last() != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
             {
                 return Err(format!(
                     "front-door process bracket: {label} escaped/refused incorrectly: status={:?} \
@@ -18158,8 +19081,12 @@ fn product_front_door_process_bracket() -> Result<(), String> {
         Ok(())
     })();
 
-    let cleanup = std::fs::remove_dir_all(&tmp)
-        .map_err(|error| format!("front-door process bracket: cannot remove {}: {error}", tmp.display()));
+    let cleanup = std::fs::remove_dir_all(&tmp).map_err(|error| {
+        format!(
+            "front-door process bracket: cannot remove {}: {error}",
+            tmp.display()
+        )
+    });
     match (result, cleanup) {
         (Ok(()), Ok(())) => {
             println!(
@@ -18312,9 +19239,8 @@ fn compat_test_results(
                 ));
             }
         };
-        let attempt_count = u64::try_from(latest.attempt).map_err(|_| {
-            format!("structured compatibility attempts overflowed for {label}")
-        })?;
+        let attempt_count = u64::try_from(latest.attempt)
+            .map_err(|_| format!("structured compatibility attempts overflowed for {label}"))?;
         results.push(TestResult::new(label.to_string(), passed, attempt_count)?);
     }
     let executed = u64::try_from(results.len())
@@ -18388,8 +19314,10 @@ fn typed_test_node_coverage(
     planned_test_nodes: &BTreeSet<String>,
     outcomes: &[StepOutcome],
 ) -> serde_json::Value {
-    let final_outcomes: BTreeMap<&str, &StepOutcome> =
-        outcomes.iter().map(|outcome| (outcome.tag.as_str(), outcome)).collect();
+    let final_outcomes: BTreeMap<&str, &StepOutcome> = outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect();
     let mut executed = 0usize;
     let mut zero_executed_nodes = Vec::new();
     let mut absent_nodes = Vec::new();
@@ -18429,7 +19357,11 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         oom_kills: 0,
         timed_out: false,
         cpu_timed_out: false,
-        reason: if ok { String::new() } else { "test failure".into() },
+        reason: if ok {
+            String::new()
+        } else {
+            "test failure".into()
+        },
         aborted,
     };
 
@@ -18484,7 +19416,11 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         oom_kills: 0,
         timed_out: false,
         cpu_timed_out: false,
-        reason: if ok { String::new() } else { "test failure".into() },
+        reason: if ok {
+            String::new()
+        } else {
+            "test failure".into()
+        },
         aborted: false,
     };
     let full = vec![
@@ -18532,9 +19468,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         TestResult::new("mixed-fail".into(), false, 1)?,
     ]);
     let successful_count_only = outcome("test.successful-count-only", true, Some(3), Some(2));
-    if libtest_counts(&[mixed_failure, successful_count_only])
-        != (Some(5), Some(4), Some(3))
-    {
+    if libtest_counts(&[mixed_failure, successful_count_only]) != (Some(5), Some(4), Some(3)) {
         return Err(
             "typed libtest counts: mixed failed typed and successful count-only outcomes did not retain an exact pass total"
                 .into(),
@@ -18611,8 +19545,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     }
     let missing_attempt = compat_test_results(&[compat_pass], &[], "compat.")
         .expect_err("compatibility result without an attempt must refuse");
-    if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no recorded attempt")
-    {
+    if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no recorded attempt") {
         return Err(format!(
             "typed libtest counts: missing compatibility attempt did not fail by name: {missing_attempt}"
         ));
@@ -18690,8 +19623,10 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
 /// run's fold; raw_result/raw_failure_class/raw_aborted and the unchanged attempt
 /// list retain what was actually observed. No raw timeout/OOM fact is synthesized.
 fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) -> serde_json::Value {
-    let node_attempts_raw: Vec<&NodeAttempt> =
-        attempts.iter().filter(|attempt| attempt.tag == outcome.tag).collect();
+    let node_attempts_raw: Vec<&NodeAttempt> = attempts
+        .iter()
+        .filter(|attempt| attempt.tag == outcome.tag)
+        .collect();
     let first = node_attempts_raw.first().copied();
     let latest = terminal_attempt(outcome, attempts);
     let node_attempts: Vec<serde_json::Value> = node_attempts_raw
@@ -18752,10 +19687,12 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     // lane supplies attempts and therefore takes the exact-attempt branch.
     let mut gate = ledger_gate(outcome);
     gate["reported"] = serde_json::json!(latest.map(|attempt| attempt.reported).unwrap_or(true));
-    gate["execution"] = serde_json::json!(latest
-        .map(|attempt| attempt.execution)
-        .unwrap_or_else(|| outcome_execution(outcome))
-        .as_str());
+    gate["execution"] = serde_json::json!(
+        latest
+            .map(|attempt| attempt.execution)
+            .unwrap_or_else(|| outcome_execution(outcome))
+            .as_str()
+    );
     if let Some(attempt) = latest {
         gate["result"] = serde_json::json!(attempt_result(attempt));
         gate["exit_code"] = serde_json::json!(attempt.returncode);
@@ -18802,7 +19739,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     let classification = node_classification(outcome, attempts);
     gate["raw_result"] = gate["result"].clone();
     gate["raw_aborted"] = gate["aborted"].clone();
-    if matches!(classification, NodeClassification::Pass | NodeClassification::ProductFailure) {
+    if matches!(
+        classification,
+        NodeClassification::Pass | NodeClassification::ProductFailure
+    ) {
         // Parent readers discard aborted gates before consulting failure_class.
         // This is the aggregate result, while raw_aborted and the attempts retain
         // the latest actual cancellation without erasing an earlier failure.
@@ -18815,11 +19755,15 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         if let Some(raw) = gate.get(field).cloned() {
             gate[format!("raw_{field}")] = raw;
         }
-        gate.as_object_mut().expect("gate is an object").remove(field);
+        gate.as_object_mut()
+            .expect("gate is an object")
+            .remove(field);
     }
     if classification != NodeClassification::Pass {
         gate["failure_class"] = serde_json::json!(classification.as_str());
-        let cause = node_attempts_raw.iter().rev()
+        let cause = node_attempts_raw
+            .iter()
+            .rev()
             .find(|attempt| attempt_classification(attempt) == classification);
         if let Some(cause) = cause {
             if classification == NodeClassification::UnderstoodInfrastructureFailure {
@@ -18833,13 +19777,16 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             }
         }
     }
-    gate["non_product_failure_bucket"] = serde_json::json!(classification.non_product_failure_bucket());
-    set_gate_failure_evidence(&mut gate, classification == NodeClassification::ProductFailure);
+    gate["non_product_failure_bucket"] =
+        serde_json::json!(classification.non_product_failure_bucket());
+    set_gate_failure_evidence(
+        &mut gate,
+        classification == NodeClassification::ProductFailure,
+    );
     gate["attempts"] = serde_json::json!(node_attempts);
     gate["retries"] = serde_json::json!(node_attempts_raw.len().saturating_sub(1));
     gate["first_attempt_result"] = serde_json::json!(first.and_then(attempt_result));
-    gate["first_attempt_reason"] =
-        serde_json::json!(first.map(|attempt| attempt.reason.as_str()));
+    gate["first_attempt_reason"] = serde_json::json!(first.map(|attempt| attempt.reason.as_str()));
     gate
 }
 
@@ -19283,9 +20230,14 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     if plan.suite_complete
         || plan.selection_mode != "targeted"
         || plan.second.is_some()
-        || plan.cell_evidence_expected.as_ref().is_none_or(Vec::is_empty)
+        || plan
+            .cell_evidence_expected
+            .as_ref()
+            .is_none_or(Vec::is_empty)
     {
-        return Err("requalification plan: owning-step selection gained full-suite authority".into());
+        return Err(
+            "requalification plan: owning-step selection gained full-suite authority".into(),
+        );
     }
 
     let target = validate_cell_results::expected_plan(root)?
@@ -19304,10 +20256,7 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         backend: Some(requalification_identity_field(&target, "backend")?.into()),
     };
     let committed = validate_plan::validation_config(root)?;
-    let lane = dagrun::select_steps_by_labels(
-        &committed,
-        std::slice::from_ref(&exact.lane),
-    )?;
+    let lane = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&exact.lane))?;
     let owner = dagrun::result_manifest_owner(&lane.steps, &exact)?;
     let owner_tag = owner.tag();
     let expected_cfg =
@@ -19346,7 +20295,10 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
             || step.cmd.contains("run_dag_boxed_deadline")
             || step.cmd.contains("dagrun run")
     }) {
-        return Err("requalification plan: exact-result selection synthesized a node or nested scheduler".into());
+        return Err(
+            "requalification plan: exact-result selection synthesized a node or nested scheduler"
+                .into(),
+        );
     }
     require_committed_scheduler_input(&plan)?;
 
@@ -19425,7 +20377,9 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     let source_after = std::fs::read(&source_path)
         .map_err(|error| format!("requalification plan: cannot re-read source DAG: {error}"))?;
     if source_after != source_before {
-        return Err("requalification plan: exact-result selection changed ci/dag/validate.json".into());
+        return Err(
+            "requalification plan: exact-result selection changed ci/dag/validate.json".into(),
+        );
     }
     println!(
         "  requalification plan: exact five-field identity resolved to committed owner {owner_tag}; its dependency closure and declared result population stayed unchanged; graph and source mutations both refused"
@@ -19442,9 +20396,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     let state_root = root.join("state-root");
     let tool_root = root.join("tool-root");
     let frozen_root = root.join("frozen-root");
-    let target_root = root.join(
-        "cache/trees/1111111111111111111111111111111111111111",
-    );
+    let target_root = root.join("cache/trees/1111111111111111111111111111111111111111");
     let other_root = root.join("other-root");
     let fake_root = root.join("fake-root");
     let checkout = root.join("checkout");
@@ -19495,9 +20447,12 @@ fn tool_root_split_bracket() -> Result<(), String> {
     .and_then(|_| std::fs::write(&log, "fixture\n"))
     .map_err(|error| format!("tool-root split: cannot write fixture: {error}"))?;
     exec_safe_fs::set_executable(state_root.join("ci-hub/ci-hub"), 0o755)
-    .map_err(|error| format!("tool-root split: cannot chmod fixture: {error}"))?;
+        .map_err(|error| format!("tool-root split: cannot chmod fixture: {error}"))?;
     git(&state_root, &["init", "-b", "main"])?;
-    git(&state_root, &["config", "user.email", "fixture@example.com"])?;
+    git(
+        &state_root,
+        &["config", "user.email", "fixture@example.com"],
+    )?;
     git(&state_root, &["config", "user.name", "fixture"])?;
     git(&state_root, &["add", "."])?;
     git(&state_root, &["commit", "-m", "fixture"])?;
@@ -19507,7 +20462,11 @@ fn tool_root_split_bracket() -> Result<(), String> {
     )?;
     git(
         &root,
-        &["clone", state_root.to_str().unwrap(), other_root.to_str().unwrap()],
+        &[
+            "clone",
+            state_root.to_str().unwrap(),
+            other_root.to_str().unwrap(),
+        ],
     )?;
 
     std::fs::create_dir_all(frozen_root.join("ci-hub/validate"))
@@ -19532,7 +20491,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
         })
         .map_err(|error| format!("tool-root split: cannot create frozen fixture: {error}"))?;
     exec_safe_fs::set_executable(frozen_root.join("ci-hub/ci-hub"), 0o755)
-    .map_err(|error| format!("tool-root split: cannot chmod frozen fixture: {error}"))?;
+        .map_err(|error| format!("tool-root split: cannot chmod frozen fixture: {error}"))?;
     make_self_test_tree_read_only(&frozen_root)?;
     std::fs::create_dir_all(&target_root)
         .map_err(|error| format!("tool-root split: cannot create cached target: {error}"))?;
@@ -19550,10 +20509,11 @@ fn tool_root_split_bracket() -> Result<(), String> {
         TOOL_AGENT_UTILS_SHA_ENV,
         TOOL_BOOTSTRAP_SHA256_ENV,
     ];
-    let saved_authority_environment: Vec<(&str, Option<std::ffi::OsString>)> = authority_environment
-        .iter()
-        .map(|name| (*name, std::env::var_os(name)))
-        .collect();
+    let saved_authority_environment: Vec<(&str, Option<std::ffi::OsString>)> =
+        authority_environment
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
     for name in authority_environment {
         // SAFETY: validate's self-test is single-threaded and restores these values.
         unsafe { std::env::remove_var(name) };
@@ -19586,9 +20546,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     std::fs::write(tool_root.join("dirty"), "fixture\n")
         .map_err(|error| format!("tool-root split: cannot dirty fixture: {error}"))?;
     unsafe { std::env::set_var(TOOL_ROOT_ENV, &tool_root) };
-    if !configured_tool_root(Some(&state_root))
-        .is_err_and(|error| error.contains(" is dirty:"))
-    {
+    if !configured_tool_root(Some(&state_root)).is_err_and(|error| error.contains(" is dirty:")) {
         return Err("tool-root split: dirty explicit tool root did not refuse".into());
     }
     std::fs::remove_file(tool_root.join("dirty"))
@@ -19652,10 +20610,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     let copied_authority = root.join("copied-authority.json");
     exec_safe_fs::copy(&valid_authority.authority_path, &copied_authority)
         .and_then(|_| {
-            std::fs::set_permissions(
-                &copied_authority,
-                std::fs::Permissions::from_mode(0o444),
-            )
+            std::fs::set_permissions(&copied_authority, std::fs::Permissions::from_mode(0o444))
         })
         .map_err(|error| format!("tool-root split: cannot copy authority fixture: {error}"))?;
     unsafe { std::env::set_var(TOOL_AUTHORITY_ENV, &copied_authority) };
@@ -19837,9 +20792,14 @@ fn tool_root_split_bracket() -> Result<(), String> {
         .join("ci-hub/ci-hub")
         .to_string_lossy()
         .into_owned();
-    let state_launcher = state_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
+    let state_launcher = state_root
+        .join("ci-hub/ci-hub")
+        .to_string_lossy()
+        .into_owned();
     if !refusal.contains(&tool_launcher) || refusal.contains(&state_launcher) {
-        return Err("tool-root split: remediation named the state root instead of tool root".into());
+        return Err(
+            "tool-root split: remediation named the state root instead of tool root".into(),
+        );
     }
 
     // The reader and writer share this single adapter-path resolver. Exercise
@@ -19870,7 +20830,10 @@ fn tool_root_split_bracket() -> Result<(), String> {
         }
     }
 
-    let _ = Command::new("chmod").args(["-R", "u+w"]).arg(&root).status();
+    let _ = Command::new("chmod")
+        .args(["-R", "u+w"])
+        .arg(&root)
+        .status();
     let _ = std::fs::remove_dir_all(&root);
     println!(
         "  tool-root split: sealed descriptor authority, digest, receipt finalizer, and remediation preserve immutable code/state separation"
@@ -19940,22 +20903,31 @@ print("fixture append accepted")
     }
     appended?;
     let captured: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(parent.join("captured.json"))
-            .map_err(|error| format!("validate series writer: cannot read captured call: {error}"))?,
+        &std::fs::read(parent.join("captured.json")).map_err(|error| {
+            format!("validate series writer: cannot read captured call: {error}")
+        })?,
     )
     .map_err(|error| format!("validate series writer: malformed captured call: {error}"))?;
     let argv = captured["argv"]
         .as_array()
         .ok_or("validate series writer: captured argv is not an array")?;
-    let arguments = argv.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+    let arguments = argv
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
     for pair in [
-        ["--checkout", checkout.to_str().ok_or("fixture checkout is not UTF-8")?],
+        [
+            "--checkout",
+            checkout.to_str().ok_or("fixture checkout is not UTF-8")?,
+        ],
         ["--producer", "validate"],
         ["--run-id", "validate-series-fixture"],
         ["--tree", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
     ] {
         if !arguments.windows(2).any(|window| window == pair) {
-            return Err(format!("validate series writer: omitted argument pair {pair:?}"));
+            return Err(format!(
+                "validate series writer: omitted argument pair {pair:?}"
+            ));
         }
     }
     let rows = captured["stdin"]
@@ -20001,7 +20973,9 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         row("fixture.passed", true, Some(0), 1.0),
     ];
     if possible_missing_artifact_nodes("only", &outcomes) != vec!["fixture.missing"] {
-        return Err("missing-artifact hint did not select exactly the fast --only exit-127 row".into());
+        return Err(
+            "missing-artifact hint did not select exactly the fast --only exit-127 row".into(),
+        );
     }
     for mode in ["full", "targeted", "selective"] {
         if !possible_missing_artifact_nodes(mode, &outcomes).is_empty() {
@@ -20051,15 +21025,14 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         || outcome_is_failure(&no_result)
         || ledger_gate_result(&no_result) != "no_result"
         || completed_exit_code(0, 1, false, false) != NO_RESULT_EXIT_CODE as u8
-        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 1, false)
-            != ("fail", "no_result")
-        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 0, false)
-            != ("fail", "no_result")
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 1, false) != ("fail", "no_result")
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 0, false) != ("fail", "no_result")
     {
         return Err("no-result propagation: exit 75 did not remain a distinct NO_RESULT".into());
     }
     let no_result_attempt = reported_attempt(&no_result, 1);
-    let no_result_gate = ledger_gate_with_attempts(&no_result, std::slice::from_ref(&no_result_attempt));
+    let no_result_gate =
+        ledger_gate_with_attempts(&no_result, std::slice::from_ref(&no_result_attempt));
     if no_result_gate["result"] != "no_result"
         || no_result_gate["attempts"][0]["result"] != "no_result"
         || no_result_gate["failure_class"] != "no_result"
@@ -20118,7 +21091,9 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     if completed_exit_code(0, 1, true, false) != NO_RESULT_EXIT_CODE as u8
         || completed_exit_code(1, 1, true, false) != 1
     {
-        return Err("no-result propagation: run cutoff lost incomplete/product-failure distinction".into());
+        return Err(
+            "no-result propagation: run cutoff lost incomplete/product-failure distinction".into(),
+        );
     }
     if completed_exit_code(0, 1, false, true) != 1 {
         return Err(
@@ -20237,7 +21212,8 @@ fn write_ledger_with_snapshot(
     let classification = classify_run(outcomes, attempts, skipped, planned_tags, host_inapplicable);
     let failures = classification.product_failure_nodes.len();
     let no_results = classification.no_results();
-    let validation_complete = validation_is_complete(execution_complete, &classification, planned_tags);
+    let validation_complete =
+        validation_is_complete(execution_complete, &classification, planned_tags);
     // An operator stop learned nothing new about the product. Preserve the raw
     // shell outcome for forensics, but do not mint a FAILED verdict unless a
     // completed gate had already established one before the stop
@@ -20481,9 +21457,7 @@ fn write_ledger_with_snapshot(
         return None;
     }
     if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
-        eprintln!(
-            "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
-        );
+        eprintln!("validate: warning: generated ledger row has malformed HistoryRow retry_rounds");
         return None;
     }
     if typed.executed_nodes() != Ok(Some(executed_nodes)) {
@@ -20519,11 +21493,13 @@ fn write_ledger_with_snapshot(
         let configured_tool_root = std::env::var_os(TOOL_ROOT_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        let Some(adapter) = validate_history::canonical_ledger_adapter(
-            ledger,
-            configured_tool_root.as_deref(),
-        ) else {
-            eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
+        let Some(adapter) =
+            validate_history::canonical_ledger_adapter(ledger, configured_tool_root.as_deref())
+        else {
+            eprintln!(
+                "validate: warning: canonical ledger root has no parent: {}",
+                ledger.display()
+            );
             return None;
         };
         let mut child = match Command::new("python3")
@@ -20561,7 +21537,7 @@ fn write_ledger_with_snapshot(
                     String::from_utf8_lossy(&output.stdout).trim()
                 );
                 return Some(record);
-            },
+            }
             Ok(output) => eprintln!(
                 "validate: warning: canonical ledger writer {} refused: {}",
                 adapter.display(),
@@ -20578,19 +21554,34 @@ fn write_ledger_with_snapshot(
     if let Some(dir) = ledger.parent() {
         if !dir.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("validate: warning: cannot create ledger dir {}: {e}", dir.display());
+                eprintln!(
+                    "validate: warning: cannot create ledger dir {}: {e}",
+                    dir.display()
+                );
                 return None;
             }
         }
     }
     use std::io::Write;
-    match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
-        Ok(mut f) => match f.write_all(line.as_bytes()).and_then(|()| f.sync_all()).and_then(|()| {
-            // The first append can create the file. Its directory entry must
-            // survive with its bytes before it authorizes scorecard publication.
-            std::fs::File::open(ledger.parent().filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")))?.sync_all()
-        }) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ledger)
+    {
+        Ok(mut f) => match f
+            .write_all(line.as_bytes())
+            .and_then(|()| f.sync_all())
+            .and_then(|()| {
+                // The first append can create the file. Its directory entry must
+                // survive with its bytes before it authorizes scorecard publication.
+                std::fs::File::open(
+                    ledger
+                        .parent()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .unwrap_or(Path::new(".")),
+                )?
+                .sync_all()
+            }) {
             Ok(()) => {
                 eprintln!(
                     "validate: fixture/standalone ledger record appended to {}",
@@ -20600,14 +21591,20 @@ fn write_ledger_with_snapshot(
                 Some(record)
             }
             Err(e) => {
-                eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display());
+                eprintln!(
+                    "validate: warning: cannot append ledger {}: {e}",
+                    ledger.display()
+                );
                 None
-            },
+            }
         },
         Err(e) => {
-            eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display());
+            eprintln!(
+                "validate: warning: cannot open ledger {}: {e}",
+                ledger.display()
+            );
             None
-        },
+        }
     }
 }
 
@@ -20680,7 +21677,13 @@ fn ledger_path(root: &Path) -> PathBuf {
         .unwrap_or_else(|| LEDGER_TEAM_DEFAULT.to_string());
     let sanitize = |s: &str| {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>()
     };
     // CONFLICT RESOLUTION (rebase onto cd428f96): main added this parent-discovery step and this
@@ -20697,8 +21700,11 @@ fn ledger_path(root: &Path) -> PathBuf {
         );
         return found;
     }
-    root.join(LEDGER_DIR)
-        .join(format!("{}.{}.jsonl", sanitize(&team), sanitize(&short_hostname())))
+    root.join(LEDGER_DIR).join(format!(
+        "{}.{}.jsonl",
+        sanitize(&team),
+        sanitize(&short_hostname())
+    ))
 }
 
 /// Walk up from `root` for the dev-hermit parent that owns the canonical adapter.
@@ -20777,9 +21783,7 @@ fn parent_owns_scorecard_writeback(owner: Option<&str>, managed: bool) -> bool {
 
 fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
     match verdict {
-        Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => {
-            Some(FinalValidateStatus::Passed)
-        }
+        Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => Some(FinalValidateStatus::Passed),
         Verdict::Fail => Some(FinalValidateStatus::Failed),
         Verdict::NoResult | Verdict::Refused | Verdict::Interrupted => {
             Some(FinalValidateStatus::CouldNotRun)
@@ -20988,9 +21992,8 @@ fn cache_hit_run_summary(
     summary.ledger = Some(ledger.to_path_buf());
     if service_result_requested {
         let (nodes, executed, passed) = exact_counts.expect("checked above");
-        summary.nodes_executed = usize::try_from(nodes).map_err(|_| {
-            format!("cached executed_nodes {nodes} does not fit this platform")
-        })?;
+        summary.nodes_executed = usize::try_from(nodes)
+            .map_err(|_| format!("cached executed_nodes {nodes} does not fit this platform"))?;
         summary.executed_tests = Some(executed);
         summary.passed_tests = Some(passed);
     }
@@ -21008,8 +22011,7 @@ fn unavailable_invocation_lock_summary(profile: &str, error: String) -> RunSumma
     )
 }
 
-const SUMMARY_FLAKY_HEADING: &str =
-    "⚠️  FLAKY — these test ids passed only after a retry:";
+const SUMMARY_FLAKY_HEADING: &str = "⚠️  FLAKY — these test ids passed only after a retry:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestIdRetry {
@@ -21095,9 +22097,9 @@ fn inner_retry_occurrences_for_test(
         .iter()
         .filter(|observation| !observation.passed)
         .filter(|observation| {
-            observations.iter().any(|later| {
-                later.node == observation.node && later.attempt > observation.attempt
-            })
+            observations
+                .iter()
+                .any(|later| later.node == observation.node && later.attempt > observation.attempt)
         })
         .filter(|observation| {
             !attempts.iter().any(|attempt| {
@@ -21270,7 +22272,9 @@ fn test_id_summary(
     let mut unclassified_outer_retry_occurrences = 0;
     let mut test_runner_retry_occurrences = 0;
     for ((node, id), observations) in by_node_and_id {
-        let Some(last) = observations.last() else { continue };
+        let Some(last) = observations.last() else {
+            continue;
+        };
         unclassified_outer_retry_occurrences +=
             inner_retry_occurrences_for_test(&observations, attempts);
         let inner_retry_occurrences = observations
@@ -21280,7 +22284,12 @@ fn test_id_summary(
         test_runner_retry_occurrences += inner_retry_occurrences;
         let retry_classes = retry_classes_for_test(&observations, attempts);
         let was_retried = !retry_classes.is_empty() || inner_retry_occurrences > 0;
-        let item = TestIdRetry { node, id, retry_classes, inner_retry_occurrences };
+        let item = TestIdRetry {
+            node,
+            id,
+            retry_classes,
+            inner_retry_occurrences,
+        };
         if last.passed {
             if was_retried {
                 recovered.push(item);
@@ -21297,7 +22306,10 @@ fn test_id_summary(
             .difference(&failed_nodes_with_test_ids)
             .cloned()
             .collect(),
-        retry_occurrences: attempts.iter().filter(|attempt| attempt.retry_class.is_some()).count()
+        retry_occurrences: attempts
+            .iter()
+            .filter(|attempt| attempt.retry_class.is_some())
+            .count()
             + unclassified_outer_retry_occurrences
             + test_runner_retry_occurrences,
     }
@@ -21463,13 +22475,13 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     // one; CPU (user+sys, this process plus every child it reaped) against wall
     // can, and that ratio is how the 53-minute pre-gate wedge was identified on
     // 2026-08-07 — the wall clock said "still going", the ratio said "waiting".
-    let (wall, user, sys) = s
-        .cpu_wall
-        .unwrap_or_else(|| {
-            let (u, sy) = validate_runtime::process_cpu_seconds();
-            (started.elapsed().as_secs_f64(), u, sy)
-        });
-    let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let (wall, user, sys) = s.cpu_wall.unwrap_or_else(|| {
+        let (u, sy) = validate_runtime::process_cpu_seconds();
+        (started.elapsed().as_secs_f64(), u, sy)
+    });
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     lines.push(format!(
         "   {}",
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
@@ -21566,9 +22578,9 @@ fn publish_validation_service_result_or_refuse(
     match publish_validation_service_result(path, summary) {
         Ok(()) => Ok(()),
         Err(error) => {
-            summary
-                .detail
-                .push(format!("validation service result could not be published: {error}"));
+            summary.detail.push(format!(
+                "validation service result could not be published: {error}"
+            ));
             if final_validate_status(summary.verdict) == Some(FinalValidateStatus::Passed) {
                 summary.verdict = Verdict::NoResult;
                 summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
@@ -21641,8 +22653,7 @@ fn path_is_outside(path: &Path, boundary: &Path) -> bool {
         return false;
     }
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let boundary =
-        std::fs::canonicalize(boundary).unwrap_or_else(|_| boundary.to_path_buf());
+    let boundary = std::fs::canonicalize(boundary).unwrap_or_else(|_| boundary.to_path_buf());
     !path.starts_with(boundary)
 }
 
@@ -21799,7 +22810,10 @@ fn run_owned_cache_bracket() -> Result<(), String> {
         let stdout = std::str::from_utf8(&output.stdout).map_err(|error| {
             format!("run-owned cache: {label} package path is not UTF-8: {error}")
         })?;
-        let mut paths = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+        let mut paths = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
         let Some(package) = paths.next() else {
             return Err(format!(
                 "run-owned cache: {label} package generation printed no path"
@@ -21830,7 +22844,13 @@ fn run_owned_cache_bracket() -> Result<(), String> {
 
     let cargo_metadata = |manifest: &Path| {
         Command::new("cargo")
-            .args(["metadata", "--no-deps", "--format-version", "1", "--manifest-path"])
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
             .arg(manifest)
             .current_dir(&workspace)
             .output()
@@ -21953,7 +22973,8 @@ fn validation_run_state_path(
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| {
-                "nested validation did not inherit VALIDATE_RUN_STATE from its outer run".to_string()
+                "nested validation did not inherit VALIDATE_RUN_STATE from its outer run"
+                    .to_string()
             })?;
         let run_root = root.join("target/validation");
         if !path.starts_with(&run_root) {
@@ -22010,15 +23031,8 @@ fn run_state_path_bracket() -> Result<(), String> {
     let profiles = ["full", "portable", "quick", "strict-compat-only"];
     let mut observed = BTreeSet::new();
     for (index, profile) in profiles.iter().enumerate() {
-        let path = validation_run_state_path(
-            root,
-            profile,
-            None,
-            None,
-            false,
-            41,
-            100 + index as u128,
-        )?;
+        let path =
+            validation_run_state_path(root, profile, None, None, false, 41, 100 + index as u128)?;
         if !path.starts_with(root.join("target/validation")) || path == Path::new("/") {
             return Err(format!(
                 "{profile} chose a run-state path outside the run-owned root: {}",
@@ -22118,7 +23132,7 @@ fn run(
                 "(arguments not parsed)",
                 "argument parsing",
                 vec!["see the message above; run --help for the accepted flags".into()],
-            )
+            );
         }
     };
 
@@ -22138,12 +23152,17 @@ fn run(
     if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
         return match run_nested_scope_probe() {
             Ok(detail) => RunSummary::new(
-                Verdict::SelfTest, 0, "nested safe-ci scope self-test", vec![detail],
+                Verdict::SelfTest,
+                0,
+                "nested safe-ci scope self-test",
+                vec![detail],
             ),
             Err(error) => {
                 eprintln!("validate: NESTED SCOPE SELF-TEST FAILED: {error}");
                 RunSummary::new(
-                    Verdict::Fail, 2, "nested safe-ci scope self-test",
+                    Verdict::Fail,
+                    2,
+                    "nested safe-ci scope self-test",
                     vec![format!("nested scope self-test failed: {error}")],
                 )
             }
@@ -22161,8 +23180,18 @@ fn run(
         });
         if log_probe.is_some() {
             return match result {
-                Ok(()) => RunSummary::new(Verdict::SelfTest, 0, "runner log isolation self-test", vec![RUNNER_LOG_SELF_TEST_OK.into()]),
-                Err(error) => RunSummary::new(Verdict::Fail, 2, "runner log isolation self-test", vec![error]),
+                Ok(()) => RunSummary::new(
+                    Verdict::SelfTest,
+                    0,
+                    "runner log isolation self-test",
+                    vec![RUNNER_LOG_SELF_TEST_OK.into()],
+                ),
+                Err(error) => RunSummary::new(
+                    Verdict::Fail,
+                    2,
+                    "runner log isolation self-test",
+                    vec![error],
+                ),
             };
         }
         return match result {
@@ -22182,18 +23211,18 @@ fn run(
             ),
             Err(e) => {
                 eprintln!("validate: SELF-TEST FAILED: {e}");
-                RunSummary::new(Verdict::Fail, 2, "self-test", vec![format!("self-test failed: {e}")])
+                RunSummary::new(
+                    Verdict::Fail,
+                    2,
+                    "self-test",
+                    vec![format!("self-test failed: {e}")],
+                )
             }
         };
     }
 
     if let Err(error) = establish_release_build_environment(&args) {
-        return RunSummary::refused(
-            2,
-            args.level.name(),
-            "release build mode",
-            vec![error],
-        );
+        return RunSummary::refused(2, args.level.name(), "release build mode", vec![error]);
     }
 
     let level_name = args.level.name().to_string();
@@ -22238,8 +23267,11 @@ fn run(
     // The profile name is needed by the admission gates below, which run BEFORE
     // the plan exists. It is derived exactly as `build_plan` derives it, so the
     // lock record and the ledger row can never disagree about what was running.
-    let profile_name =
-        args.focused.as_ref().map(|f| f.profile()).unwrap_or_else(|| level_name.clone());
+    let profile_name = args
+        .focused
+        .as_ref()
+        .map(|f| f.profile())
+        .unwrap_or_else(|| level_name.clone());
 
     // ---- re-entrancy (validate.sh:460) ---------------------------------------
     //
@@ -22279,7 +23311,9 @@ fn run(
             &profile_name,
             "the re-entrancy guard",
             vec![
-                format!("this process is a descendant of validate pid {outer}, which is already driving a run"),
+                format!(
+                    "this process is a descendant of validate pid {outer}, which is already driving a run"
+                ),
                 "a full suite inside a full suite would pay the whole preamble twice, append a \
                  SECOND ledger row, and could publish a SECOND receipt for one logical run"
                     .into(),
@@ -22343,11 +23377,11 @@ fn run(
         .is_some_and(|candidate| candidate.join("ci-hub").is_dir());
     if !args.allow_local_off_the_record_run
         && product_front_door_applies(
-        parent.is_some(),
-        ci_hub_dir_present,
-        nesting.nested,
-        args.show_plan,
-    )
+            parent.is_some(),
+            ci_hub_dir_present,
+            nesting.nested,
+            args.show_plan,
+        )
     {
         let tool_root = tool_root
             .as_deref()
@@ -22447,12 +23481,7 @@ fn run(
     }
 
     if let Err(error) = establish_cell_host_facts(nesting.nested) {
-        return RunSummary::refused(
-            2,
-            &profile_name,
-            "cell-result host facts",
-            vec![error],
-        );
+        return RunSummary::refused(2, &profile_name, "cell-result host facts", vec![error]);
     }
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
@@ -22534,7 +23563,10 @@ fn run(
         )
     {
         eprintln!("validate: refusing to run on a dirty working tree.");
-        eprintln!("  HEAD {} has uncommitted working-tree changes, so a record anchored to it", git_sha());
+        eprintln!(
+            "  HEAD {} has uncommitted working-tree changes, so a record anchored to it",
+            git_sha()
+        );
         eprintln!("  would describe a tree that exists nowhere in history. Commit (preferred), or");
         eprintln!("  stage the WIP with 'git add', then re-run. To force an explicitly unanchored");
         eprintln!(
@@ -22585,7 +23617,10 @@ fn run(
                 2,
                 &profile_name,
                 "the rebase-freshness gate",
-                msg.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+                msg.lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect(),
             );
         }
     }
@@ -22618,7 +23653,7 @@ fn run(
                         &profile_name,
                         "run-owned cache setup",
                         vec![error],
-                    )
+                    );
                 }
             };
             std::env::set_var("XDG_CACHE_HOME", cache);
@@ -22641,7 +23676,7 @@ fn run(
                 &profile_name,
                 "run-state setup",
                 vec![format!("clock is before the Unix epoch: {error}")],
-            )
+            );
         }
     };
     let inherited_run_state = std::env::var_os("VALIDATE_RUN_STATE");
@@ -22649,7 +23684,9 @@ fn run(
         verified_run_state_scope_reexec(&root, inherited_run_state.as_deref());
     std::env::remove_var(RUN_STATE_SCOPE_REEXEC_ENV);
     if verified_scope_reexec {
-        eprintln!("validate: preserving its run-owned state across the verified cgroup scope re-exec");
+        eprintln!(
+            "validate: preserving its run-owned state across the verified cgroup scope re-exec"
+        );
     }
     let tmp = match validation_run_state_path(
         &root,
@@ -22661,9 +23698,7 @@ fn run(
         run_state_nonce,
     ) {
         Ok(path) => path,
-        Err(error) => {
-            return RunSummary::refused(2, &profile_name, "run-state setup", vec![error])
-        }
+        Err(error) => return RunSummary::refused(2, &profile_name, "run-state setup", vec![error]),
     };
     if let Err(e) = std::fs::create_dir_all(&tmp) {
         return RunSummary::refused(
@@ -22704,7 +23739,10 @@ fn run(
                     2,
                     &profile_name,
                     "run-owned temporary path setup",
-                    vec![format!("cannot create {} for {variable}: {error}", path.display())],
+                    vec![format!(
+                        "cannot create {} for {variable}: {error}",
+                        path.display()
+                    )],
                 );
             }
             std::env::set_var(variable, path);
@@ -22814,11 +23852,15 @@ fn run(
         }
         if let Some(cap) = env_positive("VALIDATE_GATE_TIMEOUT_SECONDS") {
             clamp_wall(&mut plan, cap);
-            eprintln!("validate: VALIDATE_GATE_TIMEOUT_SECONDS={cap}: every gate's wall ceiling lowered to at most {cap}s");
+            eprintln!(
+                "validate: VALIDATE_GATE_TIMEOUT_SECONDS={cap}: every gate's wall ceiling lowered to at most {cap}s"
+            );
         }
         if let Some(cap) = env_positive("VALIDATE_GATE_CPU_TIMEOUT_SECONDS") {
             clamp_cpu(&mut plan, cap);
-            eprintln!("validate: VALIDATE_GATE_CPU_TIMEOUT_SECONDS={cap}: every gate's CPU budget lowered to at most {cap}s");
+            eprintln!(
+                "validate: VALIDATE_GATE_CPU_TIMEOUT_SECONDS={cap}: every gate's CPU budget lowered to at most {cap}s"
+            );
         }
     } else if [
         "VALIDATE_GATE_TIMEOUT_SECONDS",
@@ -22864,15 +23906,24 @@ fn run(
     };
 
     let cumulative_selection = if should_capture_cumulative_evidence(
-        &plan, nesting.nested, args.allow_local_off_the_record_run,
-    )
-    {
+        &plan,
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+    ) {
         match validate_evidence::SelectedEvidence::capture(&root, &plan) {
             Ok(selected) => Some(selected),
-            Err(error) => return RunSummary::refused(2, &plan.profile,
-                "constructed evidence plan", vec![error]),
+            Err(error) => {
+                return RunSummary::refused(
+                    2,
+                    &plan.profile,
+                    "constructed evidence plan",
+                    vec![error],
+                );
+            }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     // Fail-closed caps audit. A node without declared caps would run UNBOXED
     // while the driver still printed "boxing ACTIVE" — a green verifying less
@@ -22914,7 +23965,9 @@ fn run(
             undeclared.len(),
             undeclared.join(", ")
         );
-        eprintln!("  Declare timeout + cpu_timeout + a memory hint for each; see scripts/lib/validate_plan.rs.");
+        eprintln!(
+            "  Declare timeout + cpu_timeout + a memory hint for each; see scripts/lib/validate_plan.rs."
+        );
         return RunSummary::refused(
             3,
             &plan.profile,
@@ -22993,12 +24046,7 @@ fn run(
         let mut exported = plan.cfg.clone();
         if args.write_generated_plan.is_some() {
             if let Err(error) = materialize_source_cpu_timeouts(&mut exported) {
-                return RunSummary::refused(
-                    2,
-                    &plan.profile,
-                    "source DAG export",
-                    vec![error],
-                );
+                return RunSummary::refused(2, &plan.profile, "source DAG export", vec![error]);
             }
         }
         if let Err(error) = std::fs::write(path, format!("{}\n", dag_to_json(&exported))) {
@@ -23014,7 +24062,10 @@ fn run(
             0,
             &plan.profile,
             vec![
-                format!("complete constructed outer DAG written to {}", path.display()),
+                format!(
+                    "complete constructed outer DAG written to {}",
+                    path.display()
+                ),
                 "nothing was executed and no ledger row was written".into(),
             ],
         );
@@ -23046,21 +24097,50 @@ fn run(
                 }))
                 .expect("constructed plan is serializable")
             );
-            return RunSummary::new(Verdict::PlanOnly, 0, &plan.profile, vec![
-                "--show-plan-json: constructed outer steps printed".into(),
-                "nothing was executed and no ledger row was written".into(),
-            ]);
+            return RunSummary::new(
+                Verdict::PlanOnly,
+                0,
+                &plan.profile,
+                vec![
+                    "--show-plan-json: constructed outer steps printed".into(),
+                    "nothing was executed and no ledger row was written".into(),
+                ],
+            );
         }
-        println!("profile: {}  selection: {}", plan.profile, plan.selection_mode);
+        println!(
+            "profile: {}  selection: {}",
+            plan.profile, plan.selection_mode
+        );
         for (i, cfg) in all.iter().enumerate() {
-            println!("\n--- DAG {} of {} ({}) : {} node(s)", i + 1, all.len(), cfg.description, cfg.steps.len());
-            println!("{:<40} {:>7} {:>7} {:>8}  deps", "node", "wall_s", "cpu_s", "mem");
+            println!(
+                "\n--- DAG {} of {} ({}) : {} node(s)",
+                i + 1,
+                all.len(),
+                cfg.description,
+                cfg.steps.len()
+            );
+            println!(
+                "{:<40} {:>7} {:>7} {:>8}  deps",
+                "node", "wall_s", "cpu_s", "mem"
+            );
             for s in &cfg.steps {
-                let cpu = if s.cpu_timeout > 0 { s.cpu_timeout } else { cfg.default_step_cpu_timeout };
-                let mem = s.hint.hard_mem_max_bytes.or(s.hint.rss_baseline_bytes).unwrap_or(0);
+                let cpu = if s.cpu_timeout > 0 {
+                    s.cpu_timeout
+                } else {
+                    cfg.default_step_cpu_timeout
+                };
+                let mem = s
+                    .hint
+                    .hard_mem_max_bytes
+                    .or(s.hint.rss_baseline_bytes)
+                    .unwrap_or(0);
                 println!(
                     "{:<40} {:>7} {:>7} {:>7}M  {}",
-                    s.tag(), s.timeout, cpu, mem / (1024 * 1024), s.deps.join(",")
+                    s.tag(),
+                    s.timeout,
+                    cpu,
+                    mem / (1024 * 1024),
+                    s.deps.join(",")
                 );
             }
         }
@@ -23076,7 +24156,9 @@ fn run(
             0,
             &plan.profile,
             vec![
-                format!("--show-plan: {total} outer boxed node(s) printed, all with declared wall+cpu+memory caps"),
+                format!(
+                    "--show-plan: {total} outer boxed node(s) printed, all with declared wall+cpu+memory caps"
+                ),
                 "Rust test IDs and E2E cells inside those nodes were not enumerated".into(),
                 "nothing was executed and no ledger row was written".into(),
             ],
@@ -23200,40 +24282,39 @@ fn run(
 
     std::env::set_var(RUN_STATE_SCOPE_REEXEC_ENV, &tmp);
     let cgroup_result = resolve_cgroups(
-            args.allow_cgroup_failure,
-            run_timeout,
-            deadline_ns,
-            service_result_path,
-        );
+        args.allow_cgroup_failure,
+        run_timeout,
+        deadline_ns,
+        service_result_path,
+    );
     std::env::remove_var(RUN_STATE_SCOPE_REEXEC_ENV);
-    let cgroups: BoxedCgroups =
-        match cgroup_result {
-            Ok(c) => {
-                // Claim the re-entrancy marker HERE, not before resolve_cgroups.
-                // On the default path resolve_cgroups re-execs into a transient
-                // systemd scope and does not return, so the process that reaches
-                // this line is the one that will actually drive the run -- and it is
-                // the only one whose pid a nested payload should see. Claiming
-                // earlier made the driver read its own boxing re-exec as a nested
-                // invocation and refuse itself.
-                validate_runtime::claim_active_marker();
-                c
-            }
-            Err(code) => {
-                return RunSummary::refused(
-                    code,
-                    &plan.profile,
-                    "cgroup boxing (fail-closed)",
-                    vec![
-                        "two-level cgroup-v2 boxing could not be established; see the message above"
-                            .into(),
-                        "resource boxing is this tool's primary purpose — re-run with \
+    let cgroups: BoxedCgroups = match cgroup_result {
+        Ok(c) => {
+            // Claim the re-entrancy marker HERE, not before resolve_cgroups.
+            // On the default path resolve_cgroups re-execs into a transient
+            // systemd scope and does not return, so the process that reaches
+            // this line is the one that will actually drive the run -- and it is
+            // the only one whose pid a nested payload should see. Claiming
+            // earlier made the driver read its own boxing re-exec as a nested
+            // invocation and refuse itself.
+            validate_runtime::claim_active_marker();
+            c
+        }
+        Err(code) => {
+            return RunSummary::refused(
+                code,
+                &plan.profile,
+                "cgroup boxing (fail-closed)",
+                vec![
+                    "two-level cgroup-v2 boxing could not be established; see the message above"
+                        .into(),
+                    "resource boxing is this tool's primary purpose — re-run with \
                          --allow-cgroup-failure to accept an UNBOXED run"
-                            .into(),
-                    ],
-                )
-            }
-        };
+                        .into(),
+                ],
+            );
+        }
+    };
 
     let commit = git_sha();
     let git_depth = match measure_git_depth(&commit) {
@@ -23270,12 +24351,15 @@ fn run(
                     "a run with no durable receipt is a silent no-result; see the message above"
                         .into(),
                 ],
-            )
+            );
         }
     }
     // Safe: just assigned. Cloned so the summary and the ledger can both name it
     // without borrowing the live tee handle.
-    let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    let log_path = durable_slot
+        .as_ref()
+        .map(|d| d.path.clone())
+        .unwrap_or_default();
     // Now that the log exists, tell the holder record where it is, so a validate
     // REFUSED against this one can print a command to tail it. Gated on actually
     // holding the lock: a nested payload must never rewrite the outer run's
@@ -23283,12 +24367,15 @@ fn run(
     if let Some(lock) = invocation_lock.as_mut() {
         validate_runtime::record_invocation_log_path(lock, &log_path);
     }
-    let (e2e_result_root, fresh_result_root) =
-        match configure_e2e_result_root(&root, &log_path, &tmp.join("e2e-build")) {
-            Ok(path) => path,
-            Err(message) => {
-                eprintln!("validate: ERROR: {message}");
-                return RunSummary::refused(
+    let (e2e_result_root, fresh_result_root) = match configure_e2e_result_root(
+        &root,
+        &log_path,
+        &tmp.join("e2e-build"),
+    ) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("validate: ERROR: {message}");
+            return RunSummary::refused(
                     4,
                     &plan.profile,
                     "durable per-cell result setup",
@@ -23298,8 +24385,8 @@ fn run(
                             .into(),
                     ],
                 );
-            }
-        };
+        }
+    };
     eprintln!("validate: per-cell results: {}", e2e_result_root.display());
     let mut raw_census = fresh_result_root
         .and_then(|held| RawCensusAuthority::prepare(held, &log_path, admitted_context.as_ref()));
@@ -23308,12 +24395,19 @@ fn run(
         Some(selected) => {
             let retained = std::env::var("E2E_RUN_ID")
                 .map_err(|error| format!("cannot bind evidence run identity: {error}"))
-                .and_then(|run_id| selected.publish(parent.as_deref().unwrap_or(&root), &plan,
-                    &run_id, &commit));
+                .and_then(|run_id| {
+                    selected.publish(parent.as_deref().unwrap_or(&root), &plan, &run_id, &commit)
+                });
             match retained {
                 Ok(evidence) => Some(evidence),
-                Err(error) => return RunSummary::refused(4, &plan.profile,
-                    "constructed evidence publication", vec![error]),
+                Err(error) => {
+                    return RunSummary::refused(
+                        4,
+                        &plan.profile,
+                        "constructed evidence publication",
+                        vec![error],
+                    );
+                }
             }
         }
         None => None,
@@ -23452,7 +24546,10 @@ fn run(
         .chain(plan.host_inapplicable.iter().map(|n| n.tag.clone()))
         .collect();
 
-    println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
+    println!(
+        "Validation profile: {} (selection: {})",
+        plan.profile, plan.selection_mode
+    );
     println!(
         "Commit: {commit} ({})",
         if dirty_at_admission {
@@ -23464,7 +24561,11 @@ fn run(
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
     println!(
         "Plan: {node_count} boxed DAG node(s){}{}",
-        if plan.second.is_some() { " across 2 sequential lanes" } else { "" },
+        if plan.second.is_some() {
+            " across 2 sequential lanes"
+        } else {
+            ""
+        },
         if plan.host_inapplicable.is_empty() {
             String::new()
         } else {
@@ -23569,11 +24670,14 @@ fn run(
         );
     }
     let classification = classify_run(
-        &outcomes, &attempts, &skipped, &planned_tags, &plan.host_inapplicable,
+        &outcomes,
+        &attempts,
+        &skipped,
+        &planned_tags,
+        &plan.host_inapplicable,
     );
-    let validation_complete = validation_is_complete(
-        execution_complete, &classification, &planned_tags,
-    );
+    let validation_complete =
+        validation_is_complete(execution_complete, &classification, &planned_tags);
     print_cost_table(&outcomes, &attempts, &skipped, &plan.host_inapplicable);
     print_retry_ledger(&attempts);
 
@@ -23605,7 +24709,9 @@ fn run(
         ) {
             Ok(_) => None,
             Err(error) => {
-                eprintln!("validate: ERROR: completed cell results were not added to the series: {error}");
+                eprintln!(
+                    "validate: ERROR: completed cell results were not added to the series: {error}"
+                );
                 Some(error)
             }
         }
@@ -23623,12 +24729,7 @@ fn run(
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
     let (executed_tests, passed_tests, filtered_tests, compatibility_count_error) =
-        match run_test_counts(
-            &outcomes,
-            &attempts,
-            plan.compat,
-            plan.compat_prefix,
-        ) {
+        match run_test_counts(&outcomes, &attempts, plan.compat, plan.compat_prefix) {
             Ok((executed, passed, filtered)) => (executed, passed, filtered, None),
             Err(error) => {
                 eprintln!("validate: ERROR: {error}");
@@ -23808,15 +24909,26 @@ fn run(
         let finalized_row = if !nesting.nested && !args.allow_local_off_the_record_run {
             write_ledger_with_snapshot(
                 LedgerPublication {
-                    ledger: &ledger, ctx: &ctx, outcomes: &outcomes, attempts: &attempts,
-                    skipped: &skipped, host_inapplicable: &plan.host_inapplicable,
-                    planned_tags: &planned_tags, wall_s: wall, exit_code: 130,
-                    log_file: &log_path.to_string_lossy(), execution_complete: false,
-                    coverage: coverage.clone(), cell_results: None, cumulative_evidence: None,
+                    ledger: &ledger,
+                    ctx: &ctx,
+                    outcomes: &outcomes,
+                    attempts: &attempts,
+                    skipped: &skipped,
+                    host_inapplicable: &plan.host_inapplicable,
+                    planned_tags: &planned_tags,
+                    wall_s: wall,
+                    exit_code: 130,
+                    log_file: &log_path.to_string_lossy(),
+                    execution_complete: false,
+                    coverage: coverage.clone(),
+                    cell_results: None,
+                    cumulative_evidence: None,
                 },
                 Some((&raw_snapshot, &mut raw_census)),
             )
-        } else { None };
+        } else {
+            None
+        };
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
@@ -23826,16 +24938,23 @@ fn run(
             nesting.nested,
             args.allow_local_off_the_record_run,
             &ScorecardPublication {
-                parent: parent.as_deref(), tool_root: tool_root.as_deref(),
-                expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
-                delegated: scorecard_delegated, release_builder,
+                parent: parent.as_deref(),
+                tool_root: tool_root.as_deref(),
+                expected_head: &ctx.commit,
+                finalized_row: finalized_row.as_ref(),
+                delegated: scorecard_delegated,
+                release_builder,
             },
         );
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut detail = vec![
             format!("stopped by SIG{sig}; prior measured product failures remain failures"),
-            validation_completeness_detail(false, classification.product_result_nodes.len(), planned_tags.len()),
+            validation_completeness_detail(
+                false,
+                classification.product_result_nodes.len(),
+                planned_tags.len(),
+            ),
         ];
         if let Some(error) = &series_error {
             detail.push(format!(
@@ -23847,12 +24966,7 @@ fn run(
             args.allow_local_off_the_record_run,
             release_builder,
         ));
-        let mut s = RunSummary::new(
-            Verdict::Interrupted,
-            130,
-            &plan.profile,
-            detail,
-        );
+        let mut s = RunSummary::new(Verdict::Interrupted, 130, &plan.profile, detail);
         s.nodes_executed = completed_node_count(&outcomes, &attempts);
         s.nodes_failed = classification.product_failure_nodes.len();
         s.nodes_skipped = skipped.len();
@@ -23893,14 +25007,25 @@ fn run(
         };
         if let Some(f) = floor {
             if passed < f {
-                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.display_name());
+                println!(
+                    "❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR",
+                    mode.display_name()
+                );
                 ok = false;
             } else {
-                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.display_name());
+                println!(
+                    "✅ {} ratchet: {passed}/{measured} passing, floor {f} — met",
+                    mode.display_name()
+                );
             }
         }
         if !blocking.is_empty() {
-            println!("❌ {} blocking failures ({}): {}", mode.display_name(), blocking.len(), blocking.join(", "));
+            println!(
+                "❌ {} blocking failures ({}): {}",
+                mode.display_name(),
+                blocking.len(),
+                blocking.join(", ")
+            );
         }
     }
 
@@ -23919,7 +25044,8 @@ fn run(
     let mut envelope_regressed = false;
     let mut envelope_error: Option<(u8, String)> = None;
     if let Some(env) = &plan.envelope {
-        let short = sh("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        let short =
+            sh("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
         let vector = validate_envelope::score_with_passed(env.reps, &short, |tag| {
             classification.product_result_nodes.contains(tag)
                 && !classification.product_failure_nodes.contains(tag)
@@ -23927,7 +25053,10 @@ fn run(
         let json_file = validate_envelope::json_path(&root);
         let text = validate_envelope::to_ordered_json(&vector);
         if let Err(e) = std::fs::write(&json_file, format!("{text}\n")) {
-            eprintln!("validate: warning: cannot write {}: {e}", json_file.display());
+            eprintln!(
+                "validate: warning: cannot write {}: {e}",
+                json_file.display()
+            );
         }
         validate_envelope::print_summary(&vector, env.reps, &json_file);
         if let Some(baseline) = &env.baseline {
@@ -23943,10 +25072,17 @@ fn run(
 
     let failures = classification.product_failure_nodes.len();
     let no_results = classification.no_results();
-    let no_result_nodes: BTreeSet<&str> = classification.no_result_nodes.iter()
-        .chain(classification.understood_infrastructure_failure_nodes.keys())
+    let no_result_nodes: BTreeSet<&str> = classification
+        .no_result_nodes
+        .iter()
+        .chain(
+            classification
+                .understood_infrastructure_failure_nodes
+                .keys(),
+        )
         .chain(classification.understood_prerequisite_failure_nodes.iter())
-        .map(String::as_str).collect();
+        .map(String::as_str)
+        .collect();
     let no_result_nodes: Vec<&str> = no_result_nodes.into_iter().collect();
     // The verdict is the RATCHET, not the raw node count.
     //
@@ -23981,9 +25117,13 @@ fn run(
     // so it is only authoritative when nothing is excused. A known exit 75
     // fully explains why the runner returned non-ok; any other unexplained
     // non-ok state remains a failure.
-    let unexplained_runner_failure =
-        plan.nonblocking.is_empty() && plan.compat.is_none() && !ok && no_results == 0
-            && failures == 0 && !run_timed_out && !outcomes.iter().any(outcome_is_failure);
+    let unexplained_runner_failure = plan.nonblocking.is_empty()
+        && plan.compat.is_none()
+        && !ok
+        && no_results == 0
+        && failures == 0
+        && !run_timed_out
+        && !outcomes.iter().any(outcome_is_failure);
     let mut exit_code = completed_exit_code(
         effective_failures,
         no_results,
@@ -24065,11 +25205,19 @@ fn run(
     let cumulative_expected = prepared_evidence.is_some();
     let retained_evidence = if execution_complete {
         match prepared_evidence {
-            Some(prepared) => match prepared.retain_snapshot(parent.as_deref().unwrap_or(&root),
-                &raw_snapshot, &ctx, &outcomes, &attempts, plan.compat_prefix) {
+            Some(prepared) => match prepared.retain_snapshot(
+                parent.as_deref().unwrap_or(&root),
+                &raw_snapshot,
+                &ctx,
+                &outcomes,
+                &attempts,
+                plan.compat_prefix,
+            ) {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
-                    let detail = format!("cannot retain cumulative validation evidence: {error}; refusing a schema-10 receipt");
+                    let detail = format!(
+                        "cannot retain cumulative validation evidence: {error}; refusing a schema-10 receipt"
+                    );
                     eprintln!("validate: ERROR: {detail}");
                     evidence_refusal_details.push(detail);
                     exit_code = exit_code_with_evidence_refusal(exit_code);
@@ -24078,8 +25226,11 @@ fn run(
             },
             None => None,
         }
-    } else { None };
-    let legacy_cell_results = if !cumulative_expected && !nesting.nested
+    } else {
+        None
+    };
+    let legacy_cell_results = if !cumulative_expected
+        && !nesting.nested
         && !args.allow_local_off_the_record_run
         && should_retain_cells
         && execution_complete
@@ -24111,7 +25262,9 @@ fn run(
     } else {
         None
     };
-    let retained_cell_results = retained_evidence.as_ref().map(|evidence| &evidence.cells)
+    let retained_cell_results = retained_evidence
+        .as_ref()
+        .map(|evidence| &evidence.cells)
         .or(legacy_cell_results.as_ref());
     let retained_coverage = if plan.suite_complete
         && !nesting.nested
@@ -24119,7 +25272,12 @@ fn run(
     {
         let selected = retained_cell_results
             .as_ref()
-            .and_then(|results| results.evidence.get("selected").and_then(serde_json::Value::as_array))
+            .and_then(|results| {
+                results
+                    .evidence
+                    .get("selected")
+                    .and_then(serde_json::Value::as_array)
+            })
             .cloned()
             .map(Ok)
             .unwrap_or_else(|| validate_cell_results::expected_plan(&root));
@@ -24127,7 +25285,9 @@ fn run(
             .as_ref()
             .map(|results| results.run_id.clone())
             .or_else(|| {
-                std::env::var("E2E_RUN_ID").ok().filter(|value| !value.trim().is_empty())
+                std::env::var("E2E_RUN_ID")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
             })
             .ok_or("E2E_RUN_ID is missing after the validate run".to_string());
         match run_id.and_then(|run_id| {
@@ -24146,41 +25306,40 @@ fn run(
                 )
             })
         }) {
-                Ok(scope) => {
-                    let retained_plan = &scope.evidence["plan"];
-                    let e2e = &scope.evidence["e2e"];
-                    let binaries = &scope.evidence["integration_test_binaries"];
-                    let plan_name = retained_plan["name"].as_str().unwrap_or("unknown");
-                    let selected = e2e["selected_count"].as_u64().unwrap_or(0);
-                    let in_manifest = e2e["in_manifest_count"].as_u64().unwrap_or(0);
-                    let in_manifest_not_selected = e2e
-                        ["in_manifest_not_selected_by_path_count"]
-                        .as_u64()
-                        .unwrap_or(0);
-                    println!(
-                        "Coverage: plan {} selected {} outer nodes; E2E selected {selected} of {in_manifest} cells in the manifest; \
+            Ok(scope) => {
+                let retained_plan = &scope.evidence["plan"];
+                let e2e = &scope.evidence["e2e"];
+                let binaries = &scope.evidence["integration_test_binaries"];
+                let plan_name = retained_plan["name"].as_str().unwrap_or("unknown");
+                let selected = e2e["selected_count"].as_u64().unwrap_or(0);
+                let in_manifest = e2e["in_manifest_count"].as_u64().unwrap_or(0);
+                let in_manifest_not_selected = e2e["in_manifest_not_selected_by_path_count"]
+                    .as_u64()
+                    .unwrap_or(0);
+                println!(
+                    "Coverage: plan {} selected {} outer nodes; E2E selected {selected} of {in_manifest} cells in the manifest; \
                          {in_manifest_not_selected} cells in the manifest were not selected by {plan_name}; integration \
                          binaries CI-registered {} of {} ({} reason-recorded, {} none-recorded).",
-                        plan_name,
-                        retained_plan["outer_node_count"],
-                        binaries["ci_registered_count"],
-                        binaries["present_count"],
-                        binaries["reason_recorded_count"],
-                        binaries["none_recorded_count"],
-                    );
-                    println!("Coverage artifact: {}", scope.evidence["artifact"]["path"]);
-                    Some(scope)
-                }
-                Err(error) => {
-                    let detail = format!(
-                        "cannot retain complete coverage evidence: {error}; refusing a full receipt"
-                    );
-                    eprintln!("validate: ERROR: {detail}");
-                    evidence_refusal_details.push(detail);
-                    exit_code = exit_code_with_evidence_refusal(exit_code);
-                    None
-                }
+                    plan_name,
+                    retained_plan["outer_node_count"],
+                    binaries["ci_registered_count"],
+                    binaries["present_count"],
+                    binaries["reason_recorded_count"],
+                    binaries["none_recorded_count"],
+                );
+                println!("Coverage artifact: {}", scope.evidence["artifact"]["path"]);
+                Some(scope)
             }
+            Err(error) => {
+                let detail = format!(
+                    "cannot retain complete coverage evidence: {error}; refusing a full receipt"
+                );
+                eprintln!("validate: ERROR: {detail}");
+                evidence_refusal_details.push(detail);
+                exit_code = exit_code_with_evidence_refusal(exit_code);
+                None
+            }
+        }
     } else {
         None
     };
@@ -24266,8 +25425,10 @@ fn run(
         nesting.nested,
         args.allow_local_off_the_record_run,
         &ScorecardPublication {
-            parent: parent.as_deref(), tool_root: tool_root.as_deref(),
-            expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
+            parent: parent.as_deref(),
+            tool_root: tool_root.as_deref(),
+            expected_head: &ctx.commit,
+            finalized_row: finalized_row.as_ref(),
             delegated: scorecard_delegated,
             release_builder,
         },
@@ -24302,11 +25463,16 @@ fn run(
     // The completed-run summary. Names the excused rows explicitly, so a green
     // verdict that ignored some failures can never read as "everything passed".
     let mut detail = vec![validation_completeness_detail(
-        validation_complete, classification.product_result_nodes.len(), planned_tags.len(),
+        validation_complete,
+        classification.product_result_nodes.len(),
+        planned_tags.len(),
     )];
     let excused = failures.saturating_sub(effective_failures);
     if exit_code == 0 {
-        detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
+        detail.push(format!(
+            "every blocking gate passed ({} node(s) ran)",
+            outcomes.len()
+        ));
     } else if exit_code == NO_RESULT_EXIT_CODE as u8 {
         detail.push(format!(
             "{} gate(s) could not determine their condition: {}",
@@ -24314,9 +25480,8 @@ fn run(
             no_result_nodes.join(", ")
         ));
     } else {
-        let (_named, listing) = classified_blocking_listing(
-            &classification, &summary_nonblocking, effective_failures,
-        );
+        let (_named, listing) =
+            classified_blocking_listing(&classification, &summary_nonblocking, effective_failures);
         detail.push(format!("{effective_failures} blocking failure(s){listing}"));
     }
     if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
@@ -24388,8 +25553,12 @@ fn run(
     match executed_tests {
         Some(n) => detail.push(format!(
             "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
-            passed_tests.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
-            filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
+            passed_tests
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            filtered_tests
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(
             "executed_tests is UNKNOWN — this row is a NON-VERDICT and cannot qualify a receipt, \
@@ -24493,11 +25662,17 @@ fn stop_test_seam(
         oom_kills: 0,
         timed_out: false,
         cpu_timed_out: false,
-        reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
+        reason: if ok {
+            String::new()
+        } else {
+            "stop-test synthetic failure".into()
+        },
         aborted: false,
     };
-    let outcomes =
-        vec![synth("stop-test completed gate 1", !prior_failure), synth("stop-test completed gate 2", true)];
+    let outcomes = vec![
+        synth("stop-test completed gate 1", !prior_failure),
+        synth("stop-test completed gate 2", true),
+    ];
 
     let commit = git_sha();
     let git_depth = match measure_git_depth(&commit) {
@@ -24606,7 +25781,11 @@ fn stop_test_seam(
         validate_runtime::StopTestExit::Signalled => vec![format!(
             "stop-path fixture: stopped by SIG{}; recorded as {}",
             interruption.clone().unwrap_or_default(),
-            if prior_failure { "fail (a completed gate had already failed)" } else { "no_result" }
+            if prior_failure {
+                "fail (a completed gate had already failed)"
+            } else {
+                "no_result"
+            }
         )],
         validate_runtime::StopTestExit::EarlyExit => vec![
             "stop-path fixture: VALIDATE_STOP_TEST_EXIT_EARLY — an ordinary incomplete exit, NOT \
@@ -24631,7 +25810,11 @@ fn stop_test_seam(
         );
     }
     let mut s = RunSummary::new(
-        if interruption.is_some() { Verdict::Interrupted } else { Verdict::Fail },
+        if interruption.is_some() {
+            Verdict::Interrupted
+        } else {
+            Verdict::Fail
+        },
         exit_code,
         profile,
         detail,
@@ -24654,7 +25837,8 @@ mod committed_selection_preservation_tests {
     fn hosted_shard_consumers_resolve_public_names_without_losing_coverage() {
         let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let (committed, _, _) = load_committed_validation_dag(root).unwrap();
-        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        let hosted =
+            dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
         let plan = serde_json::json!({
             "profile": "hosted-portable", "selection_mode": "label",
             "dags": [{"steps": hosted.steps.iter().map(|step| serde_json::json!({
@@ -24724,7 +25908,8 @@ mod committed_selection_preservation_tests {
                 let mut actual = BTreeSet::new();
                 let mut partitions = 0;
                 for line in stdout.lines() {
-                    let Some(selected) = line.trim().strip_prefix("ci/run-node.sh portable ") else {
+                    let Some(selected) = line.trim().strip_prefix("ci/run-node.sh portable ")
+                    else {
                         continue;
                     };
                     partitions += 1;
@@ -24876,7 +26061,10 @@ mod committed_selection_preservation_tests {
         let output = run("ci/check-shard-coverage.sh", &late_buck, &plan);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stderr}");
-        assert!(stderr.contains("release build job drops constructed predecessor"), "{stderr}");
+        assert!(
+            stderr.contains("release build job drops constructed predecessor"),
+            "{stderr}"
+        );
         assert!(stderr.contains("build.buck_release_artifact"), "{stderr}");
     }
 
@@ -24885,17 +26073,34 @@ mod committed_selection_preservation_tests {
         let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let (committed, _, _) = load_committed_validation_dag(root).unwrap();
         let public = [
-            "test.app_strict_verify", "test.applications_e2e", "test.arbitrary_binaries",
-            "test.command_strict_verify", "test.detcore_misc",
-            "test.detcore_parallel", "test.detcore_unit", "test.envelope_levels",
-            "test.hermit_integration", "test.hermit_unit", "test.ignored_syscall_regressions",
-            "test.liteinst_strict", "test.regular_crates", "test.rr_suite_contract",
+            "test.app_strict_verify",
+            "test.applications_e2e",
+            "test.arbitrary_binaries",
+            "test.command_strict_verify",
+            "test.detcore_misc",
+            "test.detcore_parallel",
+            "test.detcore_unit",
+            "test.envelope_levels",
+            "test.hermit_integration",
+            "test.hermit_unit",
+            "test.ignored_syscall_regressions",
+            "test.liteinst_strict",
+            "test.regular_crates",
+            "test.rr_suite_contract",
             "test.sabre_examples",
         ];
-        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
-        let mut expected = public.iter().map(|tag| format!("{tag}_on_host")).collect::<BTreeSet<_>>();
-        let compat = hosted.steps.iter().filter(|step| step.group == "compat")
-            .map(Step::tag).collect::<BTreeSet<_>>();
+        let hosted =
+            dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        let mut expected = public
+            .iter()
+            .map(|tag| format!("{tag}_on_host"))
+            .collect::<BTreeSet<_>>();
+        let compat = hosted
+            .steps
+            .iter()
+            .filter(|step| step.group == "compat")
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
         assert_eq!(compat.len(), 189);
         expected.extend(compat);
         expected.insert("compatprep.fixtures_on_host".into());
@@ -24907,19 +26112,39 @@ mod committed_selection_preservation_tests {
             let mut argv = if only {
                 vec!["--only".into(), "hosted-portable".into(), requested.clone()]
             } else {
-                vec!["--hosted-portable-only".into(), "--selected".into(), requested.clone(), "--ignore-selected-deps".into()]
+                vec![
+                    "--hosted-portable-only".into(),
+                    "--selected".into(),
+                    requested.clone(),
+                    "--ignore-selected-deps".into(),
+                ]
             };
             argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into());
             let args = parse_argv(&argv).unwrap();
             let temp = tempfile::tempdir().unwrap();
             let plan = build_plan(root, &args, temp.path()).unwrap();
             let mut expected = expected.clone();
-            if only { expected.extend(["pre.submodules".into(), PIN_GATE_TAG.into()]); }
-            assert_eq!(plan.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>(), expected);
+            if only {
+                expected.extend(["pre.submodules".into(), PIN_GATE_TAG.into()]);
+            }
+            assert_eq!(
+                plan.cfg
+                    .steps
+                    .iter()
+                    .map(Step::tag)
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
             for actual in &plan.cfg.steps {
-                let source = hosted.steps.iter().find(|step| step.tag() == actual.tag()).unwrap();
+                let source = hosted
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == actual.tag())
+                    .unwrap();
                 let mut source = source.clone();
-                source.deps.retain(|dependency| expected.contains(dependency));
+                source
+                    .deps
+                    .retain(|dependency| expected.contains(dependency));
                 assert_eq!(
                     dag_to_json(&hosted.with_steps(vec![actual.clone()])),
                     dag_to_json(&hosted.with_steps(vec![source])),
@@ -24929,23 +26154,58 @@ mod committed_selection_preservation_tests {
         // Already committed names stay exact; absent names never acquire a
         // fabricated counterpart, and the local profile retains local IDs.
         for (profile, selected, expected) in [
-            ("--hosted-portable-only", "test.regular_crates_on_host", "test.regular_crates_on_host"),
-            ("--portable-only", "test.regular_crates", "test.regular_crates"),
+            (
+                "--hosted-portable-only",
+                "test.regular_crates_on_host",
+                "test.regular_crates_on_host",
+            ),
+            (
+                "--portable-only",
+                "test.regular_crates",
+                "test.regular_crates",
+            ),
         ] {
-            let args = parse_argv(&[profile.into(), "--selected".into(), selected.into(), "--ignore-selected-deps".into(), ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()]).unwrap();
+            let args = parse_argv(&[
+                profile.into(),
+                "--selected".into(),
+                selected.into(),
+                "--ignore-selected-deps".into(),
+                ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+            ])
+            .unwrap();
             let temp = tempfile::tempdir().unwrap();
             let plan = build_plan(root, &args, temp.path()).unwrap();
-            assert_eq!(plan.cfg.steps.iter().map(Step::tag).collect::<Vec<_>>(), [expected]);
+            assert_eq!(
+                plan.cfg.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+                [expected]
+            );
         }
-        let args = parse_argv(&["--hosted-portable-only".into(), "--selected".into(), "test.no_such_public_node".into(), ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()]).unwrap();
+        let args = parse_argv(&[
+            "--hosted-portable-only".into(),
+            "--selected".into(),
+            "test.no_such_public_node".into(),
+            ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        ])
+        .unwrap();
         let temp = tempfile::tempdir().unwrap();
-        assert!(build_plan(root, &args, temp.path()).err().expect("unknown selector must refuse").contains("unknown step tag"));
+        assert!(
+            build_plan(root, &args, temp.path())
+                .err()
+                .expect("unknown selector must refuse")
+                .contains("unknown step tag")
+        );
     }
 
     fn inert_step(source: &Step, command: String) -> Step {
         let mut step = step_with_caps(
-            &source.group, &source.job, "committed dependency/resource fixture",
-            command, source.deps.clone(), 10, 10, 64 * 1024 * 1024,
+            &source.group,
+            &source.job,
+            "committed dependency/resource fixture",
+            command,
+            source.deps.clone(),
+            10,
+            10,
+            64 * 1024 * 1024,
         );
         step.hint.resources = source.hint.resources.clone();
         step.fail_fast_family = source.fail_fast_family.clone();
@@ -24954,74 +26214,186 @@ mod committed_selection_preservation_tests {
 
     #[test]
     fn focused_selection_cannot_execute_after_failed_preflight() {
-        let root = Path::new(file!()).parent().and_then(Path::parent).expect("validate.rs has a repository parent");
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent");
         for (lane, target, pin, gate) in [
-            ("portable", "test.detcore_unit", PIN_GATE_TAG, "gate.manifest"),
-            ("hosted-portable", "test.cli_on_host", PIN_GATE_TAG, "gate.manifest"),
-            ("hosted-privileged", "privileged-only-test.cli_kvm_on_host", "pre.reverie_pin_on_host", "gate.manifest_on_host"),
+            (
+                "portable",
+                "test.detcore_unit",
+                PIN_GATE_TAG,
+                "gate.manifest",
+            ),
+            (
+                "hosted-portable",
+                "test.cli_on_host",
+                PIN_GATE_TAG,
+                "gate.manifest",
+            ),
+            (
+                "hosted-privileged",
+                "privileged-only-test.cli_kvm_on_host",
+                "pre.reverie_pin_on_host",
+                "gate.manifest_on_host",
+            ),
         ] {
-        for off_record in [false, true] {
-            for failed_gate in [pin, gate] {
-                if off_record && failed_gate == gate { continue; }
-                let temp = tempfile::tempdir().unwrap();
-                let sentinel = temp.path().join("target-ran");
-                let mut argv = vec!["--only".into(), lane.into(), target.into()];
-                if off_record { argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()); }
-                let args = parse_argv(&argv).unwrap();
-                let plan = build_plan(root, &args, temp.path()).unwrap();
-                assert!(plan.cfg.steps.iter().any(|step| step.tag() == failed_gate));
-                let fixture = plan.cfg.with_steps(plan.cfg.steps.iter().map(|source| {
-                    let cmd = match source.tag().as_str() {
-                        tag if tag == failed_gate => "exit 23".into(),
-                        tag if tag == target => format!(": > {}", validate_plan::shell_quote(&sentinel.to_string_lossy())),
-                        _ => "true".into(),
-                    };
-                    inert_step(source, cmd)
-                }).collect());
-                let result = run_lane_once(&fixture, 4, true, 0, None, &temp.path().join("failed.log"), None, false);
-                assert!(!result.ok);
-                assert!(result.outcomes.iter().any(|outcome| outcome.tag == failed_gate && outcome.returncode == Some(23)));
-                assert!(result.skipped.contains(&target.to_string()), "{:?}", result.skipped);
-                assert!(!sentinel.exists(), "{failed_gate} failure did not block target (off_record={off_record})");
+            for off_record in [false, true] {
+                for failed_gate in [pin, gate] {
+                    if off_record && failed_gate == gate {
+                        continue;
+                    }
+                    let temp = tempfile::tempdir().unwrap();
+                    let sentinel = temp.path().join("target-ran");
+                    let mut argv = vec!["--only".into(), lane.into(), target.into()];
+                    if off_record {
+                        argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into());
+                    }
+                    let args = parse_argv(&argv).unwrap();
+                    let plan = build_plan(root, &args, temp.path()).unwrap();
+                    assert!(plan.cfg.steps.iter().any(|step| step.tag() == failed_gate));
+                    let fixture = plan.cfg.with_steps(
+                        plan.cfg
+                            .steps
+                            .iter()
+                            .map(|source| {
+                                let cmd = match source.tag().as_str() {
+                                    tag if tag == failed_gate => "exit 23".into(),
+                                    tag if tag == target => format!(
+                                        ": > {}",
+                                        validate_plan::shell_quote(&sentinel.to_string_lossy())
+                                    ),
+                                    _ => "true".into(),
+                                };
+                                inert_step(source, cmd)
+                            })
+                            .collect(),
+                    );
+                    let result = run_lane_once(
+                        &fixture,
+                        4,
+                        true,
+                        0,
+                        None,
+                        &temp.path().join("failed.log"),
+                        None,
+                        false,
+                    );
+                    assert!(!result.ok);
+                    assert!(result.outcomes.iter().any(
+                        |outcome| outcome.tag == failed_gate && outcome.returncode == Some(23)
+                    ));
+                    assert!(
+                        result.skipped.contains(&target.to_string()),
+                        "{:?}",
+                        result.skipped
+                    );
+                    assert!(
+                        !sentinel.exists(),
+                        "{failed_gate} failure did not block target (off_record={off_record})"
+                    );
 
-                // Removing both gate edges recreates the bug and must let the
-                // sentinel run despite the same failing preflight.
-                let mut missing_gate = fixture.clone();
-                missing_gate.steps.iter_mut().find(|step| step.tag() == target).unwrap().deps.clear();
-                let result = run_lane_once(&missing_gate, 4, true, 0, None, &temp.path().join("missing-edge.log"), None, false);
-                assert!(!result.ok);
-                assert!(sentinel.exists(), "negative control failed to expose lost ordering");
+                    // Removing both gate edges recreates the bug and must let the
+                    // sentinel run despite the same failing preflight.
+                    let mut missing_gate = fixture.clone();
+                    missing_gate
+                        .steps
+                        .iter_mut()
+                        .find(|step| step.tag() == target)
+                        .unwrap()
+                        .deps
+                        .clear();
+                    let result = run_lane_once(
+                        &missing_gate,
+                        4,
+                        true,
+                        0,
+                        None,
+                        &temp.path().join("missing-edge.log"),
+                        None,
+                        false,
+                    );
+                    assert!(!result.ok);
+                    assert!(
+                        sentinel.exists(),
+                        "negative control failed to expose lost ordering"
+                    );
+                }
             }
         }
-    }
     }
 
     #[test]
     fn portable_failure_preserves_independent_privileged_work_and_shared_exclusion() {
-        let root = Path::new(file!()).parent().and_then(Path::parent).expect("validate.rs has a repository parent");
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent");
         let committed = validate_plan::validation_config(root).unwrap();
-        let tags = ["test.cli", "privileged-build.privileged_tests", "privileged-test.cli_kvm"];
-        let selected = dagrun::select_steps_by_tags(&committed, &tags.iter().map(|tag| tag.to_string()).collect::<Vec<_>>(), true).unwrap();
+        let tags = [
+            "test.cli",
+            "privileged-build.privileged_tests",
+            "privileged-test.cli_kvm",
+        ];
+        let selected = dagrun::select_steps_by_tags(
+            &committed,
+            &tags.iter().map(|tag| tag.to_string()).collect::<Vec<_>>(),
+            true,
+        )
+        .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let active = validate_plan::shell_quote(&temp.path().join("active").to_string_lossy());
         let artifact = validate_plan::shell_quote(&temp.path().join("artifact").to_string_lossy());
         let passed = temp.path().join("privileged-passed");
-        let fixture = selected.with_steps(selected.steps.iter().map(|source| {
-            let command = match source.tag().as_str() {
-                "test.cli" => format!("set -eu; mkdir {active}; sleep 0.1; rmdir {active}; exit 17"),
-                "privileged-build.privileged_tests" => format!("set -eu; mkdir {active}; sleep 0.1; : > {artifact}; rmdir {active}"),
-                "privileged-test.cli_kvm" => format!("set -eu; mkdir {active}; test -f {artifact}; : > {}; rmdir {active}", validate_plan::shell_quote(&passed.to_string_lossy())),
-                _ => unreachable!(),
-            };
-            inert_step(source, command)
-        }).collect());
-        let result = run_lane_once(&fixture, 3, true, 0, None, &temp.path().join("keep-going.log"), None, false);
+        let fixture = selected.with_steps(
+            selected
+                .steps
+                .iter()
+                .map(|source| {
+                    let command = match source.tag().as_str() {
+                        "test.cli" => {
+                            format!("set -eu; mkdir {active}; sleep 0.1; rmdir {active}; exit 17")
+                        }
+                        "privileged-build.privileged_tests" => format!(
+                            "set -eu; mkdir {active}; sleep 0.1; : > {artifact}; rmdir {active}"
+                        ),
+                        "privileged-test.cli_kvm" => format!(
+                            "set -eu; mkdir {active}; test -f {artifact}; : > {}; rmdir {active}",
+                            validate_plan::shell_quote(&passed.to_string_lossy())
+                        ),
+                        _ => unreachable!(),
+                    };
+                    inert_step(source, command)
+                })
+                .collect(),
+        );
+        let result = run_lane_once(
+            &fixture,
+            3,
+            true,
+            0,
+            None,
+            &temp.path().join("keep-going.log"),
+            None,
+            false,
+        );
         assert!(!result.ok);
         assert!(result.skipped.is_empty(), "{:?}", result.skipped);
         assert_eq!(result.outcomes.len(), 3);
-        assert!(result.outcomes.iter().any(|outcome| outcome.tag == "test.cli" && outcome.returncode == Some(17)));
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.tag == "test.cli" && outcome.returncode == Some(17))
+        );
         for tag in &tags[1..] {
-            assert!(result.outcomes.iter().any(|outcome| outcome.tag == *tag && outcome.ok), "{tag} did not finish independently");
+            assert!(
+                result
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.tag == *tag && outcome.ok),
+                "{tag} did not finish independently"
+            );
         }
         assert!(passed.is_file());
 
@@ -25029,11 +26401,28 @@ mod committed_selection_preservation_tests {
         // privileged nodes while leaving the portable failure unchanged.
         std::fs::remove_file(&passed).unwrap();
         let mut success_dependency = fixture;
-        success_dependency.steps.iter_mut().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().deps.push("test.cli".into());
-        let result = run_lane_once(&success_dependency, 3, true, 0, None, &temp.path().join("success-edge.log"), None, false);
+        success_dependency
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "privileged-build.privileged_tests")
+            .unwrap()
+            .deps
+            .push("test.cli".into());
+        let result = run_lane_once(
+            &success_dependency,
+            3,
+            true,
+            0,
+            None,
+            &temp.path().join("success-edge.log"),
+            None,
+            false,
+        );
         assert!(!result.ok);
         assert!(!passed.exists());
-        for tag in &tags[1..] { assert!(result.skipped.contains(&tag.to_string())); }
+        for tag in &tags[1..] {
+            assert!(result.skipped.contains(&tag.to_string()));
+        }
     }
 }
 
@@ -25050,40 +26439,104 @@ mod fused_privileged_build_tests {
     fn cold_fixture(repository: &Path, helper: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let cargo_log = root.path().join("cargo-calls");
-        write_executable(&root.path().join("ci/verify-hermit-e2e-artifact.sh"), "#!/bin/sh\nexit 0\n");
-        write_executable(&root.path().join("ci/run-with-reverie-dbt-budget.sh"), "#!/bin/sh\nexec \"$@\"\n");
-        write_executable(&root.path().join("bin/cargo"), include_str!("../ci/tests/nextest-preparation-cargo-fixture.py"));
+        write_executable(
+            &root.path().join("ci/verify-hermit-e2e-artifact.sh"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_executable(
+            &root.path().join("ci/run-with-reverie-dbt-budget.sh"),
+            "#!/bin/sh\nexec \"$@\"\n",
+        );
+        write_executable(
+            &root.path().join("bin/cargo"),
+            include_str!("../ci/tests/nextest-preparation-cargo-fixture.py"),
+        );
         std::os::unix::fs::symlink(helper, root.path().join("ci/nextest-binaries.rs")).unwrap();
         std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
-        exec_safe_fs::copy(repository.join("ci/dag/validate.json"), root.path().join("ci/dag/validate.json")).unwrap();
+        exec_safe_fs::copy(
+            repository.join("ci/dag/validate.json"),
+            root.path().join("ci/dag/validate.json"),
+        )
+        .unwrap();
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-        std::fs::write(root.path().join("guest-names.json"), serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap()).unwrap();
-        std::fs::write(root.path().join(".gitignore"), "/target/\n/custom-cargo-target/\n/cargo-calls\n").unwrap();
-        for args in [vec!["init", "-q"], vec!["add", "."], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]] {
-            let output = scratch_git().args(args).current_dir(root.path()).output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::fs::write(
+            root.path().join("guest-names.json"),
+            serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "/target/\n/custom-cargo-target/\n/cargo-calls\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let output = scratch_git()
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let bin = root.path().join("bin");
         (root, bin, cargo_log)
     }
 
-    fn run_build(command: &str, root: &Path, bin: &Path, cargo_log: &Path, artifact_mode: &str) -> std::process::Output {
+    fn run_build(
+        command: &str,
+        root: &Path,
+        bin: &Path,
+        cargo_log: &Path,
+        artifact_mode: &str,
+    ) -> std::process::Output {
         let mut path = vec![bin.to_path_buf()];
-        if let Some(existing) = std::env::var_os("PATH") { path.extend(std::env::split_paths(&existing)); }
-        Command::new("bash").arg("-c").arg(command).current_dir(root)
+        if let Some(existing) = std::env::var_os("PATH") {
+            path.extend(std::env::split_paths(&existing));
+        }
+        Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(root)
             .env("PATH", std::env::join_paths(path).unwrap())
-            .env("CARGO_CALL_LOG", cargo_log).env("CARGO_ARTIFACT_MODE", artifact_mode)
-            .output().unwrap()
+            .env("CARGO_CALL_LOG", cargo_log)
+            .env("CARGO_ARTIFACT_MODE", artifact_mode)
+            .output()
+            .unwrap()
     }
 
     #[test]
     fn fused_privileged_build_creates_tests_misc_in_a_cold_target_before_consumers() {
         let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let committed = validate_plan::validation_config(repository).unwrap();
-        let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
+        let workspace = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace")
+            .unwrap();
         assert!(workspace.cmd.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
-        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
-        let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
+        let preparation =
+            &workspace.cmd[workspace.cmd.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
+        let mut consumer = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-build.privileged_tests")
+            .unwrap()
+            .clone();
         // This fixture supplies a fake Cargo executable and an empty target.
         // Preserve its full cold/prepared contract against the exact authored
         // payload, after checking each newly committed container boundary.
@@ -25104,18 +26557,35 @@ mod fused_privileged_build_tests {
             argv[boundary + 5].clone()
         }
         consumer.cmd = pinned_payload(&consumer.cmd);
-        assert!(!consumer.cmd.contains("cargo "), "the barrier must not rebuild shared test executables");
-        let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
-        assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
+        assert!(
+            !consumer.cmd.contains("cargo "),
+            "the barrier must not rebuild shared test executables"
+        );
+        let query = Command::new(repository.join("ci/nextest-binaries.rs"))
+            .arg("--print-executable")
+            .output()
+            .unwrap();
+        assert!(
+            query.status.success(),
+            "{}",
+            String::from_utf8_lossy(&query.stderr)
+        );
         let helper = PathBuf::from(String::from_utf8(query.stdout).unwrap().trim());
         assert!(helper.is_absolute() && helper.is_file());
 
         let (root, bin, log) = cold_fixture(repository, &helper);
         let unprepared = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
-        assert!(!unprepared.status.success(), "a cold consumer cannot invent the missing preparation");
+        assert!(
+            !unprepared.status.success(),
+            "a cold consumer cannot invent the missing preparation"
+        );
         assert!(!log.exists(), "the consumer must not fall back to Cargo");
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
-        assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
         let before = std::fs::read_to_string(&log).unwrap();
         // The FULL profile, because `preparation` above is the full plan's own
         // producer (NEXTEST_FULL_PREPARE_COMMAND) run against a fixture holding
@@ -25124,156 +26594,504 @@ mod fused_privileged_build_tests {
         // builds against 15 expected. That is not a widening -- the loop below
         // requires every expected selection to appear exactly once, so this
         // now checks 16 selections where it checked 15.
-        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "full").unwrap();
-        let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
-        let builds = calls.iter().filter(|args| args.first().map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
-        assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
+        let expected =
+            hermit_manifest_plan::nextest_binaries::profile_selections(repository, "full").unwrap();
+        let calls = before
+            .lines()
+            .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+            .collect::<Vec<_>>();
+        let builds = calls
+            .iter()
+            .filter(|args| {
+                args.first().map(String::as_str) == Some("nextest")
+                    && !args.iter().any(|arg| arg == "--binaries-metadata")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            builds.len(),
+            expected.len(),
+            "each distinct selection is prepared once"
+        );
         for selection in expected.values() {
-            assert_eq!(builds.iter().filter(|args| args.ends_with(selection)).count(), 1, "missing or duplicated selection {selection:?}");
+            assert_eq!(
+                builds
+                    .iter()
+                    .filter(|args| args.ends_with(selection))
+                    .count(),
+                1,
+                "missing or duplicated selection {selection:?}"
+            );
         }
-        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build") && args.iter().any(|a| a == "hermetic_infra_hermit_tests")).count(), 1, "the 21 Cargo guests are built together once");
-        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build") && args.iter().any(|a| a == "nextest-cpu-wrapper")).count(), 1, "the normal measurement wrapper is built once, outside every test consumer");
-        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build")).count(), 2, "no other builds were introduced");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.first().map(String::as_str) == Some("build")
+                    && args.iter().any(|a| a == "hermetic_infra_hermit_tests"))
+                .count(),
+            1,
+            "the 21 Cargo guests are built together once"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.first().map(String::as_str) == Some("build")
+                    && args.iter().any(|a| a == "nextest-cpu-wrapper"))
+                .count(),
+            1,
+            "the normal measurement wrapper is built once, outside every test consumer"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.first().map(String::as_str) == Some("build"))
+                .count(),
+            2,
+            "no other builds were introduced"
+        );
         let read_only = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
-        assert!(read_only.status.success(), "{}", String::from_utf8_lossy(&read_only.stderr));
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "the privileged consumer must not invoke Cargo after preparation");
+        assert!(
+            read_only.status.success(),
+            "{}",
+            String::from_utf8_lossy(&read_only.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "the privileged consumer must not invoke Cargo after preparation"
+        );
         let record_path = root.path().join("target/ci/nextest-binaries/current.json");
         let published_record = std::fs::read(&record_path).unwrap();
-        let wrapper_query = run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current");
-        assert!(wrapper_query.status.success(), "{}", String::from_utf8_lossy(&wrapper_query.stderr));
+        let wrapper_query = run_build(
+            "./ci/nextest-binaries.rs cpu-wrapper",
+            root.path(),
+            &bin,
+            &log,
+            "current",
+        );
+        assert!(
+            wrapper_query.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrapper_query.stderr)
+        );
         let wrapper = PathBuf::from(String::from_utf8(wrapper_query.stdout).unwrap().trim());
-        assert_eq!(wrapper, root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"));
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a wrapper lookup must not build");
+        assert_eq!(
+            wrapper,
+            root.path()
+                .join("custom-cargo-target/debug/nextest-cpu-wrapper")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "a wrapper lookup must not build"
+        );
         let wrapper_bytes = std::fs::read(&wrapper).unwrap();
         for mode in ["missing", "stale"] {
-            if mode == "missing" { std::fs::remove_file(&wrapper).unwrap(); }
-            else { crate::exec_safe_fs::write_executable(&wrapper, "#!/bin/sh\nexit 23\n", 0o755).unwrap(); }
-            assert!(!run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper");
-            assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper through the barrier");
-            assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a {mode} wrapper cannot cause a fallback build");
+            if mode == "missing" {
+                std::fs::remove_file(&wrapper).unwrap();
+            } else {
+                crate::exec_safe_fs::write_executable(&wrapper, "#!/bin/sh\nexit 23\n", 0o755)
+                    .unwrap();
+            }
+            assert!(
+                !run_build(
+                    "./ci/nextest-binaries.rs cpu-wrapper",
+                    root.path(),
+                    &bin,
+                    &log,
+                    "current"
+                )
+                .status
+                .success(),
+                "accepted {mode} wrapper"
+            );
+            assert!(
+                !run_build(&consumer.cmd, root.path(), &bin, &log, "current")
+                    .status
+                    .success(),
+                "accepted {mode} wrapper through the barrier"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                before,
+                "a {mode} wrapper cannot cause a fallback build"
+            );
             // Preserve the producer's original mode.
             crate::exec_safe_fs::write_executable(&wrapper, &wrapper_bytes, 0o755).unwrap();
         }
-        let no_build = run_build("HERMIT_PREPARED_NEXTEST_REQUIRED=1 ./ci/nextest-binaries.rs build-cpu-wrapper", root.path(), &bin, &log, "current");
-        assert!(!no_build.status.success(), "an official consumer cannot invoke standalone preparation");
+        let no_build = run_build(
+            "HERMIT_PREPARED_NEXTEST_REQUIRED=1 ./ci/nextest-binaries.rs build-cpu-wrapper",
+            root.path(),
+            &bin,
+            &log,
+            "current",
+        );
+        assert!(
+            !no_build.status.success(),
+            "an official consumer cannot invoke standalone preparation"
+        );
         assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
         let selection = expected.values().next().unwrap();
         let declaration = validate_plan::shell_quote(&serde_json::to_string(selection).unwrap());
-        let selectors = selection.iter().map(|arg| validate_plan::shell_quote(arg)).collect::<Vec<_>>().join(" ");
+        let selectors = selection
+            .iter()
+            .map(|arg| validate_plan::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         for operation in ["list", "run"] {
-            let cmd = format!("HERMIT_PREPARED_NEXTEST_REQUIRED=1 NEXTEST_PREPARED_BUILD_SELECTION={declaration} HERMIT_NEXTEST_CPU_WRAPPER_BIN={} ./ci/nextest-binaries.rs {operation} {selectors}", validate_plan::shell_quote(&wrapper.to_string_lossy()));
+            let cmd = format!(
+                "HERMIT_PREPARED_NEXTEST_REQUIRED=1 NEXTEST_PREPARED_BUILD_SELECTION={declaration} HERMIT_NEXTEST_CPU_WRAPPER_BIN={} ./ci/nextest-binaries.rs {operation} {selectors}",
+                validate_plan::shell_quote(&wrapper.to_string_lossy())
+            );
             let result = run_build(&cmd, root.path(), &bin, &log, "current");
-            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
         }
         let after_readers = std::fs::read_to_string(&log).unwrap();
-        let added = after_readers.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+        let added = after_readers
+            .strip_prefix(&before)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(added.len(), 2);
         for (args, operation) in added.iter().zip(["list", "run"]) {
             assert_eq!(&args[..2], ["nextest", operation]);
-            assert!(args.iter().any(|a| a == "--cargo-metadata") && args.iter().any(|a| a == "--binaries-metadata"));
+            assert!(
+                args.iter().any(|a| a == "--cargo-metadata")
+                    && args.iter().any(|a| a == "--binaries-metadata")
+            );
         }
         let declined = run_build(preparation, root.path(), &bin, &log, "declined");
-        assert_eq!(declined.status.code(), Some(75), "a declined Cargo preparation must remain no-result");
-        assert_eq!(std::fs::read(&record_path).unwrap(), published_record, "a declined replacement must preserve the prior complete record");
+        assert_eq!(
+            declined.status.code(),
+            Some(75),
+            "a declined Cargo preparation must remain no-result"
+        );
+        assert_eq!(
+            std::fs::read(&record_path).unwrap(),
+            published_record,
+            "a declined replacement must preserve the prior complete record"
+        );
         let before = std::fs::read_to_string(&log).unwrap();
-        assert!(run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "unchanged prior preparation must remain usable after a declined replacement");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "using the prior preparation must not invoke Cargo");
-        let executable = run_build("./ci/nextest-binaries.rs executable hermit-detcore tests_misc", root.path(), &bin, &log, "current");
+        assert!(
+            run_build(&consumer.cmd, root.path(), &bin, &log, "current")
+                .status
+                .success(),
+            "unchanged prior preparation must remain usable after a declined replacement"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "using the prior preparation must not invoke Cargo"
+        );
+        let executable = run_build(
+            "./ci/nextest-binaries.rs executable hermit-detcore tests_misc",
+            root.path(),
+            &bin,
+            &log,
+            "current",
+        );
         assert!(executable.status.success());
         let executable = PathBuf::from(String::from_utf8(executable.stdout).unwrap().trim());
-        assert_eq!(executable, root.path().join("custom-cargo-target/debug/build/hermit-detcore/out/tests_misc"));
-        assert!(executable.is_file(), "the exact Cargo target must exist before the consumer");
-        assert!(!root.path().join("target/debug").exists(), "the producer must not silently remap to the default target");
-        let changed_build = run_build(&format!("export SOURCE_DATE_EPOCH=946684800; {}", consumer.cmd), root.path(), &bin, &log, "current");
-        assert!(!changed_build.status.success(), "a changed build timestamp must refuse prepared metadata");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a stale build setting must not compile a replacement");
-        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n# changed source\n").unwrap();
-        assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed source must refuse old metadata");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a stale source must not compile a replacement");
+        assert_eq!(
+            executable,
+            root.path()
+                .join("custom-cargo-target/debug/build/hermit-detcore/out/tests_misc")
+        );
+        assert!(
+            executable.is_file(),
+            "the exact Cargo target must exist before the consumer"
+        );
+        assert!(
+            !root.path().join("target/debug").exists(),
+            "the producer must not silently remap to the default target"
+        );
+        let changed_build = run_build(
+            &format!("export SOURCE_DATE_EPOCH=946684800; {}", consumer.cmd),
+            root.path(),
+            &bin,
+            &log,
+            "current",
+        );
+        assert!(
+            !changed_build.status.success(),
+            "a changed build timestamp must refuse prepared metadata"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "a stale build setting must not compile a replacement"
+        );
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\n# changed source\n",
+        )
+        .unwrap();
+        assert!(
+            !run_build(&consumer.cmd, root.path(), &bin, &log, "current")
+                .status
+                .success(),
+            "changed source must refuse old metadata"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "a stale source must not compile a replacement"
+        );
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-        assert!(run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "restoring exact inputs must restore acceptance");
+        assert!(
+            run_build(&consumer.cmd, root.path(), &bin, &log, "current")
+                .status
+                .success(),
+            "restoring exact inputs must restore acceptance"
+        );
         std::fs::write(&executable, "#!/bin/sh\nexit 17\n").unwrap();
-        assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed bytes at the same path must be stale");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "stale refusal must not compile a replacement");
+        assert!(
+            !run_build(&consumer.cmd, root.path(), &bin, &log, "current")
+                .status
+                .success(),
+            "changed bytes at the same path must be stale"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "stale refusal must not compile a replacement"
+        );
 
         // The standalone privileged lane must prepare tests_misc even though
         // CPUID executes its harness directly rather than through Nextest.
         let (privileged_root, privileged_bin, privileged_log) = cold_fixture(repository, &helper);
-        let privileged = run_build("./ci/nextest-binaries.rs prepare privileged", privileged_root.path(), &privileged_bin, &privileged_log, "current");
-        assert!(privileged.status.success(), "{}", String::from_utf8_lossy(&privileged.stderr));
-        let privileged_selections = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged").unwrap();
+        let privileged = run_build(
+            "./ci/nextest-binaries.rs prepare privileged",
+            privileged_root.path(),
+            &privileged_bin,
+            &privileged_log,
+            "current",
+        );
+        assert!(
+            privileged.status.success(),
+            "{}",
+            String::from_utf8_lossy(&privileged.stderr)
+        );
+        let privileged_selections =
+            hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged")
+                .unwrap();
         assert_eq!(privileged_selections.len(), 3);
-        assert!(privileged_selections.values().any(|args| args == &["-p", "hermit-detcore", "--test", "tests_misc"]));
-        let mut direct = committed.steps.iter().find(|step| step.tag() == "privileged-only-cpuid.faulting").unwrap().clone();
+        assert!(
+            privileged_selections
+                .values()
+                .any(|args| args == &["-p", "hermit-detcore", "--test", "tests_misc"])
+        );
+        let mut direct = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-only-cpuid.faulting")
+            .unwrap()
+            .clone();
         direct.cmd = pinned_payload(&direct.cmd);
-        let declaration = direct.env.get(hermit_manifest_plan::nextest_binaries::SELECTION_ENV).unwrap();
-        let prefix = format!("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION={}; ", validate_plan::shell_quote(declaration));
+        let declaration = direct
+            .env
+            .get(hermit_manifest_plan::nextest_binaries::SELECTION_ENV)
+            .unwrap();
+        let prefix = format!(
+            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION={}; ",
+            validate_plan::shell_quote(declaration)
+        );
         let before = std::fs::read_to_string(&privileged_log).unwrap();
-        let direct_result = run_build(&format!("{prefix}{}", direct.cmd), privileged_root.path(), &privileged_bin, &privileged_log, "current");
-        assert!(direct_result.status.success(), "{}", String::from_utf8_lossy(&direct_result.stderr));
-        let missing_declaration = run_build("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; unset NEXTEST_PREPARED_BUILD_SELECTION; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc", privileged_root.path(), &privileged_bin, &privileged_log, "current");
-        assert!(!missing_declaration.status.success(), "the required direct selection cannot be omitted");
-        let wrong_declaration = run_build("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION='[\"-p\",\"hermit-detcore\",\"--lib\"]'; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc", privileged_root.path(), &privileged_bin, &privileged_log, "current");
-        assert!(!wrong_declaration.status.success(), "a different build selection cannot satisfy the direct target");
-        assert_eq!(std::fs::read_to_string(&privileged_log).unwrap(), before, "direct consumers and refusals must not invoke Cargo");
+        let direct_result = run_build(
+            &format!("{prefix}{}", direct.cmd),
+            privileged_root.path(),
+            &privileged_bin,
+            &privileged_log,
+            "current",
+        );
+        assert!(
+            direct_result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&direct_result.stderr)
+        );
+        let missing_declaration = run_build(
+            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; unset NEXTEST_PREPARED_BUILD_SELECTION; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc",
+            privileged_root.path(),
+            &privileged_bin,
+            &privileged_log,
+            "current",
+        );
+        assert!(
+            !missing_declaration.status.success(),
+            "the required direct selection cannot be omitted"
+        );
+        let wrong_declaration = run_build(
+            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION='[\"-p\",\"hermit-detcore\",\"--lib\"]'; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc",
+            privileged_root.path(),
+            &privileged_bin,
+            &privileged_log,
+            "current",
+        );
+        assert!(
+            !wrong_declaration.status.success(),
+            "a different build selection cannot satisfy the direct target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&privileged_log).unwrap(),
+            before,
+            "direct consumers and refusals must not invoke Cargo"
+        );
 
-        for mode in ["missing", "wrong", "ambiguous", "wrapper-missing", "wrapper-wrong", "wrapper-ambiguous"] {
+        for mode in [
+            "missing",
+            "wrong",
+            "ambiguous",
+            "wrapper-missing",
+            "wrapper-wrong",
+            "wrapper-ambiguous",
+        ] {
             let (root, bin, log) = cold_fixture(repository, &helper);
             let result = run_build(preparation, root.path(), &bin, &log, mode);
-            assert!(!result.status.success(), "the actual producer accepted Cargo artifact mode {mode}");
-            assert!(!root.path().join("target/ci/nextest-binaries/current.json").exists(), "a failed producer must not publish partial selections");
+            assert!(
+                !result.status.success(),
+                "the actual producer accepted Cargo artifact mode {mode}"
+            );
+            assert!(
+                !root
+                    .path()
+                    .join("target/ci/nextest-binaries/current.json")
+                    .exists(),
+                "a failed producer must not publish partial selections"
+            );
             let before = std::fs::read_to_string(&log).unwrap();
-            assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, mode).status.success());
-            assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "failed preparation must not enable consumer compilation");
+            assert!(
+                !run_build(&consumer.cmd, root.path(), &bin, &log, mode)
+                    .status
+                    .success()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                before,
+                "failed preparation must not enable consumer compilation"
+            );
         }
     }
     #[test]
     fn prepared_nextest_preserves_renderer_width_and_ignored_filter_tail() {
         let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let cfg = validate_plan::validation_config(repository).unwrap();
-        let step = cfg.steps.iter().find(|step| step.tag() == "test.isolated_dbt_workdir").unwrap();
+        let step = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.isolated_dbt_workdir")
+            .unwrap();
         assert_eq!(step.jobs_flag.as_deref(), Some(""));
         assert_eq!(step.jobs_env.as_deref(), Some("NEXTEST_TEST_THREADS"));
-        let selection = serde_json::from_str::<Vec<String>>(&step.env["NEXTEST_PREPARED_BUILD_SELECTION"]).unwrap();
-        assert_eq!(selection, ["-p", "hermit", "--features", "third-party-backends", "--test", "cli"]);
-        let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
-        assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
+        let selection =
+            serde_json::from_str::<Vec<String>>(&step.env["NEXTEST_PREPARED_BUILD_SELECTION"])
+                .unwrap();
+        assert_eq!(
+            selection,
+            [
+                "-p",
+                "hermit",
+                "--features",
+                "third-party-backends",
+                "--test",
+                "cli"
+            ]
+        );
+        let query = Command::new(repository.join("ci/nextest-binaries.rs"))
+            .arg("--print-executable")
+            .output()
+            .unwrap();
+        assert!(
+            query.status.success(),
+            "{}",
+            String::from_utf8_lossy(&query.stderr)
+        );
         let helper = PathBuf::from(String::from_utf8(query.stdout).unwrap().trim());
         let (root, bin, log) = cold_fixture(repository, &helper);
         // The real prepared adapter invokes this Cargo fixture. Record its
         // inherited worker setting separately without changing the old log.
         std::fs::rename(bin.join("cargo"), bin.join("cargo-fixture")).unwrap();
-        write_executable(&bin.join("cargo"), r#"#!/usr/bin/env python3
+        write_executable(
+            &bin.join("cargo"),
+            r#"#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
 if os.environ.get('NEXTEST_WIDTH_LOG'):
     with open(os.environ['NEXTEST_WIDTH_LOG'], 'a') as out:
         out.write(json.dumps({'argv':sys.argv[1:],'threads':os.environ.get('NEXTEST_TEST_THREADS')})+'\n')
 os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixture')),*sys.argv[1:]])
-"#);
-        let prepared = run_build("./ci/nextest-binaries.rs prepare portable", root.path(), &bin, &log, "current");
-        assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
+"#,
+        );
+        let prepared = run_build(
+            "./ci/nextest-binaries.rs prepare portable",
+            root.path(),
+            &bin,
+            &log,
+            "current",
+        );
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
         let before = std::fs::read_to_string(&log).unwrap();
         let width_log = root.path().join("target/width.jsonl");
         let mut paths = vec![bin.clone()];
-        if let Some(existing) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&existing)); }
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
         let path = std::env::join_paths(paths).unwrap();
-        let tail = ["-E", "test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_strict_returns_with_blocked_stdin_source)", "--", "--include-ignored"];
+        let tail = [
+            "-E",
+            "test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_strict_returns_with_blocked_stdin_source)",
+            "--",
+            "--include-ignored",
+        ];
         for width in [1, 3] {
-            let (name, value) = dagrun::model::env_with_inner_jobs(step, &cfg.default_jobs_env, Some(width)).unwrap();
-            assert_eq!(dagrun::model::command_with_inner_jobs(step, &cfg.default_jobs_flag, Some(width)), step.cmd);
-            let output = Command::new(&helper).arg("run").args(&selection).args(tail)
-                .current_dir(root.path()).env("PATH", &path)
-                .env("CARGO_CALL_LOG", &log).env("CARGO_ARTIFACT_MODE", "current")
+            let (name, value) =
+                dagrun::model::env_with_inner_jobs(step, &cfg.default_jobs_env, Some(width))
+                    .unwrap();
+            assert_eq!(
+                dagrun::model::command_with_inner_jobs(step, &cfg.default_jobs_flag, Some(width)),
+                step.cmd
+            );
+            let output = Command::new(&helper)
+                .arg("run")
+                .args(&selection)
+                .args(tail)
+                .current_dir(root.path())
+                .env("PATH", &path)
+                .env("CARGO_CALL_LOG", &log)
+                .env("CARGO_ARTIFACT_MODE", "current")
                 .env("NEXTEST_WIDTH_LOG", &width_log)
                 .env("HERMIT_PREPARED_NEXTEST_REQUIRED", "1")
-                .env("NEXTEST_PREPARED_BUILD_SELECTION", serde_json::to_string(&selection).unwrap())
-                .env("HERMIT_NEXTEST_CPU_WRAPPER_BIN", root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"))
-                .env("NEXTEST_TEST_THREADS", "99").env(name, value)
-                .output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                .env(
+                    "NEXTEST_PREPARED_BUILD_SELECTION",
+                    serde_json::to_string(&selection).unwrap(),
+                )
+                .env(
+                    "HERMIT_NEXTEST_CPU_WRAPPER_BIN",
+                    root.path()
+                        .join("custom-cargo-target/debug/nextest-cpu-wrapper"),
+                )
+                .env("NEXTEST_TEST_THREADS", "99")
+                .env(name, value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-        let rows = std::fs::read_to_string(&width_log).unwrap().lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+        let rows = std::fs::read_to_string(&width_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
         for (row, expected) in rows.iter().zip(["1", "3"]) {
             assert_eq!(row["threads"], expected);
@@ -25282,16 +27100,27 @@ os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixt
             assert!(args.iter().any(|arg| arg == "--cargo-metadata"));
             assert!(args.iter().any(|arg| arg == "--binaries-metadata"));
             assert!(args.ends_with(&tail.map(String::from)));
-            assert!(!args.iter().any(|arg| arg == "-j" || arg == "--test-threads"));
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "-j" || arg == "--test-threads")
+            );
         }
         let after = std::fs::read_to_string(&log).unwrap();
-        let calls = after.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
-        assert_eq!(calls.len(), 2, "prepared consumers must not rebuild or relist Cargo targets");
+        let calls = after
+            .strip_prefix(&before)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            2,
+            "prepared consumers must not rebuild or relist Cargo targets"
+        );
         assert!(calls.iter().all(|args| args[..2] == ["nextest", "run"]));
     }
-
 }
-
 
 #[cfg(test)]
 mod final_validate_status_tests {
@@ -25312,7 +27141,10 @@ mod final_validate_status_tests {
         let after_cell_retention = exit_code_with_evidence_refusal(refused_exit);
         let after_coverage_retention = exit_code_with_evidence_refusal(after_cell_retention);
         assert_eq!(after_coverage_retention, COULD_NOT_RUN_EXIT_CODE);
-        assert_eq!(completed_verdict(after_coverage_retention), Verdict::NoResult);
+        assert_eq!(
+            completed_verdict(after_coverage_retention),
+            Verdict::NoResult
+        );
         assert_eq!(exit_code_with_evidence_refusal(0), COULD_NOT_RUN_EXIT_CODE);
 
         let failed_exit = exit_code_with_verdict_refusals(1, &refusals);
@@ -25353,10 +27185,9 @@ mod final_validate_status_tests {
         refused.passed_tests = Some(0);
         let refused_path = temp.path().join("refused.json");
         write_validation_service_result(&refused_path, &refused).unwrap();
-        let refused_result = ValidationServiceResult::from_json_slice(
-            &std::fs::read(&refused_path).unwrap(),
-        )
-        .unwrap();
+        let refused_result =
+            ValidationServiceResult::from_json_slice(&std::fs::read(&refused_path).unwrap())
+                .unwrap();
         assert_eq!(refused_result.schema_version, 5);
         assert_eq!(
             refused_result.final_validate_status,
@@ -25377,11 +27208,13 @@ mod final_validate_status_tests {
         failed.passed_tests = Some(1);
         let failed_path = temp.path().join("failed.json");
         write_validation_service_result(&failed_path, &failed).unwrap();
-        let failed_result = ValidationServiceResult::from_json_slice(
-            &std::fs::read(&failed_path).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(failed_result.final_validate_status, FinalValidateStatus::Failed);
+        let failed_result =
+            ValidationServiceResult::from_json_slice(&std::fs::read(&failed_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            failed_result.final_validate_status,
+            FinalValidateStatus::Failed
+        );
         assert_eq!(failed_result.exit_code, 1);
         assert_eq!(failed_result.detail, None);
 
@@ -25392,11 +27225,13 @@ mod final_validate_status_tests {
         passed.passed_tests = Some(2);
         let passed_path = temp.path().join("passed.json");
         write_validation_service_result(&passed_path, &passed).unwrap();
-        let passed_result = ValidationServiceResult::from_json_slice(
-            &std::fs::read(&passed_path).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(passed_result.final_validate_status, FinalValidateStatus::Passed);
+        let passed_result =
+            ValidationServiceResult::from_json_slice(&std::fs::read(&passed_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            passed_result.final_validate_status,
+            FinalValidateStatus::Passed
+        );
         assert_eq!(passed_result.exit_code, 0);
         assert_eq!(passed_result.detail, None);
 
@@ -25404,11 +27239,9 @@ mod final_validate_status_tests {
         assert!(collision.contains("without replacing an existing result"));
 
         let permissionless_path = Path::new("/proc/self/validation-service-result.json");
-        let permissionless = publish_validation_service_result_or_refuse(
-            Some(permissionless_path),
-            &mut passed,
-        )
-        .unwrap_err();
+        let permissionless =
+            publish_validation_service_result_or_refuse(Some(permissionless_path), &mut passed)
+                .unwrap_err();
         assert!(permissionless.contains("cannot create validation service result beside"));
         assert_eq!(passed.verdict, Verdict::NoResult);
         assert_eq!(passed.exit_code, COULD_NOT_RUN_EXIT_CODE);
@@ -25419,11 +27252,9 @@ mod final_validate_status_tests {
             Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
         );
 
-        let failed_publish = publish_validation_service_result_or_refuse(
-            Some(permissionless_path),
-            &mut failed,
-        )
-        .unwrap_err();
+        let failed_publish =
+            publish_validation_service_result_or_refuse(Some(permissionless_path), &mut failed)
+                .unwrap_err();
         assert!(failed_publish.contains("cannot create validation service result beside"));
         assert_eq!(failed.verdict, Verdict::Fail);
         assert_eq!(failed.exit_code, 1);
@@ -25458,7 +27289,10 @@ mod e2e_attempt_tests {
     #[test]
     fn no_lane_step_receives_an_outer_attempt_environment_variable() {
         let manifest = manifest_step("manifest_applications");
-        assert_eq!(validation_step_identity(&manifest), ValidationStepIdentity::ManifestRun);
+        assert_eq!(
+            validation_step_identity(&manifest),
+            ValidationStepIdentity::ManifestRun
+        );
         assert!(!manifest.env.contains_key("E2E_ATTEMPT"));
 
         let ordinary = step_with_caps(
@@ -25471,10 +27305,12 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
-        assert_eq!(validation_step_identity(&ordinary), ValidationStepIdentity::Other);
+        assert_eq!(
+            validation_step_identity(&ordinary),
+            ValidationStepIdentity::Other
+        );
         assert!(!ordinary.env.contains_key("E2E_ATTEMPT"));
     }
-
 }
 
 #[cfg(test)]
@@ -25891,7 +27727,8 @@ mod submodule_service_tests {
         std::fs::create_dir(&root).unwrap();
         git(&root, &["init", "--quiet"]);
         std::fs::write(root.join("payload"), b"same source\n").unwrap();
-        std::fs::set_permissions(root.join("payload"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(root.join("payload"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
         symlink("payload", root.join("link")).unwrap();
         git(&root, &["add", "--", "payload", "link"]);
         git(
@@ -25943,8 +27780,7 @@ mod submodule_service_tests {
         symlink("payload", copied.join("link")).unwrap();
         assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
 
-        let au_refusal =
-            "submodule service result: original AU source differs from the clean recorded fixture pin";
+        let au_refusal = "submodule service result: original AU source differs from the clean recorded fixture pin";
         std::fs::write(au.join("api"), b"uncommitted API\n").unwrap();
         assert_eq!(
             assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
@@ -26276,7 +28112,9 @@ mod scorecard_cutover_tests {
             toolchain: "fixture-python-unittest",
             release_builder: RELEASE_BUILDER_CARGO,
         };
-        for (builder, cargo_reusable) in [(RELEASE_BUILDER_CARGO, true), (RELEASE_BUILDER_BUCK, false)] {
+        for (builder, cargo_reusable) in
+            [(RELEASE_BUILDER_CARGO, true), (RELEASE_BUILDER_BUCK, false)]
+        {
             let mut ctx = context(temp.path(), "full", builder, HEAD.into(), tree.clone());
             ctx.selection_mode = "full".into();
             ctx.release_builder = builder;
@@ -26303,7 +28141,10 @@ mod scorecard_cutover_tests {
             assert_eq!(retained["release_builder"], builder);
             assert_eq!(retained["e2e_payload"], e2e_payload_identity(builder));
             let release = builder == RELEASE_BUILDER_BUCK;
-            assert_eq!(retained["e2e_payload"]["profile"], if release { "release" } else { "debug" });
+            assert_eq!(
+                retained["e2e_payload"]["profile"],
+                if release { "release" } else { "debug" }
+            );
             assert_eq!(retained["e2e_payload"]["debug_assertions"], !release);
             assert_eq!(retained["e2e_payload"]["overflow_checks"], !release);
 
@@ -26317,12 +28158,16 @@ mod scorecard_cutover_tests {
                 ("executed_tests", serde_json::json!(9)),
                 ("gates_expected", serde_json::json!(5)),
                 ("gates_run", serde_json::json!(5)),
-                ("coverage", serde_json::json!({"planned_test_nodes": 5, "executed_test_nodes": 5, "absent_nodes": []})),
+                (
+                    "coverage",
+                    serde_json::json!({"planned_test_nodes": 5, "executed_test_nodes": 5, "absent_nodes": []}),
+                ),
             ] {
                 green[field] = value;
             }
             assert_eq!(
-                validate_history::cache_lookup(std::slice::from_ref(&green), "pass", &key).is_some(),
+                validate_history::cache_lookup(std::slice::from_ref(&green), "pass", &key)
+                    .is_some(),
                 cargo_reusable,
                 "{builder} green against a Cargo cache key"
             );
@@ -26332,15 +28177,20 @@ mod scorecard_cutover_tests {
                 "{builder} green as a full-suite receipt"
             );
             // The written builder and payload read back as that same builder.
-            let own_key = validate_history::CacheKey { release_builder: builder, ..key };
+            let own_key = validate_history::CacheKey {
+                release_builder: builder,
+                ..key
+            };
             assert!(
-                validate_history::cache_lookup(std::slice::from_ref(&green), "pass", &own_key).is_some(),
+                validate_history::cache_lookup(std::slice::from_ref(&green), "pass", &own_key)
+                    .is_some(),
                 "{builder} green against its own builder's cache key"
             );
             let mut spoiled = green.clone();
             spoiled["e2e_payload"]["overflow_checks"] = serde_json::json!(release);
             assert!(
-                validate_history::cache_lookup(std::slice::from_ref(&spoiled), "pass", &own_key).is_none(),
+                validate_history::cache_lookup(std::slice::from_ref(&spoiled), "pass", &own_key)
+                    .is_none(),
                 "{builder} green whose payload no longer matches its builder"
             );
         }
@@ -27168,9 +29018,10 @@ mod raw_census_publication_tests {
             .find(|step| step.tag() == "e2e.manifest_bin_c")
             .unwrap()
             .clone();
-        wrong_tag.cmd = wrong_tag
-            .cmd
-            .replacen(" -- bash -c ", " --proc-locks-runtime -- bash -c ", 1);
+        wrong_tag.cmd =
+            wrong_tag
+                .cmd
+                .replacen(" -- bash -c ", " --proc-locks-runtime -- bash -c ", 1);
         assert!(
             normal_raw_result_path(&wrong_tag, "fixture-run").is_err(),
             "an unrelated publisher accepted the proc-locks runtime option"

@@ -14,53 +14,53 @@
 #include <string.h>
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 5 };
-    sigset_t set;
-    sigset_t cur;
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 5 };
+  sigset_t set;
+  sigset_t cur;
+  int ok = 0;
 
-    /* check 1: SIG_SETMASK installs a mask blocking USR1 and USR2. */
-    sigemptyset(&set);
-    sigaddset(&set, SIGUSR1);
-    sigaddset(&set, SIGUSR2);
-    if (sigprocmask(SIG_SETMASK, &set, NULL) == 0) {
-        ok++;
-    }
+  /* check 1: SIG_SETMASK installs a mask blocking USR1 and USR2. */
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  sigaddset(&set, SIGUSR2);
+  if (sigprocmask(SIG_SETMASK, &set, NULL) == 0) {
+    ok++;
+  }
 
-    /* check 2: query with a NULL action reflects both signals blocked. */
-    sigemptyset(&cur);
-    if (sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
-        sigismember(&cur, SIGUSR1) == 1 && sigismember(&cur, SIGUSR2) == 1) {
-        ok++;
-    }
+  /* check 2: query with a NULL action reflects both signals blocked. */
+  sigemptyset(&cur);
+  if (sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
+      sigismember(&cur, SIGUSR1) == 1 && sigismember(&cur, SIGUSR2) == 1) {
+    ok++;
+  }
 
-    /* check 3: SIG_UNBLOCK USR1 leaves only USR2 blocked. */
-    sigemptyset(&set);
-    sigaddset(&set, SIGUSR1);
-    sigemptyset(&cur);
-    if (sigprocmask(SIG_UNBLOCK, &set, NULL) == 0 &&
-        sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
-        sigismember(&cur, SIGUSR1) == 0 && sigismember(&cur, SIGUSR2) == 1) {
-        ok++;
-    }
+  /* check 3: SIG_UNBLOCK USR1 leaves only USR2 blocked. */
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  sigemptyset(&cur);
+  if (sigprocmask(SIG_UNBLOCK, &set, NULL) == 0 &&
+      sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
+      sigismember(&cur, SIGUSR1) == 0 && sigismember(&cur, SIGUSR2) == 1) {
+    ok++;
+  }
 
-    /* check 4: SIG_BLOCK USR1 restores both blocked. */
-    sigemptyset(&cur);
-    if (sigprocmask(SIG_BLOCK, &set, NULL) == 0 &&
-        sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
-        sigismember(&cur, SIGUSR1) == 1 && sigismember(&cur, SIGUSR2) == 1) {
-        ok++;
-    }
+  /* check 4: SIG_BLOCK USR1 restores both blocked. */
+  sigemptyset(&cur);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) == 0 &&
+      sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
+      sigismember(&cur, SIGUSR1) == 1 && sigismember(&cur, SIGUSR2) == 1) {
+    ok++;
+  }
 
-    /* check 5: clearing the mask leaves neither signal blocked. */
-    sigemptyset(&set);
-    sigemptyset(&cur);
-    if (sigprocmask(SIG_SETMASK, &set, NULL) == 0 &&
-        sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
-        sigismember(&cur, SIGUSR1) == 0 && sigismember(&cur, SIGUSR2) == 0) {
-        ok++;
-    }
+  /* check 5: clearing the mask leaves neither signal blocked. */
+  sigemptyset(&set);
+  sigemptyset(&cur);
+  if (sigprocmask(SIG_SETMASK, &set, NULL) == 0 &&
+      sigprocmask(SIG_SETMASK, NULL, &cur) == 0 &&
+      sigismember(&cur, SIGUSR1) == 0 && sigismember(&cur, SIGUSR2) == 0) {
+    ok++;
+  }
 
-    printf("sigprocmask ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  printf("sigprocmask ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

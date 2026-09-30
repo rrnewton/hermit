@@ -34,7 +34,7 @@ static atomic_int signal_count;
 static atomic_int signal_sender_ready;
 static struct signal_target signal_target;
 
-static void fail(const char *operation) {
+static void fail(const char* operation) {
   fprintf(stderr, "%s: %s\n", operation, strerror(errno));
   exit(1);
 }
@@ -51,8 +51,8 @@ static void syscall_burst(unsigned int iterations, uint64_t state) {
   }
 }
 
-static void *worker_main(void *argument) {
-  struct worker *worker = argument;
+static void* worker_main(void* argument) {
+  struct worker* worker = argument;
   int result = pthread_barrier_wait(&start_barrier);
   if (result != 0 && result != PTHREAD_BARRIER_SERIAL_THREAD) {
     errno = result;
@@ -70,8 +70,8 @@ static void start_workers(struct worker workers[WORKERS], uint64_t seed) {
   }
   for (unsigned int index = 0; index < WORKERS; ++index) {
     workers[index].seed = seed ^ (uint64_t)(index + 1);
-    result = pthread_create(&workers[index].thread, NULL, worker_main,
-                            &workers[index]);
+    result = pthread_create(
+        &workers[index].thread, NULL, worker_main, &workers[index]);
     if (result != 0) {
       errno = result;
       fail("pthread_create");
@@ -123,18 +123,20 @@ static void signal_handler(int signal_number) {
   atomic_fetch_add_explicit(&signal_count, 1, memory_order_release);
 }
 
-static void *signal_sender_main(void *argument) {
+static void* signal_sender_main(void* argument) {
   (void)argument;
   while (!atomic_load_explicit(&signal_sender_ready, memory_order_acquire)) {
     __asm__ volatile("pause");
   }
   for (int expected = 1; expected <= SIGNAL_ITERATIONS; ++expected) {
-    if (syscall(SYS_tgkill, signal_target.pid, signal_target.tid, SIGUSR1) != 0) {
-      atomic_store_explicit(&signal_count, SIGNAL_ITERATIONS,
-                            memory_order_release);
-      return (void *)(uintptr_t)1;
+    if (syscall(SYS_tgkill, signal_target.pid, signal_target.tid, SIGUSR1) !=
+        0) {
+      atomic_store_explicit(
+          &signal_count, SIGNAL_ITERATIONS, memory_order_release);
+      return (void*)(uintptr_t)1;
     }
-    while (atomic_load_explicit(&signal_count, memory_order_acquire) < expected) {
+    while (atomic_load_explicit(&signal_count, memory_order_acquire) <
+           expected) {
       __asm__ volatile("pause");
     }
   }
@@ -211,7 +213,7 @@ static void unblock_signal(void) {
 }
 
 static void finish_signal_sender(pthread_t sender) {
-  void *result = NULL;
+  void* result = NULL;
   int join_result = pthread_join(sender, &result);
   if (join_result != 0 || result != NULL) {
     errno = join_result != 0 ? join_result : EIO;
@@ -219,8 +221,11 @@ static void finish_signal_sender(pthread_t sender) {
   }
   int observed = atomic_load_explicit(&signal_count, memory_order_acquire);
   if (observed != SIGNAL_ITERATIONS) {
-    fprintf(stderr, "expected %d signals, observed %d\n", SIGNAL_ITERATIONS,
-            observed);
+    fprintf(
+        stderr,
+        "expected %d signals, observed %d\n",
+        SIGNAL_ITERATIONS,
+        observed);
     exit(1);
   }
   unblock_signal();
@@ -264,7 +269,7 @@ static void run_phased_chaos(uint64_t seed) {
   run_fork_stress();
 }
 
-static uint64_t timespec_nanos(const struct timespec *time) {
+static uint64_t timespec_nanos(const struct timespec* time) {
   return (uint64_t)time->tv_sec * 1000000000ULL + (uint64_t)time->tv_nsec;
 }
 
@@ -286,8 +291,8 @@ static void run_clock_progress(void) {
   }
 }
 
-static uint64_t parse_seed(const char *value) {
-  char *end = NULL;
+static uint64_t parse_seed(const char* value) {
+  char* end = NULL;
   errno = 0;
   unsigned long long seed = strtoull(value, &end, 10);
   if (errno != 0 || end == value || *end != '\0') {
@@ -297,7 +302,7 @@ static uint64_t parse_seed(const char *value) {
   return (uint64_t)seed;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "clock-progress") == 0) {
     run_clock_progress();
     puts("clock-progress-ok");
@@ -328,8 +333,9 @@ int main(int argc, char **argv) {
     puts("chaos-ok");
     return 0;
   }
-  fprintf(stderr,
-          "usage: %s clock-progress|threads|signals|fork|chaos[-verify] SEED\n",
-          argv[0]);
+  fprintf(
+      stderr,
+      "usage: %s clock-progress|threads|signals|fork|chaos[-verify] SEED\n",
+      argv[0]);
   return 2;
 }

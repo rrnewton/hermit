@@ -46,8 +46,12 @@ int main(void) {
   errno = 0;
   long result = ptrace(PTRACE_ATTACH, child, NULL, NULL);
   if (result != -1 || errno != EPERM) {
-    fprintf(stderr, "PTRACE_ATTACH returned %ld with errno %d (%s), expected EPERM\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "PTRACE_ATTACH returned %ld with errno %d (%s), expected EPERM\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
 

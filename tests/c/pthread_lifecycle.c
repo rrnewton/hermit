@@ -23,7 +23,8 @@ int main(void) {
   int total = 0;
 
   for (int index = 0; index < THREADS; ++index) {
-    if (pthread_create(&threads[index], NULL, thread_main, &values[index]) != 0) {
+    if (pthread_create(&threads[index], NULL, thread_main, &values[index]) !=
+        0) {
       return 1;
     }
   }

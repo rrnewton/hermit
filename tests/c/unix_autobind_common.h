@@ -37,10 +37,9 @@ static int run_unix_autobind_probe(int socket_type, const char* label) {
   }
   close(fd);
 
-  const socklen_t expected_length =
-      offsetof(struct sockaddr_un, sun_path) + 6;
-  if (observed.sun_family != AF_UNIX ||
-      observed_length != expected_length || observed.sun_path[0] != '\0') {
+  const socklen_t expected_length = offsetof(struct sockaddr_un, sun_path) + 6;
+  if (observed.sun_family != AF_UNIX || observed_length != expected_length ||
+      observed.sun_path[0] != '\0') {
     fprintf(
         stderr,
         "invalid autobind shape: family=%d length=%u first=%d\n",

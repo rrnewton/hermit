@@ -26,11 +26,11 @@ int main(void) {
   socklen_t address_len = sizeof(address);
   int enabled = 1;
   if (receiver < 0 || sender < 0 ||
-      bind(receiver, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-      getsockname(receiver, (struct sockaddr *)&address, &address_len) != 0 ||
-      setsockopt(receiver, SOL_SOCKET, SO_TIMESTAMP, &enabled,
-                 sizeof(enabled)) != 0 ||
-      sendto(sender, "x", 1, 0, (struct sockaddr *)&address, sizeof(address)) !=
+      bind(receiver, (struct sockaddr*)&address, sizeof(address)) != 0 ||
+      getsockname(receiver, (struct sockaddr*)&address, &address_len) != 0 ||
+      setsockopt(
+          receiver, SOL_SOCKET, SO_TIMESTAMP, &enabled, sizeof(enabled)) != 0 ||
+      sendto(sender, "x", 1, 0, (struct sockaddr*)&address, sizeof(address)) !=
           1) {
     perror("setup");
     return 1;
@@ -49,7 +49,7 @@ int main(void) {
     perror("recvmsg");
     return 2;
   }
-  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
   if (header == NULL || header->cmsg_level != SOL_SOCKET ||
       header->cmsg_type != SCM_TIMESTAMP ||
       header->cmsg_len < CMSG_LEN(sizeof(struct timeval))) {
@@ -68,11 +68,14 @@ int main(void) {
       observed_now.tv_sec - value.tv_sec > 1 ||
       (value.tv_sec == observed_now.tv_sec &&
        value.tv_usec * 1000L > observed_now.tv_nsec)) {
-    fprintf(stderr,
-            "SCM_TIMESTAMP escaped logical time: timestamp=%ld.%06ld "
-            "now=%ld.%09ld\n",
-            (long)value.tv_sec, (long)value.tv_usec, (long)observed_now.tv_sec,
-            observed_now.tv_nsec);
+    fprintf(
+        stderr,
+        "SCM_TIMESTAMP escaped logical time: timestamp=%ld.%06ld "
+        "now=%ld.%09ld\n",
+        (long)value.tv_sec,
+        (long)value.tv_usec,
+        (long)observed_now.tv_sec,
+        observed_now.tv_nsec);
     return 5;
   }
   puts("timestamp=ok");

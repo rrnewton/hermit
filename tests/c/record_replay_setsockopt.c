@@ -41,12 +41,12 @@ int main(void) {
       .sin_port = 0,
       .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
   };
-  if (bind(first, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (bind(first, (struct sockaddr*)&address, sizeof(address)) < 0) {
     perror("bind(first)");
     return 3;
   }
   socklen_t address_len = sizeof(address);
-  if (getsockname(first, (struct sockaddr *)&address, &address_len) < 0) {
+  if (getsockname(first, (struct sockaddr*)&address, &address_len) < 0) {
     perror("getsockname(first)");
     return 4;
   }
@@ -55,7 +55,7 @@ int main(void) {
     fputs("socket did not receive an assigned port\n", stderr);
     return 5;
   }
-  if (bind(second, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (bind(second, (struct sockaddr*)&address, sizeof(address)) < 0) {
     perror("bind(second)");
     return 5;
   }

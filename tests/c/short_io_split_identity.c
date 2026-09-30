@@ -65,186 +65,192 @@ enum { CHUNKS = 8, MAX_RETURNS = 512 };
 /* One transfer's observed split: the sequence of write() return values, and
  * how many of them were short. */
 struct split {
-    int count;
-    ssize_t value[MAX_RETURNS]; /* retained: the per-call sequence, for diagnosis */
-    int short_returns;
-    size_t total;
+  int count;
+  ssize_t
+      value[MAX_RETURNS]; /* retained: the per-call sequence, for diagnosis */
+  int short_returns;
+  size_t total;
 };
 
 /* Write `total` bytes to `fd`, looping to completion, recording every return
  * value. Returns false only on a hard error. */
-static bool transfer(int fd, const char *buffer, size_t total, struct split *out) {
-    memset(out, 0, sizeof *out);
-    size_t done = 0;
-    while (done < total) {
-        size_t want = total - done;
-        ssize_t got = write(fd, buffer + done, want);
-        if (got < 0) {
-            if (errno == EINTR) {
-                continue; /* not a split; do not record it */
-            }
-            return false;
-        }
-        if (out->count >= MAX_RETURNS) {
-            return false;
-        }
-        out->value[out->count++] = got;
-        if ((size_t)got < want) {
-            /* BRANCH ON THE SHORT BOUNDARY: a partial return takes this path,
-             * a full one does not. The count is compared across transfers. */
-            out->short_returns++;
-        }
-        done += (size_t)got;
+static bool
+transfer(int fd, const char* buffer, size_t total, struct split* out) {
+  memset(out, 0, sizeof *out);
+  size_t done = 0;
+  while (done < total) {
+    size_t want = total - done;
+    ssize_t got = write(fd, buffer + done, want);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue; /* not a split; do not record it */
+      }
+      return false;
     }
-    out->total = done;
-    return true;
+    if (out->count >= MAX_RETURNS) {
+      return false;
+    }
+    out->value[out->count++] = got;
+    if ((size_t)got < want) {
+      /* BRANCH ON THE SHORT BOUNDARY: a partial return takes this path,
+       * a full one does not. The count is compared across transfers. */
+      out->short_returns++;
+    }
+    done += (size_t)got;
+  }
+  out->total = done;
+  return true;
 }
 
 /* Drain `total` bytes from `fd` and exit; the child keeps the pipe moving so
  * the writer's loop can complete instead of blocking forever. */
 static void drain_child(int fd, size_t total) {
-    char sink[4096];
-    size_t seen = 0;
-    while (seen < total) {
-        ssize_t got = read(fd, sink, sizeof sink);
-        if (got < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            _exit(1);
-        }
-        if (got == 0) {
-            break;
-        }
-        seen += (size_t)got;
+  char sink[4096];
+  size_t seen = 0;
+  while (seen < total) {
+    ssize_t got = read(fd, sink, sizeof sink);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      _exit(1);
     }
-    _exit(seen == total ? 0 : 1);
+    if (got == 0) {
+      break;
+    }
+    seen += (size_t)got;
+  }
+  _exit(seen == total ? 0 : 1);
 }
 
 /* Run one transfer of `total` bytes through a fresh blocking pipe. */
-static bool one_transfer(const char *buffer, size_t total, struct split *out) {
-    int fds[2];
-    if (pipe(fds) != 0) {
-        return false;
-    }
-    pid_t child = fork();
-    if (child < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        return false;
-    }
-    if (child == 0) {
-        close(fds[1]);
-        drain_child(fds[0], total);
-    }
+static bool one_transfer(const char* buffer, size_t total, struct split* out) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    return false;
+  }
+  pid_t child = fork();
+  if (child < 0) {
     close(fds[0]);
-    bool ok = transfer(fds[1], buffer, total, out);
     close(fds[1]);
-    int status = 0;
-    if (waitpid(child, &status, 0) != child) {
-        return false;
-    }
-    return ok && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return false;
+  }
+  if (child == 0) {
+    close(fds[1]);
+    drain_child(fds[0], total);
+  }
+  close(fds[0]);
+  bool ok = transfer(fds[1], buffer, total, out);
+  close(fds[1]);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    return false;
+  }
+  return ok && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 6 };
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 6 };
+  int ok = 0;
 
-    /* Size the transfer off the pipe's CAPACITY (F_GETPIPE_SZ), not PIPE_BUF.
-     * They differ by 16x here (4096 vs 65536), and sizing off PIPE_BUF made an
-     * earlier revision of this fixture VACUOUS: 8 * 4096 fits entirely in the
-     * pipe, so the write never went short and the split contract tested
-     * nothing. Check 7 below now asserts a short return actually occurred, so
-     * that mistake cannot come back silently. */
-    size_t total = 0;
-    {
-        int probe[2];
-        if (pipe(probe) != 0) {
-            printf("shortio ok=%d\n", ok);
-            return EXIT_FAILURE;
-        }
-        long capacity = (long)fcntl(probe[1], F_GETPIPE_SZ);
-        close(probe[0]);
-        close(probe[1]);
-        if (capacity <= 0) {
-            printf("shortio ok=%d\n", ok);
-            return EXIT_FAILURE;
-        }
-        total = (size_t)capacity * CHUNKS;
+  /* Size the transfer off the pipe's CAPACITY (F_GETPIPE_SZ), not PIPE_BUF.
+   * They differ by 16x here (4096 vs 65536), and sizing off PIPE_BUF made an
+   * earlier revision of this fixture VACUOUS: 8 * 4096 fits entirely in the
+   * pipe, so the write never went short and the split contract tested
+   * nothing. Check 7 below now asserts a short return actually occurred, so
+   * that mistake cannot come back silently. */
+  size_t total = 0;
+  {
+    int probe[2];
+    if (pipe(probe) != 0) {
+      printf("shortio ok=%d\n", ok);
+      return EXIT_FAILURE;
     }
-    ok++; /* 1: a transfer size was derived without hardcoding a host number */
+    long capacity = (long)fcntl(probe[1], F_GETPIPE_SZ);
+    close(probe[0]);
+    close(probe[1]);
+    if (capacity <= 0) {
+      printf("shortio ok=%d\n", ok);
+      return EXIT_FAILURE;
+    }
+    total = (size_t)capacity * CHUNKS;
+  }
+  ok++; /* 1: a transfer size was derived without hardcoding a host number */
 
-    char *buffer = malloc(total);
-    if (buffer == NULL) {
-        printf("shortio ok=%d\n", ok);
-        return EXIT_FAILURE;
-    }
-    for (size_t i = 0; i < total; i++) {
-        buffer[i] = (char)('a' + (i % 26));
-    }
-
-    struct split first;
-    struct split second;
-    bool ran_first = one_transfer(buffer, total, &first);
-    if (ran_first) {
-        ok++; /* 2 */
-    }
-    bool ran_second = one_transfer(buffer, total, &second);
-    if (ran_second) {
-        ok++; /* 3 */
-    }
-
-    /* COMPLETION: a deterministic-but-wrong short split still has to move every
-     * byte once the application loops. This is the clause that a pure identity
-     * contract would miss. */
-    if (ran_first && first.total == total) {
-        ok++; /* 4 */
-    }
-    if (ran_second && second.total == total) {
-        ok++; /* 5 */
-    }
-
-    /* No return may be zero or negative: a zero-length write to a pipe with a
-     * live reader is not a legal split, it is a livelock. */
-    bool returns_sane = ran_first && ran_second;
-    for (int i = 0; returns_sane && i < first.count; i++) {
-        returns_sane = first.value[i] > 0;
-    }
-    for (int i = 0; returns_sane && i < second.count; i++) {
-        returns_sane = second.value[i] > 0;
-    }
-#ifdef HERMIT_TEST_SHORTIO_PLANT_ZERO_RETURN
-    /* Plant an illegal zero-length return in the recorded sequence; the check
-     * above must reject it. Forcing `returns_sane = true` instead would be an
-     * inert mutation, because it is already true on a healthy run. */
-    if (first.count > 0) {
-        first.value[first.count / 2] = 0;
-        returns_sane = false;
-        for (int i = 0; i < first.count; i++) {
-            if (first.value[i] <= 0) {
-                returns_sane = false;
-                break;
-            }
-            returns_sane = true;
-        }
-    }
-#endif
-    if (returns_sane) {
-        ok++; /* 6 */
-    }
-
-    /* SPLIT PARITY is delegated to the harness: print the observed split so the
-     * stdout comparison pins it across runs and across backends. A perturbed
-     * split -- including a collapse to a single full write -- changes this line
-     * and is caught there rather than by a self-comparison that does not hold. */
-    printf("shortio split A=%d/%d B=%d/%d\n", first.count, first.short_returns,
-           second.count, second.short_returns);
-
-    free(buffer);
-#ifdef HERMIT_TEST_ORACLE_NEGATIVE
-    ok--; /* stable wrong stdout must be rejected by the normal exit oracle */
-#endif
+  char* buffer = malloc(total);
+  if (buffer == NULL) {
     printf("shortio ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+    return EXIT_FAILURE;
+  }
+  for (size_t i = 0; i < total; i++) {
+    buffer[i] = (char)('a' + (i % 26));
+  }
+
+  struct split first;
+  struct split second;
+  bool ran_first = one_transfer(buffer, total, &first);
+  if (ran_first) {
+    ok++; /* 2 */
+  }
+  bool ran_second = one_transfer(buffer, total, &second);
+  if (ran_second) {
+    ok++; /* 3 */
+  }
+
+  /* COMPLETION: a deterministic-but-wrong short split still has to move every
+   * byte once the application loops. This is the clause that a pure identity
+   * contract would miss. */
+  if (ran_first && first.total == total) {
+    ok++; /* 4 */
+  }
+  if (ran_second && second.total == total) {
+    ok++; /* 5 */
+  }
+
+  /* No return may be zero or negative: a zero-length write to a pipe with a
+   * live reader is not a legal split, it is a livelock. */
+  bool returns_sane = ran_first && ran_second;
+  for (int i = 0; returns_sane && i < first.count; i++) {
+    returns_sane = first.value[i] > 0;
+  }
+  for (int i = 0; returns_sane && i < second.count; i++) {
+    returns_sane = second.value[i] > 0;
+  }
+#ifdef HERMIT_TEST_SHORTIO_PLANT_ZERO_RETURN
+  /* Plant an illegal zero-length return in the recorded sequence; the check
+   * above must reject it. Forcing `returns_sane = true` instead would be an
+   * inert mutation, because it is already true on a healthy run. */
+  if (first.count > 0) {
+    first.value[first.count / 2] = 0;
+    returns_sane = false;
+    for (int i = 0; i < first.count; i++) {
+      if (first.value[i] <= 0) {
+        returns_sane = false;
+        break;
+      }
+      returns_sane = true;
+    }
+  }
+#endif
+  if (returns_sane) {
+    ok++; /* 6 */
+  }
+
+  /* SPLIT PARITY is delegated to the harness: print the observed split so the
+   * stdout comparison pins it across runs and across backends. A perturbed
+   * split -- including a collapse to a single full write -- changes this line
+   * and is caught there rather than by a self-comparison that does not hold. */
+  printf(
+      "shortio split A=%d/%d B=%d/%d\n",
+      first.count,
+      first.short_returns,
+      second.count,
+      second.short_returns);
+
+  free(buffer);
+#ifdef HERMIT_TEST_ORACLE_NEGATIVE
+  ok--; /* stable wrong stdout must be rejected by the normal exit oracle */
+#endif
+  printf("shortio ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

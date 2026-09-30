@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -47,6 +47,7 @@ REQUIRED_CHECKS = {
     "rrnewton/hermit": ("merge-gate-v4",),
     "rrnewton/reverie": ("merge-gate",),
 }
+
 
 @dataclass(frozen=True)
 class PullRequest:
@@ -119,11 +120,15 @@ def parse_pull_request(repo: str, raw: object) -> PullRequest:
         raise ValueError(f"{repo}: expected PR object, got {type(raw).__name__}")
 
     labels_raw = raw.get("labels")
-    labels = frozenset(
-        str(label.get("name"))
-        for label in labels_raw
-        if isinstance(label, dict) and label.get("name")
-    ) if isinstance(labels_raw, list) else frozenset()
+    labels = (
+        frozenset(
+            str(label.get("name"))
+            for label in labels_raw
+            if isinstance(label, dict) and label.get("name")
+        )
+        if isinstance(labels_raw, list)
+        else frozenset()
+    )
 
     try:
         number = int(raw["number"])

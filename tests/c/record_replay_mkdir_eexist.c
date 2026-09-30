@@ -14,26 +14,26 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *operation, const char *path) {
+static void fail(const char* operation, const char* path) {
   fprintf(stderr, "%s failed for %s: errno=%d\n", operation, path, errno);
   exit(1);
 }
 
-static void expect_mkdir_errno(const char *path, int expected) {
+static void expect_mkdir_errno(const char* path, int expected) {
   errno = 0;
   if (mkdir(path, 0777) != -1 || errno != expected) {
     fail("mkdir errno assertion", path);
   }
 }
 
-static void expect_mkdirat_errno(int dirfd, const char *path, int expected) {
+static void expect_mkdirat_errno(int dirfd, const char* path, int expected) {
   errno = 0;
   if (mkdirat(dirfd, path, 0777) != -1 || errno != expected) {
     fail("mkdirat errno assertion", path);
   }
 }
 
-static void expect_directory(const char *path) {
+static void expect_directory(const char* path) {
   if (chdir(path) != 0) {
     fail("chdir expected directory", path);
   }
@@ -42,19 +42,21 @@ static void expect_directory(const char *path) {
   }
 }
 
-static void expect_not_directory(const char *path) {
+static void expect_not_directory(const char* path) {
   errno = 0;
   if (chdir(path) == 0) {
     fail("chdir unexpectedly accepted non-directory", path);
   }
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc != 12) {
-    fprintf(stderr, "usage: %s BASIC_ROOT DIR FILE LINK WALK_ROOT WALK_LINK "
-                    "WALK_PATH UNCONFINED_ROOT ABSOLUTE_DIR NEW_DIR "
-                    "MISSING_CHILD\n",
-            argv[0]);
+    fprintf(
+        stderr,
+        "usage: %s BASIC_ROOT DIR FILE LINK WALK_ROOT WALK_LINK "
+        "WALK_PATH UNCONFINED_ROOT ABSOLUTE_DIR NEW_DIR "
+        "MISSING_CHILD\n",
+        argv[0]);
     return 2;
   }
 

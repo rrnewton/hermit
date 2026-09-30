@@ -40,22 +40,22 @@
 #error "a steady-state profile wrapper must define PROFILE_NAME"
 #endif
 
-static void fail(const char *operation, int error) {
+static void fail(const char* operation, int error) {
   fprintf(stderr, "%s: %s\n", operation, strerror(error));
   exit(EXIT_FAILURE);
 }
 
-static void check_pthread(const char *operation, int error) {
+static void check_pthread(const char* operation, int error) {
   if (error != 0) {
     fail(operation, error);
   }
 }
 
-#if STEADY_PROFILE == PROFILE_OPEN_READ_CLOSE ||                         \
-    STEADY_PROFILE == PROFILE_SOCKETPAIR_DGRAM ||                        \
+#if STEADY_PROFILE == PROFILE_OPEN_READ_CLOSE ||  \
+    STEADY_PROFILE == PROFILE_SOCKETPAIR_DGRAM || \
     STEADY_PROFILE == PROFILE_PIPE_NONBLOCK
-static void read_exact(int fd, void *buffer, size_t length) {
-  unsigned char *next = buffer;
+static void read_exact(int fd, void* buffer, size_t length) {
+  unsigned char* next = buffer;
   while (length != 0) {
     ssize_t count = read(fd, next, length);
     if (count < 0 && errno == EINTR) {
@@ -72,8 +72,8 @@ static void read_exact(int fd, void *buffer, size_t length) {
 
 #if STEADY_PROFILE == PROFILE_SOCKETPAIR_DGRAM || \
     STEADY_PROFILE == PROFILE_PIPE_NONBLOCK
-static void write_exact(int fd, const void *buffer, size_t length) {
-  const unsigned char *next = buffer;
+static void write_exact(int fd, const void* buffer, size_t length) {
+  const unsigned char* next = buffer;
   while (length != 0) {
     ssize_t count = write(fd, next, length);
     if (count < 0 && errno == EINTR) {
@@ -97,8 +97,8 @@ struct dup_worker {
   uint64_t completed;
 };
 
-static void *dup_worker(void *opaque) {
-  struct dup_worker *worker = opaque;
+static void* dup_worker(void* opaque) {
+  struct dup_worker* worker = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     int copy = dup(worker->source);
     if (copy < 0) {
@@ -125,9 +125,9 @@ static uint64_t run_profile(void) {
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
     workers[index].source = source;
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    dup_worker,
-                                                    &workers[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, dup_worker, &workers[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -143,8 +143,8 @@ static uint64_t run_profile(void) {
 
 enum { THREADS = 4, ROUNDS = 500 };
 
-static void *open_worker(void *opaque) {
-  uint64_t *completed = opaque;
+static void* open_worker(void* opaque) {
+  uint64_t* completed = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     int descriptor = open("/dev/zero", O_RDONLY | O_CLOEXEC);
     if (descriptor < 0) {
@@ -168,9 +168,9 @@ static uint64_t run_profile(void) {
   uint64_t completed[THREADS] = {0};
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    open_worker,
-                                                    &completed[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, open_worker, &completed[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -188,8 +188,8 @@ struct socket_worker {
   uint64_t checksum;
 };
 
-static void *socket_worker(void *opaque) {
-  struct socket_worker *worker = opaque;
+static void* socket_worker(void* opaque) {
+  struct socket_worker* worker = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sockets) != 0) {
@@ -213,9 +213,9 @@ static uint64_t run_profile(void) {
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
     workers[index].id = index;
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    socket_worker,
-                                                    &workers[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, socket_worker, &workers[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -233,8 +233,8 @@ struct pipe_worker {
   uint64_t checksum;
 };
 
-static void *pipe_worker(void *opaque) {
-  struct pipe_worker *worker = opaque;
+static void* pipe_worker(void* opaque) {
+  struct pipe_worker* worker = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     int descriptors[2];
     if (pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) != 0) {
@@ -258,9 +258,9 @@ static uint64_t run_profile(void) {
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
     workers[index].id = index;
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    pipe_worker,
-                                                    &workers[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, pipe_worker, &workers[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -273,8 +273,8 @@ static uint64_t run_profile(void) {
 
 enum { THREADS = 4, ROUNDS = 800 };
 
-static void *random_worker(void *opaque) {
-  uint64_t *checksum = opaque;
+static void* random_worker(void* opaque) {
+  uint64_t* checksum = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     unsigned char bytes[8];
     size_t offset = 0;
@@ -298,9 +298,10 @@ static uint64_t run_profile(void) {
   uint64_t checksums[THREADS] = {0};
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    random_worker,
-                                                    &checksums[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(
+            &threads[index], NULL, random_worker, &checksums[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -313,8 +314,8 @@ static uint64_t run_profile(void) {
 
 enum { THREADS = 4, ROUNDS = 1000 };
 
-static void *clock_worker(void *opaque) {
-  uint64_t *completed = opaque;
+static void* clock_worker(void* opaque) {
+  uint64_t* completed = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     struct timespec monotonic;
     struct timespec realtime;
@@ -332,9 +333,9 @@ static uint64_t run_profile(void) {
   uint64_t completed[THREADS] = {0};
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    clock_worker,
-                                                    &completed[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, clock_worker, &completed[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -352,8 +353,8 @@ struct spin_state {
   uint64_t count;
 };
 
-static void *spin_worker(void *opaque) {
-  struct spin_state *state = opaque;
+static void* spin_worker(void* opaque) {
+  struct spin_state* state = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     int error;
     while ((error = pthread_spin_trylock(&state->lock)) == EBUSY) {
@@ -373,12 +374,14 @@ static void *spin_worker(void *opaque) {
 
 static uint64_t run_profile(void) {
   struct spin_state state = {.count = 0};
-  check_pthread("pthread_spin_init",
-                pthread_spin_init(&state.lock, PTHREAD_PROCESS_PRIVATE));
+  check_pthread(
+      "pthread_spin_init",
+      pthread_spin_init(&state.lock, PTHREAD_PROCESS_PRIVATE));
   pthread_t threads[THREADS];
   for (unsigned index = 0; index < THREADS; ++index) {
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    spin_worker, &state));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, spin_worker, &state));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -399,26 +402,26 @@ struct cond_state {
 };
 
 struct cond_worker {
-  struct cond_state *state;
+  struct cond_state* state;
   unsigned id;
 };
 
-static void *cond_worker(void *opaque) {
-  struct cond_worker *worker = opaque;
+static void* cond_worker(void* opaque) {
+  struct cond_worker* worker = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
-    check_pthread("pthread_mutex_lock",
-                  pthread_mutex_lock(&worker->state->mutex));
+    check_pthread(
+        "pthread_mutex_lock", pthread_mutex_lock(&worker->state->mutex));
     while (worker->state->turn != worker->id) {
-      check_pthread("pthread_cond_wait",
-                    pthread_cond_wait(&worker->state->condvar,
-                                      &worker->state->mutex));
+      check_pthread(
+          "pthread_cond_wait",
+          pthread_cond_wait(&worker->state->condvar, &worker->state->mutex));
     }
     worker->state->completed[worker->id] += 1;
     worker->state->turn = 1 - worker->id;
-    check_pthread("pthread_cond_signal",
-                  pthread_cond_signal(&worker->state->condvar));
-    check_pthread("pthread_mutex_unlock",
-                  pthread_mutex_unlock(&worker->state->mutex));
+    check_pthread(
+        "pthread_cond_signal", pthread_cond_signal(&worker->state->condvar));
+    check_pthread(
+        "pthread_mutex_unlock", pthread_mutex_unlock(&worker->state->mutex));
   }
   return NULL;
 }
@@ -436,9 +439,9 @@ static uint64_t run_profile(void) {
   };
   pthread_t threads[2];
   for (unsigned index = 0; index < 2; ++index) {
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    cond_worker,
-                                                    &workers[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, cond_worker, &workers[index]));
   }
   for (unsigned index = 0; index < 2; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -453,27 +456,26 @@ static uint64_t run_profile(void) {
 enum { THREADS = 4, ROUNDS = 800 };
 
 struct rwlock_worker {
-  pthread_rwlock_t *lock;
+  pthread_rwlock_t* lock;
   unsigned id;
   uint64_t completed;
 };
 
-static void *rwlock_worker(void *opaque) {
-  struct rwlock_worker *worker = opaque;
+static void* rwlock_worker(void* opaque) {
+  struct rwlock_worker* worker = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     if (worker->id == 0) {
-      check_pthread("pthread_rwlock_wrlock",
-                    pthread_rwlock_wrlock(worker->lock));
+      check_pthread(
+          "pthread_rwlock_wrlock", pthread_rwlock_wrlock(worker->lock));
     } else {
-      check_pthread("pthread_rwlock_rdlock",
-                    pthread_rwlock_rdlock(worker->lock));
+      check_pthread(
+          "pthread_rwlock_rdlock", pthread_rwlock_rdlock(worker->lock));
     }
     worker->completed += 1;
     if (sched_yield() != 0) {
       fail("sched_yield", errno);
     }
-    check_pthread("pthread_rwlock_unlock",
-                  pthread_rwlock_unlock(worker->lock));
+    check_pthread("pthread_rwlock_unlock", pthread_rwlock_unlock(worker->lock));
   }
   return NULL;
 }
@@ -486,9 +488,9 @@ static uint64_t run_profile(void) {
   for (unsigned index = 0; index < THREADS; ++index) {
     workers[index].lock = &lock;
     workers[index].id = index;
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    rwlock_worker,
-                                                    &workers[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, rwlock_worker, &workers[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -503,19 +505,19 @@ static uint64_t run_profile(void) {
 enum { THREADS = 4, ROUNDS = 700 };
 
 struct barrier_worker {
-  pthread_barrier_t *barrier;
+  pthread_barrier_t* barrier;
   uint64_t completed;
 };
 
-static void wait_at_barrier(pthread_barrier_t *barrier) {
+static void wait_at_barrier(pthread_barrier_t* barrier) {
   int error = pthread_barrier_wait(barrier);
   if (error != 0 && error != PTHREAD_BARRIER_SERIAL_THREAD) {
     fail("pthread_barrier_wait", error);
   }
 }
 
-static void *barrier_worker(void *opaque) {
-  struct barrier_worker *worker = opaque;
+static void* barrier_worker(void* opaque) {
+  struct barrier_worker* worker = opaque;
   for (unsigned round = 0; round < ROUNDS; ++round) {
     wait_at_barrier(worker->barrier);
     if (sched_yield() != 0) {
@@ -529,16 +531,16 @@ static void *barrier_worker(void *opaque) {
 
 static uint64_t run_profile(void) {
   pthread_barrier_t barrier;
-  check_pthread("pthread_barrier_init",
-                pthread_barrier_init(&barrier, NULL, THREADS));
+  check_pthread(
+      "pthread_barrier_init", pthread_barrier_init(&barrier, NULL, THREADS));
   pthread_t threads[THREADS];
   struct barrier_worker workers[THREADS] = {0};
   uint64_t checksum = 0;
   for (unsigned index = 0; index < THREADS; ++index) {
     workers[index].barrier = &barrier;
-    check_pthread("pthread_create", pthread_create(&threads[index], NULL,
-                                                    barrier_worker,
-                                                    &workers[index]));
+    check_pthread(
+        "pthread_create",
+        pthread_create(&threads[index], NULL, barrier_worker, &workers[index]));
   }
   for (unsigned index = 0; index < THREADS; ++index) {
     check_pthread("pthread_join", pthread_join(threads[index], NULL));
@@ -554,7 +556,9 @@ static uint64_t run_profile(void) {
 
 int main(void) {
   uint64_t checksum = run_profile();
-  printf("steady-state profile=%s checksum=%llu\n", PROFILE_NAME,
-         (unsigned long long)checksum);
+  printf(
+      "steady-state profile=%s checksum=%llu\n",
+      PROFILE_NAME,
+      (unsigned long long)checksum);
   return EXIT_SUCCESS;
 }

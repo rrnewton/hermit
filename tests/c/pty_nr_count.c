@@ -4,7 +4,7 @@
 #include <unistd.h>
 
 static int pty_count(void) {
-  FILE *file = fopen("/proc/sys/kernel/pty/nr", "r");
+  FILE* file = fopen("/proc/sys/kernel/pty/nr", "r");
   int count = -1;
   if (file == NULL || fscanf(file, "%d", &count) != 1) {
     return -1;

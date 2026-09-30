@@ -10,18 +10,19 @@
  * Symbolic-link parity probe: symlinkat / readlinkat / lstat vs stat.
  *
  * A single process creates a regular target file and a symlink to it under a
- * unique temporary root, then checks the deterministic Linux symlink rules every
- * backend's file model must honor identically. Every observation is a pure
- * function of the process's own path operations, with no dependence on time,
- * scheduling, pid, or host identity:
+ * unique temporary root, then checks the deterministic Linux symlink rules
+ * every backend's file model must honor identically. Every observation is a
+ * pure function of the process's own path operations, with no dependence on
+ * time, scheduling, pid, or host identity:
  *
  *   - symlinkat creates a link whose readlinkat contents equal the exact target
  *     path string that was stored.
  *   - lstat of the link reports type S_IFLNK with a size equal to the stored
  *     target path length (lstat does not follow the link).
- *   - stat of the link follows it and reports the target's regular-file type and
- *     its six-byte size.
- *   - opening the link reads the target's contents (checksum 597 over "abcdef").
+ *   - stat of the link follows it and reports the target's regular-file type
+ * and its six-byte size.
+ *   - opening the link reads the target's contents (checksum 597 over
+ * "abcdef").
  *   - a dangling symlink to a missing path still lstat's as S_IFLNK, while stat
  *     through it fails with ENOENT.
  *
@@ -29,8 +30,9 @@
  *
  *   symlink_ops size=6 checksum=597 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, inode, device, uid, gid, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, inode, device, uid, gid, or address is
+ * observed.
  */
 
 #define _GNU_SOURCE
@@ -49,7 +51,7 @@
 #define PAYLOAD "abcdef"
 #define PAYLOAD_LEN 6
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -81,7 +83,8 @@ int main(void) {
   int ok = 0;
   struct stat st;
 
-  /* symlinkat creates a link whose readlinkat contents equal the target path. */
+  /* symlinkat creates a link whose readlinkat contents equal the target path.
+   */
   char readback[128];
   if (symlinkat(target, root_fd, "link") == 0) {
     ssize_t n = readlinkat(root_fd, "link", readback, sizeof(readback) - 1);

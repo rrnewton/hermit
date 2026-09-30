@@ -26,8 +26,9 @@
  *
  *   mkdir_rmdir ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, inode, device, uid, gid, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, inode, device, uid, gid, or address is
+ * observed.
  */
 
 #define _GNU_SOURCE
@@ -43,7 +44,7 @@
    failure, not a smaller success. */
 #define EXPECTED_CHECKS 6
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -107,10 +108,7 @@ int main(void) {
      bitwise parity still holds and the cell passes green. */
   if (ok != EXPECTED_CHECKS) {
     fprintf(
-        stderr,
-        "mkdir_rmdir completed %d of %d steps\n",
-        ok,
-        EXPECTED_CHECKS);
+        stderr, "mkdir_rmdir completed %d of %d steps\n", ok, EXPECTED_CHECKS);
     return 1;
   }
   return 0;

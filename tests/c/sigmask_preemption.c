@@ -22,8 +22,8 @@ struct worker {
   int error;
 };
 
-static void *run_worker(void *opaque) {
-  struct worker *worker = opaque;
+static void* run_worker(void* opaque) {
+  struct worker* worker = opaque;
   sigset_t blocked;
   sigset_t previous;
   sigemptyset(&blocked);
@@ -52,7 +52,8 @@ int main(void) {
 
   for (unsigned index = 0; index < THREADS; ++index) {
     workers[index].id = index;
-    if (pthread_create(&threads[index], NULL, run_worker, &workers[index]) != 0) {
+    if (pthread_create(&threads[index], NULL, run_worker, &workers[index]) !=
+        0) {
       return 10;
     }
   }
@@ -64,7 +65,10 @@ int main(void) {
     checksum ^= workers[index].checksum;
   }
 
-  printf("sigmask-stress threads=%d rounds=%d checksum=%016lx\n", THREADS,
-         ROUNDS, (unsigned long)checksum);
+  printf(
+      "sigmask-stress threads=%d rounds=%d checksum=%016lx\n",
+      THREADS,
+      ROUNDS,
+      (unsigned long)checksum);
   return EXIT_SUCCESS;
 }

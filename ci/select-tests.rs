@@ -50,8 +50,8 @@
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
-use std::collections::BTreeSet;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -174,7 +174,12 @@ impl Footprints {
             })
             .unwrap_or_default();
 
-        Footprints { groups, force_full, ci_irrelevant, footprints }
+        Footprints {
+            groups,
+            force_full,
+            ci_irrelevant,
+            footprints,
+        }
     }
 
     /// Expand a node-reference list, resolving `@GROUP` aliases recursively.
@@ -197,7 +202,11 @@ impl Footprints {
 
 fn str_vec(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -255,19 +264,28 @@ impl Dag {
     }
 
     fn resolve_selection_node(&self, node: &str) -> Option<&str> {
-        self.all_nodes.get(node)
+        self.all_nodes
+            .get(node)
             .or_else(|| self.all_nodes.get(&format!("{node}_on_host")))
             .map(String::as_str)
     }
 
     fn expand_selection_aliases(&self, nodes: &mut BTreeSet<String>) {
-        *nodes = nodes.iter()
-            .map(|node| self.resolve_selection_node(node).unwrap_or(node).to_string())
+        *nodes = nodes
+            .iter()
+            .map(|node| {
+                self.resolve_selection_node(node)
+                    .unwrap_or(node)
+                    .to_string()
+            })
             .collect();
         if nodes.contains(STRICT_COMPAT_SELECTION_ALIAS) {
-            let compat = self.all_nodes.iter()
+            let compat = self
+                .all_nodes
+                .iter()
                 .filter(|node| node.starts_with("compat."))
-                .cloned().collect::<Vec<_>>();
+                .cloned()
+                .collect::<Vec<_>>();
             // An absent alias target remains unknown and forces the full suite.
             if !compat.is_empty() {
                 nodes.remove(STRICT_COMPAT_SELECTION_ALIAS);
@@ -328,7 +346,10 @@ impl Shards {
                 })
                 .unwrap_or_default()
         };
-        Shards { debug: parse("debug_shards"), release: parse("release_shards") }
+        Shards {
+            debug: parse("debug_shards"),
+            release: parse("release_shards"),
+        }
     }
 }
 
@@ -461,7 +482,12 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         reasons.push(format!(
             "{} unmapped path(s) (e.g. {}) → conservative full suite",
             unknown.len(),
-            unknown.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            unknown
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         return full(dag.all_nodes.clone(), reasons);
     }
@@ -490,8 +516,11 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         }
     }
     // Drop any footprint node that is not in the current DAG (schema drift guard).
-    let unknown_nodes: Vec<String> =
-        matched.iter().filter(|n| !dag.all_nodes.contains(*n)).cloned().collect();
+    let unknown_nodes: Vec<String> = matched
+        .iter()
+        .filter(|n| !dag.all_nodes.contains(*n))
+        .cloned()
+        .collect();
     if !unknown_nodes.is_empty() {
         reasons.push(format!(
             "footprint referenced {} node(s) absent from validate.json ({}) → full suite (stale map)",
@@ -517,7 +546,13 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
     } else {
         reasons.push("e2e: no cells (non-e2e change)".into());
     }
-    Selection { decision: Decision::Selective, nodes: closed, e2e_all, e2e_backends, reasons }
+    Selection {
+        decision: Decision::Selective,
+        nodes: closed,
+        e2e_all,
+        e2e_backends,
+        reasons,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -527,22 +562,29 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
 /// A concrete run plan: which test shards and which e2e cells to execute, plus
 /// the release-build jobs those selections require.
 struct RunPlan {
-    shards: Vec<String>,      // shard slugs (debug + release) to run
-    cells: Vec<Cell>,         // e2e cells to run
-    build_debug: bool,        // the shared debug build job
-    build_dbt: bool,          // the DBT release artifact
-    build_aux: bool,          // the sabre/liteinst release artifacts
-    total_shards: usize,      // universe sizes, for reporting
+    shards: Vec<String>, // shard slugs (debug + release) to run
+    cells: Vec<Cell>,    // e2e cells to run
+    build_debug: bool,   // the shared debug build job
+    build_dbt: bool,     // the DBT release artifact
+    build_aux: bool,     // the sabre/liteinst release artifacts
+    total_shards: usize, // universe sizes, for reporting
     total_cells: usize,
 }
 
 /// Resolve public shard selectors against the same hosted node universe as
 /// footprint selectors. A missing node must never silently omit a shard.
 fn resolved_shard_nodes(shard: &Shard, dag: &Dag) -> Result<BTreeSet<String>, String> {
-    shard.nodes.iter().map(|node| {
-        dag.resolve_selection_node(node).map(str::to_owned)
-            .ok_or_else(|| format!("shard {} references unknown hosted node {node}", shard.slug))
-    }).collect()
+    shard
+        .nodes
+        .iter()
+        .map(|node| {
+            dag.resolve_selection_node(node)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!("shard {} references unknown hosted node {node}", shard.slug)
+                })
+        })
+        .collect()
 }
 
 /// Map a node-level Selection onto shards and e2e cells.
@@ -558,7 +600,12 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan, dag: &Dag) -> 
     let (shard_slugs, cells): (Vec<String>, Vec<Cell>) = match sel.decision {
         Decision::Skip => (Vec::new(), Vec::new()),
         Decision::Full => (
-            shards.debug.iter().chain(&shards.release).map(|s| s.slug.clone()).collect(),
+            shards
+                .debug
+                .iter()
+                .chain(&shards.release)
+                .map(|s| s.slug.clone())
+                .collect(),
             plan.cells.clone(),
         ),
         Decision::Selective => {
@@ -712,7 +759,10 @@ fn read_files_stdin() -> Vec<String> {
     use std::io::Read;
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s).ok();
-    s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+    s.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 fn repo_root() -> std::path::PathBuf {
@@ -720,7 +770,10 @@ fn repo_root() -> std::path::PathBuf {
     let here = std::env::current_exe().ok();
     let _ = here;
     // Prefer git toplevel; fall back to CWD.
-    if let Ok(out) = Command::new("git").args(["rev-parse", "--show-toplevel"]).output() {
+    if let Ok(out) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !p.is_empty() {
@@ -754,11 +807,19 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--base" => {
-                base = Some(args.get(i + 1).cloned().unwrap_or_else(|| fail("--base needs a ref")));
+                base = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .unwrap_or_else(|| fail("--base needs a ref")),
+                );
                 i += 2;
             }
             "--baseline" => {
-                baseline = Some(args.get(i + 1).cloned().unwrap_or_else(|| fail("--baseline needs a SHA")));
+                baseline = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .unwrap_or_else(|| fail("--baseline needs a SHA")),
+                );
                 i += 2;
             }
             "--since-green" => {
@@ -766,7 +827,10 @@ fn main() {
                 i += 1;
             }
             "--format" => {
-                format = args.get(i + 1).cloned().unwrap_or_else(|| fail("--format needs a value"));
+                format = args
+                    .get(i + 1)
+                    .cloned()
+                    .unwrap_or_else(|| fail("--format needs a value"));
                 i += 2;
             }
             "--files" => {
@@ -803,7 +867,8 @@ fn main() {
             Some(b) => {
                 let files = local_changed_files(&b);
                 let mut sel = select(&fp, &dag, &files);
-                sel.reasons.insert(0, format!("LOCAL delta vs known-green baseline {b}"));
+                sel.reasons
+                    .insert(0, format!("LOCAL delta vs known-green baseline {b}"));
                 let rp = derive_run_plan(&sel, &shards, &plan, &dag);
                 emit(&sel, &rp, &format, files.len());
                 return;
@@ -888,7 +953,10 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                     for c in &rp.cells {
                         *m.entry(c.backend.clone()).or_default() += 1;
                     }
-                    m.iter().map(|(b, n)| format!("{b}:{n}")).collect::<Vec<_>>().join(" ")
+                    m.iter()
+                        .map(|(b, n)| format!("{b}:{n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 };
                 println!("  e2e cells by backend: {by_backend}");
             }
@@ -942,7 +1010,9 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                         .create(true)
                         .append(true)
                         .open(&path)
-                        .unwrap_or_else(|e| fail(&format!("cannot open GITHUB_OUTPUT {path}: {e}")));
+                        .unwrap_or_else(|e| {
+                            fail(&format!("cannot open GITHUB_OUTPUT {path}: {e}"))
+                        });
                     f.write_all(lines.as_bytes()).ok();
                 }
                 Err(_) => print!("{lines}"),
@@ -1021,16 +1091,37 @@ fn self_test() {
 
     // --- glob matcher ---
     check("glob exact", glob_match("Cargo.toml", "Cargo.toml"));
-    check("glob exact not suffix", !glob_match("Cargo.toml", "detcore/Cargo.toml"));
+    check(
+        "glob exact not suffix",
+        !glob_match("Cargo.toml", "detcore/Cargo.toml"),
+    );
     check("glob star segment", glob_match("*.md", "README.md"));
     check("glob star no cross slash", !glob_match("*.md", "docs/x.md"));
-    check("glob doublestar suffix", glob_match("docs/**", "docs/a/b/c.md"));
-    check("glob doublestar rs", glob_match("**/*.rs", "detcore/src/scheduler.rs"));
+    check(
+        "glob doublestar suffix",
+        glob_match("docs/**", "docs/a/b/c.md"),
+    );
+    check(
+        "glob doublestar rs",
+        glob_match("**/*.rs", "detcore/src/scheduler.rs"),
+    );
     check("glob doublestar rs root", glob_match("**/*.rs", "main.rs"));
-    check("glob dir rs", glob_match("detcore/**/*.rs", "detcore/src/a/b.rs"));
-    check("glob dir rs miss", !glob_match("detcore/**/*.rs", "hermit-cli/src/a.rs"));
-    check("glob prefix dir", glob_match("detcore-dbt/**", "detcore-dbt/src/lib.rs"));
-    check("glob prefix dir file", glob_match("detcore-dbt/**", "detcore-dbt/Cargo.toml"));
+    check(
+        "glob dir rs",
+        glob_match("detcore/**/*.rs", "detcore/src/a/b.rs"),
+    );
+    check(
+        "glob dir rs miss",
+        !glob_match("detcore/**/*.rs", "hermit-cli/src/a.rs"),
+    );
+    check(
+        "glob prefix dir",
+        glob_match("detcore-dbt/**", "detcore-dbt/src/lib.rs"),
+    );
+    check(
+        "glob prefix dir file",
+        glob_match("detcore-dbt/**", "detcore-dbt/Cargo.toml"),
+    );
     check("glob question", glob_match("a?c", "abc"));
     check("glob mid doublestar", glob_match("a/**/z.c", "a/b/c/z.c"));
     check("glob mid doublestar empty", glob_match("a/**/z.c", "a/z.c"));
@@ -1042,27 +1133,56 @@ fn self_test() {
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
 
-    check("every declared shard node resolves in the actual hosted DAG",
-        shards.debug.iter().chain(&shards.release)
-            .all(|shard| resolved_shard_nodes(shard, &dag).is_ok()));
+    check(
+        "every declared shard node resolves in the actual hosted DAG",
+        shards
+            .debug
+            .iter()
+            .chain(&shards.release)
+            .all(|shard| resolved_shard_nodes(shard, &dag).is_ok()),
+    );
     let alias_fixture = Dag {
         all_nodes: ["test.exact", "test.exact_on_host", "test.public_on_host"]
-            .into_iter().map(String::from).collect(),
+            .into_iter()
+            .map(String::from)
+            .collect(),
         deps: BTreeMap::new(),
     };
-    check("public selector resolves only its exact hosted counterpart",
-        alias_fixture.resolve_selection_node("test.public") == Some("test.public_on_host"));
-    check("literal node wins over a simultaneous hosted counterpart",
-        alias_fixture.resolve_selection_node("test.exact") == Some("test.exact"));
-    check("unknown and partial selector names do not resolve",
+    check(
+        "public selector resolves only its exact hosted counterpart",
+        alias_fixture.resolve_selection_node("test.public") == Some("test.public_on_host"),
+    );
+    check(
+        "literal node wins over a simultaneous hosted counterpart",
+        alias_fixture.resolve_selection_node("test.exact") == Some("test.exact"),
+    );
+    check(
+        "unknown and partial selector names do not resolve",
         alias_fixture.resolve_selection_node("test.pub").is_none()
-            && alias_fixture.resolve_selection_node("test.public_typo").is_none());
+            && alias_fixture
+                .resolve_selection_node("test.public_typo")
+                .is_none(),
+    );
 
-    let docs = select(&fp, &dag, &["ai_docs/x.md".into(), "docs/y.md".into(), "README.md".into()]);
-    check("docs-only ⇒ skip", docs.decision == Decision::Skip && docs.nodes.is_empty());
+    let docs = select(
+        &fp,
+        &dag,
+        &[
+            "ai_docs/x.md".into(),
+            "docs/y.md".into(),
+            "README.md".into(),
+        ],
+    );
+    check(
+        "docs-only ⇒ skip",
+        docs.decision == Decision::Skip && docs.nodes.is_empty(),
+    );
 
     let lock = select(&fp, &dag, &["Cargo.lock".into()]);
-    check("Cargo.lock ⇒ full", lock.decision == Decision::Full && lock.nodes.len() == dag.all_nodes.len());
+    check(
+        "Cargo.lock ⇒ full",
+        lock.decision == Decision::Full && lock.nodes.len() == dag.all_nodes.len(),
+    );
 
     let toolchain = select(&fp, &dag, &["rust-toolchain.toml".into()]);
     check("toolchain ⇒ full", toolchain.decision == Decision::Full);
@@ -1071,7 +1191,10 @@ fn self_test() {
     check("ci/** ⇒ full", ci.decision == Decision::Full);
 
     let skill = select(&fp, &dag, &[".claude/skills/benchmark/SKILL.md".into()]);
-    check("skill change ⇒ selective", skill.decision == Decision::Selective);
+    check(
+        "skill change ⇒ selective",
+        skill.decision == Decision::Selective,
+    );
     check(
         "skill change runs discovery check",
         skill.nodes.contains("check.skill_discovery"),
@@ -1083,62 +1206,138 @@ fn self_test() {
 
     let dbt = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into()]);
     check("dbt-only ⇒ selective", dbt.decision == Decision::Selective);
-    check("dbt-only runs the DBT runtime ABI check", dbt.nodes.contains("check.dbt_runtime_abi"));
-    check("dbt-only runs c-programs DBT cells", dbt.nodes.contains("e2e.manifest_c_programs_on_host"));
-    check("dbt-only runs system-utils DBT cells", dbt.nodes.contains("e2e.manifest_system_utils_on_host"));
-    check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
-    check("dbt-only pulls build.workspace (dep)", dbt.nodes.contains("build.workspace"));
+    check(
+        "dbt-only runs the DBT runtime ABI check",
+        dbt.nodes.contains("check.dbt_runtime_abi"),
+    );
+    check(
+        "dbt-only runs c-programs DBT cells",
+        dbt.nodes.contains("e2e.manifest_c_programs_on_host"),
+    );
+    check(
+        "dbt-only runs system-utils DBT cells",
+        dbt.nodes.contains("e2e.manifest_system_utils_on_host"),
+    );
+    check(
+        "dbt-only pulls build.runtime_release",
+        dbt.nodes.contains("build.runtime_release"),
+    );
+    check(
+        "dbt-only pulls build.workspace (dep)",
+        dbt.nodes.contains("build.workspace"),
+    );
     check(
         "dbt-only skips strict compat cells",
         !dbt.nodes.iter().any(|node| node.starts_with("compat.")),
     );
-    check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes_on_host"));
-    check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
-    check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
+    check(
+        "dbt-only skips language_runtimes",
+        !dbt.nodes.contains("e2e.manifest_language_runtimes_on_host"),
+    );
+    check(
+        "dbt-only is a strict subset",
+        dbt.nodes.len() < dag.all_nodes.len(),
+    );
+    check(
+        "dbt-only includes preflight",
+        dbt.nodes.contains("lint.rustfmt"),
+    );
 
     let core = select(&fp, &dag, &["detcore/src/scheduler.rs".into()]);
-    check("detcore core ⇒ selective", core.decision == Decision::Selective);
+    check(
+        "detcore core ⇒ selective",
+        core.decision == Decision::Selective,
+    );
     check(
         "detcore core expands the strict compat alias",
         core.nodes.iter().any(|node| node.starts_with("compat."))
             && !core.nodes.contains(STRICT_COMPAT_SELECTION_ALIAS),
     );
-    check("detcore core runs detcore_unit", core.nodes.contains("test.detcore_unit_on_host"));
+    check(
+        "detcore core runs detcore_unit",
+        core.nodes.contains("test.detcore_unit_on_host"),
+    );
 
-    let mut removed = Dag { all_nodes: dag.all_nodes.clone(), deps: dag.deps.clone() };
-    check("actual hosted DBT counterpart is present before removal",
-        removed.all_nodes.remove("e2e.manifest_system_utils_on_host"));
-    check("removed footprint counterpart forces full instead of dropping its coverage",
-        select(&fp, &removed, &["detcore-dbt/src/lib.rs".into()]).decision == Decision::Full);
-    let mut removed = Dag { all_nodes: dag.all_nodes.clone(), deps: dag.deps.clone() };
-    removed.all_nodes.retain(|node| !node.starts_with("compat."));
-    check("removed compatibility alias targets force full",
-        select(&fp, &removed, &["detcore/src/scheduler.rs".into()]).decision == Decision::Full);
-    let unknown_fp = Footprints {
-        groups: BTreeMap::new(), force_full: vec![], ci_irrelevant: vec![],
-        footprints: vec![Fp { paths: vec!["fixture/**".into()],
-            nodes: vec!["test.public_typo".into()], e2e_all: false, e2e_backends: vec![] }],
+    let mut removed = Dag {
+        all_nodes: dag.all_nodes.clone(),
+        deps: dag.deps.clone(),
     };
-    check("unknown footprint selector forces full",
-        select(&unknown_fp, &alias_fixture, &["fixture/input".into()]).decision == Decision::Full);
+    check(
+        "actual hosted DBT counterpart is present before removal",
+        removed
+            .all_nodes
+            .remove("e2e.manifest_system_utils_on_host"),
+    );
+    check(
+        "removed footprint counterpart forces full instead of dropping its coverage",
+        select(&fp, &removed, &["detcore-dbt/src/lib.rs".into()]).decision == Decision::Full,
+    );
+    let mut removed = Dag {
+        all_nodes: dag.all_nodes.clone(),
+        deps: dag.deps.clone(),
+    };
+    removed
+        .all_nodes
+        .retain(|node| !node.starts_with("compat."));
+    check(
+        "removed compatibility alias targets force full",
+        select(&fp, &removed, &["detcore/src/scheduler.rs".into()]).decision == Decision::Full,
+    );
+    let unknown_fp = Footprints {
+        groups: BTreeMap::new(),
+        force_full: vec![],
+        ci_irrelevant: vec![],
+        footprints: vec![Fp {
+            paths: vec!["fixture/**".into()],
+            nodes: vec!["test.public_typo".into()],
+            e2e_all: false,
+            e2e_backends: vec![],
+        }],
+    };
+    check(
+        "unknown footprint selector forces full",
+        select(&unknown_fp, &alias_fixture, &["fixture/input".into()]).decision == Decision::Full,
+    );
 
     let workdir = select(&fp, &dag, &["common/test-workdir/src/lib.rs".into()]);
-    check("shared workdir selects its real non-Cargo application consumer",
+    check(
+        "shared workdir selects its real non-Cargo application consumer",
         workdir.decision == Decision::Selective
-            && workdir.nodes.contains("test.applications_e2e_on_host"));
-    check("shared workdir retains all-backend E2E affinity", workdir.e2e_all);
+            && workdir.nodes.contains("test.applications_e2e_on_host"),
+    );
+    check(
+        "shared workdir retains all-backend E2E affinity",
+        workdir.e2e_all,
+    );
 
     let unknown = select(&fp, &dag, &["some/brand/new/area/file.py".into()]);
     check("unknown path ⇒ full", unknown.decision == Decision::Full);
 
-    let mixed = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into(), "README.md".into()]);
-    check("dbt + docs ⇒ selective (docs inert)", mixed.decision == Decision::Selective);
+    let mixed = select(
+        &fp,
+        &dag,
+        &["detcore-dbt/src/lib.rs".into(), "README.md".into()],
+    );
+    check(
+        "dbt + docs ⇒ selective (docs inert)",
+        mixed.decision == Decision::Selective,
+    );
 
-    let mixed2 = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into(), "Cargo.lock".into()]);
-    check("dbt + Cargo.lock ⇒ full (force wins)", mixed2.decision == Decision::Full);
+    let mixed2 = select(
+        &fp,
+        &dag,
+        &["detcore-dbt/src/lib.rs".into(), "Cargo.lock".into()],
+    );
+    check(
+        "dbt + Cargo.lock ⇒ full (force wins)",
+        mixed2.decision == Decision::Full,
+    );
 
     let rs_lint = select(&fp, &dag, &["hermit-verify/src/main.rs".into()]);
-    check("rs change pulls clippy", rs_lint.nodes.contains("lint.clippy"));
+    check(
+        "rs change pulls clippy",
+        rs_lint.nodes.contains("lint.clippy"),
+    );
 
     // --- shard + e2e cell derivation (footprint → shard-selection layer) ---
     let total_cells = plan.cells.len();
@@ -1152,15 +1351,28 @@ fn self_test() {
     let rp_full = derive_run_plan(&lock, &shards, &plan, &dag);
     check("full ⇒ all shards", rp_full.shards.len() == total_shards);
     check("full ⇒ all cells", rp_full.cells.len() == total_cells);
-    check("full ⇒ all builds", rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux);
+    check(
+        "full ⇒ all builds",
+        rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux,
+    );
 
     // DBT is a Cargo dependency of hermit. Package-level reverse-dependency
     // closure therefore includes Hermit's other third-party-backend test
     // nodes, while explicit backend affinity still limits e2e cells to DBT.
     let rp_dbt = derive_run_plan(&dbt, &shards, &plan, &dag);
-    check("dbt ⇒ dbt-parity shard", rp_dbt.shards.contains(&"dbt-parity".to_string()));
-    check("dbt ⇒ hermit reverse-dep sabre shard", rp_dbt.shards.contains(&"sabre".to_string()));
-    let expected_dbt_cells = plan.cells.iter().filter(|cell| cell.backend == "dbt").count();
+    check(
+        "dbt ⇒ dbt-parity shard",
+        rp_dbt.shards.contains(&"dbt-parity".to_string()),
+    );
+    check(
+        "dbt ⇒ hermit reverse-dep sabre shard",
+        rp_dbt.shards.contains(&"sabre".to_string()),
+    );
+    let expected_dbt_cells = plan
+        .cells
+        .iter()
+        .filter(|cell| cell.backend == "dbt")
+        .count();
     check(
         "dbt ⇒ exactly the planned dbt cells",
         rp_dbt.cells.len() == expected_dbt_cells
@@ -1170,33 +1382,77 @@ fn self_test() {
     // independent of that population so dropping every DBT cell cannot pass.
     let mixed_backend_fixture = Plan {
         cells: vec![
-            Cell { category: "fixture-a".into(), mode: "run".into(), backend: "dbt".into() },
-            Cell { category: "fixture-a".into(), mode: "run".into(), backend: "ptrace".into() },
-            Cell { category: "fixture-b".into(), mode: "verify".into(), backend: "dbt".into() },
-            Cell { category: "fixture-b".into(), mode: "verify".into(), backend: "sabre".into() },
+            Cell {
+                category: "fixture-a".into(),
+                mode: "run".into(),
+                backend: "dbt".into(),
+            },
+            Cell {
+                category: "fixture-a".into(),
+                mode: "run".into(),
+                backend: "ptrace".into(),
+            },
+            Cell {
+                category: "fixture-b".into(),
+                mode: "verify".into(),
+                backend: "dbt".into(),
+            },
+            Cell {
+                category: "fixture-b".into(),
+                mode: "verify".into(),
+                backend: "sabre".into(),
+            },
         ],
     };
     let selected_fixture = derive_run_plan(&dbt, &shards, &mixed_backend_fixture, &dag);
     check(
         "dbt fixture ⇒ both DBT identities and no other backend",
-        selected_fixture.cells.iter().map(Plan::slug).collect::<Vec<_>>()
-            == vec!["fixture-a__run__dbt".to_string(), "fixture-b__verify__dbt".to_string()],
+        selected_fixture
+            .cells
+            .iter()
+            .map(Plan::slug)
+            .collect::<Vec<_>>()
+            == vec![
+                "fixture-a__run__dbt".to_string(),
+                "fixture-b__verify__dbt".to_string(),
+            ],
     );
-    check("dbt ⇒ reverse-dep builds dbt and aux", rp_dbt.build_dbt && rp_dbt.build_aux);
-    check("dbt ⇒ cells are a strict subset", rp_dbt.cells.len() < total_cells);
+    check(
+        "dbt ⇒ reverse-dep builds dbt and aux",
+        rp_dbt.build_dbt && rp_dbt.build_aux,
+    );
+    check(
+        "dbt ⇒ cells are a strict subset",
+        rp_dbt.cells.len() < total_cells,
+    );
 
     // SaBRe backend change: only sabre cells + sabre shard.
     let sabre = select(&fp, &dag, &["detcore-sabre/src/lib.rs".into()]);
     let rp_sabre = derive_run_plan(&sabre, &shards, &plan, &dag);
-    check("sabre ⇒ sabre shard", rp_sabre.shards.contains(&"sabre".to_string()));
-    check("sabre ⇒ only sabre cells", !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"));
-    check("sabre ⇒ build_dbt, not aux", rp_sabre.build_dbt && !rp_sabre.build_aux);
+    check(
+        "sabre ⇒ sabre shard",
+        rp_sabre.shards.contains(&"sabre".to_string()),
+    );
+    check(
+        "sabre ⇒ only sabre cells",
+        !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"),
+    );
+    check(
+        "sabre ⇒ build_dbt, not aux",
+        rp_sabre.build_dbt && !rp_sabre.build_aux,
+    );
 
     // LiteInst runtime change: only liteinst cells + liteinst shard.
     let liteinst = select(&fp, &dag, &["scripts/stage-liteinst-runtime.sh".into()]);
     let rp_lite = derive_run_plan(&liteinst, &shards, &plan, &dag);
-    check("liteinst ⇒ liteinst shard", rp_lite.shards.contains(&"liteinst".to_string()));
-    check("liteinst ⇒ only liteinst cells", !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"));
+    check(
+        "liteinst ⇒ liteinst shard",
+        rp_lite.shards.contains(&"liteinst".to_string()),
+    );
+    check(
+        "liteinst ⇒ only liteinst cells",
+        !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"),
+    );
 
     // Core change: all backends' cells (shared Detcore path).
     let rp_core = derive_run_plan(&core, &shards, &plan, &dag);
@@ -1206,33 +1462,64 @@ fn self_test() {
     // Pure standalone-script change: shards but no e2e cells.
     let rp_scripts = derive_run_plan(&rs_lint, &shards, &plan, &dag);
     check("hermit-verify ⇒ 0 e2e cells", rp_scripts.cells.is_empty());
-    check("hermit-verify retains the regular-crates unit-parallel shard",
-        rp_scripts.shards.contains(&"unit-parallel".to_string()));
+    check(
+        "hermit-verify retains the regular-crates unit-parallel shard",
+        rp_scripts.shards.contains(&"unit-parallel".to_string()),
+    );
 
-    let only_regular = Selection { decision: Decision::Selective,
+    let only_regular = Selection {
+        decision: Decision::Selective,
         nodes: BTreeSet::from(["test.regular_crates_on_host".into()]),
-        e2e_all: false, e2e_backends: BTreeSet::new(), reasons: vec![] };
+        e2e_all: false,
+        e2e_backends: BTreeSet::new(),
+        reasons: vec![],
+    };
     let regular_plan = derive_run_plan(&only_regular, &shards, &plan, &dag);
-    check("one hosted regular node selects exactly its original public shard",
+    check(
+        "one hosted regular node selects exactly its original public shard",
         regular_plan.shards == vec!["unit-parallel".to_string()]
-            && regular_plan.cells.is_empty() && regular_plan.build_debug
-            && !regular_plan.build_dbt && !regular_plan.build_aux);
-    let mut missing = Dag { all_nodes: dag.all_nodes.clone(), deps: dag.deps.clone() };
-    check("actual regular counterpart exists before the missing-shard control",
-        missing.all_nodes.remove("test.regular_crates_on_host"));
-    let regular_shard = shards.debug.iter().find(|shard| shard.slug == "unit-parallel").unwrap();
-    check("removed declared shard counterpart is refused",
-        resolved_shard_nodes(regular_shard, &missing).is_err());
-    let literal_shard = Shard { slug: "literal".into(), needs: String::new(),
-        nodes: vec!["test.exact".into()] };
-    check("shard resolution also prefers the literal node over another hosted node",
+            && regular_plan.cells.is_empty()
+            && regular_plan.build_debug
+            && !regular_plan.build_dbt
+            && !regular_plan.build_aux,
+    );
+    let mut missing = Dag {
+        all_nodes: dag.all_nodes.clone(),
+        deps: dag.deps.clone(),
+    };
+    check(
+        "actual regular counterpart exists before the missing-shard control",
+        missing.all_nodes.remove("test.regular_crates_on_host"),
+    );
+    let regular_shard = shards
+        .debug
+        .iter()
+        .find(|shard| shard.slug == "unit-parallel")
+        .unwrap();
+    check(
+        "removed declared shard counterpart is refused",
+        resolved_shard_nodes(regular_shard, &missing).is_err(),
+    );
+    let literal_shard = Shard {
+        slug: "literal".into(),
+        needs: String::new(),
+        nodes: vec!["test.exact".into()],
+    };
+    check(
+        "shard resolution also prefers the literal node over another hosted node",
         resolved_shard_nodes(&literal_shard, &alias_fixture).unwrap()
-            == BTreeSet::from(["test.exact".into()]));
+            == BTreeSet::from(["test.exact".into()]),
+    );
 
     // Backend disjointness: the dbt and sabre cell sets never overlap.
     check(
         "dbt vs sabre cells disjoint",
-        !rp_dbt.cells.iter().any(|d| rp_sabre.cells.iter().any(|s| Plan::slug(d) == Plan::slug(s))),
+        !rp_dbt.cells.iter().any(|d| {
+            rp_sabre
+                .cells
+                .iter()
+                .any(|s| Plan::slug(d) == Plan::slug(s))
+        }),
     );
 
     // --- local-delta merge (pure) ---
@@ -1255,7 +1542,10 @@ fn self_test() {
     // A resolved baseline feeds the SAME select() path as a PR diff, so the
     // local delta of a docs-only change must still skip.
     let local_docs = select(&fp, &dag, &["docs/z.md".into()]);
-    check("local docs-only ⇒ skip", local_docs.decision == Decision::Skip);
+    check(
+        "local docs-only ⇒ skip",
+        local_docs.decision == Decision::Skip,
+    );
 
     println!("\n{total} check(s), {failures} failure(s)");
     if failures > 0 {

@@ -15,14 +15,14 @@
 #include <unistd.h>
 
 /*
- * The kernel AIO interface (io_setup/io_submit/io_getevents/io_destroy, distinct
- * from io_uring) completes asynchronous I/O out of program order and exposes
- * host-timing-dependent completion events. Hermit refuses the whole subsystem
- * deterministically with ENOSYS rather than admitting that nondeterminism into
- * the guest, mirroring the io_uring and copy_file_range contracts. This row
- * asserts that every AIO entry point fails identically with ENOSYS across all
- * three backends and that the refused io_setup leaves the caller's context id
- * untouched, even though io_setup succeeds outside Hermit.
+ * The kernel AIO interface (io_setup/io_submit/io_getevents/io_destroy,
+ * distinct from io_uring) completes asynchronous I/O out of program order and
+ * exposes host-timing-dependent completion events. Hermit refuses the whole
+ * subsystem deterministically with ENOSYS rather than admitting that
+ * nondeterminism into the guest, mirroring the io_uring and copy_file_range
+ * contracts. This row asserts that every AIO entry point fails identically with
+ * ENOSYS across all three backends and that the refused io_setup leaves the
+ * caller's context id untouched, even though io_setup succeeds outside Hermit.
  */
 
 int main(void) {
@@ -53,7 +53,7 @@ int main(void) {
   }
 
   errno = 0;
-  result = syscall(SYS_io_submit, (unsigned long)0x1234, 0L, (void *)0);
+  result = syscall(SYS_io_submit, (unsigned long)0x1234, 0L, (void*)0);
   if (result == -1 && errno == ENOSYS) {
     ok++;
   } else {
@@ -68,7 +68,7 @@ int main(void) {
 
   errno = 0;
   result = syscall(
-      SYS_io_getevents, (unsigned long)0x1234, 0L, 0L, (void *)0, (void *)0);
+      SYS_io_getevents, (unsigned long)0x1234, 0L, 0L, (void*)0, (void*)0);
   if (result == -1 && errno == ENOSYS) {
     ok++;
   } else {

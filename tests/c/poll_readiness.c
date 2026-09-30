@@ -10,8 +10,8 @@
  * I/O readiness (poll/select/ppoll) parity probe.
  *
  * A single process creates one pipe and drives it through a fixed sequence of
- * states, querying readiness with a ZERO timeout at each step so the result is a
- * pure function of the pipe's buffered state and never a function of elapsed
+ * states, querying readiness with a ZERO timeout at each step so the result is
+ * a pure function of the pipe's buffered state and never a function of elapsed
  * time. It checks the invariants Detcore's readiness model must preserve
  * identically on every backend:
  *
@@ -19,8 +19,9 @@
  *     write end writable (POLLOUT) under both poll(2) and select(2).
  *   - After the buffered data is drained, with the write end still open, the
  *     read end reports NOT ready with a zero timeout (poll returns 0).
- *   - After the write end is closed, the read end reports an event: poll returns
- *     a nonzero revents mask that includes POLLHUP (and/or POLLIN for the EOF).
+ *   - After the write end is closed, the read end reports an event: poll
+ * returns a nonzero revents mask that includes POLLHUP (and/or POLLIN for the
+ * EOF).
  *   - ppoll(2) with a zero timespec agrees with poll(2) on the writable case.
  *
  * A zero timeout means the calls return immediately; no wall-clock, monotonic
@@ -29,8 +30,8 @@
  *
  *   poll_readiness ok=8
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no timestamp, cpu-time, pid, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no timestamp, cpu-time, pid, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -43,7 +44,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -162,8 +163,8 @@ int main(void) {
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "poll completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(stderr, "poll completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

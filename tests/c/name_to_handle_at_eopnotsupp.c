@@ -22,7 +22,7 @@
 
 int main(void) {
   size_t storage_size = sizeof(struct file_handle) + 128;
-  struct file_handle *handle = calloc(1, storage_size);
+  struct file_handle* handle = calloc(1, storage_size);
   if (handle == NULL) {
     perror("allocate file handle");
     return 2;
@@ -31,13 +31,16 @@ int main(void) {
 
   int mount_id = 0;
   errno = 0;
-  long result = syscall(SYS_name_to_handle_at, AT_FDCWD, "/", handle,
-                        &mount_id, 0U);
+  long result =
+      syscall(SYS_name_to_handle_at, AT_FDCWD, "/", handle, &mount_id, 0U);
   if (result != -1 || errno != EOPNOTSUPP) {
-    fprintf(stderr,
-            "name_to_handle_at returned %ld with errno %d (%s), expected "
-            "EOPNOTSUPP\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "name_to_handle_at returned %ld with errno %d (%s), expected "
+        "EOPNOTSUPP\n",
+        result,
+        errno,
+        strerror(errno));
     free(handle);
     return 1;
   }

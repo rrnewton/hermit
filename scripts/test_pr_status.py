@@ -48,9 +48,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "status": "COMPLETED",
             },
         ]
-        self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red"
-        )
+        self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red")
 
     def test_incomplete_status_is_pending(self) -> None:
         checks = [
@@ -167,9 +165,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
             pr_status.classify_ci_rollup("rrnewton/reverie", [merge_gate]), "green"
         )
         self.assertEqual(
-            pr_status.classify_ci_rollup(
-                "rrnewton/reverie", [merge_gate, auxiliary]
-            ),
+            pr_status.classify_ci_rollup("rrnewton/reverie", [merge_gate, auxiliary]),
             "green",
         )
 
@@ -282,8 +278,12 @@ class RenderReportTest(unittest.TestCase):
 
 class ClassifyRunConclusionTest(unittest.TestCase):
     def test_success_is_pass(self) -> None:
-        self.assertEqual(pr_status.classify_run_conclusion("success", "completed"), "pass")
-        self.assertEqual(pr_status.classify_run_conclusion("SUCCESS", "COMPLETED"), "pass")
+        self.assertEqual(
+            pr_status.classify_run_conclusion("success", "completed"), "pass"
+        )
+        self.assertEqual(
+            pr_status.classify_run_conclusion("SUCCESS", "COMPLETED"), "pass"
+        )
 
     def test_failure_family_is_fail(self) -> None:
         for concl in ("failure", "timed_out", "error", "startup_failure"):
@@ -301,9 +301,13 @@ class ClassifyRunConclusionTest(unittest.TestCase):
             )
 
     def test_no_conclusion_yet_is_pending(self) -> None:
-        self.assertEqual(pr_status.classify_run_conclusion("", "in_progress"), "no-result")
+        self.assertEqual(
+            pr_status.classify_run_conclusion("", "in_progress"), "no-result"
+        )
         self.assertEqual(pr_status.classify_run_conclusion(None, "queued"), "no-result")
-        self.assertEqual(pr_status.classify_run_conclusion("", "completed"), "no-result")
+        self.assertEqual(
+            pr_status.classify_run_conclusion("", "completed"), "no-result"
+        )
 
     def test_unknown_conclusion_is_other(self) -> None:
         self.assertEqual(
@@ -372,8 +376,18 @@ class RenderMainCiTest(unittest.TestCase):
 
     def test_counts_ordering_and_failure_highlight(self) -> None:
         runs = [
-            self._run("aaaaaaaa", "CI (GitHub-managed portable)", "success", "2026-07-27T10:00:00Z"),
-            self._run("bbbbbbbb", "CI (GitHub-managed portable)", "failure", "2026-07-27T12:00:00Z"),
+            self._run(
+                "aaaaaaaa",
+                "CI (GitHub-managed portable)",
+                "success",
+                "2026-07-27T10:00:00Z",
+            ),
+            self._run(
+                "bbbbbbbb",
+                "CI (GitHub-managed portable)",
+                "failure",
+                "2026-07-27T12:00:00Z",
+            ),
             self._run("cccccccc", "Docs", "", "2026-07-27T13:00:00Z"),
         ]
         report = pr_status.render_main_ci(runs, "rrnewton/hermit", 10)

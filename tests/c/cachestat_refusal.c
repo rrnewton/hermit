@@ -4,8 +4,8 @@
  * cachestat(2) (Linux 6.5+) reports page-cache residency for a file
  * descriptor: how many pages are cached, dirty, in writeback, evicted, and
  * recently evicted. Those counters are pure host page-cache state — they depend
- * on what the host kernel happens to have cached at that instant and vary run to
- * run and host to host. Exposing them to a guest would be an uncontrolled
+ * on what the host kernel happens to have cached at that instant and vary run
+ * to run and host to host. Exposing them to a guest would be an uncontrolled
  * nondeterminism channel, so Hermit refuses the syscall with a deterministic
  * ENOSYS on every backend, exactly as it does for io_uring, listmount,
  * copy_file_range, and kernel AIO.
@@ -37,16 +37,16 @@
 #endif
 
 struct cachestat_range_k {
-    uint64_t off;
-    uint64_t len;
+  uint64_t off;
+  uint64_t len;
 };
 
 struct cachestat_k {
-    uint64_t nr_cache;
-    uint64_t nr_dirty;
-    uint64_t nr_writeback;
-    uint64_t nr_evicted;
-    uint64_t nr_recently_evicted;
+  uint64_t nr_cache;
+  uint64_t nr_dirty;
+  uint64_t nr_writeback;
+  uint64_t nr_evicted;
+  uint64_t nr_recently_evicted;
 };
 
 /*
@@ -54,55 +54,56 @@ struct cachestat_k {
  * exactly as the caller pre-filled it (a refusal must copy no host state).
  */
 static int refused_and_untouched(int fd) {
-    const uint64_t sentinel = 0xEEEEEEEEEEEEEEEEULL;
-    struct cachestat_range_k range = {0, 0};
-    struct cachestat_k stat;
-    memset(&stat, 0xEE, sizeof(stat));
+  const uint64_t sentinel = 0xEEEEEEEEEEEEEEEEULL;
+  struct cachestat_range_k range = {0, 0};
+  struct cachestat_k stat;
+  memset(&stat, 0xEE, sizeof(stat));
 
-    errno = 0;
-    long rc = syscall(SYS_cachestat, (unsigned)fd, &range, &stat, 0u);
-    if (!(rc == -1 && errno == ENOSYS)) {
-        return 0;
-    }
-    if (stat.nr_cache != sentinel || stat.nr_dirty != sentinel ||
-        stat.nr_writeback != sentinel || stat.nr_evicted != sentinel ||
-        stat.nr_recently_evicted != sentinel) {
-        return 0;
-    }
-    return 1;
+  errno = 0;
+  long rc = syscall(SYS_cachestat, (unsigned)fd, &range, &stat, 0u);
+  if (!(rc == -1 && errno == ENOSYS)) {
+    return 0;
+  }
+  if (stat.nr_cache != sentinel || stat.nr_dirty != sentinel ||
+      stat.nr_writeback != sentinel || stat.nr_evicted != sentinel ||
+      stat.nr_recently_evicted != sentinel) {
+    return 0;
+  }
+  return 1;
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 2 };
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 2 };
+  int ok = 0;
 
-    int dir_fd = open("/tmp", O_RDONLY);
-    if (dir_fd >= 0) {
-        if (refused_and_untouched(dir_fd)) {
-            ok += 1;
-        }
-        close(dir_fd);
+  int dir_fd = open("/tmp", O_RDONLY);
+  if (dir_fd >= 0) {
+    if (refused_and_untouched(dir_fd)) {
+      ok += 1;
     }
+    close(dir_fd);
+  }
 
-    char path[] = "/tmp/cachestat_refusal.XXXXXX";
-    int file_fd = mkstemp(path);
-    if (file_fd >= 0) {
-        if (write(file_fd, "hello\n", 6) == 6 && refused_and_untouched(file_fd)) {
-            ok += 1;
-        }
-        close(file_fd);
-        unlink(path);
+  char path[] = "/tmp/cachestat_refusal.XXXXXX";
+  int file_fd = mkstemp(path);
+  if (file_fd >= 0) {
+    if (write(file_fd, "hello\n", 6) == 6 && refused_and_untouched(file_fd)) {
+      ok += 1;
     }
+    close(file_fd);
+    unlink(path);
+  }
 
-    printf("cachestat ok=%d\n", ok);
-    /* Route a behavioural failure into the exit status. Without this the guest
-       exits 0 whatever `ok` reached, so a regression only lowered the printed
-       number -- and under --verify both runs lower it identically, so the
-       comparison still matches and the cell stays green. Every check above is
-       unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-    	fprintf(stderr, "cachestat completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-    	return 1;
-    }
-    return 0;
+  printf("cachestat ok=%d\n", ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(
+        stderr, "cachestat completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
+  return 0;
 }

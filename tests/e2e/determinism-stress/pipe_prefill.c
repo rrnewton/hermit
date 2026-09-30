@@ -13,7 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void fail(const char *operation) {
+static void fail(const char* operation) {
   fprintf(stderr, "%s: %s\n", operation, strerror(errno));
   exit(EXIT_FAILURE);
 }
@@ -62,13 +62,17 @@ int main(void) {
   const ssize_t length = read(outbound[0], output, sizeof(output));
   close(outbound[0]);
   int status = 0;
-  if (waitpid(child, &status, 0) != child || length != (ssize_t)sizeof(output) ||
-      !WIFEXITED(status) || WEXITSTATUS(status) != 37 ||
+  if (waitpid(child, &status, 0) != child ||
+      length != (ssize_t)sizeof(output) || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 37 ||
       memcmp(output, expected, sizeof(expected)) != 0) {
     return EXIT_FAILURE;
   }
 
-  printf("fork-pipe bytes=%zu child-exit=%d payload=%s\n", sizeof(output),
-         WEXITSTATUS(status), output);
+  printf(
+      "fork-pipe bytes=%zu child-exit=%d payload=%s\n",
+      sizeof(output),
+      WEXITSTATUS(status),
+      output);
   return EXIT_SUCCESS;
 }

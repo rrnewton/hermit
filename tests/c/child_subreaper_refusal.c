@@ -15,8 +15,8 @@
  * PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER reconfigure how orphaned
  * descendants are re-parented: a subreaper adopts the orphaned grandchildren of
  * the processes below it instead of letting them reparent to init. That rewires
- * the process-reaping hierarchy, which Hermit's deterministic container owns and
- * models directly, so Hermit refuses to let a guest mutate or query the
+ * the process-reaping hierarchy, which Hermit's deterministic container owns
+ * and models directly, so Hermit refuses to let a guest mutate or query the
  * subreaper attribute: both prctl requests fail with a deterministic ENOSYS on
  * every backend, exactly as io_uring, kernel AIO, and System V IPC are refused.
  * Outside Hermit the same calls succeed.

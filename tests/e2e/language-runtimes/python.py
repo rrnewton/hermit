@@ -57,7 +57,9 @@ def thread_probe():
                 schedule.append(worker_id)
             time.sleep(0)
 
-    workers = [threading.Thread(target=worker, args=(index,)) for index in range(THREADS)]
+    workers = [
+        threading.Thread(target=worker, args=(index,)) for index in range(THREADS)
+    ]
     for worker in workers:
         worker.start()
     ready.wait()

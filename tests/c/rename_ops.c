@@ -22,7 +22,7 @@
 enum { ROOT_CAP = 64, PATH_CAP = 128 };
 
 // Create a file at path holding exactly data; 0 on success, -1 otherwise.
-static int mkfile(const char *path, const char *data) {
+static int mkfile(const char* path, const char* data) {
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
     return -1;
@@ -34,13 +34,13 @@ static int mkfile(const char *path, const char *data) {
 }
 
 // 1 if stat(path) fails with ENOENT (the name is absent), 0 otherwise.
-static int missing(const char *path) {
+static int missing(const char* path) {
   struct stat st;
   return stat(path, &st) != 0 && errno == ENOENT;
 }
 
 // File size at path, or -1 if it cannot be stat'd.
-static long fsize(const char *path) {
+static long fsize(const char* path) {
   struct stat st;
   return stat(path, &st) == 0 ? (long)st.st_size : -1;
 }
@@ -83,8 +83,7 @@ int main(void) {
   if (mkdir(sub, 0755) == 0) {
     int rootfd = open(root, O_RDONLY | O_DIRECTORY);
     int subfd = open(sub, O_RDONLY | O_DIRECTORY);
-    if (rootfd >= 0 && subfd >= 0 &&
-        renameat(rootfd, "b", subfd, "c") == 0) {
+    if (rootfd >= 0 && subfd >= 0 && renameat(rootfd, "b", subfd, "c") == 0) {
       snprintf(subb, sizeof subb, "%s/sub/c", root);
       if (missing(b) && fsize(subb) == 6) {
         ok++;
@@ -107,8 +106,8 @@ int main(void) {
 
   // Remove the whole temporary tree so the fixture is idempotent. Leaving the
   // mkdtemp root behind would make a second run (for example the second pass of
-  // hermit --verify, which replays the same deterministic random stream) collide
-  // on the same candidate name and retry, perturbing the syscall count.
+  // hermit --verify, which replays the same deterministic random stream)
+  // collide on the same candidate name and retry, perturbing the syscall count.
   snprintf(subb, sizeof subb, "%s/sub/c", root);
   unlink(subb);
   rmdir(sub);

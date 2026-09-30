@@ -27,7 +27,7 @@
 #define SYNC_FILE_RANGE_WRITE 2
 #endif
 
-static void require_zero(long result, const char *name) {
+static void require_zero(long result, const char* name) {
   if (result != 0) {
     perror(name);
     exit(1);
@@ -36,29 +36,34 @@ static void require_zero(long result, const char *name) {
 
 static int expected_xattr_error(int error) {
   return error == EACCES || error == ENODATA || error == ENOTSUP ||
-         error == EOPNOTSUPP || error == EPERM;
+      error == EOPNOTSUPP || error == EPERM;
 }
 
-static void require_xattr_result(ssize_t result, const char *name) {
+static void require_xattr_result(ssize_t result, const char* name) {
   if (result < 0 && !expected_xattr_error(errno)) {
     perror(name);
     exit(1);
   }
 }
 
-static void require_xattr_value(ssize_t result, const char *name,
-                                const char *actual, const char *expected,
-                                size_t expected_len, int must_exist) {
+static void require_xattr_value(
+    ssize_t result,
+    const char* name,
+    const char* actual,
+    const char* expected,
+    size_t expected_len,
+    int must_exist) {
   require_xattr_result(result, name);
-  if (must_exist && (result != (ssize_t)expected_len ||
-                     memcmp(actual, expected, expected_len) != 0)) {
+  if (must_exist &&
+      (result != (ssize_t)expected_len ||
+       memcmp(actual, expected, expected_len) != 0)) {
     fprintf(stderr, "%s returned unexpected extended-attribute value\n", name);
     exit(1);
   }
 }
 
-static int xattr_list_contains(const char *list, size_t list_len,
-                               const char *name) {
+static int
+xattr_list_contains(const char* list, size_t list_len, const char* name) {
   size_t offset = 0;
   size_t name_len = strlen(name);
   while (offset < list_len) {
@@ -75,9 +80,12 @@ static int xattr_list_contains(const char *list, size_t list_len,
   return 0;
 }
 
-static void require_xattr_list(ssize_t result, const char *call_name,
-                               const char *list, const char *xattr_name,
-                               int must_exist) {
+static void require_xattr_list(
+    ssize_t result,
+    const char* call_name,
+    const char* list,
+    const char* xattr_name,
+    int must_exist) {
   require_xattr_result(result, call_name);
   if (must_exist &&
       (result < 0 || !xattr_list_contains(list, (size_t)result, xattr_name))) {
@@ -92,10 +100,16 @@ int main(void) {
   char symlink_path[128];
   long pid = (long)getpid();
   snprintf(path, sizeof(path), "/tmp/hermit-file-metadata-%ld", pid);
-  snprintf(hardlink_path, sizeof(hardlink_path),
-           "/tmp/hermit-file-metadata-%ld-hard", pid);
-  snprintf(symlink_path, sizeof(symlink_path),
-           "/tmp/hermit-file-metadata-%ld-sym", pid);
+  snprintf(
+      hardlink_path,
+      sizeof(hardlink_path),
+      "/tmp/hermit-file-metadata-%ld-hard",
+      pid);
+  snprintf(
+      symlink_path,
+      sizeof(symlink_path),
+      "/tmp/hermit-file-metadata-%ld-sym",
+      pid);
 
   unlink(symlink_path);
   unlink(hardlink_path);
@@ -114,8 +128,11 @@ int main(void) {
   }
   off_t offset_after = lseek(fd, 0, SEEK_CUR);
   if (offset_after != offset_before) {
-    fprintf(stderr, "pwrite changed file offset: %ld -> %ld\n",
-            (long)offset_before, (long)offset_after);
+    fprintf(
+        stderr,
+        "pwrite changed file offset: %ld -> %ld\n",
+        (long)offset_before,
+        (long)offset_after);
     return 1;
   }
   char readback[8] = {0};
@@ -130,8 +147,8 @@ int main(void) {
   require_zero(fchmod(fd, 0600), "fchmod");
   require_zero(fchown(fd, uid, gid), "fchown");
   require_zero(syscall(SYS_fchownat, AT_FDCWD, path, uid, gid, 0), "fchownat");
-  require_zero(syscall(SYS_faccessat, AT_FDCWD, path, R_OK | W_OK),
-               "faccessat");
+  require_zero(
+      syscall(SYS_faccessat, AT_FDCWD, path, R_OK | W_OK), "faccessat");
 
   long fchmodat2_result = syscall(SYS_fchmodat2, AT_FDCWD, path, 0600, 0);
   if (fchmodat2_result != 0 && errno != ENOSYS) {
@@ -143,7 +160,7 @@ int main(void) {
   require_zero(symlink(path, symlink_path), "symlink");
   require_zero(lchown(symlink_path, uid, gid), "lchown");
 
-  const char *name = "user.hermit";
+  const char* name = "user.hermit";
   const char value[] = "metadata";
   char value_buffer[32] = {0};
   char list_buffer[128] = {0};
@@ -152,8 +169,8 @@ int main(void) {
   int must_exist = result == 0;
   memset(value_buffer, 0, sizeof(value_buffer));
   result = getxattr(path, name, value_buffer, sizeof(value_buffer));
-  require_xattr_value(result, "getxattr", value_buffer, value, sizeof(value),
-                      must_exist);
+  require_xattr_value(
+      result, "getxattr", value_buffer, value, sizeof(value), must_exist);
   memset(list_buffer, 0, sizeof(list_buffer));
   result = listxattr(path, list_buffer, sizeof(list_buffer));
   require_xattr_list(result, "listxattr", list_buffer, name, must_exist);
@@ -166,8 +183,8 @@ int main(void) {
   must_exist = result == 0;
   memset(value_buffer, 0, sizeof(value_buffer));
   result = fgetxattr(fd, name, value_buffer, sizeof(value_buffer));
-  require_xattr_value(result, "fgetxattr", value_buffer, value, sizeof(value),
-                      must_exist);
+  require_xattr_value(
+      result, "fgetxattr", value_buffer, value, sizeof(value), must_exist);
   memset(list_buffer, 0, sizeof(list_buffer));
   result = flistxattr(fd, list_buffer, sizeof(list_buffer));
   require_xattr_list(result, "flistxattr", list_buffer, name, must_exist);
@@ -180,8 +197,8 @@ int main(void) {
   must_exist = result == 0;
   memset(value_buffer, 0, sizeof(value_buffer));
   result = lgetxattr(symlink_path, name, value_buffer, sizeof(value_buffer));
-  require_xattr_value(result, "lgetxattr", value_buffer, value, sizeof(value),
-                      must_exist);
+  require_xattr_value(
+      result, "lgetxattr", value_buffer, value, sizeof(value), must_exist);
   memset(list_buffer, 0, sizeof(list_buffer));
   result = llistxattr(symlink_path, list_buffer, sizeof(list_buffer));
   require_xattr_list(result, "llistxattr", list_buffer, name, must_exist);
@@ -189,7 +206,7 @@ int main(void) {
   must_exist ? require_zero(result, "lremovexattr")
              : require_xattr_result(result, "lremovexattr");
 
-  void *mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  void* mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (mapping == MAP_FAILED) {
     perror("mmap");
     return 1;
@@ -199,8 +216,9 @@ int main(void) {
   require_zero(munmap(mapping, 4096), "munmap");
 
   require_zero(syscall(SYS_readahead, fd, 0, 4096), "readahead");
-  require_zero(syscall(SYS_sync_file_range, fd, 0, 4096, SYNC_FILE_RANGE_WRITE),
-               "sync_file_range");
+  require_zero(
+      syscall(SYS_sync_file_range, fd, 0, 4096, SYNC_FILE_RANGE_WRITE),
+      "sync_file_range");
 
   require_zero(close(fd), "close");
   require_zero(unlink(symlink_path), "unlink symlink");

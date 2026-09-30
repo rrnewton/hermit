@@ -67,7 +67,8 @@ int main(void) {
 
   if (ftruncate(fd, 10) == 0 && fd_size(fd) == 10) {
     char tail[4] = {1, 1, 1, 1};
-    if (pread(fd, tail, sizeof tail, (off_t)payload_len) == (ssize_t)sizeof tail &&
+    if (pread(fd, tail, sizeof tail, (off_t)payload_len) ==
+            (ssize_t)sizeof tail &&
         tail[0] == 0 && tail[1] == 0 && tail[2] == 0 && tail[3] == 0) {
       ok++; // 5: ftruncate grows with zero-filled tail
     }
@@ -80,9 +81,13 @@ int main(void) {
        number -- and under --verify both runs lower it identically, so the
        comparison still matches and the cell stays green. Every check above is
        unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-        fprintf(stderr, "memfd_create completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-        return 1;
-    }
-    return 0;
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(
+        stderr,
+        "memfd_create completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
+  }
+  return 0;
 }

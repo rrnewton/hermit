@@ -29,9 +29,9 @@
 
 /* struct open_how and RESOLVE_* may be absent on older toolchains. */
 struct parity_open_how {
-	__u64 flags;
-	__u64 mode;
-	__u64 resolve;
+  __u64 flags;
+  __u64 mode;
+  __u64 resolve;
 };
 
 #ifndef RESOLVE_NO_SYMLINKS
@@ -41,51 +41,49 @@ struct parity_open_how {
 #define RESOLVE_BENEATH 0x08
 #endif
 
-static int expect_enosys(const struct parity_open_how *how)
-{
-	errno = 0;
-	long r = syscall(SYS_openat2, AT_FDCWD, "/", how, sizeof(*how));
-	return (r == -1 && errno == ENOSYS) ? 1 : 0;
+static int expect_enosys(const struct parity_open_how* how) {
+  errno = 0;
+  long r = syscall(SYS_openat2, AT_FDCWD, "/", how, sizeof(*how));
+  return (r == -1 && errno == ENOSYS) ? 1 : 0;
 }
 
-int main(void)
-{
-	enum { EXPECTED_CHECKS = 3 };
-	int ok = 0;
+int main(void) {
+  enum { EXPECTED_CHECKS = 3 };
+  int ok = 0;
 
-	/* Plain read-only open via the extensible interface. */
-	struct parity_open_how basic = {
-		.flags = O_RDONLY,
-		.mode = 0,
-		.resolve = 0,
-	};
-	ok += expect_enosys(&basic);
+  /* Plain read-only open via the extensible interface. */
+  struct parity_open_how basic = {
+      .flags = O_RDONLY,
+      .mode = 0,
+      .resolve = 0,
+  };
+  ok += expect_enosys(&basic);
 
-	/* Scoped resolution request (RESOLVE_NO_SYMLINKS). */
-	struct parity_open_how scoped = {
-		.flags = O_RDONLY,
-		.mode = 0,
-		.resolve = RESOLVE_NO_SYMLINKS,
-	};
-	ok += expect_enosys(&scoped);
+  /* Scoped resolution request (RESOLVE_NO_SYMLINKS). */
+  struct parity_open_how scoped = {
+      .flags = O_RDONLY,
+      .mode = 0,
+      .resolve = RESOLVE_NO_SYMLINKS,
+  };
+  ok += expect_enosys(&scoped);
 
-	/* Beneath-scoped resolution request (RESOLVE_BENEATH). */
-	struct parity_open_how beneath = {
-		.flags = O_RDONLY,
-		.mode = 0,
-		.resolve = RESOLVE_BENEATH,
-	};
-	ok += expect_enosys(&beneath);
+  /* Beneath-scoped resolution request (RESOLVE_BENEATH). */
+  struct parity_open_how beneath = {
+      .flags = O_RDONLY,
+      .mode = 0,
+      .resolve = RESOLVE_BENEATH,
+  };
+  ok += expect_enosys(&beneath);
 
-	printf("openat2 ok=%d\n", ok);
-	/* Route a behavioural failure into the exit status. Without this the guest
-	   exits 0 whatever `ok` reached, so a regression only lowered the printed
-	   number -- and under --verify both runs lower it identically, so the
-	   comparison still matches and the cell stays green. Every check above is
-	   unchanged; this only requires all of them. */
-	if (ok != EXPECTED_CHECKS) {
-		fprintf(stderr, "openat2 completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-		return 1;
-	}
-	return 0;
+  printf("openat2 ok=%d\n", ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "openat2 completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
+  return 0;
 }

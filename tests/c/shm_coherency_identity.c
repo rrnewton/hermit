@@ -7,7 +7,8 @@
  */
 
 /*
- * Contract: WHAT EACH PROCESS OBSERVES THROUGH A SHARED MAPPING is deterministic.
+ * Contract: WHAT EACH PROCESS OBSERVES THROUGH A SHARED MAPPING is
+ * deterministic.
  *
  * This is a different question from thread scheduling. A backend can
  * sequentialize threads identically -- same thread running at the same point
@@ -61,25 +62,30 @@ static int observations = 0;
 /* Emit one observation: the label, the raw value seen, and the branch taken on
  * it. The branch is printed as its own token so a control-flow change is
  * visible even when the value is unchanged. */
-static void observe_u64(const char* label, unsigned long long v, const char* branch) {
+static void
+observe_u64(const char* label, unsigned long long v, const char* branch) {
   printf("OBS %-26s value=0x%016llx branch=%s\n", label, v, branch);
   observations++;
 }
 
-static void observe_words(const char* label, const volatile unsigned long long* p, int n) {
+static void
+observe_words(const char* label, const volatile unsigned long long* p, int n) {
   printf("OBS %-26s words=", label);
   for (int i = 0; i < n; i++) {
     printf("%s%llx", i ? "," : "", (unsigned long long)p[i]);
   }
   /* Which prefix of the record is populated: this is the PARTIAL-UPDATE
    * observation. A reader that catches 3 of 8 words has seen a real, legitimate
-   * intermediate state; the contract is that it catches the same 3 every run. */
+   * intermediate state; the contract is that it catches the same 3 every run.
+   */
   int filled = 0;
   while (filled < n && p[filled] != 0) {
     filled++;
   }
-  printf(" filled=%d branch=%s\n", filled,
-         filled == 0 ? "none" : (filled == n ? "complete" : "PARTIAL"));
+  printf(
+      " filled=%d branch=%s\n",
+      filled,
+      filled == 0 ? "none" : (filled == n ? "complete" : "PARTIAL"));
   observations++;
 }
 
@@ -109,8 +115,8 @@ int main(void) {
   }
 
   /* --- A: MAP_SHARED anonymous, across fork ------------------------------ */
-  volatile unsigned long long* anon =
-      mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  volatile unsigned long long* anon = mmap(
+      NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (anon == MAP_FAILED) {
     printf("SETUP mmap anon shared FAILED %s\n", strerror(errno));
     return 2;
@@ -143,8 +149,8 @@ int main(void) {
   printf("SETUP memfd %s\n", memmap == MAP_FAILED ? "UNAVAILABLE" : "ok");
 
   /* --- D: MAP_PRIVATE, for COW divergence -------------------------------- */
-  volatile unsigned long long* priv =
-      mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  volatile unsigned long long* priv = mmap(
+      NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (priv == MAP_FAILED) {
     printf("SETUP mmap private FAILED %s\n", strerror(errno));
     return 2;
@@ -173,13 +179,17 @@ int main(void) {
     }
     /* COW: the child's write must NOT be visible to the parent. */
     priv[0] = 0xBBBBBBBBBBBBBBBBULL;
-    observe_u64("child.private.after_write", priv[0],
-                priv[0] == 0xBBBBBBBBBBBBBBBBULL ? "child-sees-own" : "UNEXPECTED");
+    observe_u64(
+        "child.private.after_write",
+        priv[0],
+        priv[0] == 0xBBBBBBBBBBBBBBBBULL ? "child-sees-own" : "UNEXPECTED");
     /* msync: push the file-backed mapping and report the result, since a
      * backend can make msync a no-op and still look correct on read-back. */
     int rc = msync((void*)filemap, PAGE, MS_SYNC);
-    observe_u64("child.msync.rc", (unsigned long long)(long long)rc,
-                rc == 0 ? "synced" : "failed");
+    observe_u64(
+        "child.msync.rc",
+        (unsigned long long)(long long)rc,
+        rc == 0 ? "synced" : "failed");
     printf("OBSERVATIONS %d\n", observations);
     _exit(observations > 0 ? 0 : 3);
   }
@@ -192,12 +202,16 @@ int main(void) {
   }
 
   /* COW divergence: the parent must still see its own value. */
-  observe_u64("parent.private.after_child", priv[0],
-              priv[0] == 0xAAAAAAAAAAAAAAAAULL ? "COW-isolated"
-                                               : "LEAKED-child-write");
+  observe_u64(
+      "parent.private.after_child",
+      priv[0],
+      priv[0] == 0xAAAAAAAAAAAAAAAAULL ? "COW-isolated" : "LEAKED-child-write");
 
   int status = 0;
-  waitpid(pid, &status, 0); /* reap only; every observation above already happened */
+  waitpid(
+      pid,
+      &status,
+      0); /* reap only; every observation above already happened */
 
   /* After reaping, the writes must all be visible -- the settled state. */
   observe_words("parent.anon.settled", anon, NWORD);
@@ -205,15 +219,17 @@ int main(void) {
   if (memmap != MAP_FAILED) {
     observe_words("parent.memfd.settled", memmap, NWORD);
   }
-  observe_u64("parent.private.settled", priv[0],
-              priv[0] == 0xAAAAAAAAAAAAAAAAULL ? "COW-isolated"
-                                               : "LEAKED-child-write");
+  observe_u64(
+      "parent.private.settled",
+      priv[0],
+      priv[0] == 0xAAAAAAAAAAAAAAAAULL ? "COW-isolated" : "LEAKED-child-write");
 
   /* Read the backing FILE, not the mapping: msync's visible effect. */
   unsigned long long via_file[NWORD];
   memset(via_file, 0, sizeof(via_file));
   if (pread(fd, via_file, sizeof(via_file), 0) == (ssize_t)sizeof(via_file)) {
-    observe_words("parent.file.readback", (volatile unsigned long long*)via_file, NWORD);
+    observe_words(
+        "parent.file.readback", (volatile unsigned long long*)via_file, NWORD);
   } else {
     printf("OBS parent.file.readback UNREADABLE %s\n", strerror(errno));
   }
@@ -225,7 +241,8 @@ int main(void) {
   }
   unlink("shm_backing.bin");
 
-  /* NON-VACUITY GATE. A run that observed nothing must FAIL, not pass quietly. */
+  /* NON-VACUITY GATE. A run that observed nothing must FAIL, not pass quietly.
+   */
   printf("OBSERVATIONS %d\n", observations);
   if (observations == 0) {
     printf("VACUOUS: no shared-memory observation was made\n");

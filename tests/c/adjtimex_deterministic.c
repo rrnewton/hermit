@@ -26,11 +26,14 @@ int main(void) {
   errno = 0;
   long mutation_result = syscall(SYS_adjtimex, &mutation);
   if (mutation_result != -1 || errno != EPERM) {
-    fprintf(stderr, "adjtimex mutation returned %ld/%d, expected EPERM\n",
-            mutation_result, errno);
+    fprintf(
+        stderr,
+        "adjtimex mutation returned %ld/%d, expected EPERM\n",
+        mutation_result,
+        errno);
     return 1;
   }
-  printf("adjtimex-ok state=%ld status=%d tick=%ld\n", result, tx.status,
-         tx.tick);
+  printf(
+      "adjtimex-ok state=%ld status=%d tick=%ld\n", result, tx.status, tx.tick);
   return 0;
 }

@@ -10,7 +10,8 @@
  *   release  == "5.2.0"                    (pinned kernel release; native leaks
  *                                           the real running kernel, e.g. 6.x)
  *   nodename == "hermetic-container.local" (pinned hostname; native and the DBT
- *                                           backend leak the real host hostname)
+ *                                           backend leak the real host
+ * hostname)
  *
  * The ptrace and KVM backends determinize all four. The DBT (DynamoRIO) backend
  * pins release but forwards the *host* nodename, so it deterministically-but-
@@ -36,8 +37,8 @@
  * Under Hermit these are the virtualized identity and are identical on every
  * host, so emitting them keeps the output host-independent in the context this
  * fixture is contracted for. Natively they are the real host identity and this
- * fixture already fails by construction (native scores ok=2: sysname and machine
- * happen to match, release and nodename do not).
+ * fixture already fails by construction (native scores ok=2: sysname and
+ * machine happen to match, release and nodename do not).
  */
 #define PINNED_SYSNAME "Linux"
 #define PINNED_MACHINE "x86_64"
@@ -45,36 +46,36 @@
 #define PINNED_NODENAME "hermetic-container.local"
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 4 };
-    int ok = 0;
-    struct utsname u;
+  enum { EXPECTED_CHECKS = 4 };
+  int ok = 0;
+  struct utsname u;
 
-    memset(&u, 0, sizeof(u));
-    int uname_rc = uname(&u) == 0;
-    if (uname_rc) {
-        if (strcmp(u.sysname, PINNED_SYSNAME) == 0) {
-            ok += 1;
-        }
-        if (strcmp(u.machine, PINNED_MACHINE) == 0) {
-            ok += 1;
-        }
-        if (strcmp(u.release, PINNED_RELEASE) == 0) {
-            ok += 1;
-        }
-        if (strcmp(u.nodename, PINNED_NODENAME) == 0) {
-            ok += 1;
-        }
+  memset(&u, 0, sizeof(u));
+  int uname_rc = uname(&u) == 0;
+  if (uname_rc) {
+    if (strcmp(u.sysname, PINNED_SYSNAME) == 0) {
+      ok += 1;
     }
+    if (strcmp(u.machine, PINNED_MACHINE) == 0) {
+      ok += 1;
+    }
+    if (strcmp(u.release, PINNED_RELEASE) == 0) {
+      ok += 1;
+    }
+    if (strcmp(u.nodename, PINNED_NODENAME) == 0) {
+      ok += 1;
+    }
+  }
 
-    /* The four pinned strings ARE the contract, so they are emitted. Under
-     * Hermit they are the same virtualized identity on every host. */
-    printf(
-        "uname ok=%d uname_rc=%d sysname=%s machine=%s release=%s nodename=%s\n",
-        ok,
-        uname_rc,
-        u.sysname,
-        u.machine,
-        u.release,
-        u.nodename);
-    return ok == EXPECTED_CHECKS ? 0 : 1;
+  /* The four pinned strings ARE the contract, so they are emitted. Under
+   * Hermit they are the same virtualized identity on every host. */
+  printf(
+      "uname ok=%d uname_rc=%d sysname=%s machine=%s release=%s nodename=%s\n",
+      ok,
+      uname_rc,
+      u.sysname,
+      u.machine,
+      u.release,
+      u.nodename);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }

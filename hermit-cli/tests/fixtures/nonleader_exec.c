@@ -15,19 +15,20 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CHECK(expression)                                                       \
-  do {                                                                          \
-    if (!(expression)) {                                                        \
-      fprintf(stderr, "line %d: %s (errno=%d)\n", __LINE__, #expression, errno);   \
-      _exit(90);                                                                \
-    }                                                                           \
+#define CHECK(expression)                                                    \
+  do {                                                                       \
+    if (!(expression)) {                                                     \
+      fprintf(                                                               \
+          stderr, "line %d: %s (errno=%d)\n", __LINE__, #expression, errno); \
+      _exit(90);                                                             \
+    }                                                                        \
   } while (0)
 
 enum { ROUNDS = 2, SAMPLES = 4, FINAL_STATUS = 73 };
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t parked = PTHREAD_COND_INITIALIZER;
-static const char *program;
+static const char* program;
 static int round_number, ready_fd, ack_fd;
 static pid_t peer_tid;
 static uint64_t previous_time;
@@ -36,11 +37,15 @@ static int leader_waiting;
 static int leader_spinning;
 #endif
 
-static pid_t my_tid(void) { return (pid_t)syscall(SYS_gettid); }
-static pid_t my_pid(void) { return (pid_t)syscall(SYS_getpid); }
+static pid_t my_tid(void) {
+  return (pid_t)syscall(SYS_gettid);
+}
+static pid_t my_pid(void) {
+  return (pid_t)syscall(SYS_getpid);
+}
 
-static uint64_t parse(const char *text) {
-  char *end;
+static uint64_t parse(const char* text) {
+  char* end;
   errno = 0;
   uint64_t value = strtoull(text, &end, 10);
   CHECK(errno == 0 && end != text && *end == '\0');
@@ -80,8 +85,9 @@ static uint64_t spin_work(uint64_t iterations) {
 #endif
 
 /* Real branches between raw syscalls exercise the surviving PMU clock. Every
- * nanosecond sample and work result is printed and compared without rounding. */
-static uint64_t samples(const char *phase, int round, uint64_t previous) {
+ * nanosecond sample and work result is printed and compared without rounding.
+ */
+static uint64_t samples(const char* phase, int round, uint64_t previous) {
   for (unsigned index = 0; index < SAMPLES; ++index) {
     volatile uint64_t work = 1;
 #ifdef NONLEADER_EXEC_PREEMPT
@@ -104,14 +110,20 @@ static uint64_t samples(const char *phase, int round, uint64_t previous) {
     CHECK(now.tv_sec >= 0 && now.tv_nsec >= 0 && now.tv_nsec < 1000000000);
     uint64_t nanos = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
     CHECK(nanos > previous);
-    printf("sample round=%d phase=%s index=%u nanos=%" PRIu64 " work=%" PRIu64
-           "\n", round, phase, index, nanos, work);
+    printf(
+        "sample round=%d phase=%s index=%u nanos=%" PRIu64 " work=%" PRIu64
+        "\n",
+        round,
+        phase,
+        index,
+        nanos,
+        work);
     previous = nanos;
   }
   return previous;
 }
 
-static void *park_peer(void *unused) {
+static void* park_peer(void* unused) {
   (void)unused;
   CHECK(pthread_mutex_lock(&mutex) == 0);
   peer_tid = my_tid();
@@ -122,7 +134,7 @@ static void *park_peer(void *unused) {
   return NULL;
 }
 
-static void *exec_worker(void *unused) {
+static void* exec_worker(void* unused) {
   (void)unused;
   CHECK(pthread_mutex_lock(&mutex) == 0);
   while (!peer_tid)
@@ -135,15 +147,20 @@ static void *exec_worker(void *unused) {
     CHECK(pthread_cond_wait(&ready, &mutex) == 0);
 #else
   /* Obtaining this mutex proves the leader and peer released it in cond_wait.
-   * Keep it locked through exec, so even a spurious wake cannot let either run. */
+   * Keep it locked through exec, so even a spurious wake cannot let either run.
+   */
 #endif
   pid_t pid = my_pid(), worker = my_tid();
   CHECK(pid != worker && pid != peer_tid && worker != peer_tid);
   CHECK(syscall(SYS_tgkill, pid, pid, 0) == 0);
   CHECK(syscall(SYS_tgkill, pid, worker, 0) == 0);
   CHECK(syscall(SYS_tgkill, pid, peer_tid, 0) == 0);
-  printf("before round=%d pid=%d worker=%d peer=%d\n", round_number, pid,
-         worker, peer_tid);
+  printf(
+      "before round=%d pid=%d worker=%d peer=%d\n",
+      round_number,
+      pid,
+      worker,
+      peer_tid);
   uint64_t last = samples("before", round_number, previous_time);
   char next[16], leader[16], former[16], peer[16], clock[32], out[16], in[16];
   CHECK(snprintf(next, sizeof(next), "%d", round_number + 1) > 0);
@@ -153,8 +170,17 @@ static void *exec_worker(void *unused) {
   CHECK(snprintf(clock, sizeof(clock), "%" PRIu64, last) > 0);
   CHECK(snprintf(out, sizeof(out), "%d", ready_fd) > 0);
   CHECK(snprintf(in, sizeof(in), "%d", ack_fd) > 0);
-  char *const args[] = {(char *)program, "image", next, leader, former,
-                        peer, clock, out, in, NULL};
+  char* const args[] = {
+      (char*)program,
+      "image",
+      next,
+      leader,
+      former,
+      peer,
+      clock,
+      out,
+      in,
+      NULL};
   CHECK(fflush(stdout) == 0);
   execv(program, args);
   CHECK(0 && "worker exec must succeed");
@@ -189,7 +215,7 @@ static void start_round(void) {
 #endif
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   program = argv[0];
   if (argc == 9 && strcmp(argv[1], "image") == 0) {
     round_number = (int)parse(argv[2]);
@@ -208,8 +234,13 @@ int main(int argc, char **argv) {
     CHECK(syscall(SYS_tgkill, leader, former, 0) == -1 && errno == ESRCH);
     errno = 0;
     CHECK(syscall(SYS_tgkill, leader, peer, 0) == -1 && errno == ESRCH);
-    printf("after round=%d pid=%d tid=%d former=%d peer=%d gone=ESRCH\n",
-           round_number - 1, my_pid(), my_tid(), former, peer);
+    printf(
+        "after round=%d pid=%d tid=%d former=%d peer=%d gone=ESRCH\n",
+        round_number - 1,
+        my_pid(),
+        my_tid(),
+        former,
+        peer);
     previous_time = samples("after", round_number - 1, previous_time);
     CHECK(fflush(stdout) == 0);
     byte_write(ready_fd, (unsigned char)round_number);

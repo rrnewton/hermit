@@ -16,10 +16,10 @@ first failure is silent.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -152,8 +152,6 @@ class AReachableAuthorityStillSaysNo(unittest.TestCase):
         self.assertEqual(cancelled.stdout.strip(), "NO_RESULT")
 
 
-
-
 class TheSecondPinnedAuthorityAdapterUsesTheSameSpelling(unittest.TestCase):
     """review_contract_adapter.py fetches a different pinned contract and had
     the identical defect. One spelling across both, so a caller learns it once.
@@ -192,7 +190,9 @@ class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
     def test_probe_says_reachable_when_it_is(self) -> None:
         result = subprocess.run(
             [str(SCRIPTS / "authority-available.sh")],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if result.returncode == 3:
             self.skipTest("authority genuinely unreachable here")
@@ -213,15 +213,20 @@ class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
             stub.chmod(stub.stat().st_mode | stat_module.S_IEXEC)
             result = subprocess.run(
                 [str(SCRIPTS / "authority-available.sh"), str(stub)],
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                check=False,
             )
 
         self.assertNotEqual(
-            result.returncode, 3,
+            result.returncode,
+            3,
             "an ordinary adapter error must not be reported as unreachable, or a "
             "broken adapter would make every guarded checker skip silently",
         )
-        self.assertNotEqual(result.returncode, 0, "and it must not be reported as success")
+        self.assertNotEqual(
+            result.returncode, 0, "and it must not be reported as success"
+        )
 
     def test_oracle_startup_reports_transport_failure_as_no_result(self) -> None:
         """The oracle's own authority fetch must preserve the outage direction."""
@@ -255,7 +260,9 @@ class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
 
         probe = subprocess.run(
             [str(SCRIPTS / "authority-available.sh")],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if probe.returncode == 3:
             self.skipTest("authority genuinely unreachable here")
@@ -265,17 +272,25 @@ class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
             # The directory the caller exports must actually satisfy the adapter
             # with no network available at all -- that is what closes the window.
             result = subprocess.run(
-                [sys.executable, str(ADAPTER), "--status", "completed",
-                 "--conclusion", "failure"],
-                capture_output=True, text=True, check=False,
+                [
+                    sys.executable,
+                    str(ADAPTER),
+                    "--status",
+                    "completed",
+                    "--conclusion",
+                    "failure",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
                 env=dict(os.environ, DEV_HERMIT_PARENT=str(materialized), PATH=""),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "FAILED")
         finally:
             import shutil as shutil_module
-            shutil_module.rmtree(materialized, ignore_errors=True)
 
+            shutil_module.rmtree(materialized, ignore_errors=True)
 
 
 if __name__ == "__main__":

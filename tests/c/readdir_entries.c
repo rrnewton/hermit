@@ -20,12 +20,12 @@
 
 enum { PATH_CAP = 128, JOIN_CAP = 64, MAX_ENTRIES = 16 };
 
-static int name_cmp(const void *a, const void *b) {
-  return strcmp(*(const char *const *)a, *(const char *const *)b);
+static int name_cmp(const void* a, const void* b) {
+  return strcmp(*(const char* const*)a, *(const char* const*)b);
 }
 
 // Create a one-byte regular file at path; return 0 on success, -1 otherwise.
-static int make_file(const char *path) {
+static int make_file(const char* path) {
   int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
     return -1;
@@ -49,7 +49,7 @@ int main(void) {
   }
 
   // Create the entries in an order that is NOT the sorted order.
-  const char *want[] = {"gamma", "alpha", "beta"};
+  const char* want[] = {"gamma", "alpha", "beta"};
   int created = 0;
   for (int i = 0; i < 3; i++) {
     char path[PATH_CAP];
@@ -59,11 +59,11 @@ int main(void) {
     }
   }
 
-  char *names[MAX_ENTRIES];
+  char* names[MAX_ENTRIES];
   int n = 0;
-  DIR *dir = opendir(root);
+  DIR* dir = opendir(root);
   if (dir != NULL) {
-    struct dirent *entry;
+    struct dirent* entry;
     while ((entry = readdir(dir)) != NULL && n < MAX_ENTRIES) {
       if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
         continue;
@@ -119,8 +119,8 @@ int main(void) {
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "readdir completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(stderr, "readdir completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

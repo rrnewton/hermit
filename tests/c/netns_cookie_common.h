@@ -39,8 +39,8 @@ static int verify_netns_cookie(int first_fd, int second_fd, const char* label) {
   if (first != second) {
     fprintf(
         stderr,
-        "sockets in one network namespace had cookies %" PRIu64
-        " and %" PRIu64 "\n",
+        "sockets in one network namespace had cookies %" PRIu64 " and %" PRIu64
+        "\n",
         first,
         second);
     return 1;

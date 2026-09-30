@@ -31,8 +31,8 @@ int main() {
   struct sysinfo info;
   sleep(5);
 
-  void* allocation =
-      allocateMemory(1 * MB); // allocating 1Mb of memory to check in sysinfo result
+  void* allocation = allocateMemory(
+      1 * MB); // allocating 1Mb of memory to check in sysinfo result
   if (allocation == NULL) {
     perror("malloc");
     return EXIT_FAILURE;

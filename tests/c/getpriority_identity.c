@@ -28,8 +28,8 @@
  * STILL 20 — proving the write was virtualized away rather than applied — and
  * (4) checks that an invalid `which` still faults with EINVAL, preserving the
  * Linux boundary. On a real host step (3) would observe the changed nice, so a
- * native run diverges, proving this pins a genuine determinization rather than a
- * tautology.
+ * native run diverges, proving this pins a genuine determinization rather than
+ * a tautology.
  */
 
 #define _GNU_SOURCE
@@ -41,7 +41,8 @@
 
 /* Detcore's fixed raw getpriority return: kernel 20 == nice 0. */
 #define VIRTUAL_RAW_PRIORITY 20
-/* A nice level distinct from the virtualized default, used to prove inertness. */
+/* A nice level distinct from the virtualized default, used to prove inertness.
+ */
 #define ATTEMPTED_NICE 10
 /* PRIO_PROCESS is 0 on Linux; spell it out to avoid wrapper header reliance. */
 #define WHICH_PROCESS 0
@@ -51,8 +52,12 @@
 static int expect_raw_priority(int iter) {
   long ret = syscall(SYS_getpriority, WHICH_PROCESS, 0);
   if (ret != VIRTUAL_RAW_PRIORITY) {
-    fprintf(stderr, "iter %d: getpriority returned %ld, expected %d (nice 0)\n",
-            iter, ret, VIRTUAL_RAW_PRIORITY);
+    fprintf(
+        stderr,
+        "iter %d: getpriority returned %ld, expected %d (nice 0)\n",
+        iter,
+        ret,
+        VIRTUAL_RAW_PRIORITY);
     return 1;
   }
   return 0;
@@ -69,23 +74,28 @@ int main(void) {
   /* setpriority must be accepted as an inert no-op returning 0. */
   long set_ret = syscall(SYS_setpriority, WHICH_PROCESS, 0, ATTEMPTED_NICE);
   if (set_ret != 0) {
-    fprintf(stderr, "setpriority returned %ld, expected 0 (inert no-op)\n",
-            set_ret);
+    fprintf(
+        stderr,
+        "setpriority returned %ld, expected 0 (inert no-op)\n",
+        set_ret);
     return 1;
   }
 
   /* The attempted nice change must not be reflected: still the constant 20. */
   if (expect_raw_priority(4)) {
-    fprintf(stderr, "setpriority leaked into getpriority (nice not virtualized)\n");
+    fprintf(
+        stderr, "setpriority leaked into getpriority (nice not virtualized)\n");
     return 1;
   }
 
   /* An invalid `which` preserves the Linux EINVAL boundary. */
   long bad = syscall(SYS_getpriority, WHICH_INVALID, 0);
   if (bad != -1 || errno != EINVAL) {
-    fprintf(stderr,
-            "getpriority(invalid which) returned %ld errno %d, expected -1 EINVAL\n",
-            bad, errno);
+    fprintf(
+        stderr,
+        "getpriority(invalid which) returned %ld errno %d, expected -1 EINVAL\n",
+        bad,
+        errno);
     return 1;
   }
 

@@ -14,9 +14,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern char **environ;
+extern char** environ;
 
-static int expect_execveat_enosys(const char *path, char *const arguments[]) {
+static int expect_execveat_enosys(const char* path, char* const arguments[]) {
   errno = 0;
   if (syscall(SYS_execveat, AT_FDCWD, path, arguments, environ, 0) != -1)
     return 1;
@@ -24,7 +24,7 @@ static int expect_execveat_enosys(const char *path, char *const arguments[]) {
 }
 
 int main(void) {
-  char *const root_arguments[] = {"/bin/true", NULL};
+  char* const root_arguments[] = {"/bin/true", NULL};
   if (expect_execveat_enosys(root_arguments[0], root_arguments) != 0)
     return 2;
 
@@ -32,7 +32,7 @@ int main(void) {
   if (child < 0)
     return 3;
   if (child == 0) {
-    char *const child_arguments[] = {"/bin/sh", "-c", "exit 42", NULL};
+    char* const child_arguments[] = {"/bin/sh", "-c", "exit 42", NULL};
     if (expect_execveat_enosys(child_arguments[0], child_arguments) != 0)
       _exit(4);
     _exit(0);

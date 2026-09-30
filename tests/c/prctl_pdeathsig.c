@@ -19,8 +19,8 @@
  * changes, and clears the parent-death signal and reads each value back. It
  * never arranges for the parent to die, so no signal is delivered and no
  * scheduling or timing channel is involved -- exactly like the sigprocmask and
- * sigaction state contracts. Setting a value and reading back the value just set
- * is a pure per-thread register with no host-derived state, so it is
+ * sigaction state contracts. Setting a value and reading back the value just
+ * set is a pure per-thread register with no host-derived state, so it is
  * deterministic across repeated runs and backends.
  *
  * ptrace and DBT drive the full state machine; KVM's ElfExecutor does not
@@ -30,7 +30,8 @@
  * EMISSION CONTRACT: the fixture prints the signal number read back after each
  * set, not just a check count. The values are guest-chosen (SIGUSR1, then
  * SIGUSR2, then cleared), so they are host-independent, and printing them makes
- * a wrong read-back visible in the byte stream instead of only in a lower total.
+ * a wrong read-back visible in the byte stream instead of only in a lower
+ * total.
  */
 
 int main(void) {
@@ -48,7 +49,12 @@ int main(void) {
   if (prctl(PR_GET_PDEATHSIG, &got1, 0, 0, 0) == 0 && got1 == SIGUSR1) {
     ok++;
   } else {
-    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want %d)\n", got1, errno, SIGUSR1);
+    fprintf(
+        stderr,
+        "PR_GET_PDEATHSIG got %d errno %d (want %d)\n",
+        got1,
+        errno,
+        SIGUSR1);
     return 1;
   }
 
@@ -63,7 +69,12 @@ int main(void) {
   if (prctl(PR_GET_PDEATHSIG, &got2, 0, 0, 0) == 0 && got2 == SIGUSR2) {
     ok++;
   } else {
-    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want %d)\n", got2, errno, SIGUSR2);
+    fprintf(
+        stderr,
+        "PR_GET_PDEATHSIG got %d errno %d (want %d)\n",
+        got2,
+        errno,
+        SIGUSR2);
     return 1;
   }
 
@@ -82,8 +93,12 @@ int main(void) {
     return 1;
   }
 
-  printf("pdeathsig ok=%d set_usr1_readback=%d set_usr2_readback=%d "
-         "cleared_readback=%d\n",
-         ok, got1, got2, got3);
+  printf(
+      "pdeathsig ok=%d set_usr1_readback=%d set_usr2_readback=%d "
+      "cleared_readback=%d\n",
+      ok,
+      got1,
+      got2,
+      got3);
   return ok == 6 ? 0 : 1;
 }

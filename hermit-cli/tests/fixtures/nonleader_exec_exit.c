@@ -10,23 +10,23 @@
  * replacement here: an unbound survivor must fail in the runtime itself. */
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t parked = PTHREAD_COND_INITIALIZER;
-static const char *program;
+static const char* program;
 
 static void require(int success) {
   if (!success)
     _exit(90);
 }
 
-static void *worker(void *unused) {
+static void* worker(void* unused) {
   (void)unused;
   /* Main held this mutex before pthread_create and only releases it in the
    * condition wait. Keep it locked until exec, including any spurious wake. */
   require(pthread_mutex_lock(&mutex) == 0);
-  execl(program, program, "replacement", (char *)NULL);
+  execl(program, program, "replacement", (char*)NULL);
   _exit(91);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "replacement") == 0)
     _exit(0);
   require(argc == 1);

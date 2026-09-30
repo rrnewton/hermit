@@ -3,20 +3,25 @@
 
 from __future__ import annotations
 
-import subprocess
-import tempfile
-import unittest
-from unittest import mock
 import json
 import os
 import shutil
+import subprocess
+import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("audit-test-binary-registration.py")
 REPOSITORY_LOCATION_VARIABLES = (
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
     "GIT_PREFIX",
 )
 
@@ -44,7 +49,9 @@ class RegistrationAuditTest(unittest.TestCase):
             "#[test]\nfn unknown() {}\n"
         )
         # Nested helpers are tracked source, but not top-level Cargo test targets.
-        (self.root / "hermit-cli/tests/common/mod.rs").write_text("pub fn helper() {}\n")
+        (self.root / "hermit-cli/tests/common/mod.rs").write_text(
+            "pub fn helper() {}\n"
+        )
         (self.root / "ci/dag/validate.json").write_text(
             '{"steps":[{"group":"test","job":"registered",'
             '"cmd":"cargo test -p hermit --test registered",'
@@ -229,7 +236,6 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
 
-
     def test_prlimit_does_not_register_nonexecuting_or_malformed_commands(self) -> None:
         invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
         for command in (
@@ -256,7 +262,6 @@ class RegistrationAuditTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertIn("integration_test_binaries", result.stderr)
 
-
     def test_prlimit_assignments_require_shell_position_or_explicit_env(self) -> None:
         invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
         for command in (
@@ -269,7 +274,6 @@ class RegistrationAuditTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("ci-registered=2", result.stdout)
-
 
     def test_prlimit_refuses_unsupported_nested_runner_forms(self) -> None:
         invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
@@ -285,7 +289,6 @@ class RegistrationAuditTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertIn("integration_test_binaries", result.stderr)
 
-
     def test_prlimit_cannot_execute_a_shell_exec_builtin(self) -> None:
         invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
         prlimit = shutil.which("prlimit")
@@ -295,7 +298,10 @@ class RegistrationAuditTest(unittest.TestCase):
         environment = dict(os.environ, PATH=str(self.root))
         for prefix, argv in (
             ("exec", ["exec"]),
-            ("env CARGO_BUILD_JOBS=1 exec", [env_command, "CARGO_BUILD_JOBS=1", "exec"]),
+            (
+                "env CARGO_BUILD_JOBS=1 exec",
+                [env_command, "CARGO_BUILD_JOBS=1", "exec"],
+            ),
         ):
             with self.subTest(prefix=prefix):
                 result = self._plant_probe_with_dag_command(
@@ -313,7 +319,6 @@ class RegistrationAuditTest(unittest.TestCase):
                 )
                 self.assertEqual(real.returncode, 127, real.stderr)
 
-
     def test_shell_exec_before_prlimit_still_executes_the_test_command(self) -> None:
         result = self._plant_probe_with_dag_command(
             "exec prlimit --fsize=67108864:67108864 -- "
@@ -324,15 +329,17 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertIn("ci-registered=2", result.stdout)
         real = subprocess.run(
             [
-                "/bin/sh", "-c", 'exec "$1" --fsize=67108864:67108864 -- /bin/true',
-                "fixture", shutil.which("prlimit"),
+                "/bin/sh",
+                "-c",
+                'exec "$1" --fsize=67108864:67108864 -- /bin/true',
+                "fixture",
+                shutil.which("prlimit"),
             ],
             capture_output=True,
             text=True,
             check=False,
         )
         self.assertEqual(real.returncode, 0, real.stderr)
-
 
     def test_prlimit_budget_wrapper_registers_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(

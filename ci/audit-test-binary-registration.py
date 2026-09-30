@@ -37,7 +37,7 @@ DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 AGENT_UTILS_PY = DEFAULT_ROOT / "agent-utils/py"
 sys.path.insert(0, str(AGENT_UTILS_PY))
 
-from dagrun import DagJsonError, dag_from_json  # noqa: E402
+from dagrun import dag_from_json, DagJsonError  # noqa: E402
 
 
 DECLARATIONS = Path("ci/undeclared-test-binaries.tsv")
@@ -69,7 +69,9 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 # the allowlist and are refused.
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
+_KNOWN_RUNNERS = frozenset(
+    {"timeout", "env", "nice", "nohup", "xargs", "exec", "command"}
+)
 _DURATION_RE = re.compile(r"^\d+[smhd]?$")
 # The isolated-workdir nodes execute through this command form of prlimit.
 # Do not accept prlimit's query/help/PID forms, or infer execution without its
@@ -102,7 +104,9 @@ def _prefix_still_runs_cargo(prefix: str) -> bool:
             # not shell syntax. Only an explicit env command can consume it.
             if position < len(tokens) and tokens[position] == "env":
                 position += 1
-                while position < len(tokens) and _ENV_ASSIGNMENT_RE.match(tokens[position]):
+                while position < len(tokens) and _ENV_ASSIGNMENT_RE.match(
+                    tokens[position]
+                ):
                     position += 1
             # Only the actual script wrapper used by these nodes is supported
             # between prlimit (or env) and the recognized test invocation.
@@ -115,7 +119,11 @@ def _prefix_still_runs_cargo(prefix: str) -> bool:
             continue
         if "/" in token or token.endswith(".sh"):
             continue
-        if token in _KNOWN_RUNNERS or token.startswith("-") or _DURATION_RE.match(token):
+        if (
+            token in _KNOWN_RUNNERS
+            or token.startswith("-")
+            or _DURATION_RE.match(token)
+        ):
             continue
         return False
     return True
@@ -179,7 +187,9 @@ def registered_targets(root: Path) -> set[str]:
         try:
             config = dag_from_json(path.read_text())
         except (OSError, DagJsonError) as error:
-            raise ValueError(f"cannot parse {path.relative_to(root)}: {error}") from error
+            raise ValueError(
+                f"cannot parse {path.relative_to(root)}: {error}"
+            ) from error
         for step in config.steps:
             executed = executed_test_targets(step.cmd)
             declared = step.integration_test_binaries

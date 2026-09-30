@@ -66,26 +66,29 @@ impl CacheHit {
     /// positive executed-node evidence and exact equal test counts.
     pub fn exact_current_pass_counts(&self) -> Option<(i64, i64, i64)> {
         if self.schema_version
-            != Some(if crate::validate_evidence::ENABLED { 10 } else { crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION })
-            || !matches!(
-                self.producer.as_str(),
-                "validate.rs" | "hermit-validate-rs"
-            )
+            != Some(if crate::validate_evidence::ENABLED {
+                10
+            } else {
+                crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION
+            })
+            || !matches!(self.producer.as_str(), "validate.rs" | "hermit-validate-rs")
         {
             return None;
         }
         let nodes = self.executed_nodes?;
         let executed = self.executed_tests?;
         let passed = self.passed_tests?;
-        (nodes > 0 && executed > 0 && passed == executed)
-            .then_some((nodes, executed, passed))
+        (nodes > 0 && executed > 0 && passed == executed).then_some((nodes, executed, passed))
     }
 }
 
 /// The adapter executable comes from the immutable tooling checkout, while
 /// `ledger` continues to name canonical shared state. Older direct callers
 /// without a tool root retain the historical parent-relative behavior.
-pub fn canonical_ledger_adapter(ledger: &Path, tool_root: Option<&Path>) -> Option<std::path::PathBuf> {
+pub fn canonical_ledger_adapter(
+    ledger: &Path,
+    tool_root: Option<&Path>,
+) -> Option<std::path::PathBuf> {
     let state_root = ledger.parent()?;
     Some(
         tool_root
@@ -119,7 +122,8 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         let configured_tool_root = std::env::var_os("DEV_HERMIT_TOOL_ROOT")
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from);
-        let Some(adapter) = canonical_ledger_adapter(ledger, configured_tool_root.as_deref()) else {
+        let Some(adapter) = canonical_ledger_adapter(ledger, configured_tool_root.as_deref())
+        else {
             return Vec::new();
         };
         let Ok(output) = canonical_ledger_reader(&adapter).output() else {
@@ -143,7 +147,9 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         };
         text
     } else {
-        let Ok(text) = std::fs::read_to_string(ledger) else { return Vec::new() };
+        let Ok(text) = std::fs::read_to_string(ledger) else {
+            return Vec::new();
+        };
         text
     };
     text.lines()
@@ -212,14 +218,28 @@ const LEGACY_PAIRLESS_SCHEMAS: [i64; 8] = [1, 2, 3, 4, 5, 6, 7, 10];
 fn is_utc_timestamp(ts: &str) -> bool {
     let b = ts.as_bytes();
     let digits = |r: std::ops::Range<usize>| -> Option<u32> {
-        b[r].iter().try_fold(0u32, |n, &c| c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0')))
+        b[r].iter().try_fold(0u32, |n, &c| {
+            c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'))
+        })
     };
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
         return false;
     }
-    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(sec)) =
-        (digits(0..4), digits(5..7), digits(8..10), digits(11..13), digits(14..16), digits(17..19))
-    else {
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(sec)) = (
+        digits(0..4),
+        digits(5..7),
+        digits(8..10),
+        digits(11..13),
+        digits(14..16),
+        digits(17..19),
+    ) else {
         return false;
     };
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
@@ -252,7 +272,9 @@ fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
             let finished = row.get("finished_at").and_then(|v| v.as_str());
             // A null `repo` is an absent one, as in the parent's typed row.
             let legacy = match row.get("repo").filter(|v| !v.is_null()) {
-                Some(serde_json::Value::String(r)) if r == "reverie" || r == "rrnewton/reverie" => true,
+                Some(serde_json::Value::String(r)) if r == "reverie" || r == "rrnewton/reverie" => {
+                    true
+                }
                 None => finished.is_some_and(|t| is_utc_timestamp(t) && t < LEGACY_PAIRLESS_BEFORE),
                 Some(serde_json::Value::String(r)) if r == "hermit" || r == "rrnewton/hermit" => {
                     finished.is_some_and(|t| is_utc_timestamp(t) && t < LEGACY_PAIRLESS_BEFORE)
@@ -263,8 +285,8 @@ fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
         }
         (Some(builder), Some(payload)) => {
             let builder = builder.as_str()?;
-            let known = builder == crate::RELEASE_BUILDER_CARGO
-                || builder == crate::RELEASE_BUILDER_BUCK;
+            let known =
+                builder == crate::RELEASE_BUILDER_CARGO || builder == crate::RELEASE_BUILDER_BUCK;
             (known && *payload == crate::e2e_payload_identity(builder)).then_some(builder)
         }
         _ => None,
@@ -383,19 +405,37 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
     // conservative cache refusal grants no qualification or failure-obligation
     // authority; those readers authenticate the complete retained artifacts.
     let parity_divergence = i(row, "schema_version") == Some(10)
-        && row.get("cell_results").and_then(|v| v.get("cells"))
-            .and_then(serde_json::Value::as_array).is_some_and(|cells| cells.iter().any(|cell| {
-                cell.get("cell_verdict").and_then(|v| v.get("state"))
-                    .and_then(serde_json::Value::as_str) == Some("compared-and-diverged")
-                || cell.get("backend_parity").and_then(|v| v.get("attempts"))
-                    .and_then(serde_json::Value::as_array).is_some_and(|attempts| attempts.iter().any(|attempt| {
-                        ["candidate", "reference"].iter().any(|role| attempt.get(role)
-                            .and_then(|v| v.get("state")).and_then(serde_json::Value::as_str)
-                                == Some("compared-and-diverged"))
-                        || attempt.get("cross").and_then(|v| v.get("state"))
-                            .and_then(serde_json::Value::as_str) == Some("diverged")
-                    }))
-            }));
+        && row
+            .get("cell_results")
+            .and_then(|v| v.get("cells"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|cells| {
+                cells.iter().any(|cell| {
+                    cell.get("cell_verdict")
+                        .and_then(|v| v.get("state"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("compared-and-diverged")
+                        || cell
+                            .get("backend_parity")
+                            .and_then(|v| v.get("attempts"))
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|attempts| {
+                                attempts.iter().any(|attempt| {
+                                    ["candidate", "reference"].iter().any(|role| {
+                                        attempt
+                                            .get(role)
+                                            .and_then(|v| v.get("state"))
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some("compared-and-diverged")
+                                    }) || attempt
+                                        .get("cross")
+                                        .and_then(|v| v.get("state"))
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("diverged")
+                                })
+                            })
+                })
+            });
     if typed_cell_divergence || parity_divergence {
         return true;
     }
@@ -409,8 +449,7 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
 }
 
 fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool {
-    rows
-        .iter()
+    rows.iter()
         .any(|row| failure_row_blocks_pass_cache(row, key))
 }
 
@@ -446,7 +485,10 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
             match row.get("coverage") {
                 None => false,
                 Some(c) => {
-                    let absent = c.get("absent_nodes").and_then(|a| a.as_array()).map(|a| a.len());
+                    let absent = c
+                        .get("absent_nodes")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.len());
                     let executed = c.get("executed_test_nodes").and_then(|v| v.as_i64());
                     matches!(absent, Some(0)) && executed.is_some()
                 }
@@ -519,9 +561,17 @@ pub fn cache_lookup(
         passed_tests: i(row, "passed_tests"),
         commit: {
             let c = s(row, "commit");
-            if c.is_empty() { "unknown".to_string() } else { c.to_string() }
+            if c.is_empty() {
+                "unknown".to_string()
+            } else {
+                c.to_string()
+            }
         },
-        producer: if producer.is_empty() { "validate.sh".into() } else { producer.into() },
+        producer: if producer.is_empty() {
+            "validate.sh".into()
+        } else {
+            producer.into()
+        },
     })
 }
 
@@ -547,11 +597,20 @@ fn emit(mut v: Vec<f64>, scope: &str) -> String {
     let n = v.len();
     let lo = v[0];
     let hi = v[n - 1];
-    let md = if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 };
+    let md = if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    };
     if (lo - hi).abs() < f64::EPSILON {
         format!("~{} ({scope}, n={n})", human(md))
     } else {
-        format!("~{} (median; range {}-{}; {scope}, n={n})", human(md), human(lo), human(hi))
+        format!(
+            "~{} (median; range {}-{}; {scope}, n={n})",
+            human(md),
+            human(lo),
+            human(hi)
+        )
     }
 }
 
@@ -724,31 +783,128 @@ pub fn self_test() -> Result<String, String> {
     // the positive row with exactly one field spoiled, so a refusal is
     // attributable to that field and nothing else.
     let negatives: Vec<(&str, serde_json::Value)> = vec![
-        ("different tree", base(serde_json::json!({"tree": "OTHER", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("different profile", base(serde_json::json!({"profile": "quick", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("different host", base(serde_json::json!({"host": "h2", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("different toolchain", base(serde_json::json!({"toolchain": "rustc 2.0", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        (
+            "different tree",
+            base(
+                serde_json::json!({"tree": "OTHER", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "different profile",
+            base(
+                serde_json::json!({"profile": "quick", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "different host",
+            base(
+                serde_json::json!({"host": "h2", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "different toolchain",
+            base(
+                serde_json::json!({"toolchain": "rustc 2.0", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
         // A Buck run executed the release payload, without debug assertions or
         // overflow checks: it is not the run a Cargo request asks for.
-        ("Buck release payload", base(serde_json::json!({"release_builder": "buck", "e2e_payload": crate::e2e_payload_identity("buck"), "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("non-string release builder", base(serde_json::json!({"release_builder": null, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("selective run", base(serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("not commit-anchored", base(serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("dirty tree", base(serde_json::json!({"tree_dirty": true, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("nonzero failures", base(serde_json::json!({"failures": 1, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("validate.rs row with no executed_tests", base(serde_json::json!({"producer": "validate.rs", "executed_nodes": 47, "gates_expected": 47, "gates_run": 47, "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []}}))),
-        ("validate.rs row with zero executed_tests", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 0, "executed_nodes": 47, "gates_expected": 47, "gates_run": 47, "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []}}))),
-        ("zero executed nodes", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 0, "coverage": {"executed_test_nodes": 0, "absent_nodes": []}}))),
-        ("absent coverage block", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5}))),
-        ("planned node never ran", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "coverage": {"executed_test_nodes": 4, "absent_nodes": ["test.x"]}}))),
-        ("gates_run below gates_expected", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "gates_expected": 47, "gates_run": 12, "coverage": {"executed_test_nodes": 5, "absent_nodes": []}}))),
-        ("bash row with zero executed_tests", base(serde_json::json!({"producer": "validate.sh", "executed_tests": 0}))),
-        ("bash row with no executed_tests", base(serde_json::json!({"producer": "validate.sh"}))),
+        (
+            "Buck release payload",
+            base(
+                serde_json::json!({"release_builder": "buck", "e2e_payload": crate::e2e_payload_identity("buck"), "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "non-string release builder",
+            base(
+                serde_json::json!({"release_builder": null, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "selective run",
+            base(
+                serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "not commit-anchored",
+            base(
+                serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "dirty tree",
+            base(
+                serde_json::json!({"tree_dirty": true, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "nonzero failures",
+            base(
+                serde_json::json!({"failures": 1, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "validate.rs row with no executed_tests",
+            base(
+                serde_json::json!({"producer": "validate.rs", "executed_nodes": 47, "gates_expected": 47, "gates_run": 47, "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "validate.rs row with zero executed_tests",
+            base(
+                serde_json::json!({"producer": "validate.rs", "executed_tests": 0, "executed_nodes": 47, "gates_expected": 47, "gates_run": 47, "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "zero executed nodes",
+            base(
+                serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 0, "coverage": {"executed_test_nodes": 0, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "absent coverage block",
+            base(
+                serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5}),
+            ),
+        ),
+        (
+            "planned node never ran",
+            base(
+                serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "coverage": {"executed_test_nodes": 4, "absent_nodes": ["test.x"]}}),
+            ),
+        ),
+        (
+            "gates_run below gates_expected",
+            base(
+                serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "gates_expected": 47, "gates_run": 12, "coverage": {"executed_test_nodes": 5, "absent_nodes": []}}),
+            ),
+        ),
+        (
+            "bash row with zero executed_tests",
+            base(serde_json::json!({"producer": "validate.sh", "executed_tests": 0})),
+        ),
+        (
+            "bash row with no executed_tests",
+            base(serde_json::json!({"producer": "validate.sh"})),
+        ),
         // The cross-producer trap this module exists to close: a validate.rs row
         // must NOT be admitted by the bash counter, and vice versa.
-        ("validate.rs row carrying only executed_tests", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 999}))),
-        ("bash row carrying only executed_nodes", base(serde_json::json!({"producer": "validate.sh", "executed_nodes": 999}))),
-        ("unknown producer", base(serde_json::json!({"producer": "some-other-tool", "executed_nodes": 9, "executed_tests": 9}))),
+        (
+            "validate.rs row carrying only executed_tests",
+            base(serde_json::json!({"producer": "validate.rs", "executed_tests": 999})),
+        ),
+        (
+            "bash row carrying only executed_nodes",
+            base(serde_json::json!({"producer": "validate.sh", "executed_nodes": 999})),
+        ),
+        (
+            "unknown producer",
+            base(
+                serde_json::json!({"producer": "some-other-tool", "executed_nodes": 9, "executed_tests": 9}),
+            ),
+        ),
     ];
     let mut refused = 0usize;
     for (why, row) in &negatives {
@@ -761,12 +917,13 @@ pub fn self_test() -> Result<String, String> {
     // Builder identity, in both directions. A row that names cargo is the
     // same run as a legacy row; a Buck key must refuse either, and a Buck red
     // must still latch the Cargo key for its tree.
-    let with_identity = |row: &serde_json::Value, builder: serde_json::Value, payload: serde_json::Value| {
-        let mut row = row.clone();
-        row["release_builder"] = builder;
-        row["e2e_payload"] = payload;
-        row
-    };
+    let with_identity =
+        |row: &serde_json::Value, builder: serde_json::Value, payload: serde_json::Value| {
+            let mut row = row.clone();
+            row["release_builder"] = builder;
+            row["e2e_payload"] = payload;
+            row
+        };
     let cargo_identity = crate::e2e_payload_identity("cargo");
     let buck_identity = crate::e2e_payload_identity("buck");
     let cargo_named = with_identity(&rs_pass, serde_json::json!("cargo"), cargo_identity.clone());
@@ -774,10 +931,15 @@ pub fn self_test() -> Result<String, String> {
         return Err("cache: a row naming the cargo builder and payload must be a Cargo HIT".into());
     }
     accepted += 1;
-    let buck_key = CacheKey { release_builder: "buck", ..key };
+    let buck_key = CacheKey {
+        release_builder: "buck",
+        ..key
+    };
     for (why, row) in [("legacy", &rs_pass), ("cargo-named", &cargo_named)] {
         if cache_lookup(std::slice::from_ref(row), "pass", &buck_key).is_some() {
-            return Err(format!("cache: a {why} Cargo green answered a Buck request"));
+            return Err(format!(
+                "cache: a {why} Cargo green answered a Buck request"
+            ));
         }
         refused += 1;
     }
@@ -806,12 +968,33 @@ pub fn self_test() -> Result<String, String> {
     let before = "2026-09-25T20:42:28Z";
     let legacy: Vec<(&str, serde_json::Value)> = vec![
         ("one second before the cutoff", pairless(Some(before), None)),
-        ("repo hermit before the cutoff", pairless(Some(before), Some(serde_json::json!("hermit")))),
-        ("repo rrnewton/hermit before the cutoff", pairless(Some(before), Some(serde_json::json!("rrnewton/hermit")))),
-        ("null repo before the cutoff", pairless(Some(before), Some(serde_json::Value::Null))),
-        ("a real Feb 29 before the cutoff", pairless(Some("2024-02-29T12:00:00Z"), None)),
-        ("a contemporary Reverie row", pairless(Some("2026-09-26T00:00:00Z"), Some(serde_json::json!("reverie")))),
-        ("an undated rrnewton/reverie row", pairless(None, Some(serde_json::json!("rrnewton/reverie")))),
+        (
+            "repo hermit before the cutoff",
+            pairless(Some(before), Some(serde_json::json!("hermit"))),
+        ),
+        (
+            "repo rrnewton/hermit before the cutoff",
+            pairless(Some(before), Some(serde_json::json!("rrnewton/hermit"))),
+        ),
+        (
+            "null repo before the cutoff",
+            pairless(Some(before), Some(serde_json::Value::Null)),
+        ),
+        (
+            "a real Feb 29 before the cutoff",
+            pairless(Some("2024-02-29T12:00:00Z"), None),
+        ),
+        (
+            "a contemporary Reverie row",
+            pairless(
+                Some("2026-09-26T00:00:00Z"),
+                Some(serde_json::json!("reverie")),
+            ),
+        ),
+        (
+            "an undated rrnewton/reverie row",
+            pairless(None, Some(serde_json::json!("rrnewton/reverie"))),
+        ),
     ];
     for (why, row) in &legacy {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_none() {
@@ -820,28 +1003,64 @@ pub fn self_test() -> Result<String, String> {
         accepted += 1;
     }
     let contemporary: Vec<(&str, serde_json::Value)> = vec![
-        ("at the cutoff", pairless(Some(LEGACY_PAIRLESS_BEFORE), None)),
-        ("repo hermit at the cutoff", pairless(Some(LEGACY_PAIRLESS_BEFORE), Some(serde_json::json!("hermit")))),
-        ("after the cutoff", pairless(Some("2026-09-26T00:00:00Z"), None)),
+        (
+            "at the cutoff",
+            pairless(Some(LEGACY_PAIRLESS_BEFORE), None),
+        ),
+        (
+            "repo hermit at the cutoff",
+            pairless(
+                Some(LEGACY_PAIRLESS_BEFORE),
+                Some(serde_json::json!("hermit")),
+            ),
+        ),
+        (
+            "after the cutoff",
+            pairless(Some("2026-09-26T00:00:00Z"), None),
+        ),
         ("without finished_at", pairless(None, None)),
         ("with a null finished_at", {
             let mut row = rs_pass.clone();
             row["finished_at"] = serde_json::Value::Null;
             row
         }),
-        ("with a space separator", pairless(Some("2026-08-07 00:00:00Z"), None)),
-        ("with fractional seconds", pairless(Some("2026-08-07T00:00:00.5Z"), None)),
-        ("with an offset", pairless(Some("2026-08-07T00:00:00+00:00"), None)),
-        ("on Feb 29 of a common year", pairless(Some("2026-02-29T00:00:00Z"), None)),
+        (
+            "with a space separator",
+            pairless(Some("2026-08-07 00:00:00Z"), None),
+        ),
+        (
+            "with fractional seconds",
+            pairless(Some("2026-08-07T00:00:00.5Z"), None),
+        ),
+        (
+            "with an offset",
+            pairless(Some("2026-08-07T00:00:00+00:00"), None),
+        ),
+        (
+            "on Feb 29 of a common year",
+            pairless(Some("2026-02-29T00:00:00Z"), None),
+        ),
         ("in month 00", pairless(Some("2026-00-07T00:00:00Z"), None)),
         ("in month 13", pairless(Some("2026-13-07T00:00:00Z"), None)),
         ("on day 00", pairless(Some("2026-08-00T00:00:00Z"), None)),
         ("in hour 24", pairless(Some("2026-08-07T24:00:00Z"), None)),
         ("in minute 60", pairless(Some("2026-08-07T00:60:00Z"), None)),
-        ("on a leap second", pairless(Some("2026-08-07T23:59:60Z"), None)),
+        (
+            "on a leap second",
+            pairless(Some("2026-08-07T23:59:60Z"), None),
+        ),
         ("in year zero", pairless(Some("0000-08-07T00:00:00Z"), None)),
-        ("naming another repository", pairless(Some(before), Some(serde_json::json!("facebookexperimental/hermit")))),
-        ("with a non-string repo", pairless(Some(before), Some(serde_json::json!(7)))),
+        (
+            "naming another repository",
+            pairless(
+                Some(before),
+                Some(serde_json::json!("facebookexperimental/hermit")),
+            ),
+        ),
+        (
+            "with a non-string repo",
+            pairless(Some(before), Some(serde_json::json!(7))),
+        ),
     ];
     // The schema bounds the inference too: every row below is an otherwise
     // legacy positive (dated before the cutoff, or a Reverie row) whose
@@ -858,21 +1077,69 @@ pub fn self_test() -> Result<String, String> {
     };
     let reverie = pairless(Some(before), Some(serde_json::json!("rrnewton/reverie")));
     let unhistorical: Vec<(&str, serde_json::Value)> = vec![
-        ("without schema_version", with_schema(pairless(Some(before), None), None)),
-        ("with a null schema_version", with_schema(pairless(Some(before), None), Some(serde_json::Value::Null))),
-        ("with a string schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!("5")))),
-        ("with a float schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!(5.0)))),
-        ("with a boolean schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!(true)))),
-        ("with an array schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!([5])))),
-        ("with an object schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!({"v": 5})))),
-        ("with schema_version 0", with_schema(pairless(Some(before), None), Some(serde_json::json!(0)))),
-        ("with schema_version -1", with_schema(pairless(Some(before), None), Some(serde_json::json!(-1)))),
-        ("with schema_version 8", with_schema(pairless(Some(before), None), Some(serde_json::json!(8)))),
-        ("with schema_version 9", with_schema(pairless(Some(before), None), Some(serde_json::json!(9)))),
-        ("with future schema_version 11", with_schema(pairless(Some(before), None), Some(serde_json::json!(11)))),
-        ("with future schema_version 999", with_schema(pairless(Some(before), None), Some(serde_json::json!(999)))),
-        ("from Reverie without schema_version", with_schema(reverie.clone(), None)),
-        ("from Reverie with future schema_version 999", with_schema(reverie.clone(), Some(serde_json::json!(999)))),
+        (
+            "without schema_version",
+            with_schema(pairless(Some(before), None), None),
+        ),
+        (
+            "with a null schema_version",
+            with_schema(pairless(Some(before), None), Some(serde_json::Value::Null)),
+        ),
+        (
+            "with a string schema_version",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!("5"))),
+        ),
+        (
+            "with a float schema_version",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(5.0))),
+        ),
+        (
+            "with a boolean schema_version",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(true))),
+        ),
+        (
+            "with an array schema_version",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!([5]))),
+        ),
+        (
+            "with an object schema_version",
+            with_schema(
+                pairless(Some(before), None),
+                Some(serde_json::json!({"v": 5})),
+            ),
+        ),
+        (
+            "with schema_version 0",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(0))),
+        ),
+        (
+            "with schema_version -1",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(-1))),
+        ),
+        (
+            "with schema_version 8",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(8))),
+        ),
+        (
+            "with schema_version 9",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(9))),
+        ),
+        (
+            "with future schema_version 11",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(11))),
+        ),
+        (
+            "with future schema_version 999",
+            with_schema(pairless(Some(before), None), Some(serde_json::json!(999))),
+        ),
+        (
+            "from Reverie without schema_version",
+            with_schema(reverie.clone(), None),
+        ),
+        (
+            "from Reverie with future schema_version 999",
+            with_schema(reverie.clone(), Some(serde_json::json!(999))),
+        ),
     ];
     for (why, row) in &unhistorical {
         for k in [&key, &buck_key] {
@@ -888,9 +1155,14 @@ pub fn self_test() -> Result<String, String> {
     // Every historical schema is still a Cargo HIT, bracketing the set from
     // inside as the rows above bracket it from outside.
     for schema in LEGACY_PAIRLESS_SCHEMAS {
-        let row = with_schema(pairless(Some(before), None), Some(serde_json::json!(schema)));
+        let row = with_schema(
+            pairless(Some(before), None),
+            Some(serde_json::json!(schema)),
+        );
         if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_none() {
-            return Err(format!("cache: a pairless schema-{schema} row before the cutoff must be a Cargo HIT"));
+            return Err(format!(
+                "cache: a pairless schema-{schema} row before the cutoff must be a Cargo HIT"
+            ));
         }
         accepted += 1;
     }
@@ -920,13 +1192,38 @@ pub fn self_test() -> Result<String, String> {
     let inconsistent: Vec<(&str, serde_json::Value)> = vec![
         ("cargo builder without a payload", missing_payload),
         ("cargo payload without a builder", missing_builder),
-        ("cargo builder with the Buck payload", with_identity(&rs_pass, serde_json::json!("cargo"), buck_identity.clone())),
-        ("buck builder with the Cargo payload", with_identity(&rs_pass, serde_json::json!("buck"), cargo_identity.clone())),
-        ("cargo payload with an extra field", with_identity(&rs_pass, serde_json::json!("cargo"), extra_field)),
-        ("cargo payload without debug assertions", with_identity(&rs_pass, serde_json::json!("cargo"), flipped_assertions)),
-        ("unknown builder with the Cargo payload", with_identity(&rs_pass, serde_json::json!("bazel"), cargo_identity.clone())),
-        ("non-string builder with the Cargo payload", with_identity(&rs_pass, serde_json::json!(7), cargo_identity.clone())),
-        ("cargo builder with a null payload", with_identity(&rs_pass, serde_json::json!("cargo"), serde_json::Value::Null)),
+        (
+            "cargo builder with the Buck payload",
+            with_identity(&rs_pass, serde_json::json!("cargo"), buck_identity.clone()),
+        ),
+        (
+            "buck builder with the Cargo payload",
+            with_identity(&rs_pass, serde_json::json!("buck"), cargo_identity.clone()),
+        ),
+        (
+            "cargo payload with an extra field",
+            with_identity(&rs_pass, serde_json::json!("cargo"), extra_field),
+        ),
+        (
+            "cargo payload without debug assertions",
+            with_identity(&rs_pass, serde_json::json!("cargo"), flipped_assertions),
+        ),
+        (
+            "unknown builder with the Cargo payload",
+            with_identity(&rs_pass, serde_json::json!("bazel"), cargo_identity.clone()),
+        ),
+        (
+            "non-string builder with the Cargo payload",
+            with_identity(&rs_pass, serde_json::json!(7), cargo_identity.clone()),
+        ),
+        (
+            "cargo builder with a null payload",
+            with_identity(
+                &rs_pass,
+                serde_json::json!("cargo"),
+                serde_json::Value::Null,
+            ),
+        ),
     ];
     for (why, row) in &inconsistent {
         for k in [&key, &buck_key] {
@@ -969,9 +1266,8 @@ pub fn self_test() -> Result<String, String> {
     // today's nested state spelling remains readable but cannot poison a pass
     // cache until this reader explicitly supports that schema.
     let mut newer_failing = failing.clone();
-    newer_failing["schema_version"] = serde_json::json!(
-        crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION + 1
-    );
+    newer_failing["schema_version"] =
+        serde_json::json!(crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION + 1);
     if cache_lookup(&[newer_failing, rs_pass.clone()], "pass", &key).is_none() {
         return Err(
             "cache: an unsupported newer cell-results schema must not gain failure authority"
@@ -982,7 +1278,11 @@ pub fn self_test() -> Result<String, String> {
     for role in ["reference", "cross"] {
         let mut parity_failure = failing.clone();
         parity_failure["schema_version"] = serde_json::json!(10);
-        let state = if role == "cross" { "diverged" } else { "compared-and-diverged" };
+        let state = if role == "cross" {
+            "diverged"
+        } else {
+            "compared-and-diverged"
+        };
         parity_failure["cell_results"] = serde_json::json!({"cells":[{
             "cell_verdict":{"state":"compared-and-matched"},
             "backend_parity":{"attempts":[{role:{"state":state}}]}
@@ -990,7 +1290,9 @@ pub fn self_test() -> Result<String, String> {
         if cache_lookup(&[parity_failure.clone(), rs_pass.clone()], "pass", &key).is_some()
             || cache_lookup(&[rs_pass.clone(), parity_failure], "pass", &key).is_some()
         {
-            return Err(format!("cache: an ordinary pass erased a schema-10 {role} divergence"));
+            return Err(format!(
+                "cache: an ordinary pass erased a schema-10 {role} divergence"
+            ));
         }
     }
 
@@ -1071,7 +1373,13 @@ pub fn self_test() -> Result<String, String> {
         "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
                    "failure_origin": "outer_gate"}]
     }));
-    if cache_lookup(&[named_gate_without_aggregate, sh_pass.clone()], "pass", &key).is_some() {
+    if cache_lookup(
+        &[named_gate_without_aggregate, sh_pass.clone()],
+        "pass",
+        &key,
+    )
+    .is_some()
+    {
         return Err(
             "cache: a bound named-gate failure must latch without an aggregate count".into(),
         );
@@ -1095,27 +1403,44 @@ pub fn self_test() -> Result<String, String> {
 
     // Estimate brackets: below MIN it must SAY it is insufficient; at/above MIN
     // it must produce a median. A silently-fabricated number is the failure mode.
-    let sample = |secs: i64| base(serde_json::json!({"cache_state": "warm", "real_seconds": secs, "producer": "validate.rs"}));
-    let thin: Vec<serde_json::Value> = (0..MIN_SAMPLES - 1).map(|i| sample(100 + i as i64)).collect();
+    let sample = |secs: i64| {
+        base(
+            serde_json::json!({"cache_state": "warm", "real_seconds": secs, "producer": "validate.rs"}),
+        )
+    };
+    let thin: Vec<serde_json::Value> = (0..MIN_SAMPLES - 1)
+        .map(|i| sample(100 + i as i64))
+        .collect();
     let est = history_estimate(&thin, "full", "cargo", "warm", "h1", true);
     if !est.contains("insufficient history") {
-        return Err(format!("estimate: {} samples must be reported as insufficient", thin.len()));
+        return Err(format!(
+            "estimate: {} samples must be reported as insufficient",
+            thin.len()
+        ));
     }
     let enough: Vec<serde_json::Value> = vec![sample(60), sample(120), sample(180)];
     let est = history_estimate(&enough, "full", "cargo", "warm", "h1", true);
     if !est.starts_with("~2m00s") || !est.contains("n=3") {
-        return Err(format!("estimate: median of 60/120/180 must be ~2m00s, got {est}"));
+        return Err(format!(
+            "estimate: median of 60/120/180 must be ~2m00s, got {est}"
+        ));
     }
-    if !history_estimate(&enough, "full", "cargo", "warm", "h1", false).contains("no run-history ledger") {
+    if !history_estimate(&enough, "full", "cargo", "warm", "h1", false)
+        .contains("no run-history ledger")
+    {
         return Err("estimate: a missing ledger must say so".into());
     }
     // A failing run must never contribute to a completion-time estimate.
     let poisoned: Vec<serde_json::Value> = vec![
         sample(60),
         sample(120),
-        base(serde_json::json!({"cache_state": "warm", "real_seconds": 5, "result": "fail", "producer": "validate.rs"})),
+        base(
+            serde_json::json!({"cache_state": "warm", "real_seconds": 5, "result": "fail", "producer": "validate.rs"}),
+        ),
     ];
-    if !history_estimate(&poisoned, "full", "cargo", "warm", "h1", true).contains("insufficient history") {
+    if !history_estimate(&poisoned, "full", "cargo", "warm", "h1", true)
+        .contains("insufficient history")
+    {
         return Err("estimate: a failing run must not count as a completion sample".into());
     }
     // Only a run under the current release builder times it. Each row below
@@ -1134,41 +1459,90 @@ pub fn self_test() -> Result<String, String> {
         row
     };
     let foreign = [
-        ("buck run", fast(serde_json::json!({"release_builder": "buck", "e2e_payload": buck_payload}))),
-        ("buck builder, cargo payload", fast(serde_json::json!({"release_builder": "buck", "e2e_payload": cargo_payload}))),
-        ("cargo builder, buck payload", fast(serde_json::json!({"release_builder": "cargo", "e2e_payload": buck_payload}))),
-        ("builder without payload", fast(serde_json::json!({"release_builder": "cargo"}))),
-        ("unknown builder", fast(serde_json::json!({"release_builder": "bazel", "e2e_payload": cargo_payload}))),
-        ("contemporary pairless hermit", fast(serde_json::json!({"repo": "hermit", "finished_at": "2026-09-25T20:42:29Z"}))),
-        ("pairless schema 8", fast(serde_json::json!({"schema_version": 8}))),
-        ("pairless schema 9", fast(serde_json::json!({"schema_version": 9}))),
-        ("pairless future schema 11", fast(serde_json::json!({"schema_version": 11}))),
-        ("pairless string schema", fast(serde_json::json!({"schema_version": "5"}))),
-        ("pairless unversioned", fast(serde_json::json!({"schema_version": null}))),
-        ("pairless undated", fast(serde_json::json!({"finished_at": null}))),
-        ("pairless malformed date", fast(serde_json::json!({"finished_at": "2026-02-30T00:00:00Z"}))),
+        (
+            "buck run",
+            fast(serde_json::json!({"release_builder": "buck", "e2e_payload": buck_payload})),
+        ),
+        (
+            "buck builder, cargo payload",
+            fast(serde_json::json!({"release_builder": "buck", "e2e_payload": cargo_payload})),
+        ),
+        (
+            "cargo builder, buck payload",
+            fast(serde_json::json!({"release_builder": "cargo", "e2e_payload": buck_payload})),
+        ),
+        (
+            "builder without payload",
+            fast(serde_json::json!({"release_builder": "cargo"})),
+        ),
+        (
+            "unknown builder",
+            fast(serde_json::json!({"release_builder": "bazel", "e2e_payload": cargo_payload})),
+        ),
+        (
+            "contemporary pairless hermit",
+            fast(serde_json::json!({"repo": "hermit", "finished_at": "2026-09-25T20:42:29Z"})),
+        ),
+        (
+            "pairless schema 8",
+            fast(serde_json::json!({"schema_version": 8})),
+        ),
+        (
+            "pairless schema 9",
+            fast(serde_json::json!({"schema_version": 9})),
+        ),
+        (
+            "pairless future schema 11",
+            fast(serde_json::json!({"schema_version": 11})),
+        ),
+        (
+            "pairless string schema",
+            fast(serde_json::json!({"schema_version": "5"})),
+        ),
+        (
+            "pairless unversioned",
+            fast(serde_json::json!({"schema_version": null})),
+        ),
+        (
+            "pairless undated",
+            fast(serde_json::json!({"finished_at": null})),
+        ),
+        (
+            "pairless malformed date",
+            fast(serde_json::json!({"finished_at": "2026-02-30T00:00:00Z"})),
+        ),
     ];
     for (name, row) in &foreign {
         let mut rows = enough.clone();
         rows.push(row.clone());
         let est = history_estimate(&rows, "full", "cargo", "warm", "h1", true);
         if !est.starts_with("~2m00s") || !est.contains("n=3") {
-            return Err(format!("estimate: {name} must not time a cargo run, got {est}"));
+            return Err(format!(
+                "estimate: {name} must not time a cargo run, got {est}"
+            ));
         }
     }
     // The paired Cargo form and the dated legacy pairless form both time Cargo.
     let mut rows = enough.clone();
-    rows.push(fast(serde_json::json!({"release_builder": "cargo", "e2e_payload": cargo_payload})));
-    rows.push(fast(serde_json::json!({"repo": "reverie", "finished_at": "2026-09-26T00:00:00Z"})));
+    rows.push(fast(
+        serde_json::json!({"release_builder": "cargo", "e2e_payload": cargo_payload}),
+    ));
+    rows.push(fast(
+        serde_json::json!({"repo": "reverie", "finished_at": "2026-09-26T00:00:00Z"}),
+    ));
     let est = history_estimate(&rows, "full", "cargo", "warm", "h1", true);
     if !est.contains("n=5") {
-        return Err(format!("estimate: paired and legacy Cargo passes must both count, got {est}"));
+        return Err(format!(
+            "estimate: paired and legacy Cargo passes must both count, got {est}"
+        ));
     }
     // A Buck run is timed only by Buck history: the legacy Cargo samples above
     // do not count, and the paired Buck passes do.
     let est = history_estimate(&enough, "full", "buck", "warm", "h1", true);
     if !est.contains("insufficient history") || !est.contains("only 0 prior successful buck") {
-        return Err(format!("estimate: cargo history must not time a buck run, got {est}"));
+        return Err(format!(
+            "estimate: cargo history must not time a buck run, got {est}"
+        ));
     }
     let buck_rows: Vec<serde_json::Value> = [60, 120, 180]
         .iter()
@@ -1181,7 +1555,9 @@ pub fn self_test() -> Result<String, String> {
         .collect();
     let est = history_estimate(&buck_rows, "full", "buck", "warm", "h1", true);
     if !est.starts_with("~2m00s") || !est.contains("n=3") {
-        return Err(format!("estimate: buck passes must time a buck run, got {est}"));
+        return Err(format!(
+            "estimate: buck passes must time a buck run, got {est}"
+        ));
     }
 
     // Selective-baseline brackets: a nonexistent commit must be REFUSED (so the
@@ -1198,14 +1574,19 @@ pub fn self_test() -> Result<String, String> {
                               exists: &dyn Fn(&str) -> bool| {
         selective_baseline_from(rows, explicit, None, slot, exists)
     };
-    let seen: BTreeSet<String> = ledger_rows.iter().map(|r| s(r, "commit").to_string()).collect();
+    let seen: BTreeSet<String> = ledger_rows
+        .iter()
+        .map(|r| s(r, "commit").to_string())
+        .collect();
     if seen.len() != 2 {
         return Err("selective: fixture rows must carry distinct commits".into());
     }
     if selective_baseline(&ledger_rows, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err("selective: this slot's newest passing commit must win".into());
     }
-    if selective_baseline(&ledger_rows, Some("cafe"), "mine", &exists_all).as_deref() != Some("cafe") {
+    if selective_baseline(&ledger_rows, Some("cafe"), "mine", &exists_all).as_deref()
+        != Some("cafe")
+    {
         return Err("selective: an explicit --baseline must win".into());
     }
     if selective_baseline(&ledger_rows, Some("cafe"), "mine", &exists_none).is_some() {
@@ -1255,7 +1636,10 @@ pub fn self_test() -> Result<String, String> {
     let mut pairless_green = ledger_rows.clone();
     pairless_green.push(base(serde_json::json!({"slot": "mine", "commit": "hhh", "producer": "validate.rs", "finished_at": "2026-09-26T00:00:00Z"})));
     if selective_baseline(&pairless_green, None, "mine", &exists_all).as_deref() != Some("bbb") {
-        return Err("selective: a pairless green after the writer must not become the Cargo baseline".into());
+        return Err(
+            "selective: a pairless green after the writer must not become the Cargo baseline"
+                .into(),
+        );
     }
     // The same schema bound governs the baseline: each newer pairless green
     // below is dated before the cutoff and differs from a legacy baseline only
@@ -1270,7 +1654,8 @@ pub fn self_test() -> Result<String, String> {
         ("future 11", Some(serde_json::json!(11))),
         ("future 999", Some(serde_json::json!(999))),
     ] {
-        let mut row = base(serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}));
+        let mut row =
+            base(serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}));
         match schema {
             Some(schema) => row["schema_version"] = schema,
             None => {

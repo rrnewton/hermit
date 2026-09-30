@@ -26,10 +26,7 @@ static long syscall0(long number) {
 static long syscall1(long number, long arg1) {
   register long rax __asm__("rax") = number;
   register long rdi __asm__("rdi") = arg1;
-  __asm__ volatile("syscall"
-                   : "+a"(rax)
-                   : "D"(rdi)
-                   : "rcx", "r11", "memory");
+  __asm__ volatile("syscall" : "+a"(rax) : "D"(rdi) : "rcx", "r11", "memory");
   return rax;
 }
 
@@ -58,7 +55,7 @@ static long syscall4(long number, long arg1, long arg2, long arg3, long arg4) {
   return rax;
 }
 
-static unsigned long text_length(const char *text) {
+static unsigned long text_length(const char* text) {
   unsigned long length = 0;
   while (text[length] != '\0') {
     ++length;
@@ -66,7 +63,7 @@ static unsigned long text_length(const char *text) {
   return length;
 }
 
-static void write_text(const char *text) {
+static void write_text(const char* text) {
   syscall3(SYS_WRITE, STDOUT_FILENO, (long)text, text_length(text));
 }
 

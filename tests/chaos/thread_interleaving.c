@@ -45,52 +45,52 @@ static int order[THREADS];
 static int order_len = 0;
 
 static void* worker(void* arg) {
-    int id = (int)(long)arg;
+  int id = (int)(long)arg;
 
-    /*
-     * A short bounded spin before the append. It carries no data dependence
-     * and no observable effect of its own; it exists only to widen the window
-     * in which the scheduler may preempt this thread, so that which worker
-     * arrives next is decided by scheduling rather than by thread-creation
-     * order. The bound is a compile-time constant, so the work performed is
-     * identical on every run.
-     */
-    volatile int sink = 0;
-    for (int i = 0; i < 20000; i++) {
-        sink += i;
-    }
-    (void)sink;
+  /*
+   * A short bounded spin before the append. It carries no data dependence
+   * and no observable effect of its own; it exists only to widen the window
+   * in which the scheduler may preempt this thread, so that which worker
+   * arrives next is decided by scheduling rather than by thread-creation
+   * order. The bound is a compile-time constant, so the work performed is
+   * identical on every run.
+   */
+  volatile int sink = 0;
+  for (int i = 0; i < 20000; i++) {
+    sink += i;
+  }
+  (void)sink;
 
-    pthread_mutex_lock(&order_lock);
-    order[order_len++] = id;
-    pthread_mutex_unlock(&order_lock);
-    return NULL;
+  pthread_mutex_lock(&order_lock);
+  order[order_len++] = id;
+  pthread_mutex_unlock(&order_lock);
+  return NULL;
 }
 
 int main(void) {
-    pthread_t threads[THREADS];
+  pthread_t threads[THREADS];
 
-    for (long i = 0; i < THREADS; i++) {
-        if (pthread_create(&threads[i], NULL, worker, (void*)i) != 0) {
-            fprintf(stderr, "pthread_create failed\n");
-            return 2;
-        }
+  for (long i = 0; i < THREADS; i++) {
+    if (pthread_create(&threads[i], NULL, worker, (void*)i) != 0) {
+      fprintf(stderr, "pthread_create failed\n");
+      return 2;
     }
-    for (int i = 0; i < THREADS; i++) {
-        pthread_join(threads[i], NULL);
-    }
+  }
+  for (int i = 0; i < THREADS; i++) {
+    pthread_join(threads[i], NULL);
+  }
 
-    if (order_len != THREADS) {
-        fprintf(stderr, "ERROR! recorded %d of %d appends\n", order_len, THREADS);
-        return 2;
-    }
+  if (order_len != THREADS) {
+    fprintf(stderr, "ERROR! recorded %d of %d appends\n", order_len, THREADS);
+    return 2;
+  }
 
-    /*
-     * The permutation IS the observation. Print it on one line so the harness's
-     * stdout hash is exactly the interleaving class.
-     */
-    for (int i = 0; i < THREADS; i++) {
-        printf("%d%s", order[i], (i + 1 == THREADS) ? "\n" : " ");
-    }
-    return 0;
+  /*
+   * The permutation IS the observation. Print it on one line so the harness's
+   * stdout hash is exactly the interleaving class.
+   */
+  for (int i = 0; i < THREADS; i++) {
+    printf("%d%s", order[i], (i + 1 == THREADS) ? "\n" : " ");
+  }
+  return 0;
 }

@@ -120,7 +120,11 @@ fn ci_hub_path_from(
         return Some(std::path::PathBuf::from(path));
     }
     let parent = parent.filter(|path| !path.is_empty())?;
-    Some(std::path::PathBuf::from(parent).join("ci-hub").join("ci-hub"))
+    Some(
+        std::path::PathBuf::from(parent)
+            .join("ci-hub")
+            .join("ci-hub"),
+    )
 }
 
 fn ci_hub_path() -> Option<std::path::PathBuf> {
@@ -142,11 +146,16 @@ fn resolve_pr() -> Option<String> {
     if !has_cmd("gh") {
         return None;
     }
-    let (prog, pre): (&str, &[&str]) =
-        if has_cmd("with-proxy") { ("with-proxy", &["gh"]) } else { ("gh", &[]) };
+    let (prog, pre): (&str, &[&str]) = if has_cmd("with-proxy") {
+        ("with-proxy", &["gh"])
+    } else {
+        ("gh", &[])
+    };
     let out = Command::new(prog)
         .args(pre)
-        .args(["pr", "view", "--repo", LABEL_REPO, "--json", "number", "-q", ".number"])
+        .args([
+            "pr", "view", "--repo", LABEL_REPO, "--json", "number", "-q", ".number",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -176,15 +185,22 @@ pub fn publish() -> Publication {
         })
         .unwrap_or(false);
     if !is_exec {
-        let msg = format!("the ci-hub receipt publisher is not executable at {}", ci_hub.display());
+        let msg = format!(
+            "the ci-hub receipt publisher is not executable at {}",
+            ci_hub.display()
+        );
         eprintln!("⚠️  counted validation recorded, but {msg}; not applying locally-validated");
         return Publication::Unavailable(msg);
     }
     let Some(pr) = resolve_pr() else {
-        eprintln!("⚠️  counted validation recorded, but no PR was found; not applying locally-validated");
+        eprintln!(
+            "⚠️  counted validation recorded, but no PR was found; not applying locally-validated"
+        );
         return Publication::Unavailable("no PR was found".into());
     };
-    let status = Command::new(&ci_hub).args(apply_local_label_args(&pr)).status();
+    let status = Command::new(&ci_hub)
+        .args(apply_local_label_args(&pr))
+        .status();
     match status {
         Ok(s) if s.success() => {
             println!(
@@ -236,22 +252,58 @@ pub fn self_test() -> Result<String, String> {
     let mut accepted = 1usize;
     // Negative: each condition, spoiled alone, must be REFUSED.
     let negatives: Vec<(&str, Result<(), String>)> = vec![
-        ("nonzero exit", eligible(1, 0, true, true, false, "full", "cargo")),
-        ("nonzero failures", eligible(0, 1, true, true, false, "full", "cargo")),
-        ("--no-label-pr", eligible(0, 0, false, true, false, "full", "cargo")),
-        ("not commit-anchored", eligible(0, 0, true, false, false, "full", "cargo")),
-        ("dirty tree", eligible(0, 0, true, true, true, "full", "cargo")),
-        ("quick profile", eligible(0, 0, true, true, false, "quick", "cargo")),
-        ("portable-only profile", eligible(0, 0, true, true, false, "portable-only", "cargo")),
-        ("super profile", eligible(0, 0, true, true, false, "super", "cargo")),
-        ("envelope-only profile", eligible(0, 0, true, true, false, "envelope-only", "cargo")),
-        ("selective profile", eligible(0, 0, true, true, false, "selective", "cargo")),
-        ("focused compat profile", eligible(0, 0, true, true, false, "strict-compat-only", "cargo")),
+        (
+            "nonzero exit",
+            eligible(1, 0, true, true, false, "full", "cargo"),
+        ),
+        (
+            "nonzero failures",
+            eligible(0, 1, true, true, false, "full", "cargo"),
+        ),
+        (
+            "--no-label-pr",
+            eligible(0, 0, false, true, false, "full", "cargo"),
+        ),
+        (
+            "not commit-anchored",
+            eligible(0, 0, true, false, false, "full", "cargo"),
+        ),
+        (
+            "dirty tree",
+            eligible(0, 0, true, true, true, "full", "cargo"),
+        ),
+        (
+            "quick profile",
+            eligible(0, 0, true, true, false, "quick", "cargo"),
+        ),
+        (
+            "portable-only profile",
+            eligible(0, 0, true, true, false, "portable-only", "cargo"),
+        ),
+        (
+            "super profile",
+            eligible(0, 0, true, true, false, "super", "cargo"),
+        ),
+        (
+            "envelope-only profile",
+            eligible(0, 0, true, true, false, "envelope-only", "cargo"),
+        ),
+        (
+            "selective profile",
+            eligible(0, 0, true, true, false, "selective", "cargo"),
+        ),
+        (
+            "focused compat profile",
+            eligible(0, 0, true, true, false, "strict-compat-only", "cargo"),
+        ),
         (
             "cell requalification profile",
             eligible(0, 0, true, true, false, "cell-requalification", "cargo"),
         ),
-        ("Buck release payload", eligible(0, 0, true, true, false, "full", "buck")),
+        (
+            "Buck release payload",
+            eligible(0, 0, true, true, false, "full", "buck"),
+        ),
     ];
     let mut refused = 0usize;
     for (why, r) in &negatives {
@@ -265,7 +317,9 @@ pub fn self_test() -> Result<String, String> {
     // condition), so the refusal cannot silently move.
     if let Err(e) = eligible(0, 0, true, true, false, "super", "cargo") {
         if !e.contains("not the full suite") {
-            return Err(format!("receipt: super must be refused BY THE PROFILE gate, got: {e}"));
+            return Err(format!(
+                "receipt: super must be refused BY THE PROFILE gate, got: {e}"
+            ));
         }
     }
     let focused_error = eligible(0, 0, true, true, false, "cell-requalification", "cargo")

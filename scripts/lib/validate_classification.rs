@@ -1653,7 +1653,10 @@ mod publication_tests {
                     ),
                     0
                 );
-                assert_eq!(attempt_classification(&unknown), NodeClassification::NoResult);
+                assert_eq!(
+                    attempt_classification(&unknown),
+                    NodeClassification::NoResult
+                );
 
                 let mut with_failed_row = unknown.clone();
                 with_failed_row.test_results = Some(vec![
@@ -1662,7 +1665,11 @@ mod publication_tests {
                 let mut latest = unknown.clone();
                 latest.attempt = 2;
                 for (name, attempts, wanted) in [
-                    ("aborted_import", vec![unknown], NodeClassification::NoResult),
+                    (
+                        "aborted_import",
+                        vec![unknown],
+                        NodeClassification::NoResult,
+                    ),
                     (
                         "retained_failed_row",
                         vec![with_failed_row],

@@ -19,7 +19,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static void require_zero(long result, const char *name) {
+static void require_zero(long result, const char* name) {
   if (result != 0) {
     fprintf(stderr, "%s failed: %s\n", name, strerror(errno));
     exit(1);
@@ -43,8 +43,13 @@ int main(void) {
   }
 
   size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
-  void *page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* page = mmap(
+      NULL,
+      page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (page == MAP_FAILED) {
     perror("mmap");
     return 1;
@@ -57,8 +62,8 @@ int main(void) {
   }
 
   char path[128];
-  snprintf(path, sizeof(path), "/tmp/hermit-syscall-quick-wins-%ld",
-           (long)getpid());
+  snprintf(
+      path, sizeof(path), "/tmp/hermit-syscall-quick-wins-%ld", (long)getpid());
   int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
   if (fd < 0 || write(fd, "x", 1) != 1) {
     perror("open/write");
@@ -67,8 +72,11 @@ int main(void) {
   require_zero(syscall(SYS_fsync, fd), "fsync");
 
   char sendfile_path[128];
-  snprintf(sendfile_path, sizeof(sendfile_path),
-           "/tmp/hermit-syscall-sendfile-%ld", (long)getpid());
+  snprintf(
+      sendfile_path,
+      sizeof(sendfile_path),
+      "/tmp/hermit-syscall-sendfile-%ld",
+      (long)getpid());
   int sendfile_fd = open(sendfile_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
   if (sendfile_fd < 0 || lseek(fd, 0, SEEK_SET) != 0) {
     perror("open/lseek sendfile");
@@ -101,9 +109,9 @@ int main(void) {
     perror("prepare close_range");
     return 1;
   }
-  require_zero(syscall(SYS_close_range, (unsigned int)high_fd,
-                       (unsigned int)high_fd, 0),
-               "close_range");
+  require_zero(
+      syscall(SYS_close_range, (unsigned int)high_fd, (unsigned int)high_fd, 0),
+      "close_range");
   errno = 0;
   if (fcntl(high_fd, F_GETFD) != -1 || errno != EBADF) {
     fputs("close_range left its descriptor open\n", stderr);
@@ -134,8 +142,14 @@ int main(void) {
     return 1;
   }
 
-  printf("syscall-quick-wins-ok uids=%u:%u:%u gids=%u:%u:%u vm=ok fs=ok "
-         "net=ok fd=ok security=ok\n",
-         ruid, euid, suid, rgid, egid, sgid);
+  printf(
+      "syscall-quick-wins-ok uids=%u:%u:%u gids=%u:%u:%u vm=ok fs=ok "
+      "net=ok fd=ok security=ok\n",
+      ruid,
+      euid,
+      suid,
+      rgid,
+      egid,
+      sgid);
   return 0;
 }

@@ -33,8 +33,8 @@ int main(void) {
     return 1;
   }
 
-  void *mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
-                       MAP_SHARED, fd, 0);
+  void* mapping = mmap(
+      NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (mapping == MAP_FAILED) {
     perror("mmap");
     close(fd);
@@ -42,13 +42,21 @@ int main(void) {
   }
 
   errno = 0;
-  long result = syscall(SYS_remap_file_pages, (char *)mapping + page_size,
-                        (size_t)page_size, 0, 0, 0);
+  long result = syscall(
+      SYS_remap_file_pages,
+      (char*)mapping + page_size,
+      (size_t)page_size,
+      0,
+      0,
+      0);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "temporary-file remap_file_pages returned %ld with errno %d (%s), "
-            "expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "temporary-file remap_file_pages returned %ld with errno %d (%s), "
+        "expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     munmap(mapping, (size_t)page_size * 2);
     close(fd);
     return 1;

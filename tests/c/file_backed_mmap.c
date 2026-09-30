@@ -29,8 +29,8 @@
  *
  *   file_backed_mmap size=16 checksum=1160 ok=5
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -46,7 +46,7 @@
 #define PAYLOAD "ABCDEFGHIJKLMNOP"
 #define PAYLOAD_LEN 16
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -70,7 +70,8 @@ int main(void) {
   int ok = 0;
 
   /* MAP_PRIVATE mapping exposes the file's bytes. */
-  char *map = mmap(NULL, PAYLOAD_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  char* map =
+      mmap(NULL, PAYLOAD_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
   if (map == MAP_FAILED)
     fail("mmap private");
   if (memcmp(map, PAYLOAD, PAYLOAD_LEN) == 0)
@@ -96,7 +97,7 @@ int main(void) {
   if (ro < 0)
     fail("open ro");
   off_t final_size = fd_size(ro);
-  char *view = mmap(NULL, PAYLOAD_LEN, PROT_READ, MAP_PRIVATE, ro, 0);
+  char* view = mmap(NULL, PAYLOAD_LEN, PROT_READ, MAP_PRIVATE, ro, 0);
   if (view == MAP_FAILED)
     fail("mmap ro");
   long checksum = 0;
@@ -114,16 +115,23 @@ int main(void) {
   if (unlink(template) != 0)
     fail("unlink");
 
-  printf("file_backed_mmap size=%ld checksum=%ld ok=%d\n", (long)final_size,
-         checksum, ok);
+  printf(
+      "file_backed_mmap size=%ld checksum=%ld ok=%d\n",
+      (long)final_size,
+      checksum,
+      ok);
   /* Route a behavioural failure into the exit status. Without this the guest
      exits 0 whatever `ok` reached, so a regression only lowered the printed
      number -- and under --verify both runs lower it identically, so the
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "file_backed_mmap completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr,
+        "file_backed_mmap completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

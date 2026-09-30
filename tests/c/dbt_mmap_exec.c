@@ -29,8 +29,12 @@ static void fail(const char* operation) {
 
 int main(void) {
   static const unsigned char return_42[] = {
-      0xb8, 0x2a, 0x00, 0x00, 0x00, /* mov $42, %eax */
-      0xc3,                         /* ret */
+      0xb8,
+      0x2a,
+      0x00,
+      0x00,
+      0x00, /* mov $42, %eax */
+      0xc3, /* ret */
   };
   long page_size = sysconf(_SC_PAGESIZE);
   if (page_size <= 0) {
