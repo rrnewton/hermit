@@ -18129,6 +18129,15 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             encoded.push(b'\n');
             fs::write(&result_path, encoded).map_err(|e| e.to_string())
         };
+        // Only the first clone observation below runs the helper through
+        // `cargo run`; require_shared_clone_helper then checks that Cargo used the
+        // shared target and left the helper's bytes unchanged. Every later child
+        // runs that same Cargo-built file directly, which skips Cargo's
+        // fingerprint check (0.11 s per child, measured 2026-09-30), and the tier
+        // re-checks the bytes at its end.
+        let prepared_command_helper = std::path::absolute(&command_helper)
+            .map_err(|error| format!("cannot make the manifest helper path absolute: {error}"))?;
+        let child_helper_via_cargo = std::cell::Cell::new(true);
         let run_result_command = |command: &str, summary: Option<&Path>| {
             let mut child = Command::new(&executable);
             child
@@ -18138,6 +18147,9 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 // The helper must still read the clone's explicit data root.
                 .env("CARGO_TARGET_DIR", command_root.join("target"))
                 .current_dir(&result_command_root);
+            if !child_helper_via_cargo.get() {
+                child.env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper);
+            }
             if let Some(summary) = summary {
                 child.arg("--current-summary").arg(summary);
             }
@@ -18191,6 +18203,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             ));
         }
         require_shared_clone_helper()?;
+        child_helper_via_cargo.set(false);
         let first_observe = read_history_files(&result_command_root)?;
         fs::write(reverie_root.join("fixture"), "advanced\n").map_err(|e| e.to_string())?;
         commit("advance sibling")?;
@@ -18280,6 +18293,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 .arg(&fixture_head)
                 .arg("--refreshed-at")
                 .arg("fixture-refresh")
+                .env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper)
                 .current_dir(&result_command_root);
             command
         };
@@ -19272,6 +19286,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             .arg(&fixture_head)
             .arg("--refreshed-at")
             .arg("fixture-refresh")
+            .env(MANIFEST_PLAN_BIN_ENV, &prepared_command_helper)
             .current_dir(&result_command_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -21513,6 +21528,9 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         );
         fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
         restore_generated()?;
+        // The children above ran this file directly; it must still hold the
+        // bytes Cargo built.
+        require_shared_clone_helper()?;
         Some(CommandsFixture {
             _history_environment,
             _publication_lock: publication_lock,
