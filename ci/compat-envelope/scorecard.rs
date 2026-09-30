@@ -627,7 +627,8 @@ impl ObservationProvenance {
 /// failures are parity failures is `measured-and-passed` or
 /// `measured-no-verdict` here and `diverged` there. On every other kind of
 /// evidence the two agree. Until series.py changes, do not treat its state
-/// as a second copy of this one.
+/// as a second copy of this one. Aligning the two definitions is
+/// <https://github.com/rrnewton/dev-hermit/issues/469>.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MeasurementState {
