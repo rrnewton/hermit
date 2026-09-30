@@ -2951,6 +2951,7 @@ fn emit_series_to(
             results,
             &run_id,
             &metadata.hermit_sha,
+            metadata.source_tree_dirty,
             bounds,
         ));
         sent?;
@@ -2985,6 +2986,12 @@ fn emit_series_to(
 /// one that refuses the rows or one killed at its bound is named, with the
 /// rows left where they are.
 ///
+/// The rows go out with `--source-tree-dirty` set to `source_tree_dirty`,
+/// which [`emit_series_to`] takes from the campaign's `run.json`: the tree
+/// state the campaign recorded when it started, which summarize and
+/// admission require every cell row to repeat
+/// ([`result_row_identity_and_invocation_match`]).
+///
 /// A pressure test has no plan that says which cells its post-pass owed, so,
 /// unlike validate, it cannot stand record-missing rows in for refused
 /// outputs; the line names the refusal instead.
@@ -2995,6 +3002,7 @@ fn append_series_parity(
     results: &Path,
     run_id: &str,
     tree: &str,
+    source_tree_dirty: bool,
     bounds: parity::AppendBounds,
 ) -> String {
     let rows = match parity::node_ledger_sources(
@@ -3025,6 +3033,7 @@ fn append_series_parity(
             producer: parity::ParityProducer::PressureTest,
             run_id,
             tree,
+            source_tree_dirty,
             source: results,
         },
         &rows,
@@ -17908,6 +17917,7 @@ sys.exit(2)
                 &self.path("results"),
                 RUN,
                 TREE,
+                false,
                 parity::AppendBounds::default(),
             )
         }
@@ -17944,6 +17954,7 @@ sys.exit(2)
             ["--producer", "pressure-test"],
             ["--run-id", RUN],
             ["--tree", TREE],
+            ["--source-tree-dirty", "false"],
         ] {
             assert!(
                 argv.windows(2).any(|window| window == pair),
@@ -18112,12 +18123,13 @@ print("fixture " + args[0] + " accepted")
 
     /// `emit_series`, the call site that sends a run's cells and then its
     /// parity rows (E7 of the S12 review), reaches both writers with the
-    /// run's identity, and the parity rows go out even when the cells are
-    /// refused.
+    /// run's identity, sends the parity rows with the tree state the
+    /// campaign's `run.json` recorded, and sends them even when the cells
+    /// are refused.
     #[test]
     fn emitting_a_series_sends_its_cells_and_then_its_parity_rows() {
-        for cells_exit in [0u8, 1] {
-            let fixture = Fixture::new(&format!("emit-{cells_exit}"), WRITER);
+        for (cells_exit, dirty) in [(0u8, false), (1, false), (0, true), (1, true)] {
+            let fixture = Fixture::new(&format!("emit-{cells_exit}-{dirty}"), WRITER);
             let parent = recording_parent(&fixture.root.path, cells_exit);
             let results = fixture.path("results");
             let checkout = fixture.path("checkout");
@@ -18125,7 +18137,7 @@ print("fixture " + args[0] + " accepted")
                 results.join("run.json"),
                 json!({
                     "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
-                    "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                    "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": dirty,
                     "run_timeout_seconds": 60, "cells": [],
                 })
                 .to_string(),
@@ -18135,7 +18147,7 @@ print("fixture " + args[0] + " accepted")
             fs::create_dir_all(&cell).unwrap();
             let row = json!({
                 "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
-                "source_tree_dirty": false, "test": "c-programs/aio-refusal",
+                "source_tree_dirty": dirty, "test": "c-programs/aio-refusal",
                 "category": "c-programs", "lane": "portable", "mode": "verify",
                 "backend": "kvm", "classification": "required", "outcome": "PASS",
                 "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
@@ -18206,6 +18218,8 @@ print("fixture " + args[0] + " accepted")
                         RUN,
                         "--tree",
                         TREE,
+                        "--source-tree-dirty",
+                        if dirty { "true" } else { "false" },
                     ],
                 ]
             );
