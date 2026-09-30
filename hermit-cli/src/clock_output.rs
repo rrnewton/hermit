@@ -23,8 +23,15 @@
 //! differ, in Linux's store order, and finally verifies that every destination
 //! holds its post-call bytes. Validating everything first matters when
 //! destinations alias: once the timeval is restored, an aliased timezone no
-//! longer holds its pre-call bytes. Successful calls use the same phases,
-//! requiring readable destinations first and then writing every byte.
+//! longer holds its pre-call bytes. For the same reason, the write phase reads
+//! each destination again just before writing it and skips a byte that already
+//! holds its post-call value. Two mappings of one page alias without sharing an
+//! address: with the timeval in a writable mapping and the timezone in a
+//! read-only mapping of the same page, Linux stores the timeval and faults on
+//! the timezone, yet the timezone's snapshots differ. Restoring the timeval
+//! already restores those bytes, and writing them again through the read-only
+//! mapping would fail. Successful calls use the same phases, requiring readable
+//! destinations first and then writing every byte.
 
 use std::fmt::Display;
 use std::io;
@@ -41,8 +48,8 @@ use crate::event::ClockOutput;
 /// The largest captured output: a `timespec` or a `timeval`.
 const MAX_OUTPUT: usize = 16;
 
-// TODO-HUMAN-REVIEW(PR-3212): Review captured clock copyout and errno fidelity.
-// https://github.com/rrnewton/hermit/pull/3212
+// TODO-HUMAN-REVIEW(PR-3420): Review captured clock copyout and errno fidelity.
+// https://github.com/rrnewton/hermit/pull/3420
 /// One guest output of a captured clock syscall, named for diagnostics.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Destination {
@@ -122,7 +129,10 @@ impl Destination {
     /// syscall, so the read adds no guest stop, and because it repeats the
     /// post-call read of the same words that every successful call already
     /// performs, next to an injected syscall that costs several ptrace stops.
-    /// Only recording pays it; replay performs the same reads as before.
+    /// Only recording pays for this read. Replay reads each non-NULL
+    /// destination of a successful or `EFAULT` call once before any write and
+    /// once after all writes, and after `EFAULT` once more just before writing
+    /// it. Replay reads nothing for any other failure or a malformed output.
     pub(crate) fn pre_call<M: MemoryAccess>(&self, memory: &M) -> Result<Vec<u8>, Error> {
         self.read_prefix(memory)
     }
@@ -263,14 +273,30 @@ pub(crate) fn replay<M: MemoryAccess>(
         }
     }
 
-    // 2. Apply in the listed order. After EFAULT, write only the bytes that
-    // the call proved it stored; a successful copyout writes every byte.
+    // 2. Apply in the listed order. A successful copyout writes every byte.
+    // After EFAULT, write only a byte whose two snapshots differ, which the
+    // call stored, and skip it when guest memory, read just before this
+    // destination's writes, already holds its post-call value. That happens
+    // when an earlier write in this loop reached it through another mapping
+    // of the same memory, a physical alias that no address comparison can
+    // see. Writing it again would change nothing, and Linux may never have
+    // stored it through this destination: with tv in a writable mapping and
+    // tz in a read-only mapping of one page, Linux stores tv and faults on tz,
+    // yet tz's snapshots differ, so writing tz would refuse a faithful event.
+    // Phase 3 still verifies every byte.
     for (destination, output) in outputs {
         let Some(address) = destination.address else {
             continue;
         };
+        let current = if efault {
+            destination.read_prefix(memory)?
+        } else {
+            Vec::new()
+        };
         for (offset, byte) in output.bytes.iter().enumerate() {
-            if efault && output.pre_call_bytes[offset] == *byte {
+            if efault
+                && (output.pre_call_bytes[offset] == *byte || current.get(offset) == Some(byte))
+            {
                 continue;
             }
             destination.restore_byte(memory, address, offset, *byte)?;
@@ -399,6 +425,78 @@ mod tests {
     impl Drop for Pages {
         fn drop(&mut self) {
             unsafe { libc::munmap(self.base as *mut libc::c_void, self.page * 2) };
+        }
+    }
+
+    /// One memfd page mapped twice with `MAP_SHARED`, so that a store through
+    /// either view is visible through the other: a physical alias that no
+    /// comparison of guest addresses can see. Both views are unmapped on drop.
+    struct AliasedPage {
+        view_a: usize,
+        view_b: usize,
+        page: usize,
+    }
+
+    impl AliasedPage {
+        fn new(protection_a: libc::c_int, protection_b: libc::c_int) -> Self {
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let fd =
+                unsafe { libc::memfd_create(c"clock-output-alias".as_ptr(), libc::MFD_CLOEXEC) };
+            assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+            assert_eq!(unsafe { libc::ftruncate(fd, page as libc::off_t) }, 0);
+            let map = |protection| {
+                let view = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        page,
+                        protection,
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                };
+                assert_ne!(view, libc::MAP_FAILED);
+                view as usize
+            };
+            let (view_a, view_b) = (map(protection_a), map(protection_b));
+            // The two mappings keep the memfd alive.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+            Self {
+                view_a,
+                view_b,
+                page,
+            }
+        }
+
+        fn check_range(&self, address: usize, len: usize) {
+            assert!(
+                [self.view_a, self.view_b]
+                    .into_iter()
+                    .any(|view| address >= view && address + len <= view + self.page)
+            );
+        }
+
+        /// Stores through a writable view.
+        fn fill(&self, address: usize, bytes: &[u8]) {
+            self.check_range(address, bytes.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
+            };
+        }
+
+        fn bytes(&self, address: usize, len: usize) -> Vec<u8> {
+            self.check_range(address, len);
+            (0..len)
+                .map(|offset| unsafe { std::ptr::read_volatile((address + offset) as *const u8) })
+                .collect()
+        }
+    }
+
+    impl Drop for AliasedPage {
+        fn drop(&mut self) {
+            for view in [self.view_a, self.view_b] {
+                unsafe { libc::munmap(view as *mut libc::c_void, self.page) };
+            }
         }
     }
 
@@ -672,6 +770,50 @@ mod tests {
             "captured clock output: gettimeofday tz: guest bytes differ from the recorded \
              pre-call bytes"
         );
+    }
+
+    #[test]
+    fn efault_replay_skips_bytes_an_aliased_write_already_restored() {
+        // tv is in a writable view of a page and tz in a read-only view of the
+        // same page, at the same offset. Linux stores the whole timeval through
+        // the writable view and then faults on tz, which it never stored. The
+        // tz snapshots still differ, because the read-only view shows tv_sec.
+        let alias = AliasedPage::new(libc::PROT_READ | libc::PROT_WRITE, libc::PROT_READ);
+        alias.fill(alias.view_a, &[0x5a; 16]);
+        let tv = Destination::new(
+            "gettimeofday",
+            "tv",
+            AddrMut::<Timeval>::from_raw(alias.view_a),
+        );
+        let tz = Destination::new(
+            "gettimeofday",
+            "tz",
+            AddrMut::<Timezone>::from_raw(alias.view_b),
+        );
+        let memory = LocalMemory::new();
+        let (tv_before, tz_before) = (tv.pre_call(&memory).unwrap(), tz.pre_call(&memory).unwrap());
+        let result = gettimeofday(alias.view_a, alias.view_b);
+        assert_eq!(result, Err(Errno::EFAULT));
+        let timeval = tv.capture(&memory, result, tv_before).unwrap();
+        let timezone = tz.capture(&memory, result, tz_before).unwrap();
+        assert_ne!(timeval.bytes[..8], [0x5a; 8], "Linux stored tv_sec");
+        assert_eq!(timezone.pre_call_bytes, vec![0x5a; 8]);
+        assert_eq!(timezone.bytes, timeval.bytes[..8]);
+
+        // Restoring tv also restores tz through the alias. Writing tz's
+        // changed bytes again would fail on the read-only view and refuse this
+        // faithful event, so replay skips a byte that already holds its
+        // post-call value.
+        alias.fill(alias.view_a, &[0x5a; 16]);
+        let mut memory = TestMemory::new(None);
+        replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap();
+        let changed = timeval.bytes.iter().filter(|&&byte| byte != 0x5a).count();
+        assert_eq!(
+            memory.writes, changed,
+            "only the changed timeval bytes are written"
+        );
+        assert_eq!(alias.bytes(alias.view_a, 16), timeval.bytes);
+        assert_eq!(alias.bytes(alias.view_b, 8), timezone.bytes);
     }
 
     #[test]
