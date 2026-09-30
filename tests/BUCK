@@ -370,6 +370,14 @@ cpp_binary(
     ],
 )
 
+# Guests whose assertions need a single-threaded process. The default Rust
+# allocator starts a background thread before main, so these use malloc (the
+# same reason as the allocator overrides above;
+# https://github.com/rrnewton/hermit/issues/3419).
+single_threaded_rs = [
+    "rust/tkill.rs",
+]
+
 # TODO(T124837711): get the rest of the tests working under trace replay:
 tracereplay_exempt_rs = [
     "rust/bind_connect_race.rs",
@@ -384,6 +392,7 @@ tracereplay_exempt_rs = [
 
 [
     hermit_rust_test(
+        allocator = "malloc" if p in single_threaded_rs else None,
         chaos = True,
         # TODO(T124815884): add disabled test(s) as they work:
         chaosreplay = (p != "rust/thread_random.rs") and (p != "rust/poll_spin.rs"),

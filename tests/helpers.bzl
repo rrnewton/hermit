@@ -283,11 +283,15 @@ def hermit_bin_test(
     )
 
 def hermit_rust_test(
-    path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False
+    path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False, allocator = None
 ):
     basename = paths.replace_extension(paths.basename(path), "")
     bin_name = "rustbin_" + basename
     bin_target = ":" + bin_name
+
+    # A guest that must stay single-threaded names an allocator without a
+    # background thread (see tests/BUCK).
+    allocator_args = {"allocator": allocator} if allocator else {}
     rust_binary(
         # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
         target_compatible_with = ["ovr_config//cpu:x86_64"],
@@ -304,6 +308,7 @@ def hermit_rust_test(
             "-Aunused-crate-dependencies",
         ],
         unittests = False,
+        **allocator_args
     )
     build_test(
         "rs_" + basename,

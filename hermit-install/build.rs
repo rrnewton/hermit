@@ -322,6 +322,9 @@ fn build_liteinst_runtime(
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)
+            // This caller derives the pin through the pin gate; an exported
+            // test override must not choose its marker.
+            .env_remove("HERMIT_LITEINST_REVERIE_PIN")
             .arg("release")
             .arg(&runtime)
             .arg(&target),
