@@ -33,11 +33,14 @@
 //! mapping would fail. Successful calls use the same phases, requiring readable
 //! destinations first and then writing every byte.
 
+use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Display;
 use std::io;
 
 use reverie::Errno;
 use reverie::Error;
+use reverie::Pid;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::AddrSliceMut;
@@ -132,8 +135,10 @@ impl Destination {
     /// Only recording pays for this read. Replay reads each non-NULL
     /// destination of a successful or `EFAULT` call once before any write and
     /// once after all writes, and after `EFAULT` once more just before writing
-    /// it. Replay reads nothing for any other failure, or for outputs that are
-    /// malformed or contradict each other where they overlap.
+    /// it. After an `EFAULT` call that changed a byte, replay also reads the
+    /// guest's `/proc/<pid>/maps` once, before any write. Replay reads nothing
+    /// for any other failure, or for outputs that are malformed or contradict
+    /// each other where they overlap.
     pub(crate) fn pre_call<M: MemoryAccess>(&self, memory: &M) -> Result<Vec<u8>, Error> {
         self.read_prefix(memory)
     }
@@ -247,6 +252,214 @@ fn overlap_disagrees(
     })
 }
 
+/// Replay of an `EFAULT` call refused before any guest write: a byte changed
+/// during the recorded call, so replay must restore it, but its address is not
+/// writable in replay and no earlier write of the call reaches it through
+/// shared memory. Linux can store such a byte through another mapping of the
+/// same memory, and replay gives every file mapping its own anonymous copy, so
+/// that alias no longer exists. This is a limitation of hermit replay, not a
+/// fault in the program (https://github.com/rrnewton/hermit/issues/3434).
+#[derive(Debug)]
+pub(crate) struct UnreplayableClockOutput {
+    pub(crate) syscall: &'static str,
+    pub(crate) name: &'static str,
+    /// The first such byte, counted from the start of the destination.
+    pub(crate) offset: usize,
+}
+
+impl Display for UnreplayableClockOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "captured clock output: {} {}: replay refused before any guest write: byte {} \
+             changed during the recorded call but is not writable in replay and shares no \
+             memory with an earlier output. This is a limitation of hermit replay, not a fault \
+             in the program: replay does not recreate aliases between shared file mappings \
+             (https://github.com/rrnewton/hermit/issues/3434)",
+            self.syscall, self.name, self.offset
+        )
+    }
+}
+
+impl std::error::Error for UnreplayableClockOutput {}
+
+/// Where a guest byte lives: two addresses have the same key exactly when a
+/// store through one is visible through the other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ByteKey {
+    /// A byte of a private mapping, which no other address reaches.
+    Private(usize),
+    /// A byte of a shared mapping: the mapped object's device and inode, and
+    /// the byte's offset in that object.
+    Shared {
+        device: (u32, u32),
+        inode: u64,
+        offset: u64,
+    },
+}
+
+/// One row of `/proc/<pid>/maps`, reduced to what [`refuse_unwritable_stores`]
+/// needs.
+struct MapsRow {
+    start: usize,
+    end: usize,
+    writable: bool,
+    shared: bool,
+    offset: u64,
+    device: (u32, u32),
+    inode: u64,
+}
+
+impl MapsRow {
+    /// Parses `start-end perms offset major:minor inode [path]`, ignoring the
+    /// path. Every number is hexadecimal except the inode.
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_ascii_whitespace();
+        let (start, end) = fields.next()?.split_once('-')?;
+        let permissions = fields.next()?.as_bytes();
+        let offset = fields.next()?;
+        let (major, minor) = fields.next()?.split_once(':')?;
+        let inode = fields.next()?;
+        if permissions.len() != 4 {
+            return None;
+        }
+        Some(Self {
+            start: usize::from_str_radix(start, 16).ok()?,
+            end: usize::from_str_radix(end, 16).ok()?,
+            writable: match permissions[1] {
+                b'w' => true,
+                b'-' => false,
+                _ => return None,
+            },
+            shared: match permissions[3] {
+                b's' => true,
+                b'p' => false,
+                _ => return None,
+            },
+            offset: u64::from_str_radix(offset, 16).ok()?,
+            device: (
+                u32::from_str_radix(major, 16).ok()?,
+                u32::from_str_radix(minor, 16).ok()?,
+            ),
+            inode: inode.parse().ok()?,
+        })
+    }
+
+    /// The key of the byte at `address`, which this row covers.
+    fn key(&self, address: usize) -> Option<ByteKey> {
+        if !self.shared {
+            return Some(ByteKey::Private(address));
+        }
+        Some(ByteKey::Shared {
+            device: self.device,
+            inode: self.inode,
+            offset: self
+                .offset
+                .checked_add(u64::try_from(address - self.start).ok()?)?,
+        })
+    }
+}
+
+/// Refuses an `EFAULT` replay, before any guest write, if phase 2 of
+/// [`replay`] would have to write a byte that is not writable in replay.
+///
+/// This runs phase 2 on a model of guest memory, using the guest's
+/// `/proc/<pid>/maps` as it is now: two addresses share one value exactly when
+/// they map the same object at the same offset, which covers aliases that
+/// replay recreates, such as an `mremap` copy of shared anonymous memory. The
+/// model starts from the bytes phase 1 has just read, which equal the recorded
+/// pre-call bytes. For each output in order, it takes a snapshot, as phase 2
+/// re-reads the destination, and for each byte phase 2 would write, it
+/// refuses if the byte is not writable and otherwise stores the byte's
+/// post-call value under its key. The model never adds or removes a write of
+/// phase 2. Nothing can change the map or the bytes before phase 2 writes:
+/// the calling thread stays stopped in this syscall, replay runs one guest
+/// thread at a time, and only a syscall changes the map.
+///
+/// A byte is writable when its mapping has the `w` permission, which is what
+/// [`Destination::restore_byte`]'s `process_vm_writev` requires. A map that
+/// cannot be read or parsed, or that does not cover a byte phase 1 read, is an
+/// ordinary Tool error, also before any write.
+fn refuse_unwritable_stores(
+    pid: Pid,
+    outputs: &[(Destination, &ClockOutput)],
+) -> Result<(), Error> {
+    // The caller runs this only when some output has differing snapshots;
+    // failures to use the map name that output.
+    let Some((trigger, _)) = outputs
+        .iter()
+        .find(|(_, output)| output.bytes != output.pre_call_bytes)
+    else {
+        return Ok(());
+    };
+    let path = format!("/proc/{}/maps", pid.as_raw());
+    let maps = std::fs::read(&path)
+        .map_err(|error| trigger.failure(format_args!("cannot read {path}: {error}")))?;
+    // A mapped path can be any bytes, not only UTF-8, and `MapsRow::parse`
+    // ignores it. Linux writes a newline in a path as `\012`, so every row is
+    // one line.
+    let maps = String::from_utf8_lossy(&maps);
+    let rows = maps
+        .lines()
+        .map(|line| {
+            MapsRow::parse(line)
+                .ok_or_else(|| trigger.failure(format_args!("malformed {path} row {line:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // The key and writability of every byte each output covers.
+    let bytes = outputs
+        .iter()
+        .map(|(destination, output)| {
+            let Some(address) = destination.address else {
+                return Ok(Vec::new());
+            };
+            (0..output.bytes.len())
+                .map(|offset| {
+                    address
+                        .checked_add(offset)
+                        .and_then(|address| {
+                            let row = rows
+                                .iter()
+                                .find(|row| row.start <= address && address < row.end)?;
+                            Some((row.key(address)?, row.writable))
+                        })
+                        .ok_or_else(|| {
+                            destination.failure(format_args!("byte {offset} is not in {path}"))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Phase 1 has just read these bytes and found the pre-call bytes. Bytes
+    // that share a key were read from the same memory, so they agree.
+    let mut model = HashMap::new();
+    for ((_, output), bytes) in outputs.iter().zip(&bytes) {
+        for (&(key, _), &value) in bytes.iter().zip(&output.pre_call_bytes) {
+            model.entry(key).or_insert(value);
+        }
+    }
+    for ((destination, output), bytes) in outputs.iter().zip(&bytes) {
+        let snapshot = bytes.iter().map(|(key, _)| model[key]).collect::<Vec<u8>>();
+        for (offset, &(key, writable)) in bytes.iter().enumerate() {
+            let value = output.bytes[offset];
+            if output.pre_call_bytes[offset] == value || snapshot[offset] == value {
+                continue;
+            }
+            if !writable {
+                return Err(Error::Tool(anyhow::Error::new(UnreplayableClockOutput {
+                    syscall: destination.syscall,
+                    name: destination.name,
+                    offset,
+                })));
+            }
+            model.insert(key, value);
+        }
+    }
+    Ok(())
+}
+
 /// Replays one captured call's outputs, listed in Linux's store order.
 ///
 /// Every destination passes its shape check before any guest access. Outputs
@@ -256,9 +469,13 @@ fn overlap_disagrees(
 /// refused before any guest access too. Every destination then passes
 /// validation before the first write, and every write must succeed. A
 /// mismatch or failed write is a typed Tool error that names the syscall and
-/// the destination.
+/// the destination. After `EFAULT`, a write that would need a byte that is not
+/// writable in replay is refused before the first write, with
+/// [`UnreplayableClockOutput`]; `pid` is the guest process whose
+/// `/proc/<pid>/maps` shows which bytes are writable and which share memory.
 pub(crate) fn replay<M: MemoryAccess>(
     memory: &mut M,
+    pid: Pid,
     result: Result<i64, Errno>,
     outputs: &[(Destination, &ClockOutput)],
 ) -> Result<(), Error> {
@@ -328,6 +545,18 @@ pub(crate) fn replay<M: MemoryAccess>(
         } else if current != output.pre_call_bytes {
             return Err(destination.failure("guest bytes differ from the recorded pre-call bytes"));
         }
+    }
+
+    // Still before any write, after EFAULT: refuse if phase 2 would have to
+    // write a byte that is not writable in replay. Phase 2 below could only
+    // fail at that byte, after writing the bytes before it. Only a call that
+    // changed a byte writes anything after EFAULT.
+    if efault
+        && outputs
+            .iter()
+            .any(|(_, output)| output.bytes != output.pre_call_bytes)
+    {
+        refuse_unwritable_stores(pid, outputs)?;
     }
 
     // 2. Apply in the listed order. A successful copyout writes every byte.
@@ -547,6 +776,27 @@ mod tests {
                 .map(|offset| unsafe { std::ptr::read_volatile((address + offset) as *const u8) })
                 .collect()
         }
+
+        /// Does to view B what the Replayer does to every file mapping
+        /// (replayer/mmap.rs): maps a new, writable, shared anonymous page in
+        /// its place, fills it, and then applies `protection`. View B then
+        /// shares no memory with view A.
+        fn separate_view_b(&self, fill: u8, protection: libc::c_int) {
+            let view = unsafe {
+                libc::mmap(
+                    self.view_b as *mut libc::c_void,
+                    self.page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(view as usize, self.view_b);
+            unsafe { std::ptr::write_bytes(self.view_b as *mut u8, fill, self.page) };
+            let view = self.view_b as *mut libc::c_void;
+            assert_eq!(unsafe { libc::mprotect(view, self.page, protection) }, 0);
+        }
     }
 
     impl Drop for AliasedPage {
@@ -573,6 +823,31 @@ mod tests {
         error.to_string()
     }
 
+    /// The message of a refusal before any guest write, which must be an
+    /// `UnreplayableClockOutput`.
+    fn refusal_message(error: Error) -> String {
+        let Error::Tool(error) = error else {
+            panic!("expected a Tool error, got {error:?}");
+        };
+        assert!(
+            error.is::<UnreplayableClockOutput>(),
+            "expected UnreplayableClockOutput, got {error:?}"
+        );
+        error.to_string()
+    }
+
+    /// The refusal of a byte that replay would have to write but that is not
+    /// writable in replay.
+    fn unwritable_store(name: &str, offset: usize) -> String {
+        format!(
+            "captured clock output: gettimeofday {name}: replay refused before any guest write: \
+             byte {offset} changed during the recorded call but is not writable in replay and \
+             shares no memory with an earlier output. This is a limitation of hermit replay, not \
+             a fault in the program: replay does not recreate aliases between shared file \
+             mappings (https://github.com/rrnewton/hermit/issues/3434)"
+        )
+    }
+
     fn output(bytes: Vec<u8>, pre_call_bytes: Vec<u8>) -> ClockOutput {
         ClockOutput {
             pointer_present: true,
@@ -595,7 +870,13 @@ mod tests {
         output.bytes[..4].copy_from_slice(&12345678_u32.to_ne_bytes());
         let expected = output.bytes.clone();
         let mut memory = TestMemory::new(None);
-        replay(&mut memory, Err(Errno::EFAULT), &[(destination, &output)]).unwrap();
+        replay(
+            &mut memory,
+            Pid::this(),
+            Err(Errno::EFAULT),
+            &[(destination, &output)],
+        )
+        .unwrap();
         assert_eq!(
             destination.read_prefix(&LocalMemory::new()).unwrap(),
             expected
@@ -628,8 +909,13 @@ mod tests {
             let destination = Destination::new("time", "tloc", address);
             let mut memory = TestMemory::new(Some(write_result));
             let recorded = output(11_u64.to_ne_bytes().to_vec(), 7_u64.to_ne_bytes().to_vec());
-            let error =
-                replay(&mut memory, Err(Errno::EFAULT), &[(destination, &recorded)]).unwrap_err();
+            let error = replay(
+                &mut memory,
+                Pid::this(),
+                Err(Errno::EFAULT),
+                &[(destination, &recorded)],
+            )
+            .unwrap_err();
             assert_eq!(tool_message(error), message);
             assert_eq!(target, 7);
             assert_eq!(memory.writes, 1);
@@ -646,13 +932,20 @@ mod tests {
             let unchanged = output(target.to_ne_bytes().to_vec(), target.to_ne_bytes().to_vec());
             replay(
                 &mut memory,
+                Pid::this(),
                 Err(Errno::EFAULT),
                 &[(destination, &unchanged)],
             )
             .unwrap();
             assert_eq!(memory.writes, 0);
             let successful = output(target.to_ne_bytes().to_vec(), Vec::new());
-            let error = replay(&mut memory, Ok(0), &[(destination, &successful)]).unwrap_err();
+            let error = replay(
+                &mut memory,
+                Pid::this(),
+                Ok(0),
+                &[(destination, &successful)],
+            )
+            .unwrap_err();
             assert_eq!(
                 tool_message(error),
                 format!(
@@ -683,7 +976,13 @@ mod tests {
             assert!(output.pointer_present);
             assert!(output.bytes.is_empty());
             assert!(output.pre_call_bytes.is_empty());
-            replay(&mut memory, Err(Errno::EINVAL), &[(destination, &output)]).unwrap();
+            replay(
+                &mut memory,
+                Pid::this(),
+                Err(Errno::EINVAL),
+                &[(destination, &output)],
+            )
+            .unwrap();
             assert_eq!(memory.reads.get(), 0);
             assert_eq!(memory.writes, 0);
         }
@@ -728,7 +1027,13 @@ mod tests {
                 bytes,
                 pre_call_bytes,
             };
-            let error = replay(&mut memory, result, &[(destination, &recorded)]).unwrap_err();
+            let error = replay(
+                &mut memory,
+                Pid::this(),
+                result,
+                &[(destination, &recorded)],
+            )
+            .unwrap_err();
             assert_eq!(
                 tool_message(error),
                 "captured clock output: time tloc: recorded pointer shape or output length diverged"
@@ -767,7 +1072,13 @@ mod tests {
         // divergence, so replay refuses before writing anything.
         pages.fill(tz_address, &[0xdd; 8]);
         let mut memory = TestMemory::new(None);
-        let error = replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+        let error = replay(
+            &mut memory,
+            Pid::this(),
+            result,
+            &[(tv, &timeval), (tz, &timezone)],
+        )
+        .unwrap_err();
         assert_eq!(
             tool_message(error),
             "captured clock output: gettimeofday tz: guest bytes differ from the recorded \
@@ -812,7 +1123,13 @@ mod tests {
         // destinations end at their post-call bytes.
         pages.fill(tv_address, &[0x5a; 8]);
         let mut memory = TestMemory::new(None);
-        replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap();
+        replay(
+            &mut memory,
+            Pid::this(),
+            result,
+            &[(tv, &timeval), (tz, &timezone)],
+        )
+        .unwrap();
         assert_eq!(pages.bytes(tv_address, 16), timeval.bytes);
         assert_eq!(pages.bytes(tv_address, 8), timezone.bytes);
 
@@ -820,8 +1137,8 @@ mod tests {
         // previous one refuses this faithful event: tz then already holds the
         // restored tv_sec instead of its pre-call bytes.
         pages.fill(tv_address, &[0x5a; 8]);
-        replay(&mut memory, result, &[(tv, &timeval)]).unwrap();
-        let error = replay(&mut memory, result, &[(tz, &timezone)]).unwrap_err();
+        replay(&mut memory, Pid::this(), result, &[(tv, &timeval)]).unwrap();
+        let error = replay(&mut memory, Pid::this(), result, &[(tz, &timezone)]).unwrap_err();
         assert_eq!(
             tool_message(error),
             "captured clock output: gettimeofday tz: guest bytes differ from the recorded \
@@ -863,7 +1180,13 @@ mod tests {
         // post-call value.
         alias.fill(alias.view_a, &[0x5a; 16]);
         let mut memory = TestMemory::new(None);
-        replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap();
+        replay(
+            &mut memory,
+            Pid::this(),
+            result,
+            &[(tv, &timeval), (tz, &timezone)],
+        )
+        .unwrap();
         let changed = timeval.bytes.iter().filter(|&&byte| byte != 0x5a).count();
         assert_eq!(
             memory.writes, changed,
@@ -875,40 +1198,104 @@ mod tests {
 
     #[test]
     fn efault_replay_refuses_a_stored_byte_it_cannot_write() {
-        // gettimeofday(&tv, (void *)1) stores the whole timeval and then
-        // faults on tz. At replay the same bytes are on a read-only page.
-        let pages = Pages::new();
-        let tv_address = pages.boundary();
-        pages.fill(tv_address, &[0x5a; 16]);
-        let tv = Destination::new(
-            "gettimeofday",
-            "tv",
-            AddrMut::<Timeval>::from_raw(tv_address),
-        );
-        let tz = Destination::new("gettimeofday", "tz", AddrMut::<Timezone>::from_raw(1));
-        let memory = LocalMemory::new();
-        let (tv_before, tz_before) = (tv.pre_call(&memory).unwrap(), tz.pre_call(&memory).unwrap());
-        let result = gettimeofday(tv_address, 1);
-        assert_eq!(result, Err(Errno::EFAULT));
-        let timeval = tv.capture(&memory, result, tv_before).unwrap();
-        let timezone = tz.capture(&memory, result, tz_before).unwrap();
-        let first_stored = (0..16)
-            .find(|&offset| timeval.bytes[offset] != timeval.pre_call_bytes[offset])
-            .expect("Linux stored the timeval");
+        {
+            // Block 1: gettimeofday(&tv, (void *)1) stores the whole timeval
+            // and then faults on tz. At replay the same bytes are on a
+            // read-only page, and replay refuses before its first write.
+            let pages = Pages::new();
+            let tv_address = pages.boundary();
+            pages.fill(tv_address, &[0x5a; 16]);
+            let tv = Destination::new(
+                "gettimeofday",
+                "tv",
+                AddrMut::<Timeval>::from_raw(tv_address),
+            );
+            let tz = Destination::new("gettimeofday", "tz", AddrMut::<Timezone>::from_raw(1));
+            let memory = LocalMemory::new();
+            let (tv_before, tz_before) =
+                (tv.pre_call(&memory).unwrap(), tz.pre_call(&memory).unwrap());
+            let result = gettimeofday(tv_address, 1);
+            assert_eq!(result, Err(Errno::EFAULT));
+            let timeval = tv.capture(&memory, result, tv_before).unwrap();
+            let timezone = tz.capture(&memory, result, tz_before).unwrap();
+            let first_stored = (0..16)
+                .find(|&offset| timeval.bytes[offset] != timeval.pre_call_bytes[offset])
+                .expect("Linux stored the timeval");
 
-        pages.fill(tv_address, &[0x5a; 16]);
-        pages.protect_second(libc::PROT_READ);
-        let mut memory = TestMemory::new(None);
-        let error = replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
-        assert_eq!(
-            tool_message(error),
-            format!(
-                "captured clock output: gettimeofday tv: cannot restore syscall output at byte \
-                 {first_stored} (write returned Ok(0))"
+            pages.fill(tv_address, &[0x5a; 16]);
+            pages.protect_second(libc::PROT_READ);
+            let mut memory = TestMemory::new(None);
+            let error = replay(
+                &mut memory,
+                Pid::this(),
+                result,
+                &[(tv, &timeval), (tz, &timezone)],
             )
-        );
-        assert_eq!(memory.writes, 1);
-        assert_eq!(pages.bytes(tv_address, 16), vec![0x5a; 16]);
+            .unwrap_err();
+            assert_eq!(refusal_message(error), unwritable_store("tv", first_stored));
+            assert_eq!(memory.writes, 0);
+            assert_eq!(pages.bytes(tv_address, 16), vec![0x5a; 16]);
+        }
+        {
+            // Block 2: the Codex counterexample as replay leaves it. The
+            // recording maps one memfd page twice, with tv in the read-write
+            // view and tz at offset 8 of the read-only view. Linux stores the
+            // timeval and faults on tz, yet tz's snapshots differ where
+            // tv_usec was stored. Replay gives each file mapping its own
+            // anonymous object (replayer/mmap.rs), so restoring tv no longer
+            // reaches tz, and replay would have to write tz through the
+            // read-only view. Limit: this test builds that topology by hand
+            // with `AliasedPage::separate_view_b`; it does not run the
+            // Replayer.
+            let alias = AliasedPage::new(libc::PROT_READ | libc::PROT_WRITE, libc::PROT_READ);
+            alias.fill(alias.view_a, &vec![0x5a; alias.page]);
+            let tv = Destination::new(
+                "gettimeofday",
+                "tv",
+                AddrMut::<Timeval>::from_raw(alias.view_a),
+            );
+            let tz = Destination::new(
+                "gettimeofday",
+                "tz",
+                AddrMut::<Timezone>::from_raw(alias.view_b + 8),
+            );
+            let memory = LocalMemory::new();
+            let (tv_before, tz_before) =
+                (tv.pre_call(&memory).unwrap(), tz.pre_call(&memory).unwrap());
+            let result = gettimeofday(alias.view_a, alias.view_b + 8);
+            assert_eq!(result, Err(Errno::EFAULT));
+            let timeval = tv.capture(&memory, result, tv_before).unwrap();
+            let timezone = tz.capture(&memory, result, tz_before).unwrap();
+            assert_eq!(timezone.pre_call_bytes, vec![0x5a; 8]);
+            assert_eq!(
+                timezone.bytes,
+                timeval.bytes[8..],
+                "tz shows the stored tv_usec"
+            );
+            // Which tz byte replay reaches first depends on the clock: a byte
+            // of tv_usec that happens to equal 0x5a is not written.
+            let first_changed = (0..8)
+                .find(|&offset| timezone.bytes[offset] != 0x5a)
+                .expect("the stored tv_usec changed tz");
+
+            alias.separate_view_b(0x5a, libc::PROT_READ);
+            alias.fill(alias.view_a, &[0x5a; 16]);
+            let mut memory = TestMemory::new(None);
+            let error = replay(
+                &mut memory,
+                Pid::this(),
+                result,
+                &[(tv, &timeval), (tz, &timezone)],
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal_message(error),
+                unwritable_store("tz", first_changed)
+            );
+            assert_eq!(memory.writes, 0);
+            assert_eq!(alias.bytes(alias.view_a, 16), vec![0x5a; 16]);
+            assert_eq!(alias.bytes(alias.view_b + 8, 8), vec![0x5a; 8]);
+        }
     }
 
     #[test]
@@ -964,7 +1351,13 @@ mod tests {
         pages.fill(tv_address, &[0x5a; 8]);
         pages.protect_second(libc::PROT_NONE);
         let mut memory = TestMemory::new(None);
-        let error = replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+        let error = replay(
+            &mut memory,
+            Pid::this(),
+            result,
+            &[(tv, &timeval), (tz, &timezone)],
+        )
+        .unwrap_err();
         assert_eq!(
             tool_message(error),
             "captured clock output: gettimeofday tv: output mapping diverged: 16 readable bytes \
@@ -998,7 +1391,13 @@ mod tests {
         let timeval = output(timeval_bytes, Vec::new());
         let timezone = output(vec![0x33; 8], Vec::new());
         let mut memory = TestMemory::new(None);
-        let error = replay(&mut memory, Ok(0), &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+        let error = replay(
+            &mut memory,
+            Pid::this(),
+            Ok(0),
+            &[(tv, &timeval), (tz, &timezone)],
+        )
+        .unwrap_err();
         assert_eq!(
             tool_message(error),
             "captured clock output: gettimeofday tv: restored bytes differ from recording"
@@ -1039,8 +1438,13 @@ mod tests {
             ),
         ] {
             let mut memory = TestMemory::new(None);
-            let error =
-                replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+            let error = replay(
+                &mut memory,
+                Pid::this(),
+                result,
+                &[(tv, &timeval), (tz, &timezone)],
+            )
+            .unwrap_err();
             assert_eq!(
                 tool_message(error),
                 "captured clock output: gettimeofday tz: recorded bytes contradict gettimeofday \

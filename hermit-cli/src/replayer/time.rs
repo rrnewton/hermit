@@ -26,7 +26,12 @@ impl Replayer {
         // errno and any partial copyout belong to this call, not the next one.
         let event = next_event!(guest, ClockGettimeV2)?;
         let tp = Destination::new("clock_gettime", "tp", syscall.tp().map(|pointer| pointer.0));
-        clock_output::replay(&mut guest.memory(), event.result, &[(tp, &event.output)])?;
+        clock_output::replay(
+            &mut guest.memory(),
+            guest.pid(),
+            event.result,
+            &[(tp, &event.output)],
+        )?;
         event.result.map_err(Error::from)
     }
 
@@ -37,7 +42,12 @@ impl Replayer {
     ) -> Result<i64, Error> {
         let event = next_event!(guest, TimeV2)?;
         let tloc = Destination::new("time", "tloc", syscall.tloc());
-        clock_output::replay(&mut guest.memory(), event.result, &[(tloc, &event.output)])?;
+        clock_output::replay(
+            &mut guest.memory(),
+            guest.pid(),
+            event.result,
+            &[(tloc, &event.output)],
+        )?;
         event.result.map_err(Error::from)
     }
 
@@ -54,6 +64,7 @@ impl Replayer {
         let tz = Destination::new("gettimeofday", "tz", syscall.tz());
         clock_output::replay(
             &mut guest.memory(),
+            guest.pid(),
             event.result,
             &[(tv, &event.timeval), (tz, &event.timezone)],
         )?;
