@@ -938,6 +938,43 @@ mod tests {
     }
 
     #[test]
+    fn efault_replay_refuses_an_output_mapping_that_diverged() {
+        // gettimeofday(&tv, (void *)1) with tv_usec on a read-only page: Linux
+        // stores tv_sec, faults on tv_usec and never reaches tz. At replay the
+        // second page is no longer readable, so guest memory no longer covers
+        // the bytes that the recording compared.
+        let pages = Pages::new();
+        let tv_address = pages.boundary() - 8;
+        pages.fill(tv_address, &[0x5a; 16]);
+        pages.protect_second(libc::PROT_READ);
+        let tv = Destination::new(
+            "gettimeofday",
+            "tv",
+            AddrMut::<Timeval>::from_raw(tv_address),
+        );
+        let tz = Destination::new("gettimeofday", "tz", AddrMut::<Timezone>::from_raw(1));
+        let memory = LocalMemory::new();
+        let (tv_before, tz_before) = (tv.pre_call(&memory).unwrap(), tz.pre_call(&memory).unwrap());
+        let result = gettimeofday(tv_address, 1);
+        assert_eq!(result, Err(Errno::EFAULT));
+        let timeval = tv.capture(&memory, result, tv_before).unwrap();
+        let timezone = tz.capture(&memory, result, tz_before).unwrap();
+        assert_eq!(timeval.pre_call_bytes, vec![0x5a; 16]);
+
+        pages.fill(tv_address, &[0x5a; 8]);
+        pages.protect_second(libc::PROT_NONE);
+        let mut memory = TestMemory::new(None);
+        let error = replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+        assert_eq!(
+            tool_message(error),
+            "captured clock output: gettimeofday tv: output mapping diverged: 16 readable bytes \
+             before the recorded call, 8 now"
+        );
+        assert_eq!(memory.writes, 0);
+        assert_eq!(pages.bytes(tv_address, 8), vec![0x5a; 8]);
+    }
+
+    #[test]
     fn successful_replay_verifies_every_output_after_every_write() {
         // tz, at offset 8 of a second mapping of tv's page, aliases tv_usec
         // physically, which no comparison of addresses can see. A faithful
