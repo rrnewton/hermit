@@ -36533,6 +36533,77 @@ mod parity_summary_tests {
         );
     }
 
+    /// One copy of an observation holding `results` per coordinate, each
+    /// recording a position on that coordinate alone, so each of the four
+    /// position checks in [`derive_measurement`] is exercised by itself.
+    fn located_on_each_coordinate(results: &[&str]) -> Vec<Observation> {
+        (0..4)
+            .map(|coordinate| {
+                let mut located = observation(results, &[]);
+                let positions = match coordinate {
+                    0 => &mut located.first_divergent_record,
+                    1 => &mut located.first_divergent_syscall,
+                    2 => &mut located.first_divergent_scheduler_turn,
+                    _ => &mut located.first_divergent_virtual_nanoseconds,
+                };
+                positions.record(Some(13));
+                located
+            })
+            .collect()
+    }
+
+    /// The retired rerun's positions are parity positions: they never locate
+    /// a determinism failure that recorded no position of its own. Before
+    /// https://github.com/rrnewton/hermit/issues/3301 (S1) any stored
+    /// position located the cell, and this cell was `diverged`.
+    #[test]
+    fn a_parity_only_observations_positions_do_not_locate_a_determinism_failure() {
+        let unlocated = || observation(&["determinism-failure"], &[]);
+        for parity_only in located_on_each_coordinate(&["parity-failure"]) {
+            let cell = tracked_cell(&golden(1), "kvm", vec![unlocated(), parity_only.clone()]);
+            assert_eq!(
+                derive_measurement(&cell),
+                MeasurementState::DivergedUnlocated,
+                "{:?}",
+                cell.observations
+            );
+            // Alone, the parity-only observation is no divergence at all.
+            let cell = tracked_cell(&golden(1), "kvm", vec![parity_only]);
+            assert_eq!(
+                derive_measurement(&cell),
+                MeasurementState::MeasuredNoVerdict,
+                "{:?}",
+                cell.observations
+            );
+        }
+    }
+
+    /// One observation holding both a determinism (or replay) failure and a
+    /// parity failure is located by its positions, as before S1.
+    #[test]
+    fn one_observation_holding_both_failure_kinds_is_located_by_its_positions() {
+        for results in [
+            ["determinism-failure", "parity-failure"],
+            ["replay-failure", "parity-failure"],
+        ] {
+            for both in located_on_each_coordinate(&results) {
+                let cell = tracked_cell(&golden(1), "kvm", vec![both]);
+                assert_eq!(
+                    derive_measurement(&cell),
+                    MeasurementState::Diverged,
+                    "{:?}",
+                    cell.observations
+                );
+            }
+            // With no position at all, the same observation is unlocated.
+            let cell = tracked_cell(&golden(1), "kvm", vec![observation(&results, &[])]);
+            assert_eq!(
+                derive_measurement(&cell),
+                MeasurementState::DivergedUnlocated
+            );
+        }
+    }
+
     #[test]
     fn a_retired_id_row_joins_its_successor() {
         let retired = "backend-parity-c/pidfd-open-self";
