@@ -7065,12 +7065,15 @@ fn summarize(
     // The verify histories of each cell's first repetition that this summary
     // accepted: the operands of the parity post-pass, one harness history per
     // cell. A first repetition it refused is handed over as its reason
-    // instead, typed as an evidence error or an invalid row, so that side of
-    // a parity cell is unavailable, never measured and never reported
-    // missing. A later repetition whose accepted row recorded a verify
-    // mismatch is handed over as where it did: that side's two runs diverged,
-    // so it has no deterministic log and its parity cells are
-    // nondeterministic.
+    // instead, typed as the condition the harness's own post-pass classifies
+    // the same way ([`parity_rejection`]): a missing or invalid row, verify
+    // logs or a golden that were not retained, or a cell that only the
+    // retained harness summary proves host-inapplicable. A harness or
+    // evidence defect is therefore unmeasured, in the floor as 0, and never
+    // an outcome that left no golden. A later repetition whose accepted row
+    // recorded a verify mismatch is handed over as where it did: that side's
+    // two runs diverged, so it has no deterministic log and its parity cells
+    // are nondeterministic.
     let mut parity_rows: Vec<CellResult> = Vec::new();
     let mut parity_rejected: BTreeMap<(String, String), parity::ParityRejection> = BTreeMap::new();
     let mut parity_nondeterministic: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -7338,6 +7341,11 @@ fn summarize(
                     None,
                 )
             };
+            // The evidence errors in the retained verify logs and in the
+            // normalized ptrace golden, which type a refused parity operand
+            // ([`parity_rejection`]).
+            let mut log_errors = 0usize;
+            let mut golden_errors = 0usize;
             let mut typed_no_comparison_refusal = false;
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
@@ -7374,6 +7382,7 @@ fn summarize(
                 Some(artifact_dir) => match retained_verification_logs(cell, artifact_dir) {
                     Ok(logs) => logs,
                     Err(error) => {
+                        log_errors += 1;
                         evidence_errors.push(error);
                         Vec::new()
                     }
@@ -7384,6 +7393,7 @@ fn summarize(
                 Some(artifact_dir) => match normalized_ptrace_golden(cell, artifact_dir) {
                     Ok(path) => path,
                     Err(error) => {
+                        golden_errors += 1;
                         evidence_errors.push(error);
                         None
                     }
@@ -7394,6 +7404,7 @@ fn summarize(
                 && matches!(verification_verdict, Some("matched" | "diverged"))
                 && verification_logs.len() != 2
             {
+                log_errors += 1;
                 evidence_errors.push(
                 "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
                     .into(),
@@ -7407,6 +7418,7 @@ fn summarize(
                     .iter()
                     .any(|error| error.contains("golden-log normalization"))
             {
+                golden_errors += 1;
                 evidence_errors
                     .push("terminal ptrace verify result has no normalized golden INFO log".into());
             }
@@ -7453,13 +7465,25 @@ fn summarize(
                         evidence_errors.join("; ")
                     };
                     let reason = format!("result row rejected by the series summary: {why}");
+                    let evidence = RefusedParityEvidence {
+                        // Exactly the samples' prerequisite failure below.
+                        host_inapplicable: retained_prerequisite
+                            && !row_valid
+                            && initial_evidence_valid
+                            && sample_evidence_errors.is_empty()
+                            && result_rows_for_history.is_empty()
+                            && !proven_timeout
+                            && !proven_oom,
+                        no_row: result_rows_for_history.is_empty()
+                            && matches!(result_file_size, None | Some(0)),
+                        row_valid,
+                        other_error: evidence_errors.len() > log_errors + golden_errors,
+                        log_error: log_errors > 0,
+                        golden_error: golden_errors > 0,
+                    };
                     parity_rejected.insert(
                         (cell.test.clone(), cell.backend.clone()),
-                        if evidence_errors.is_empty() {
-                            parity::ParityRejection::InvalidRow(reason)
-                        } else {
-                            parity::ParityRejection::EvidenceError(reason)
-                        },
+                        parity_rejection(reason, evidence),
                     );
                 }
             } else if cell.mode == parity::PARITY_MODE && row_valid && evidence_errors.is_empty() {
@@ -7994,6 +8018,62 @@ fn summarize(
     Ok(())
 }
 
+/// What a verify cell's first repetition that the summary refused left
+/// behind, for [`parity_rejection`].
+#[derive(Clone, Copy, Debug, Default)]
+struct RefusedParityEvidence {
+    /// The retained harness summary proves the cell host-inapplicable, and
+    /// nothing contradicts it: the samples' prerequisite failure.
+    host_inapplicable: bool,
+    /// No result row was read, and the result history is absent or empty.
+    no_row: bool,
+    /// The rows were read and are the cell's: they match its identity, its
+    /// harness exit and the runner's terminal attempt, and carry complete
+    /// invocations.
+    row_valid: bool,
+    /// Evidence other than the retained verify logs and the golden refused
+    /// the rows: the harness exit, the verification report, the recorded
+    /// invocation or the recorded result.
+    other_error: bool,
+    /// The verify logs were not retained as the summary requires.
+    log_error: bool,
+    /// The normalized ptrace golden was not written.
+    golden_error: bool,
+}
+
+/// The typed reason a verify cell's refused first repetition is handed to
+/// the parity post-pass with ([`parity::PostPassConfig::rejected`]): the
+/// condition the harness's own post-pass classifies the same way
+/// ([`parity::ParityRejection::typed`]). A harness or evidence defect is
+/// therefore unmeasured, in the floor as 0, and never an outcome that left
+/// no golden; `infrastructure-error` stays the class of a row whose own
+/// typed result says so. <https://github.com/rrnewton/hermit/issues/3301>
+///
+/// In order, as the post-pass checks an operand:
+/// - the retained harness summary alone proves the cell host-inapplicable,
+///   so it left no log, like a `HOST-INAPPLICABLE` row;
+/// - no row was read from an absent or empty history: a missing row, like a
+///   cell with no history (the harness's `no-result-row`);
+/// - rows that are not the cell's, or that other evidence contradicts or
+///   cannot support: an invalid row, like a history the harness refuses;
+/// - a valid row whose verify logs were not retained as required;
+/// - a valid ptrace row whose normalized golden was not written.
+fn parity_rejection(reason: String, evidence: RefusedParityEvidence) -> parity::ParityRejection {
+    if evidence.host_inapplicable {
+        parity::ParityRejection::HostInapplicable(reason)
+    } else if evidence.no_row {
+        parity::ParityRejection::MissingRow(reason)
+    } else if !evidence.row_valid || evidence.other_error {
+        parity::ParityRejection::InvalidRow(reason)
+    } else if evidence.log_error {
+        parity::ParityRejection::LogNotRetained(reason)
+    } else if evidence.golden_error {
+        parity::ParityRejection::GoldenNotWritten(reason)
+    } else {
+        parity::ParityRejection::InvalidRow(reason)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Set by a self-test to panic inside [`report_parity`], outside
@@ -8008,10 +8088,11 @@ thread_local! {
 /// and neither `summary.json` nor the exit status changes. A post-pass that
 /// refused or panicked before measuring leaves no earlier summary's records
 /// behind. `rejected` holds the verify cells whose first repetition the
-/// summary refused, with the typed reason; their parity cells are
-/// unavailable. `nondeterministic` holds the verify cells a later repetition
-/// of which the summary accepted recorded a verify mismatch, with where;
-/// their parity cells are nondeterministic.
+/// summary refused, with the typed reason ([`parity_rejection`]); their
+/// parity cells take the class the harness gives the same condition and are
+/// never compared. `nondeterministic` holds the verify cells a later
+/// repetition of which the summary accepted recorded a verify mismatch, with
+/// where; their parity cells are nondeterministic.
 fn report_parity(
     root: &Path,
     results: &Path,
@@ -16867,6 +16948,134 @@ mod pressure_sample_tests {
             .unwrap_or_else(|| panic!("no parity line for {cell} in {records:?}"))
     }
 
+    /// A verify cell whose first repetition the summary refused reaches the
+    /// parity post-pass as the condition the harness's own post-pass
+    /// classifies the same way, checked in the post-pass's order. Every such
+    /// harness or evidence defect is unmeasured, in the floor as 0, as the
+    /// reference or as a candidate. Only a cell the retained harness summary
+    /// proves host-inapplicable leaves no golden, as a `HOST-INAPPLICABLE`
+    /// row does, and nothing the summary refuses is `infrastructure-error`.
+    #[test]
+    fn a_refused_parity_operand_takes_the_class_the_harness_gives_its_condition() {
+        use hermit_manifest_plan::parity::ParityRejection::GoldenNotWritten;
+        use hermit_manifest_plan::parity::ParityRejection::HostInapplicable;
+        use hermit_manifest_plan::parity::ParityRejection::InvalidRow;
+        use hermit_manifest_plan::parity::ParityRejection::LogNotRetained;
+        use hermit_manifest_plan::parity::ParityRejection::MissingRow;
+        let evidence = RefusedParityEvidence::default();
+        let valid = RefusedParityEvidence {
+            row_valid: true,
+            ..evidence
+        };
+        let every_error = RefusedParityEvidence {
+            other_error: true,
+            log_error: true,
+            golden_error: true,
+            ..valid
+        };
+        let cases: [(
+            &str,
+            RefusedParityEvidence,
+            fn(String) -> parity::ParityRejection,
+        ); 9] = [
+            (
+                "proven host-inapplicable",
+                RefusedParityEvidence {
+                    host_inapplicable: true,
+                    no_row: true,
+                    other_error: true,
+                    ..evidence
+                },
+                HostInapplicable,
+            ),
+            (
+                "no row",
+                RefusedParityEvidence {
+                    no_row: true,
+                    other_error: true,
+                    ..evidence
+                },
+                MissingRow,
+            ),
+            (
+                "rows that are not the cell's",
+                RefusedParityEvidence {
+                    log_error: true,
+                    golden_error: true,
+                    ..evidence
+                },
+                InvalidRow,
+            ),
+            ("contradicted by other evidence", every_error, InvalidRow),
+            (
+                "only other evidence",
+                RefusedParityEvidence {
+                    other_error: true,
+                    ..valid
+                },
+                InvalidRow,
+            ),
+            (
+                "logs and golden",
+                RefusedParityEvidence {
+                    log_error: true,
+                    golden_error: true,
+                    ..valid
+                },
+                LogNotRetained,
+            ),
+            (
+                "logs",
+                RefusedParityEvidence {
+                    log_error: true,
+                    ..valid
+                },
+                LogNotRetained,
+            ),
+            (
+                "golden",
+                RefusedParityEvidence {
+                    golden_error: true,
+                    ..valid
+                },
+                GoldenNotWritten,
+            ),
+            ("no typed error", valid, InvalidRow),
+        ];
+        for (label, evidence, expected) in cases {
+            let rejection = parity_rejection(label.to_string(), evidence);
+            assert_eq!(rejection, expected(label.to_string()), "{label}");
+            assert_eq!(rejection.reason(), label);
+            let host_inapplicable = matches!(rejection, HostInapplicable(_));
+            for (operand, missing) in [
+                (
+                    parity::ParityOperand::Reference,
+                    parity::ParityVerdict::ReferenceMissing,
+                ),
+                (
+                    parity::ParityOperand::Candidate,
+                    parity::ParityVerdict::CandidateMissing,
+                ),
+            ] {
+                let (_, class) = rejection.typed(operand, missing);
+                assert_ne!(
+                    class,
+                    parity::UnavailableClass::InfrastructureError,
+                    "{label}"
+                );
+                assert_eq!(
+                    class.group(),
+                    if host_inapplicable {
+                        parity::UnavailableGroup::NoGolden
+                    } else {
+                        parity::UnavailableGroup::Unmeasured
+                    },
+                    "{label} as {operand:?}"
+                );
+            }
+        }
+    }
+
     /// The series' parity post-pass is the harness's post-pass, with the
     /// harness's scope rule. It runs after summary.json is written and changes
     /// no file but its own. A selected cell whose ptrace verify cell the series
@@ -16878,7 +17087,8 @@ mod pressure_sample_tests {
     /// post-pass that measures nothing, because its scope is empty or cannot
     /// be resolved, leaves no records of an earlier summary behind. A verify
     /// cell every repetition of which the summary refused makes its parity
-    /// cells unavailable, with the summary's reason for the first repetition.
+    /// cells unmeasured, in the floor as 0, with the class the harness gives
+    /// the first repetition's condition and the summary's reason for it.
     #[test]
     fn series_parity_post_pass_reports_missing_operands_and_leaves_the_summary_unchanged() {
         let root = checkout_root();
@@ -17103,9 +17313,11 @@ mod pressure_sample_tests {
         assert!(!parity_path.exists());
         assert!(!status_path.exists());
 
-        // A first repetition the summary refused is never read: its parity
-        // cell is unavailable with the summary's reason, an evidence error of
-        // the reference, not missing, while no repetition the summary
+        // A first repetition the summary refused is never read. Rows that
+        // contradict their harness exit are an invalid row, like a history
+        // the harness refuses: the cell is unmeasured with the summary's
+        // reason, in the floor as 0. A refused reference does not take its
+        // test's cells out of the floor, and no repetition the summary
         // accepted recorded a mismatch either.
         metadata.parity_select = vec![failed_cell.to_string()];
         write_metadata(&metadata);
@@ -17126,17 +17338,25 @@ mod pressure_sample_tests {
         assert_eq!(records.len(), 1, "{records:?}");
         let refused = parity_record(&records, &failed_cell);
         assert_eq!(
-            refused.verdict,
-            parity::ParityVerdict::Unavailable,
-            "{refused:?}"
-        );
-        assert_eq!(
-            (refused.unavailable_class, refused.operand),
+            (refused.verdict, refused.unavailable_class, refused.operand),
             (
-                Some(parity::UnavailableClass::InfrastructureError),
+                parity::ParityVerdict::Unavailable,
+                Some(parity::UnavailableClass::NoResultRow),
                 Some(parity::ParityOperand::Reference)
             ),
             "{refused:?}"
+        );
+        assert_eq!(
+            refused
+                .unavailable_class
+                .map(parity::UnavailableClass::group),
+            Some(parity::UnavailableGroup::Unmeasured),
+            "{refused:?}"
+        );
+        assert_eq!((refused.credit, refused.unequalized_credit), (None, None));
+        assert_eq!(
+            (&refused.reference_log, &refused.candidate_log),
+            (&None, &None)
         );
         let reason = refused.reason.as_deref().unwrap_or_default();
         assert!(
@@ -17195,9 +17415,11 @@ mod pressure_sample_tests {
     /// binary the cells ran, as unequalized credit. A panic in the post-pass,
     /// or an output that cannot be written, changes neither the summary nor
     /// the result, and a panic leaves no earlier records behind. A cell whose
-    /// row is valid but whose retained evidence the summary refused is
-    /// unavailable with that reason, an evidence error of that side, and is
-    /// not compared.
+    /// row is valid but whose retained logs the summary refused is not
+    /// compared: it did not retain its log, unmeasured with the summary's
+    /// reason and in the floor as 0, whether the missing log is the first-run
+    /// log the post-pass compares or the second-run log only the summary
+    /// requires.
     #[test]
     fn series_parity_post_pass_measures_only_the_verify_cells_summarize_accepted() {
         let root = checkout_root();
@@ -17308,6 +17530,7 @@ mod pressure_sample_tests {
         };
         let mut evidence = BTreeMap::new();
         let mut rows = Vec::new();
+        let mut run1_logs = BTreeMap::new();
         let mut run2_logs = BTreeMap::new();
         for id in &metadata.cells {
             let reference = id.backend == parity::PARITY_REFERENCE_BACKEND;
@@ -17325,6 +17548,7 @@ mod pressure_sample_tests {
             );
             fs::write(logs.join("run1_log_fixture.log"), &log).unwrap();
             fs::write(logs.join("run2_log_fixture.log"), &log).unwrap();
+            run1_logs.insert(id.backend.clone(), logs.join("run1_log_fixture.log"));
             run2_logs.insert(id.backend.clone(), logs.join("run2_log_fixture.log"));
             if reference {
                 fs::write(logs.join("normalized-ptrace-golden.log"), &log).unwrap();
@@ -17473,24 +17697,81 @@ mod pressure_sample_tests {
             parity::ParityVerdict::Diverged
         );
 
-        // A valid row whose retained evidence the summary refused is not
-        // compared: its cell is unavailable with the summary's reason.
+        // A valid row whose retained logs the summary refused is not
+        // compared. Without the candidate's first-run log, the log the
+        // harness's post-pass compares, the candidate did not retain its log,
+        // like a passing harness cell with none: unmeasured with the
+        // summary's reason, in the floor as 0, and the golden is still named.
+        let golden_text = golden.to_string_lossy().into_owned();
+        let run1 = &run1_logs[cell.backend.as_str()];
+        let saved_run1 = fs::read(run1).unwrap();
+        fs::remove_file(run1).unwrap();
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("produced no trustworthy result"), "{error}");
+        let records = read_parity_records(&parity_path);
+        let refused = parity_record(&records, &cell);
+        assert_eq!(
+            (refused.verdict, refused.unavailable_class, refused.operand),
+            (
+                parity::ParityVerdict::CandidateMissing,
+                Some(parity::UnavailableClass::LogNotRetained),
+                Some(parity::ParityOperand::Candidate)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused
+                .unavailable_class
+                .map(parity::UnavailableClass::group),
+            Some(parity::UnavailableGroup::Unmeasured),
+            "{refused:?}"
+        );
+        assert_eq!((refused.credit, refused.unequalized_credit), (None, None));
+        assert_eq!(
+            (
+                refused.reference_log.as_deref(),
+                refused.candidate_log.as_deref()
+            ),
+            (Some(golden_text.as_str()), None),
+            "{refused:?}"
+        );
+        let reason = refused.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(&format!(
+                "the {} candidate verify cell of {}: result row rejected by the series summary: ",
+                cell.backend, cell.test_id
+            )) && reason.contains(
+                "must contain exactly one nonempty run1 capture and one nonempty run2 capture"
+            ),
+            "{refused:?}"
+        );
+        refused.validate().unwrap();
+        assert_eq!(log_diff_calls(), 2);
+        // The summary also requires the second-run log, which the post-pass
+        // never reads. Without it the summary refuses the cell the same way,
+        // and the cell counts as 0 the same way: never compared, and never
+        // outside the floor.
+        fs::write(run1, saved_run1).unwrap();
         fs::remove_file(&run2_logs[cell.backend.as_str()]).unwrap();
         let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
         assert!(error.contains("produced no trustworthy result"), "{error}");
         let records = read_parity_records(&parity_path);
         let refused = parity_record(&records, &cell);
         assert_eq!(
-            refused.verdict,
-            parity::ParityVerdict::Unavailable,
+            (refused.verdict, refused.unavailable_class, refused.operand),
+            (
+                parity::ParityVerdict::CandidateMissing,
+                Some(parity::UnavailableClass::LogNotRetained),
+                Some(parity::ParityOperand::Candidate)
+            ),
             "{refused:?}"
         );
         assert_eq!(
-            (refused.unavailable_class, refused.operand),
             (
-                Some(parity::UnavailableClass::InfrastructureError),
-                Some(parity::ParityOperand::Candidate)
+                refused.reference_log.as_deref(),
+                refused.candidate_log.as_deref()
             ),
+            (Some(golden_text.as_str()), None),
             "{refused:?}"
         );
         let reason = refused.reason.as_deref().unwrap_or_default();
