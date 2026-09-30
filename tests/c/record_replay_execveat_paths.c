@@ -28,7 +28,8 @@ static void fail(const char* operation) {
   exit(1);
 }
 
-static void exec_fd_alias(const char* executable, const char* prefix, const char* phase) {
+static void
+exec_fd_alias(const char* executable, const char* prefix, const char* phase) {
   int fd = open(executable, O_PATH);
   if (fd < 0) {
     fail("open executable alias");
@@ -61,7 +62,8 @@ int main(int argc, char** argv) {
     long result = syscall(
         SYS_execveat, AT_FDCWD, link, unused, environ, AT_SYMLINK_NOFOLLOW);
     if (result != -1 || errno != ELOOP) {
-      fprintf(stderr, "AT_SYMLINK_NOFOLLOW returned %ld errno=%d\n", result, errno);
+      fprintf(
+          stderr, "AT_SYMLINK_NOFOLLOW returned %ld errno=%d\n", result, errno);
       return 1;
     }
     unlink(link);
@@ -85,7 +87,8 @@ int main(int argc, char** argv) {
       fail("open AT_EMPTY_PATH executable");
     }
     int status_flags = fcntl(fd, F_GETFL);
-    if (status_flags < 0 || fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) != 0) {
+    if (status_flags < 0 ||
+        fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) != 0) {
       fail("set AT_EMPTY_PATH executable status flags");
     }
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {

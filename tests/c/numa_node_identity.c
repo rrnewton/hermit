@@ -7,8 +7,9 @@
  */
 
 /*
- * numa_node_identity — backend-parity contract for Detcore's single-virtual-node
- * NUMA determinization of get_mempolicy(2) and move_pages(2).
+ * numa_node_identity — backend-parity contract for Detcore's
+ * single-virtual-node NUMA determinization of get_mempolicy(2) and
+ * move_pages(2).
  *
  * Detcore presents exactly one virtual NUMA node. get_mempolicy(2) reports the
  * default policy MPOL_DEFAULT (0), and move_pages(2) in query mode
@@ -21,10 +22,10 @@
  * This fixture uses the RAW syscalls (no libnuma) so it observes precisely what
  * Detcore's handlers return. It (1) queries get_mempolicy and asserts the mode
  * is MPOL_DEFAULT, and (2) maps two anonymous pages, faults in only the first,
- * and runs a move_pages location query repeatedly, asserting node 0 for both the
- * resident and the not-present page. On a real host the not-present page's status
- * comes back as -ENOENT (a negative value), so a native run diverges — proving
- * this pins a genuine determinization rather than a tautology.
+ * and runs a move_pages location query repeatedly, asserting node 0 for both
+ * the resident and the not-present page. On a real host the not-present page's
+ * status comes back as -ENOENT (a negative value), so a native run diverges —
+ * proving this pins a genuine determinization rather than a tautology.
  */
 
 #define _GNU_SOURCE
@@ -40,24 +41,36 @@
 /* Poison sentinel: a value neither Detcore nor the kernel writes on success. */
 #define SENTINEL 0x7f
 
-static int query_move_pages(int iter, void *const pages[2], int out_status[2]) {
+static int query_move_pages(int iter, void* const pages[2], int out_status[2]) {
   int status[2] = {SENTINEL, SENTINEL};
 
   /* nodes == NULL selects location-query mode; pid 0 targets this process. */
-  long ret = syscall(SYS_move_pages, 0, (unsigned long)2, pages, (int *)NULL,
-                     status, (unsigned long)0);
+  long ret = syscall(
+      SYS_move_pages,
+      0,
+      (unsigned long)2,
+      pages,
+      (int*)NULL,
+      status,
+      (unsigned long)0);
   if (ret != 0) {
-    fprintf(stderr, "iter %d: move_pages query returned %ld, expected 0\n", iter,
-            ret);
+    fprintf(
+        stderr,
+        "iter %d: move_pages query returned %ld, expected 0\n",
+        iter,
+        ret);
     return 1;
   }
   out_status[0] = status[0];
   out_status[1] = status[1];
   for (int p = 0; p < 2; p++) {
     if (status[p] != 0) {
-      fprintf(stderr,
-              "iter %d: move_pages status[%d] = %d, expected 0 (virtual node 0)\n",
-              iter, p, status[p]);
+      fprintf(
+          stderr,
+          "iter %d: move_pages status[%d] = %d, expected 0 (virtual node 0)\n",
+          iter,
+          p,
+          status[p]);
       return 1;
     }
   }
@@ -67,12 +80,20 @@ static int query_move_pages(int iter, void *const pages[2], int out_status[2]) {
 int main(void) {
   /* get_mempolicy: the current policy must be the virtualized MPOL_DEFAULT. */
   int mode = SENTINEL;
-  long pol = syscall(SYS_get_mempolicy, &mode, (unsigned long *)NULL,
-                     (unsigned long)0, (void *)NULL, (unsigned long)0);
+  long pol = syscall(
+      SYS_get_mempolicy,
+      &mode,
+      (unsigned long*)NULL,
+      (unsigned long)0,
+      (void*)NULL,
+      (unsigned long)0);
   if (pol != 0 || mode != VIRTUAL_MEMPOLICY) {
-    fprintf(stderr,
-            "get_mempolicy returned %ld mode %d, expected 0 and MPOL_DEFAULT %d\n",
-            pol, mode, VIRTUAL_MEMPOLICY);
+    fprintf(
+        stderr,
+        "get_mempolicy returned %ld mode %d, expected 0 and MPOL_DEFAULT %d\n",
+        pol,
+        mode,
+        VIRTUAL_MEMPOLICY);
     return 1;
   }
 
@@ -82,19 +103,24 @@ int main(void) {
     return 1;
   }
 
-  unsigned char *region = mmap(NULL, (size_t)page_size * 2,
-                               PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  unsigned char* region = mmap(
+      NULL,
+      (size_t)page_size * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (region == MAP_FAILED) {
     perror("mmap");
     return 1;
   }
 
   /* Fault in only the first page; the second stays not-present on purpose so
-   * that a native kernel would report -ENOENT for it while Detcore reports 0. */
+   * that a native kernel would report -ENOENT for it while Detcore reports 0.
+   */
   region[0] = 1;
 
-  void *const pages[2] = {region, region + page_size};
+  void* const pages[2] = {region, region + page_size};
 
   /* Repeat to prove the determinized answer is stable, not incidental. */
   int status[2] = {SENTINEL, SENTINEL};
@@ -105,14 +131,17 @@ int main(void) {
   }
 
   /* Emit the observations rather than a success token. resident_node and
-   * absent_node are the determinized answers this contract exists to pin: a real
-   * kernel reports -ENOENT (-2) for the not-present page, so absent_node=0 is
-   * Detcore's single-virtual-node determinization and is the value a divergent
-   * backend would get wrong. Printing only "numa-node-identity-ok" meant a
-   * backend reporting the WRONG constant node produced byte-identical output,
-   * and two backends agreeing on the same wrong node could never be separated
-   * by comparing them. */
-  printf("numa-node-identity mempolicy_mode=%d resident_node=%d absent_node=%d\n",
-         mode, status[0], status[1]);
+   * absent_node are the determinized answers this contract exists to pin: a
+   * real kernel reports -ENOENT (-2) for the not-present page, so absent_node=0
+   * is Detcore's single-virtual-node determinization and is the value a
+   * divergent backend would get wrong. Printing only "numa-node-identity-ok"
+   * meant a backend reporting the WRONG constant node produced byte-identical
+   * output, and two backends agreeing on the same wrong node could never be
+   * separated by comparing them. */
+  printf(
+      "numa-node-identity mempolicy_mode=%d resident_node=%d absent_node=%d\n",
+      mode,
+      status[0],
+      status[1]);
   return 0;
 }

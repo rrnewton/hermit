@@ -29,9 +29,9 @@
  */
 
 struct robust_head {
-  void *next;
+  void* next;
   long futex_offset;
-  void *list_op_pending;
+  void* list_op_pending;
 };
 
 int main(void) {
@@ -40,7 +40,7 @@ int main(void) {
 
   /* The initial query (glibc has already registered a head) must succeed; its
    * value is not asserted. */
-  void *head0 = NULL;
+  void* head0 = NULL;
   size_t len0 = 0;
   errno = 0;
   long result = syscall(SYS_get_robust_list, 0, &head0, &len0);
@@ -74,7 +74,7 @@ int main(void) {
     return 1;
   }
 
-  void *head1 = NULL;
+  void* head1 = NULL;
   size_t len1 = 0;
   errno = 0;
   result = syscall(SYS_get_robust_list, 0, &head1, &len1);
@@ -93,14 +93,22 @@ int main(void) {
   if (head1 == &mine) {
     ok++;
   } else {
-    fprintf(stderr, "round-trip head mismatch: got %p want %p\n", head1, (void *)&mine);
+    fprintf(
+        stderr,
+        "round-trip head mismatch: got %p want %p\n",
+        head1,
+        (void*)&mine);
     return 1;
   }
 
   if (len1 == sizeof(mine)) {
     ok++;
   } else {
-    fprintf(stderr, "round-trip len mismatch: got %zu want %zu\n", len1, sizeof(mine));
+    fprintf(
+        stderr,
+        "round-trip len mismatch: got %zu want %zu\n",
+        len1,
+        sizeof(mine));
     return 1;
   }
 

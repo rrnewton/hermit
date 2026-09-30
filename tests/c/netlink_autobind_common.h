@@ -17,10 +17,7 @@ static int bind_netlink_socket(int protocol, struct sockaddr_nl* observed) {
   struct sockaddr_nl requested;
   memset(&requested, 0, sizeof(requested));
   requested.nl_family = AF_NETLINK;
-  if (bind(
-          fd,
-          (const struct sockaddr*)&requested,
-          sizeof(requested)) != 0) {
+  if (bind(fd, (const struct sockaddr*)&requested, sizeof(requested)) != 0) {
     perror("bind");
     close(fd);
     return -1;
@@ -28,10 +25,7 @@ static int bind_netlink_socket(int protocol, struct sockaddr_nl* observed) {
 
   memset(observed, 0, sizeof(*observed));
   socklen_t observed_length = sizeof(*observed);
-  if (getsockname(
-          fd,
-          (struct sockaddr*)observed,
-          &observed_length) != 0) {
+  if (getsockname(fd, (struct sockaddr*)observed, &observed_length) != 0) {
     perror("getsockname");
     close(fd);
     return -1;

@@ -48,9 +48,7 @@ LEGACY_19 = (
 CURRENT_20 = LEGACY_19 + ",verify_compare"
 RENAMED_20 = CURRENT_20.replace(",parity,", ",stdout_parity,")
 OPERAND_AWARE_23 = RENAMED_20 + ",ref_output_hash,parity_comparator,parity_tier"
-LEGACY_OPERAND_AWARE_23 = (
-    CURRENT_20 + ",ref_output_hash,parity_comparator,parity_tier"
-)
+LEGACY_OPERAND_AWARE_23 = CURRENT_20 + ",ref_output_hash,parity_comparator,parity_tier"
 
 # A planted matching cell and a planted divergent cell.  Their parity comes from
 # real byte operands, not from the enclosing PASS/FAIL status.  This is the
@@ -157,7 +155,11 @@ def parity_of(row: dict[str, str]) -> str | None:
 
 print("case OPERANDS — verdict is derived from real bytes in both directions")
 matching = run_matrix.stdout_parity_evidence(b"same\n", b"same\n")
-check("matching bytes populate parity=1", matching.get("stdout_parity") == "1", repr(matching))
+check(
+    "matching bytes populate parity=1",
+    matching.get("stdout_parity") == "1",
+    repr(matching),
+)
 check(
     "matching bytes populate two equal SHA-256 operands",
     len(matching.get("output_hash", "")) == 64
@@ -165,7 +167,11 @@ check(
     repr(matching),
 )
 divergent = run_matrix.stdout_parity_evidence(b"candidate\n", b"reference\n")
-check("divergent bytes populate parity=0", divergent.get("stdout_parity") == "0", repr(divergent))
+check(
+    "divergent bytes populate parity=0",
+    divergent.get("stdout_parity") == "0",
+    repr(divergent),
+)
 check(
     "divergent bytes populate two unequal SHA-256 operands",
     len(divergent.get("output_hash", "")) == 64
@@ -246,7 +252,11 @@ check(
     and producer_match.get("output_hash") == producer_match.get("ref_output_hash"),
     repr(producer_match),
 )
-check("matching producer consumed 1 reference + 3 candidate runs", not remaining, repr(remaining))
+check(
+    "matching producer consumed 1 reference + 3 candidate runs",
+    not remaining,
+    repr(remaining),
+)
 
 result, producer_diff, remaining = run_producer(b"not the reference\n")
 check("divergent producer cell fails", result[0] == "FAIL", repr(result))
@@ -256,7 +266,11 @@ check(
     and producer_diff.get("output_hash") != producer_diff.get("ref_output_hash"),
     repr(producer_diff),
 )
-check("divergent producer consumed 1 reference + 1 candidate run", not remaining, repr(remaining))
+check(
+    "divergent producer consumed 1 reference + 1 candidate run",
+    not remaining,
+    repr(remaining),
+)
 
 
 def run_dynamic_producer(reference_stdout: bytes, candidate_stdout: bytes):
@@ -293,8 +307,7 @@ def run_dynamic_producer(reference_stdout: bytes, candidate_stdout: bytes):
 result, dynamic_diff, remaining = run_dynamic_producer(b"pid=111\n", b"pid=222\n")
 check(
     "dynamic-output divergence is RED even when all candidate runs are stable",
-    result[0] == "FAIL"
-    and result[1] == "run 1 stdout differed from ptrace reference",
+    result[0] == "FAIL" and result[1] == "run 1 stdout differed from ptrace reference",
     repr(result),
 )
 check(
@@ -318,9 +331,7 @@ def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
 
     def planted_run(command):
         commands.append(command)
-        return run_matrix.subprocess.CompletedProcess(
-            command, 0, candidate_stdout, b""
-        )
+        return run_matrix.subprocess.CompletedProcess(command, 0, candidate_stdout, b"")
 
     evidence: dict[str, str] = {}
     try:
@@ -339,8 +350,10 @@ def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
     return result, evidence, commands, fixtures.exposed_tmp_paths
 
 
-result, backend_local, backend_local_commands, exposed_tmp_paths = run_backend_local_dynamic(
-    "anonymous_mmap_layout", b"multiple 0x1000 0x2000 0x3000\n"
+result, backend_local, backend_local_commands, exposed_tmp_paths = (
+    run_backend_local_dynamic(
+        "anonymous_mmap_layout", b"multiple 0x1000 0x2000 0x3000\n"
+    )
 )
 check(
     "backend-local layout remains a within-backend repeatability contract",
@@ -444,8 +457,7 @@ finally:
     run_matrix.run_with_timeout = original
 check(
     "KVM memory_advice keeps its fixed-output parity contract",
-    kvm_memory_advice[0] == "PASS"
-    and kvm_evidence.get("stdout_parity") == "1",
+    kvm_memory_advice[0] == "PASS" and kvm_evidence.get("stdout_parity") == "1",
     repr((kvm_memory_advice, kvm_evidence)),
 )
 check(
@@ -459,8 +471,7 @@ check(
     "all KVM candidates retain the required KVM-only fixture argument",
     len(kvm_commands) == run_matrix.RUNS + 1
     and all(
-        "--backend" in command and "--kvm" in command
-        for command in kvm_commands[1:]
+        "--backend" in command and "--kvm" in command for command in kvm_commands[1:]
     ),
     repr(kvm_commands),
 )
@@ -507,9 +518,7 @@ def run_cpuid_reference(
             "cpuid_policy",
             run_matrix.CatalogFixtures(),
             strict=True,
-            host_capabilities=typed_host_capabilities(
-                cpuid_faulting=cpuid_faulting
-            ),
+            host_capabilities=typed_host_capabilities(cpuid_faulting=cpuid_faulting),
             evidence=evidence,
         )
     finally:
@@ -572,8 +581,7 @@ check(
     cpuid_match[0] == "PASS"
     and len(cpuid_commands) == run_matrix.RUNS + 1
     and cpuid_evidence.get("stdout_parity") == "1"
-    and cpuid_evidence.get("output_hash")
-    == cpuid_evidence.get("ref_output_hash"),
+    and cpuid_evidence.get("output_hash") == cpuid_evidence.get("ref_output_hash"),
     repr((cpuid_match, cpuid_evidence, cpuid_commands)),
 )
 
@@ -619,12 +627,18 @@ path, err = append(CURRENT_20)
 check("append is accepted, not refused", err is None, repr(err))
 if err is None:
     got = read_planted(path)
-    check("planted dbt PASS reads outcome=pass", got["planted-dbt-pass"]["outcome"] == "pass")
+    check(
+        "planted dbt PASS reads outcome=pass",
+        got["planted-dbt-pass"]["outcome"] == "pass",
+    )
     check(
         "legacy row with no reference column withholds PASS parity",
         parity_of(got["planted-dbt-pass"]) == "",
     )
-    check("planted dbt FAIL reads outcome=fail", got["planted-dbt-diff"]["outcome"] == "fail")
+    check(
+        "planted dbt FAIL reads outcome=fail",
+        got["planted-dbt-diff"]["outcome"] == "fail",
+    )
     check(
         "legacy row with no reference column withholds FAIL parity",
         parity_of(got["planted-dbt-diff"]) == "",
@@ -695,7 +709,10 @@ if err is None:
     )
     check(
         "comparison contract travels with both measured rows",
-        all(row["parity_comparator"] == "stdout-sha256-exact-v1" for row in (held, differed))
+        all(
+            row["parity_comparator"] == "stdout-sha256-exact-v1"
+            for row in (held, differed)
+        )
         and all(row["parity_tier"] == "stdout-exact" for row in (held, differed)),
     )
 
@@ -759,7 +776,9 @@ if err is None:
         hdr,
     )
 
-print("case ROUTING — validation writes an ignored observation, never current scorecard")
+print(
+    "case ROUTING — validation writes an ignored observation, never current scorecard"
+)
 with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
     root = Path(td)
     compat = root / "compat-envelope"
@@ -842,14 +861,20 @@ with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
             os.environ.pop("DEV_HERMIT_ROOT", None)
         else:
             os.environ["DEV_HERMIT_ROOT"] = old_root
-    check("default observation was written", destination is not None and destination.is_file())
+    check(
+        "default observation was written",
+        destination is not None and destination.is_file(),
+    )
     check(
         "default observation is under the ignored per-run directory",
         destination is not None
         and destination.parent == compat / "ignored" / "backend-parity",
         str(destination),
     )
-    check("tracked current view stayed byte-identical", current.read_text() == "sentinel-current-view\n")
+    check(
+        "tracked current view stayed byte-identical",
+        current.read_text() == "sentinel-current-view\n",
+    )
     check("direct append to tracked current view is refused", canonical_refused)
     check(
         "tracked current view is refused even when parent discovery is unavailable",
@@ -883,7 +908,10 @@ with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
         )
         check(
             "new rows without L3 flags record false, not historical blank",
-            all(row["stack_parity"] == "0" and row["heap_parity"] == "0" for row in routed),
+            all(
+                row["stack_parity"] == "0" and row["heap_parity"] == "0"
+                for row in routed
+            ),
         )
 
 print()

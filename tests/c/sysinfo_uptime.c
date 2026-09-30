@@ -118,7 +118,8 @@ struct observation {
 static struct observation observe(const char* label) {
   struct sysinfo info;
   struct observation result;
-  if (sysinfo(&info) != 0 || clock_gettime(CLOCK_MONOTONIC, &result.clock) != 0) {
+  if (sysinfo(&info) != 0 ||
+      clock_gettime(CLOCK_MONOTONIC, &result.clock) != 0) {
     perror("sysinfo/clock_gettime observation");
     exit(1);
   }
@@ -128,7 +129,8 @@ static struct observation observe(const char* label) {
 }
 
 static void require_order(struct observation before, struct observation after) {
-  if (after.uptime < before.uptime || after.clock.tv_sec < before.clock.tv_sec ||
+  if (after.uptime < before.uptime ||
+      after.clock.tv_sec < before.clock.tv_sec ||
       (after.clock.tv_sec == before.clock.tv_sec &&
        after.clock.tv_nsec < before.clock.tv_nsec)) {
     fprintf(stderr, "sysinfo uptime or monotonic clock moved backwards\n");
@@ -184,7 +186,8 @@ static int observe_thread_and_exec(const char* executable) {
   struct worker_observations worker;
   pthread_t thread;
   require_pthread_success(
-      pthread_create(&thread, NULL, observation_worker, &worker), "pthread_create");
+      pthread_create(&thread, NULL, observation_worker, &worker),
+      "pthread_create");
   require_pthread_success(pthread_join(thread, NULL), "pthread_join");
   struct observation after = observe("parent after join");
   require_order(before, worker.before);
@@ -200,7 +203,14 @@ static int observe_thread_and_exec(const char* executable) {
     perror("prepare observation exec");
     return 1;
   }
-  execl(executable, executable, "--observe-after-exec", uptime, seconds, nanos, NULL);
+  execl(
+      executable,
+      executable,
+      "--observe-after-exec",
+      uptime,
+      seconds,
+      nanos,
+      NULL);
   perror("observation execl");
   return 1;
 }
@@ -215,8 +225,9 @@ int main(int argc, char** argv) {
   if (argc == 5 && strcmp(argv[1], "--observe-after-exec") == 0) {
     struct observation before = {
         .uptime = observation_argument(argv[2]),
-        .clock = {.tv_sec = observation_argument(argv[3]),
-                  .tv_nsec = observation_argument(argv[4])},
+        .clock =
+            {.tv_sec = observation_argument(argv[3]),
+             .tv_nsec = observation_argument(argv[4])},
     };
     if (before.clock.tv_nsec >= 1000000000) {
       fprintf(stderr, "invalid observation nanoseconds\n");

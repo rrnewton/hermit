@@ -25,15 +25,19 @@ int main(void) {
 
   struct timex mutation = {.modes = ADJ_OFFSET, .offset = 1};
   errno = 0;
-  long mutation_result =
-      syscall(SYS_clock_adjtime, CLOCK_REALTIME, &mutation);
+  long mutation_result = syscall(SYS_clock_adjtime, CLOCK_REALTIME, &mutation);
   if (mutation_result != -1 || errno != EPERM) {
-    fprintf(stderr,
-            "clock_adjtime mutation returned %ld/%d, expected EPERM\n",
-            mutation_result, errno);
+    fprintf(
+        stderr,
+        "clock_adjtime mutation returned %ld/%d, expected EPERM\n",
+        mutation_result,
+        errno);
     return 1;
   }
-  printf("clock-adjtime-ok state=%ld status=%d tick=%ld\n", result,
-         tx.status, tx.tick);
+  printf(
+      "clock-adjtime-ok state=%ld status=%d tick=%ld\n",
+      result,
+      tx.status,
+      tx.tick);
   return 0;
 }

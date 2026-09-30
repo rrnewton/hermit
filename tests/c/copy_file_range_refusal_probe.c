@@ -19,10 +19,12 @@
 #endif
 
 int main(void) {
-  int input = open("/tmp/hermit-copy-file-range-source",
-                   O_RDWR | O_CREAT | O_TRUNC, 0600);
-  int output = open("/tmp/hermit-copy-file-range-destination",
-                    O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  int input = open(
+      "/tmp/hermit-copy-file-range-source", O_RDWR | O_CREAT | O_TRUNC, 0600);
+  int output = open(
+      "/tmp/hermit-copy-file-range-destination",
+      O_WRONLY | O_CREAT | O_TRUNC,
+      0600);
   if (input < 0 || output < 0) {
     perror("open");
     return 2;
@@ -41,7 +43,10 @@ int main(void) {
     return 0;
   }
 
-  fprintf(stderr, "copy_file_range: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "copy_file_range: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

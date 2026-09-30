@@ -36,14 +36,14 @@
 /* Returns the 1-based proc stat field `index` (>= 3), or NULL on parse error.
  * The comm field (2) may contain spaces and parentheses, so scan past the
  * final ") " terminator and split the remainder on whitespace. */
-static char *stat_field(char *buf, int index) {
-  char *comm_end = strstr(buf, ") ");
+static char* stat_field(char* buf, int index) {
+  char* comm_end = strstr(buf, ") ");
   if (comm_end == NULL || index < 3) {
     return NULL;
   }
-  char *rest = comm_end + 2;
-  char *save = NULL;
-  char *tok = strtok_r(rest, " \t\n", &save);
+  char* rest = comm_end + 2;
+  char* save = NULL;
+  char* tok = strtok_r(rest, " \t\n", &save);
   for (int field = 3; tok != NULL; field++) {
     if (field == index) {
       return tok;
@@ -72,13 +72,14 @@ static int check_pread_sanitized(void) {
 
   /* Field 22 (starttime) is normalized to 0 by the snapshot sanitizer. Live
    * kernel bytes would contain a nonzero, run-varying tick count. */
-  char *starttime = stat_field(buf, 22);
+  char* starttime = stat_field(buf, 22);
   if (starttime == NULL) {
     fprintf(stderr, "could not locate stat field 22 in: %s\n", buf);
     return 1;
   }
   if (strcmp(starttime, "0") != 0) {
-    fprintf(stderr, "pread bypassed procfs snapshot: starttime=%s\n", starttime);
+    fprintf(
+        stderr, "pread bypassed procfs snapshot: starttime=%s\n", starttime);
     return 1;
   }
 
@@ -88,8 +89,10 @@ static int check_pread_sanitized(void) {
 
 static int check_sendfile_refused(void) {
   int in_fd = open("/proc/self/stat", O_RDONLY);
-  int out_fd = open("/tmp/hermit-procfs-sendfile-destination",
-                    O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  int out_fd = open(
+      "/tmp/hermit-procfs-sendfile-destination",
+      O_WRONLY | O_CREAT | O_TRUNC,
+      0600);
   if (in_fd < 0 || out_fd < 0) {
     perror("open sendfile endpoints");
     return 1;
@@ -106,8 +109,11 @@ static int check_sendfile_refused(void) {
     return 0;
   }
 
-  fprintf(stderr, "sendfile: expected ENOSYS, got copied=%zd errno=%d\n", copied,
-          saved);
+  fprintf(
+      stderr,
+      "sendfile: expected ENOSYS, got copied=%zd errno=%d\n",
+      copied,
+      saved);
   return 1;
 }
 

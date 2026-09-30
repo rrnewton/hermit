@@ -17,8 +17,8 @@
  * fixture_mutation.py can prove the round-trip is load-bearing.
  *
  * This fixture carries NO bespoke pass/fail logic: it uses only the shared
- * contract in parity_probe.h. Adding a family member means supplying its syscall
- * and its mutable field, nothing more.
+ * contract in parity_probe.h. Adding a family member means supplying its
+ * syscall and its mutable field, nothing more.
  */
 
 #include <sys/resource.h>

@@ -3,7 +3,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void run_child(const char *message) {
+static void run_child(const char* message) {
   if (getpid() <= 0) {
     _exit(2);
   }
@@ -13,7 +13,7 @@ static void run_child(const char *message) {
   _exit(0);
 }
 
-static void fork_and_wait(const char *message) {
+static void fork_and_wait(const char* message) {
   pid_t child = fork();
   if (child < 0) {
     perror("fork");
@@ -24,7 +24,8 @@ static void fork_and_wait(const char *message) {
   }
 
   int status = 0;
-  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
     fprintf(stderr, "child failed: status=%d\n", status);
     exit(1);
   }

@@ -59,6 +59,7 @@ def refusal_output(
         + f"{FINAL_COULD_NOT_RUN}\n"
     )
 
+
 # These are complete channel contents plus the observed child status, not source
 # fragments. The thirteen False cases include ordinary failures, other refusal
 # reasons, incomplete status output, and a status/code disagreement. The three
@@ -74,8 +75,7 @@ CASES: tuple[tuple[str, int, bool], ...] = (
     ("validate: REFUSED_cases is a guest label", 1, False),
     ("another validate is already running in this documentation", 1, False),
     (
-        "wrapper: "
-        + refusal_output(reason=REENTRANCY_REASON),
+        "wrapper: " + refusal_output(reason=REENTRANCY_REASON),
         75,
         False,
     ),
@@ -258,8 +258,7 @@ def self_test() -> None:
         ]
         return bool(
             summaries
-            and lines[summaries[-1] + 1 : summaries[-1] + 2]
-            == [REENTRANCY_REASON]
+            and lines[summaries[-1] + 1 : summaries[-1] + 2] == [REENTRANCY_REASON]
         )
 
     shapes = ("refused by:", "validate: REFUSED", "another validate is already running")
@@ -385,7 +384,9 @@ def self_test() -> None:
         except RuntimeError:
             pass
         else:
-            raise AssertionError("self-test accepted a target that exits zero while loading")
+            raise AssertionError(
+                "self-test accepted a target that exits zero while loading"
+            )
 
 
 def usage() -> int:

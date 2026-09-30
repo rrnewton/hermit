@@ -29,7 +29,7 @@ static long fd_mode(int fd) {
 }
 
 // Return the permission bits (low 12) currently reported for a path, or -1.
-static long path_mode(const char *path) {
+static long path_mode(const char* path) {
   struct stat st;
   if (stat(path, &st) != 0) {
     return -1;

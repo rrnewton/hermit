@@ -26,6 +26,7 @@ capable LLDB / gdbserver is present.
 
 import unittest
 
+import lldb
 from harness import (
     DebuggerTestBase,
     EXPECT_A,
@@ -34,8 +35,6 @@ from harness import (
     HermitGdbserver,
     pick_free_port,
 )
-
-import lldb
 
 
 class LldbRunGdbserver(DebuggerTestBase):
@@ -89,9 +88,10 @@ class LldbRunGdbserver(DebuggerTestBase):
     def _require_inspection(self, thread):
         """Skip (don't fail) when this LLDB/gdbserver combo can't provide
         register/frame info."""
-        if thread.GetNumFrames() == 0 or not thread.GetFrameAtIndex(
-            0
-        ).GetFunctionName():
+        if (
+            thread.GetNumFrames() == 0
+            or not thread.GetFrameAtIndex(0).GetFunctionName()
+        ):
             self.skipTest(
                 "LLDB connected and planted the breakpoint, but cannot read "
                 "register/frame info from Hermit's gdbserver (this LLDB build "

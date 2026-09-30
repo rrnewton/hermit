@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
-from pathlib import Path
 import re
 import signal
 import socket
@@ -14,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -154,7 +154,9 @@ def find_parent_adapter() -> Path | None:
 ACCEPT_ARM_NODE = "check.canonical_adapter_accept"
 ACCEPT_ARM_ONLY_FLAG = "--canonical-adapter-accept-arm-only"
 EXCLUDE_ACCEPT_ARM_FLAG = "--exclude-canonical-adapter-accept-arm"
-ACCEPT_ARM_COMMAND = f"python3 ./scripts/test_validate_stop_paths.py {ACCEPT_ARM_ONLY_FLAG}"
+ACCEPT_ARM_COMMAND = (
+    f"python3 ./scripts/test_validate_stop_paths.py {ACCEPT_ARM_ONLY_FLAG}"
+)
 # `full` is local `scripts/validate.rs full`, run from a validation checkout
 # nested under the dev-hermit parent. Every other label names either a GitHub
 # lane that checks out bare Hermit (`hosted-portable`, `portable`,
@@ -167,7 +169,9 @@ DAG = ROOT / "ci" / "dag" / "validate.json"
 
 def accept_arm_owners(dag: dict) -> list[dict]:
     """Every DAG step whose command runs the accept arm."""
-    return [step for step in dag["steps"] if ACCEPT_ARM_ONLY_FLAG in step.get("cmd", "")]
+    return [
+        step for step in dag["steps"] if ACCEPT_ARM_ONLY_FLAG in step.get("cmd", "")
+    ]
 
 
 def check_accept_arm_ownership(dag: dict) -> str:
@@ -216,15 +220,21 @@ def run_accept_arm_ownership_contract() -> str:
         steps[:] = [step for step in steps if not is_owner(step)]
 
     def add_hosted_label(steps: list[dict]) -> None:
-        next(step for step in steps if is_owner(step))["labels"].append("hosted-portable")
+        next(step for step in steps if is_owner(step))["labels"].append(
+            "hosted-portable"
+        )
 
     def drop_full_label(steps: list[dict]) -> None:
         owner_step = next(step for step in steps if is_owner(step))
-        owner_step["labels"] = [label for label in owner_step["labels"] if label != "full"]
+        owner_step["labels"] = [
+            label for label in owner_step["labels"] if label != "full"
+        ]
 
     def second_owner(steps: list[dict]) -> None:
         lint = next(
-            step for step in steps if (step["group"], step["job"]) == ("check", "lint_checks")
+            step
+            for step in steps
+            if (step["group"], step["job"]) == ("check", "lint_checks")
         )
         lint["cmd"] += f" && {ACCEPT_ARM_COMMAND}"
 
@@ -236,8 +246,16 @@ def run_accept_arm_ownership_contract() -> str:
 
     for name, change, expected in (
         ("owner deleted", drop_owner, "has none"),
-        ("owner scheduled on the hosted lane", add_hosted_label, "exactly the parent-lane labels"),
-        ("owner dropped from local validate", drop_full_label, "exactly the parent-lane labels"),
+        (
+            "owner scheduled on the hosted lane",
+            add_hosted_label,
+            "exactly the parent-lane labels",
+        ),
+        (
+            "owner dropped from local validate",
+            drop_full_label,
+            "exactly the parent-lane labels",
+        ),
         ("a second owner", second_owner, "check.lint_checks"),
         ("owner run through make", through_make, "not through make"),
     ):
@@ -295,7 +313,9 @@ def stop_test_env(
         TMPDIR=str(tmpdir),
     )
     if lock_proven:
-        stat_fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+        stat_fields = (
+            Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+        )
         start_ticks = int(stat_fields[19])
         host = socket.gethostname().split(".", 1)[0]
         commit = subprocess.check_output(
@@ -471,7 +491,11 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
             return
         returncode = process.poll()
         if returncode is not None:
-            seen = log.read_text(errors="replace") if log.exists() else "<log never created>"
+            seen = (
+                log.read_text(errors="replace")
+                if log.exists()
+                else "<log never created>"
+            )
             status = final_validate_status(seen)
             if child_hit_reentrancy_refusal(seen, returncode):
                 raise ValidateChildRefused(
@@ -670,7 +694,9 @@ def run_signal(
     lock_proven: bool = False,
     forged_owner: bool = False,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"validate-stop-{sig.name.lower()}-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"validate-stop-{sig.name.lower()}-"
+    ) as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
@@ -696,7 +722,11 @@ def run_signal(
         rendered = log.read_text(errors="replace")
         assert_stop_test_never_started_dagrun(tmpdir, rendered)
 
-        rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+        rows = (
+            [json.loads(line) for line in ledger.read_text().splitlines()]
+            if ledger.exists()
+            else []
+        )
         if not expect_record:
             assert not rows, (sig.name, rows)
             assert rc == -sig.value, (sig.name, rc)
@@ -851,18 +881,23 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             # empty glob, and it adds a contract the old form did not have: a
             # producer that reports a write it did not perform now fails here.
             appended = [
-                line for line in output.splitlines()
+                line
+                for line in output.splitlines()
                 if "canonical ledger record appended" in line
             ]
             assert len(appended) == 1, (appended, output)
-            report = json.loads(appended[0][appended[0].index("{"):])
+            report = json.loads(appended[0][appended[0].index("{") :])
             spool_rel = report["spool"]
             assert spool_rel.startswith("ignored/"), (spool_rel, output)
             shard = canonical_root / spool_rel
-            assert shard.is_file(), (spool_rel, sorted(
-                str(p.relative_to(canonical_root))
-                for p in canonical_root.rglob("*") if p.is_file()
-            ))
+            assert shard.is_file(), (
+                spool_rel,
+                sorted(
+                    str(p.relative_to(canonical_root))
+                    for p in canonical_root.rglob("*")
+                    if p.is_file()
+                ),
+            )
             # The producer must NOT reach past the spool and write the published
             # shard itself. That separation is the whole reason the spool exists,
             # so assert the published location stays empty rather than merely
@@ -989,7 +1024,9 @@ def main(argv: list[str] | None = None) -> None:
         run_accept_arm_only()
         return
     exclude_accept_arm = args == [EXCLUDE_ACCEPT_ARM_FLAG]
-    accept_arm_owner = run_accept_arm_ownership_contract() if exclude_accept_arm else None
+    accept_arm_owner = (
+        run_accept_arm_ownership_contract() if exclude_accept_arm else None
+    )
 
     run_final_validate_status_contract()
     check_stop_test_env_does_not_inherit_outer_validate()
@@ -1073,7 +1110,9 @@ def main(argv: list[str] | None = None) -> None:
             "and that node is present in the committed DAG); "
         )
     elif adapter_unevaluated:
-        adapter_summary = "canonical adapter REFUSE arm only (accept arm not evaluable here); "
+        adapter_summary = (
+            "canonical adapter REFUSE arm only (accept arm not evaluable here); "
+        )
     else:
         adapter_summary = "canonical adapter accept/refuse bracketed; "
     print(
@@ -1100,7 +1139,10 @@ def run_accept_arm_only() -> None:
         run_canonical_adapter_contract(refuse=False)
     except NoParentAdapter as exc:
         sys.stdout.flush()
-        print(f"{NO_RESULT_MARKER} canonical adapter contract, accept arm: {exc}", file=sys.stderr)
+        print(
+            f"{NO_RESULT_MARKER} canonical adapter contract, accept arm: {exc}",
+            file=sys.stderr,
+        )
         print(
             f"NO RESULT (exit {NO_RESULT_EXIT_CODE}): the accept arm was not evaluated. "
             "Run from a checkout nested under the dev-hermit parent.",

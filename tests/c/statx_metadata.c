@@ -24,14 +24,15 @@
  *     descriptor.
  *   - statx on a missing path fails deterministically with ENOENT.
  *
- * Over a file containing the six bytes "abcdef" the deterministic invariants are
- * a size of 6 and a content checksum of 'a'+'b'+'c'+'d'+'e'+'f' = 597. Only
+ * Over a file containing the six bytes "abcdef" the deterministic invariants
+ * are a size of 6 and a content checksum of 'a'+'b'+'c'+'d'+'e'+'f' = 597. Only
  * invariants are printed:
  *
  *   statx_metadata size=6 checksum=597 ok=5
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, inode, device, uid, gid, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, inode, device, uid, gid, or address is
+ * observed.
  */
 
 #define _GNU_SOURCE
@@ -46,7 +47,7 @@
 #define PAYLOAD "abcdef"
 #define PAYLOAD_LEN 6
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -65,8 +66,9 @@ int main(void) {
 
   /* statx by path reports the requested size and regular-file type. */
   memset(&stx, 0, sizeof(stx));
-  if (statx(AT_FDCWD, template, 0, STATX_SIZE | STATX_TYPE | STATX_NLINK,
-            &stx) == 0 &&
+  if (statx(
+          AT_FDCWD, template, 0, STATX_SIZE | STATX_TYPE | STATX_NLINK, &stx) ==
+          0 &&
       (stx.stx_mask & STATX_SIZE) != 0 && stx.stx_size == PAYLOAD_LEN)
     ok++;
 
@@ -87,8 +89,9 @@ int main(void) {
   /* statx on a missing path fails deterministically with ENOENT. */
   memset(&stx, 0, sizeof(stx));
   errno = 0;
-  if (statx(AT_FDCWD, "/tmp/statx_metadata_absent_marker", 0, STATX_SIZE,
-            &stx) < 0 &&
+  if (statx(
+          AT_FDCWD, "/tmp/statx_metadata_absent_marker", 0, STATX_SIZE, &stx) <
+          0 &&
       errno == ENOENT)
     ok++;
 
@@ -113,8 +116,12 @@ int main(void) {
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "statx_metadata completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr,
+        "statx_metadata completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

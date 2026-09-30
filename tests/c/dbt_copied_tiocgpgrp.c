@@ -21,8 +21,7 @@ int main(void) {
   if (child == 0) {
     pid_t foreground = 0;
     errno = 0;
-    if (ioctl(STDERR_FILENO, TIOCGPGRP, &foreground) != -1 ||
-        errno != ENOTTY) {
+    if (ioctl(STDERR_FILENO, TIOCGPGRP, &foreground) != -1 || errno != ENOTTY) {
       _exit(2);
     }
     _exit(0);

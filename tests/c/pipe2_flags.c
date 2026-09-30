@@ -62,8 +62,9 @@ int main(void) {
   int fds[2] = {-1, -1};
 
   // pipe2(0): neither flag set on either end.
-  if (pipe2(fds, 0) == 0 && fd_cloexec(fds[0]) == 0 && fd_cloexec(fds[1]) == 0 &&
-      fd_nonblock(fds[0]) == 0 && fd_nonblock(fds[1]) == 0) {
+  if (pipe2(fds, 0) == 0 && fd_cloexec(fds[0]) == 0 &&
+      fd_cloexec(fds[1]) == 0 && fd_nonblock(fds[0]) == 0 &&
+      fd_nonblock(fds[1]) == 0) {
     ok++;
   }
   close_pair(fds);
@@ -103,8 +104,8 @@ int main(void) {
   // identically, so the comparison still matches and the cell stays green.
   // The four checks above are unchanged; this only requires all of them.
   if (ok != EXPECTED_CHECKS) {
-    fprintf(stderr, "pipe2_flags completed %d of %d checks\n", ok,
-            EXPECTED_CHECKS);
+    fprintf(
+        stderr, "pipe2_flags completed %d of %d checks\n", ok, EXPECTED_CHECKS);
     return 1;
   }
   return 0;

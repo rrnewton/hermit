@@ -15,7 +15,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   int expect_passthrough = argc == 2 && strcmp(argv[1], "passthrough") == 0;
   int pipefd[2];
   if (pipe(pipefd) != 0) {
@@ -39,9 +39,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   {
-    fprintf(stderr,
-            "vmsplice returned %ld with errno %d (%s), expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "vmsplice returned %ld with errno %d (%s), expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
 }

@@ -39,47 +39,46 @@
 #define MPOL_F_ADDR (1 << 1)
 #endif
 
-static long get_mode(int *mode, void *addr, unsigned long flags)
-{
-	*mode = -1;
-	errno = 0;
-	return syscall(SYS_get_mempolicy, mode, (void *)0, 0UL, addr, flags);
+static long get_mode(int* mode, void* addr, unsigned long flags) {
+  *mode = -1;
+  errno = 0;
+  return syscall(SYS_get_mempolicy, mode, (void*)0, 0UL, addr, flags);
 }
 
-int main(void)
-{
-	enum { EXPECTED_CHECKS = 4 };
-	int ok = 0;
-	int mode;
-	int probe = 7; /* an address whose governing policy we query */
+int main(void) {
+  enum { EXPECTED_CHECKS = 4 };
+  int ok = 0;
+  int mode;
+  int probe = 7; /* an address whose governing policy we query */
 
-	/* Default process policy mode is MPOL_DEFAULT. */
-	if (get_mode(&mode, (void *)0, 0UL) == 0 && mode == MPOL_DEFAULT)
-		ok += 1;
+  /* Default process policy mode is MPOL_DEFAULT. */
+  if (get_mode(&mode, (void*)0, 0UL) == 0 && mode == MPOL_DEFAULT)
+    ok += 1;
 
-	/* Policy governing a specific address is also the default. */
-	if (get_mode(&mode, &probe, (unsigned long)MPOL_F_ADDR) == 0 &&
-	    mode == MPOL_DEFAULT)
-		ok += 1;
+  /* Policy governing a specific address is also the default. */
+  if (get_mode(&mode, &probe, (unsigned long)MPOL_F_ADDR) == 0 &&
+      mode == MPOL_DEFAULT)
+    ok += 1;
 
-	/* Resetting to the default policy requires no node mask. */
-	errno = 0;
-	if (syscall(SYS_set_mempolicy, MPOL_DEFAULT, (void *)0, 0UL) == 0)
-		ok += 1;
+  /* Resetting to the default policy requires no node mask. */
+  errno = 0;
+  if (syscall(SYS_set_mempolicy, MPOL_DEFAULT, (void*)0, 0UL) == 0)
+    ok += 1;
 
-	/* The policy remains the default after the reset. */
-	if (get_mode(&mode, (void *)0, 0UL) == 0 && mode == MPOL_DEFAULT)
-		ok += 1;
+  /* The policy remains the default after the reset. */
+  if (get_mode(&mode, (void*)0, 0UL) == 0 && mode == MPOL_DEFAULT)
+    ok += 1;
 
-	printf("mempolicy ok=%d\n", ok);
-	/* Route a behavioural failure into the exit status. Without this the guest
-	   exits 0 whatever `ok` reached, so a regression only lowered the printed
-	   number -- and under --verify both runs lower it identically, so the
-	   comparison still matches and the cell stays green. Every check above is
-	   unchanged; this only requires all of them. */
-	if (ok != EXPECTED_CHECKS) {
-		fprintf(stderr, "mempolicy completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-		return 1;
-	}
-	return 0;
+  printf("mempolicy ok=%d\n", ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(
+        stderr, "mempolicy completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
+  return 0;
 }

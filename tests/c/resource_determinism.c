@@ -57,8 +57,8 @@ static void require_limit(
       actual->rlim_max != expected->rlim_max) {
     fprintf(
         stderr,
-        "%s mismatch: got %" PRIu64 ":%" PRIu64
-        ", expected %" PRIu64 ":%" PRIu64 "\n",
+        "%s mismatch: got %" PRIu64 ":%" PRIu64 ", expected %" PRIu64
+        ":%" PRIu64 "\n",
         operation,
         (uint64_t)actual->rlim_cur,
         (uint64_t)actual->rlim_max,
@@ -110,11 +110,8 @@ static void check_limit_queries(void) {
       fail("SYS_getrlimit");
     }
     if (syscall(
-            SYS_prlimit64,
-            0,
-            resources[i].resource,
-            NULL,
-            &prlimit_limit) != 0) {
+            SYS_prlimit64, 0, resources[i].resource, NULL, &prlimit_limit) !=
+        0) {
       fail("SYS_prlimit64 query");
     }
 
@@ -177,12 +174,8 @@ static void check_limit_mutations(void) {
 
   changed = original;
   changed.rlim_cur = lower_soft_limit(original.rlim_cur, 3);
-  if (syscall(
-          SYS_prlimit64,
-          getpid(),
-          RLIMIT_NOFILE,
-          &changed,
-          &previous) != 0) {
+  if (syscall(SYS_prlimit64, getpid(), RLIMIT_NOFILE, &changed, &previous) !=
+      0) {
     fail("SYS_prlimit64 mutation");
   }
   require_limit("prlimit64 previous", &previous, &original);
@@ -191,8 +184,7 @@ static void check_limit_mutations(void) {
   }
   require_limit("prlimit64 mutation", &observed, &changed);
   printf(
-      "prlimit64 old=%" PRIu64 ":%" PRIu64 " new=%" PRIu64 ":%" PRIu64
-      "\n",
+      "prlimit64 old=%" PRIu64 ":%" PRIu64 " new=%" PRIu64 ":%" PRIu64 "\n",
       (uint64_t)previous.rlim_cur,
       (uint64_t)previous.rlim_max,
       (uint64_t)observed.rlim_cur,
@@ -244,7 +236,11 @@ static void check_limit_mutations(void) {
       EINVAL,
       "other-pid invalid-resource prlimit64 query");
   require_prlimit_error(
-      getpid() + 1, RLIMIT_NOFILE, (void*)1, EFAULT, "other-pid bad prlimit64 input");
+      getpid() + 1,
+      RLIMIT_NOFILE,
+      (void*)1,
+      EFAULT,
+      "other-pid bad prlimit64 input");
   require_prlimit_error(
       0, RLIMIT_NLIMITS, NULL, EINVAL, "invalid-resource prlimit64 query");
 
@@ -316,11 +312,8 @@ static void check_prlimit_fork_inheritance(void) {
 // Read one getrusage snapshot and validate its shape. CPU time is retained in
 // the returned value so callers can compare two snapshots; only a copy is
 // cleared for the byte scan that proves every unmodeled field remains zero.
-static struct rusage read_rusage(
-    int who,
-    const char* name,
-    int expect_maxrss,
-    int allow_cpu) {
+static struct rusage
+read_rusage(int who, const char* name, int expect_maxrss, int allow_cpu) {
   struct rusage usage;
   memset(&usage, 0xa5, sizeof(usage));
   if (getrusage(who, &usage) != 0) {
@@ -404,18 +397,17 @@ static void check_self_and_thread_rusage_advances(void) {
   }
 
   struct rusage self_after = read_rusage(RUSAGE_SELF, "self after", 1, 1);
-  struct rusage thread_after =
-      read_rusage(RUSAGE_THREAD, "thread after", 1, 1);
+  struct rusage thread_after = read_rusage(RUSAGE_THREAD, "thread after", 1, 1);
   if (rusage_cpu_micros(&self_after) <= rusage_cpu_micros(&self_before) ||
-      rusage_system_micros(&self_after) <=
-          rusage_system_micros(&self_before)) {
+      rusage_system_micros(&self_after) <= rusage_system_micros(&self_before)) {
     fprintf(stderr, "getrusage self CPU did not advance across syscall work\n");
     exit(1);
   }
   if (rusage_cpu_micros(&thread_after) <= rusage_cpu_micros(&thread_before) ||
       rusage_system_micros(&thread_after) <=
           rusage_system_micros(&thread_before)) {
-    fprintf(stderr, "getrusage thread CPU did not advance across syscall work\n");
+    fprintf(
+        stderr, "getrusage thread CPU did not advance across syscall work\n");
     exit(1);
   }
   puts("rusage self and thread logical CPU advances");
@@ -576,11 +568,13 @@ static void check_times(void) {
     fail("times second");
   }
   if (second <= first) {
-    fprintf(stderr, "times elapsed clock did not advance across logical work\n");
+    fprintf(
+        stderr, "times elapsed clock did not advance across logical work\n");
     exit(1);
   }
   if (second_usage.tms_stime <= first_usage.tms_stime) {
-    fprintf(stderr, "times system CPU clock did not advance across syscall work\n");
+    fprintf(
+        stderr, "times system CPU clock did not advance across syscall work\n");
     exit(1);
   }
 
@@ -634,7 +628,8 @@ static void check_times(void) {
     fail("times after child");
   }
   if (after_child.tms_cstime <= child_system_before) {
-    fprintf(stderr, "times child system CPU clock did not include reaped child\n");
+    fprintf(
+        stderr, "times child system CPU clock did not include reaped child\n");
     exit(1);
   }
   struct rusage child_rusage_after =
@@ -644,8 +639,7 @@ static void check_times(void) {
       rusage_system_micros(&child_rusage_after) <=
           rusage_system_micros(&child_rusage_before)) {
     fprintf(
-        stderr,
-        "getrusage children CPU did not include the reaped child\n");
+        stderr, "getrusage children CPU did not include the reaped child\n");
     exit(1);
   }
 

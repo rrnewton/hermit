@@ -43,10 +43,11 @@ static struct timespec add_nanoseconds(struct timespec time, long nanoseconds) {
   return time;
 }
 
-static long long elapsed_nanoseconds(struct timespec start,
-                                     struct timespec finish) {
+static long long elapsed_nanoseconds(
+    struct timespec start,
+    struct timespec finish) {
   return (long long)(finish.tv_sec - start.tv_sec) * 1000 * 1000 * 1000 +
-         finish.tv_nsec - start.tv_nsec;
+      finish.tv_nsec - start.tv_nsec;
 }
 
 int main(void) {
@@ -111,13 +112,14 @@ int main(void) {
 
   const long long elapsed = elapsed_nanoseconds(start, finish);
   if (!alarm_delivered) {
-    fputs("FAIL: SIGALRM was not delivered within 100 ms of virtual time\n",
-          stderr);
+    fputs(
+        "FAIL: SIGALRM was not delivered within 100 ms of virtual time\n",
+        stderr);
     return 1;
   }
   if (elapsed < TIMER_DELAY_NS || elapsed > WAIT_DEADLINE_NS) {
-    fprintf(stderr,
-            "FAIL: SIGALRM was delivered outside the expected window\n");
+    fprintf(
+        stderr, "FAIL: SIGALRM was delivered outside the expected window\n");
     return 1;
   }
 

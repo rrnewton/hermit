@@ -20,15 +20,15 @@
  *     value clamped to that observed hard limit (lowering the soft limit is
  *     always permitted for an unprivileged process on Linux), then reads it
  *     straight back;
- *   - confirms a query-only prlimit64(pid=0, self) agrees with the value it just
- *     installed;
+ *   - confirms a query-only prlimit64(pid=0, self) agrees with the value it
+ * just installed;
  *   - performs a prlimit64 atomic set+get round-trip and confirms the reported
  *     old value equals what it had installed a moment earlier;
- *   - raises the soft limit back up to the hard limit (raising the soft limit up
- *     to the hard limit is always permitted) and reads it back;
- *   - confirms the two faithful Linux refusals that do not depend on host state:
- *     a request with soft > hard fails with EINVAL, and an unprivileged attempt
- *     to raise the hard limit fails with EPERM.
+ *   - raises the soft limit back up to the hard limit (raising the soft limit
+ * up to the hard limit is always permitted) and reads it back;
+ *   - confirms the two faithful Linux refusals that do not depend on host
+ * state: a request with soft > hard fails with EINVAL, and an unprivileged
+ * attempt to raise the hard limit fails with EPERM.
  *
  * EMISSION CONTRACT. This fixture used to print the bare string
  * "rlimit-identity-ok" and nothing else, on the stated reasoning that printing
@@ -82,23 +82,23 @@
  * every failure into errno 1 (EPERM) and silently breaks the EINVAL refusal
  * check below.
  */
-static int getrlimit_raw(int resource, struct rlimit *out) {
+static int getrlimit_raw(int resource, struct rlimit* out) {
   return (int)syscall(SYS_getrlimit, resource, out);
 }
 
-static int setrlimit_raw(int resource, const struct rlimit *in) {
+static int setrlimit_raw(int resource, const struct rlimit* in) {
   return (int)syscall(SYS_setrlimit, resource, in);
 }
 
-static int fail(const char *what) {
+static int fail(const char* what) {
   fprintf(stderr, "rlimit-identity: %s failed: %s\n", what, strerror(errno));
   return 1;
 }
 
 int main(void) {
   /* Observe our own RLIMIT_NOFILE limits. Under Detcore this is a fixed virtual
-   * value; the checks below only compare against values we derive from it or set
-   * ourselves, so nothing host-specific escapes to stdout. */
+   * value; the checks below only compare against values we derive from it or
+   * set ourselves, so nothing host-specific escapes to stdout. */
   struct rlimit nofile;
   memset(&nofile, 0xff, sizeof(nofile));
   if (getrlimit_raw(RLIMIT_NOFILE, &nofile) != 0)
@@ -106,9 +106,9 @@ int main(void) {
   const rlim_t hard = nofile.rlim_max;
 
   /* Lower the soft limit to a fixed value clamped to the observed hard limit.
-   * Lowering the soft limit is always permitted for an unprivileged process, and
-   * clamping to the observed hard limit keeps the target host-independent. The
-   * hard limit is left unchanged. */
+   * Lowering the soft limit is always permitted for an unprivileged process,
+   * and clamping to the observed hard limit keeps the target host-independent.
+   * The hard limit is left unchanged. */
   const rlim_t soft1 = (hard >= 64) ? (rlim_t)64 : hard;
   struct rlimit set1 = {.rlim_cur = soft1, .rlim_max = hard};
   if (setrlimit_raw(RLIMIT_NOFILE, &set1) != 0)
@@ -128,7 +128,8 @@ int main(void) {
   if (prlimit(0, RLIMIT_NOFILE, NULL, &query) != 0)
     return fail("prlimit RLIMIT_NOFILE query");
   if (query.rlim_cur != soft1 || query.rlim_max != hard) {
-    fprintf(stderr, "rlimit-identity: prlimit query disagrees with set value\n");
+    fprintf(
+        stderr, "rlimit-identity: prlimit query disagrees with set value\n");
     return 1;
   }
 
@@ -153,8 +154,8 @@ int main(void) {
     return 1;
   }
 
-  /* Raise the soft limit back up to the hard limit; raising the soft limit up to
-   * (but not above) the hard limit is always permitted. */
+  /* Raise the soft limit back up to the hard limit; raising the soft limit up
+   * to (but not above) the hard limit is always permitted. */
   struct rlimit restore = {.rlim_cur = hard, .rlim_max = hard};
   if (setrlimit_raw(RLIMIT_NOFILE, &restore) != 0)
     return fail("setrlimit RLIMIT_NOFILE restore");
@@ -167,9 +168,10 @@ int main(void) {
     return 1;
   }
 
-  /* Faithful Linux refusal 1: a request with soft > hard fails with EINVAL. Only
-   * meaningful when the hard limit leaves room for an invalid soft value.
-   * -1 records "not applicable on this hard limit" rather than "not checked". */
+  /* Faithful Linux refusal 1: a request with soft > hard fails with EINVAL.
+   * Only meaningful when the hard limit leaves room for an invalid soft value.
+   * -1 records "not applicable on this hard limit" rather than "not checked".
+   */
   int soft_gt_hard_errno = -1;
   if (hard != RLIM_INFINITY && hard > 0) {
     struct rlimit bad = {.rlim_cur = hard, .rlim_max = hard - 1};
@@ -179,16 +181,18 @@ int main(void) {
       return 1;
     }
     if (errno != EINVAL) {
-      fprintf(stderr, "rlimit-identity: soft>hard errno not EINVAL: %s\n",
-              strerror(errno));
+      fprintf(
+          stderr,
+          "rlimit-identity: soft>hard errno not EINVAL: %s\n",
+          strerror(errno));
       return 1;
     }
     soft_gt_hard_errno = errno;
   }
 
   /* Faithful Linux refusal 2: an unprivileged process may not raise its hard
-   * limit; requesting a larger hard limit fails with EPERM. Only meaningful when
-   * the current hard limit is not already infinite. */
+   * limit; requesting a larger hard limit fails with EPERM. Only meaningful
+   * when the current hard limit is not already infinite. */
   int raise_hard_errno = -1;
   if (hard != RLIM_INFINITY) {
     struct rlimit raise_hard = {.rlim_cur = hard, .rlim_max = hard + 1};
@@ -198,22 +202,30 @@ int main(void) {
       return 1;
     }
     if (errno != EPERM) {
-      fprintf(stderr, "rlimit-identity: raise-hard errno not EPERM: %s\n",
-              strerror(errno));
+      fprintf(
+          stderr,
+          "rlimit-identity: raise-hard errno not EPERM: %s\n",
+          strerror(errno));
       return 1;
     }
     raise_hard_errno = errno;
   }
 
   /* Emit the observations, not a success token. nofile_hard is the virtualized
-   * constant this contract exists to pin; the readbacks are what each round trip
-   * actually returned; the two errnos are the refusals actually observed. */
-  printf("rlimit-identity nofile_hard=%llu soft1_readback=%llu "
-         "prlimit_query=%llu prlimit_old=%llu soft2_readback=%llu "
-         "restore_readback=%llu soft_gt_hard_errno=%d raise_hard_errno=%d\n",
-         (unsigned long long)hard, (unsigned long long)read1.rlim_cur,
-         (unsigned long long)query.rlim_cur, (unsigned long long)old2.rlim_cur,
-         (unsigned long long)read2.rlim_cur, (unsigned long long)read3.rlim_cur,
-         soft_gt_hard_errno, raise_hard_errno);
+   * constant this contract exists to pin; the readbacks are what each round
+   * trip actually returned; the two errnos are the refusals actually observed.
+   */
+  printf(
+      "rlimit-identity nofile_hard=%llu soft1_readback=%llu "
+      "prlimit_query=%llu prlimit_old=%llu soft2_readback=%llu "
+      "restore_readback=%llu soft_gt_hard_errno=%d raise_hard_errno=%d\n",
+      (unsigned long long)hard,
+      (unsigned long long)read1.rlim_cur,
+      (unsigned long long)query.rlim_cur,
+      (unsigned long long)old2.rlim_cur,
+      (unsigned long long)read2.rlim_cur,
+      (unsigned long long)read3.rlim_cur,
+      soft_gt_hard_errno,
+      raise_hard_errno);
   return 0;
 }

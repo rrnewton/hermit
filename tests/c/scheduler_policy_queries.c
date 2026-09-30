@@ -30,7 +30,7 @@ struct sched_attr_compat {
   uint64_t sched_period;
 };
 
-static int require_zero(long result, const char *name) {
+static int require_zero(long result, const char* name) {
   if (result != 0) {
     fprintf(stderr, "%s failed: %s\n", name, strerror(errno));
     return 1;
@@ -57,7 +57,8 @@ int main(void) {
   if (getitimer(ITIMER_REAL, &timer) != 0 ||
       (timer.it_value.tv_sec == 0 && timer.it_value.tv_usec == 0) ||
       timer.it_interval.tv_sec != 0 || timer.it_interval.tv_usec != 0) {
-    fputs("logical ITIMER_REAL query lost the pending one-shot timer\n", stderr);
+    fputs(
+        "logical ITIMER_REAL query lost the pending one-shot timer\n", stderr);
     return 1;
   }
   struct itimerval disarmed;
@@ -69,8 +70,10 @@ int main(void) {
 
   long priority = syscall(SYS_ioprio_get, 1, 0);
   if (priority != 0) {
-    fprintf(stderr, "ioprio_get returned %ld, expected virtual default 0\n",
-            priority);
+    fprintf(
+        stderr,
+        "ioprio_get returned %ld, expected virtual default 0\n",
+        priority);
     return 1;
   }
 
@@ -81,8 +84,8 @@ int main(void) {
   attr.sched_runtime = 100000;
   attr.sched_deadline = 200000;
   attr.sched_period = 200000;
-  if (require_zero(syscall(SYS_sched_setattr, 0, &attr, 0),
-                   "sched_setattr") != 0) {
+  if (require_zero(syscall(SYS_sched_setattr, 0, &attr, 0), "sched_setattr") !=
+      0) {
     return 1;
   }
 

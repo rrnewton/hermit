@@ -16,16 +16,16 @@ struct shared_state {
 };
 
 struct worker_args {
-  struct shared_state *state;
+  struct shared_state* state;
   int id;
 };
 
-static void *worker(void *opaque) {
-  struct worker_args *args = opaque;
-  struct shared_state *state = args->state;
+static void* worker(void* opaque) {
+  struct worker_args* args = opaque;
+  struct shared_state* state = args->state;
   int barrier_result = pthread_barrier_wait(&state->start);
   if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
-    return (void *)1;
+    return (void*)1;
   }
 
   uint64_t retries = 0;
@@ -33,12 +33,15 @@ static void *worker(void *opaque) {
     uint64_t current =
         atomic_load_explicit(&state->cas_counter, memory_order_relaxed);
     while (!atomic_compare_exchange_weak_explicit(
-        &state->cas_counter, &current, current + 1, memory_order_seq_cst,
+        &state->cas_counter,
+        &current,
+        current + 1,
+        memory_order_seq_cst,
         memory_order_relaxed)) {
       retries++;
     }
-    atomic_fetch_add_explicit(&state->fetch_add_counter, 1,
-                              memory_order_seq_cst);
+    atomic_fetch_add_explicit(
+        &state->fetch_add_counter, 1, memory_order_seq_cst);
   }
   state->retries[args->id] = retries;
   return NULL;
@@ -64,7 +67,7 @@ int main(void) {
   }
 
   for (int id = 0; id < THREADS; id++) {
-    void *result = NULL;
+    void* result = NULL;
     if (pthread_join(threads[id], &result) != 0 || result != NULL) {
       return 4;
     }
@@ -79,8 +82,10 @@ int main(void) {
     return 5;
   }
 
-  printf("lock-free final=%lu fetch-add=%lu retries=", (unsigned long)cas_value,
-         (unsigned long)fetch_add_value);
+  printf(
+      "lock-free final=%lu fetch-add=%lu retries=",
+      (unsigned long)cas_value,
+      (unsigned long)fetch_add_value);
   for (int id = 0; id < THREADS; id++) {
     printf("%s%lu", id == 0 ? "" : ",", (unsigned long)state.retries[id]);
   }

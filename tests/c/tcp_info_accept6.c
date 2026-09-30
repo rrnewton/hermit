@@ -12,7 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int fail(const char *operation) {
+static int fail(const char* operation) {
   perror(operation);
   return 1;
 }
@@ -24,7 +24,7 @@ static int check_info(int fd) {
     return fail("getsockopt TCP_INFO");
   }
 
-  const unsigned char *bytes = (const unsigned char *)&info;
+  const unsigned char* bytes = (const unsigned char*)&info;
   for (size_t offset = 0; offset < length; ++offset) {
     if (offset != 0 && offset != 1 && offset != 5 && offset != 6 &&
         bytes[offset] != 0) {
@@ -32,8 +32,12 @@ static int check_info(int fd) {
       return 2;
     }
   }
-  printf("accept6 state=%u ca=%u options=%u scales=%u\n", bytes[0], bytes[1],
-         bytes[5], bytes[6]);
+  printf(
+      "accept6 state=%u ca=%u options=%u scales=%u\n",
+      bytes[0],
+      bytes[1],
+      bytes[5],
+      bytes[6]);
   return 0;
 }
 
@@ -46,11 +50,11 @@ int main(void) {
       .sin6_family = AF_INET6,
       .sin6_addr = IN6ADDR_LOOPBACK_INIT,
   };
-  if (bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (bind(listener, (struct sockaddr*)&address, sizeof(address)) < 0) {
     return fail("bind");
   }
   socklen_t address_length = sizeof(address);
-  if (getsockname(listener, (struct sockaddr *)&address, &address_length) < 0) {
+  if (getsockname(listener, (struct sockaddr*)&address, &address_length) < 0) {
     return fail("getsockname");
   }
   if (listen(listener, 1) < 0) {
@@ -61,7 +65,7 @@ int main(void) {
   if (client < 0) {
     return fail("socket client");
   }
-  if (connect(client, (struct sockaddr *)&address, sizeof(address)) < 0) {
+  if (connect(client, (struct sockaddr*)&address, sizeof(address)) < 0) {
     return fail("connect");
   }
   int accepted = accept(listener, NULL, NULL);

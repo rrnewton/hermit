@@ -28,15 +28,15 @@ struct shared_state {
   _Atomic int trigger;
 };
 
-static struct shared_state *state;
-static const char *self_path;
+static struct shared_state* state;
+static const char* self_path;
 
-static void die(const char *what) {
+static void die(const char* what) {
   perror(what);
   _exit(2);
 }
 
-static void wait_until(_Atomic int *word, int value) {
+static void wait_until(_Atomic int* word, int value) {
   for (unsigned i = 0; i < 10000000; ++i) {
     if (atomic_load_explicit(word, memory_order_acquire) == value) {
       return;
@@ -48,7 +48,7 @@ static void wait_until(_Atomic int *word, int value) {
 }
 
 static void wait_for_waiter(void) {
-  _Atomic uint32_t *lock = (_Atomic uint32_t *)&state->mutex;
+  _Atomic uint32_t* lock = (_Atomic uint32_t*)&state->mutex;
   for (unsigned i = 0; i < 10000000; ++i) {
     if (atomic_load_explicit(lock, memory_order_acquire) & FUTEX_WAITERS) {
       return;
@@ -71,8 +71,8 @@ static void lock_as_owner(void) {
 static void waiter_process(void) {
   int rc = pthread_mutex_lock(&state->mutex);
   if (rc != EOWNERDEAD) {
-    fprintf(stderr, "waiter got %d (%s), expected EOWNERDEAD\n", rc,
-            strerror(rc));
+    fprintf(
+        stderr, "waiter got %d (%s), expected EOWNERDEAD\n", rc, strerror(rc));
     _exit(5);
   }
   rc = pthread_mutex_consistent(&state->mutex);
@@ -102,7 +102,7 @@ static pid_t spawn_waiter(void) {
   return pid;
 }
 
-static void await_success(pid_t pid, const char *name) {
+static void await_success(pid_t pid, const char* name) {
   int status;
   if (waitpid(pid, &status, 0) != pid) {
     die("waitpid");
@@ -113,7 +113,7 @@ static void await_success(pid_t pid, const char *name) {
   }
 }
 
-static void *owner_thread(void *unused) {
+static void* owner_thread(void* unused) {
   (void)unused;
   lock_as_owner();
   for (;;) {
@@ -122,7 +122,7 @@ static void *owner_thread(void *unused) {
   return NULL;
 }
 
-static void *exec_thread(void *unused) {
+static void* exec_thread(void* unused) {
   (void)unused;
   wait_until(&state->trigger, 1);
   execl(self_path, self_path, "after-exec", NULL);
@@ -130,7 +130,7 @@ static void *exec_thread(void *unused) {
   return NULL;
 }
 
-static pid_t spawn_group_owner(const char *mode) {
+static pid_t spawn_group_owner(const char* mode) {
   pid_t pid = fork();
   if (pid < 0) {
     die("fork owner");
@@ -176,7 +176,7 @@ static pid_t spawn_group_owner(const char *mode) {
   _exit(8);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "after-exec") == 0) {
     return 0;
   }
@@ -185,8 +185,13 @@ int main(int argc, char **argv) {
     return 64;
   }
   self_path = argv[0];
-  state = mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
-               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  state = mmap(
+      NULL,
+      sizeof(*state),
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
   if (state == MAP_FAILED) {
     die("mmap");
   }

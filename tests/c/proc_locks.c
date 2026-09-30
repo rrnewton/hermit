@@ -27,7 +27,7 @@ static int take_lock(int fd) {
 #endif
 }
 
-static ssize_t read_all(int fd, char *buffer) {
+static ssize_t read_all(int fd, char* buffer) {
   size_t used = 0;
   while (used < SNAPSHOT_CAP - 1) {
     ssize_t count = read(fd, buffer + used, SNAPSHOT_CAP - 1 - used);
@@ -47,21 +47,21 @@ static ssize_t read_all(int fd, char *buffer) {
   return -1;
 }
 
-static int check_virtual_graph(const char *snapshot) {
-  char *copy = strdup(snapshot);
+static int check_virtual_graph(const char* snapshot) {
+  char* copy = strdup(snapshot);
   if (copy == NULL) {
     return 1;
   }
   char first_object[64] = {0};
   int rows = 0;
   int distinct_object = 0;
-  char *save_line = NULL;
-  for (char *line = strtok_r(copy, "\n", &save_line); line != NULL;
+  char* save_line = NULL;
+  for (char* line = strtok_r(copy, "\n", &save_line); line != NULL;
        line = strtok_r(NULL, "\n", &save_line)) {
-    char *fields[9] = {0};
+    char* fields[9] = {0};
     int count = 0;
-    char *save_field = NULL;
-    for (char *field = strtok_r(line, " \t", &save_field);
+    char* save_field = NULL;
+    for (char* field = strtok_r(line, " \t", &save_field);
          field != NULL && count < 9;
          field = strtok_r(NULL, " \t", &save_field)) {
       fields[count++] = field;
@@ -83,7 +83,7 @@ static int check_virtual_graph(const char *snapshot) {
   return rows < 2 || !distinct_object;
 }
 
-static int open_and_read(const char *path, char *snapshot) {
+static int open_and_read(const char* path, char* snapshot) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) {
     return 1;
@@ -96,17 +96,23 @@ static int open_and_read(const char *path, char *snapshot) {
 int main(void) {
   char first_path[96];
   char second_path[96];
-  snprintf(first_path, sizeof(first_path), "/tmp/hermit-proc-locks-%d-a", LOCK_API);
-  snprintf(second_path, sizeof(second_path), "/tmp/hermit-proc-locks-%d-b", LOCK_API);
+  snprintf(
+      first_path, sizeof(first_path), "/tmp/hermit-proc-locks-%d-a", LOCK_API);
+  snprintf(
+      second_path,
+      sizeof(second_path),
+      "/tmp/hermit-proc-locks-%d-b",
+      LOCK_API);
   int first = open(first_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
   int second = open(second_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
-  if (first < 0 || second < 0 || take_lock(first) < 0 || take_lock(second) < 0) {
+  if (first < 0 || second < 0 || take_lock(first) < 0 ||
+      take_lock(second) < 0) {
     return 1;
   }
 
-  char *direct = calloc(SNAPSHOT_CAP, 1);
-  char *alias = calloc(SNAPSHOT_CAP, 1);
-  char *relative = calloc(SNAPSHOT_CAP, 1);
+  char* direct = calloc(SNAPSHOT_CAP, 1);
+  char* alias = calloc(SNAPSHOT_CAP, 1);
+  char* relative = calloc(SNAPSHOT_CAP, 1);
   if (direct == NULL || alias == NULL || relative == NULL) {
     return 1;
   }
@@ -124,8 +130,8 @@ int main(void) {
   }
 
   char prefix[8];
-  if (lseek(locks, 0, SEEK_SET) != 0 || read(locks, prefix, sizeof(prefix)) !=
-                                             (ssize_t)sizeof(prefix)) {
+  if (lseek(locks, 0, SEEK_SET) != 0 ||
+      read(locks, prefix, sizeof(prefix)) != (ssize_t)sizeof(prefix)) {
     return 1;
   }
   int duplicate = dup(locks);

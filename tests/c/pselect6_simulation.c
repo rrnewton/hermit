@@ -70,8 +70,13 @@ static int run_wrapper_boundary(int unmap_tail) {
     fputs("invalid pselect wrapper page size\n", stderr);
     return 1;
   }
-  char* mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  char* mapping = mmap(
+      NULL,
+      (size_t)page_size * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (mapping == MAP_FAILED) {
     perror("pselect wrapper mapping");
     return 1;
@@ -86,9 +91,11 @@ static int run_wrapper_boundary(int unmap_tail) {
   errno = 0;
   long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed, wrapper);
   if (result != -1 || errno != EINVAL) {
-    fprintf(stderr,
-            "readable split pselect6 wrapper: result=%ld errno=%d\n",
-            result, errno);
+    fprintf(
+        stderr,
+        "readable split pselect6 wrapper: result=%ld errno=%d\n",
+        result,
+        errno);
     munmap(mapping, (size_t)page_size * 2);
     return 1;
   }
@@ -106,11 +113,14 @@ static int run_wrapper_boundary(int unmap_tail) {
     errno = 0;
     result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, timeouts[i], wrapper);
     if (result != -1 || errno != EFAULT) {
-      fprintf(stderr,
-              "%s pselect6 wrapper tail before %s timeout: "
-              "result=%ld errno=%d (expected EFAULT)\n",
-              unmap_tail ? "unmapped" : "protected",
-              i == 0 ? "malformed" : "unreadable", result, errno);
+      fprintf(
+          stderr,
+          "%s pselect6 wrapper tail before %s timeout: "
+          "result=%ld errno=%d (expected EFAULT)\n",
+          unmap_tail ? "unmapped" : "protected",
+          i == 0 ? "malformed" : "unreadable",
+          result,
+          errno);
       failed = 1;
     }
   }
@@ -124,13 +134,15 @@ static int run_wrapper_boundary(int unmap_tail) {
 static int run_argument_validation_order(void) {
   struct timespec malformed = {.tv_sec = 0, .tv_nsec = 1000000000};
   errno = 0;
-  long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed,
-                        (void*)1);
+  long result =
+      syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed, (void*)1);
   if (result != -1 || errno != EFAULT) {
-    fprintf(stderr,
-            "unreadable pselect6 signal-mask wrapper did not precede timeout "
-            "validation: result=%ld errno=%d\n",
-            result, errno);
+    fprintf(
+        stderr,
+        "unreadable pselect6 signal-mask wrapper did not precede timeout "
+        "validation: result=%ld errno=%d\n",
+        result,
+        errno);
     return 1;
   }
 
@@ -143,10 +155,12 @@ static int run_argument_validation_order(void) {
   errno = 0;
   result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, (void*)1, &bad_size);
   if (result != -1 || errno != EFAULT) {
-    fprintf(stderr,
-            "pselect6 timeout access did not precede signal-mask size "
-            "validation: result=%ld errno=%d\n",
-            result, errno);
+    fprintf(
+        stderr,
+        "pselect6 timeout access did not precede signal-mask size "
+        "validation: result=%ld errno=%d\n",
+        result,
+        errno);
     return 1;
   }
 
@@ -155,13 +169,15 @@ static int run_argument_validation_order(void) {
       .sigsetsize = sizeof(uint64_t),
   };
   errno = 0;
-  result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed,
-                   &unreadable_mask);
+  result =
+      syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed, &unreadable_mask);
   if (result != -1 || errno != EINVAL) {
-    fprintf(stderr,
-            "pselect6 timeout validation did not precede signal-mask access: "
-            "result=%ld errno=%d\n",
-            result, errno);
+    fprintf(
+        stderr,
+        "pselect6 timeout validation did not precede signal-mask access: "
+        "result=%ld errno=%d\n",
+        result,
+        errno);
     return 1;
   }
   if (run_wrapper_boundary(0) != 0 || run_wrapper_boundary(1) != 0) {
@@ -231,36 +247,50 @@ static int run_default_workload(void) {
 
   struct timespec fdset_fault_timeout = {.tv_sec = 1, .tv_nsec = 0};
   errno = 0;
-  if (syscall(SYS_pselect6, 1, (void*)1, NULL, NULL,
-              &fdset_fault_timeout, NULL) != -1 ||
+  if (syscall(
+          SYS_pselect6, 1, (void*)1, NULL, NULL, &fdset_fault_timeout, NULL) !=
+          -1 ||
       errno != EFAULT) {
-    fprintf(stderr,
-            "bad fdset pselect timeout failed: errno=%d remain=%ld.%09ld\n", errno,
-            fdset_fault_timeout.tv_sec, fdset_fault_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "bad fdset pselect timeout failed: errno=%d remain=%ld.%09ld\n",
+        errno,
+        fdset_fault_timeout.tv_sec,
+        fdset_fault_timeout.tv_nsec);
     return 1;
   }
 
   struct timespec raw_timeout = {.tv_sec = 0, .tv_nsec = 1000000};
-  if (syscall(SYS_pselect6, 0, (void*)1, (void*)1, (void*)1,
-              &raw_timeout, NULL) != 0 ||
+  if (syscall(
+          SYS_pselect6, 0, (void*)1, (void*)1, (void*)1, &raw_timeout, NULL) !=
+          0 ||
       raw_timeout.tv_sec != 0 || raw_timeout.tv_nsec != 0) {
-    fprintf(stderr, "nfds=0 pselect or timeout writeback failed: %ld.%09ld\n",
-            raw_timeout.tv_sec, raw_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "nfds=0 pselect or timeout writeback failed: %ld.%09ld\n",
+        raw_timeout.tv_sec,
+        raw_timeout.tv_nsec);
     return 1;
   }
 
   raw_timeout = (struct timespec){.tv_sec = 0, .tv_nsec = 1000000};
   errno = 0;
-  if (syscall(SYS_pselect6, -1, (void*)1, (void*)1, (void*)1,
-              &raw_timeout, NULL) != -1 ||
+  if (syscall(
+          SYS_pselect6, -1, (void*)1, (void*)1, (void*)1, &raw_timeout, NULL) !=
+          -1 ||
       errno != EINVAL) {
     fprintf(stderr, "negative nfds pselect: errno=%d\n", errno);
     return 1;
   }
 
   long page_size = sysconf(_SC_PAGESIZE);
-  void* mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* mapping = mmap(
+      NULL,
+      (size_t)page_size * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
   if (mapping == MAP_FAILED ||
       mprotect((char*)mapping + page_size, (size_t)page_size, PROT_NONE) != 0) {
     perror("pselect fdset mapping");
@@ -319,10 +349,13 @@ static int run_default_workload(void) {
       (signal_timeout.tv_sec == 1 && signal_timeout.tv_nsec == 0) ||
       signal_timeout.tv_sec < 0 || signal_timeout.tv_nsec < 0 ||
       signal_timeout.tv_nsec >= 1000000000) {
-    fprintf(stderr,
-            "interrupted pselect timeout failed: errno=%d seen=%d remain=%ld.%09ld\n",
-            errno, signal_received, signal_timeout.tv_sec,
-            signal_timeout.tv_nsec);
+    fprintf(
+        stderr,
+        "interrupted pselect timeout failed: errno=%d seen=%d remain=%ld.%09ld\n",
+        errno,
+        signal_received,
+        signal_timeout.tv_sec,
+        signal_timeout.tv_nsec);
     return 1;
   }
   if (write(signal_ack[1], "s", 1) != 1) {
@@ -330,7 +363,8 @@ static int run_default_workload(void) {
     return 1;
   }
   void* signal_result = NULL;
-  if (pthread_join(signal_thread, &signal_result) != 0 || signal_result != NULL) {
+  if (pthread_join(signal_thread, &signal_result) != 0 ||
+      signal_result != NULL) {
     fputs("signal sender failed\n", stderr);
     return 1;
   }
@@ -384,15 +418,17 @@ int main(int argc, char** argv) {
     return run_default_workload();
   }
   if (argc != 2) {
-    fprintf(stderr,
-            "usage: %s [argument-validation-order|wrapper-protected-tail|"
-            "wrapper-unmapped-tail]\n", argv[0]);
+    fprintf(
+        stderr,
+        "usage: %s [argument-validation-order|wrapper-protected-tail|"
+        "wrapper-unmapped-tail]\n",
+        argv[0]);
     return 2;
   }
   if (strcmp(argv[1], "wrapper-protected-tail") == 0 ||
       strcmp(argv[1], "wrapper-unmapped-tail") == 0) {
-    int result = run_wrapper_boundary(
-        strcmp(argv[1], "wrapper-unmapped-tail") == 0);
+    int result =
+        run_wrapper_boundary(strcmp(argv[1], "wrapper-unmapped-tail") == 0);
     if (result == 0) {
       puts("pselect6-simulation-ok");
     }
@@ -406,8 +442,10 @@ int main(int argc, char** argv) {
     return result;
   }
 
-  fprintf(stderr,
-          "usage: %s [argument-validation-order|wrapper-protected-tail|"
-          "wrapper-unmapped-tail]\n", argv[0]);
+  fprintf(
+      stderr,
+      "usage: %s [argument-validation-order|wrapper-protected-tail|"
+      "wrapper-unmapped-tail]\n",
+      argv[0]);
   return 2;
 }

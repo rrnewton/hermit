@@ -64,8 +64,7 @@ static long read_relative_proc_timer_slack(void) {
   if (chdir("/") != 0) {
     return -1;
   }
-  const int path_fd =
-      open("proc/self/timerslack_ns", O_PATH | O_CLOEXEC);
+  const int path_fd = open("proc/self/timerslack_ns", O_PATH | O_CLOEXEC);
   if (path_fd < 0) {
     return -1;
   }

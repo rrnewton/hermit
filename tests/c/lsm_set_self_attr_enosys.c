@@ -24,10 +24,13 @@ int main(void) {
   errno = 0;
   long result = syscall(SYS_lsm_set_self_attr, LSM_ATTR_CURRENT, NULL, 0UL, 0U);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "lsm_set_self_attr returned %ld with errno %d (%s), expected "
-            "ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "lsm_set_self_attr returned %ld with errno %d (%s), expected "
+        "ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
   puts("lsm_set_self_attr deterministically unavailable");

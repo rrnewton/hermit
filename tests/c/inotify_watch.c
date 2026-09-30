@@ -30,25 +30,25 @@
 #include <unistd.h>
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 4 };
+  enum { EXPECTED_CHECKS = 4 };
 
-    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    int init_ok = fd >= 0;
+  int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+  int init_ok = fd >= 0;
 
-    int wd = inotify_add_watch(fd, "/tmp", IN_CREATE | IN_DELETE);
-    int watch_added = wd >= 0;
+  int wd = inotify_add_watch(fd, "/tmp", IN_CREATE | IN_DELETE);
+  int watch_added = wd >= 0;
 
-    int watch_removed = inotify_rm_watch(fd, wd) == 0;
+  int watch_removed = inotify_rm_watch(fd, wd) == 0;
 
-    int closed = fd >= 0 && close(fd) == 0;
+  int closed = fd >= 0 && close(fd) == 0;
 
-    int ok = init_ok + watch_added + watch_removed + closed;
-    printf(
-        "ino ok=%d init_ok=%d watch_added=%d watch_removed=%d closed=%d\n",
-        ok,
-        init_ok,
-        watch_added,
-        watch_removed,
-        closed);
-    return ok == EXPECTED_CHECKS ? 0 : 1;
+  int ok = init_ok + watch_added + watch_removed + closed;
+  printf(
+      "ino ok=%d init_ok=%d watch_added=%d watch_removed=%d closed=%d\n",
+      ok,
+      init_ok,
+      watch_added,
+      watch_removed,
+      closed);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }

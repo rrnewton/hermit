@@ -33,10 +33,13 @@ int main(void) {
   errno = 0;
   long result = syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "watchpoint perf_event_open returned %ld with errno %d (%s), "
-            "expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "watchpoint perf_event_open returned %ld with errno %d (%s), "
+        "expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     if (result >= 0) {
       close((int)result);
     }

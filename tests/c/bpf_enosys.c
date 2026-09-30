@@ -26,8 +26,12 @@ int main(void) {
   errno = 0;
   long result = syscall(SYS_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr, "bpf returned %ld with errno %d (%s), expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "bpf returned %ld with errno %d (%s), expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
   puts("bpf deterministically unavailable");

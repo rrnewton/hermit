@@ -30,9 +30,9 @@ struct blocked_child {
   int release_fd;
 };
 
-static const char *wait_stage = "unset";
+static const char* wait_stage = "unset";
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -64,16 +64,23 @@ static void release_child(struct blocked_child child) {
 
 static void require_exit(pid_t waited, pid_t expected, int status, int code) {
   if (waited != expected || !WIFEXITED(status) || WEXITSTATUS(status) != code) {
-    fprintf(stderr,
-            "%s: waited=%d expected=%d status=%#x exited=%d exit_status=%d "
-            "errno=%d\n",
-            wait_stage, waited, expected, status, WIFEXITED(status),
-            WIFEXITED(status) ? WEXITSTATUS(status) : -1, errno);
+    fprintf(
+        stderr,
+        "%s: waited=%d expected=%d status=%#x exited=%d exit_status=%d "
+        "errno=%d\n",
+        wait_stage,
+        waited,
+        expected,
+        status,
+        WIFEXITED(status),
+        WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+        errno);
     exit(2);
   }
 }
 
-static void waitpid_exit(pid_t selector, pid_t expected, int options, int code) {
+static void
+waitpid_exit(pid_t selector, pid_t expected, int options, int code) {
   int status = 0;
   pid_t waited = waitpid(selector, &status, options);
   require_exit(waited, expected, status, code);
@@ -85,11 +92,11 @@ struct thread_child {
   int done_read;
 };
 
-static void *spawn_from_worker(void *opaque) {
-  struct thread_child *state = opaque;
+static void* spawn_from_worker(void* opaque) {
+  struct thread_child* state = opaque;
   pid_t child = fork();
   if (child < 0)
-    return (void *)(intptr_t)1;
+    return (void*)(intptr_t)1;
   if (child == 0) {
     char token;
     if (read(state->release_read, &token, 1) != 1)
@@ -97,10 +104,10 @@ static void *spawn_from_worker(void *opaque) {
     _exit(19);
   }
   if (write(state->pid_write, &child, sizeof(child)) != sizeof(child))
-    return (void *)(intptr_t)2;
+    return (void*)(intptr_t)2;
   char token;
   if (read(state->done_read, &token, 1) != 1)
-    return (void *)(intptr_t)3;
+    return (void*)(intptr_t)3;
   return NULL;
 }
 
@@ -108,15 +115,16 @@ static pid_t raw_clone(unsigned long flags) {
   return (pid_t)syscall(SYS_clone, flags, NULL, NULL, NULL, 0);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   int same_group_only = argc == 2 && strcmp(argv[1], "--same-group-only") == 0;
   int groups_only = argc == 2 && strcmp(argv[1], "--groups-only") == 0;
   int nothread_only = argc == 2 && strcmp(argv[1], "--nothread-only") == 0;
-  if (argc > 2 || (argc == 2 && !same_group_only && !groups_only &&
-                              !nothread_only)) {
-    fprintf(stderr,
-            "usage: %s [--same-group-only|--groups-only|--nothread-only]\n",
-            argv[0]);
+  if (argc > 2 ||
+      (argc == 2 && !same_group_only && !groups_only && !nothread_only)) {
+    fprintf(
+        stderr,
+        "usage: %s [--same-group-only|--groups-only|--nothread-only]\n",
+        argv[0]);
     return 64;
   }
   int full = argc == 1;
@@ -191,7 +199,7 @@ int main(int argc, char **argv) {
     waitpid_exit(thread_child, thread_child, 0, 19);
     if (write(done_pipe[1], &token, 1) != 1)
       fail("release worker");
-    void *thread_result = NULL;
+    void* thread_result = NULL;
     if (pthread_join(worker, &thread_result) != 0 || thread_result != NULL)
       return 6;
   }

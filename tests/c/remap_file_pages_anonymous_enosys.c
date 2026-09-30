@@ -22,20 +22,29 @@ int main(void) {
     return 1;
   }
 
-  void *mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
-                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  void* mapping = mmap(
+      NULL,
+      (size_t)page_size * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
   if (mapping == MAP_FAILED) {
     perror("mmap");
     return 1;
   }
 
   errno = 0;
-  long result = syscall(SYS_remap_file_pages, mapping, (size_t)page_size, 0, 1, 0);
+  long result =
+      syscall(SYS_remap_file_pages, mapping, (size_t)page_size, 0, 1, 0);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "anonymous remap_file_pages returned %ld with errno %d (%s), "
-            "expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "anonymous remap_file_pages returned %ld with errno %d (%s), "
+        "expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     munmap(mapping, (size_t)page_size * 2);
     return 1;
   }

@@ -43,7 +43,7 @@ int main(void) {
     return 1;
   }
 
-  struct robust_list_head *head = NULL;
+  struct robust_list_head* head = NULL;
   size_t length = 0;
   if (syscall(SYS_get_robust_list, child, &head, &length) != 0) {
     perror("get_robust_list child");

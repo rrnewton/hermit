@@ -68,8 +68,9 @@ int main(void) {
     perror("getitimer");
     return 3;
   }
-  int armed = (got.it_value.tv_sec > 0 || got.it_value.tv_usec > 0 ||
-               got.it_interval.tv_usec > 0);
+  int armed =
+      (got.it_value.tv_sec > 0 || got.it_value.tv_usec > 0 ||
+       got.it_interval.tv_usec > 0);
   printf("timer armed (getitimer remaining>0 or interval set): %d\n", armed);
 
   /* Fixed observation window: twenty 10ms sleeps (~200ms of virtual time).

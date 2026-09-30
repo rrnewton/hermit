@@ -22,9 +22,9 @@
  * which consumer consumed each item. If Hermit's thread scheduling, futex
  * ordering, or condvar wakeup order were nondeterministic, this consumption log
  * and the per-consumer tallies would differ between two runs, so
- * `hermit run --strict --verify` would report a divergence. An order-independent
- * XOR checksum is printed last as a correctness anchor: it must always equal the
- * XOR of every produced value regardless of interleaving.
+ * `hermit run --strict --verify` would report a divergence. An
+ * order-independent XOR checksum is printed last as a correctness anchor: it
+ * must always equal the XOR of every produced value regardless of interleaving.
  */
 
 #define _GNU_SOURCE
@@ -63,29 +63,29 @@ struct bounded_queue {
 };
 
 struct producer_args {
-  struct bounded_queue *queue;
+  struct bounded_queue* queue;
   int producer_id;
 };
 
 struct consumer_args {
-  struct bounded_queue *queue;
+  struct bounded_queue* queue;
   int consumer_id;
 };
 
-static void fail(const char *operation, int err) {
+static void fail(const char* operation, int err) {
   fprintf(stderr, "%s: %s\n", operation, strerror(err));
   exit(EXIT_FAILURE);
 }
 
-#define CHECK(call)                        \
-  do {                                     \
-    int rc__ = (call);                     \
-    if (rc__ != 0) {                       \
-      fail(#call, rc__);                   \
-    }                                      \
+#define CHECK(call)      \
+  do {                   \
+    int rc__ = (call);   \
+    if (rc__ != 0) {     \
+      fail(#call, rc__); \
+    }                    \
   } while (0)
 
-static void queue_push(struct bounded_queue *queue, int value) {
+static void queue_push(struct bounded_queue* queue, int value) {
   CHECK(pthread_mutex_lock(&queue->mutex));
   while (queue->size == QUEUE_CAPACITY) {
     CHECK(pthread_cond_wait(&queue->not_full, &queue->mutex));
@@ -97,7 +97,7 @@ static void queue_push(struct bounded_queue *queue, int value) {
   CHECK(pthread_mutex_unlock(&queue->mutex));
 }
 
-static int queue_pop(struct bounded_queue *queue, int consumer_id) {
+static int queue_pop(struct bounded_queue* queue, int consumer_id) {
   CHECK(pthread_mutex_lock(&queue->mutex));
   while (queue->size == 0) {
     CHECK(pthread_cond_wait(&queue->not_empty, &queue->mutex));
@@ -117,8 +117,8 @@ static int queue_pop(struct bounded_queue *queue, int consumer_id) {
   return value;
 }
 
-static void *producer_main(void *opaque) {
-  struct producer_args *args = opaque;
+static void* producer_main(void* opaque) {
+  struct producer_args* args = opaque;
   for (int seq = 0; seq < ITEMS_PER_PRODUCER; ++seq) {
     /* Encode producer and sequence so every produced value is unique. */
     int value = args->producer_id * 1000 + seq;
@@ -127,8 +127,8 @@ static void *producer_main(void *opaque) {
   return NULL;
 }
 
-static void *consumer_main(void *opaque) {
-  struct consumer_args *args = opaque;
+static void* consumer_main(void* opaque) {
+  struct consumer_args* args = opaque;
   for (;;) {
     int value = queue_pop(args->queue, args->consumer_id);
     if (value == POISON) {
@@ -153,12 +153,14 @@ int main(void) {
   for (int i = 0; i < CONSUMER_COUNT; ++i) {
     consumer_args[i].queue = &queue;
     consumer_args[i].consumer_id = i;
-    CHECK(pthread_create(&consumers[i], NULL, consumer_main, &consumer_args[i]));
+    CHECK(
+        pthread_create(&consumers[i], NULL, consumer_main, &consumer_args[i]));
   }
   for (int i = 0; i < PRODUCER_COUNT; ++i) {
     producer_args[i].queue = &queue;
     producer_args[i].producer_id = i;
-    CHECK(pthread_create(&producers[i], NULL, producer_main, &producer_args[i]));
+    CHECK(
+        pthread_create(&producers[i], NULL, producer_main, &producer_args[i]));
   }
 
   for (int i = 0; i < PRODUCER_COUNT; ++i) {
@@ -191,9 +193,13 @@ int main(void) {
     }
   }
   if (queue.consumed != REAL_ITEMS || checksum != expected) {
-    fprintf(stderr,
-            "correctness violation: consumed=%d (want %d) checksum=%u (want %u)\n",
-            queue.consumed, REAL_ITEMS, checksum, expected);
+    fprintf(
+        stderr,
+        "correctness violation: consumed=%d (want %d) checksum=%u (want %u)\n",
+        queue.consumed,
+        REAL_ITEMS,
+        checksum,
+        expected);
     return EXIT_FAILURE;
   }
   printf("checksum %u\n", checksum);

@@ -51,12 +51,9 @@ HEX_FIELDS = {
     "recursive_identity_sha256",
 }
 BOOTSTRAP_PIN_SHA256 = {
-    "8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc":
-        "eb75c9063ed5e55c26037d6e3c6d29cf4ece47d4664966462b4bb690427c3db3",
+    "8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc": "eb75c9063ed5e55c26037d6e3c6d29cf4ece47d4664966462b4bb690427c3db3",
 }
-RELEASE_REPOSITORY_PATTERN = re.compile(
-    r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
-)
+RELEASE_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DIRECTORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -158,9 +155,7 @@ def load_registry_bytes(
             )
         ):
             refuse("release count inventory is invalid")
-        if pin["archive_member_count"] != (
-            pin["file_count"] + len(directories) + 1
-        ):
+        if pin["archive_member_count"] != (pin["file_count"] + len(directories) + 1):
             refuse("archive member count disagrees with files and directories")
 
     identities = [pin["identity"] for pin in releases]
@@ -190,9 +185,10 @@ def load_registry(path: Path) -> dict:
 
 
 def pin_sha256(pin: dict) -> str:
-    encoded = json.dumps(
-        pin, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode() + b"\n"
+    encoded = (
+        json.dumps(pin, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        + b"\n"
+    )
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -201,9 +197,7 @@ def require_append_only(
     historical: list[dict],
     bootstrap: dict[str, str] = BOOTSTRAP_PIN_SHA256,
 ) -> None:
-    current_by_identity = {
-        pin["identity"]: pin for pin in current["releases"]
-    }
+    current_by_identity = {pin["identity"]: pin for pin in current["releases"]}
     for identity, expected_sha256 in bootstrap.items():
         pin = current_by_identity.get(identity)
         if pin is None:
@@ -231,7 +225,9 @@ def require_append_only(
             refuse(f"current registry changed published pin {identity}")
 
 
-def select_registry(checked_in: dict, published: dict, explicit: dict | None = None) -> dict:
+def select_registry(
+    checked_in: dict, published: dict, explicit: dict | None = None
+) -> dict:
     """Preserve both complete pin maps; an explicit request owns latest choice."""
     if checked_in["release_repository"] != published["release_repository"]:
         refuse("checked-in and published release repositories disagree")
@@ -293,15 +289,14 @@ def load_historical_registries(path: Path, repository_root: Path) -> list[dict]:
         stderr=subprocess.PIPE,
     )
     if history.returncode != 0:
-        refuse(f"cannot list historical release-pin registries: {history.stderr.decode(errors='replace')}")
+        refuse(
+            f"cannot list historical release-pin registries: {history.stderr.decode(errors='replace')}"
+        )
 
     registries = []
     for commit in history.stdout.decode().splitlines():
-        if (
-            len(commit) not in (40, 64)
-            or any(
-                character not in "0123456789abcdef" for character in commit
-            )
+        if len(commit) not in (40, 64) or any(
+            character not in "0123456789abcdef" for character in commit
         ):
             refuse("git returned an invalid historical registry commit")
         object_name = f"{commit}:{relative}"
@@ -362,8 +357,16 @@ if MODE == "extract":
     FILE_BYTES = PIN["file_bytes"]
     DIRECTORIES = tuple(PIN["directories"])
     EXPECTED_COUNTS = PIN["counts"]
-elif MODE not in ("finalize", "validate", "describe", "validate-update", "select-registry"):
-    refuse("expected validate, validate-update, select-registry, describe, extract, or finalize mode")
+elif MODE not in (
+    "finalize",
+    "validate",
+    "describe",
+    "validate-update",
+    "select-registry",
+):
+    refuse(
+        "expected validate, validate-update, select-registry, describe, extract, or finalize mode"
+    )
 
 
 def canonical(value: object) -> bytes:
@@ -421,8 +424,7 @@ def tree_measurements(root: Path) -> dict[str, object]:
         content.update(b"\n")
 
     mode_rows = [
-        f"{relative}\t{kind}\t{mode:o}\n"
-        for relative, kind, mode, _, _ in inventory
+        f"{relative}\t{kind}\t{mode:o}\n" for relative, kind, mode, _, _ in inventory
     ]
     identity_rows = [
         f"{relative}\t{kind}\t{mode:o}\t{file_sha256}\n"
@@ -432,9 +434,7 @@ def tree_measurements(root: Path) -> dict[str, object]:
         "content_tree_sha256": content.hexdigest(),
         "file_bytes": sum(row[3] for row in files),
         "file_count": len(files),
-        "mode_sha256": hashlib.sha256(
-            "".join(sorted(mode_rows)).encode()
-        ).hexdigest(),
+        "mode_sha256": hashlib.sha256("".join(sorted(mode_rows)).encode()).hexdigest(),
         "recursive_identity_sha256": hashlib.sha256(
             "".join(identity_rows).encode()
         ).hexdigest(),
@@ -451,9 +451,7 @@ def verify_pinned_tree(root: Path, pin: dict) -> None:
         "recursive_identity_sha256",
     ):
         if observed[field] != pin[field]:
-            refuse(
-                f"retained tree {pin['identity']} disagrees with its {field} pin"
-            )
+            refuse(f"retained tree {pin['identity']} disagrees with its {field} pin")
 
 
 def copy_regular_tree(source_root: Path, destination_root: Path) -> None:
@@ -515,13 +513,9 @@ def copy_regular_tree(source_root: Path, destination_root: Path) -> None:
     ):
         relative = source.relative_to(source_root)
         destination = (
-            destination_root
-            if not relative.parts
-            else destination_root / relative
+            destination_root if not relative.parts else destination_root / relative
         )
-        source_mode = stat.S_IMODE(
-            source.stat(follow_symlinks=False).st_mode
-        )
+        source_mode = stat.S_IMODE(source.stat(follow_symlinks=False).st_mode)
         os.chmod(destination, source_mode, follow_symlinks=False)
 
 
@@ -571,7 +565,11 @@ if MODE == "describe":
         artifacts_sha256=build["artifacts_sha256"],
         manifest_tree_sha256=build["tree_sha256"],
         counts=build["counts"],
-        directories=sorted(directory["path"] for directory in build["directories"] if directory["path"] != "."),
+        directories=sorted(
+            directory["path"]
+            for directory in build["directories"]
+            if directory["path"] != "."
+        ),
     )
     print(json.dumps(result, sort_keys=True))
     raise SystemExit(0)
@@ -579,26 +577,38 @@ if MODE == "describe":
 
 if MODE == "select-registry":
     if len(sys.argv) not in (5, 6):
-        refuse("select-registry requires checked-in, repository, published, and optional explicit registry")
+        refuse(
+            "select-registry requires checked-in, repository, published, and optional explicit registry"
+        )
     checked_in, repository, published = map(Path, sys.argv[2:5])
     baseline = load_registry(checked_in)
     previous = load_registry(published)
     explicit = load_registry(Path(sys.argv[5])) if len(sys.argv) == 6 else None
     selected = select_registry(baseline, previous, explicit)
-    require_append_only(selected, [baseline, previous, *load_historical_registries(checked_in, repository)])
+    require_append_only(
+        selected,
+        [baseline, previous, *load_historical_registries(checked_in, repository)],
+    )
     print(json.dumps(selected, sort_keys=True, separators=(",", ":")))
     raise SystemExit(0)
 
 
 if MODE == "validate-update":
     if len(sys.argv) != 6:
-        refuse("validate-update requires proposed, checked-in, repository and published registries")
+        refuse(
+            "validate-update requires proposed, checked-in, repository and published registries"
+        )
     proposed, checked_in, repository, published = map(Path, sys.argv[2:])
     current = load_registry(proposed)
     baseline = load_registry(checked_in)
     previous = load_registry(published)
-    require_append_only(current, [baseline, previous, *load_historical_registries(checked_in, repository)])
-    print("verified nightly registry preserves checked-in and previously published identities")
+    require_append_only(
+        current,
+        [baseline, previous, *load_historical_registries(checked_in, repository)],
+    )
+    print(
+        "verified nightly registry preserves checked-in and previously published identities"
+    )
     raise SystemExit(0)
 
 
@@ -796,19 +806,19 @@ with tarfile.open(ARCHIVE, mode="r:gz") as archive:
         refuse("manifest directory inventory disagrees with artifact rows")
     if manifest["directories_sha256"] != digest(directories):
         refuse("manifest directory digest disagrees with its rows")
-    if digest(
-        {
-            "artifacts_sha256": manifest["artifacts_sha256"],
-            "directories_sha256": manifest["directories_sha256"],
-        }
-    ) != MANIFEST_TREE_SHA256:
+    if (
+        digest(
+            {
+                "artifacts_sha256": manifest["artifacts_sha256"],
+                "directories_sha256": manifest["directories_sha256"],
+            }
+        )
+        != MANIFEST_TREE_SHA256
+    ):
         refuse("manifest tree digest disagrees with its inventories")
 
     expected_names = {"", "build.json", *DIRECTORIES, *paths}
-    if (
-        set(by_name) != expected_names
-        or len(members) != PIN["archive_member_count"]
-    ):
+    if set(by_name) != expected_names or len(members) != PIN["archive_member_count"]:
         refuse("archive member inventory disagrees with build.json")
     for directory in ("", *DIRECTORIES):
         if not by_name[directory].isdir():
@@ -824,10 +834,7 @@ with tarfile.open(ARCHIVE, mode="r:gz") as archive:
         if not publication_root.is_dir() or publication_root.is_symlink():
             refuse("compatibility publication root is not a regular directory")
     else:
-        if (
-            not publication_root.parent.is_dir()
-            or publication_root.parent.is_symlink()
-        ):
+        if not publication_root.parent.is_dir() or publication_root.parent.is_symlink():
             refuse("documentation target is not a regular directory")
         publication_root.mkdir()
         os.chmod(publication_root, 0o755, follow_symlinks=False)
@@ -866,4 +873,6 @@ with tarfile.open(ARCHIVE, mode="r:gz") as archive:
         os.chmod(TARGET / directory, 0o555, follow_symlinks=False)
 
 verify_pinned_tree(TARGET, PIN)
-print(f"verified compatibility website {IDENTITY}: {FILE_COUNT} files, {FILE_BYTES} bytes")
+print(
+    f"verified compatibility website {IDENTITY}: {FILE_COUNT} files, {FILE_BYTES} bytes"
+)

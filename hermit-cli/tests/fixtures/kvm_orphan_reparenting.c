@@ -140,7 +140,8 @@ static long open_status_ppid(void) {
 
 // Raw PIDs differ between backends, so a traced process is named by its role;
 // any other value (the reparent target, or an error) is printed as measured.
-static const char* relation(char* buf, size_t len, long value, pid_t root, pid_t middle) {
+static const char*
+relation(char* buf, size_t len, long value, pid_t root, pid_t middle) {
   if (value == root) {
     return "root";
   }
@@ -222,7 +223,10 @@ static int grandchild(void) {
   if (waitpid(middle, &status, 0) != middle) {
     die("waitpid middle");
   }
-  printf("root: middle exited=%d status=%d\n", WIFEXITED(status), WEXITSTATUS(status));
+  printf(
+      "root: middle exited=%d status=%d\n",
+      WIFEXITED(status),
+      WEXITSTATUS(status));
   char buf[1024];
   ssize_t n;
   while ((n = read(result[0], buf, sizeof(buf))) > 0) {
@@ -230,9 +234,14 @@ static int grandchild(void) {
   }
   pid_t waited = waitpid(-1, &status, 0);
   if (waited < 0) {
-    printf("root: wait for orphan -> %s\n", errno == ECHILD ? "ECHILD" : strerror(errno));
+    printf(
+        "root: wait for orphan -> %s\n",
+        errno == ECHILD ? "ECHILD" : strerror(errno));
   } else {
-    printf("root: wait for orphan -> reaped pid=%ld status=%d\n", (long)waited, WEXITSTATUS(status));
+    printf(
+        "root: wait for orphan -> reaped pid=%ld status=%d\n",
+        (long)waited,
+        WEXITSTATUS(status));
   }
   return 0;
 }
@@ -289,7 +298,10 @@ static void unwaitable_child(const char* label, int use_nocldwait) {
     die("sigaction restore");
   }
   if (waited < 0) {
-    printf("%s: wait -> %s\n", label, saved == ECHILD ? "ECHILD" : strerror(saved));
+    printf(
+        "%s: wait -> %s\n",
+        label,
+        saved == ECHILD ? "ECHILD" : strerror(saved));
   } else {
     printf("%s: wait -> reaped status=%d\n", label, WEXITSTATUS(status));
   }
@@ -311,7 +323,9 @@ static int exits(void) {
   if (waitid(P_PID, (id_t)zombie, &info, WEXITED | WNOWAIT) != 0) {
     die("waitid zombie");
   }
-  printf("zombie: exited status=%d, root exits without reaping it\n", info.si_status);
+  printf(
+      "zombie: exited status=%d, root exits without reaping it\n",
+      info.si_status);
   return 0;
 }
 
@@ -452,7 +466,12 @@ static void writer_group(const char* class_name, int fatal) {
     write_exact(writer_ready[1], "r", 1);
     close(writer_ready[1]);
     wait_eof(eof[0]);
-    dprintf(1, "reader: EOF class=%s termination=%s peers=%d\n", class_name, termination, PEERS);
+    dprintf(
+        1,
+        "reader: EOF class=%s termination=%s peers=%d\n",
+        class_name,
+        termination,
+        PEERS);
     _exit(0);
   }
   close(eof[0]);
@@ -476,9 +495,15 @@ static void writer_group(const char* class_name, int fatal) {
     errno = EPROTO;
     die("unexpected readiness");
   }
-  dprintf(1, "writer: class=%s termination=%s peers=%d\n", class_name, termination, PEERS);
+  dprintf(
+      1,
+      "writer: class=%s termination=%s peers=%d\n",
+      class_name,
+      termination,
+      PEERS);
   pthread_t issuer;
-  int error = pthread_create(&issuer, NULL, fatal ? fatal_signal_taker : exit_group_issuer, NULL);
+  int error = pthread_create(
+      &issuer, NULL, fatal ? fatal_signal_taker : exit_group_issuer, NULL);
   if (error != 0) {
     errno = error;
     die("pthread_create issuer");
@@ -563,7 +588,8 @@ static int orphan_segfault(void) {
     write_exact(ready[1], "r", 1);
     close(ready[1]);
     wait_eof(eof[0]);
-    dprintf(1, "reader: EOF class=direct-parent-terminal termination=SIGSEGV\n");
+    dprintf(
+        1, "reader: EOF class=direct-parent-terminal termination=SIGSEGV\n");
     _exit(0);
   }
   pid_t writer = fork();
@@ -599,7 +625,8 @@ static int orphan_writer(int fatal) {
   sigset_t term;
   sigemptyset(&term);
   sigaddset(&term, SIGTERM);
-  if (sigaction(SIGTERM, &action, NULL) != 0 || sigprocmask(SIG_UNBLOCK, &term, NULL) != 0) {
+  if (sigaction(SIGTERM, &action, NULL) != 0 ||
+      sigprocmask(SIG_UNBLOCK, &term, NULL) != 0) {
     die("SIGTERM default");
   }
   int parent_gone[2];

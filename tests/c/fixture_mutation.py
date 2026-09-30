@@ -337,9 +337,7 @@ def check_family_registry(
     discovered = family_sources(directory)
     missing = sorted(str(path) for path in registered if not path.is_file())
     unregistered = sorted(str(path) for path in discovered - registered)
-    outside = sorted(
-        str(path) for path in registered - discovered if path.is_file()
-    )
+    outside = sorted(str(path) for path in registered - discovered if path.is_file())
     if missing or unregistered or outside:
         raise HarnessError(
             "fixture registry does not match the parity_probe.h family in "
@@ -347,7 +345,9 @@ def check_family_registry(
             f"not-including-{PROBE_HEADER}={outside}"
         )
     if not registered:
-        raise HarnessError(f"fixture registry is empty; nothing in {directory} to examine")
+        raise HarnessError(
+            f"fixture registry is empty; nothing in {directory} to examine"
+        )
 
 
 def compile_fixture(spec: FixtureSpec, output: Path) -> Path:
@@ -539,7 +539,15 @@ def backend_available(hermit: Path, backend: str) -> tuple[bool, str]:
     """Smoke-test a candidate backend with a trivial guest."""
     if backend == GOLDEN_BACKEND:
         return True, ""
-    command = [str(hermit), "run", "--backend", backend, "--base-env=minimal", "--", "/bin/true"]
+    command = [
+        str(hermit),
+        "run",
+        "--backend",
+        backend,
+        "--base-env=minimal",
+        "--",
+        "/bin/true",
+    ]
     result = _run(command, dict(os.environ), HERMIT_TIMEOUT_S)
     if result is None:
         return False, "smoke test timed out"
@@ -586,7 +594,10 @@ class Report:
         buckets: dict[int, int] = {}
         for achieved in self.tiers.values():
             buckets[achieved] = buckets.get(achieved, 0) + 1
-        parts = [f"{count} at {tier_label(t)}" for t, count in sorted(buckets.items(), reverse=True)]
+        parts = [
+            f"{count} at {tier_label(t)}"
+            for t, count in sorted(buckets.items(), reverse=True)
+        ]
         return f"{len(self.tiers)} parity cell(s): " + "; ".join(parts)
 
 
@@ -688,7 +699,9 @@ def check_declared_fields(report: Report, name: str, spec: FixtureSpec) -> None:
             f"mutation seam -- they are inert"
         )
     if not missing and not inert:
-        report.ok(f"{name}: declared fields {sorted(declared)} match the source seam exactly")
+        report.ok(
+            f"{name}: declared fields {sorted(declared)} match the source seam exactly"
+        )
 
 
 def run_native(report: Report, name: str, binary: Path, spec: FixtureSpec) -> None:
@@ -794,7 +807,11 @@ def check_cpuset_shim(report: Report, placement: Placement, workdir: Path) -> bo
         f"cpuset shim [native]: refuses CPU {placement.forbidden} and accepts "
         f"CPU {allowed} when started on CPU {allowed}"
     )
-    if observation is not None and observation.exit_status == 0 and observation.stdout == expected:
+    if (
+        observation is not None
+        and observation.exit_status == 0
+        and observation.stdout == expected
+    ):
         report.ok(label)
         return True
     report.fail(
@@ -858,7 +875,9 @@ def run_hermit(
             f"nothing would report parity against it"
         )
         return
-    report.ok(f"{name} [hermit/{GOLDEN_BACKEND}]: golden reference ({golden.summary()})")
+    report.ok(
+        f"{name} [hermit/{GOLDEN_BACKEND}]: golden reference ({golden.summary()})"
+    )
 
     # GOLDEN SELF-CONSISTENCY, and it is the positive control for the whole
     # tier ladder. Run the golden backend a SECOND time and require the top
@@ -945,7 +964,9 @@ def run_self_test(report: Report) -> None:
     print("[self-test] harness bracket cases")
 
     # --- NEGATIVE: omitted. A run that emits nothing must not report parity.
-    require_parity(report, "self-test/omitted", _obs(stdout=b""), _obs(stdout=b""), min_tier=1)
+    require_parity(
+        report, "self-test/omitted", _obs(stdout=b""), _obs(stdout=b""), min_tier=1
+    )
     # --- NEGATIVE: inert. A mutation that perturbs nothing observable is a
     #     field the harness cannot police, not a passing field.
     require_divergence(report, "self-test/inert", _obs(), _obs(), tier=MAX_TIER)
@@ -954,7 +975,10 @@ def run_self_test(report: Report) -> None:
     #     mutation whose only effect is in stdout must be CAUGHT, and a
     #     candidate differing only in stdout must NOT report parity.
     require_parity(
-        report, "self-test/stdout-drift", _obs(stdout=b"id: 1\n"), _obs(stdout=b"id: 2\n")
+        report,
+        "self-test/stdout-drift",
+        _obs(stdout=b"id: 1\n"),
+        _obs(stdout=b"id: 2\n"),
     )
 
     # --- NEGATIVE: stderr-drift. Unexpressible before this change. Identical
@@ -1002,7 +1026,10 @@ def run_self_test(report: Report) -> None:
     else:
         report.ok(f"self-test/positive-identical: reached {tier_label(MAX_TIER)}")
     require_divergence(
-        report, "self-test/positive-divergence", _obs(stdout=b"id: 1\n"), _obs(stdout=b"id: 2\n")
+        report,
+        "self-test/positive-divergence",
+        _obs(stdout=b"id: 1\n"),
+        _obs(stdout=b"id: 2\n"),
     )
     # --- POSITIVE: a candidate that matches through stdout but drifts in the
     #     INFO log must still report parity AT TIER-2 rather than be rejected.
@@ -1015,7 +1042,9 @@ def run_self_test(report: Report) -> None:
         min_tier=2,
     )
     if tier2 != 2:
-        report.fail(f"self-test/positive-tier2-with-log-drift: expected TIER-2, got {tier2}")
+        report.fail(
+            f"self-test/positive-tier2-with-log-drift: expected TIER-2, got {tier2}"
+        )
 
 
 def self_test_expectations() -> dict[str, bool]:
@@ -1138,7 +1167,9 @@ def main(argv: list[str]) -> int:
     if unknown:
         raise HarnessError(f"unknown fixture(s): {unknown}; known: {sorted(FIXTURES)}")
     if not selected:
-        raise HarnessError("no fixture selected; a run that examines nothing is not a pass")
+        raise HarnessError(
+            "no fixture selected; a run that examines nothing is not a pass"
+        )
 
     candidates = tuple(args.backends) if args.backends else DEFAULT_CANDIDATES
 

@@ -18,8 +18,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         payload = (
-            f"path={self.path} time={time.time_ns()} "
-            f"token={secrets.token_hex(8)}\n"
+            f"path={self.path} time={time.time_ns()} token={secrets.token_hex(8)}\n"
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")

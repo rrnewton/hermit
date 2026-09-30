@@ -37,8 +37,10 @@ int main(void) {
   if (result >= 0) {
     close((int)result);
   }
-  fprintf(stderr,
-          "perf_event_open: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "perf_event_open: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

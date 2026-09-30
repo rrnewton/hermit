@@ -37,104 +37,108 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #define NKIDS 5
 
 int main(void) {
-    int failures = 0;
-    int fd[2];
-    if (pipe(fd) != 0) {
-        perror("pipe");
-        return 2;
-    }
+  int failures = 0;
+  int fd[2];
+  if (pipe(fd) != 0) {
+    perror("pipe");
+    return 2;
+  }
 
-    pid_t kids[NKIDS];
-    for (int i = 0; i < NKIDS; i++) {
-        pid_t p = fork();
-        if (p < 0) {
-            perror("fork");
-            return 2;
-        }
-        if (p == 0) {
-            close(fd[0]);
-            /* Unequal work: later children finish sooner on a real machine. */
-            volatile unsigned long acc = 0;
-            for (unsigned long k = 0; k < (unsigned long)(NKIDS - i) * 200000UL; k++) {
-                acc += k;
-            }
-            char buf[32];
-            int n = snprintf(buf, sizeof buf, "w%d\n", i);
-            if (write(fd[1], buf, (size_t)n) != n) {
-                _exit(3);
-            }
-            /*
-             * `acc` is volatile, so every iteration of the busy loop above is
-             * an observable access the compiler must emit; nothing further is
-             * needed to keep the unequal work alive. The previous form here
-             * guarded the exit code with `(acc & 1) == 2`, which cannot hold
-             * for any value of a one-bit mask -- gcc rejects it under the
-             * harness's own `-Werror=tautological-compare`
-             * (ci/test_harness.sh:2395), so this guest never compiled and the
-             * cell could never have produced a witness. The `4` arm was
-             * unreachable by construction, so dropping it leaves the observed
-             * exit code exactly as it always would have been: `i + 1`.
-             */
-            _exit(i + 1);
-        }
-        kids[i] = p;
+  pid_t kids[NKIDS];
+  for (int i = 0; i < NKIDS; i++) {
+    pid_t p = fork();
+    if (p < 0) {
+      perror("fork");
+      return 2;
     }
-    close(fd[1]);
+    if (p == 0) {
+      close(fd[0]);
+      /* Unequal work: later children finish sooner on a real machine. */
+      volatile unsigned long acc = 0;
+      for (unsigned long k = 0; k < (unsigned long)(NKIDS - i) * 200000UL;
+           k++) {
+        acc += k;
+      }
+      char buf[32];
+      int n = snprintf(buf, sizeof buf, "w%d\n", i);
+      if (write(fd[1], buf, (size_t)n) != n) {
+        _exit(3);
+      }
+      /*
+       * `acc` is volatile, so every iteration of the busy loop above is
+       * an observable access the compiler must emit; nothing further is
+       * needed to keep the unequal work alive. The previous form here
+       * guarded the exit code with `(acc & 1) == 2`, which cannot hold
+       * for any value of a one-bit mask -- gcc rejects it under the
+       * harness's own `-Werror=tautological-compare`
+       * (ci/test_harness.sh:2395), so this guest never compiled and the
+       * cell could never have produced a witness. The `4` arm was
+       * unreachable by construction, so dropping it leaves the observed
+       * exit code exactly as it always would have been: `i + 1`.
+       */
+      _exit(i + 1);
+    }
+    kids[i] = p;
+  }
+  close(fd[1]);
 
-    char buf[512];
-    ssize_t total = 0, r;
-    while ((r = read(fd[0], buf + total, sizeof buf - (size_t)total - 1)) > 0) {
-        total += r;
-    }
-    if (r < 0) {
-        perror("read");
-        return 2;
-    }
-    buf[total] = '\0';
-    fputs(buf, stdout);
+  char buf[512];
+  ssize_t total = 0, r;
+  while ((r = read(fd[0], buf + total, sizeof buf - (size_t)total - 1)) > 0) {
+    total += r;
+  }
+  if (r < 0) {
+    perror("read");
+    return 2;
+  }
+  buf[total] = '\0';
+  fputs(buf, stdout);
 
-    if (total != (ssize_t)(NKIDS * 3)) {
-        fprintf(stderr, "expected %d pipe bytes, got %zd\n", NKIDS * 3, total);
-        failures++;
+  if (total != (ssize_t)(NKIDS * 3)) {
+    fprintf(stderr, "expected %d pipe bytes, got %zd\n", NKIDS * 3, total);
+    failures++;
+  }
+  for (int i = 0; i < NKIDS; i++) {
+    char needle[4];
+    snprintf(needle, sizeof needle, "w%d\n", i);
+    char* first = strstr(buf, needle);
+    if (first == NULL || strstr(first + 1, needle) != NULL) {
+      fprintf(
+          stderr,
+          "writer %d did not contribute exactly one complete line\n",
+          i);
+      failures++;
     }
-    for (int i = 0; i < NKIDS; i++) {
-        char needle[4];
-        snprintf(needle, sizeof needle, "w%d\n", i);
-        char* first = strstr(buf, needle);
-        if (first == NULL || strstr(first + 1, needle) != NULL) {
-            fprintf(stderr, "writer %d did not contribute exactly one complete line\n", i);
-            failures++;
-        }
-    }
+  }
 
-    int reaped[NKIDS] = {0};
-    for (int i = 0; i < NKIDS; i++) {
-        int st = 0;
-        pid_t got = wait(&st);
-        if (got < 0) {
-            perror("wait");
-            return 2;
-        }
-        int slot = -1;
-        for (int j = 0; j < NKIDS; j++) {
-            if (kids[j] == got) {
-                slot = j;
-            }
-        }
-        int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-        printf("reap%d slot=%d code=%d\n", i, slot, code);
-        if (slot < 0 || reaped[slot] || code != slot + 1) {
-            failures++;
-        } else {
-            reaped[slot] = 1;
-        }
+  int reaped[NKIDS] = {0};
+  for (int i = 0; i < NKIDS; i++) {
+    int st = 0;
+    pid_t got = wait(&st);
+    if (got < 0) {
+      perror("wait");
+      return 2;
     }
-    fflush(stdout);
-    return failures == 0 ? 0 : 1;
+    int slot = -1;
+    for (int j = 0; j < NKIDS; j++) {
+      if (kids[j] == got) {
+        slot = j;
+      }
+    }
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    printf("reap%d slot=%d code=%d\n", i, slot, code);
+    if (slot < 0 || reaped[slot] || code != slot + 1) {
+      failures++;
+    } else {
+      reaped[slot] = 1;
+    }
+  }
+  fflush(stdout);
+  return failures == 0 ? 0 : 1;
 }

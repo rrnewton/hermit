@@ -62,8 +62,11 @@ int main(void) {
     bytes = read(fd, &expirations, sizeof(expirations));
   } while (bytes < 0 && errno == EINTR);
   if (bytes != (ssize_t)sizeof(expirations)) {
-    fprintf(stderr, "timerfd read failed: bytes=%zd error=%s\n", bytes,
-            strerror(errno));
+    fprintf(
+        stderr,
+        "timerfd read failed: bytes=%zd error=%s\n",
+        bytes,
+        strerror(errno));
     close(fd);
     return 1;
   }
@@ -77,20 +80,26 @@ int main(void) {
   close(fd);
 
   const int64_t elapsed_ns = timespec_ns(after) - timespec_ns(before);
-  printf("timerfd expirations=%llu elapsed_ns=%lld requested_ns=%lld\n",
-         (unsigned long long)expirations, (long long)elapsed_ns,
-         (long long)TIMER_NS);
+  printf(
+      "timerfd expirations=%llu elapsed_ns=%lld requested_ns=%lld\n",
+      (unsigned long long)expirations,
+      (long long)elapsed_ns,
+      (long long)TIMER_NS);
 
   if (expirations != 1) {
-    fprintf(stderr, "timerfd expiration count mismatch: got=%llu expected=1\n",
-            (unsigned long long)expirations);
+    fprintf(
+        stderr,
+        "timerfd expiration count mismatch: got=%llu expected=1\n",
+        (unsigned long long)expirations);
     return 1;
   }
   if (elapsed_ns < TIMER_NS) {
-    fprintf(stderr,
-            "timerfd expired before its CLOCK_MONOTONIC deadline: "
-            "elapsed_ns=%lld requested_ns=%lld\n",
-            (long long)elapsed_ns, (long long)TIMER_NS);
+    fprintf(
+        stderr,
+        "timerfd expired before its CLOCK_MONOTONIC deadline: "
+        "elapsed_ns=%lld requested_ns=%lld\n",
+        (long long)elapsed_ns,
+        (long long)TIMER_NS);
     return 2;
   }
 

@@ -25,7 +25,10 @@ int main(void) {
     return 0;
   }
 
-  fprintf(stderr, "shmget: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "shmget: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

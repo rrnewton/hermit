@@ -39,53 +39,54 @@
 
 /* One inline syscall site. `volatile` keeps it from being optimized away or
  * merged with its neighbours, so the site count is a property of the source. */
-static long sys_write(int fd, const void *buf, unsigned long len) {
-    long ret;
-    __asm__ volatile("syscall"
-                     : "=a"(ret)
-                     : "a"(1L), "D"((long)fd), "S"(buf), "d"(len)
-                     : "rcx", "r11", "memory");
-    return ret;
+static long sys_write(int fd, const void* buf, unsigned long len) {
+  long ret;
+  __asm__ volatile("syscall"
+                   : "=a"(ret)
+                   : "a"(1L), "D"((long)fd), "S"(buf), "d"(len)
+                   : "rcx", "r11", "memory");
+  return ret;
 }
 
 static long sys_getpid_discarded(void) {
-    /* A second DISTINCT site, and a syscall whose result we deliberately do not
-     * print: a patcher must handle sites whose values never reach stdout, and a
-     * pid is not deterministic so printing it would be a determinism bug. */
-    long ret;
-    __asm__ volatile("syscall" : "=a"(ret) : "a"(39L) : "rcx", "r11", "memory");
-    return ret;
+  /* A second DISTINCT site, and a syscall whose result we deliberately do not
+   * print: a patcher must handle sites whose values never reach stdout, and a
+   * pid is not deterministic so printing it would be a determinism bug. */
+  long ret;
+  __asm__ volatile("syscall" : "=a"(ret) : "a"(39L) : "rcx", "r11", "memory");
+  return ret;
 }
 
 static long sys_sched_yield(void) {
-    long ret;
-    __asm__ volatile("syscall" : "=a"(ret) : "a"(24L) : "rcx", "r11", "memory");
-    return ret;
+  long ret;
+  __asm__ volatile("syscall" : "=a"(ret) : "a"(24L) : "rcx", "r11", "memory");
+  return ret;
 }
 
 int main(void) {
-    static const char line0[] = "inline: first site\n";
-    static const char line1[] = "inline: loop sites\n";
+  static const char line0[] = "inline: first site\n";
+  static const char line1[] = "inline: loop sites\n";
 
-    /* Site 1. */
-    long total = sys_write(1, line0, sizeof(line0) - 1);
+  /* Site 1. */
+  long total = sys_write(1, line0, sizeof(line0) - 1);
 
-    /* Sites 2 and 3, exercised repeatedly: a rewriter must patch a site that is
-     * executed many times, not just once, and the trampoline must be re-entrant. */
-    total += sys_write(1, line1, sizeof(line1) - 1);
-    for (int i = 0; i < 8; i++) {
-        total += sys_write(1, "", 0); /* 0-byte write: valid, returns 0 */
-        if (sys_sched_yield() != 0) {
-            return 2;
-        }
+  /* Sites 2 and 3, exercised repeatedly: a rewriter must patch a site that is
+   * executed many times, not just once, and the trampoline must be re-entrant.
+   */
+  total += sys_write(1, line1, sizeof(line1) - 1);
+  for (int i = 0; i < 8; i++) {
+    total += sys_write(1, "", 0); /* 0-byte write: valid, returns 0 */
+    if (sys_sched_yield() != 0) {
+      return 2;
     }
+  }
 
-    /* A site whose value is intentionally discarded. */
-    if (sys_getpid_discarded() <= 0) {
-        return 2;
-    }
+  /* A site whose value is intentionally discarded. */
+  if (sys_getpid_discarded() <= 0) {
+    return 2;
+  }
 
-    /* Deterministic: the byte counts above are fixed by the string lengths. */
-    printf("inline_sites total_written=%ld\n", total);
-    return 0;
+  /* Deterministic: the byte counts above are fixed by the string lengths. */
+  printf("inline_sites total_written=%ld\n", total);
+  return 0;
 }

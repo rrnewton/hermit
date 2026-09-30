@@ -57,11 +57,8 @@ static long raw_pipe2(void* pipefd, int flags) {
 
 static int failures = 0;
 
-static void expect_errno(
-    const char* what,
-    void* pipefd,
-    int flags,
-    int want_errno) {
+static void
+expect_errno(const char* what, void* pipefd, int flags, int want_errno) {
   long rc = raw_pipe2(pipefd, flags);
   int got = errno;
   if (rc == -1 && got == want_errno) {
@@ -119,17 +116,22 @@ int main(int argc, char** argv) {
   int fds[2] = {-1, -1};
   long rc = raw_pipe2(fds, 0);
   if (rc != 0) {
-    fprintf(stderr, "valid_pipe2: expected success, got rc=%ld errno=%d\n", rc,
-            errno);
+    fprintf(
+        stderr,
+        "valid_pipe2: expected success, got rc=%ld errno=%d\n",
+        rc,
+        errno);
     failures++;
   } else {
     int capacity = fcntl(fds[1], F_GETPIPE_SZ);
     printf("valid_pipe2: ok capacity=%d\n", capacity);
     if (expected_capacity > 0 && (long)capacity != expected_capacity) {
-      fprintf(stderr,
-              "valid_pipe2: expected pinned capacity %ld, got %d -- the "
-              "deterministic pipe-capacity pin is not in effect\n",
-              expected_capacity, capacity);
+      fprintf(
+          stderr,
+          "valid_pipe2: expected pinned capacity %ld, got %d -- the "
+          "deterministic pipe-capacity pin is not in effect\n",
+          expected_capacity,
+          capacity);
       failures++;
     }
     /* The pair must be usable, not merely returned. */

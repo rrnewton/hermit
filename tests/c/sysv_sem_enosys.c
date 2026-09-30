@@ -25,7 +25,10 @@ int main(void) {
     return 0;
   }
 
-  fprintf(stderr, "semget: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "semget: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

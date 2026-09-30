@@ -22,8 +22,8 @@ int main(void) {
   }
   int flags = fcntl(fd, F_GETFD);
   if (flags < 0 || (flags & FD_CLOEXEC) == 0) {
-    fprintf(stderr, "pidfd missing FD_CLOEXEC: flags=%d errno=%d\n", flags,
-            errno);
+    fprintf(
+        stderr, "pidfd missing FD_CLOEXEC: flags=%d errno=%d\n", flags, errno);
     close(fd);
     return 1;
   }
@@ -32,8 +32,8 @@ int main(void) {
   errno = 0;
   int invalid = (int)syscall(SYS_pidfd_open, getpid(), 1);
   if (invalid != -1 || errno != EINVAL) {
-    fprintf(stderr, "pidfd_open invalid flags returned %d/%d\n", invalid,
-            errno);
+    fprintf(
+        stderr, "pidfd_open invalid flags returned %d/%d\n", invalid, errno);
     return 1;
   }
   puts("pidfd-open-self-ok cloexec=1");

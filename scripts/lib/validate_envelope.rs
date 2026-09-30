@@ -55,14 +55,27 @@ pub struct EnvelopeProbe {
 
 /// `ENVELOPE_PROBES` (validate.sh:1251), split exactly as `read -r -a` split it.
 pub const PROBES: &[EnvelopeProbe] = &[
-    EnvelopeProbe { label: "true", argv: &["/bin/true"] },
-    EnvelopeProbe { label: "echo", argv: &["/bin/echo", "hermit-envelope"] },
-    EnvelopeProbe { label: "date", argv: &["/bin/date", "-u", "+%Y"] },
+    EnvelopeProbe {
+        label: "true",
+        argv: &["/bin/true"],
+    },
+    EnvelopeProbe {
+        label: "echo",
+        argv: &["/bin/echo", "hermit-envelope"],
+    },
+    EnvelopeProbe {
+        label: "date",
+        argv: &["/bin/date", "-u", "+%Y"],
+    },
 ];
 
 /// `HERMIT_RUN_ARGS` (validate.sh:1230).
-pub const HERMIT_RUN_ARGS: &[&str] =
-    &["run", "--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"];
+pub const HERMIT_RUN_ARGS: &[&str] = &[
+    "run",
+    "--base-env=minimal",
+    "--no-virtualize-cpuid",
+    "--max-timeslice=disabled",
+];
 
 /// `L4_REPS` (validate.sh:1256).
 pub const L4_REPS_DEFAULT: i64 = 20;
@@ -132,7 +145,10 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
         out.push(node(
             "envelope",
             &job("l3"),
-            &format!("envelope {}: L3 --verify --detlog-heap --detlog-stack", p.label),
+            &format!(
+                "envelope {}: L3 --verify --detlog-heap --detlog-stack",
+                p.label
+            ),
             level_command(
                 hermit_bin,
                 &["--strict", "--verify", "--detlog-heap", "--detlog-stack"],
@@ -151,7 +167,10 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
         out.push(node(
             "envelope",
             &job("l4"),
-            &format!("envelope {}: L4 = L2 stress x{reps} (no divergence)", p.label),
+            &format!(
+                "envelope {}: L4 = L2 stress x{reps} (no divergence)",
+                p.label
+            ),
             format!(
                 "i=0; while [ $i -lt {reps} ]; do timeout {SMOKE_TIMEOUT_S}s {l2_cmd} || exit 1; \
                  i=$((i+1)); done"
@@ -169,7 +188,13 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             .and_then(|v| v.trim_end_matches('s').parse::<i64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(SMOKE_TIMEOUT_S);
-        let mut rr: Vec<String> = vec![hermit_bin.to_string(), "record".into(), "start".into(), "--verify".into(), "--".into()];
+        let mut rr: Vec<String> = vec![
+            hermit_bin.to_string(),
+            "record".into(),
+            "start".into(),
+            "--verify".into(),
+            "--".into(),
+        ];
         rr.extend(p.argv.iter().map(|s| s.to_string()));
         out.push(node(
             "envelope",
@@ -191,8 +216,11 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
 /// is exactly what the bash's `p4=0` default did when L2 failed.
 pub fn score(outcomes: &[StepOutcome], reps: i64, commit: &str) -> serde_json::Value {
     score_with_passed(reps, commit, |tag| {
-        outcomes.iter().find(|outcome| outcome.tag == tag)
-            .map(|outcome| outcome.ok && !outcome.aborted).unwrap_or(false)
+        outcomes
+            .iter()
+            .find(|outcome| outcome.tag == tag)
+            .map(|outcome| outcome.ok && !outcome.aborted)
+            .unwrap_or(false)
     })
 }
 
@@ -208,7 +236,10 @@ pub fn score_with_passed(
     let mut probes = Vec::new();
     for p in PROBES {
         let mut row = serde_json::Map::new();
-        row.insert("probe".into(), serde_json::Value::String(p.label.to_string()));
+        row.insert(
+            "probe".into(),
+            serde_json::Value::String(p.label.to_string()),
+        );
         for (i, lvl) in LEVELS.iter().enumerate() {
             let bit = i64::from(passed(&format!("envelope.{}_{lvl}", p.label)));
             totals[i] += bit;
@@ -273,7 +304,9 @@ pub fn to_ordered_json(v: &serde_json::Value) -> String {
         n("l4_pass"),
         n("rr_pass"),
         n("total"),
-        v.get("commit").and_then(|c| c.as_str()).unwrap_or("unknown"),
+        v.get("commit")
+            .and_then(|c| c.as_str())
+            .unwrap_or("unknown"),
         n("l4_reps"),
         probes.join(",")
     )
@@ -289,13 +322,31 @@ pub fn to_ordered_json(v: &serde_json::Value) -> String {
 pub fn print_summary(v: &serde_json::Value, reps: i64, json_file: &Path) {
     let g = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
     let total = g("total");
-    let commit = v.get("commit").and_then(|c| c.as_str()).unwrap_or("unknown");
+    let commit = v
+        .get("commit")
+        .and_then(|c| c.as_str())
+        .unwrap_or("unknown");
     println!("\n== Working-envelope vector (commit {commit}) ==");
-    println!("  L1  hermit run --strict                          : {}/{total}", g("l1_pass"));
-    println!("  L2  --strict --verify (bitwise identical)        : {}/{total}", g("l2_pass"));
-    println!("  L3  --verify --detlog-heap --detlog-stack        : {}/{total}", g("l3_pass"));
-    println!("  L4  L2 stress x{reps:<3} (no divergence)               : {}/{total}", g("l4_pass"));
-    println!("  rr  record/replay end-to-end                     : {}/{total}", g("rr_pass"));
+    println!(
+        "  L1  hermit run --strict                          : {}/{total}",
+        g("l1_pass")
+    );
+    println!(
+        "  L2  --strict --verify (bitwise identical)        : {}/{total}",
+        g("l2_pass")
+    );
+    println!(
+        "  L3  --verify --detlog-heap --detlog-stack        : {}/{total}",
+        g("l3_pass")
+    );
+    println!(
+        "  L4  L2 stress x{reps:<3} (no divergence)               : {}/{total}",
+        g("l4_pass")
+    );
+    println!(
+        "  rr  record/replay end-to-end                     : {}/{total}",
+        g("rr_pass")
+    );
     println!("  total e2e probes                                 : {total}");
     println!("  JSON: {}", json_file.display());
     println!("  {}", to_ordered_json(v));
@@ -308,14 +359,29 @@ pub fn print_summary(v: &serde_json::Value, reps: i64, json_file: &Path) {
 /// not enforce monotonicity at all. Parsing with `serde_json` removes that
 /// failure mode; an unreadable or malformed baseline still returns 2.
 pub fn compare(current: &serde_json::Value, baseline: &Path) -> Result<bool, (u8, String)> {
-    let text = std::fs::read_to_string(baseline)
-        .map_err(|e| (2u8, format!("envelope-compare: cannot read baseline {}: {e}", baseline.display())))?;
+    let text = std::fs::read_to_string(baseline).map_err(|e| {
+        (
+            2u8,
+            format!(
+                "envelope-compare: cannot read baseline {}: {e}",
+                baseline.display()
+            ),
+        )
+    })?;
     let base: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        (2u8, format!("envelope-compare: baseline {} is not valid JSON: {e}", baseline.display()))
+        (
+            2u8,
+            format!(
+                "envelope-compare: baseline {} is not valid JSON: {e}",
+                baseline.display()
+            ),
+        )
     })?;
     let mut regressed = false;
     println!("\n== Envelope monotonicity vs {} ==", baseline.display());
-    for key in ["l1_pass", "l2_pass", "l3_pass", "l4_pass", "rr_pass", "total"] {
+    for key in [
+        "l1_pass", "l2_pass", "l3_pass", "l4_pass", "rr_pass", "total",
+    ] {
         let b = base.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let c = current.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         if c < b {
@@ -334,7 +400,10 @@ pub fn self_test() -> Result<String, String> {
     let steps = nodes("/nonexistent/hermit", 3, "gate.manifest");
     let want = PROBES.len() * LEVELS.len();
     if steps.len() != want {
-        return Err(format!("envelope built {} nodes, expected {want}", steps.len()));
+        return Err(format!(
+            "envelope built {} nodes, expected {want}",
+            steps.len()
+        ));
     }
     for s in &steps {
         if s.timeout <= 0 || s.cpu_timeout <= 0 || s.hint.hard_mem_max_bytes.is_none() {
@@ -384,18 +453,25 @@ pub fn self_test() -> Result<String, String> {
     let full = score(&all, 3, "deadbee");
     for k in ["l1_pass", "l2_pass", "l3_pass", "l4_pass", "rr_pass"] {
         if full[k].as_i64() != Some(PROBES.len() as i64) {
-            return Err(format!("envelope score: full sweep must give {k} = {}", PROBES.len()));
+            return Err(format!(
+                "envelope score: full sweep must give {k} = {}",
+                PROBES.len()
+            ));
         }
     }
     // Drop every l4 outcome (as a dependency-skip would) and confirm l4_pass falls to 0.
-    let no_l4: Vec<StepOutcome> =
-        all.iter().filter(|o| !o.tag.ends_with("_l4")).cloned().collect();
+    let no_l4: Vec<StepOutcome> = all
+        .iter()
+        .filter(|o| !o.tag.ends_with("_l4"))
+        .cloned()
+        .collect();
     if score(&no_l4, 3, "deadbee")["l4_pass"].as_i64() != Some(0) {
         return Err("envelope score: a skipped l4 node must score 0".into());
     }
     // Comparison bracket, against real files: an equal baseline must be ACCEPTED
     // and a higher baseline must be reported as a REGRESSION.
-    let dir = std::env::temp_dir().join(format!("validate-envelope-selftest-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("validate-envelope-selftest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("self-test: {e}"))?;
     let equal = dir.join("equal.json");
     let higher = dir.join("higher.json");
@@ -404,19 +480,27 @@ pub fn self_test() -> Result<String, String> {
     let ordered = to_ordered_json(&full);
     if !ordered.starts_with(r#"{"l1_pass":"#) {
         let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!("envelope JSON must start with l1_pass (validate.sh order), got {ordered:.40}"));
+        return Err(format!(
+            "envelope JSON must start with l1_pass (validate.sh order), got {ordered:.40}"
+        ));
     }
     let round: serde_json::Value = serde_json::from_str(&ordered)
         .map_err(|e| format!("envelope JSON is not valid JSON: {e}"))?;
-    for k in ["l1_pass", "l2_pass", "l3_pass", "l4_pass", "rr_pass", "total", "commit", "l4_reps", "probes"] {
+    for k in [
+        "l1_pass", "l2_pass", "l3_pass", "l4_pass", "rr_pass", "total", "commit", "l4_reps",
+        "probes",
+    ] {
         if round.get(k).is_none() {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(format!("envelope JSON lost key {k}"));
         }
     }
     std::fs::write(&equal, &ordered).map_err(|e| format!("self-test: {e}"))?;
-    std::fs::write(&higher, r#"{"l1_pass":99,"l2_pass":0,"l3_pass":0,"l4_pass":0,"rr_pass":0,"total":0}"#)
-        .map_err(|e| format!("self-test: {e}"))?;
+    std::fs::write(
+        &higher,
+        r#"{"l1_pass":99,"l2_pass":0,"l3_pass":0,"l4_pass":0,"rr_pass":0,"total":0}"#,
+    )
+    .map_err(|e| format!("self-test: {e}"))?;
     let mut accepted = 0usize;
     let mut refused = 0usize;
     match compare(&full, &equal) {

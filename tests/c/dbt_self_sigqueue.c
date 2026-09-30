@@ -17,7 +17,7 @@
 
 static volatile sig_atomic_t delivered;
 
-static void receive_signal(int signal, siginfo_t *info, void *context) {
+static void receive_signal(int signal, siginfo_t* info, void* context) {
   (void)signal;
   (void)context;
   if (info != NULL && info->si_code == SI_QUEUE)
@@ -46,18 +46,24 @@ int main(void) {
   siginfo_t info = queued_signal();
   long result = syscall(SYS_rt_tgsigqueueinfo, pid, tid, SIGUSR1, &info);
   if (result != 0 || delivered != 1) {
-    fprintf(stderr,
-            "rt_tgsigqueueinfo failed: result=%ld errno=%d delivered=%d\n",
-            result, errno, delivered);
+    fprintf(
+        stderr,
+        "rt_tgsigqueueinfo failed: result=%ld errno=%d delivered=%d\n",
+        result,
+        errno,
+        delivered);
     return 2;
   }
 
   info = queued_signal();
   result = syscall(SYS_rt_sigqueueinfo, pid, SIGUSR1, &info);
   if (result != 0 || delivered != 2) {
-    fprintf(stderr,
-            "rt_sigqueueinfo failed: result=%ld errno=%d delivered=%d\n",
-            result, errno, delivered);
+    fprintf(
+        stderr,
+        "rt_sigqueueinfo failed: result=%ld errno=%d delivered=%d\n",
+        result,
+        errno,
+        delivered);
     return 3;
   }
 

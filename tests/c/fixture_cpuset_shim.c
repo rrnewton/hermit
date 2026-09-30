@@ -48,8 +48,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-int __real_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t *mask);
-int __wrap_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t *mask);
+int __real_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* mask);
+int __wrap_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* mask);
 
 /* The simulated cpuset: this process's affinity mask at startup. */
 static cpu_set_t shim_cpuset;
@@ -63,7 +63,7 @@ __attribute__((constructor)) static void shim_capture_cpuset(void) {
       syscall(SYS_sched_getaffinity, 0, sizeof(shim_cpuset), &shim_cpuset) > 0;
 }
 
-int __wrap_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t *mask) {
+int __wrap_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* mask) {
   if (mask == NULL) {
     errno = EFAULT;
     return -1;
@@ -85,7 +85,7 @@ int __wrap_sched_setaffinity(pid_t pid, size_t size, const cpu_set_t *mask) {
 
 /* Ask for each CPU named on the command line, one at a time, and report the
  * result of every request. */
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s CPU...\n", argv[0]);
     return 2;
@@ -98,7 +98,11 @@ int main(int argc, char **argv) {
     errno = 0;
     int rc = sched_setaffinity(0, sizeof(want), &want);
     int saved = errno;
-    printf("cpuset-shim-control cpu%d rc=%d errno=%d\n", cpu, rc, rc == 0 ? 0 : saved);
+    printf(
+        "cpuset-shim-control cpu%d rc=%d errno=%d\n",
+        cpu,
+        rc,
+        rc == 0 ? 0 : saved);
   }
   return 0;
 }

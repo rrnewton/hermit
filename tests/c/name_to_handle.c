@@ -45,8 +45,7 @@ int main(void) {
   int mount_id = 0x1234;
 
   errno = 0;
-  int result =
-      name_to_handle_at(AT_FDCWD, "/", &storage.handle, &mount_id, 0);
+  int result = name_to_handle_at(AT_FDCWD, "/", &storage.handle, &mount_id, 0);
   if (result == -1 && errno == EOPNOTSUPP) {
     ok++;
   } else {

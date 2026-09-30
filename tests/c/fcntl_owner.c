@@ -16,8 +16,8 @@
  * No signal is ever delivered: the contract only registers and reads back owner
  * and signal state on a pipe descriptor, so it is pure process-local fcntl
  * bookkeeping with no scheduling or delivery dependence. It asserts only
- * relational round-trips (the value read back equals the value just set), so the
- * golden stdout is portable:
+ * relational round-trips (the value read back equals the value just set), so
+ * the golden stdout is portable:
  *   1. F_SETOWN to our own pid succeeds.
  *   2. F_GETOWN reads back our pid.
  *   3. F_SETSIG to SIGUSR1 succeeds.
@@ -26,49 +26,54 @@
  *   6. F_GETOWN_EX reads back F_OWNER_PID and our pid.
  */
 int main(void) {
-    enum { EXPECTED_CHECKS = 6 };
-    int ok = 0;
-    int fds[2];
-    if (pipe(fds) != 0) {
-        printf("fowner ok=0\n");
-        return EXIT_FAILURE;
-    }
-    pid_t me = getpid();
+  enum { EXPECTED_CHECKS = 6 };
+  int ok = 0;
+  int fds[2];
+  if (pipe(fds) != 0) {
+    printf("fowner ok=0\n");
+    return EXIT_FAILURE;
+  }
+  pid_t me = getpid();
 
-    if (fcntl(fds[0], F_SETOWN, me) == 0) {
-        ok++;
-    }
-    int getown = fcntl(fds[0], F_GETOWN);
-    if (getown == me) {
-        ok++;
-    }
-    if (fcntl(fds[0], F_SETSIG, SIGUSR1) == 0) {
-        ok++;
-    }
-    int getsig = fcntl(fds[0], F_GETSIG);
-    if (getsig == SIGUSR1) {
-        ok++;
-    }
-    struct f_owner_ex set_ex = {.type = F_OWNER_PID, .pid = me};
-    if (fcntl(fds[0], F_SETOWN_EX, &set_ex) == 0) {
-        ok++;
-    }
-    struct f_owner_ex got_ex = {0};
-    if (fcntl(fds[0], F_GETOWN_EX, &got_ex) == 0 &&
-        got_ex.type == F_OWNER_PID && got_ex.pid == me) {
-        ok++;
-    }
+  if (fcntl(fds[0], F_SETOWN, me) == 0) {
+    ok++;
+  }
+  int getown = fcntl(fds[0], F_GETOWN);
+  if (getown == me) {
+    ok++;
+  }
+  if (fcntl(fds[0], F_SETSIG, SIGUSR1) == 0) {
+    ok++;
+  }
+  int getsig = fcntl(fds[0], F_GETSIG);
+  if (getsig == SIGUSR1) {
+    ok++;
+  }
+  struct f_owner_ex set_ex = {.type = F_OWNER_PID, .pid = me};
+  if (fcntl(fds[0], F_SETOWN_EX, &set_ex) == 0) {
+    ok++;
+  }
+  struct f_owner_ex got_ex = {0};
+  if (fcntl(fds[0], F_GETOWN_EX, &got_ex) == 0 && got_ex.type == F_OWNER_PID &&
+      got_ex.pid == me) {
+    ok++;
+  }
 
-    close(fds[0]);
-    close(fds[1]);
+  close(fds[0]);
+  close(fds[1]);
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
-    ok--; /* plant one failed contract check to bracket the exit oracle */
+  ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    /* Emit the OBSERVED VALUES, not just the sum. getsig and the owner TYPE are
-     * host-independent constants (SIGUSR1, F_OWNER_PID); getown is compared to our
-     * own pid rather than printed raw, because a raw pid is not host-independent. */
-    printf("fowner ok=%d getsig=%d owner_type=%d getown_is_self=%d ex_pid_is_self=%d\n",
-           ok, getsig, (int)got_ex.type, getown == me ? 1 : 0,
-           got_ex.pid == me ? 1 : 0);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  /* Emit the OBSERVED VALUES, not just the sum. getsig and the owner TYPE are
+   * host-independent constants (SIGUSR1, F_OWNER_PID); getown is compared to
+   * our own pid rather than printed raw, because a raw pid is not
+   * host-independent. */
+  printf(
+      "fowner ok=%d getsig=%d owner_type=%d getown_is_self=%d ex_pid_is_self=%d\n",
+      ok,
+      getsig,
+      (int)got_ex.type,
+      getown == me ? 1 : 0,
+      got_ex.pid == me ? 1 : 0);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

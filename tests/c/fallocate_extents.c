@@ -12,12 +12,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <linux/falloc.h>
 
 // Report the current size of fd via fstat, or -1 on failure.
 static long fd_size(int fd) {
@@ -88,8 +88,9 @@ int main(void) {
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "fallocate completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr, "fallocate completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

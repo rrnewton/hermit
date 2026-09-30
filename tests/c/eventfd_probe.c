@@ -34,7 +34,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -50,7 +50,7 @@ static int write_u64(int fd, uint64_t value) {
   }
 }
 
-static int read_u64(int fd, uint64_t *out) {
+static int read_u64(int fd, uint64_t* out) {
   for (;;) {
     ssize_t n = read(fd, out, sizeof(*out));
     if (n == (ssize_t)sizeof(*out))
@@ -108,15 +108,19 @@ int main(void) {
   sem_sum--;
 #endif
 
-  printf("eventfd counter=%llu sem=%llu\n", (unsigned long long)counter,
-         (unsigned long long)sem_sum);
+  printf(
+      "eventfd counter=%llu sem=%llu\n",
+      (unsigned long long)counter,
+      (unsigned long long)sem_sum);
 
   if (counter != 36 || sem_sum != 5 || !sem_units_valid) {
-    fprintf(stderr,
-            "eventfd arithmetic mismatch: counter=%llu (expected 36), "
-            "sem=%llu (expected 5), sem_units_valid=%d\n",
-            (unsigned long long)counter, (unsigned long long)sem_sum,
-            sem_units_valid);
+    fprintf(
+        stderr,
+        "eventfd arithmetic mismatch: counter=%llu (expected 36), "
+        "sem=%llu (expected 5), sem_units_valid=%d\n",
+        (unsigned long long)counter,
+        (unsigned long long)sem_sum,
+        sem_units_valid);
     return 1;
   }
   return 0;

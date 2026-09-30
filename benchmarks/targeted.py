@@ -112,9 +112,7 @@ def parse_args() -> argparse.Namespace:
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
 
-    args.backends = comma_separated(
-        parser, args.backends, BACKEND_NAMES, "--backends"
-    )
+    args.backends = comma_separated(parser, args.backends, BACKEND_NAMES, "--backends")
     if "native" not in args.backends:
         parser.error("--backends must include native for overhead ratios")
     args.benchmarks = comma_separated(
@@ -271,15 +269,9 @@ def measure_once(command: Sequence[str], timeout: float) -> int:
 
 def summarize_samples(samples_ns: Sequence[int]) -> dict[str, object]:
     return {
-        "samples_seconds": [
-            round(sample / 1_000_000_000, 9) for sample in samples_ns
-        ],
-        "mean_seconds": round(
-            statistics.fmean(samples_ns) / 1_000_000_000, 9
-        ),
-        "median_seconds": round(
-            statistics.median(samples_ns) / 1_000_000_000, 9
-        ),
+        "samples_seconds": [round(sample / 1_000_000_000, 9) for sample in samples_ns],
+        "mean_seconds": round(statistics.fmean(samples_ns) / 1_000_000_000, 9),
+        "median_seconds": round(statistics.median(samples_ns) / 1_000_000_000, 9),
     }
 
 
@@ -292,8 +284,7 @@ def measure_benchmark(
     timeout: float,
 ) -> dict[str, object]:
     commands = {
-        backend: backend_command(hermit, backend, benchmark)
-        for backend in backends
+        backend: backend_command(hermit, backend, benchmark) for backend in backends
     }
     native_output = run_precheck(commands["native"], timeout)
     available = []
@@ -392,9 +383,11 @@ def host_cpu() -> str:
 
 def perf_event_paranoid() -> str:
     try:
-        return Path("/proc/sys/kernel/perf_event_paranoid").read_text(
-            encoding="ascii"
-        ).strip()
+        return (
+            Path("/proc/sys/kernel/perf_event_paranoid")
+            .read_text(encoding="ascii")
+            .strip()
+        )
     except OSError:
         return "unknown"
 
@@ -438,9 +431,7 @@ def render_summary(results: dict[str, object]) -> str:
                 continue
             cells.append(format_mode(mode, backend == "native"))
             if mode["status"] != "ok":
-                failures.append(
-                    f"- {benchmark['name']} / {backend}: {mode['reason']}"
-                )
+                failures.append(f"- {benchmark['name']} / {backend}: {mode['reason']}")
         rows.append(
             f"| {benchmark['name']} | {cells[0]} | {cells[1]} | "
             f"{cells[2]} | {cells[3]} |"
@@ -486,9 +477,7 @@ def main() -> int:
         for backend in args.backends:
             mode = modes[backend]
             assert isinstance(mode, dict)
-            status.append(
-                f"{backend}={format_mode(mode, backend == 'native')}"
-            )
+            status.append(f"{backend}={format_mode(mode, backend == 'native')}")
         print("  " + " ".join(status), file=sys.stderr)
 
     results: dict[str, object] = {
@@ -518,9 +507,7 @@ def main() -> int:
 
     results_path = output_dir / "results.json"
     summary_path = output_dir / "summary.md"
-    results_path.write_text(
-        json.dumps(results, indent=2) + "\n", encoding="utf-8"
-    )
+    results_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     summary = render_summary(results)
     summary_path.write_text(summary, encoding="utf-8")
 

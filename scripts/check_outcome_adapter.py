@@ -4,16 +4,16 @@
 from __future__ import annotations
 
 import argparse
-from functools import cache
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from functools import cache
+from pathlib import Path
 from types import ModuleType
-from typing import Callable, Protocol, Sequence, cast
+from typing import Callable, cast, Protocol, Sequence
 
 
 #: Exit status for "could not consult the authority at all". Distinct from 0
@@ -107,8 +107,7 @@ AUTHORITY_COMMIT = "4b78d727f35bc8612ac460a6e270dda5f5df304c"
 AUTHORITY_SHA256 = "2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8"
 AUTHORITY_RELATIVE_PATH = Path("ci-hub/check_outcome.py")
 AUTHORITY_API_PATH = (
-    "repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py"
-    f"?ref={AUTHORITY_COMMIT}"
+    f"repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref={AUTHORITY_COMMIT}"
 )
 
 
@@ -159,8 +158,7 @@ def _fetch_pinned_source() -> bytes:
         # the message, and default to the loud reading.
         if _is_transport_failure(detail):
             raise AuthorityUnavailable(
-                "cannot fetch the pinned check-status authority with gh api: "
-                f"{detail}"
+                f"cannot fetch the pinned check-status authority with gh api: {detail}"
             )
         raise AuthorityRefused(
             "the pinned check-status authority was reached and refused: "
@@ -245,7 +243,9 @@ def annotate_rollups(value: object) -> object:
     result: dict[object, object] = {}
     for key, item in value.items():
         if key == "statusCheckRollup":
-            item = select_latest_checks(item, head_sha=str(value.get("headRefOid") or ""))
+            item = select_latest_checks(
+                item, head_sha=str(value.get("headRefOid") or "")
+            )
         result[key] = annotate_rollups(item)
     if "status" in value or "conclusion" in value or "state" in value:
         result["_checkOutcome"] = classify_check(
@@ -302,7 +302,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.annotate_rollups:
             json.dump(
-                annotate_rollups(json.load(sys.stdin)), sys.stdout, separators=(",", ":")
+                annotate_rollups(json.load(sys.stdin)),
+                sys.stdout,
+                separators=(",", ":"),
             )
             print()
         elif args.select_latest_rollup:

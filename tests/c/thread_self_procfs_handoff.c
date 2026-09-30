@@ -22,24 +22,24 @@ struct handoff {
   long opener_tid;
 };
 
-static void *read_status(void *opaque) {
-  struct handoff *handoff = opaque;
+static void* read_status(void* opaque) {
+  struct handoff* handoff = opaque;
   char buffer[8192];
   ssize_t count = read(handoff->fd, buffer, sizeof(buffer) - 1);
   if (count < 0) {
-    return (void *)(intptr_t)1;
+    return (void*)(intptr_t)1;
   }
   buffer[count] = '\0';
 
-  char *save = NULL;
-  for (char *line = strtok_r(buffer, "\n", &save); line != NULL;
+  char* save = NULL;
+  for (char* line = strtok_r(buffer, "\n", &save); line != NULL;
        line = strtok_r(NULL, "\n", &save)) {
     if (strncmp(line, "Pid:", 4) == 0) {
       long observed = strtol(line + 4, NULL, 10);
-      return (void *)(intptr_t)(observed == handoff->opener_tid ? 0 : 2);
+      return (void*)(intptr_t)(observed == handoff->opener_tid ? 0 : 2);
     }
   }
-  return (void *)(intptr_t)3;
+  return (void*)(intptr_t)3;
 }
 
 int main(void) {
@@ -55,7 +55,7 @@ int main(void) {
   if (pthread_create(&reader, NULL, read_status, &handoff) != 0) {
     return EXIT_FAILURE;
   }
-  void *result = NULL;
+  void* result = NULL;
   if (pthread_join(reader, &result) != 0 || close(handoff.fd) != 0) {
     return EXIT_FAILURE;
   }

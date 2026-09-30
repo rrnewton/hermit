@@ -33,54 +33,64 @@
 #define SYS_epoll_pwait2 441
 #endif
 
-static int epoll_pwait2_call(int epfd, struct epoll_event *ev, int maxev,
-                             const struct timespec *timeout) {
-    // Raw syscall: sigmask NULL, sigsetsize 0 (no signal mask installed).
-    return (int)syscall(SYS_epoll_pwait2, epfd, ev, maxev, timeout, (void *)0,
-                        (size_t)0);
+static int epoll_pwait2_call(
+    int epfd,
+    struct epoll_event* ev,
+    int maxev,
+    const struct timespec* timeout) {
+  // Raw syscall: sigmask NULL, sigsetsize 0 (no signal mask installed).
+  return (int)syscall(
+      SYS_epoll_pwait2, epfd, ev, maxev, timeout, (void*)0, (size_t)0);
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 7 };
-    int ok = 0;
-    struct timespec zero = {0, 0};
+  enum { EXPECTED_CHECKS = 7 };
+  int ok = 0;
+  struct timespec zero = {0, 0};
 
-    int efd = eventfd(0, EFD_NONBLOCK);
-    int ep = epoll_create1(EPOLL_CLOEXEC);
-    if (efd < 0 || ep < 0) {
-        printf("epoll_pwait2 SETUP_FAIL\n");
-        return 1;
-    }
+  int efd = eventfd(0, EFD_NONBLOCK);
+  int ep = epoll_create1(EPOLL_CLOEXEC);
+  if (efd < 0 || ep < 0) {
+    printf("epoll_pwait2 SETUP_FAIL\n");
+    return 1;
+  }
 
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof ev);
-    ev.events = EPOLLIN;
-    ev.data.fd = efd;
-    // (1) Register the eventfd for read readiness.
-    if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev) == 0) ok++;
+  struct epoll_event ev;
+  memset(&ev, 0, sizeof ev);
+  ev.events = EPOLLIN;
+  ev.data.fd = efd;
+  // (1) Register the eventfd for read readiness.
+  if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev) == 0)
+    ok++;
 
-    uint64_t one = 1;
-    // (2) Arm the eventfd so it becomes readable.
-    if (write(efd, &one, sizeof one) == (ssize_t)sizeof one) ok++;
+  uint64_t one = 1;
+  // (2) Arm the eventfd so it becomes readable.
+  if (write(efd, &one, sizeof one) == (ssize_t)sizeof one)
+    ok++;
 
-    struct epoll_event out[4];
-    memset(out, 0, sizeof out);
-    int n = epoll_pwait2_call(ep, out, 4, &zero);
-    // (3) Exactly one ready descriptor.
-    if (n == 1) ok++;
-    // (4) It is the eventfd we armed.
-    if (n == 1 && out[0].data.fd == efd) ok++;
-    // (5) Reported ready for read.
-    if (n == 1 && (out[0].events & EPOLLIN)) ok++;
+  struct epoll_event out[4];
+  memset(out, 0, sizeof out);
+  int n = epoll_pwait2_call(ep, out, 4, &zero);
+  // (3) Exactly one ready descriptor.
+  if (n == 1)
+    ok++;
+  // (4) It is the eventfd we armed.
+  if (n == 1 && out[0].data.fd == efd)
+    ok++;
+  // (5) Reported ready for read.
+  if (n == 1 && (out[0].events & EPOLLIN))
+    ok++;
 
-    // (6) Deregister the descriptor.
-    if (epoll_ctl(ep, EPOLL_CTL_DEL, efd, &ev) == 0) ok++;
-    int n2 = epoll_pwait2_call(ep, out, 4, &zero);
-    // (7) Nothing ready after removal (non-blocking, returns 0 immediately).
-    if (n2 == 0) ok++;
+  // (6) Deregister the descriptor.
+  if (epoll_ctl(ep, EPOLL_CTL_DEL, efd, &ev) == 0)
+    ok++;
+  int n2 = epoll_pwait2_call(ep, out, 4, &zero);
+  // (7) Nothing ready after removal (non-blocking, returns 0 immediately).
+  if (n2 == 0)
+    ok++;
 
-    close(efd);
-    close(ep);
-    printf("epoll_pwait2 ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  close(efd);
+  close(ep);
+  printf("epoll_pwait2 ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

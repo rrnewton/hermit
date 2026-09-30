@@ -11,10 +11,10 @@
  *
  * copy_file_range performs an in-kernel byte copy between two file descriptors.
  * Detcore does not implement it on any backend, so every backend must refuse it
- * identically with a deterministic errno rather than performing a host-dependent
- * copy. This mirrors the io_uring and listmount refusal rows: it pins the
- * deterministic error so the syscall cannot silently start copying bytes on one
- * backend while refusing on another.
+ * identically with a deterministic errno rather than performing a
+ * host-dependent copy. This mirrors the io_uring and listmount refusal rows: it
+ * pins the deterministic error so the syscall cannot silently start copying
+ * bytes on one backend while refusing on another.
  *
  * A single process creates a source file holding the six bytes "abcdef" and an
  * empty destination file, then calls copy_file_range to copy them. The contract
@@ -23,15 +23,16 @@
  *   - copy_file_range fails with a deterministic errno (ENOSYS), and
  *   - it copies no bytes, so the destination stays empty (size 0).
  *
- * The destination emptiness is verified through fstat, whose file-size result is
- * a pure function of what was written. The printed checksum is derived by
+ * The destination emptiness is verified through fstat, whose file-size result
+ * is a pure function of what was written. The printed checksum is derived by
  * reading the source back, independent of copy_file_range, and equals
  * 'a'+'b'+'c'+'d'+'e'+'f' = 597. Only invariants are printed:
  *
  *   copy_file_range_refusal src=6 dst=0 checksum=597 ok=3
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, inode, device, uid, gid, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, inode, device, uid, gid, or address is
+ * observed.
  */
 
 #define _GNU_SOURCE
@@ -46,7 +47,7 @@
 #define PAYLOAD "abcdef"
 #define PAYLOAD_LEN 6
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -92,7 +93,8 @@ int main(void) {
   if (fd_size(src_fd) == PAYLOAD_LEN)
     ok++;
 
-  /* Derive a content checksum by reading the source, independent of the copy. */
+  /* Derive a content checksum by reading the source, independent of the copy.
+   */
   char buf[PAYLOAD_LEN];
   if (pread(src_fd, buf, PAYLOAD_LEN, 0) != PAYLOAD_LEN)
     fail("pread payload");
@@ -112,16 +114,24 @@ int main(void) {
   if (unlink(dst_template) != 0)
     fail("unlink dst");
 
-  printf("copy_file_range_refusal src=%ld dst=%ld checksum=%ld ok=%d\n",
-         src_size, dst_size, checksum, ok);
+  printf(
+      "copy_file_range_refusal src=%ld dst=%ld checksum=%ld ok=%d\n",
+      src_size,
+      dst_size,
+      checksum,
+      ok);
   /* Route a behavioural failure into the exit status. Without this the guest
      exits 0 whatever `ok` reached, so a regression only lowered the printed
      number -- and under --verify both runs lower it identically, so the
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "copy_file_range completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr,
+        "copy_file_range completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

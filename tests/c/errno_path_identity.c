@@ -30,9 +30,9 @@
  *
  * Cases whose failure depends on host conditions are deliberately EXCLUDED --
  * ENOMEM under memory pressure, EAGAIN under load, EINTR on signal timing,
- * ENOSPC on a full disk. Including them would make the fixture flaky and, worse,
- * would make a genuine determinism regression indistinguishable from a busy
- * machine. A fixture that fails for environmental reasons trains people to
+ * ENOSPC on a full disk. Including them would make the fixture flaky and,
+ * worse, would make a genuine determinism regression indistinguishable from a
+ * busy machine. A fixture that fails for environmental reasons trains people to
  * ignore it.
  *
  * The program asserts that every selected operation reaches a failure path,
@@ -48,6 +48,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -55,7 +56,6 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
-#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -74,11 +74,11 @@ static void report(const char* name, long ret, int err) {
   }
 }
 
-#define ATTEMPT(name, expr)      \
-  do {                           \
-    errno = 0;                   \
-    long r = (long)(expr);       \
-    report((name), r, errno);    \
+#define ATTEMPT(name, expr)   \
+  do {                        \
+    errno = 0;                \
+    long r = (long)(expr);    \
+    report((name), r, errno); \
   } while (0)
 
 int main(void) {
@@ -86,7 +86,8 @@ int main(void) {
   ATTEMPT("open-missing", open("/nonexistent-hermit-fixture", O_RDONLY));
   ATTEMPT("open-dir-for-write", open("/", O_WRONLY));
   ATTEMPT("open-excl-existing", open("/", O_CREAT | O_EXCL, 0600));
-  ATTEMPT("stat-missing", stat("/nonexistent-hermit-fixture", &(struct stat){0}));
+  ATTEMPT(
+      "stat-missing", stat("/nonexistent-hermit-fixture", &(struct stat){0}));
   ATTEMPT("access-missing", access("/nonexistent-hermit-fixture", R_OK));
   ATTEMPT("unlink-missing", unlink("/nonexistent-hermit-fixture"));
   ATTEMPT("rmdir-missing", rmdir("/nonexistent-hermit-fixture"));
@@ -109,13 +110,20 @@ int main(void) {
   /* --- invalid arguments -------------------------------------------------- */
   ATTEMPT("lseek-bad-whence", lseek(0, 0, 12345));
   ATTEMPT("fcntl-bad-cmd", fcntl(0, 99999));
-  ATTEMPT("mmap-zero-length", (long)(intptr_t)mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  ATTEMPT(
+      "mmap-zero-length",
+      (long)(intptr_t)mmap(
+          NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   ATTEMPT("madvise-bad-advice", madvise(NULL, 0, 99999));
   ATTEMPT("mprotect-unaligned", mprotect((void*)0x1, 1, PROT_READ));
   ATTEMPT("socket-bad-domain", socket(9999, SOCK_STREAM, 0));
   ATTEMPT("kill-bad-signal", kill(getpid(), 9999));
-  ATTEMPT("nanosleep-negative", nanosleep(&(struct timespec){.tv_sec = -1, .tv_nsec = 0}, NULL));
-  ATTEMPT("clock-gettime-bad-pointer", syscall(SYS_clock_gettime, CLOCK_REALTIME, (void*)1));
+  ATTEMPT(
+      "nanosleep-negative",
+      nanosleep(&(struct timespec){.tv_sec = -1, .tv_nsec = 0}, NULL));
+  ATTEMPT(
+      "clock-gettime-bad-pointer",
+      syscall(SYS_clock_gettime, CLOCK_REALTIME, (void*)1));
   ATTEMPT("getcwd-tiny-buffer", syscall(SYS_getcwd, (char[1]){0}, 1));
   ATTEMPT("pipe2-bad-flags", pipe2((int[2]){0}, 0x7fffffff));
   ATTEMPT("dup3-same-fd", dup3(0, 0, 0));
@@ -144,7 +152,8 @@ int main(void) {
    * stable -- and this is intra-run, so a run-to-run comparison alone would not
    * catch it. */
   for (int i = 0; i < 3; i++) {
-    ATTEMPT("repeat-open-missing", open("/nonexistent-hermit-fixture", O_RDONLY));
+    ATTEMPT(
+        "repeat-open-missing", open("/nonexistent-hermit-fixture", O_RDONLY));
   }
 
   return unexpected_successes == 0 ? 0 : 1;

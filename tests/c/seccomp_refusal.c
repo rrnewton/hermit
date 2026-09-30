@@ -44,7 +44,8 @@ int main(void) {
   if (prctl(PR_GET_SECCOMP, 0, 0, 0, 0) == -1 && errno == ENOSYS) {
     ok++;
   } else {
-    fprintf(stderr, "PR_GET_SECCOMP not refused with ENOSYS: errno %d\n", errno);
+    fprintf(
+        stderr, "PR_GET_SECCOMP not refused with ENOSYS: errno %d\n", errno);
     return 1;
   }
 
@@ -55,7 +56,8 @@ int main(void) {
       errno == EOPNOTSUPP) {
     ok++;
   } else {
-    fprintf(stderr, "seccomp(2) not refused with EOPNOTSUPP: errno %d\n", errno);
+    fprintf(
+        stderr, "seccomp(2) not refused with EOPNOTSUPP: errno %d\n", errno);
     return 1;
   }
 

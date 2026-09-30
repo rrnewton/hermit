@@ -48,7 +48,8 @@ static void thread_exit(int signum, siginfo_t* info, void* uctxt) {
   (void)signum;
   (void)info;
   (void)uctxt;
-  ssize_t written = write(STDOUT_FILENO, "caught SIGTERM, preparing exit\n", 31);
+  ssize_t written =
+      write(STDOUT_FILENO, "caught SIGTERM, preparing exit\n", 31);
   (void)written;
   atomic_store(&thread_should_exit, 1);
 }
@@ -77,7 +78,8 @@ static void* first_thread(void* param) {
   sigemptyset(&set);
   sigaddset(&set, SIGTERM);
 
-  ssize_t written = write(STDOUT_FILENO, "1. sigtimedwait timeout zero seconds\n", 35);
+  ssize_t written =
+      write(STDOUT_FILENO, "1. sigtimedwait timeout zero seconds\n", 35);
   (void)written;
   int res = sigtimedwait(&set, &siginfo, &tp);
   printf(

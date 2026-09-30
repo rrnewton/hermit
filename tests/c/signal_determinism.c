@@ -11,7 +11,6 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
-#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +19,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ALT_STACK_SIZE (64 * 1024)
@@ -248,8 +248,10 @@ static int arm_nonrestartable_wait(int write_fd, int queued_signal) {
   return 0;
 }
 
-static int check_nonrestartable_result(const char* syscall_name, int result,
-                                       int saved_errno) {
+static int check_nonrestartable_result(
+    const char* syscall_name,
+    int result,
+    int saved_errno) {
   if (result != -1 || saved_errno != EINTR) {
     fprintf(
         stderr,
@@ -299,9 +301,7 @@ static int test_poll_interrupted_despite_sa_restart(void) {
   }
   close(descriptors[0]);
   close(descriptors[1]);
-  printf(
-      "poll interrupted deliveries=%d\n",
-      (int)nonrestartable_deliveries);
+  printf("poll interrupted deliveries=%d\n", (int)nonrestartable_deliveries);
   return 0;
 }
 
@@ -345,8 +345,7 @@ static int test_epoll_wait_interrupted_despite_sa_restart(void) {
   close(descriptors[0]);
   close(descriptors[1]);
   printf(
-      "epoll_wait interrupted deliveries=%d\n",
-      (int)nonrestartable_deliveries);
+      "epoll_wait interrupted deliveries=%d\n", (int)nonrestartable_deliveries);
   return 0;
 }
 
@@ -397,7 +396,8 @@ static int test_sigtimedwait_interrupted_despite_sa_restart(void) {
     return 1;
   }
   if (signal_was_pending != 1) {
-    fputs("SIGUSR2 was not pending after rt_sigtimedwait interruption\n", stderr);
+    fputs(
+        "SIGUSR2 was not pending after rt_sigtimedwait interruption\n", stderr);
     return 1;
   }
   printf(
@@ -782,10 +782,8 @@ static int test_altstack_preservation(void) {
     perror("sigaltstack query");
     return 1;
   }
-  const int preserved =
-      (current.ss_flags & SS_DISABLE) == 0 &&
-      current.ss_sp == alternate.ss_sp &&
-      current.ss_size == alternate.ss_size;
+  const int preserved = (current.ss_flags & SS_DISABLE) == 0 &&
+      current.ss_sp == alternate.ss_sp && current.ss_size == alternate.ss_size;
 
   if (raise(SIGUSR2) != 0) {
     perror("raise");

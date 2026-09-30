@@ -36,7 +36,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -49,10 +49,14 @@ static void fail(const char *message) {
  */
 static int violations;
 
-static void expect(const char *name, long long observed, long long wanted) {
+static void expect(const char* name, long long observed, long long wanted) {
   if (observed != wanted) {
-    fprintf(stderr, "invariant %s: observed %lld, wanted %lld\n", name, observed,
-            wanted);
+    fprintf(
+        stderr,
+        "invariant %s: observed %lld, wanted %lld\n",
+        name,
+        observed,
+        wanted);
     violations++;
   }
 }
@@ -74,8 +78,9 @@ int main(void) {
       _exit(102);
     if (close(fds[1]) != 0)
       _exit(103);
-    char *const argv[] = {(char *)"/bin/echo", (char *)"-n", (char *)"hermit-fork-exec", NULL};
-    char *const envp[] = {NULL};
+    char* const argv[] = {
+        (char*)"/bin/echo", (char*)"-n", (char*)"hermit-fork-exec", NULL};
+    char* const envp[] = {NULL};
     execve("/bin/echo", argv, envp);
     _exit(104); /* only reached if execve failed */
   }
@@ -110,7 +115,11 @@ int main(void) {
   expect("checksum", (long long)checksum, 1594);
   expect("exited", WIFEXITED(status) ? 1 : 0, 1);
   expect("code", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
-  printf("forkexec bytes=%zu checksum=%lu exited=%d code=%d\n", bytes, checksum,
-         WIFEXITED(status) ? 1 : 0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  printf(
+      "forkexec bytes=%zu checksum=%lu exited=%d code=%d\n",
+      bytes,
+      checksum,
+      WIFEXITED(status) ? 1 : 0,
+      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
   return violations == 0 ? 0 : 1;
 }

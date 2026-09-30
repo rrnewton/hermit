@@ -154,15 +154,13 @@ static void* sample_thread(void* unused) {
 }
 
 /* Fails the generation unless `now` is strictly after `before`. */
-static void require_after(
-    long generation,
-    const char* what,
-    int64_t now,
-    int64_t before) {
+static void
+require_after(long generation, const char* what, int64_t now, int64_t before) {
   if (now <= before) {
     fprintf(
         stderr,
-        "FAIL gen=%ld %s read %" PRId64 " is not after the preceding read %" PRId64
+        "FAIL gen=%ld %s read %" PRId64
+        " is not after the preceding read %" PRId64
         ": virtual time is frozen, coarsened, reset, or went backwards\n",
         generation,
         what,
@@ -182,7 +180,8 @@ int main(int argc, char** argv) {
     previous_last = parse_ns(argv[2]);
     generation0_first = parse_ns(argv[3]);
   } else if (argc != 1) {
-    fprintf(stderr, "usage: %s [generation prev_last_ns gen0_first_ns]\n", argv[0]);
+    fprintf(
+        stderr, "usage: %s [generation prev_last_ns gen0_first_ns]\n", argv[0]);
     return 1;
   }
 
@@ -218,7 +217,8 @@ int main(int argc, char** argv) {
     if (readings[i] <= readings[i - 1]) {
       fprintf(
           stderr,
-          "FAIL gen=%ld read %d (%" PRId64 ") did not advance past read %d (%" PRId64
+          "FAIL gen=%ld read %d (%" PRId64
+          ") did not advance past read %d (%" PRId64
           "): virtual time is frozen or coarsened\n",
           generation,
           i,
@@ -302,8 +302,8 @@ int main(int argc, char** argv) {
     const int64_t after = read_clock_ns();
     require_after(generation, "work-end", after, before);
     printf(
-        "work gen=%ld index=%d iterations=%ld before_ns=%" PRId64 " after_ns=%" PRId64
-        " checksum=%" PRIu64 "\n",
+        "work gen=%ld index=%d iterations=%ld before_ns=%" PRId64
+        " after_ns=%" PRId64 " checksum=%" PRIu64 "\n",
         generation,
         i,
         WORK_ITERATIONS[i],
@@ -370,7 +370,8 @@ int main(int argc, char** argv) {
       "%" PRId64,
       generation == 0 ? first : generation0_first);
 
-  /* Flush before exec: the replacement image does not inherit our stdio buffer. */
+  /* Flush before exec: the replacement image does not inherit our stdio buffer.
+   */
   fflush(stdout);
 
   char* next_argv[] = {argv[0], next_generation, last_text, first_text, NULL};

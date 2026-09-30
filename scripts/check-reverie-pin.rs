@@ -2048,8 +2048,7 @@ fn check_liteinst_cache_keys(root: &Path, pin: &str) -> Result<i32, String> {
 
 /// Every 40-hex revision that appears as CODE (not prose) in one of these
 /// files is a DBT budget calibration binding and must equal the canonical pin.
-const DBT_BUDGET_BINDING_FILES: [&str; 2] =
-    [BUDGET_CALIBRATION_SITE, "ci/configure-build-jobs.sh"];
+const DBT_BUDGET_BINDING_FILES: [&str; 2] = [BUDGET_CALIBRATION_SITE, "ci/configure-build-jobs.sh"];
 
 /// Exactly-40-hex tokens on a line, ignoring longer hex runs.
 ///
@@ -2059,7 +2058,11 @@ const DBT_BUDGET_BINDING_FILES: [&str; 2] =
 /// accepting shorter tokens would match ordinary hex in a message.
 fn exact_40_hex_tokens(line: &str) -> Vec<String> {
     line.split(|c: char| !c.is_ascii_hexdigit())
-        .filter(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()))
+        .filter(|t| {
+            t.len() == 40
+                && t.chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        })
         .map(str::to_string)
         .collect()
 }

@@ -225,7 +225,9 @@ def _connect_replay():
     last_error = None
     for _ in range(200):
         try:
-            gdb.execute("target remote " + _replay_target, from_tty=False, to_string=True)
+            gdb.execute(
+                "target remote " + _replay_target, from_tty=False, to_string=True
+            )
             return
         except gdb.error as error:
             last_error = error
@@ -319,7 +321,9 @@ def _step_back(thread_id, granularity):
     target_index = matching[-2] if len(matching) >= 2 else -1
     position = _history[target_index] if target_index >= 0 else None
     occurrence = (
-        sum(1 for entry in _history[: target_index + 1] if entry["pc"] == position["pc"])
+        sum(
+            1 for entry in _history[: target_index + 1] if entry["pc"] == position["pc"]
+        )
         if position is not None
         else 0
     )
@@ -334,11 +338,7 @@ def _step_back(thread_id, granularity):
 @capability("supportsStepBack")
 @request("stepBack", on_dap_thread=True)
 def step_back(
-    *,
-    threadId: int,
-    singleThread: bool = False,
-    granularity: str = "statement",
-    **args
+    *, threadId: int, singleThread: bool = False, granularity: str = "statement", **args
 ):
     if singleThread:
         raise DAPException("Hermit reverse execution restarts the whole replay")
@@ -355,7 +355,11 @@ def step_back(
 def _visible_breakpoints_by_pc():
     result = {}
     for breakpoint in gdb.breakpoints() or []:
-        if not breakpoint.is_valid() or not breakpoint.enabled or not breakpoint.visible:
+        if (
+            not breakpoint.is_valid()
+            or not breakpoint.enabled
+            or not breakpoint.visible
+        ):
             continue
         for location in breakpoint.locations:
             if location.enabled and location.address is not None:
@@ -378,11 +382,15 @@ def _reverse_continue(thread_id):
     if position is not None:
         position["breakpoint_ids"] = breakpoints[position["pc"]]
     occurrence = (
-        sum(1 for entry in _history[: target_index + 1] if entry["pc"] == position["pc"])
+        sum(
+            1 for entry in _history[: target_index + 1] if entry["pc"] == position["pc"]
+        )
         if position is not None
         else 0
     )
-    body = _restart_at(position, occurrence, "breakpoint" if position is not None else "entry")
+    body = _restart_at(
+        position, occurrence, "breakpoint" if position is not None else "entry"
+    )
     if target_index >= 0:
         del _history[target_index + 1 :]
     else:

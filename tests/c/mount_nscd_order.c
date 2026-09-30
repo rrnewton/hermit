@@ -5,7 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static void copy_file(const char *path) {
+static void copy_file(const char* path) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) {
     fprintf(stderr, "open %s: %s\n", path, strerror(errno));
@@ -37,7 +37,9 @@ int main(void) {
   copy_file("/var/run/nscd/from-later");
   int leaked = open("/run/nscd/from-var", O_RDONLY);
   if (leaked >= 0) {
-    fprintf(stderr, "the /var source leaked through the protected /run/nscd mount\n");
+    fprintf(
+        stderr,
+        "the /var source leaked through the protected /run/nscd mount\n");
     close(leaked);
     return 1;
   }

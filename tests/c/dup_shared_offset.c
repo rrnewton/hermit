@@ -33,8 +33,8 @@
  *
  *   dup_shared_offset size=8 checksum=748 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -46,13 +46,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
 
 /* Read exactly n bytes at the current offset into buf (advances the offset). */
-static void read_exact(int fd, char *buf, size_t n) {
+static void read_exact(int fd, char* buf, size_t n) {
   size_t got = 0;
   while (got < n) {
     ssize_t r = read(fd, buf + got, n - got);
@@ -68,7 +68,7 @@ static void read_exact(int fd, char *buf, size_t n) {
 }
 
 /* Read exactly n bytes at absolute offset off into buf (offset-independent). */
-static void pread_exact(int fd, char *buf, size_t n, off_t off) {
+static void pread_exact(int fd, char* buf, size_t n, off_t off) {
   size_t got = 0;
   while (got < n) {
     ssize_t r = pread(fd, buf + got, n - got, off + (off_t)got);
@@ -124,7 +124,8 @@ int main(void) {
   if (lseek(fd3, 0, SEEK_CUR) == 4 && lseek(fd, 0, SEEK_CUR) == 4)
     ok++;
 
-  /* A write through fd2 lands at the shared offset and is visible everywhere. */
+  /* A write through fd2 lands at the shared offset and is visible everywhere.
+   */
   if (lseek(fd2, 4, SEEK_SET) != 4)
     fail("lseek fd2 to 4");
   if (write(fd2, "WXYZ", 4) != 4)
@@ -144,7 +145,10 @@ int main(void) {
   if (close(fd) != 0 || close(fd2) != 0 || close(fd3) != 0)
     fail("close");
 
-  printf("dup_shared_offset size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
-         checksum, ok);
+  printf(
+      "dup_shared_offset size=%ld checksum=%ld ok=%d\n",
+      (long)st.st_size,
+      checksum,
+      ok);
   return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

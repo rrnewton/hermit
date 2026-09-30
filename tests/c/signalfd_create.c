@@ -15,10 +15,10 @@
  * clean triple pass.
  *
  * EACH STEP IS REPORTED SEPARATELY and the fixture fails closed. "sfd ok=6"
- * summed six independent contracts, so a backend that failed to block the second
- * signal and a backend that handed back a duplicate descriptor both printed
- * "sfd ok=5" and compared EQUAL. The existing exit-status guard catches the
- * lower total, but does not identify which step failed.
+ * summed six independent contracts, so a backend that failed to block the
+ * second signal and a backend that handed back a duplicate descriptor both
+ * printed "sfd ok=5" and compared EQUAL. The existing exit-status guard catches
+ * the lower total, but does not identify which step failed.
  *
  * The raw descriptor NUMBERS are deliberately not printed. A file descriptor is
  * allocation state the guest inherits rather than a value it chooses, so
@@ -35,36 +35,35 @@
 #include <unistd.h>
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 6 };
+  enum { EXPECTED_CHECKS = 6 };
 
-    sigset_t m1;
-    sigemptyset(&m1);
-    sigaddset(&m1, SIGUSR1);
-    int block1 = sigprocmask(SIG_BLOCK, &m1, NULL) == 0;
-    int fd1 = signalfd(-1, &m1, SFD_NONBLOCK | SFD_CLOEXEC);
-    int fd1_valid = fd1 >= 0;
+  sigset_t m1;
+  sigemptyset(&m1);
+  sigaddset(&m1, SIGUSR1);
+  int block1 = sigprocmask(SIG_BLOCK, &m1, NULL) == 0;
+  int fd1 = signalfd(-1, &m1, SFD_NONBLOCK | SFD_CLOEXEC);
+  int fd1_valid = fd1 >= 0;
 
-    sigset_t m2;
-    sigemptyset(&m2);
-    sigaddset(&m2, SIGUSR2);
-    int block2 = sigprocmask(SIG_BLOCK, &m2, NULL) == 0;
-    int fd2 = signalfd(-1, &m2, SFD_NONBLOCK | SFD_CLOEXEC);
-    int fd2_distinct = fd2 >= 0 && fd2 != fd1;
+  sigset_t m2;
+  sigemptyset(&m2);
+  sigaddset(&m2, SIGUSR2);
+  int block2 = sigprocmask(SIG_BLOCK, &m2, NULL) == 0;
+  int fd2 = signalfd(-1, &m2, SFD_NONBLOCK | SFD_CLOEXEC);
+  int fd2_distinct = fd2 >= 0 && fd2 != fd1;
 
-    int closed1 = fd1 >= 0 && close(fd1) == 0;
-    int closed2 = fd2 >= 0 && close(fd2) == 0;
+  int closed1 = fd1 >= 0 && close(fd1) == 0;
+  int closed2 = fd2 >= 0 && close(fd2) == 0;
 
-    int ok =
-        block1 + fd1_valid + block2 + fd2_distinct + closed1 + closed2;
-    printf(
-        "sfd ok=%d block1=%d fd1_valid=%d block2=%d fd2_distinct=%d "
-        "closed1=%d closed2=%d\n",
-        ok,
-        block1,
-        fd1_valid,
-        block2,
-        fd2_distinct,
-        closed1,
-        closed2);
-    return ok == EXPECTED_CHECKS ? 0 : 1;
+  int ok = block1 + fd1_valid + block2 + fd2_distinct + closed1 + closed2;
+  printf(
+      "sfd ok=%d block1=%d fd1_valid=%d block2=%d fd2_distinct=%d "
+      "closed1=%d closed2=%d\n",
+      ok,
+      block1,
+      fd1_valid,
+      block2,
+      fd2_distinct,
+      closed1,
+      closed2);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }

@@ -70,7 +70,10 @@ struct Node {
 }
 
 fn repo_root() -> PathBuf {
-    if let Ok(out) = Command::new("git").args(["rev-parse", "--show-toplevel"]).output() {
+    if let Ok(out) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !p.is_empty() {
@@ -122,7 +125,10 @@ fn sample_commits(rev: &str, n: usize) -> Vec<String> {
         .output()
         .unwrap_or_else(|e| fail(&format!("git log failed: {e}")));
     if !out.status.success() {
-        fail(&format!("git log {rev} failed: {}", String::from_utf8_lossy(&out.stderr)));
+        fail(&format!(
+            "git log {rev} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -158,14 +164,23 @@ fn select_nodes(selector: &Path, files: &[String]) -> (String, Vec<String>) {
         let stdin = child.stdin.as_mut().unwrap();
         stdin.write_all(files.join("\n").as_bytes()).ok();
     }
-    let out = child.wait_with_output().unwrap_or_else(|e| fail(&format!("selector wait: {e}")));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| fail(&format!("selector wait: {e}")));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        fail(&format!("selector emitted non-JSON: {e}: {}", String::from_utf8_lossy(&out.stdout)))
+        fail(&format!(
+            "selector emitted non-JSON: {e}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        ))
     });
     let decision = v["decision"].as_str().unwrap_or("full").to_string();
     let nodes = v["nodes"]
         .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     (decision, nodes)
 }
@@ -202,15 +217,24 @@ nightly', never 'safe to delete'.
     while i < args.len() {
         match args[i].as_str() {
             "--sample" => {
-                sample = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("--sample needs a number"));
+                sample = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| fail("--sample needs a number"));
                 i += 2;
             }
             "--rev" => {
-                rev = args.get(i + 1).cloned().unwrap_or_else(|| fail("--rev needs a ref"));
+                rev = args
+                    .get(i + 1)
+                    .cloned()
+                    .unwrap_or_else(|| fail("--rev needs a ref"));
                 i += 2;
             }
             "--format" => {
-                format = args.get(i + 1).cloned().unwrap_or_else(|| fail("--format needs a value"));
+                format = args
+                    .get(i + 1)
+                    .cloned()
+                    .unwrap_or_else(|| fail("--format needs a value"));
                 i += 2;
             }
             other => fail(&format!("unknown argument: {other} (see --help)")),
@@ -253,7 +277,12 @@ nightly', never 'safe to delete'.
 
     let total = commits.len() as f64;
     // Normalize the declared ordinal weight so power-to-weight is unit-free.
-    let max_weight = nodes.values().map(|n| n.declared_weight).max().unwrap_or(1).max(1) as f64;
+    let max_weight = nodes
+        .values()
+        .map(|n| n.declared_weight)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
 
     // Sort ascending by power-to-weight (worst first = best pruning candidates).
     let mut ranked: Vec<&Node> = nodes.values().collect();
@@ -263,7 +292,10 @@ nightly', never 'safe to delete'.
         rate / w
     };
     ranked.sort_by(|a, b| {
-        p2w(a).partial_cmp(&p2w(b)).unwrap().then(b.declared_weight.cmp(&a.declared_weight))
+        p2w(a)
+            .partial_cmp(&p2w(b))
+            .unwrap()
+            .then(b.declared_weight.cmp(&a.declared_weight))
     });
 
     // This is a configured review heuristic over an unmeasured ordinal weight
@@ -275,7 +307,9 @@ nightly', never 'safe to delete'.
 
     match format.as_str() {
         "csv" => {
-            println!("node,declared_unmeasured_weight,classification,times_selected,sample_size,sample_newest_sha,sample_oldest_sha,selection_rate,power_to_weight,review_candidate");
+            println!(
+                "node,declared_unmeasured_weight,classification,times_selected,sample_size,sample_newest_sha,sample_oldest_sha,selection_rate,power_to_weight,review_candidate"
+            );
             for n in &ranked {
                 let rate = n.times_selected as f64 / total;
                 println!(
@@ -294,7 +328,10 @@ nightly', never 'safe to delete'.
             }
         }
         "human" => {
-            println!("Power-to-weight ranking over {} commit(s) from {rev}", commits.len());
+            println!(
+                "Power-to-weight ranking over {} commit(s) from {rev}",
+                commits.len()
+            );
             println!(
                 "  decisions: {n_selective} selective, {n_skip} skip, {n_full} full \
                  ({:.0}% of commits ran the full suite)",
@@ -314,7 +351,11 @@ nightly', never 'safe to delete'.
             );
             for n in &ranked {
                 let rate = n.times_selected as f64 / total;
-                let flag = if is_nightly_candidate(n) { "NIGHTLY-CANDIDATE" } else { "" };
+                let flag = if is_nightly_candidate(n) {
+                    "NIGHTLY-CANDIDATE"
+                } else {
+                    ""
+                };
                 println!(
                     "{:<38} {:>6} {:>14} {:>8.0}% {:>7.3}  {}",
                     n.tag,
@@ -325,7 +366,8 @@ nightly', never 'safe to delete'.
                     flag
                 );
             }
-            let candidates: Vec<&&Node> = ranked.iter().filter(|n| is_nightly_candidate(n)).collect();
+            let candidates: Vec<&&Node> =
+                ranked.iter().filter(|n| is_nightly_candidate(n)).collect();
             println!(
                 "\n{} node(s) flagged NIGHTLY-CANDIDATE (declared unmeasured weight >= 120 \
                  AND measured selection < 34%; configured review heuristic, n={}).",

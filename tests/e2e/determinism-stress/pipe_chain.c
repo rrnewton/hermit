@@ -24,12 +24,12 @@ enum {
 
 static const char seed[] = "seed=ptrace-compat\n";
 
-static void fail(const char *operation) {
+static void fail(const char* operation) {
   fprintf(stderr, "%s: %s\n", operation, strerror(errno));
   exit(EXIT_FAILURE);
 }
 
-static ssize_t read_all(int fd, char *buffer, size_t capacity) {
+static ssize_t read_all(int fd, char* buffer, size_t capacity) {
   size_t length = 0;
   while (length < capacity) {
     const ssize_t bytes = read(fd, buffer + length, capacity - length);
@@ -48,7 +48,7 @@ static ssize_t read_all(int fd, char *buffer, size_t capacity) {
   return -1;
 }
 
-static int write_all(int fd, const char *buffer, size_t length) {
+static int write_all(int fd, const char* buffer, size_t length) {
   size_t written = 0;
   while (written < length) {
     const ssize_t bytes = write(fd, buffer + written, length - written);
@@ -89,9 +89,12 @@ static void run_stage(int links[LINK_COUNT][2], unsigned stage) {
     _exit(200 + stage);
   }
 
-  const int addition_length =
-      snprintf(addition, sizeof(addition),
-               "stage=%u payload=%08x\n", stage, 0x13579bdfU ^ stage);
+  const int addition_length = snprintf(
+      addition,
+      sizeof(addition),
+      "stage=%u payload=%08x\n",
+      stage,
+      0x13579bdfU ^ stage);
   if (addition_length < 0 || (size_t)addition_length >= sizeof(addition) ||
       (size_t)input_length + (size_t)addition_length > sizeof(buffer) ||
       write_all(output, buffer, (size_t)input_length) != 0 ||
@@ -110,16 +113,19 @@ static int wait_for_exit(pid_t process, int expected_exit) {
   } while (waited < 0 && errno == EINTR);
 
   return waited == process && WIFEXITED(status) &&
-         WEXITSTATUS(status) == expected_exit;
+      WEXITSTATUS(status) == expected_exit;
 }
 
 static size_t build_expected(char expected[BUFFER_CAPACITY]) {
   size_t length = sizeof(seed) - 1;
   memcpy(expected, seed, length);
   for (unsigned stage = 0; stage < STAGE_COUNT; ++stage) {
-    const int bytes = snprintf(expected + length, BUFFER_CAPACITY - length,
-                               "stage=%u payload=%08x\n", stage,
-                               0x13579bdfU ^ stage);
+    const int bytes = snprintf(
+        expected + length,
+        BUFFER_CAPACITY - length,
+        "stage=%u payload=%08x\n",
+        stage,
+        0x13579bdfU ^ stage);
     if (bytes < 0 || (size_t)bytes >= BUFFER_CAPACITY - length) {
       fail("snprintf(expected)");
     }
@@ -181,16 +187,18 @@ int main(void) {
   const size_t expected_length = build_expected(expected);
   if ((size_t)output_length != expected_length ||
       memcmp(output, expected, expected_length) != 0) {
-    fprintf(stderr, "pipe output mismatch: got=%zd expected=%zu\n",
-            output_length, expected_length);
+    fprintf(
+        stderr,
+        "pipe output mismatch: got=%zd expected=%zu\n",
+        output_length,
+        expected_length);
     return EXIT_FAILURE;
   }
 
   if (write_all(STDOUT_FILENO, output, (size_t)output_length) != 0) {
     fail("write(stdout)");
   }
-  printf("pipe-chain stages=%u bytes=%zu exits=", STAGE_COUNT,
-         expected_length);
+  printf("pipe-chain stages=%u bytes=%zu exits=", STAGE_COUNT, expected_length);
   for (unsigned stage = 0; stage < STAGE_COUNT; ++stage) {
     printf("%s%u", stage == 0 ? "" : ",", STAGE_EXIT_BASE + stage);
   }

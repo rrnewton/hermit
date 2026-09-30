@@ -46,26 +46,35 @@ int main(void) {
   errno = 0;
   long default_slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
   if (default_slack <= 0) {
-    fprintf(stderr,
-            "initial PR_GET_TIMERSLACK returned %ld with errno %d (%s), "
-            "expected a positive default\n",
-            default_slack, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "initial PR_GET_TIMERSLACK returned %ld with errno %d (%s), "
+        "expected a positive default\n",
+        default_slack,
+        errno,
+        strerror(errno));
     return 1;
   }
 
   errno = 0;
   if (prctl(PR_SET_TIMERSLACK, REQUESTED_TIMERSLACK, 0, 0, 0) != 0) {
-    fprintf(stderr,
-            "PR_SET_TIMERSLACK failed with errno %d (%s), expected success\n",
-            errno, strerror(errno));
+    fprintf(
+        stderr,
+        "PR_SET_TIMERSLACK failed with errno %d (%s), expected success\n",
+        errno,
+        strerror(errno));
     return 1;
   }
 
   errno = 0;
   long slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
   if (slack != REQUESTED_TIMERSLACK) {
-    fprintf(stderr, "PR_GET_TIMERSLACK returned %ld (errno %d), expected %ld\n",
-            slack, errno, REQUESTED_TIMERSLACK);
+    fprintf(
+        stderr,
+        "PR_GET_TIMERSLACK returned %ld (errno %d), expected %ld\n",
+        slack,
+        errno,
+        REQUESTED_TIMERSLACK);
     return 1;
   }
 
@@ -74,31 +83,39 @@ int main(void) {
     fprintf(
         stderr,
         "PR_SET_TIMERSLACK reset failed with errno %d (%s), expected success\n",
-        errno, strerror(errno));
+        errno,
+        strerror(errno));
     return 1;
   }
 
   errno = 0;
   slack = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
   if (slack != default_slack) {
-    fprintf(stderr,
-            "PR_GET_TIMERSLACK after reset returned %ld (errno %d), expected "
-            "default %ld\n",
-            slack, errno, default_slack);
+    fprintf(
+        stderr,
+        "PR_GET_TIMERSLACK after reset returned %ld (errno %d), expected "
+        "default %ld\n",
+        slack,
+        errno,
+        default_slack);
     return 1;
   }
 
   errno = 0;
   int refused = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
   if (refused != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "PR_SET_NO_NEW_PRIVS returned %d with errno %d (%s), expected -1 "
-            "ENOSYS\n",
-            refused, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "PR_SET_NO_NEW_PRIVS returned %d with errno %d (%s), expected -1 "
+        "ENOSYS\n",
+        refused,
+        errno,
+        strerror(errno));
     return 1;
   }
 
-  puts("prctl timer slack round-trips and resets; unsupported option is "
-       "refused");
+  puts(
+      "prctl timer slack round-trips and resets; unsupported option is "
+      "refused");
   return 0;
 }

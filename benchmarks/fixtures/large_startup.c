@@ -15,6 +15,6 @@ __asm__(
 extern void benchmark_padding(void);
 
 int main(void) {
-    benchmark_padding();
-    return 0;
+  benchmark_padding();
+  return 0;
 }

@@ -10,8 +10,8 @@
  * open(2)/openat(2) flag-semantics parity probe.
  *
  * A single process drives one temporary path through a fixed sequence of opens
- * and checks the deterministic flag semantics Detcore's file model must preserve
- * identically on every backend:
+ * and checks the deterministic flag semantics Detcore's file model must
+ * preserve identically on every backend:
  *
  *   - O_CREAT|O_EXCL on an existing path fails with EEXIST.
  *   - An O_WRONLY descriptor rejects read(2) with EBADF.
@@ -30,8 +30,8 @@
  *
  *   openat_flags size=2 checksum=209 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -43,7 +43,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -128,7 +128,10 @@ int main(void) {
   if (unlink(template) != 0)
     fail("unlink");
 
-  printf("openat_flags size=%ld checksum=%ld ok=%d\n", (long)final_size,
-         checksum, ok);
+  printf(
+      "openat_flags size=%ld checksum=%ld ok=%d\n",
+      (long)final_size,
+      checksum,
+      ok);
   return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

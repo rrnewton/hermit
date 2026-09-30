@@ -34,8 +34,8 @@ struct observation {
 
 static atomic_int next_completion;
 
-static void *observe(void *opaque) {
-  struct observation *result = opaque;
+static void* observe(void* opaque) {
+  struct observation* result = opaque;
   unsigned int unused_b;
   unsigned int unused_c;
   unsigned int unused_d;
@@ -49,8 +49,8 @@ static void *observe(void *opaque) {
     return NULL;
   }
 
-  if (__get_cpuid(0, &result->cpuid_max_leaf, &unused_b, &unused_c,
-                  &unused_d) == 0) {
+  if (__get_cpuid(
+          0, &result->cpuid_max_leaf, &unused_b, &unused_c, &unused_d) == 0) {
     result->error = 1;
     return NULL;
   }
@@ -72,8 +72,8 @@ int main(void) {
   atomic_init(&next_completion, 0);
 
   for (int thread = 0; thread < THREADS; thread++) {
-    if (pthread_create(&threads[thread], NULL, observe,
-                       &observations[thread]) != 0) {
+    if (pthread_create(
+            &threads[thread], NULL, observe, &observations[thread]) != 0) {
       return 2;
     }
   }
@@ -86,16 +86,19 @@ int main(void) {
 
   puts("flag-matrix-probe");
   for (int thread = 0; thread < THREADS; thread++) {
-    const struct observation *observation = &observations[thread];
+    const struct observation* observation = &observations[thread];
     printf(
         "thread=%d order=%d realtime=%lld.%09ld monotonic=%lld.%09ld "
         "mtime=%lld.%09ld cpuid=%u random=",
-        thread, observation->completion_order,
-        (long long)observation->realtime.tv_sec, observation->realtime.tv_nsec,
+        thread,
+        observation->completion_order,
+        (long long)observation->realtime.tv_sec,
+        observation->realtime.tv_nsec,
         (long long)observation->monotonic.tv_sec,
         observation->monotonic.tv_nsec,
         (long long)observation->executable.st_mtim.tv_sec,
-        observation->executable.st_mtim.tv_nsec, observation->cpuid_max_leaf);
+        observation->executable.st_mtim.tv_nsec,
+        observation->cpuid_max_leaf);
     print_random(observation->random);
     putchar('\n');
   }

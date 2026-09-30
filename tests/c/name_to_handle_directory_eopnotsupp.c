@@ -15,7 +15,7 @@
 #include <string.h>
 
 int main(void) {
-  struct file_handle *handle = calloc(1, sizeof(*handle) + 128);
+  struct file_handle* handle = calloc(1, sizeof(*handle) + 128);
   if (handle == NULL) {
     perror("calloc file_handle");
     return 1;
@@ -28,10 +28,13 @@ int main(void) {
   int call_errno = errno;
   free(handle);
   if (result != -1 || call_errno != EOPNOTSUPP) {
-    fprintf(stderr,
-            "directory name_to_handle_at returned %d with errno %d (%s), "
-            "expected EOPNOTSUPP\n",
-            result, call_errno, strerror(call_errno));
+    fprintf(
+        stderr,
+        "directory name_to_handle_at returned %d with errno %d (%s), "
+        "expected EOPNOTSUPP\n",
+        result,
+        call_errno,
+        strerror(call_errno));
     return 1;
   }
 

@@ -26,7 +26,10 @@ int main(void) {
     return 0;
   }
 
-  fprintf(stderr, "ptrace: expected EPERM, got result=%ld errno=%d\n", result,
-          errno);
+  fprintf(
+      stderr,
+      "ptrace: expected EPERM, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

@@ -31,7 +31,7 @@ struct blocked_child {
   int exit_marker_fd;
 };
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -80,7 +80,7 @@ static struct blocked_child spawn_blocked_child(int exit_code) {
   };
 }
 
-static void release_child(struct blocked_child *child) {
+static void release_child(struct blocked_child* child) {
   const char token = 'x';
   char marker;
   if (write(child->release_fd, &token, sizeof(token)) != 1)
@@ -92,7 +92,6 @@ static void release_child(struct blocked_child *child) {
   close(child->release_fd);
   close(child->exit_marker_fd);
 }
-
 
 static void require_empty_nonblocking_waits(pid_t child) {
   int status = 0;
@@ -107,32 +106,33 @@ static void require_empty_nonblocking_waits(pid_t child) {
     exit(2);
 }
 
-static void *send_self_sigkill(void *opaque) {
-  enum sigkill_spelling spelling = *(const enum sigkill_spelling *)opaque;
+static void* send_self_sigkill(void* opaque) {
+  enum sigkill_spelling spelling = *(const enum sigkill_spelling*)opaque;
   pid_t pid = getpid();
   pid_t tid = (pid_t)syscall(SYS_gettid);
   long result;
 
   switch (spelling) {
-  case USE_KILL:
-    result = kill(pid, SIGKILL);
-    break;
-  case USE_TKILL:
-    result = syscall(SYS_tkill, tid, SIGKILL);
-    break;
-  case USE_TGKILL:
-    result = syscall(SYS_tgkill, pid, tid, SIGKILL);
-    break;
-  default:
-    _exit(121);
+    case USE_KILL:
+      result = kill(pid, SIGKILL);
+      break;
+    case USE_TKILL:
+      result = syscall(SYS_tkill, tid, SIGKILL);
+      break;
+    case USE_TGKILL:
+      result = syscall(SYS_tgkill, pid, tid, SIGKILL);
+      break;
+    default:
+      _exit(121);
   }
 
   /* A successful SIGKILL never returns. Preserve errno if a backend does. */
   _exit(result == -1 ? 80 + (errno & 31) : 79);
 }
 
-static int run_self_sigkill_case(const char *name,
-                                 enum sigkill_spelling spelling) {
+static int run_self_sigkill_case(
+    const char* name,
+    enum sigkill_spelling spelling) {
   pid_t child = fork();
   if (child == -1) {
     printf("%s: fork-failed errno=%d\n", name, errno);
@@ -158,8 +158,11 @@ static int run_self_sigkill_case(const char *name,
     printf("%s: wrong-status raw=%d\n", name, status);
     return 1;
   }
-  printf("%s: signalled sig=%d core=%d\n", name, WTERMSIG(status),
-         WCOREDUMP(status) != 0);
+  printf(
+      "%s: signalled sig=%d core=%d\n",
+      name,
+      WTERMSIG(status),
+      WCOREDUMP(status) != 0);
   return 0;
 }
 
@@ -172,7 +175,7 @@ static int run_self_sigkill_mode(void) {
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "self-sigkill") == 0)
     return run_self_sigkill_mode();
   if (argc != 1)
@@ -232,7 +235,8 @@ int main(int argc, char **argv) {
       info.si_status != 13)
     return 9;
 
-  puts("wait4=7 waitid=9 wait4-any=11 waitid-any=13 live-wnohang=empty "
-       "child-ready-won");
+  puts(
+      "wait4=7 waitid=9 wait4-any=11 waitid-any=13 live-wnohang=empty "
+      "child-ready-won");
   return 0;
 }

@@ -18,13 +18,13 @@ static void handler(int signal_number) {
   }
 }
 
-static void *sender(void *opaque) {
-  int signal_number = *(int *)opaque;
+static void* sender(void* opaque) {
+  int signal_number = *(int*)opaque;
   int barrier_result = pthread_barrier_wait(&start);
   if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
-    return (void *)1;
+    return (void*)1;
   }
-  return (void *)(long)pthread_kill(main_thread, signal_number);
+  return (void*)(long)pthread_kill(main_thread, signal_number);
 }
 
 int main(void) {
@@ -55,13 +55,15 @@ int main(void) {
     sched_yield();
   }
   for (int index = 0; index < 2; index++) {
-    void *result = NULL;
+    void* result = NULL;
     if (pthread_join(threads[index], &result) != 0 || result != NULL) {
       return 4;
     }
   }
 
-  printf("signal-order=%s,%s\n", order[0] == SIGUSR1 ? "USR1" : "USR2",
-         order[1] == SIGUSR1 ? "USR1" : "USR2");
+  printf(
+      "signal-order=%s,%s\n",
+      order[0] == SIGUSR1 ? "USR1" : "USR2",
+      order[1] == SIGUSR1 ? "USR1" : "USR2");
   return pthread_barrier_destroy(&start) == 0 ? 0 : 5;
 }

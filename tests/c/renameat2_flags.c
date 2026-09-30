@@ -23,74 +23,74 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int put(const char *path, const char *text) {
-    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) {
-        return -1;
-    }
-    size_t len = strlen(text);
-    ssize_t n = write(fd, text, len);
-    close(fd);
-    return n == (ssize_t)len ? 0 : -1;
+static int put(const char* path, const char* text) {
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) {
+    return -1;
+  }
+  size_t len = strlen(text);
+  ssize_t n = write(fd, text, len);
+  close(fd);
+  return n == (ssize_t)len ? 0 : -1;
 }
 
-static int slurp(const char *path, char *buf, size_t cap) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return -1;
-    }
-    ssize_t n = read(fd, buf, cap - 1);
-    close(fd);
-    if (n < 0) {
-        return -1;
-    }
-    buf[n] = 0;
-    return 0;
+static int slurp(const char* path, char* buf, size_t cap) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return -1;
+  }
+  ssize_t n = read(fd, buf, cap - 1);
+  close(fd);
+  if (n < 0) {
+    return -1;
+  }
+  buf[n] = 0;
+  return 0;
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 4 };
-    char root[] = "/tmp/rn2XXXXXX";
-    if (!mkdtemp(root)) {
-        perror("mkdtemp");
-        return 1;
-    }
-    char a[128], b[128], buf[64];
-    snprintf(a, sizeof a, "%s/a", root);
-    snprintf(b, sizeof b, "%s/b", root);
+  enum { EXPECTED_CHECKS = 4 };
+  char root[] = "/tmp/rn2XXXXXX";
+  if (!mkdtemp(root)) {
+    perror("mkdtemp");
+    return 1;
+  }
+  char a[128], b[128], buf[64];
+  snprintf(a, sizeof a, "%s/a", root);
+  snprintf(b, sizeof b, "%s/b", root);
 
-    int ok = 0;
+  int ok = 0;
 
-    put(a, "AAA");
-    put(b, "BBB");
-    errno = 0;
-    if (renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE) == -1 &&
-        errno == EEXIST) {
-        ok++;
-    }
+  put(a, "AAA");
+  put(b, "BBB");
+  errno = 0;
+  if (renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE) == -1 &&
+      errno == EEXIST) {
+    ok++;
+  }
 
-    unlink(b);
-    if (renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE) == 0 &&
-        slurp(b, buf, sizeof buf) == 0 && strcmp(buf, "AAA") == 0) {
-        ok++;
-    }
+  unlink(b);
+  if (renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE) == 0 &&
+      slurp(b, buf, sizeof buf) == 0 && strcmp(buf, "AAA") == 0) {
+    ok++;
+  }
 
-    put(a, "XXX");
-    if (renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE) == 0 &&
-        slurp(a, buf, sizeof buf) == 0 && strcmp(buf, "AAA") == 0 &&
-        slurp(b, buf, sizeof buf) == 0 && strcmp(buf, "XXX") == 0) {
-        ok++;
-    }
+  put(a, "XXX");
+  if (renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE) == 0 &&
+      slurp(a, buf, sizeof buf) == 0 && strcmp(buf, "AAA") == 0 &&
+      slurp(b, buf, sizeof buf) == 0 && strcmp(buf, "XXX") == 0) {
+    ok++;
+  }
 
-    if (renameat2(AT_FDCWD, a, AT_FDCWD, b, 0) == 0 &&
-        slurp(b, buf, sizeof buf) == 0 && strcmp(buf, "AAA") == 0) {
-        ok++;
-    }
+  if (renameat2(AT_FDCWD, a, AT_FDCWD, b, 0) == 0 &&
+      slurp(b, buf, sizeof buf) == 0 && strcmp(buf, "AAA") == 0) {
+    ok++;
+  }
 
-    printf("renameat2 ok=%d\n", ok);
+  printf("renameat2 ok=%d\n", ok);
 
-    unlink(a);
-    unlink(b);
-    rmdir(root);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  unlink(a);
+  unlink(b);
+  rmdir(root);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -14,7 +14,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   int expect_passthrough = argc == 2 && strcmp(argv[1], "passthrough") == 0;
   int source[2];
   int destination[2];
@@ -40,8 +40,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   {
-    fprintf(stderr, "tee returned %ld with errno %d (%s), expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "tee returned %ld with errno %d (%s), expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
 }

@@ -48,8 +48,14 @@ public final class RuntimeProbe {
     TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
     Instant now = Instant.now();
     ZonedDateTime utc = ZonedDateTime.ofInstant(now, ZoneOffset.UTC);
-    System.out.println("TIME unix_ns=" + now.getEpochSecond() + String.format("%09d", now.getNano())
-        + " utc=" + utc + " zone=" + utc.getOffset());
+    System.out.println(
+        "TIME unix_ns="
+            + now.getEpochSecond()
+            + String.format("%09d", now.getNano())
+            + " utc="
+            + utc
+            + " zone="
+            + utc.getOffset());
   }
 
   private static void threadProbe() throws Exception {
@@ -64,27 +70,30 @@ public final class RuntimeProbe {
 
     for (int workerId = 0; workerId < THREADS; workerId++) {
       final int id = workerId;
-      Thread worker = new Thread(() -> {
-        ready.countDown();
-        try {
-          start.await();
-          for (int iteration = 0; iteration < ITERATIONS; iteration++) {
-            lock.lock();
-            try {
-              counter.incrementAndGet();
-              schedule[nextRecord.getAndIncrement()] = (byte) id;
-            } finally {
-              lock.unlock();
-            }
-            Thread.yield();
-          }
-        } catch (InterruptedException error) {
-          Thread.currentThread().interrupt();
-          throw new RuntimeException(error);
-        } finally {
-          done.countDown();
-        }
-      }, "hermit-runtime-" + id);
+      Thread worker =
+          new Thread(
+              () -> {
+                ready.countDown();
+                try {
+                  start.await();
+                  for (int iteration = 0; iteration < ITERATIONS; iteration++) {
+                    lock.lock();
+                    try {
+                      counter.incrementAndGet();
+                      schedule[nextRecord.getAndIncrement()] = (byte) id;
+                    } finally {
+                      lock.unlock();
+                    }
+                    Thread.yield();
+                  }
+                } catch (InterruptedException error) {
+                  Thread.currentThread().interrupt();
+                  throw new RuntimeException(error);
+                } finally {
+                  done.countDown();
+                }
+              },
+              "hermit-runtime-" + id);
       workers.add(worker);
       worker.start();
     }
@@ -101,8 +110,8 @@ public final class RuntimeProbe {
       throw new AssertionError("thread counter mismatch: " + counter.get() + " != " + expected);
     }
     String digest = hex(MessageDigest.getInstance("SHA-256").digest(schedule));
-    System.out.println("THREAD workers=" + THREADS + " counter=" + counter.get()
-        + " schedule_sha256=" + digest);
+    System.out.println(
+        "THREAD workers=" + THREADS + " counter=" + counter.get() + " schedule_sha256=" + digest);
   }
 
   private static void systemProbe() throws Exception {
@@ -116,11 +125,23 @@ public final class RuntimeProbe {
         threads = line.substring(line.indexOf(':') + 1).trim();
       }
     }
-    String procHostname = new String(
-        Files.readAllBytes(Paths.get("/proc/sys/kernel/hostname")), StandardCharsets.UTF_8).trim();
-    System.out.println("SYSTEM uname=" + System.getProperty("os.name") + "/"
-        + System.getProperty("os.arch") + " env=" + sentinel + " proc=" + name + "/"
-        + threads + "/" + procHostname);
+    String procHostname =
+        new String(
+                Files.readAllBytes(Paths.get("/proc/sys/kernel/hostname")), StandardCharsets.UTF_8)
+            .trim();
+    System.out.println(
+        "SYSTEM uname="
+            + System.getProperty("os.name")
+            + "/"
+            + System.getProperty("os.arch")
+            + " env="
+            + sentinel
+            + " proc="
+            + name
+            + "/"
+            + threads
+            + "/"
+            + procHostname);
   }
 
   public static void main(String[] args) throws Exception {

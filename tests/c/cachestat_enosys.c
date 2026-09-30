@@ -28,9 +28,12 @@ int main(void) {
   errno = 0;
   long result = syscall(SYS_cachestat, -1, &range, &result_buf, 0U);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "cachestat returned %ld with errno %d (%s), expected ENOSYS\n",
-            result, errno, strerror(errno));
+    fprintf(
+        stderr,
+        "cachestat returned %ld with errno %d (%s), expected ENOSYS\n",
+        result,
+        errno,
+        strerror(errno));
     return 1;
   }
   puts("cachestat deterministically unavailable");

@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 int main(void) {
-  struct robust_list_head *head = NULL;
+  struct robust_list_head* head = NULL;
   size_t length = 0;
 
   if (syscall(SYS_get_robust_list, 0, &head, &length) != 0) {

@@ -30,8 +30,8 @@
  *
  *   vectored_file_io size=10 checksum=959 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #define _GNU_SOURCE
@@ -44,7 +44,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -62,9 +62,9 @@ int main(void) {
 
   /* writev gathers the three iovecs contiguously into the file. */
   struct iovec wv[3] = {
-      {(void *)"abc", 3},
-      {(void *)"defgh", 5},
-      {(void *)"ij", 2},
+      {(void*)"abc", 3},
+      {(void*)"defgh", 5},
+      {(void*)"ij", 2},
   };
   if (writev(fd, wv, 3) == 10)
     ok++;
@@ -83,7 +83,7 @@ int main(void) {
   off_t after_readv = lseek(fd, 0, SEEK_CUR); /* should be 10 */
 
   /* pwritev overwrites [4..8) at an explicit offset, not the file offset. */
-  struct iovec pw[2] = {{(void *)"WX", 2}, {(void *)"YZ", 2}};
+  struct iovec pw[2] = {{(void*)"WX", 2}, {(void*)"YZ", 2}};
   if (pwritev(fd, pw, 2, 4) == 4)
     ok++;
   if (lseek(fd, 0, SEEK_CUR) == after_readv) /* pwritev left the offset alone */
@@ -110,16 +110,23 @@ int main(void) {
   if (close(fd) != 0)
     fail("close");
 
-  printf("vectored_file_io size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
-         checksum, ok);
+  printf(
+      "vectored_file_io size=%ld checksum=%ld ok=%d\n",
+      (long)st.st_size,
+      checksum,
+      ok);
   /* Route a behavioural failure into the exit status. Without this the guest
      exits 0 whatever `ok` reached, so a regression only lowered the printed
      number -- and under --verify both runs lower it identically, so the
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "vectored_file_io completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr,
+        "vectored_file_io completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

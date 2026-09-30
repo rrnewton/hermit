@@ -21,14 +21,17 @@
 
 int main(void) {
   errno = 0;
-  long result = syscall(SYS_add_key, "user", "hermit-add-key", "x", 1,
-                        KEY_SPEC_PROCESS_KEYRING);
+  long result = syscall(
+      SYS_add_key, "user", "hermit-add-key", "x", 1, KEY_SPEC_PROCESS_KEYRING);
   if (result == -1 && errno == ENOSYS) {
     puts("add_key deterministically unavailable");
     return 0;
   }
 
-  fprintf(stderr, "add_key: expected ENOSYS, got result=%ld errno=%d\n",
-          result, errno);
+  fprintf(
+      stderr,
+      "add_key: expected ENOSYS, got result=%ld errno=%d\n",
+      result,
+      errno);
   return 1;
 }

@@ -42,13 +42,13 @@
 
 #define STREAM_BYTES 256
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
 
 /* Write the whole buffer, tolerating short writes. */
-static int write_all(int fd, const uint8_t *buffer, size_t length) {
+static int write_all(int fd, const uint8_t* buffer, size_t length) {
   size_t written = 0;
   while (written < length) {
     ssize_t n = write(fd, buffer + written, length - written);
@@ -115,7 +115,8 @@ int main(void) {
     fail("waitpid");
   int reaped = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
 
-  printf("pipe_ipc bytes=%ld checksum=%ld reaped=%d\n", bytes, checksum, reaped);
+  printf(
+      "pipe_ipc bytes=%ld checksum=%ld reaped=%d\n", bytes, checksum, reaped);
 
   /* Every expected value below is fixed by this fixture's own constants:
      the producer writes STREAM_BYTES bytes with stream[i] = (uint8_t)i, so

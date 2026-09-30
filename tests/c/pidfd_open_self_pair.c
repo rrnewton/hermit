@@ -22,28 +22,35 @@
 #include <unistd.h>
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 6 };
-    int ok = 0;
+  enum { EXPECTED_CHECKS = 6 };
+  int ok = 0;
 
-    // (1) open a pidfd referring to this process via its (virtual) PID.
-    long fd1 = syscall(SYS_pidfd_open, getpid(), 0);
-    if (fd1 >= 0) ok++;
+  // (1) open a pidfd referring to this process via its (virtual) PID.
+  long fd1 = syscall(SYS_pidfd_open, getpid(), 0);
+  if (fd1 >= 0)
+    ok++;
 
-    // (2) a second self pidfd also opens.
-    long fd2 = syscall(SYS_pidfd_open, getpid(), 0);
-    if (fd2 >= 0) ok++;
+  // (2) a second self pidfd also opens.
+  long fd2 = syscall(SYS_pidfd_open, getpid(), 0);
+  if (fd2 >= 0)
+    ok++;
 
-    // (3) the two are distinct open file descriptions (relational, not absolute).
-    if (fd1 >= 0 && fd2 >= 0 && fd2 != fd1) ok++;
+  // (3) the two are distinct open file descriptions (relational, not absolute).
+  if (fd1 >= 0 && fd2 >= 0 && fd2 != fd1)
+    ok++;
 
-    // (4) an invalid flags argument is rejected with EINVAL (faithful error path).
-    long bad = syscall(SYS_pidfd_open, getpid(), 0xFFFFFFFF);
-    if (bad == -1 && errno == EINVAL) ok++;
+  // (4) an invalid flags argument is rejected with EINVAL (faithful error
+  // path).
+  long bad = syscall(SYS_pidfd_open, getpid(), 0xFFFFFFFF);
+  if (bad == -1 && errno == EINVAL)
+    ok++;
 
-    // (5),(6) both descriptors close cleanly.
-    if (fd1 >= 0 && close((int)fd1) == 0) ok++;
-    if (fd2 >= 0 && close((int)fd2) == 0) ok++;
+  // (5),(6) both descriptors close cleanly.
+  if (fd1 >= 0 && close((int)fd1) == 0)
+    ok++;
+  if (fd2 >= 0 && close((int)fd2) == 0)
+    ok++;
 
-    printf("pidfd ok=%d\n", ok);
-    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  printf("pidfd ok=%d\n", ok);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

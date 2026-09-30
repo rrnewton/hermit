@@ -32,8 +32,8 @@
  *
  *   append_pwrite size=7 checksum=473 ok=6
  *
- * It is deliberately free of gated concerns: single process, no fork/thread, and
- * no pid, timestamp, cpu-time, or address is observed.
+ * It is deliberately free of gated concerns: single process, no fork/thread,
+ * and no pid, timestamp, cpu-time, or address is observed.
  */
 
 #include <errno.h>
@@ -44,7 +44,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void fail(const char *message) {
+static void fail(const char* message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
   exit(1);
 }
@@ -71,13 +71,15 @@ int main(void) {
   if (write(fd, "0123", 4) != 4)
     fail("write 0123");
 
-  /* pwrite writes at an explicit offset without moving the descriptor offset. */
+  /* pwrite writes at an explicit offset without moving the descriptor offset.
+   */
   if (pwrite(fd, "XY", 2, 0) != 2)
     fail("pwrite XY");
   if (own_offset(fd) == 4)
     ok++;
 
-  /* The next ordinary write lands at the (unchanged) offset 4 and advances it. */
+  /* The next ordinary write lands at the (unchanged) offset 4 and advances it.
+   */
   if (write(fd, "45", 2) != 2)
     fail("write 45");
   if (own_offset(fd) == 6)
@@ -92,7 +94,8 @@ int main(void) {
   if (own_offset(fd) == 6)
     ok++;
 
-  /* Enable O_APPEND: writes now land at end of file regardless of the offset. */
+  /* Enable O_APPEND: writes now land at end of file regardless of the offset.
+   */
   int flags = fcntl(fd, F_GETFL);
   if (flags < 0)
     fail("fcntl F_GETFL");
@@ -122,16 +125,23 @@ int main(void) {
   if (close(fd) != 0)
     fail("close");
 
-  printf("append_pwrite size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
-         checksum, ok);
+  printf(
+      "append_pwrite size=%ld checksum=%ld ok=%d\n",
+      (long)st.st_size,
+      checksum,
+      ok);
   /* Route a behavioural failure into the exit status. Without this the guest
      exits 0 whatever `ok` reached, so a regression only lowered the printed
      number -- and under --verify both runs lower it identically, so the
      comparison still matches and the cell stays green. Every check above is
      unchanged; this only requires all of them. */
   if (ok != EXPECTED_CHECKS) {
-  	fprintf(stderr, "append_pwrite completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-  	return 1;
+    fprintf(
+        stderr,
+        "append_pwrite completed %d of %d checks\n",
+        ok,
+        EXPECTED_CHECKS);
+    return 1;
   }
   return 0;
 }

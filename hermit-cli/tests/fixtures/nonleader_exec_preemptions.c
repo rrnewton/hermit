@@ -15,17 +15,18 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CHECK(expression)                                                       \
-  do {                                                                          \
-    if (!(expression)) {                                                        \
-      fprintf(stderr, "line %d: %s (errno=%d)\n", __LINE__, #expression, errno);   \
-      _exit(90);                                                                \
-    }                                                                           \
+#define CHECK(expression)                                                    \
+  do {                                                                       \
+    if (!(expression)) {                                                     \
+      fprintf(                                                               \
+          stderr, "line %d: %s (errno=%d)\n", __LINE__, #expression, errno); \
+      _exit(90);                                                             \
+    }                                                                        \
   } while (0)
 
-static const char *target;
+static const char* target;
 
-static void *worker(void *unused) {
+static void* worker(void* unused) {
   (void)unused;
   pid_t pid = (pid_t)syscall(SYS_getpid);
   pid_t tid = (pid_t)syscall(SYS_gettid);
@@ -44,21 +45,27 @@ static void *worker(void *unused) {
     CHECK(now.tv_sec >= 0 && now.tv_nsec >= 0 && now.tv_nsec < 1000000000);
     uint64_t nanos = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
     CHECK(nanos > previous);
-    printf("prefix sample=%u pid=%d worker=%d nanos=%" PRIu64 " work=%" PRIu64
-           "\n", sample, pid, tid, nanos, work);
+    printf(
+        "prefix sample=%u pid=%d worker=%d nanos=%" PRIu64 " work=%" PRIu64
+        "\n",
+        sample,
+        pid,
+        tid,
+        nanos,
+        work);
     previous = nanos;
   }
   CHECK(fflush(stdout) == 0);
   /* Every phase uses the same binary, argv, and pathname. Only the host's
    * presence of an executable at this path changes the result of exec. */
-  char *const args[] = {(char *)target, "replacement", "image", NULL};
+  char* const args[] = {(char*)target, "replacement", "image", NULL};
   execv(target, args);
   CHECK(errno == ENOENT);
   puts("failed-exec-preserved");
   return NULL;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 3 && strcmp(argv[1], "replacement") == 0 &&
       strcmp(argv[2], "image") == 0) {
     char marker[PATH_MAX];

@@ -26,7 +26,8 @@ static int64_t timespec_ns(const struct timespec* value) {
 static int check_clock(const struct clock_case* test) {
   struct timespec before;
   if (clock_gettime(test->id, &before) != 0) {
-    fprintf(stderr, "%s clock_gettime failed: %s\n", test->name, strerror(errno));
+    fprintf(
+        stderr, "%s clock_gettime failed: %s\n", test->name, strerror(errno));
     return 1;
   }
 
@@ -48,7 +49,11 @@ static int check_clock(const struct clock_case* test) {
 
   struct timespec after;
   if (clock_gettime(test->id, &after) != 0) {
-    fprintf(stderr, "%s second clock_gettime failed: %s\n", test->name, strerror(errno));
+    fprintf(
+        stderr,
+        "%s second clock_gettime failed: %s\n",
+        test->name,
+        strerror(errno));
     return 1;
   }
 

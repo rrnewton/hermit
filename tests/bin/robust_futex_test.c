@@ -26,8 +26,8 @@
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdbool.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,14 +57,14 @@ static atomic_bool owner_locked = false;
 static atomic_bool waiter_started = false;
 static bool wait_before_owner_exit = false;
 
-static void *thread_result(int code) {
-  return (void *)(uintptr_t)code;
+static void* thread_result(int code) {
+  return (void*)(uintptr_t)code;
 }
 
-static void *owner_thread(void *unused) {
+static void* owner_thread(void* unused) {
   (void)unused;
 
-  struct robust_list_head *head = NULL;
+  struct robust_list_head* head = NULL;
   size_t len = 0;
   if (syscall(SYS_get_robust_list, 0, &head, &len) != 0) {
     perror("get_robust_list");
@@ -134,7 +134,7 @@ static void *owner_thread(void *unused) {
   return thread_result(OWNER_WAITER_NOT_BLOCKED);
 }
 
-static void *waiter_thread(void *unused) {
+static void* waiter_thread(void* unused) {
   (void)unused;
 
   while (!atomic_load_explicit(&owner_locked, memory_order_acquire)) {
@@ -144,9 +144,11 @@ static void *waiter_thread(void *unused) {
 
   int ret = pthread_mutex_lock(&mutex);
   if (ret != EOWNERDEAD) {
-    fprintf(stderr,
-            "waiter pthread_mutex_lock: expected EOWNERDEAD (%d), got %d\n",
-            EOWNERDEAD, ret);
+    fprintf(
+        stderr,
+        "waiter pthread_mutex_lock: expected EOWNERDEAD (%d), got %d\n",
+        EOWNERDEAD,
+        ret);
     if (ret == 0) {
       pthread_mutex_unlock(&mutex);
     }
@@ -166,14 +168,14 @@ static void *waiter_thread(void *unused) {
   return NULL;
 }
 
-static void check_pthread(int ret, const char *operation) {
+static void check_pthread(int ret, const char* operation) {
   if (ret != 0) {
     fprintf(stderr, "%s: %d\n", operation, ret);
     exit(EXIT_FAILURE);
   }
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "--wait-before-owner-exit") == 0) {
     wait_before_owner_exit = true;
   } else if (argc != 1) {
@@ -183,27 +185,32 @@ int main(int argc, char **argv) {
 
   pthread_mutexattr_t attr;
   check_pthread(pthread_mutexattr_init(&attr), "pthread_mutexattr_init");
-  check_pthread(pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST),
-                "pthread_mutexattr_setrobust");
+  check_pthread(
+      pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST),
+      "pthread_mutexattr_setrobust");
   check_pthread(pthread_mutex_init(&mutex, &attr), "pthread_mutex_init");
   check_pthread(pthread_mutexattr_destroy(&attr), "pthread_mutexattr_destroy");
 
   pthread_t owner;
   pthread_t waiter;
-  check_pthread(pthread_create(&owner, NULL, owner_thread, NULL),
-                "pthread_create(owner)");
-  check_pthread(pthread_create(&waiter, NULL, waiter_thread, NULL),
-                "pthread_create(waiter)");
+  check_pthread(
+      pthread_create(&owner, NULL, owner_thread, NULL),
+      "pthread_create(owner)");
+  check_pthread(
+      pthread_create(&waiter, NULL, waiter_thread, NULL),
+      "pthread_create(waiter)");
 
-  void *owner_result = NULL;
-  void *waiter_result = NULL;
+  void* owner_result = NULL;
+  void* waiter_result = NULL;
   check_pthread(pthread_join(owner, &owner_result), "pthread_join(owner)");
   check_pthread(pthread_join(waiter, &waiter_result), "pthread_join(waiter)");
 
   if (owner_result != NULL || waiter_result != NULL) {
-    fprintf(stderr, "owner result=%lu, waiter result=%lu\n",
-            (unsigned long)(uintptr_t)owner_result,
-            (unsigned long)(uintptr_t)waiter_result);
+    fprintf(
+        stderr,
+        "owner result=%lu, waiter result=%lu\n",
+        (unsigned long)(uintptr_t)owner_result,
+        (unsigned long)(uintptr_t)waiter_result);
     return EXIT_FAILURE;
   }
 

@@ -45,15 +45,15 @@
 
 /* Hermit's documented virtual container identity. */
 #define VIRT_NODENAME "hermetic-container.local"
-#define VIRT_RELEASE  "5.2.0"
-#define VIRT_SYSNAME  "Linux"
-#define VIRT_MACHINE  "x86_64"
+#define VIRT_RELEASE "5.2.0"
+#define VIRT_SYSNAME "Linux"
+#define VIRT_MACHINE "x86_64"
 #define VIRT_TOTALRAM 1000000000UL
-#define VIRT_PROCS    1U
+#define VIRT_PROCS 1U
 /* sysinfo(2) rounds positive fractional uptime up. This fixture expects its
  * initial observation in the first elapsed second after the configured
  * 120-second boot offset, so the exact integer uptime must be 121. */
-#define VIRT_UPTIME   121L
+#define VIRT_UPTIME 121L
 #define VIRT_AFFINITY 1
 
 static int fail(const char* field, const char* got) {
@@ -72,17 +72,22 @@ int main(void) {
   printf("uname.nodename=%s\n", u.nodename);
   printf("uname.release=%s\n", u.release);
   printf("uname.machine=%s\n", u.machine);
-  if (strcmp(u.sysname, VIRT_SYSNAME) != 0) bad |= fail("uname.sysname", u.sysname);
-  if (strcmp(u.nodename, VIRT_NODENAME) != 0) bad |= fail("uname.nodename", u.nodename);
-  if (strcmp(u.release, VIRT_RELEASE) != 0) bad |= fail("uname.release", u.release);
-  if (strcmp(u.machine, VIRT_MACHINE) != 0) bad |= fail("uname.machine", u.machine);
+  if (strcmp(u.sysname, VIRT_SYSNAME) != 0)
+    bad |= fail("uname.sysname", u.sysname);
+  if (strcmp(u.nodename, VIRT_NODENAME) != 0)
+    bad |= fail("uname.nodename", u.nodename);
+  if (strcmp(u.release, VIRT_RELEASE) != 0)
+    bad |= fail("uname.release", u.release);
+  if (strcmp(u.machine, VIRT_MACHINE) != 0)
+    bad |= fail("uname.machine", u.machine);
 
   char host[256] = {0};
   if (gethostname(host, sizeof(host) - 1) != 0) {
     return fail("gethostname", "syscall failed");
   }
   printf("gethostname=%s\n", host);
-  if (strcmp(host, VIRT_NODENAME) != 0) bad |= fail("gethostname", host);
+  if (strcmp(host, VIRT_NODENAME) != 0)
+    bad |= fail("gethostname", host);
 
   struct sysinfo si;
   if (sysinfo(&si) != 0) {
@@ -91,9 +96,12 @@ int main(void) {
   printf("sysinfo.totalram=%lu\n", (unsigned long)si.totalram);
   printf("sysinfo.procs=%u\n", si.procs);
   printf("sysinfo.uptime=%ld\n", (long)si.uptime);
-  if ((unsigned long)si.totalram != VIRT_TOTALRAM) bad |= fail("sysinfo.totalram", "host memory size");
-  if (si.procs != VIRT_PROCS) bad |= fail("sysinfo.procs", "host process count");
-  if ((long)si.uptime != VIRT_UPTIME) bad |= fail("sysinfo.uptime", "host uptime");
+  if ((unsigned long)si.totalram != VIRT_TOTALRAM)
+    bad |= fail("sysinfo.totalram", "host memory size");
+  if (si.procs != VIRT_PROCS)
+    bad |= fail("sysinfo.procs", "host process count");
+  if ((long)si.uptime != VIRT_UPTIME)
+    bad |= fail("sysinfo.uptime", "host uptime");
 
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -101,7 +109,8 @@ int main(void) {
     return fail("sched_getaffinity", "syscall failed");
   }
   printf("affinity_count=%d\n", CPU_COUNT(&set));
-  if (CPU_COUNT(&set) != VIRT_AFFINITY) bad |= fail("affinity_count", "host CPU mask");
+  if (CPU_COUNT(&set) != VIRT_AFFINITY)
+    bad |= fail("affinity_count", "host CPU mask");
 
   /* RECORDED, NOT ASSERTED: still leaks host topology (see header). */
   printf("sysconf_nprocs_onln=%ld\n", sysconf(_SC_NPROCESSORS_ONLN));

@@ -20,23 +20,23 @@
  * from the clock at write time. If the clock is virtualised but the filesystem
  * timestamp is not, a build, an archive, a cache key, or anything that hashes
  * file metadata becomes nondeterministic while every read and write still
- * succeeds. It is the same shape as the /proc leak -- nothing errors, the values
- * are simply the host's.
+ * succeeds. It is the same shape as the /proc leak -- nothing errors, the
+ * values are simply the host's.
  *
  * WHAT IS ASSERTED, AND WHAT IS NOT.
  *
  * Timestamps are printed, never compared against constants. They MUST keep
  * advancing: a file written later in the run should be able to have a later
  * mtime than one written earlier, and freezing every timestamp to a fixed value
- * would satisfy an equality check while destroying the ordering information that
- * makes mtimes useful (#140 again -- a frozen clock is not determinism). What is
- * required is that the same sequence of writes produces the same sequence of
- * timestamps every run.
+ * would satisfy an equality check while destroying the ordering information
+ * that makes mtimes useful (#140 again -- a frozen clock is not determinism).
+ * What is required is that the same sequence of writes produces the same
+ * sequence of timestamps every run.
  *
- * ORDERING is therefore checked explicitly, as a derived relation rather than as
- * a raw value: `later >= earlier` is printed as its own line. A run where the
- * absolute values changed but the ordering held would still be a divergence and
- * still be caught by the raw values; a run where the ORDERING inverted is a
+ * ORDERING is therefore checked explicitly, as a derived relation rather than
+ * as a raw value: `later >= earlier` is printed as its own line. A run where
+ * the absolute values changed but the ordering held would still be a divergence
+ * and still be caught by the raw values; a run where the ORDERING inverted is a
  * different and worse bug, and printing the relation names it directly instead
  * of leaving a reader to compare two hex numbers.
  *
@@ -154,14 +154,19 @@ int main(void) {
   /* --- ORDERING, as a derived relation ------------------------------------
    * Printed as its own line so an inverted ordering is named directly rather
    * than left for a reader to infer by comparing two timestamps. */
-  printf("ORDER first_le_second %d\n", mtime_le("ts_first.txt", "ts_second.txt"));
-  printf("ORDER second_le_inner %d\n", mtime_le("ts_second.txt", "ts_dir/inner.txt"));
+  printf(
+      "ORDER first_le_second %d\n", mtime_le("ts_first.txt", "ts_second.txt"));
+  printf(
+      "ORDER second_le_inner %d\n",
+      mtime_le("ts_second.txt", "ts_dir/inner.txt"));
 
   /* --- rewrite: does mtime advance, and reproducibly? --------------------- */
   if (write_file("ts_first.txt", "first, rewritten\n") == 0) {
     printf("AFTER REWRITE\n");
     show_stat("ts_first.txt");
-    printf("ORDER rewritten_ge_second %d\n", mtime_le("ts_second.txt", "ts_first.txt"));
+    printf(
+        "ORDER rewritten_ge_second %d\n",
+        mtime_le("ts_second.txt", "ts_first.txt"));
   }
 
   /* --- explicit timestamp control -----------------------------------------
@@ -192,12 +197,19 @@ int main(void) {
 
   /* --- statx, for the fields plain stat cannot show -----------------------
    * btime in particular: a creation time is set once and never updated, so a
-   * tool that determinizes mtime on write can still leak the host clock here. */
+   * tool that determinizes mtime on write can still leak the host clock here.
+   */
   struct statx sx;
   if (statx(AT_FDCWD, "ts_first.txt", 0, STATX_ALL, &sx) == 0) {
     printf("STATX ts_first.txt mask=0x%x\n", sx.stx_mask);
-    printf("  btime      %lld.%09u\n", (long long)sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec);
-    printf("  mtime      %lld.%09u\n", (long long)sx.stx_mtime.tv_sec, sx.stx_mtime.tv_nsec);
+    printf(
+        "  btime      %lld.%09u\n",
+        (long long)sx.stx_btime.tv_sec,
+        sx.stx_btime.tv_nsec);
+    printf(
+        "  mtime      %lld.%09u\n",
+        (long long)sx.stx_mtime.tv_sec,
+        sx.stx_mtime.tv_nsec);
     printf("  blocks     %lld\n", (long long)sx.stx_blocks);
     printf("  blksize    %u\n", sx.stx_blksize);
     printf("  attributes 0x%llx\n", (unsigned long long)sx.stx_attributes);

@@ -32,15 +32,19 @@ int main(void) {
   };
 
   errno = 0;
-  long result = syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
+  long result =
+      syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
   if (result == -1 && errno == EPERM && destination == 0xa5) {
     puts("process-vm-readv-refused-ok");
     return 0;
   }
 
-  fprintf(stderr,
-          "process_vm_readv: expected EPERM/no copy, got result=%ld errno=%d "
-          "destination=%#x\n",
-          result, errno, destination);
+  fprintf(
+      stderr,
+      "process_vm_readv: expected EPERM/no copy, got result=%ld errno=%d "
+      "destination=%#x\n",
+      result,
+      errno,
+      destination);
   return 1;
 }

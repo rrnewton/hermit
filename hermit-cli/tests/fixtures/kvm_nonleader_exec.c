@@ -9,30 +9,30 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static const char *program;
-static const char *mode;
-static const char *malformed;
-static const char *missing;
+static const char* program;
+static const char* mode;
+static const char* malformed;
+static const char* missing;
 
 static void require(int condition) {
   if (!condition)
     _exit(90);
 }
 
-static void emit(const char *text) {
+static void emit(const char* text) {
   size_t length = strlen(text);
   require(write(STDOUT_FILENO, text, length) == (ssize_t)length);
 }
 
-static int replace(const char *path, int at) {
-  char *const args[] = {(char *)path, "replacement", NULL};
-  char *const environment[] = {"LC_ALL=C", NULL};
+static int replace(const char* path, int at) {
+  char* const args[] = {(char*)path, "replacement", NULL};
+  char* const environment[] = {"LC_ALL=C", NULL};
   if (at)
     return (int)syscall(SYS_execveat, AT_FDCWD, path, args, environment, 0);
   return execve(path, args, environment);
 }
 
-static void *worker(void *unused) {
+static void* worker(void* unused) {
   (void)unused;
   require(syscall(SYS_gettid) != getpid());
   if (strcmp(mode, "errors") == 0) {
@@ -50,7 +50,7 @@ static void *worker(void *unused) {
   return NULL;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   require(argc >= 2);
   if (strcmp(argv[1], "replacement") == 0) {
     require(syscall(SYS_gettid) == getpid());

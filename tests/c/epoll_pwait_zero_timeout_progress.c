@@ -69,9 +69,16 @@ static atomic_ullong g_value = 0;
 static int g_event_fd = -1;
 
 /* Raw epoll_pwait with an explicitly NULL sigmask. */
-static int epoll_pwait_zero_timeout(int epfd, struct epoll_event* events, int maxevents) {
-  return (int)syscall(SYS_epoll_pwait, epfd, events, maxevents, /*timeout=*/0, /*sigmask=*/NULL,
-                      /*sigsetsize=*/(size_t)8);
+static int
+epoll_pwait_zero_timeout(int epfd, struct epoll_event* events, int maxevents) {
+  return (int)syscall(
+      SYS_epoll_pwait,
+      epfd,
+      events,
+      maxevents,
+      /*timeout=*/0,
+      /*sigmask=*/NULL,
+      /*sigsetsize=*/(size_t)8);
 }
 
 static void* worker(void* arg) {
@@ -110,7 +117,8 @@ static void* worker(void* arg) {
  */
 static void* sleeping_worker(void* arg) {
   (void)arg;
-  struct timespec delay = {0, 50 * 1000 * 1000}; /* 50ms: the waiter must block first. */
+  struct timespec delay = {
+      0, 50 * 1000 * 1000}; /* 50ms: the waiter must block first. */
   nanosleep(&delay, NULL);
 
   atomic_store(&g_value, PUBLISHED_VALUE);
@@ -133,8 +141,14 @@ static int run_blocking_mode(int epfd) {
    * libuv, and the one that used to wedge the whole guest. */
   struct epoll_event got;
   for (;;) {
-    int n = (int)syscall(SYS_epoll_pwait, epfd, &got, 1, /*timeout=*/-1, /*sigmask=*/NULL,
-                         /*sigsetsize=*/(size_t)8);
+    int n = (int)syscall(
+        SYS_epoll_pwait,
+        epfd,
+        &got,
+        1,
+        /*timeout=*/-1,
+        /*sigmask=*/NULL,
+        /*sigsetsize=*/(size_t)8);
     if (n < 0) {
       if (errno == EINTR) {
         continue;

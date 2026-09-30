@@ -53,8 +53,8 @@ int main(void) {
 
   errno = 0;
   if (syscall(SYS_getitimer, 99, &current) != -1 || errno != EINVAL) {
-    fprintf(stderr, "invalid getitimer: expected EINVAL, got errno=%d\n",
-            errno);
+    fprintf(
+        stderr, "invalid getitimer: expected EINVAL, got errno=%d\n", errno);
     return 5;
   }
 

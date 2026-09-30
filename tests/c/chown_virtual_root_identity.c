@@ -65,7 +65,11 @@ static void expect_ok(const char* what, int rc) {
     printf("ok       %-42s rc=0\n", what);
     return;
   }
-  printf("FAIL     %-42s expected rc=0, got rc=%d errno=%s\n", what, rc, errno_name(errno));
+  printf(
+      "FAIL     %-42s expected rc=0, got rc=%d errno=%s\n",
+      what,
+      rc,
+      errno_name(errno));
   failures++;
 }
 
@@ -73,12 +77,19 @@ static void expect_ok(const char* what, int rc) {
  * reach the guest, with the errno Linux would have produced. */
 static void expect_errno(const char* what, int rc, int wanted) {
   if (rc == 0) {
-    printf("FAIL     %-42s expected %s, got rc=0 (error swallowed)\n", what, errno_name(wanted));
+    printf(
+        "FAIL     %-42s expected %s, got rc=0 (error swallowed)\n",
+        what,
+        errno_name(wanted));
     failures++;
     return;
   }
   if (errno != wanted) {
-    printf("FAIL     %-42s expected %s, got %s\n", what, errno_name(wanted), errno_name(errno));
+    printf(
+        "FAIL     %-42s expected %s, got %s\n",
+        what,
+        errno_name(wanted),
+        errno_name(errno));
     failures++;
     return;
   }
@@ -124,8 +135,10 @@ int main(void) {
   }
   const mode_t mode_before = before.st_mode & 07777;
   if (mode_before != 06755) {
-    printf("FAIL     %-42s expected mode=6755, got mode=%04o\n", "set-id canary armed",
-           mode_before);
+    printf(
+        "FAIL     %-42s expected mode=6755, got mode=%04o\n",
+        "set-id canary armed",
+        mode_before);
     return 1;
   }
 
@@ -133,9 +146,11 @@ int main(void) {
   expect_ok("chown(file, FOREIGN)", chown(path, FOREIGN_UID, FOREIGN_GID));
   expect_ok("chown(file, 0, 0)", chown(path, 0, 0));
   expect_ok("fchown(fd, FOREIGN)", fchown(fd, FOREIGN_UID, FOREIGN_GID));
-  expect_ok("lchown(symlink, FOREIGN)", lchown(link_path, FOREIGN_UID, FOREIGN_GID));
-  expect_ok("fchownat(AT_FDCWD, file, FOREIGN)",
-            (int)syscall(SYS_fchownat, AT_FDCWD, path, FOREIGN_UID, FOREIGN_GID, 0));
+  expect_ok(
+      "lchown(symlink, FOREIGN)", lchown(link_path, FOREIGN_UID, FOREIGN_GID));
+  expect_ok(
+      "fchownat(AT_FDCWD, file, FOREIGN)",
+      (int)syscall(SYS_fchownat, AT_FDCWD, path, FOREIGN_UID, FOREIGN_GID, 0));
   /* -1 means "leave unchanged"; a real root gets 0 and so must the guest. */
   expect_ok("chown(file, -1, -1)", chown(path, (uid_t)-1, (gid_t)-1));
 
@@ -147,8 +162,10 @@ int main(void) {
   errno = 0;
   expect_errno("lchown(MISSING)", lchown(missing, 0, 0), ENOENT);
   errno = 0;
-  expect_errno("fchownat(AT_FDCWD, MISSING)",
-               (int)syscall(SYS_fchownat, AT_FDCWD, missing, 0, 0, 0), ENOENT);
+  expect_errno(
+      "fchownat(AT_FDCWD, MISSING)",
+      (int)syscall(SYS_fchownat, AT_FDCWD, missing, 0, 0, 0),
+      ENOENT);
   errno = 0;
   expect_errno("fchown(-1)", fchown(-1, 0, 0), EBADF);
   errno = 0;
@@ -165,11 +182,16 @@ int main(void) {
   close(path_fd);
   errno = 0;
   /* A regular file used as a directory component. */
-  expect_errno("chown(file/child)", chown("chown_virtual_root_target/child", 0, 0), ENOTDIR);
+  expect_errno(
+      "chown(file/child)",
+      chown("chown_virtual_root_target/child", 0, 0),
+      ENOTDIR);
   errno = 0;
   /* An unrecognised AT_* flag is rejected before anything else happens. */
-  expect_errno("fchownat(bad flags)",
-               (int)syscall(SYS_fchownat, AT_FDCWD, path, 0, 0, 0x4000), EINVAL);
+  expect_errno(
+      "fchownat(bad flags)",
+      (int)syscall(SYS_fchownat, AT_FDCWD, path, 0, 0, 0x4000),
+      EINVAL);
 
   /* ---- Read-back. Two different expectations, deliberately:
    *
@@ -188,36 +210,57 @@ int main(void) {
     return 1;
   }
   if (st.st_uid != before.st_uid || st.st_gid != before.st_gid) {
-    printf("FAIL     %-42s owner changed %u:%u -> %u:%u\n", "stat(file) read-back",
-           (unsigned)before.st_uid, (unsigned)before.st_gid, (unsigned)st.st_uid,
-           (unsigned)st.st_gid);
+    printf(
+        "FAIL     %-42s owner changed %u:%u -> %u:%u\n",
+        "stat(file) read-back",
+        (unsigned)before.st_uid,
+        (unsigned)before.st_gid,
+        (unsigned)st.st_uid,
+        (unsigned)st.st_gid);
     failures++;
   } else {
-    printf("ok       %-42s owner unchanged (%u:%u), as documented\n", "stat(file) read-back",
-           (unsigned)st.st_uid, (unsigned)st.st_gid);
+    printf(
+        "ok       %-42s owner unchanged (%u:%u), as documented\n",
+        "stat(file) read-back",
+        (unsigned)st.st_uid,
+        (unsigned)st.st_gid);
   }
   /* Set-id clearing is a privilege-containment mechanism, not bookkeeping, and
    * Linux has applied it to root like any other user since 2.2.13. Measured
    * natively: 06755 -> 0755 for chown(path, -1, -1). */
   const mode_t mode_after = st.st_mode & 07777;
   if (mode_after != 0755) {
-    printf("FAIL     %-42s expected set-id cleared %04o -> 0755, got %04o\n",
-           "stat(file) mode read-back", mode_before, mode_after);
+    printf(
+        "FAIL     %-42s expected set-id cleared %04o -> 0755, got %04o\n",
+        "stat(file) mode read-back",
+        mode_before,
+        mode_after);
     failures++;
   } else {
-    printf("ok       %-42s set-id cleared %04o -> %04o, as Linux does\n",
-           "stat(file) mode read-back", mode_before, mode_after);
+    printf(
+        "ok       %-42s set-id cleared %04o -> %04o, as Linux does\n",
+        "stat(file) mode read-back",
+        mode_before,
+        mode_after);
   }
   /* ATTR_CTIME is set unconditionally, so ctime moves even when there was
    * nothing to clear and even for a directory. */
-  if (st.st_ctim.tv_sec == before.st_ctim.tv_sec && st.st_ctim.tv_nsec == before.st_ctim.tv_nsec) {
-    printf("FAIL     %-42s ctime did not move (%lld.%09ld); Linux always sets ATTR_CTIME\n",
-           "stat(file) ctime read-back", (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+  if (st.st_ctim.tv_sec == before.st_ctim.tv_sec &&
+      st.st_ctim.tv_nsec == before.st_ctim.tv_nsec) {
+    printf(
+        "FAIL     %-42s ctime did not move (%lld.%09ld); Linux always sets ATTR_CTIME\n",
+        "stat(file) ctime read-back",
+        (long long)st.st_ctim.tv_sec,
+        st.st_ctim.tv_nsec);
     failures++;
   } else {
-    printf("ok       %-42s ctime moved %lld.%09ld -> %lld.%09ld\n", "stat(file) ctime read-back",
-           (long long)before.st_ctim.tv_sec, before.st_ctim.tv_nsec, (long long)st.st_ctim.tv_sec,
-           st.st_ctim.tv_nsec);
+    printf(
+        "ok       %-42s ctime moved %lld.%09ld -> %lld.%09ld\n",
+        "stat(file) ctime read-back",
+        (long long)before.st_ctim.tv_sec,
+        before.st_ctim.tv_nsec,
+        (long long)st.st_ctim.tv_sec,
+        st.st_ctim.tv_nsec);
   }
 
   /* The condition on S_ISGID, which a "clear both bits always" implementation
@@ -234,7 +277,9 @@ int main(void) {
       perror("fchmod(sgid canary)");
       return 1;
     }
-    expect_ok("chown(sgid, no x-grp, -1, -1)", chown(sgid_path, (uid_t)-1, (gid_t)-1));
+    expect_ok(
+        "chown(sgid, no x-grp, -1, -1)",
+        chown(sgid_path, (uid_t)-1, (gid_t)-1));
     struct stat sgid_st;
     if (stat(sgid_path, &sgid_st) != 0) {
       perror("stat(sgid canary)");
@@ -242,12 +287,16 @@ int main(void) {
     }
     const mode_t sgid_mode = sgid_st.st_mode & 07777;
     if (sgid_mode != 02644) {
-      printf("FAIL     %-42s S_ISGID must survive without S_IXGRP: 2644 -> %04o\n",
-             "stat(sgid no-x-grp) mode read-back", sgid_mode);
+      printf(
+          "FAIL     %-42s S_ISGID must survive without S_IXGRP: 2644 -> %04o\n",
+          "stat(sgid no-x-grp) mode read-back",
+          sgid_mode);
       failures++;
     } else {
-      printf("ok       %-42s S_ISGID preserved (%04o), no S_IXGRP\n",
-             "stat(sgid no-x-grp) mode read-back", sgid_mode);
+      printf(
+          "ok       %-42s S_ISGID preserved (%04o), no S_IXGRP\n",
+          "stat(sgid no-x-grp) mode read-back",
+          sgid_mode);
     }
     close(sgid_fd);
     unlink(sgid_path);
@@ -265,7 +314,8 @@ int main(void) {
       perror("chmod(dir canary)");
       return 1;
     }
-    expect_ok("chown(directory, -1, -1)", chown(dir_path, (uid_t)-1, (gid_t)-1));
+    expect_ok(
+        "chown(directory, -1, -1)", chown(dir_path, (uid_t)-1, (gid_t)-1));
     struct stat dir_st;
     if (stat(dir_path, &dir_st) != 0) {
       perror("stat(dir canary)");
@@ -273,12 +323,16 @@ int main(void) {
     }
     const mode_t dir_mode = dir_st.st_mode & 07777;
     if (dir_mode != 06755) {
-      printf("FAIL     %-42s directories are exempt: 6755 -> %04o\n",
-             "stat(directory) mode read-back", dir_mode);
+      printf(
+          "FAIL     %-42s directories are exempt: 6755 -> %04o\n",
+          "stat(directory) mode read-back",
+          dir_mode);
       failures++;
     } else {
-      printf("ok       %-42s set-id preserved on directory (%04o)\n",
-             "stat(directory) mode read-back", dir_mode);
+      printf(
+          "ok       %-42s set-id preserved on directory (%04o)\n",
+          "stat(directory) mode read-back",
+          dir_mode);
     }
     rmdir(dir_path);
   }

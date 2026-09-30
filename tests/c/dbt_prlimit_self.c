@@ -44,7 +44,7 @@ int main(void) {
   }
 
   errno = 0;
-  if (syscall(SYS_prlimit64, self + 1, RLIMIT_NOFILE, (void *)1, NULL) != -1 ||
+  if (syscall(SYS_prlimit64, self + 1, RLIMIT_NOFILE, (void*)1, NULL) != -1 ||
       errno != EFAULT) {
     fprintf(stderr, "prlimit64 bad input returned errno=%d\n", errno);
     return 5;

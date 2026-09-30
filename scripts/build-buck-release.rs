@@ -128,7 +128,8 @@ const UNWIND_PTRACE_ARCHIVE: &str = "libunwind-ptrace.a";
 const UNWIND_ARCH_SONAME: &str = "libunwind-x86_64.so.8";
 const UNWIND_CORE_SONAME: &str = "libunwind.so.8";
 const UNWIND_RUNTIME_RELATIVE: &str = "rsrcs/hermit-runtime";
-const RELEASE_RPATH: &str = "$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime";
+const RELEASE_RPATH: &str =
+    "$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime";
 const UNWIND_BUCK_PACKAGE: &str = "prebuilt_cxx_library(\n    name = \"_unwind_core\",\n    shared_lib = \"libunwind.so.8\",\n)\n\nprebuilt_cxx_library(\n    name = \"_unwind_arch\",\n    shared_lib = \"libunwind-x86_64.so.8\",\n    exported_deps = [\":_unwind_core\"],\n)\n\nprebuilt_cxx_library(\n    name = \"unwind\",\n    static_lib = \"libunwind-ptrace.a\",\n    exported_deps = [\":_unwind_arch\"],\n    visibility = [\"PUBLIC\"],\n)\n";
 const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
     "ld-linux-x86-64.so.2",
@@ -1074,10 +1075,8 @@ fn verify_lzma_buck_input(input: &LzmaBuckInput) -> Result<(), String> {
         return Err("declared liblzma snapshot hash differs from its content identity".into());
     }
     verify_lzma_elf(&library)?;
-    let buck_path = require_nonempty_regular_file(
-        &input.root.join("BUCK"),
-        "declared liblzma BUCK package",
-    )?;
+    let buck_path =
+        require_nonempty_regular_file(&input.root.join("BUCK"), "declared liblzma BUCK package")?;
     let buck = fs::read_to_string(buck_path)
         .map_err(|error| format!("declared liblzma BUCK file is unreadable: {error}"))?;
     if buck != LZMA_BUCK_PACKAGE {
@@ -1154,7 +1153,9 @@ fn publish_lzma_buck_input(
         &evidence_dir.join("lzma-input.tsv"),
         &format!(
             "schema\thermit-buck-lzma-input/v1\nsource\t{}\nsha256\t{}\ntarget\t{}\n",
-            input.source.display(), input.source_sha256, input.target
+            input.source.display(),
+            input.source_sha256,
+            input.target
         ),
     )?;
     Ok(input)
@@ -1196,11 +1197,7 @@ fn dynamic_values(path: &Path, tag: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn verify_shared_library(
-    path: &Path,
-    soname: &str,
-    needed: &[&str],
-) -> Result<(), String> {
+fn verify_shared_library(path: &Path, soname: &str, needed: &[&str]) -> Result<(), String> {
     require_nonempty_regular_file(path, &format!("{soname} shared library"))?;
     if elf_identity(path)? != (2, 1, 3, 62) {
         return Err(format!(
@@ -1225,9 +1222,7 @@ fn verify_shared_library(
             "shared library {soname} has DT_NEEDED {actual_needed:?}, expected exactly {expected_needed:?}"
         ));
     }
-    if !dynamic_values(path, "RPATH")?.is_empty()
-        || !dynamic_values(path, "RUNPATH")?.is_empty()
-    {
+    if !dynamic_values(path, "RPATH")?.is_empty() || !dynamic_values(path, "RUNPATH")?.is_empty() {
         return Err(format!(
             "shared library {soname} must not carry RPATH or RUNPATH"
         ));
@@ -1284,10 +1279,7 @@ fn require_unwind_closure() -> Result<UnwindClosure, String> {
             UNWIND_ARCH_SONAME,
             "canonical libunwind architecture runtime",
         )?,
-        core_shared: require_gcc_library(
-            UNWIND_CORE_SONAME,
-            "canonical libunwind core runtime",
-        )?,
+        core_shared: require_gcc_library(UNWIND_CORE_SONAME, "canonical libunwind core runtime")?,
     };
     verify_static_archive(&closure.ptrace_archive)?;
     verify_unwind_shared_pair(&closure.arch_shared, &closure.core_shared)?;
@@ -1411,9 +1403,8 @@ fn publish_unwind_buck_input(
         let copy_result = (|| {
             for (name, source) in unwind_sources(&temporary_input.sources) {
                 let before = sha256(source)?;
-                fs::copy(source, temporary.join(name)).map_err(|error| {
-                    format!("failed to copy declared {name} input: {error}")
-                })?;
+                fs::copy(source, temporary.join(name))
+                    .map_err(|error| format!("failed to copy declared {name} input: {error}"))?;
                 let after = sha256(source)?;
                 let expected = &temporary_input.source_sha256[name];
                 if before != *expected || after != *expected {
@@ -1446,12 +1437,17 @@ fn publish_unwind_buck_input(
     let rows = input
         .source_sha256
         .iter()
-        .map(|(name, hash)| format!("source\t{name}\t{}\t{hash}\n", match name.as_str() {
-            UNWIND_PTRACE_ARCHIVE => input.sources.ptrace_archive.display().to_string(),
-            UNWIND_ARCH_SONAME => input.sources.arch_shared.display().to_string(),
-            UNWIND_CORE_SONAME => input.sources.core_shared.display().to_string(),
-            _ => unreachable!(),
-        }))
+        .map(|(name, hash)| {
+            format!(
+                "source\t{name}\t{}\t{hash}\n",
+                match name.as_str() {
+                    UNWIND_PTRACE_ARCHIVE => input.sources.ptrace_archive.display().to_string(),
+                    UNWIND_ARCH_SONAME => input.sources.arch_shared.display().to_string(),
+                    UNWIND_CORE_SONAME => input.sources.core_shared.display().to_string(),
+                    _ => unreachable!(),
+                }
+            )
+        })
         .collect::<String>();
     atomic_write_new(
         &evidence_dir.join("unwind-input.tsv"),
@@ -2938,9 +2934,9 @@ fn validate_release_needed_libraries(libraries: &BTreeSet<String>) -> Result<(),
         };
         if stem.is_empty()
             || abi.is_empty()
-            || abi
-                .split('.')
-                .any(|component| component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()))
+            || abi.split('.').any(|component| {
+                component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit())
+            })
         {
             return Err(format!(
                 "Buck validate candidate has nonportable DT_NEEDED ABI {library:?}"
@@ -2976,9 +2972,7 @@ fn validate_release_rpath(path: &Path) -> Result<(), String> {
             "$ORIGIN/install/rsrcs/hermit-runtime",
         ]
         || components.iter().any(|component| {
-            component.is_empty()
-                || component.starts_with('/')
-                || !component.starts_with("$ORIGIN/")
+            component.is_empty() || component.starts_with('/') || !component.starts_with("$ORIGIN/")
         })
     {
         return Err("reviewed Buck release RPATH contains an ambient or absolute component".into());
@@ -3090,13 +3084,11 @@ fn install_runtime_bundle(
     }
     if let Ok(metadata) = fs::symlink_metadata(&destination) {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir_all(&destination).map_err(|error| {
-                format!("failed to replace {}: {error}", destination.display())
-            })?;
+            fs::remove_dir_all(&destination)
+                .map_err(|error| format!("failed to replace {}: {error}", destination.display()))?;
         } else {
-            fs::remove_file(&destination).map_err(|error| {
-                format!("failed to replace {}: {error}", destination.display())
-            })?;
+            fs::remove_file(&destination)
+                .map_err(|error| format!("failed to replace {}: {error}", destination.display()))?;
         }
     }
     fs::rename(&temporary, &destination).map_err(|error| {
@@ -3763,7 +3755,11 @@ const CLOCK_FIXTURE_WORK_ITERATIONS: [u64; 4] = [0, 100_000, 100_000, 200_000];
 /// Mirrors the fixture's `do_work`, so a checksum proves the declared work ran.
 fn clock_fixture_work_checksum(iterations: u64) -> u64 {
     (0..iterations).fold(27, |value: u64, _| {
-        if value & 1 == 1 { value.wrapping_mul(3).wrapping_add(1) } else { value >> 1 }
+        if value & 1 == 1 {
+            value.wrapping_mul(3).wrapping_add(1)
+        } else {
+            value >> 1
+        }
     })
 }
 
@@ -3817,10 +3813,12 @@ fn parse_clock_trajectory(stdout: &str) -> Result<ClockTrajectory, String> {
         .ok_or("clock trajectory must end with one newline")?;
     let mut lines = body.split('\n');
     let mut record = |head: String, keys: &[&str]| -> Result<Vec<u64>, String> {
-        let line = lines.next().ok_or(format!("clock trajectory lacks {head:?}"))?;
-        let mut rest = line
-            .strip_prefix(head.as_str())
-            .ok_or(format!("clock trajectory expected {head:?}, found {line:?}"))?;
+        let line = lines
+            .next()
+            .ok_or(format!("clock trajectory lacks {head:?}"))?;
+        let mut rest = line.strip_prefix(head.as_str()).ok_or(format!(
+            "clock trajectory expected {head:?}, found {line:?}"
+        ))?;
         let mut values = Vec::new();
         for key in keys {
             let (value, tail) = rest
@@ -3843,19 +3841,26 @@ fn parse_clock_trajectory(stdout: &str) -> Result<ClockTrajectory, String> {
     for generation in 0..3 {
         let mut main = Vec::new();
         for index in 0..8 {
-            let ns = record(format!("sample gen={generation} source=main index={index}"), &["ns"])?[0];
+            let ns = record(
+                format!("sample gen={generation} source=main index={index}"),
+                &["ns"],
+            )?[0];
             clock_advance(MONOTONIC, &mut last, ns)?;
             main.push(ns);
         }
         let first = main[0];
         monotonic_first.get_or_insert(first);
         if first % 1_000_000_000 == 0 {
-            return Err(format!("clock generation {generation} opens on a whole second {first}"));
+            return Err(format!(
+                "clock generation {generation} opens on a whole second {first}"
+            ));
         }
         let open = record(format!("realtime gen={generation} phase=open"), &["ns"])?[0];
         clock_advance(REALTIME, &mut realtime, open)?;
         if generation == 0 && open - CLOCK_PARITY_EPOCH_NS >= CLOCK_PARITY_STARTUP_BOUND_NS {
-            return Err(format!("clock REALTIME anchor opens {open}, outside the startup bound"));
+            return Err(format!(
+                "clock REALTIME anchor opens {open}, outside the startup bound"
+            ));
         }
         if open % 1_000_000_000 == 0 {
             return Err(format!(
@@ -3878,7 +3883,10 @@ fn parse_clock_trajectory(stdout: &str) -> Result<ClockTrajectory, String> {
         // cost3 - cost0 == (cost1 - cost0) + (cost2 - cost0), rearranged to avoid
         // unsigned underflow and widened so huge timestamps cannot overflow.
         let wide = |a: u64, b: u64| u128::from(a) + u128::from(b);
-        if cost[1] != cost[2] || cost[0] >= cost[1] || wide(cost[3], cost[0]) != wide(cost[1], cost[2]) {
+        if cost[1] != cost[2]
+            || cost[0] >= cost[1]
+            || wide(cost[3], cost[0]) != wide(cost[1], cost[2])
+        {
             return Err(format!(
                 "clock generation {generation} work cost {cost:?} ns: equal work must cost \
                  equal virtual time, more work strictly more, and double work its two halves"
@@ -3886,17 +3894,24 @@ fn parse_clock_trajectory(stdout: &str) -> Result<ClockTrajectory, String> {
         }
         for thread in 0..2 {
             for index in 0..4 {
-                let head = format!("sample gen={generation} source=thread index={index} thread={thread}");
+                let head =
+                    format!("sample gen={generation} source=thread index={index} thread={thread}");
                 clock_advance(MONOTONIC, &mut last, record(head, &["ns"])?[0])?;
             }
         }
         let close = record(format!("realtime gen={generation} phase=close"), &["ns"])?[0];
         clock_advance(REALTIME, &mut realtime, close)?;
-        let min_delta = main.windows(2).map(|pair| pair[1] - pair[0]).min().unwrap_or(0);
+        let min_delta = main
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .min()
+            .unwrap_or(0);
         if record(format!("gen={generation}"), &["first", "last", "min_delta"])?
             != [first, last, min_delta]
         {
-            return Err(format!("clock generation {generation} summary disagrees with its samples"));
+            return Err(format!(
+                "clock generation {generation} summary disagrees with its samples"
+            ));
         }
     }
     record("clock exec continuity holds across 2 execs".to_owned(), &[])?;
@@ -3925,20 +3940,32 @@ fn verify_clock_parity(
     let trajectory =
         parse_clock_trajectory(&cargo_text).map_err(|error| format!("Cargo {error}"))?;
     parse_clock_trajectory(&buck_text).map_err(|error| format!("Buck {error}"))?;
-    require_equal("ptrace fixed-epoch clock trajectory", &cargo_text, &buck_text)?;
+    require_equal(
+        "ptrace fixed-epoch clock trajectory",
+        &cargo_text,
+        &buck_text,
+    )?;
     let report = verify_report(cargo_report, true)?;
     if report != verify_report(buck_report, true)? {
         return Err("Cargo/Buck ptrace clock strict reports differ; nothing is erased".to_owned());
     }
-    let compared = report.compared_outputs.as_ref().map(|outputs| &outputs.left);
+    let compared = report
+        .compared_outputs
+        .as_ref()
+        .map(|outputs| &outputs.left);
     if compared.map(|output| (output.stdout_sha256.clone(), output.stdout_bytes))
         != Some((sha256_bytes(cargo_stdout)?, cargo_stdout.len() as u64))
     {
         return Err("clock strict report compared a different stdout".to_owned());
     }
-    let virtual_ns = report.runtime.as_ref().and_then(|runtime| runtime.run1.as_ref());
+    let virtual_ns = report
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.run1.as_ref());
     match virtual_ns {
-        Some(run) if run.virtual_nanoseconds <= trajectory.realtime_last - CLOCK_PARITY_EPOCH_NS => {
+        Some(run)
+            if run.virtual_nanoseconds <= trajectory.realtime_last - CLOCK_PARITY_EPOCH_NS =>
+        {
             Err("clock strict report virtual time ends before the last REALTIME anchor".to_owned())
         }
         Some(run) if run.virtual_nanoseconds <= trajectory.monotonic_span => {
@@ -4462,8 +4489,9 @@ fn validate_private_tmp_stage(argv: &[String]) -> Result<PrivateTmpStage, String
     }
     let canonical = |raw: &str, description: &str| -> Result<PathBuf, String> {
         let path = PathBuf::from(raw);
-        let resolved = fs::canonicalize(&path)
-            .map_err(|error| format!("matrix private /tmp {description} {raw} is unreadable: {error}"))?;
+        let resolved = fs::canonicalize(&path).map_err(|error| {
+            format!("matrix private /tmp {description} {raw} is unreadable: {error}")
+        })?;
         if !path.is_absolute() || resolved != path {
             return Err(format!(
                 "matrix private /tmp {description} {raw} is not an absolute canonical path"
@@ -4535,7 +4563,12 @@ fn require_initial_user_namespace(uid_map: &str) -> Result<(), String> {
 
 /// The candidate must see the host directory as /tmp, start in it with TMPDIR
 /// pointing at it, and run as root mapped from exactly the proxy's own uid.
-fn require_private_tmp_readback(observed: &str, dev: u64, ino: u64, uid: u32) -> Result<(), String> {
+fn require_private_tmp_readback(
+    observed: &str,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+) -> Result<(), String> {
     let expected = format!("tmp={dev}:{ino}\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 {uid} 1\n");
     if observed != expected {
         return Err(format!(
@@ -4561,7 +4594,11 @@ fn executable_on_path(name: &str) -> Result<PathBuf, String> {
 }
 
 /// The report must name the executable safehermit actually launched.
-fn require_safehermit_launched(path: &Path, expected_sha256: &str, description: &str) -> Result<(), String> {
+fn require_safehermit_launched(
+    path: &Path,
+    expected_sha256: &str,
+    description: &str,
+) -> Result<(), String> {
     let text = fs::read_to_string(path).map_err(|error| {
         format!(
             "safehermit report for {description} is unreadable at {}: {error}",
@@ -4706,7 +4743,12 @@ fn matrix_candidate_proxy_from(
             .arg(format!("--sh-bin={}", unshare.display()))
             .arg("--")
             .args(&stage.argv[1..])
-            .args(["/bin/sh", "-ceu", PRIVATE_TMP_READBACK_SCRIPT, "hermit-private-tmp-readback"])
+            .args([
+                "/bin/sh",
+                "-ceu",
+                PRIVATE_TMP_READBACK_SCRIPT,
+                "hermit-private-tmp-readback",
+            ])
             .arg(invocation.join("private-tmp.readback"))
             .arg(&binary);
         unshare_sha256
@@ -5758,8 +5800,13 @@ fn collect_matrix_data_directories(
 
 /// v2 binds each `dbt-run`'s private /tmp record and readback.
 const MATRIX_CANDIDATE_INVOCATIONS_SCHEMA: &str = "hermit-matrix-candidate-invocations/v2";
-const MATRIX_INVOCATION_FILES: [&str; 5] =
-    ["data", "invocation.json", "safehermit.report", "stderr", "stdout"];
+const MATRIX_INVOCATION_FILES: [&str; 5] = [
+    "data",
+    "invocation.json",
+    "safehermit.report",
+    "stderr",
+    "stdout",
+];
 const MATRIX_PRIVATE_TMP_INVOCATION_FILES: [&str; 7] = [
     "data",
     "invocation.json",
@@ -6397,10 +6444,8 @@ fn recompute_final_receipt(
         unwind_input_identity: context.unwind_buck_input.identity.clone(),
         unwind_ptrace_sha256: context.unwind_buck_input.source_sha256[UNWIND_PTRACE_ARCHIVE]
             .clone(),
-        unwind_arch_sha256: context.unwind_buck_input.source_sha256[UNWIND_ARCH_SONAME]
-            .clone(),
-        unwind_core_sha256: context.unwind_buck_input.source_sha256[UNWIND_CORE_SONAME]
-            .clone(),
+        unwind_arch_sha256: context.unwind_buck_input.source_sha256[UNWIND_ARCH_SONAME].clone(),
+        unwind_core_sha256: context.unwind_buck_input.source_sha256[UNWIND_CORE_SONAME].clone(),
         generated_buck_sha256: context.generated_buck_sha256.to_owned(),
         safehermit_sha256: sha256(&context.safehermit_bundle.launcher)?,
         bounded_run_space_sha256: sha256(&context.safehermit_bundle.bounded_run_space)?,
@@ -6605,10 +6650,19 @@ fn validate_artifact_identity(root: &Path) -> Result<ValidateArtifact, String> {
         )
     })?;
     let rows = document.lines().collect::<Vec<_>>();
-    let [schema, head, identity, binary_sha256, resources_sha256, arch_sha256, core_sha256] =
-        rows.as_slice()
+    let [
+        schema,
+        head,
+        identity,
+        binary_sha256,
+        resources_sha256,
+        arch_sha256,
+        core_sha256,
+    ] = rows.as_slice()
     else {
-        return Err("Buck validate artifact identity document must contain exactly seven rows".into());
+        return Err(
+            "Buck validate artifact identity document must contain exactly seven rows".into(),
+        );
     };
     let schema = schema.strip_prefix("schema\t").unwrap_or_default();
     let head = head.strip_prefix("head\t").unwrap_or_default();
@@ -6674,7 +6728,10 @@ fn validate_artifact_identity(root: &Path) -> Result<ValidateArtifact, String> {
     validate_release_rpath(&binary)?;
     let resources = resolved.join("resources.sha256");
     if sha256(&resources)? != resources_sha256 {
-        return Err("Buck validate selector resource manifest hash does not match the verified bundle".into());
+        return Err(
+            "Buck validate selector resource manifest hash does not match the verified bundle"
+                .into(),
+        );
     }
     let runtime_sha256 = BTreeMap::from([
         (UNWIND_ARCH_SONAME.to_owned(), arch_sha256.clone()),
@@ -6774,13 +6831,11 @@ fn install_validate_dag_artifact(root: &Path) -> Result<String, String> {
     let destination = parent.join("hermit-runtime");
     if let Ok(metadata) = fs::symlink_metadata(&destination) {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir_all(&destination).map_err(|error| {
-                format!("failed to replace {}: {error}", destination.display())
-            })?;
+            fs::remove_dir_all(&destination)
+                .map_err(|error| format!("failed to replace {}: {error}", destination.display()))?;
         } else {
-            fs::remove_file(&destination).map_err(|error| {
-                format!("failed to replace {}: {error}", destination.display())
-            })?;
+            fs::remove_file(&destination)
+                .map_err(|error| format!("failed to replace {}: {error}", destination.display()))?;
         }
     }
     fs::rename(&temporary, &destination).map_err(|error| {
@@ -6789,8 +6844,14 @@ fn install_validate_dag_artifact(root: &Path) -> Result<String, String> {
     })?;
     verify_runtime_install(&install, &artifact.runtime_sha256)?;
     validate_artifact_identity(root)?;
-    loader_probe(&root.join("target/release/hermit"), "direct release Hermit loader probe")?;
-    loader_probe(&root.join("target/ci/hermit-strict"), "direct strict Hermit loader probe")?;
+    loader_probe(
+        &root.join("target/release/hermit"),
+        "direct release Hermit loader probe",
+    )?;
+    loader_probe(
+        &root.join("target/ci/hermit-strict"),
+        "direct strict Hermit loader probe",
+    )?;
     loader_probe(&artifact.binary, "published Buck artifact loader probe")?;
     Ok(strict_hash)
 }
@@ -6877,10 +6938,7 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
             "-c",
             &format!("hermit_release.lzma_target={}", lzma_buck_input.target),
             "-c",
-            &format!(
-                "hermit_release.unwind_target={}",
-                unwind_buck_input.target
-            ),
+            &format!("hermit_release.unwind_target={}", unwind_buck_input.target),
             TARGET,
         ])
         .output()
@@ -7195,10 +7253,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
             "-c",
             &format!("hermit_release.lzma_target={}", lzma_buck_input.target),
             "-c",
-            &format!(
-                "hermit_release.unwind_target={}",
-                unwind_buck_input.target
-            ),
+            &format!("hermit_release.unwind_target={}", unwind_buck_input.target),
             TARGET,
         ])
         .output()
@@ -7661,7 +7716,11 @@ mod tests {
     /// Stub libunwind libraries whose DT_NEEDED sets are exactly the narrow
     /// profile plus the given extra SONAMEs, built here so the closure
     /// contract is tested without depending on the host's libunwind package.
-    fn fixture_unwind_closure(dir: &Path, arch_extra: &[&str], core_extra: &[&str]) -> UnwindClosure {
+    fn fixture_unwind_closure(
+        dir: &Path,
+        arch_extra: &[&str],
+        core_extra: &[&str],
+    ) -> UnwindClosure {
         let build = dir.join("build");
         let deps = build.join("deps");
         fs::create_dir_all(&deps).unwrap();
@@ -7702,13 +7761,20 @@ mod tests {
             &arch,
             UNWIND_ARCH_SONAME,
             &with_extras(
-                vec![format!("-L{}", dir.display()), format!("-l:{UNWIND_CORE_SONAME}")],
+                vec![
+                    format!("-L{}", dir.display()),
+                    format!("-l:{UNWIND_CORE_SONAME}"),
+                ],
                 arch_extra,
             ),
         );
         let object = build.join("stub.o");
         checked_output(
-            Command::new("gcc").args(["-c", "-fPIC"]).arg(&stub).arg("-o").arg(&object),
+            Command::new("gcc")
+                .args(["-c", "-fPIC"])
+                .arg(&stub)
+                .arg("-o")
+                .arg(&object),
             "compile fixture libunwind-ptrace member",
         )
         .unwrap();
@@ -9500,15 +9566,31 @@ esac
             "compile fixture Buck release ELF",
         )
         .unwrap();
-        checked_output(fixture_git().current_dir(&root).arg("init"), "init fixture Git repository").unwrap();
-        checked_output(fixture_git().current_dir(&root).args(["add", "ci", "candidate-hermit", "candidate.c"]), "stage fixture repository").unwrap();
+        checked_output(
+            fixture_git().current_dir(&root).arg("init"),
+            "init fixture Git repository",
+        )
+        .unwrap();
+        checked_output(
+            fixture_git()
+                .current_dir(&root)
+                .args(["add", "ci", "candidate-hermit", "candidate.c"]),
+            "stage fixture repository",
+        )
+        .unwrap();
         checked_output(
             fixture_git().current_dir(&root).args([
-                "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
-                "commit", "-m", "fixture",
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
             ]),
             "commit fixture repository",
-        ).unwrap();
+        )
+        .unwrap();
         let head = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let pointer = root.join("ignored/buck2-phase2/test-publisher.path");
         fs::create_dir_all(pointer.parent().unwrap()).unwrap();
@@ -9532,8 +9614,7 @@ esac
         let resources_sha256 = sha256(&bundle.join("resources.sha256")).unwrap();
         let selector = format!(
             "schema\thermit-buck-validate-selector/v2\nhead\t{head}\nidentity\t{identity}\nbinary_sha256\t{expected}\nresources_sha256\t{resources_sha256}\nruntime_sha256\t{UNWIND_ARCH_SONAME}\t{}\nruntime_sha256\t{UNWIND_CORE_SONAME}\t{}\n",
-            unwind.source_sha256[UNWIND_ARCH_SONAME],
-            unwind.source_sha256[UNWIND_CORE_SONAME],
+            unwind.source_sha256[UNWIND_ARCH_SONAME], unwind.source_sha256[UNWIND_CORE_SONAME],
         );
         replace_text_file(
             &root.join(VALIDATE_ARTIFACT_IDENTITY),
@@ -9552,11 +9633,8 @@ esac
             expected
         );
         assert_eq!(
-            verify_runtime_install(
-                &root.join("target/install_pkg"),
-                &runtime_hashes(&unwind),
-            )
-            .unwrap(),
+            verify_runtime_install(&root.join("target/install_pkg"), &runtime_hashes(&unwind),)
+                .unwrap(),
             runtime_hashes(&unwind),
         );
 
@@ -9593,9 +9671,15 @@ esac
         let fifo = runtime_dir.join("extra.fifo");
         checked_output(Command::new("mkfifo").arg(&fifo), "make fixture FIFO").unwrap();
         let fifo_failure = verify(&pointer).unwrap_err();
-        assert!(fifo_failure.contains("outside the exact unwind closure"), "{fifo_failure}");
+        assert!(
+            fifo_failure.contains("outside the exact unwind closure"),
+            "{fifo_failure}"
+        );
         fs::remove_file(&fifo).unwrap();
-        for extra_directory in [runtime_dir.join("extra.d"), bundle.join("install/rsrcs/extra.d")] {
+        for extra_directory in [
+            runtime_dir.join("extra.d"),
+            bundle.join("install/rsrcs/extra.d"),
+        ] {
             fs::create_dir(&extra_directory).unwrap();
             let directory_failure = verify(&pointer).unwrap_err();
             assert!(
@@ -9631,7 +9715,11 @@ esac
         );
         // The manifest binds regular files only, so a special file is refused.
         let complete_fifo = complete_bundle.join("install/rsrcs/extra.fifo");
-        checked_output(Command::new("mkfifo").arg(&complete_fifo), "make fixture FIFO").unwrap();
+        checked_output(
+            Command::new("mkfifo").arg(&complete_fifo),
+            "make fixture FIFO",
+        )
+        .unwrap();
         let complete_fifo_failure = consume(&complete_pointer, true).unwrap_err();
         assert!(
             complete_fifo_failure.contains("non-regular entry outside its manifest"),
@@ -9651,7 +9739,9 @@ esac
         );
         fs::remove_dir(&complete_runtime_directory).unwrap();
         verify(&complete_pointer).unwrap();
-        let extra_runtime = complete_install.join(UNWIND_RUNTIME_RELATIVE).join("extra.so");
+        let extra_runtime = complete_install
+            .join(UNWIND_RUNTIME_RELATIVE)
+            .join("extra.so");
         fs::write(&extra_runtime, b"extra runtime\n").unwrap();
         let extra_failure = checked_output(
             Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
@@ -9692,7 +9782,11 @@ esac
         fs::remove_dir(extra_directory).unwrap();
         // Refused before anything is moved into the artifact root.
         let source_fifo = complete_install.join("rsrcs/extra.fifo");
-        checked_output(Command::new("mkfifo").arg(&source_fifo), "make fixture FIFO").unwrap();
+        checked_output(
+            Command::new("mkfifo").arg(&source_fifo),
+            "make fixture FIFO",
+        )
+        .unwrap();
         let fifo_artifacts = root.join("fifo-artifacts");
         let source_fifo_failure = checked_output(
             Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
@@ -9738,11 +9832,13 @@ esac
             "{readelf_failure}"
         );
         for soname in [UNWIND_ARCH_SONAME, UNWIND_CORE_SONAME] {
-            assert!(complete_bundle
-                .join("install")
-                .join(UNWIND_RUNTIME_RELATIVE)
-                .join(soname)
-                .is_file());
+            assert!(
+                complete_bundle
+                    .join("install")
+                    .join(UNWIND_RUNTIME_RELATIVE)
+                    .join(soname)
+                    .is_file()
+            );
         }
         fs::remove_file(
             complete_bundle
@@ -9751,17 +9847,22 @@ esac
                 .join(UNWIND_CORE_SONAME),
         )
         .unwrap();
-        assert!(checked_output(
-            Command::new(root.join("ci/verify-hermit-e2e-artifact.sh")).arg(&complete_pointer),
-            "refuse incomplete complete Buck artifact",
-        )
-        .is_err());
+        assert!(
+            checked_output(
+                Command::new(root.join("ci/verify-hermit-e2e-artifact.sh")).arg(&complete_pointer),
+                "refuse incomplete complete Buck artifact",
+            )
+            .is_err()
+        );
 
         fs::write(root.join(VALIDATE_ARTIFACT_IDENTITY), b"not-a-digest\n").unwrap();
         assert!(install_validate_dag_artifact(&root).is_err());
         fs::write(
             root.join(VALIDATE_ARTIFACT_IDENTITY),
-            selector.replace(&format!("head\t{head}"), &format!("head\t{}", "0".repeat(40))),
+            selector.replace(
+                &format!("head\t{head}"),
+                &format!("head\t{}", "0".repeat(40)),
+            ),
         )
         .unwrap();
         assert!(install_validate_dag_artifact(&root).is_err());
@@ -9792,9 +9893,11 @@ esac
         .unwrap();
 
         let first = publish_lzma_buck_input(&root, &evidence_a, &source).unwrap();
-        assert!(first
-            .target
-            .starts_with("root//ignored/buck2-link-inputs/lzma/"));
+        assert!(
+            first
+                .target
+                .starts_with("root//ignored/buck2-link-inputs/lzma/")
+        );
         assert!(first.target.ends_with(":lzma"));
         assert_eq!(sha256(&first.library).unwrap(), sha256(&source).unwrap());
         assert_eq!(
@@ -9805,7 +9908,11 @@ esac
         assert_eq!(first.target, second.target);
         assert_eq!(first.library, second.library);
 
-        fs::write(first.root.join("BUCK"), b"prebuilt_cxx_library(name = \"decoy\")\n").unwrap();
+        fs::write(
+            first.root.join("BUCK"),
+            b"prebuilt_cxx_library(name = \"decoy\")\n",
+        )
+        .unwrap();
         assert!(verify_lzma_buck_input(&first).is_err());
         fs::write(first.root.join("BUCK"), LZMA_BUCK_PACKAGE).unwrap();
         fs::write(&source, b"changed source\n").unwrap();
@@ -9822,9 +9929,11 @@ esac
         fs::create_dir_all(&evidence).unwrap();
         let sources = fixture_unwind_closure(&source_root, &[], &[]);
         let input = publish_unwind_buck_input(&root, &evidence, sources).unwrap();
-        assert!(input
-            .target
-            .starts_with("root//ignored/buck2-link-inputs/unwind/"));
+        assert!(
+            input
+                .target
+                .starts_with("root//ignored/buck2-link-inputs/unwind/")
+        );
         assert!(input.target.ends_with(":unwind"));
         assert_eq!(input.root.file_name().unwrap(), input.identity.as_str());
         verify_unwind_buck_input(&input).unwrap();
@@ -9852,13 +9961,15 @@ esac
         )
         .unwrap();
         assert!(verify_unwind_buck_input(&input).is_err());
-        assert!(verify_shared_library(
-            &input.root.join(UNWIND_ARCH_SONAME),
-            UNWIND_ARCH_SONAME,
-            &[UNWIND_CORE_SONAME, "libc.so.6"],
-        )
-        .unwrap_err()
-        .contains("SONAME"));
+        assert!(
+            verify_shared_library(
+                &input.root.join(UNWIND_ARCH_SONAME),
+                UNWIND_ARCH_SONAME,
+                &[UNWIND_CORE_SONAME, "libc.so.6"],
+            )
+            .unwrap_err()
+            .contains("SONAME")
+        );
         restore(UNWIND_ARCH_SONAME, &input.sources.arch_shared);
 
         fs::remove_file(input.root.join(UNWIND_ARCH_SONAME)).unwrap();
@@ -9870,8 +9981,11 @@ esac
         assert!(verify_unwind_buck_input(&input).is_err());
         restore(UNWIND_ARCH_SONAME, &input.sources.arch_shared);
 
-        fs::write(input.root.join("BUCK"), b"prebuilt_cxx_library(name = \"decoy\")\n")
-            .unwrap();
+        fs::write(
+            input.root.join("BUCK"),
+            b"prebuilt_cxx_library(name = \"decoy\")\n",
+        )
+        .unwrap();
         assert!(verify_unwind_buck_input(&input).is_err());
         fs::write(input.root.join("BUCK"), UNWIND_BUCK_PACKAGE).unwrap();
 
@@ -9894,9 +10008,11 @@ esac
             runtime_root.join(UNWIND_ARCH_SONAME),
         )
         .unwrap();
-        assert!(verify_runtime_install(&runtime, &expected_runtime)
-            .unwrap_err()
-            .contains("SONAME"));
+        assert!(
+            verify_runtime_install(&runtime, &expected_runtime)
+                .unwrap_err()
+                .contains("SONAME")
+        );
 
         fs::write(&input.sources.core_shared, b"changed source\n").unwrap();
         assert!(verify_unwind_buck_input(&input).is_err());
@@ -9925,7 +10041,11 @@ esac
             ("arch-only-lzma", &[LZMA_SONAME][..], &[][..]),
             ("core-only-lzma", &[][..], &[LZMA_SONAME][..]),
             ("stray", &["libstray.so.1"][..], &["libstray.so.1"][..]),
-            ("lzma-and-stray", &[LZMA_SONAME, "libstray.so.1"][..], &[LZMA_SONAME][..]),
+            (
+                "lzma-and-stray",
+                &[LZMA_SONAME, "libstray.so.1"][..],
+                &[LZMA_SONAME][..],
+            ),
             ("unversioned-lzma", &["liblzma.so"][..], &["liblzma.so"][..]),
         ] {
             let (_, verdict) = closure(label, arch_extra, core_extra);
@@ -9945,7 +10065,10 @@ esac
         let input = publish_unwind_buck_input(&root, &evidence, lzma_closure).unwrap();
         assert_eq!(verify_unwind_buck_input(&input), Ok(UnwindProfile::Lzma));
         let rows = fs::read_to_string(evidence.join("unwind-input.tsv")).unwrap();
-        assert!(rows.starts_with("schema\thermit-buck-unwind-input/v2\n"), "{rows}");
+        assert!(
+            rows.starts_with("schema\thermit-buck-unwind-input/v2\n"),
+            "{rows}"
+        );
         assert!(rows.contains("\nprofile\tlzma\n"), "{rows}");
         let runtime = prepare_runtime_install(&evidence, &input).unwrap();
         assert_eq!(
@@ -9993,12 +10116,10 @@ esac
     #[test]
     fn release_buck_target_uses_declared_library_dependencies_and_exact_rpath() {
         let buck = fs::read_to_string(source_root().join("hermit-cli/BUCK")).unwrap();
-        assert!(buck.contains(
-            "\"gh_facebook_buck2_shims_meta//third-party/xz:lzma\""
-        ));
-        assert!(buck.contains(
-            "\"gh_facebook_buck2_shims_meta//third-party/libunwind:unwind-ptrace\""
-        ));
+        assert!(buck.contains("\"gh_facebook_buck2_shims_meta//third-party/xz:lzma\""));
+        assert!(
+            buck.contains("\"gh_facebook_buck2_shims_meta//third-party/libunwind:unwind-ptrace\"")
+        );
         assert!(buck.contains("deps = [release_lzma_target, release_unwind_target] + ["));
         assert!(buck.contains("link-arg=-Wl,--disable-new-dtags"));
         assert!(buck.contains(&format!("link-arg=-Wl,-rpath,{RELEASE_RPATH}")));
@@ -10017,27 +10138,35 @@ esac
 
         let mut unversioned = expected.clone();
         unversioned.insert("liblzma.so".to_owned());
-        assert!(validate_release_needed_libraries(&unversioned)
-            .unwrap_err()
-            .contains("unversioned"));
+        assert!(
+            validate_release_needed_libraries(&unversioned)
+                .unwrap_err()
+                .contains("unversioned")
+        );
 
         let mut nonportable = expected.clone();
         nonportable.insert("/opt/vendor/libextra.so.1".to_owned());
-        assert!(validate_release_needed_libraries(&nonportable)
-            .unwrap_err()
-            .contains("nonportable"));
+        assert!(
+            validate_release_needed_libraries(&nonportable)
+                .unwrap_err()
+                .contains("nonportable")
+        );
 
         let mut unexpected = expected.clone();
         unexpected.insert("libcrypto.so.3".to_owned());
-        assert!(validate_release_needed_libraries(&unexpected)
-            .unwrap_err()
-            .contains("unexpected"));
+        assert!(
+            validate_release_needed_libraries(&unexpected)
+                .unwrap_err()
+                .contains("unexpected")
+        );
 
         let mut missing = expected;
         missing.remove("libunwind-x86_64.so.8");
-        assert!(validate_release_needed_libraries(&missing)
-            .unwrap_err()
-            .contains("missing"));
+        assert!(
+            validate_release_needed_libraries(&missing)
+                .unwrap_err()
+                .contains("missing")
+        );
     }
 
     #[test]
@@ -10151,7 +10280,9 @@ esac
     /// order, costs and summaries.
     fn shift_clock_lines(text: &str, offset: i64, select: impl Fn(usize, &str) -> bool) -> String {
         let shift = |field: &str| match field.split_once('=') {
-            Some((key, value)) if ["ns", "before_ns", "after_ns", "first", "last"].contains(&key) => {
+            Some((key, value))
+                if ["ns", "before_ns", "after_ns", "first", "last"].contains(&key) =>
+            {
                 format!("{key}={}", value.parse::<i64>().unwrap() + offset)
             }
             _ => field.to_owned(),
@@ -10177,7 +10308,9 @@ esac
 
     /// Adds `offset` to the MONOTONIC records only, from line `from` onward.
     fn shift_monotonic_from(text: &str, offset: i64, from: usize) -> String {
-        shift_clock_lines(text, offset, |index, line| index >= from && !line.starts_with("realtime "))
+        shift_clock_lines(text, offset, |index, line| {
+            index >= from && !line.starts_with("realtime ")
+        })
     }
 
     /// Replaces the given 0-based lines of the captured trajectory.
@@ -10212,60 +10345,248 @@ esac
         let advance = "does not advance past";
         let cost = "equal work must cost equal virtual time";
         let cases = [
-            ("freeze", edit_clock_trajectory(&[(1, "sample gen=0 source=main index=1 ns=1767225600002243035")]), advance),
-            ("backwards", edit_clock_trajectory(&[(3, "sample gen=0 source=main index=3 ns=1767225600002253000")]), advance),
-            ("exec reset", edit_clock_trajectory(&[(23, "sample gen=1 source=main index=0 ns=1767225600002243035")]), advance),
-            ("thread reset", edit_clock_trajectory(&[(13, "sample gen=0 source=thread index=0 thread=0 ns=1767225600002243035")]), advance),
-            ("epoch too early", shift_clock_trajectory(text, -1_000_000_000), "CLOCK_REALTIME read"),
-            ("epoch too late", shift_clock_trajectory(text, 86_400_000_000_000), "outside the startup bound"),
-            ("round origin", shift_clock_trajectory(text, 1_000_000_000 - 17_915_150), "opens on a whole second"),
+            (
+                "freeze",
+                edit_clock_trajectory(&[(
+                    1,
+                    "sample gen=0 source=main index=1 ns=1767225600002243035",
+                )]),
+                advance,
+            ),
+            (
+                "backwards",
+                edit_clock_trajectory(&[(
+                    3,
+                    "sample gen=0 source=main index=3 ns=1767225600002253000",
+                )]),
+                advance,
+            ),
+            (
+                "exec reset",
+                edit_clock_trajectory(&[(
+                    23,
+                    "sample gen=1 source=main index=0 ns=1767225600002243035",
+                )]),
+                advance,
+            ),
+            (
+                "thread reset",
+                edit_clock_trajectory(&[(
+                    13,
+                    "sample gen=0 source=thread index=0 thread=0 ns=1767225600002243035",
+                )]),
+                advance,
+            ),
+            (
+                "epoch too early",
+                shift_clock_trajectory(text, -1_000_000_000),
+                "CLOCK_REALTIME read",
+            ),
+            (
+                "epoch too late",
+                shift_clock_trajectory(text, 86_400_000_000_000),
+                "outside the startup bound",
+            ),
+            (
+                "round origin",
+                shift_clock_trajectory(text, 1_000_000_000 - 17_915_150),
+                "opens on a whole second",
+            ),
             // REALTIME anchors are their own chain: each refusal below leaves
             // every MONOTONIC record untouched.
-            ("REALTIME before the epoch", shift_realtime(text, -1_000_000_000), "CLOCK_REALTIME read"),
-            ("REALTIME past the startup bound", shift_realtime(text, 60_000_000_000), "outside the startup bound"),
-            ("REALTIME round origin", shift_realtime(text, 1_000_000_000 - 18_050_120), "REALTIME anchor opens on a whole second"),
-            ("REALTIME frozen", edit_clock_trajectory(&[(21, "realtime gen=0 phase=close ns=1767225600002377745")]), "CLOCK_REALTIME read"),
-            ("REALTIME exec reset", edit_clock_trajectory(&[(31, "realtime gen=1 phase=open ns=1767225600002377745")]), "CLOCK_REALTIME read"),
-            ("REALTIME anchor missing", without(8), "expected \"realtime gen=0 phase=open\""),
-            ("REALTIME close missing", without(21), "expected \"realtime gen=0 phase=close\""),
+            (
+                "REALTIME before the epoch",
+                shift_realtime(text, -1_000_000_000),
+                "CLOCK_REALTIME read",
+            ),
+            (
+                "REALTIME past the startup bound",
+                shift_realtime(text, 60_000_000_000),
+                "outside the startup bound",
+            ),
+            (
+                "REALTIME round origin",
+                shift_realtime(text, 1_000_000_000 - 18_050_120),
+                "REALTIME anchor opens on a whole second",
+            ),
+            (
+                "REALTIME frozen",
+                edit_clock_trajectory(&[(21, "realtime gen=0 phase=close ns=1767225600002377745")]),
+                "CLOCK_REALTIME read",
+            ),
+            (
+                "REALTIME exec reset",
+                edit_clock_trajectory(&[(31, "realtime gen=1 phase=open ns=1767225600002377745")]),
+                "CLOCK_REALTIME read",
+            ),
+            (
+                "REALTIME anchor missing",
+                without(8),
+                "expected \"realtime gen=0 phase=open\"",
+            ),
+            (
+                "REALTIME close missing",
+                without(21),
+                "expected \"realtime gen=0 phase=close\"",
+            ),
             // Work-cost controls keep every timestamp strictly increasing, so
             // only the work-cost relation can refuse them.
             // Double work still costs exactly its two halves here, so only the
             // equal-cost relation can refuse this one.
-            ("equal work, unequal cost", edit_clock_trajectory(&[
-                (11, "work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600006447536 checksum=4"),
-                (12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600010471626 checksum=2"),
-            ]), cost),
-            ("double work, single cost", edit_clock_trajectory(&[(12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600008471625 checksum=2")]), cost),
+            (
+                "equal work, unequal cost",
+                edit_clock_trajectory(&[
+                    (
+                        11,
+                        "work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600006447536 checksum=4",
+                    ),
+                    (
+                        12,
+                        "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600010471626 checksum=2",
+                    ),
+                ]),
+                cost,
+            ),
+            (
+                "double work, single cost",
+                edit_clock_trajectory(&[(
+                    12,
+                    "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600008471625 checksum=2",
+                )]),
+                cost,
+            ),
             // Costs more than one unit of work, but not exactly two.
-            ("double work, non-additive cost", edit_clock_trajectory(&[(12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600009471625 checksum=2")]), cost),
+            (
+                "double work, non-additive cost",
+                edit_clock_trajectory(&[(
+                    12,
+                    "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600009471625 checksum=2",
+                )]),
+                cost,
+            ),
             // A clock that ignores work: every segment costs the empty one's
             // 10,050 ns, which is equal and additive, so only the grows-with-work
             // relation can refuse it.
-            ("work costs nothing", edit_clock_trajectory(&[
-                (10, "work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600002423445 checksum=4"),
-                (11, "work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600004447535 checksum=4"),
-                (12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600006471625 checksum=2"),
-            ]), cost),
-            ("wrong checksum", edit_clock_trajectory(&[(10, "work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=5")]), "checksum 5 is wrong"),
-            ("changed iterations", edit_clock_trajectory(&[(10, "work gen=0 index=1 iterations=100001 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=4")]), "expected \"work gen=0 index=1 iterations=100000\""),
-            ("missing sample", without(4), "expected \"sample gen=0 source=main index=4\""),
-            ("extra sample", edit_clock_trajectory(&[(8, "sample gen=0 source=main index=8 ns=1767225600002323355")]), "expected \"realtime gen=0 phase=open\""),
-            ("record after verdict", format!("{text}extra\n"), "extra record"),
-            ("threads reordered", reordered.join("\n") + "\n", "expected \"sample gen=0 source=thread index=0 thread=0\""),
-            ("leading zero", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=01767225600002243035")]), "malformed ns"),
-            ("signed", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=+1767225600002243035")]), "malformed ns"),
-            ("empty", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=")]), "malformed ns"),
-            ("overflow", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=99999999999999999999")]), "malformed ns"),
-            ("trailing space", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=1767225600002243035 ")]), "trailing text"),
-            ("carriage returns", text.replace('\n', "\r\n"), "trailing text"),
-            ("summary", edit_clock_trajectory(&[(22, "gen=0 first=1767225600002243035 last=1767225600013859655 min_delta=10041")]), "summary disagrees"),
-            ("no final newline", text[..text.len() - 1].to_owned(), "one newline"),
+            (
+                "work costs nothing",
+                edit_clock_trajectory(&[
+                    (
+                        10,
+                        "work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600002423445 checksum=4",
+                    ),
+                    (
+                        11,
+                        "work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600004447535 checksum=4",
+                    ),
+                    (
+                        12,
+                        "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600006471625 checksum=2",
+                    ),
+                ]),
+                cost,
+            ),
+            (
+                "wrong checksum",
+                edit_clock_trajectory(&[(
+                    10,
+                    "work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=5",
+                )]),
+                "checksum 5 is wrong",
+            ),
+            (
+                "changed iterations",
+                edit_clock_trajectory(&[(
+                    10,
+                    "work gen=0 index=1 iterations=100001 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=4",
+                )]),
+                "expected \"work gen=0 index=1 iterations=100000\"",
+            ),
+            (
+                "missing sample",
+                without(4),
+                "expected \"sample gen=0 source=main index=4\"",
+            ),
+            (
+                "extra sample",
+                edit_clock_trajectory(&[(
+                    8,
+                    "sample gen=0 source=main index=8 ns=1767225600002323355",
+                )]),
+                "expected \"realtime gen=0 phase=open\"",
+            ),
+            (
+                "record after verdict",
+                format!("{text}extra\n"),
+                "extra record",
+            ),
+            (
+                "threads reordered",
+                reordered.join("\n") + "\n",
+                "expected \"sample gen=0 source=thread index=0 thread=0\"",
+            ),
+            (
+                "leading zero",
+                edit_clock_trajectory(&[(
+                    0,
+                    "sample gen=0 source=main index=0 ns=01767225600002243035",
+                )]),
+                "malformed ns",
+            ),
+            (
+                "signed",
+                edit_clock_trajectory(&[(
+                    0,
+                    "sample gen=0 source=main index=0 ns=+1767225600002243035",
+                )]),
+                "malformed ns",
+            ),
+            (
+                "empty",
+                edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=")]),
+                "malformed ns",
+            ),
+            (
+                "overflow",
+                edit_clock_trajectory(&[(
+                    0,
+                    "sample gen=0 source=main index=0 ns=99999999999999999999",
+                )]),
+                "malformed ns",
+            ),
+            (
+                "trailing space",
+                edit_clock_trajectory(&[(
+                    0,
+                    "sample gen=0 source=main index=0 ns=1767225600002243035 ",
+                )]),
+                "trailing text",
+            ),
+            (
+                "carriage returns",
+                text.replace('\n', "\r\n"),
+                "trailing text",
+            ),
+            (
+                "summary",
+                edit_clock_trajectory(&[(
+                    22,
+                    "gen=0 first=1767225600002243035 last=1767225600013859655 min_delta=10041",
+                )]),
+                "summary disagrees",
+            ),
+            (
+                "no final newline",
+                text[..text.len() - 1].to_owned(),
+                "one newline",
+            ),
             ("no verdict", without(69), "lacks \"clock exec continuity"),
         ];
         for (name, mutated, expected) in cases {
             let error = parse_clock_trajectory(&mutated).expect_err(name);
-            assert!(error.contains(expected), "{name}: expected {expected:?}, got {error:?}");
+            assert!(
+                error.contains(expected),
+                "{name}: expected {expected:?}, got {error:?}"
+            );
         }
     }
 
@@ -10279,7 +10600,10 @@ esac
         // fractional part, and so the round-origin legs, unchanged.
         let boot_relative = shift_monotonic_from(text, -1_767_225_000_000_000_000, 0);
         assert!(boot_relative.starts_with("sample gen=0 source=main index=0 ns=600002243035\n"));
-        assert_eq!(parse_clock_trajectory(&boot_relative), Ok(CAPTURED_TRAJECTORY));
+        assert_eq!(
+            parse_clock_trajectory(&boot_relative),
+            Ok(CAPTURED_TRAJECTORY)
+        );
         // A MONOTONIC reading far past the epoch window is equally valid.
         let far = shift_monotonic_from(text, 86_400_000_000_000, 0);
         assert_eq!(parse_clock_trajectory(&far), Ok(CAPTURED_TRAJECTORY));
@@ -10294,11 +10618,22 @@ esac
         );
         // The same shifts applied to REALTIME are refused.
         for (name, shifted, expected) in [
-            ("boot-relative REALTIME", shift_realtime(text, -1_767_225_000_000_000_000), "CLOCK_REALTIME read"),
-            ("far REALTIME", shift_realtime(text, 86_400_000_000_000), "outside the startup bound"),
+            (
+                "boot-relative REALTIME",
+                shift_realtime(text, -1_767_225_000_000_000_000),
+                "CLOCK_REALTIME read",
+            ),
+            (
+                "far REALTIME",
+                shift_realtime(text, 86_400_000_000_000),
+                "outside the startup bound",
+            ),
         ] {
             let error = parse_clock_trajectory(&shifted).expect_err(name);
-            assert!(error.contains(expected), "{name}: expected {expected:?}, got {error:?}");
+            assert!(
+                error.contains(expected),
+                "{name}: expected {expected:?}, got {error:?}"
+            );
         }
         // Continuity stays mandatory for a boot-relative MONOTONIC clock.
         let frozen = boot_relative.replacen(
@@ -10347,20 +10682,49 @@ esac
         // virtual time lasted, with the REALTIME anchors unchanged, is refused
         // only by the span binding.
         let jump = shift_monotonic_from(CAPTURED_CLOCK_TRAJECTORY, 10_000_000_000, 23);
-        let jump_report = report("jump.json", clock_runtime_report_for(&jump, CAPTURED_VIRTUAL_NS));
+        let jump_report = report(
+            "jump.json",
+            clock_runtime_report_for(&jump, CAPTURED_VIRTUAL_NS),
+        );
         let boot = shift_monotonic_from(CAPTURED_CLOCK_TRAJECTORY, -1_767_225_000_000_000_000, 0);
-        let boot_report = report("boot.json", clock_runtime_report_for(&boot, CAPTURED_VIRTUAL_NS));
+        let boot_report = report(
+            "boot.json",
+            clock_runtime_report_for(&boot, CAPTURED_VIRTUAL_NS),
+        );
         verify_clock_parity(boot.as_bytes(), boot.as_bytes(), &boot_report, &boot_report).unwrap();
         let realtime_end = CAPTURED_REALTIME_LAST - CLOCK_PARITY_EPOCH_NS;
         for (cargo_bytes, buck_bytes, cargo, expected) in [
             (bytes, shifted.as_bytes(), &cargo, "clock trajectory"),
-            (shifted.as_bytes(), shifted.as_bytes(), &cargo, "compared a different stdout"),
-            (bytes, bytes, &report("short.json", clock_runtime_report(realtime_end)), "ends before the last REALTIME anchor"),
-            (jump.as_bytes(), jump.as_bytes(), &jump_report, "shorter than the MONOTONIC span"),
-            (bytes, bytes, &report("bare.json", bare), "lacks a runtime summary"),
+            (
+                shifted.as_bytes(),
+                shifted.as_bytes(),
+                &cargo,
+                "compared a different stdout",
+            ),
+            (
+                bytes,
+                bytes,
+                &report("short.json", clock_runtime_report(realtime_end)),
+                "ends before the last REALTIME anchor",
+            ),
+            (
+                jump.as_bytes(),
+                jump.as_bytes(),
+                &jump_report,
+                "shorter than the MONOTONIC span",
+            ),
+            (
+                bytes,
+                bytes,
+                &report("bare.json", bare),
+                "lacks a runtime summary",
+            ),
         ] {
             let error = verify_clock_parity(cargo_bytes, buck_bytes, cargo, cargo).unwrap_err();
-            assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
         }
         // The boundary is strict: one nanosecond past the anchor is enough.
         let edge = report("edge.json", clock_runtime_report(realtime_end + 1));
@@ -10807,11 +11171,14 @@ esac
     }
 
     fn private_tmp_handoff(stage: &[String], hermit: &[&str]) -> Vec<String> {
-        [MATRIX_PRIVATE_TMP_HANDOFF.to_owned(), stage.len().to_string()]
-            .into_iter()
-            .chain(stage.iter().cloned())
-            .chain(hermit.iter().map(|argument| (*argument).to_owned()))
-            .collect()
+        [
+            MATRIX_PRIVATE_TMP_HANDOFF.to_owned(),
+            stage.len().to_string(),
+        ]
+        .into_iter()
+        .chain(stage.iter().cloned())
+        .chain(hermit.iter().map(|argument| (*argument).to_owned()))
+        .collect()
     }
 
     #[test]
@@ -10849,9 +11216,17 @@ esac
         for directory in [&host_tmp, &source, &destination, &other] {
             fs::create_dir_all(directory).unwrap();
         }
-        let hermit = ["run", "--backend", "dbt", "--max-timeslice=disabled", "--", "/bin/true"];
+        let hermit = [
+            "run",
+            "--backend",
+            "dbt",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ];
         let stage = private_tmp_stage(&host_tmp, &[(&source, &destination)]);
-        let (parsed, rest) = split_private_tmp_handoff(private_tmp_handoff(&stage, &hermit)).unwrap();
+        let (parsed, rest) =
+            split_private_tmp_handoff(private_tmp_handoff(&stage, &hermit)).unwrap();
         assert_eq!(
             parsed,
             Some(PrivateTmpStage {
@@ -10862,14 +11237,20 @@ esac
         );
         assert_eq!(rest, hermit);
         let plain = hermit.map(str::to_owned).to_vec();
-        assert_eq!(split_private_tmp_handoff(plain.clone()).unwrap(), (None, plain));
-        let (unbound, _) =
-            split_private_tmp_handoff(private_tmp_handoff(&private_tmp_stage(&host_tmp, &[]), &hermit))
-                .unwrap();
+        assert_eq!(
+            split_private_tmp_handoff(plain.clone()).unwrap(),
+            (None, plain)
+        );
+        let (unbound, _) = split_private_tmp_handoff(private_tmp_handoff(
+            &private_tmp_stage(&host_tmp, &[]),
+            &hermit,
+        ))
+        .unwrap();
         assert_eq!(unbound.unwrap().mounts, Vec::new());
 
         let refused = |stage: Vec<String>, needle: &str| {
-            let error = split_private_tmp_handoff(private_tmp_handoff(&stage, &hermit)).unwrap_err();
+            let error =
+                split_private_tmp_handoff(private_tmp_handoff(&stage, &hermit)).unwrap_err();
             assert!(error.contains(needle), "{needle:?} not in {error}");
         };
         let mut script = stage.clone();
@@ -10884,10 +11265,19 @@ esac
         let mut signed = stage.clone();
         signed[9] = "+1".to_owned();
         refused(signed, "is not decimal");
-        refused(private_tmp_stage(&host_tmp, &[(&source, &other)]), "not strictly beneath");
-        refused(private_tmp_stage(&host_tmp, &[(&source, &host_tmp)]), "not strictly beneath");
         refused(
-            private_tmp_stage(&host_tmp, &[(&source, &destination), (&other, &destination)]),
+            private_tmp_stage(&host_tmp, &[(&source, &other)]),
+            "not strictly beneath",
+        );
+        refused(
+            private_tmp_stage(&host_tmp, &[(&source, &host_tmp)]),
+            "not strictly beneath",
+        );
+        refused(
+            private_tmp_stage(
+                &host_tmp,
+                &[(&source, &destination), (&other, &destination)],
+            ),
             "twice",
         );
         refused(
@@ -10896,7 +11286,10 @@ esac
         );
         let alias = root.join("alias");
         symlink(&host_tmp, &alias).unwrap();
-        refused(private_tmp_stage(&alias, &[]), "not an absolute canonical path");
+        refused(
+            private_tmp_stage(&alias, &[]),
+            "not an absolute canonical path",
+        );
         refused(
             private_tmp_stage(&host_tmp, &[(&source, &alias.join("verify-output"))]),
             "not an absolute canonical path",
@@ -10904,7 +11297,11 @@ esac
 
         let mut truncated = private_tmp_handoff(&stage, &[]);
         truncated[1] = (stage.len() + 1).to_string();
-        assert!(split_private_tmp_handoff(truncated).unwrap_err().contains("truncated"));
+        assert!(
+            split_private_tmp_handoff(truncated)
+                .unwrap_err()
+                .contains("truncated")
+        );
         let mut malformed = private_tmp_handoff(&stage, &hermit);
         malformed[1] = "x".to_owned();
         assert!(
@@ -10918,7 +11315,11 @@ esac
     #[test]
     fn matrix_proxy_refuses_to_launch_safehermit_inside_a_user_namespace() {
         require_initial_user_namespace("         0          0 4294967295\n").unwrap();
-        for nested in ["         0     212630          1\n", "", "0 0 4294967295\n0 0 1\n"] {
+        for nested in [
+            "         0     212630          1\n",
+            "",
+            "0 0 4294967295\n0 0 1\n",
+        ] {
             assert!(
                 require_initial_user_namespace(nested)
                     .unwrap_err()
@@ -10927,19 +11328,29 @@ esac
         }
         // The exact shape run_matrix's private-/tmp wrapper would put the proxy in.
         let nested = Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "cat", "/proc/self/uid_map"])
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "cat",
+                "/proc/self/uid_map",
+            ])
             .output()
             .unwrap();
         assert!(nested.status.success(), "{nested:?}");
         let nested = String::from_utf8(nested.stdout).unwrap();
-        assert!(require_initial_user_namespace(&nested).is_err(), "{nested:?}");
+        assert!(
+            require_initial_user_namespace(&nested).is_err(),
+            "{nested:?}"
+        );
 
         // The refusal is the proxy's first act: nothing else is read or written.
         let root = fixture_root("matrix-proxy-nested-namespace");
         fs::create_dir(&root).unwrap();
         let uid_map = root.join("uid_map");
         fs::write(&uid_map, &nested).unwrap();
-        let error = matrix_candidate_proxy_from(&uid_map, ["run".to_owned()].into_iter()).unwrap_err();
+        let error =
+            matrix_candidate_proxy_from(&uid_map, ["run".to_owned()].into_iter()).unwrap_err();
         assert!(error.contains("initial user namespace"), "{error}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -10955,7 +11366,10 @@ esac
             "tmp=48:77\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 0 4294967295\n",
             "",
         ] {
-            assert!(require_private_tmp_readback(observed, 48, 77, 1000).is_err(), "{observed:?}");
+            assert!(
+                require_private_tmp_readback(observed, 48, 77, 1000).is_err(),
+                "{observed:?}"
+            );
         }
 
         // Execute the stage and readback exactly as the proxy composes them.
@@ -10986,7 +11400,12 @@ esac
         let stage = private_tmp_stage(&host_tmp, &binds);
         let output = Command::new(&stage[0])
             .args(&stage[1..])
-            .args(["/bin/sh", "-ceu", PRIVATE_TMP_READBACK_SCRIPT, "hermit-private-tmp-readback"])
+            .args([
+                "/bin/sh",
+                "-ceu",
+                PRIVATE_TMP_READBACK_SCRIPT,
+                "hermit-private-tmp-readback",
+            ])
             .arg(&readback)
             .args(["/bin/sh", "-c", "printf candidate > /tmp/marker"])
             .output()
@@ -10997,7 +11416,10 @@ esac
         let observed = fs::read_to_string(&readback).unwrap();
         // uid_map names the parent namespace's uid, which is this test's own.
         require_private_tmp_readback(&observed, host.dev(), host.ino(), uid).unwrap();
-        assert_eq!(fs::read_to_string(host_tmp.join("marker")).unwrap(), "candidate");
+        assert_eq!(
+            fs::read_to_string(host_tmp.join("marker")).unwrap(),
+            "candidate"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -11230,11 +11652,19 @@ esac
             fs::write(invocation.join("stderr"), format!("{name} stderr\n")).unwrap();
             let buck = name.starts_with("buck-");
             if role == "dbt-run" {
-                fs::write(invocation.join("safehermit.report"), report(&unshare_sha256)).unwrap();
+                fs::write(
+                    invocation.join("safehermit.report"),
+                    report(&unshare_sha256),
+                )
+                .unwrap();
                 fs::write(
                     invocation.join("private-tmp.json"),
-                    serde_json::to_vec_pretty(if buck { &buck_private_tmp } else { &private_tmp })
-                        .unwrap(),
+                    serde_json::to_vec_pretty(if buck {
+                        &buck_private_tmp
+                    } else {
+                        &private_tmp
+                    })
+                    .unwrap(),
                 )
                 .unwrap();
                 fs::write(invocation.join("private-tmp.readback"), &readback).unwrap();
@@ -11248,14 +11678,19 @@ esac
         write_invocation("cargo-reference-3", "ptrace-reference");
         write_invocation("buck-reference-4", "ptrace-reference");
         let manifest = root.join("matrix-candidate-invocations.json");
-        let observed = inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
+        let observed =
+            inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
         atomic_write_new(
             &manifest,
             &render_matrix_candidate_invocation_manifest(&observed).unwrap(),
         )
         .unwrap();
-        let (retained, retained_hash) =
-            verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).unwrap();
+        let (retained, retained_hash) = verify_retained_matrix_candidate_invocation_manifest(
+            &root,
+            &cargo_sha256,
+            &buck_sha256,
+        )
+        .unwrap();
         assert_eq!(retained.invocations.len(), 4);
         assert_eq!(retained_hash, sha256(&manifest).unwrap());
         for invocation in &retained.invocations {
@@ -11267,7 +11702,8 @@ esac
         // Private /tmp evidence is re-checked by content, not only hashed.
         let dbt = invocations.join("cargo-observed-1");
         let refuses = |needle: &str| {
-            let error = inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap_err();
+            let error = inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256)
+                .unwrap_err();
             assert!(error.contains(needle), "{needle}: {error}");
         };
         for (file, bytes, needle) in [
@@ -11359,8 +11795,16 @@ esac
         }
         // The population must follow the role in both directions.
         let reference = invocations.join("cargo-reference-3");
-        fs::copy(dbt.join("private-tmp.json"), reference.join("private-tmp.json")).unwrap();
-        fs::copy(dbt.join("private-tmp.readback"), reference.join("private-tmp.readback")).unwrap();
+        fs::copy(
+            dbt.join("private-tmp.json"),
+            reference.join("private-tmp.json"),
+        )
+        .unwrap();
+        fs::copy(
+            dbt.join("private-tmp.readback"),
+            reference.join("private-tmp.readback"),
+        )
+        .unwrap();
         refuses("with role ptrace-reference must hold exactly");
         fs::remove_file(reference.join("private-tmp.json")).unwrap();
         fs::remove_file(reference.join("private-tmp.readback")).unwrap();
@@ -11382,9 +11826,7 @@ esac
         }
         fs::write(&reference_report, report(&cargo_sha256)).unwrap();
         // Swapping the legs' candidates refuses the audit.
-        assert!(
-            inspect_matrix_candidate_invocations(&root, &buck_sha256, &cargo_sha256).is_err()
-        );
+        assert!(inspect_matrix_candidate_invocations(&root, &buck_sha256, &cargo_sha256).is_err());
         inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
         // Relabelling any single retained invocation to the other leg refuses
         // that invocation: each is audited against its own leg's bytes.
@@ -11395,11 +11837,13 @@ esac
             ("buck-reference-4", "cargo-reference-4"),
         ] {
             fs::rename(invocations.join(name), invocations.join(relabelled)).unwrap();
-            let error =
-                inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap_err();
+            let error = inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256)
+                .unwrap_err();
             let (label, identity) = relabelled.split_once('-').unwrap();
             assert!(
-                error.contains(&format!("retained {label} DBT matrix invocation {identity} ")),
+                error.contains(&format!(
+                    "retained {label} DBT matrix invocation {identity} "
+                )),
                 "{relabelled}: {error}"
             );
             fs::rename(invocations.join(relabelled), invocations.join(name)).unwrap();
@@ -11408,9 +11852,17 @@ esac
 
         let readback_path = dbt.join("private-tmp.readback");
         fs::write(&readback_path, readback.replace("tmp=", "tmp=1")).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&readback_path, &readback).unwrap();
-        verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).unwrap();
+        verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256)
+            .unwrap();
 
         let original_manifest = fs::read_to_string(&manifest).unwrap();
         fs::write(
@@ -11418,34 +11870,76 @@ esac
             original_manifest.replace("observed-1", "mutated-1"),
         )
         .unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&manifest, &original_manifest).unwrap();
 
         fs::remove_file(&manifest).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&manifest, &original_manifest).unwrap();
 
         let stdout = invocations.join("cargo-observed-1/stdout");
         let original_stdout = fs::read(&stdout).unwrap();
         fs::write(&stdout, b"mutated stdout\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&stdout, original_stdout).unwrap();
 
         let data = invocations.join("cargo-observed-1/data/runtime.log");
         let original_data = fs::read(&data).unwrap();
         fs::write(&data, b"mutated data\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&data, original_data).unwrap();
 
         let empty_directory = invocations.join("cargo-observed-1/data/late-empty-directory");
         fs::create_dir(&empty_directory).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::remove_dir(&empty_directory).unwrap();
 
         let stderr = invocations.join("cargo-observed-1/stderr");
         let original_stderr = fs::read(&stderr).unwrap();
         fs::write(&stderr, b"mutated stderr\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&stderr, original_stderr).unwrap();
 
         let report = invocations.join("buck-observed-2/safehermit.report");
@@ -11455,30 +11949,72 @@ esac
             b"safehermit: bound.wall=APPLIED:119s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
         )
         .unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&report, &original_report).unwrap();
         fs::remove_file(&report).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::write(&report, &original_report).unwrap();
 
         let extra = invocations.join("cargo-observed-1/extra");
         fs::write(&extra, b"unexpected\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::remove_file(&extra).unwrap();
 
         let link = invocations.join("cargo-observed-1/linked");
         std::os::unix::fs::symlink("stdout", &link).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::remove_file(&link).unwrap();
 
         write_invocation("cargo-extra-observed", "ptrace-reference");
         write_invocation("buck-extra-observed", "ptrace-reference");
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::remove_dir_all(invocations.join("cargo-extra-observed")).unwrap();
         fs::remove_dir_all(invocations.join("buck-extra-observed")).unwrap();
 
         fs::remove_dir_all(invocations.join("buck-observed-2")).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
+        assert!(
+            verify_retained_matrix_candidate_invocation_manifest(
+                &root,
+                &cargo_sha256,
+                &buck_sha256
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

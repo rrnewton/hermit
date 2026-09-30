@@ -54,8 +54,8 @@ static void multiple_mmaps(void) {
 static void fixed_mmap(void) {
   size_t page = page_size();
   void* expected = (void*)(uintptr_t)0x500000000000ULL;
-  void* result = checked_mmap(
-      expected, page, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
+  void* result =
+      checked_mmap(expected, page, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
   if (result != expected) {
     fprintf(stderr, "MAP_FIXED returned %p, expected %p\n", result, expected);
     exit(1);

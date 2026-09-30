@@ -28,19 +28,19 @@ enum {
   EVENT_TIMEOUT_MS = 5000,
 };
 
-static void fail(const char *operation) {
+static void fail(const char* operation) {
   fprintf(stderr, "%s: %s\n", operation, strerror(errno));
   exit(EXIT_FAILURE);
 }
 
-static void check_pthread(int result, const char *operation) {
+static void check_pthread(int result, const char* operation) {
   if (result != 0) {
     errno = result;
     fail(operation);
   }
 }
 
-static void wait_at_barrier(pthread_barrier_t *barrier) {
+static void wait_at_barrier(pthread_barrier_t* barrier) {
   const int result = pthread_barrier_wait(barrier);
   if (result != 0 && result != PTHREAD_BARRIER_SERIAL_THREAD) {
     check_pthread(result, "pthread_barrier_wait");
@@ -57,13 +57,13 @@ struct contention_state {
 };
 
 struct contention_worker {
-  struct contention_state *state;
+  struct contention_state* state;
   unsigned id;
 };
 
-static void *contend_for_mutex(void *opaque) {
-  struct contention_worker *worker = opaque;
-  struct contention_state *state = worker->state;
+static void* contend_for_mutex(void* opaque) {
+  struct contention_worker* worker = opaque;
+  struct contention_state* state = worker->state;
 
   wait_at_barrier(&state->start);
   for (unsigned round = 0; round < CONTENTION_ROUNDS; ++round) {
@@ -73,7 +73,7 @@ static void *contend_for_mutex(void *opaque) {
     }
     state->counter += 1;
     state->checksum = (state->checksum * UINT64_C(1099511628211)) ^
-                      ((uint64_t)worker->id << 32) ^ round;
+        ((uint64_t)worker->id << 32) ^ round;
     check_pthread(pthread_mutex_unlock(&state->mutex), "pthread_mutex_unlock");
 
     if ((round + worker->id) % 3 == 0) {
@@ -92,8 +92,9 @@ static int run_contention(void) {
   pthread_t threads[THREAD_COUNT];
   struct contention_worker workers[THREAD_COUNT];
 
-  check_pthread(pthread_barrier_init(&state.start, NULL, THREAD_COUNT + 1),
-                "pthread_barrier_init");
+  check_pthread(
+      pthread_barrier_init(&state.start, NULL, THREAD_COUNT + 1),
+      "pthread_barrier_init");
   check_pthread(pthread_mutex_init(&state.mutex, NULL), "pthread_mutex_init");
 
   for (unsigned id = 0; id < THREAD_COUNT; ++id) {
@@ -110,32 +111,39 @@ static int run_contention(void) {
 
   const unsigned expected = THREAD_COUNT * CONTENTION_ROUNDS;
   if (state.counter != expected || state.trace_length != TRACE_CAPACITY) {
-    fprintf(stderr, "contention invariant failed: counter=%u/%u trace=%zu/%u\n",
-            state.counter, expected, state.trace_length, TRACE_CAPACITY);
+    fprintf(
+        stderr,
+        "contention invariant failed: counter=%u/%u trace=%zu/%u\n",
+        state.counter,
+        expected,
+        state.trace_length,
+        TRACE_CAPACITY);
     return EXIT_FAILURE;
   }
 
-  printf("contention counter=%u checksum=%016llx trace=", state.counter,
-         (unsigned long long)state.checksum);
+  printf(
+      "contention counter=%u checksum=%016llx trace=",
+      state.counter,
+      (unsigned long long)state.checksum);
   for (size_t index = 0; index < state.trace_length; ++index) {
     printf("%s%u", index == 0 ? "" : ",", state.trace[index]);
   }
   putchar('\n');
 
   check_pthread(pthread_mutex_destroy(&state.mutex), "pthread_mutex_destroy");
-  check_pthread(pthread_barrier_destroy(&state.start),
-                "pthread_barrier_destroy");
+  check_pthread(
+      pthread_barrier_destroy(&state.start), "pthread_barrier_destroy");
   return EXIT_SUCCESS;
 }
 
 struct pipe_writer {
-  pthread_barrier_t *start;
+  pthread_barrier_t* start;
   int fd;
   unsigned id;
 };
 
-static void *signal_pipe(void *opaque) {
-  struct pipe_writer *writer = opaque;
+static void* signal_pipe(void* opaque) {
+  struct pipe_writer* writer = opaque;
   const unsigned char payload = (unsigned char)('A' + writer->id);
 
   wait_at_barrier(writer->start);
@@ -164,8 +172,9 @@ static int run_event_loop(void) {
     fail("epoll_create1");
   }
 
-  check_pthread(pthread_barrier_init(&start, NULL, PIPE_COUNT + 1),
-                "pthread_barrier_init");
+  check_pthread(
+      pthread_barrier_init(&start, NULL, PIPE_COUNT + 1),
+      "pthread_barrier_init");
   for (unsigned id = 0; id < PIPE_COUNT; ++id) {
     if (pipe2(pipes[id], O_CLOEXEC | O_NONBLOCK) != 0) {
       fail("pipe2");
@@ -180,8 +189,9 @@ static int run_event_loop(void) {
     poll_fds[id] = (struct pollfd){.fd = pipes[id][0], .events = POLLIN};
     writers[id] =
         (struct pipe_writer){.start = &start, .fd = pipes[id][1], .id = id};
-    check_pthread(pthread_create(&threads[id], NULL, signal_pipe, &writers[id]),
-                  "pthread_create");
+    check_pthread(
+        pthread_create(&threads[id], NULL, signal_pipe, &writers[id]),
+        "pthread_create");
   }
 
   wait_at_barrier(&start);
@@ -255,14 +265,19 @@ static int run_event_loop(void) {
 
   const unsigned expected_mask = (1U << PIPE_COUNT) - 1;
   if (seen_mask != expected_mask || poll_mask == 0) {
-    fprintf(stderr,
-            "event-loop invariant failed: seen=%02x expected=%02x poll=%02x\n",
-            seen_mask, expected_mask, poll_mask);
+    fprintf(
+        stderr,
+        "event-loop invariant failed: seen=%02x expected=%02x poll=%02x\n",
+        seen_mask,
+        expected_mask,
+        poll_mask);
     return EXIT_FAILURE;
   }
 
-  printf("event-loop poll-ready=%d poll-mask=%02x epoll-order=", poll_ready,
-         poll_mask);
+  printf(
+      "event-loop poll-ready=%d poll-mask=%02x epoll-order=",
+      poll_ready,
+      poll_mask);
   for (unsigned index = 0; index < event_count; ++index) {
     printf("%s%u", index == 0 ? "" : ",", event_order[index]);
   }
@@ -270,7 +285,7 @@ static int run_event_loop(void) {
   return EXIT_SUCCESS;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s contention|epoll\n", argv[0]);
     return EXIT_FAILURE;
