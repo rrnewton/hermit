@@ -26242,9 +26242,11 @@ mod parity_append_tests {
     const TREE: &str = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
     const RUN: &str = "validate-parity-fixture";
 
-    /// RUN 1953's first portable record, with this fixture's run id.
+    /// RUN 1953's first portable record, with this fixture's run id and the
+    /// `unavailable_class` and `operand` every record now carries (both
+    /// `null` for a measured verdict) inserted after its verdict.
     fn diverged_record() -> String {
-        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
+        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","unavailable_class":null,"operand":null,"inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
             .replace("RUN", RUN)
             .replace("TREE", TREE)
     }

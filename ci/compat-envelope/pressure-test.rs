@@ -7015,10 +7015,15 @@ fn summarize(
     // The verify histories of each cell's first repetition that this summary
     // accepted: the operands of the parity post-pass, one harness history per
     // cell. A first repetition it refused is handed over as its reason
-    // instead, so that side of a parity cell is unavailable, never measured
-    // and never reported missing.
+    // instead, typed as an evidence error or an invalid row, so that side of
+    // a parity cell is unavailable, never measured and never reported
+    // missing. A later repetition whose accepted row recorded a verify
+    // mismatch is handed over as where it did: that side's two runs diverged,
+    // so it has no deterministic log and its parity cells are
+    // nondeterministic.
     let mut parity_rows: Vec<CellResult> = Vec::new();
-    let mut parity_rejected: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut parity_rejected: BTreeMap<(String, String), parity::ParityRejection> = BTreeMap::new();
+    let mut parity_nondeterministic: BTreeMap<(String, String), String> = BTreeMap::new();
     for cell in &metadata.cells {
         for repetition in repetition_numbers(metadata.repetitions) {
             let slug = cell_run_slug(cell, repetition);
@@ -7397,10 +7402,34 @@ fn summarize(
                     } else {
                         evidence_errors.join("; ")
                     };
+                    let reason = format!("result row rejected by the series summary: {why}");
                     parity_rejected.insert(
                         (cell.test.clone(), cell.backend.clone()),
-                        format!("result row rejected by the series summary: {why}"),
+                        if evidence_errors.is_empty() {
+                            parity::ParityRejection::InvalidRow(reason)
+                        } else {
+                            parity::ParityRejection::EvidenceError(reason)
+                        },
                     );
+                }
+            } else if cell.mode == parity::PARITY_MODE && row_valid && evidence_errors.is_empty() {
+                // A later repetition this summary accepted: the first attempt
+                // of the earliest such repetition that recorded a verify
+                // mismatch, if any. A refused row is not evidence either way.
+                if let (Some(number), Some(row)) = (
+                    repetition,
+                    result_rows_for_history
+                        .iter()
+                        .find(|row| row.result == Some(ObservedResult::DeterminismFailure)),
+                ) {
+                    parity_nondeterministic
+                        .entry((cell.test.clone(), cell.backend.clone()))
+                        .or_insert_with(|| {
+                            format!(
+                                "repetition {number} attempt {} recorded a verify mismatch",
+                                row.attempt
+                            )
+                        });
                 }
             }
             let retained_attempts = retained_attempt_count(
@@ -7883,6 +7912,7 @@ fn summarize(
         &metadata,
         &parity_rows,
         &parity_rejected,
+        &parity_nondeterministic,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );
@@ -7928,13 +7958,17 @@ thread_local! {
 /// and neither `summary.json` nor the exit status changes. A post-pass that
 /// refused or panicked before measuring leaves no earlier summary's records
 /// behind. `rejected` holds the verify cells whose first repetition the
-/// summary refused, with the reason; their parity cells are unavailable.
+/// summary refused, with the typed reason; their parity cells are
+/// unavailable. `nondeterministic` holds the verify cells a later repetition
+/// of which the summary accepted recorded a verify mismatch, with where;
+/// their parity cells are nondeterministic.
 fn report_parity(
     root: &Path,
     results: &Path,
     metadata: &RunMetadata,
     rows: &[CellResult],
-    rejected: &BTreeMap<(String, String), String>,
+    rejected: &BTreeMap<(String, String), parity::ParityRejection>,
+    nondeterministic: &BTreeMap<(String, String), String>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) {
@@ -7946,6 +7980,7 @@ fn report_parity(
     );
     config.jobs = usize::try_from(metadata.jobs).unwrap_or(1).max(1);
     config.rejected = rejected.clone();
+    config.nondeterministic = nondeterministic.clone();
     let mut warnings = Vec::new();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
@@ -16696,12 +16731,15 @@ mod pressure_sample_tests {
     /// The series' parity post-pass is the harness's post-pass, with the
     /// harness's scope rule. It runs after summary.json is written and changes
     /// no file but its own. A selected cell whose ptrace verify cell the series
-    /// ran and whose candidate it did not is candidate-missing with null
-    /// credit; a selected cell with neither side in the series is dropped with
-    /// a warning. A post-pass that measures nothing, because its scope is empty
-    /// or cannot be resolved, leaves no records of an earlier summary behind. A
-    /// verify cell whose first repetition the summary refused makes its parity
-    /// cells unavailable, with the summary's reason.
+    /// ran diverged is nondeterministic with null credit and no golden, before
+    /// its candidate, which the series did not run, is looked for: whether the
+    /// first repetition's own row records the mismatch or, when the summary
+    /// refused that row, a later repetition's accepted row does. A selected
+    /// cell with neither side in the series is dropped with a warning. A
+    /// post-pass that measures nothing, because its scope is empty or cannot
+    /// be resolved, leaves no records of an earlier summary behind. A verify
+    /// cell every repetition of which the summary refused makes its parity
+    /// cells unavailable, with the summary's reason for the first repetition.
     #[test]
     fn series_parity_post_pass_reports_missing_operands_and_leaves_the_summary_unchanged() {
         let root = checkout_root();
@@ -16820,17 +16858,39 @@ mod pressure_sample_tests {
         let records = read_parity_records(&parity_path);
         // The cell with neither side in the series has no line.
         assert_eq!(records.len(), 1, "{records:?}");
+        // Every repetition of the reference diverged, so the cell is
+        // nondeterministic, not candidate-missing: the reference has no
+        // deterministic golden log to compare a candidate against.
         let failed = parity_record(&records, &failed_cell);
-        assert_eq!(failed.verdict, parity::ParityVerdict::CandidateMissing);
+        assert_eq!(
+            (failed.verdict, failed.unavailable_class, failed.operand),
+            (
+                parity::ParityVerdict::Nondeterministic,
+                Some(parity::UnavailableClass::DeterminismMismatch),
+                Some(parity::ParityOperand::Reference)
+            ),
+            "{failed:?}"
+        );
         assert!(
             failed
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains(&format!(
-                    "the {} candidate verify cell of {} has no result row in this run",
-                    failed_cell.backend, failed_cell.test_id
+                .is_some_and(|reason| reason.starts_with(&format!(
+                    "the ptrace reference verify cell of {} failed determinism on attempt 1 (its \
+                 two runs diverged), so there is no deterministic golden log to compare against",
+                    failed_cell.test_id
                 ))),
             "{failed:?}"
+        );
+        assert_eq!(
+            (&failed.reference_log, &failed.candidate_log),
+            (&None, &None)
+        );
+        assert!(
+            !parity::golden_paths(&results, &failed_cell.test_id)
+                .unwrap()
+                .0
+                .exists()
         );
         for record in &records {
             record.validate().unwrap();
@@ -16852,6 +16912,7 @@ mod pressure_sample_tests {
             &metadata,
             &rows,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut out,
             &mut err,
         );
@@ -16861,6 +16922,16 @@ mod pressure_sample_tests {
         );
         assert!(
             out.starts_with("pressure-test: parity: 1 cell(s) -> "),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                ": matched 0, diverged 0, nondeterministic 1, reference-missing 0, \
+                 candidate-missing 0, unavailable 0, inputs-not-equalized 0; measured 0; no \
+                 golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; none measured \
+                 with equal inputs; none measured with unequal inputs; 0 log-diff \
+                 comparison(s), 0 guest runs\n"
+            ),
             "{out}"
         );
         assert_eq!(err.lines().count(), 1, "{err}");
@@ -16894,11 +16965,22 @@ mod pressure_sample_tests {
         assert!(!status_path.exists());
 
         // A first repetition the summary refused is never read: its parity
-        // cell is unavailable with the summary's reason, not missing.
+        // cell is unavailable with the summary's reason, an evidence error of
+        // the reference, not missing, while no repetition the summary
+        // accepted recorded a mismatch either.
         metadata.parity_select = vec![failed_cell.to_string()];
         write_metadata(&metadata);
-        let harness_status = first_repetition.join("harness-status");
-        fs::write(&harness_status, "x\n").unwrap();
+        let harness_statuses: Vec<PathBuf> = (1..=PROMOTION_REPETITIONS)
+            .map(|repetition| {
+                results
+                    .join("cells")
+                    .join(cell_run_slug(&selected.id, Some(repetition)))
+                    .join("harness-status")
+            })
+            .collect();
+        for harness_status in &harness_statuses {
+            fs::write(harness_status, "x\n").unwrap();
+        }
         let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
         assert!(error.contains("produced no trustworthy result"), "{error}");
         let records = read_parity_records(&parity_path);
@@ -16907,6 +16989,14 @@ mod pressure_sample_tests {
         assert_eq!(
             refused.verdict,
             parity::ParityVerdict::Unavailable,
+            "{refused:?}"
+        );
+        assert_eq!(
+            (refused.unavailable_class, refused.operand),
+            (
+                Some(parity::UnavailableClass::InfrastructureError),
+                Some(parity::ParityOperand::Reference)
+            ),
             "{refused:?}"
         );
         let reason = refused.reason.as_deref().unwrap_or_default();
@@ -16918,7 +17008,45 @@ mod pressure_sample_tests {
             "{refused:?}"
         );
         refused.validate().unwrap();
-        fs::write(&harness_status, "1\n").unwrap();
+        // The same refused first repetition, but the later repetitions the
+        // summary accepts recorded the mismatch: the reference diverged, so
+        // the cell is nondeterministic, where the earliest of them says.
+        for harness_status in &harness_statuses[1..] {
+            fs::write(harness_status, "1\n").unwrap();
+        }
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("produced no trustworthy result"), "{error}");
+        let records = read_parity_records(&parity_path);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let diverged = parity_record(&records, &failed_cell);
+        assert_eq!(
+            (
+                diverged.verdict,
+                diverged.unavailable_class,
+                diverged.operand
+            ),
+            (
+                parity::ParityVerdict::Nondeterministic,
+                Some(parity::UnavailableClass::DeterminismMismatch),
+                Some(parity::ParityOperand::Reference)
+            ),
+            "{diverged:?}"
+        );
+        assert_eq!(
+            diverged.reason.as_deref(),
+            Some(
+                format!(
+                    "the ptrace reference verify cell of {} failed determinism: repetition 2 \
+                     attempt 1 recorded a verify mismatch, so there is no deterministic golden \
+                     log to compare against",
+                    failed_cell.test_id
+                )
+                .as_str()
+            ),
+            "{diverged:?}"
+        );
+        diverged.validate().unwrap();
+        fs::write(&harness_statuses[0], "1\n").unwrap();
         cleanup.remove().unwrap();
     }
 
@@ -16929,7 +17057,8 @@ mod pressure_sample_tests {
     /// or an output that cannot be written, changes neither the summary nor
     /// the result, and a panic leaves no earlier records behind. A cell whose
     /// row is valid but whose retained evidence the summary refused is
-    /// unavailable with that reason and is not compared.
+    /// unavailable with that reason, an evidence error of that side, and is
+    /// not compared.
     #[test]
     fn series_parity_post_pass_measures_only_the_verify_cells_summarize_accepted() {
         let root = checkout_root();
@@ -17168,6 +17297,7 @@ mod pressure_sample_tests {
             &metadata,
             &rows,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut out,
             &mut err,
         );
@@ -17194,6 +17324,7 @@ mod pressure_sample_tests {
             &metadata,
             &rows,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut Closed,
             &mut Closed,
         );
@@ -17213,6 +17344,14 @@ mod pressure_sample_tests {
         assert_eq!(
             refused.verdict,
             parity::ParityVerdict::Unavailable,
+            "{refused:?}"
+        );
+        assert_eq!(
+            (refused.unavailable_class, refused.operand),
+            (
+                Some(parity::UnavailableClass::InfrastructureError),
+                Some(parity::ParityOperand::Candidate)
+            ),
             "{refused:?}"
         );
         let reason = refused.reason.as_deref().unwrap_or_default();
@@ -17688,9 +17827,11 @@ mod series_parity_append_tests {
     const TREE: &str = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
     const RUN: &str = "pressure-parity-fixture";
 
-    /// RUN 1953's first portable record, with this fixture's run id.
+    /// RUN 1953's first portable record, with this fixture's run id and the
+    /// `unavailable_class` and `operand` every record now carries (both
+    /// `null` for a measured verdict) inserted after its verdict.
     fn diverged_record() -> String {
-        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
+        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","unavailable_class":null,"operand":null,"inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
             .replace("RUN", RUN)
             .replace("TREE", TREE)
     }
