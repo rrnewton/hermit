@@ -54,11 +54,12 @@ use hermit_manifest_plan::parity::LedgerVerdict;
 use hermit_manifest_plan::parity::PARITY_CELLS_PATH;
 use hermit_manifest_plan::parity::ParityBackend;
 use hermit_manifest_plan::parity::ParityLedgerRow;
+use hermit_manifest_plan::parity::ParityOperand;
 use hermit_manifest_plan::parity::ParityProducer;
 use hermit_manifest_plan::parity::UnavailableClass;
+use hermit_manifest_plan::parity::UnavailableGroup;
 use hermit_manifest_plan::parity::UtcInstant;
 use hermit_manifest_plan::parity::parse_utc_timestamp;
-use hermit_manifest_plan::parity::unavailable_class;
 use hermit_manifest_plan::retired_ids::RetiredIds;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
@@ -5596,7 +5597,11 @@ struct ParityCellSummary {
     kind: Option<LedgerVerdict>,
     /// The ledger verdict, or `refused`.
     verdict: &'static str,
+    /// The row's typed class, never derived from its reason text; `None` for
+    /// a measured or refused cell.
     unavailable_class: Option<UnavailableClass>,
+    /// The side the row's class concerns; `None` for a refused cell.
+    operand: Option<ParityOperand>,
     reason: Option<String>,
     /// The record's measured credit, clean or not (see `credit_basis`).
     credit: Option<f64>,
@@ -5628,7 +5633,8 @@ impl ParityCellSummary {
             backend: row.backend,
             kind: Some(row.verdict),
             verdict: row.verdict.as_str(),
-            unavailable_class: unavailable_class(row.verdict, row.reason.as_deref()),
+            unavailable_class: row.unavailable_class,
+            operand: row.operand,
             reason: row.reason.clone(),
             credit,
             credit_basis: credit.map(|_| {
@@ -5668,6 +5674,7 @@ impl ParityCellSummary {
             kind: None,
             verdict: "refused",
             unavailable_class: None,
+            operand: None,
             reason: Some(why.to_string()),
             credit: None,
             credit_basis: None,
@@ -5723,12 +5730,46 @@ struct ParityDivergenceGroup {
     candidate_message: Option<String>,
 }
 
+/// The classes of `group`, in the order the scorecard prints them.
+fn classes_of(group: UnavailableGroup) -> impl Iterator<Item = UnavailableClass> {
+    UnavailableClass::ALL
+        .into_iter()
+        .filter(move |class| class.group() == group)
+}
+
+/// A credit as the scorecard prints it: `n/a` when there is none, never
+/// `0.000`; otherwise three decimals, except that a value below 1 which would
+/// print `1.000` prints `0.999`, so only full matches read as 1.
+fn credit_text(value: Option<f64>) -> String {
+    match value {
+        None => "n/a".to_string(),
+        Some(value) => {
+            let text = format!("{value:.3}");
+            if value < 1.0 && text == "1.000" {
+                "0.999".to_string()
+            } else {
+                text
+            }
+        }
+    }
+}
+
 /// Counts and credit over one set of cells.
 ///
-/// `selected = measured + unavailable + record_missing + refused`, and
-/// `measured = matched + diverged`. `mean_credit` divides the credit sum by
-/// the credited (measured) cells; `floor_credit` divides it by every selected
-/// cell, so an unmeasured, missing or refused cell counts as zero.
+/// `selected = measured + no_golden + not_compared + unmeasured +
+/// record_missing + refused`, and `measured = matched + diverged`. A cell
+/// that was not measured counts under the [`UnavailableGroup`] of its typed
+/// class, never of its reason text. A no-golden cell (an operand's own
+/// outcome left no deterministic golden log) and a not-compared cell (the
+/// backend's inputs cannot be equalized) enter neither the mean nor the
+/// floor; an unmeasured, record-missing or refused cell is in the floor as 0.
+///
+/// `mean_credit` divides the credit sum by the measured cells, so a measured
+/// cell without credit counts as 0, and `floor_credit` divides it by the
+/// `floor_cells`. No cell of a backend whose inputs cannot be equalized
+/// ([`ParityBackend::inputs_not_equalizable`]) enters any floor, a
+/// record-missing or refused one included. A mean or floor over no cells is
+/// `None`, never 0.
 ///
 /// The pooled means mix clean credit (equal inputs) with unequalized credit
 /// only under a marker that says so, and `clean_mean_credit` and
@@ -5739,14 +5780,20 @@ struct ParityDivergenceGroup {
 /// [`PARITY_CELLS_PATH`], `committed_selected` how many of those the run
 /// reported, and `outside_committed` how many it reported that the selection
 /// does not name. All three are `None` when that selection is unknown.
+/// `line` is [`ParityTally::render_line`] of the finished tally.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ParityTally {
     selected: usize,
     measured: usize,
     matched: usize,
     diverged: usize,
-    unavailable: usize,
-    unavailable_by_class: BTreeMap<UnavailableClass, usize>,
+    no_golden: usize,
+    /// Every no-golden class, zeros included.
+    no_golden_by_class: BTreeMap<UnavailableClass, usize>,
+    not_compared: usize,
+    unmeasured: usize,
+    /// Every unmeasured class, zeros included.
+    unmeasured_by_class: BTreeMap<UnavailableClass, usize>,
     record_missing: usize,
     refused: usize,
     credited: usize,
@@ -5755,6 +5802,8 @@ struct ParityTally {
     credit_sum: f64,
     clean_credit_sum: f64,
     unequalized_credit_sum: f64,
+    /// The floor's denominator.
+    floor_cells: usize,
     mean_credit: Option<f64>,
     clean_mean_credit: Option<f64>,
     unequalized_mean_credit: Option<f64>,
@@ -5763,20 +5812,26 @@ struct ParityTally {
     committed_selected: Option<usize>,
     outside_committed: Option<usize>,
     first_divergence: Option<ParityDivergenceGroup>,
+    line: String,
 }
 
 impl ParityTally {
     fn over<'a>(cells: impl IntoIterator<Item = &'a ParityCellSummary>) -> Self {
+        let zeros = |group: UnavailableGroup| {
+            classes_of(group)
+                .map(|class| (class, 0))
+                .collect::<BTreeMap<_, _>>()
+        };
         let mut tally = Self {
             selected: 0,
             measured: 0,
             matched: 0,
             diverged: 0,
-            unavailable: 0,
-            unavailable_by_class: UnavailableClass::ALL
-                .into_iter()
-                .map(|class| (class, 0))
-                .collect(),
+            no_golden: 0,
+            no_golden_by_class: zeros(UnavailableGroup::NoGolden),
+            not_compared: 0,
+            unmeasured: 0,
+            unmeasured_by_class: zeros(UnavailableGroup::Unmeasured),
             record_missing: 0,
             refused: 0,
             credited: 0,
@@ -5785,6 +5840,7 @@ impl ParityTally {
             credit_sum: 0.0,
             clean_credit_sum: 0.0,
             unequalized_credit_sum: 0.0,
+            floor_cells: 0,
             mean_credit: None,
             clean_mean_credit: None,
             unequalized_mean_credit: None,
@@ -5793,6 +5849,7 @@ impl ParityTally {
             committed_selected: None,
             outside_committed: None,
             first_divergence: None,
+            line: String::new(),
         };
         let mut groups: BTreeMap<
             (Option<usize>, Option<u64>, Option<String>),
@@ -5800,6 +5857,9 @@ impl ParityTally {
         > = BTreeMap::new();
         for cell in cells {
             tally.selected += 1;
+            // No cell of a backend whose inputs cannot be equalized is in a
+            // floor, and neither is a no-golden or not-compared cell.
+            let mut in_floor = cell.backend.inputs_not_equalizable().is_none();
             match cell.kind {
                 None => tally.refused += 1,
                 Some(LedgerVerdict::RecordMissing) => tally.record_missing += 1,
@@ -5819,11 +5879,30 @@ impl ParityTally {
                         .or_default()
                         .push(cell);
                 }
-                Some(_) => {
-                    tally.unavailable += 1;
-                    let class = cell.unavailable_class.unwrap_or(UnavailableClass::Other);
-                    *tally.unavailable_by_class.entry(class).or_default() += 1;
+                Some(verdict) => {
+                    let class = cell.unavailable_class.unwrap_or_else(|| {
+                        panic!("a validated {verdict} row always names its unavailable_class")
+                    });
+                    match class.group() {
+                        UnavailableGroup::NoGolden => {
+                            in_floor = false;
+                            tally.no_golden += 1;
+                            *tally.no_golden_by_class.entry(class).or_default() += 1;
+                        }
+                        UnavailableGroup::NotCompared => {
+                            in_floor = false;
+                            tally.not_compared += 1;
+                        }
+                        UnavailableGroup::Unmeasured => {
+                            tally.unmeasured += 1;
+                            *tally.unmeasured_by_class.entry(class).or_default() += 1;
+                        }
+                        UnavailableGroup::RecordMissing => tally.record_missing += 1,
+                    }
                 }
+            }
+            if in_floor {
+                tally.floor_cells += 1;
             }
             if let Some(credit) = cell.credit {
                 tally.credited += 1;
@@ -5838,11 +5917,11 @@ impl ParityTally {
             }
         }
         let mean = |sum: f64, count: usize| (count > 0).then(|| sum / count as f64);
-        tally.mean_credit = mean(tally.credit_sum, tally.credited);
+        tally.mean_credit = mean(tally.credit_sum, tally.measured);
         tally.clean_mean_credit = mean(tally.clean_credit_sum, tally.clean_credited);
         tally.unequalized_mean_credit =
             mean(tally.unequalized_credit_sum, tally.unequalized_credited);
-        tally.floor_credit = mean(tally.credit_sum, tally.selected);
+        tally.floor_credit = mean(tally.credit_sum, tally.floor_cells);
         let mut best: Option<(
             &(Option<usize>, Option<u64>, Option<String>),
             &Vec<&ParityCellSummary>,
@@ -5865,6 +5944,7 @@ impl ParityTally {
                 candidate_message: example.candidate_message.clone(),
             }
         });
+        tally.line = tally.render_line();
         tally
     }
 
@@ -5897,6 +5977,7 @@ impl ParityTally {
         );
         self.committed_selected = Some(owed_and_reported);
         self.outside_committed = Some(reported.len() - owed_and_reported);
+        self.line = self.render_line();
         self
     }
 
@@ -5933,9 +6014,9 @@ impl ParityTally {
     /// Which inputs the credited cells were measured with, never pooling an
     /// unequalized credit into a clean one without saying so.
     fn credit_inputs(&self) -> String {
-        let credit =
-            |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
-        if self.credited == 0 {
+        if self.selected > 0 && self.not_compared == self.selected {
+            "not compared (inputs cannot be equalized)".to_string()
+        } else if self.credited == 0 {
             "—".to_string()
         } else if self.clean_credited == 0 {
             "not equalized".to_string()
@@ -5946,54 +6027,98 @@ impl ParityTally {
                 "equalized for {} of {} (mean {} equal; {} unequal)",
                 self.clean_credited,
                 self.credited,
-                credit(self.clean_mean_credit),
-                credit(self.unequalized_mean_credit)
+                credit_text(self.clean_mean_credit),
+                credit_text(self.unequalized_mean_credit)
             )
         }
     }
 
-    /// The one-line parity summary, for example
-    /// `parity: 0/12 matched; selected 12 of 12 committed; measured 12;
-    /// unavailable 0; record-missing 0; mean credit (measured) 0.101; floor
-    /// credit (selected) 0.101`.
-    fn line(&self) -> String {
-        let credit =
-            |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
-        let refused = if self.refused > 0 {
-            format!("; refused {}", self.refused)
-        } else {
-            String::new()
-        };
-        let over = if self.credited != self.measured {
-            format!(" over {} credited", self.credited)
-        } else {
-            String::new()
-        };
-        let inputs = if self.credited > 0 && self.clean_credited == 0 {
+    /// The line's closing marker: whether the credited cells had the
+    /// reference's inputs, naming both means when some did and some did not.
+    fn inputs_marker(&self) -> String {
+        if self.credited > 0 && self.clean_credited == 0 {
             " [inputs not equalized]".to_string()
         } else if self.unequalized_credited > 0 {
             format!(
                 " [inputs equalized for {} of {} credited: mean {} over {} with equal inputs; mean {} over {} with unequal inputs]",
                 self.clean_credited,
                 self.credited,
-                credit(self.clean_mean_credit),
+                credit_text(self.clean_mean_credit),
                 self.clean_credited,
-                credit(self.unequalized_mean_credit),
+                credit_text(self.unequalized_mean_credit),
                 self.unequalized_credited
             )
         } else {
             String::new()
+        }
+    }
+
+    /// The one-line parity summary, which names each denominator, for
+    /// example `parity: 0/77 matched; selected 77 of 77 committed; mean 0.100
+    /// over 76 measured; floor 0.100 over 76 measured of 77 selected (1 no
+    /// golden: determinism-mismatch 1; 0 not compared) [inputs not
+    /// equalized]`. The nonzero classes are listed in print order. A tally
+    /// whose every cell was not compared says only that, with its coverage.
+    fn render_line(&self) -> String {
+        if self.selected > 0 && self.not_compared == self.selected {
+            return format!(
+                "parity: not compared: {} measured of {} selected (inputs cannot be equalized); {}",
+                self.measured,
+                self.selected,
+                self.coverage()
+            );
+        }
+        let classes = |counts: &BTreeMap<UnavailableClass, usize>| {
+            counts
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(class, count)| format!("{class} {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut no_golden = format!("{} no golden", self.no_golden);
+        if self.no_golden > 0 {
+            no_golden.push_str(&format!(": {}", classes(&self.no_golden_by_class)));
+        }
+        let mut parts = vec![no_golden, format!("{} not compared", self.not_compared)];
+        if self.unmeasured > 0 {
+            parts.push(format!(
+                "{} unmeasured: {}",
+                self.unmeasured,
+                classes(&self.unmeasured_by_class)
+            ));
+        }
+        if self.record_missing > 0 {
+            parts.push(format!("{} record-missing", self.record_missing));
+        }
+        if self.refused > 0 {
+            parts.push(format!("{} refused", self.refused));
+        }
+        let unequalizable = self
+            .selected
+            .saturating_sub(self.no_golden + self.not_compared + self.floor_cells);
+        if unequalizable > 0 {
+            parts.push(format!(
+                "floor excludes {unequalizable} record-missing or refused cell(s) whose inputs cannot be equalized"
+            ));
+        }
+        let credited = if self.credited != self.measured {
+            format!(" ({} credited)", self.credited)
+        } else {
+            String::new()
         };
         format!(
-            "parity: {}/{} matched; {}; measured {}; unavailable {}; record-missing {}{refused}; mean credit (measured) {}{over}; floor credit (selected) {}{inputs}",
+            "parity: {}/{} matched; {}; mean {} over {} measured{credited}; floor {} over {} measured of {} selected ({}){}",
             self.matched,
             self.selected,
             self.coverage(),
+            credit_text(self.mean_credit),
             self.measured,
-            self.unavailable,
-            self.record_missing,
-            credit(self.mean_credit),
-            credit(self.floor_credit),
+            credit_text(self.floor_credit),
+            self.measured,
+            self.selected,
+            parts.join("; "),
+            self.inputs_marker()
         )
     }
 }
@@ -6327,7 +6452,7 @@ fn summarize_parity(
             depth,
             emitted_at: run.emitted_at.as_ref().map(|(_, text)| text.clone()),
             emitted_instant: run.emitted_at.map(|(instant, _)| instant),
-            line: total.line(),
+            line: total.line.clone(),
             committed_unknown,
             committed_cells_without_row,
             cells_outside_committed,
@@ -6603,8 +6728,6 @@ fn markdown_cell(text: &str) -> String {
 }
 
 fn render_parity_tally_row(label: &str, tally: &ParityTally) -> String {
-    let credit =
-        |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
     let selected = match (
         tally.committed,
         tally.committed_selected,
@@ -6621,15 +6744,17 @@ fn render_parity_tally_row(label: &str, tally: &ParityTally) -> String {
         _ => tally.selected.to_string(),
     };
     format!(
-        "| {label} | {selected} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        "| {label} | {selected} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         tally.measured,
         tally.matched,
         tally.diverged,
-        tally.unavailable,
+        tally.no_golden,
+        tally.not_compared,
+        tally.unmeasured,
         tally.record_missing,
         tally.refused,
-        credit(tally.mean_credit),
-        credit(tally.floor_credit),
+        credit_text(tally.mean_credit),
+        credit_text(tally.floor_credit),
         markdown_cell(&tally.credit_inputs()),
     )
 }
@@ -6646,8 +6771,13 @@ beside determinism, never folded into it: no count, measurement or colour above 
 runs a ptrace rerun any more (https://github.com/rrnewton/hermit/issues/3301).\n\n\
 A measured cell earns credit in [0, 1]: its matched prefix of compared records over the longer log, and \
 1 only for a full match. **Mean credit** divides the credit sum by the measured (matched plus diverged) \
-cells; **floor credit** divides it by every selected cell, so an unavailable, record-missing or refused \
-cell counts as 0. **Selected** reads `W of C` when the run's own Hermit commit's `{PARITY_CELLS_PATH}` \
+cells, so a measured cell without credit counts as 0. **Floor credit** divides it by every selected cell \
+except two kinds that could not be compared: a **no golden** cell, where an operand's own outcome (a \
+determinism mismatch, a timeout, a crash and the like) left no deterministic golden log, and a **not \
+compared** cell, whose backend cannot be given the reference's inputs. So an **unmeasured** cell (a golden \
+log could exist, but the harness or the parity tool made no comparison), a record-missing cell and a \
+refused cell each count as 0. No cell of a backend whose inputs cannot be equalized enters any mean or \
+floor, and a mean or floor over no cells reads n/a, never 0.000. **Selected** reads `W of C` when the run's own Hermit commit's `{PARITY_CELLS_PATH}` \
 is known: the run reported W of the C cells that selection owes, and a run that reported fewer is marked \
 partial. Mean credit pools clean credit (inputs equalized) with unequalized credit only under a marker that \
 says so; **Credit inputs** shows which it is. The `{LEGACY_RERUN_LABEL}` history at the end is the retired \
@@ -6685,8 +6815,8 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
         };
         out.push_str(&format!(
             "\n### {} run `{}` {sha}{partial}\n\n`{}`\n\n\
-| Candidate backend | Selected | Measured | Matched | Diverged | Unavailable | Record-missing | Refused | Mean credit (measured) | Floor credit (selected) | Credit inputs |\n\
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+| Candidate backend | Selected | Measured | Matched | Diverged | No golden | Not compared | Unmeasured | Record-missing | Refused | Mean credit (measured) | Floor credit | Credit inputs |\n\
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
             run.producer, run.run_id, run.line
         ));
         // A backend the run reported, or one its commit's selection owes
@@ -6730,27 +6860,45 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
             }
             out.push_str(".\n");
         }
-        out.push_str("\nUnavailable cells by reason:\n\n| Candidate backend |");
-        for class in UnavailableClass::ALL {
-            out.push_str(&format!(" `{class}` |"));
-        }
-        out.push_str("\n| --- |");
-        for _ in UnavailableClass::ALL {
-            out.push_str(" ---: |");
-        }
-        out.push('\n');
-        for (label, tally) in run
-            .per_backend
-            .iter()
-            .filter(|(_, tally)| shown(tally))
-            .map(|(backend, tally)| (format!("`{backend}`"), tally))
-            .chain(std::iter::once(("**TOTAL**".to_string(), &run.total)))
-        {
-            out.push_str(&format!("| {label} |"));
-            for class in UnavailableClass::ALL {
-                out.push_str(&format!(" {} |", tally.unavailable_by_class[&class]));
+        let class_count = |tally: &ParityTally, class: UnavailableClass| match class.group() {
+            UnavailableGroup::NoGolden => tally.no_golden_by_class[&class],
+            UnavailableGroup::Unmeasured => tally.unmeasured_by_class[&class],
+            UnavailableGroup::NotCompared | UnavailableGroup::RecordMissing => 0,
+        };
+        let classes = [UnavailableGroup::NoGolden, UnavailableGroup::Unmeasured]
+            .into_iter()
+            .flat_map(classes_of)
+            .filter(|class| class_count(&run.total, *class) > 0)
+            .collect::<Vec<_>>();
+        if !classes.is_empty() {
+            let backends = run
+                .per_backend
+                .iter()
+                .filter(|(_, tally)| shown(tally))
+                .collect::<Vec<_>>();
+            out.push_str(
+                "\nCells that were not measured, by class: a no-golden cell is outside the mean and the floor, and an unmeasured cell counts 0 in the floor.\n\n| Class | Group |",
+            );
+            for (backend, _) in &backends {
+                out.push_str(&format!(" `{backend}` |"));
             }
-            out.push('\n');
+            out.push_str(" **TOTAL** |\n| --- | --- |");
+            for _ in &backends {
+                out.push_str(" ---: |");
+            }
+            out.push_str(" ---: |\n");
+            for class in classes {
+                let group = if class.group() == UnavailableGroup::NoGolden {
+                    "no golden"
+                } else {
+                    "unmeasured"
+                };
+                out.push_str(&format!("| `{class}` | {group} |"));
+                for (_, tally) in &backends {
+                    out.push_str(&format!(" {} |", class_count(tally, class)));
+                }
+                out.push_str(&format!(" {} |\n", class_count(&run.total, class)));
+            }
         }
         if let Some(group) = &run.total.first_divergence {
             out.push_str(&format!(
@@ -6776,8 +6924,10 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
             );
             for cell in unmatched {
                 let credit = match (cell.credit, cell.credit_basis) {
-                    (Some(credit), Some("unequalized")) => format!("{credit:.3} (unequalized)"),
-                    (Some(credit), _) => format!("{credit:.3}"),
+                    (Some(credit), Some("unequalized")) => {
+                        format!("{} (unequalized)", credit_text(Some(credit)))
+                    }
+                    (Some(credit), _) => credit_text(Some(credit)),
                     (None, _) => "—".into(),
                 };
                 let verdict = match cell.unavailable_class {
@@ -34768,6 +34918,8 @@ mod parity_summary_tests {
             test_id: test.into(),
             backend,
             verdict,
+            unavailable_class: None,
+            operand: None,
             inputs_equalized: false,
             reason: None,
             credit: None,
@@ -34834,9 +34986,13 @@ mod parity_summary_tests {
         test: &str,
         backend: ParityBackend,
         verdict: ParityVerdict,
+        class: UnavailableClass,
+        operand: Option<ParityOperand>,
         reason: &str,
     ) -> ParityRecord {
         let mut record = ParityRecord {
+            unavailable_class: Some(class),
+            operand,
             reason: Some(reason.into()),
             ..base_record(test, backend, verdict)
         };
@@ -34877,6 +35033,12 @@ mod parity_summary_tests {
         record: Option<ParityRecord>,
     ) -> ParityLedgerRow {
         let cell = format!("{test}@{backend}");
+        let unavailable_class = record
+            .as_ref()
+            .map_or(Some(UnavailableClass::RecordMissing), |record| {
+                record.unavailable_class
+            });
+        let operand = record.as_ref().and_then(|record| record.operand);
         ParityLedgerRow {
             schema: PARITY_LEDGER_SCHEMA.into(),
             event_type: PARITY_LEDGER_EVENT_TYPE.into(),
@@ -34892,6 +35054,8 @@ mod parity_summary_tests {
             test_id: test.into(),
             backend,
             verdict,
+            unavailable_class,
+            operand,
             reason: reason.map(str::to_string),
             source,
             record,
@@ -35015,14 +35179,14 @@ mod parity_summary_tests {
         let run = only_run(&summary);
         assert_eq!(
             run.line,
-            "parity: 0/12 matched; committed selection unknown; measured 12; unavailable 0; \
-             record-missing 0; mean credit (measured) 0.117; floor credit (selected) 0.117 \
+            "parity: 0/12 matched; committed selection unknown; mean 0.117 over 12 measured; \
+             floor 0.117 over 12 measured of 12 selected (0 no golden; 0 not compared) \
              [inputs not equalized]"
         );
         assert_eq!(
-            run.per_backend[&KVM].line(),
-            "parity: 0/4 matched; committed selection unknown; measured 4; unavailable 0; \
-             record-missing 0; mean credit (measured) 0.100; floor credit (selected) 0.100 \
+            run.per_backend[&KVM].line,
+            "parity: 0/4 matched; committed selection unknown; mean 0.100 over 4 measured; \
+             floor 0.100 over 4 measured of 4 selected (0 no golden; 0 not compared) \
              [inputs not equalized]"
         );
         assert_eq!(run.per_backend[&DBT].selected, 0);
@@ -35032,25 +35196,25 @@ mod parity_summary_tests {
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
-            "\n`parity: 0/12 matched; committed selection unknown; measured 12; unavailable 0; \
-             record-missing 0; mean credit (measured) 0.117; floor credit (selected) 0.117 \
+            "\n`parity: 0/12 matched; committed selection unknown; mean 0.117 over 12 measured; \
+             floor 0.117 over 12 measured of 12 selected (0 no golden; 0 not compared) \
              [inputs not equalized]`\n",
         );
         assert_contains(
             &rendered,
-            "| `kvm` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
+            "| `kvm` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `liteinst` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.050 | 0.050 | not equalized |\n",
+            "| `liteinst` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0.050 | 0.050 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `sabre` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.200 | 0.200 | not equalized |\n",
+            "| `sabre` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0.200 | 0.200 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| **TOTAL** | 12 | 12 | 0 | 12 | 0 | 0 | 0 | 0.117 | 0.117 | not equalized |\n",
+            "| **TOTAL** | 12 | 12 | 0 | 12 | 0 | 0 | 0 | 0 | 0 | 0.117 | 0.117 | not equalized |\n",
         );
         assert_contains(
             &rendered,
@@ -35092,9 +35256,9 @@ mod parity_summary_tests {
         let run = only_run(&summary);
         assert_eq!(
             run.line,
-            "parity: 0/12 matched; committed selection unknown; measured 9; unavailable 0; \
-             record-missing 3; mean credit (measured) 0.117; floor credit (selected) 0.088 \
-             [inputs not equalized]"
+            "parity: 0/12 matched; committed selection unknown; mean 0.117 over 9 measured; \
+             floor 0.088 over 9 measured of 12 selected (0 no golden; 0 not compared; \
+             3 record-missing) [inputs not equalized]"
         );
         let all_diverged = summarize_rows(&twelve_diverged(), &no_cells());
         assert!(run.total.floor_credit < only_run(&all_diverged).total.floor_credit);
@@ -35105,19 +35269,19 @@ mod parity_summary_tests {
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
-            "| `kvm` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.100 | 0.075 | not equalized |\n",
+            "| `kvm` | 4 | 3 | 0 | 3 | 0 | 0 | 0 | 1 | 0 | 0.100 | 0.075 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `liteinst` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.050 | 0.038 | not equalized |\n",
+            "| `liteinst` | 4 | 3 | 0 | 3 | 0 | 0 | 0 | 1 | 0 | 0.050 | 0.038 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `sabre` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.200 | 0.150 | not equalized |\n",
+            "| `sabre` | 4 | 3 | 0 | 3 | 0 | 0 | 0 | 1 | 0 | 0.200 | 0.150 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| **TOTAL** | 12 | 9 | 0 | 9 | 0 | 3 | 0 | 0.117 | 0.088 | not equalized |\n",
+            "| **TOTAL** | 12 | 9 | 0 | 9 | 0 | 0 | 0 | 3 | 0 | 0.117 | 0.088 | not equalized |\n",
         );
         assert_contains(
             &rendered,
@@ -35126,14 +35290,16 @@ mod parity_summary_tests {
     }
 
     #[test]
-    fn a_determinism_fail_operand_is_unavailable_with_its_reason_and_no_credit() {
+    fn a_determinism_mismatch_operand_is_nondeterministic_with_no_golden_and_no_credit() {
         let reason = "the kvm candidate verify cell of c-programs/golden-1 failed determinism: \
                       verify run 2 diverged at record 40";
         let rows = [
             row(unmeasured(
                 &golden(1),
                 KVM,
-                ParityVerdict::Unavailable,
+                ParityVerdict::Nondeterministic,
+                UnavailableClass::DeterminismMismatch,
+                Some(ParityOperand::Candidate),
                 reason,
             )),
             row(diverged(&golden(2), KVM, 10, 100, 11, 12, false)),
@@ -35141,33 +35307,50 @@ mod parity_summary_tests {
         let summary = summarize_rows(&rows, &no_cells());
         let run = only_run(&summary);
         let failed = cell(run, "c-programs/golden-1@kvm");
-        assert_eq!(failed.kind, Some(LedgerVerdict::Unavailable));
+        assert_eq!(failed.kind, Some(LedgerVerdict::Nondeterministic));
         assert_eq!(
-            failed.unavailable_class,
-            Some(UnavailableClass::DeterminismFail)
+            (failed.unavailable_class, failed.operand),
+            (
+                Some(UnavailableClass::DeterminismMismatch),
+                Some(ParityOperand::Candidate)
+            )
         );
         assert_eq!(failed.reason.as_deref(), Some(reason));
         assert_eq!((failed.credit, failed.credit_basis), (None, None));
-        assert_eq!((run.total.measured, run.total.unavailable), (1, 1));
+        assert_eq!((run.total.measured, run.total.no_golden), (1, 1));
         assert_eq!(run.total.credited, 1);
-        for (class, count) in &run.total.unavailable_by_class {
-            let expected = usize::from(*class == UnavailableClass::DeterminismFail);
+        for (class, count) in &run.total.no_golden_by_class {
+            let expected = usize::from(*class == UnavailableClass::DeterminismMismatch);
             assert_eq!(*count, expected, "{class}");
         }
+        assert!(
+            run.total
+                .unmeasured_by_class
+                .values()
+                .all(|count| *count == 0),
+            "{:?}",
+            run.total.unmeasured_by_class
+        );
+        // A no-golden cell is outside the floor, so the floor is the diverged
+        // cell's own credit.
         assert_eq!(
             run.line,
-            "parity: 0/2 matched; committed selection unknown; measured 1; unavailable 1; \
-             record-missing 0; mean credit (measured) 0.100; floor credit (selected) 0.050 \
-             [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
+             floor 0.100 over 1 measured of 2 selected (1 no golden: determinism-mismatch 1; \
+             0 not compared) [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
             &format!(
-                "| `c-programs/golden-1@kvm` | unavailable[determinism-fail] | — | {reason} |\n"
+                "| `c-programs/golden-1@kvm` | nondeterministic[determinism-mismatch] | — | \
+                 {reason} |\n"
             ),
         );
-        assert_contains(&rendered, "| `kvm` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |\n");
+        assert_contains(
+            &rendered,
+            "| `determinism-mismatch` | no golden | 1 | 1 |\n",
+        );
     }
 
     fn comparison(
@@ -35474,15 +35657,15 @@ mod parity_summary_tests {
         );
         assert_eq!(
             run.line,
-            "parity: 0/2 matched; committed selection unknown; measured 1; unavailable 0; \
-             record-missing 0; refused 1; mean credit (measured) 0.100; floor credit (selected) \
-             0.050 [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
+             floor 0.050 over 1 measured of 2 selected (0 no golden; 0 not compared; 1 refused) \
+             [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(&rendered, "### Refused parity rows");
         assert_contains(
             &rendered,
-            "| **TOTAL** | 2 | 1 | 0 | 1 | 0 | 0 | 1 | 0.100 | 0.050 | not equalized |\n",
+            "| **TOTAL** | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 1 | 0.100 | 0.050 | not equalized |\n",
         );
     }
 
@@ -35544,8 +35727,8 @@ mod parity_summary_tests {
         );
         assert_eq!(
             run.line,
-            "parity: 0/1 matched; committed selection unknown; measured 0; unavailable 0; \
-             record-missing 0; refused 1; mean credit (measured) n/a; floor credit (selected) 0.000"
+            "parity: 0/1 matched; committed selection unknown; mean n/a over 0 measured; \
+             floor 0.000 over 0 measured of 1 selected (0 no golden; 0 not compared; 1 refused)"
         );
     }
 
@@ -35562,6 +35745,8 @@ mod parity_summary_tests {
                 &golden(1),
                 DBT,
                 ParityVerdict::InputsNotEqualized,
+                UnavailableClass::InputsNotEqualized,
+                Some(ParityOperand::Candidate),
                 "dbt runs a rewritten program",
             )),
             row(matched(&golden(1), KVM, 80, true)),
@@ -35572,12 +35757,16 @@ mod parity_summary_tests {
                 &golden(2),
                 LITEINST,
                 ParityVerdict::CandidateMissing,
+                UnavailableClass::NoResultRow,
+                Some(ParityOperand::Candidate),
                 absent,
             )),
             row(unmeasured(
                 &golden(3),
                 KVM,
-                ParityVerdict::Unavailable,
+                ParityVerdict::Nondeterministic,
+                UnavailableClass::DeterminismMismatch,
+                Some(ParityOperand::Candidate),
                 reason,
             )),
             row(half),
@@ -35643,12 +35832,15 @@ mod parity_summary_tests {
         let run = &summary.producers[0];
         // Credited: golden-1@kvm 1.0 and golden-2@kvm 0.3 with equal inputs
         // (mean 0.650); golden-1@liteinst 0.5 and golden-1@sabre 1.0 without
-        // (mean 0.750). Pooled: 2.8 over 4 measured, and over 9 selected.
+        // (mean 0.750). Pooled: 2.8 over 4 measured, and over the floor's 7
+        // cells: the 9 selected less golden-3@kvm (no golden) and
+        // golden-1@dbt (not compared).
         assert_eq!(
             run.line,
-            "parity: 2/9 matched; committed selection unknown; measured 4; unavailable 3; \
-             record-missing 1; refused 1; mean credit (measured) 0.700; floor credit (selected) \
-             0.311 [inputs equalized for 2 of 4 credited: mean 0.650 over 2 with equal inputs; \
+            "parity: 2/9 matched; committed selection unknown; mean 0.700 over 4 measured; \
+             floor 0.400 over 4 measured of 9 selected (1 no golden: determinism-mismatch 1; \
+             1 not compared; 1 unmeasured: no-result-row 1; 1 record-missing; 1 refused) \
+             [inputs equalized for 2 of 4 credited: mean 0.650 over 2 with equal inputs; \
              mean 0.750 over 2 with unequal inputs]"
         );
         assert_eq!(
@@ -35661,20 +35853,21 @@ mod parity_summary_tests {
         assert_eq!(cell(run, "c-programs/golden-2@kvm").credit, Some(0.3));
         let rendered = render_parity_section(&summary);
         for expected in [
-            "| `dbt` | 1 | 0 | 0 | 0 | 1 | 0 | 0 | n/a | 0.000 | — |\n",
-            "| `kvm` | 4 | 2 | 1 | 1 | 1 | 1 | 0 | 0.650 | 0.325 | equalized |\n",
-            "| `liteinst` | 3 | 1 | 0 | 1 | 1 | 0 | 1 | 0.500 | 0.167 | not equalized |\n",
-            "| `sabre` | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 1.000 | 1.000 | not equalized |\n",
-            "| **TOTAL** | 9 | 4 | 2 | 2 | 3 | 1 | 1 | 0.700 | 0.311 | \
+            "| `dbt` | 1 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | n/a | n/a | \
+             not compared (inputs cannot be equalized) |\n",
+            "| `kvm` | 4 | 2 | 1 | 1 | 1 | 0 | 0 | 1 | 0 | 0.650 | 0.433 | equalized |\n",
+            "| `liteinst` | 3 | 1 | 0 | 1 | 0 | 0 | 1 | 0 | 1 | 0.500 | 0.167 | not equalized |\n",
+            "| `sabre` | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1.000 | 1.000 | not equalized |\n",
+            "| **TOTAL** | 9 | 4 | 2 | 2 | 1 | 1 | 1 | 1 | 1 | 0.700 | 0.400 | \
              equalized for 2 of 4 (mean 0.650 equal; 0.750 unequal) |\n",
-            // determinism-fail, host-inapplicable, operand-ended,
-            // log-not-retained, inputs-not-equalized, reference-missing,
-            // candidate-missing, other.
-            "| **TOTAL** | 1 | 0 | 0 | 0 | 1 | 0 | 1 | 0 |\n",
+            // The cells that were not measured, by class and backend.
+            "| Class | Group | `dbt` | `kvm` | `liteinst` | `sabre` | **TOTAL** |\n",
+            "| `determinism-mismatch` | no golden | 0 | 1 | 0 | 0 | 1 |\n",
+            "| `no-result-row` | unmeasured | 0 | 0 | 1 | 0 | 1 |\n",
             "| `c-programs/golden-1@liteinst` | diverged | 0.500 (unequalized) | record 51, syscall 7: token 3: `a51` vs `b51` |\n",
             "| `c-programs/golden-2@kvm` | diverged | 0.300 | record 31, syscall 4: token 3: `a31` vs `b31` |\n",
-            "| `c-programs/golden-3@kvm` | unavailable[determinism-fail] | — |",
-            "| `c-programs/golden-2@liteinst` | candidate-missing | — |",
+            "| `c-programs/golden-3@kvm` | nondeterministic[determinism-mismatch] | — |",
+            "| `c-programs/golden-2@liteinst` | candidate-missing[no-result-row] | — |",
             "| `c-programs/golden-1@dbt` | inputs-not-equalized | — | dbt runs a rewritten program |\n",
             "### pressure-test run `pressure-run` at `0123456789ab`",
             "| validate | `validate-older-run` | `0123456789ab` | no | `parity: 1/1 matched;",
@@ -35695,7 +35888,7 @@ mod parity_summary_tests {
             value["producers"][0]["total"]["floor_credit"]
                 .as_f64()
                 .map(|v| format!("{v:.3}")),
-            Some("0.311".into())
+            Some("0.400".into())
         );
         assert_eq!(
             value["producers"][0]["per_backend"]["kvm"]["record_missing"],
@@ -35755,18 +35948,20 @@ mod parity_summary_tests {
         input
     }
 
-    /// `(selected, measured, matched, diverged, unavailable, record-missing,
-    /// refused)` of `tally`.
-    fn counts(tally: &ParityTally) -> (usize, usize, usize, usize, usize, usize, usize) {
-        (
+    /// `[selected, measured, matched, diverged, no golden, not compared,
+    /// unmeasured, record-missing, refused]` of `tally`.
+    fn counts(tally: &ParityTally) -> [usize; 9] {
+        [
             tally.selected,
             tally.measured,
             tally.matched,
             tally.diverged,
-            tally.unavailable,
+            tally.no_golden,
+            tally.not_compared,
+            tally.unmeasured,
             tally.record_missing,
             tally.refused,
-        )
+        ]
     }
 
     #[test]
@@ -35777,42 +35972,51 @@ mod parity_summary_tests {
         let mut contradicted = row(matched(&golden(1), KVM, 40, false));
         contradicted.verdict = LedgerVerdict::Diverged;
         // A full match beside a more adverse report of the same cell from
-        // another node: (more adverse, kept verdict, kept credit, counts).
+        // another node: (more adverse, kept verdict, kept credit, counts,
+        // floor).
         let cases = [
             (
                 from_node(row(diverged(&golden(1), KVM, 10, 100, 11, 12, true)), OTHER),
                 "diverged",
                 Some(0.1),
-                (1, 1, 0, 1, 0, 0, 0),
+                [1, 1, 0, 1, 0, 0, 0, 0, 0],
+                Some(0.1),
             ),
             (
                 from_node(missing(&golden(1), KVM), OTHER),
                 "record-missing",
                 None,
-                (1, 0, 0, 0, 0, 1, 0),
+                [1, 0, 0, 0, 0, 0, 0, 1, 0],
+                Some(0.0),
             ),
             (
                 from_node(contradicted, OTHER),
                 "refused",
                 None,
-                (1, 0, 0, 0, 0, 0, 1),
+                [1, 0, 0, 0, 0, 0, 0, 0, 1],
+                Some(0.0),
             ),
+            // A timed-out operand leaves no golden log, so the kept cell is
+            // outside the floor, which is then over no cell.
             (
                 from_node(
                     row(unmeasured(
                         &golden(1),
                         KVM,
                         ParityVerdict::Unavailable,
+                        UnavailableClass::Timeout,
+                        Some(ParityOperand::Candidate),
                         timed_out,
                     )),
                     OTHER,
                 ),
                 "unavailable",
                 None,
-                (1, 0, 0, 0, 1, 0, 0),
+                [1, 0, 0, 0, 1, 0, 0, 0, 0],
+                None,
             ),
         ];
-        for (adverse, verdict, credit, expected) in cases {
+        for (adverse, verdict, credit, expected, floor) in cases {
             for rows in [[full(), adverse.clone()], [adverse.clone(), full()]] {
                 let order = rows.iter().map(|row| row.verdict).collect::<Vec<_>>();
                 let summary = summarize_rows(&rows, &no_cells());
@@ -35826,11 +36030,7 @@ mod parity_summary_tests {
                 let kept = cell(run, "c-programs/golden-1@kvm");
                 assert_eq!((kept.verdict, kept.credit), (verdict, credit), "{order:?}");
                 assert_eq!(counts(&run.total), expected, "{order:?}");
-                assert_eq!(
-                    run.total.floor_credit,
-                    Some(credit.unwrap_or(0.0)),
-                    "{order:?}"
-                );
+                assert_eq!(run.total.floor_credit, floor, "{order:?}");
             }
         }
         // Equal rank and equal credit: the kept report is still the same in
@@ -35940,6 +36140,8 @@ mod parity_summary_tests {
                 &golden(1),
                 DBT,
                 ParityVerdict::InputsNotEqualized,
+                UnavailableClass::InputsNotEqualized,
+                Some(ParityOperand::Candidate),
                 "dbt runs a rewritten program",
             )),
             rerun(
@@ -36052,9 +36254,9 @@ mod parity_summary_tests {
             );
             assert_eq!(
                 run.line,
-                "parity: 0/13 matched; committed selection unknown; measured 0; unavailable 0; \
-                 record-missing 0; refused 13; mean credit (measured) n/a; floor credit \
-                 (selected) 0.000"
+                "parity: 0/13 matched; committed selection unknown; mean n/a over 0 measured; \
+                 floor 0.000 over 0 measured of 13 selected (0 no golden; 0 not compared; \
+                 13 refused)"
             );
             let messages = summary
                 .refusals
@@ -36102,12 +36304,12 @@ mod parity_summary_tests {
             let lines = rows.iter().map(line).collect::<Vec<_>>();
             summarize_parity(&store(&lines), &no_cells(), &depth_of, &committed_of)
         };
-        let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; measured 3; \
-                             unavailable 0; record-missing 0; mean credit (measured) 0.100; \
-                             floor credit (selected) 0.100 [inputs not equalized]";
-        let partial_line = "parity: 1/1 matched; selected 1 of 3 committed (partial); measured 1; \
-                            unavailable 0; record-missing 0; mean credit (measured) 1.000; \
-                            floor credit (selected) 1.000 [inputs not equalized]";
+        let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; mean 0.100 over 3 \
+                             measured; floor 0.100 over 3 measured of 3 selected (0 no golden; \
+                             0 not compared) [inputs not equalized]";
+        let partial_line = "parity: 1/1 matched; selected 1 of 3 committed (partial); mean 1.000 \
+                            over 1 measured; floor 1.000 over 1 measured of 1 selected (0 no \
+                            golden; 0 not compared) [inputs not equalized]";
         // A later partial run at the same commit, and a partial run at a
         // deeper commit.
         for (run_id, sha, emitted_at) in [
@@ -36209,8 +36411,8 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/3 matched; selected 2 of 4 committed (partial); 1 outside the committed \
-             selection; measured 3; unavailable 0; record-missing 0; mean credit (measured) 0.083; \
-             floor credit (selected) 0.083 [inputs not equalized]"
+             selection; mean 0.083 over 3 measured; floor 0.083 over 3 measured of 3 selected \
+             (0 no golden; 0 not compared) [inputs not equalized]"
         );
         assert_eq!(
             run.committed_cells_without_row,
@@ -36231,13 +36433,13 @@ mod parity_summary_tests {
         for expected in [
             "\n### validate run `validate-golden-run` at `0123456789ab` (partial: selected 2 of 4 \
              committed)\n",
-            "| `kvm` | 2 of 3 | 2 | 0 | 2 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
-            "| `liteinst` | 0 of 0 +1 outside | 1 | 0 | 1 | 0 | 0 | 0 | 0.050 | 0.050 | not \
-             equalized |\n",
+            "| `kvm` | 2 of 3 | 2 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
+            "| `liteinst` | 0 of 0 +1 outside | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0.050 | 0.050 | \
+             not equalized |\n",
             // Owed a cell, reported none: still shown.
-            "| `sabre` | 0 of 1 | 0 | 0 | 0 | 0 | 0 | 0 | n/a | n/a | — |\n",
-            "| **TOTAL** | 2 of 4 +1 outside | 3 | 0 | 3 | 0 | 0 | 0 | 0.083 | 0.083 | not \
-             equalized |\n",
+            "| `sabre` | 0 of 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | n/a | n/a | — |\n",
+            "| **TOTAL** | 2 of 4 +1 outside | 3 | 0 | 3 | 0 | 0 | 0 | 0 | 0 | 0.083 | 0.083 | \
+             not equalized |\n",
             "\n2 cell(s) its commit selects have no row in this run: `c-programs/golden-1@sabre`, \
              `c-programs/golden-3@kvm`.\n",
             "\n1 cell(s) this run reported are not in its commit's selection: \
@@ -36613,9 +36815,9 @@ mod parity_summary_tests {
         assert_eq!(run.hermit_sha.as_deref(), Some(fixture_sha));
         assert_eq!(
             run.line,
-            "parity: 0/192 matched; selected 192 of 192 committed; measured 175; unavailable 17; \
-             record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 \
-             [inputs not equalized]"
+            "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; \
+             floor 0.051 over 175 measured of 192 selected (0 no golden; 14 not compared; \
+             3 unmeasured: no-result-row 3) [inputs not equalized]"
         );
         assert!(run.committed_cells_without_row.is_empty());
         assert!(run.cells_outside_committed.is_empty());
@@ -36623,39 +36825,37 @@ mod parity_summary_tests {
         let lines = run
             .per_backend
             .iter()
-            .map(|(backend, tally)| format!("{backend}: {}", tally.line()))
+            .map(|(backend, tally)| format!("{backend}: {}", tally.line))
             .collect::<Vec<_>>();
         assert_eq!(
             lines,
             [
-                "dbt: parity: 0/14 matched; selected 14 of 14 committed; measured 0; \
-                 unavailable 14; record-missing 0; mean credit (measured) n/a; \
-                 floor credit (selected) 0.000",
-                "kvm: parity: 0/77 matched; selected 77 of 77 committed; measured 76; \
-                 unavailable 1; record-missing 0; mean credit (measured) 0.101; \
-                 floor credit (selected) 0.100 [inputs not equalized]",
-                "liteinst: parity: 0/99 matched; selected 99 of 99 committed; measured 98; \
-                 unavailable 1; record-missing 0; mean credit (measured) 0.014; \
-                 floor credit (selected) 0.014 [inputs not equalized]",
-                "sabre: parity: 0/2 matched; selected 2 of 2 committed; measured 1; \
-                 unavailable 1; record-missing 0; mean credit (measured) 0.020; \
-                 floor credit (selected) 0.010 [inputs not equalized]",
+                "dbt: parity: not compared: 0 measured of 14 selected (inputs cannot be \
+                 equalized); selected 14 of 14 committed",
+                "kvm: parity: 0/77 matched; selected 77 of 77 committed; mean 0.101 over 76 \
+                 measured; floor 0.100 over 76 measured of 77 selected (0 no golden; \
+                 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]",
+                "liteinst: parity: 0/99 matched; selected 99 of 99 committed; mean 0.014 over 98 \
+                 measured; floor 0.014 over 98 measured of 99 selected (0 no golden; \
+                 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]",
+                "sabre: parity: 0/2 matched; selected 2 of 2 committed; mean 0.020 over 1 \
+                 measured; floor 0.010 over 1 measured of 2 selected (0 no golden; \
+                 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]",
             ]
         );
+        assert_eq!(run.total.not_compared, 14);
         assert_eq!(
-            run.total.unavailable_by_class[&UnavailableClass::InputsNotEqualized],
-            14
-        );
-        assert_eq!(
-            run.total.unavailable_by_class[&UnavailableClass::CandidateMissing],
+            run.total.unmeasured_by_class[&UnavailableClass::NoResultRow],
             3
         );
-        // Every RUN 1953 id is a retired backend-parity-c id; each joins its
-        // c-programs successor.
+        // The run emitted retired backend-parity-c ids; the rows carry the
+        // c-programs successor ids that the recompare wrote (provenance.json
+        // records the mapping). A retired id's join is
+        // `a_retired_id_row_joins_its_successor`.
         assert!(
             run.cells
                 .iter()
-                .all(|cell| cell.emitted_cell.is_some() && cell.test_id.starts_with("c-programs/"))
+                .all(|cell| cell.emitted_cell.is_none() && cell.test_id.starts_with("c-programs/"))
         );
 
         let encoded = encoded_parity_summary(&summary).unwrap().unwrap();
