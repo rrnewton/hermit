@@ -132,7 +132,8 @@ impl Destination {
     /// Only recording pays for this read. Replay reads each non-NULL
     /// destination of a successful or `EFAULT` call once before any write and
     /// once after all writes, and after `EFAULT` once more just before writing
-    /// it. Replay reads nothing for any other failure or a malformed output.
+    /// it. Replay reads nothing for any other failure, or for outputs that are
+    /// malformed or contradict each other where they overlap.
     pub(crate) fn pre_call<M: MemoryAccess>(&self, memory: &M) -> Result<Vec<u8>, Error> {
         self.read_prefix(memory)
     }
@@ -229,11 +230,33 @@ impl Destination {
     }
 }
 
+/// Whether two recorded outputs, each starting at its guest address, hold
+/// different bytes anywhere their address ranges overlap. The range
+/// arithmetic uses `u128`, so it cannot overflow.
+fn overlap_disagrees(
+    first_address: usize,
+    first: &[u8],
+    second_address: usize,
+    second: &[u8],
+) -> bool {
+    let (first_start, second_start) = (first_address as u128, second_address as u128);
+    let start = first_start.max(second_start);
+    let end = (first_start + first.len() as u128).min(second_start + second.len() as u128);
+    (start..end).any(|address| {
+        first[(address - first_start) as usize] != second[(address - second_start) as usize]
+    })
+}
+
 /// Replays one captured call's outputs, listed in Linux's store order.
 ///
-/// Every destination passes its shape check and validation before the first
-/// write, and every write must succeed. A mismatch or failed write is a typed
-/// Tool error that names the syscall and the destination.
+/// Every destination passes its shape check before any guest access. Outputs
+/// whose address ranges overlap must then agree on every byte they share: on
+/// the post-call bytes, and after `EFAULT` also on the pre-call bytes. A
+/// faithful recording reads both from the same memory, so a disagreement is
+/// refused before any guest access too. Every destination then passes
+/// validation before the first write, and every write must succeed. A
+/// mismatch or failed write is a typed Tool error that names the syscall and
+/// the destination.
 pub(crate) fn replay<M: MemoryAccess>(
     memory: &mut M,
     result: Result<i64, Errno>,
@@ -248,6 +271,40 @@ pub(crate) fn replay<M: MemoryAccess>(
         // The shape check has already required these outputs to be empty.
         Err(_) => return Ok(()),
     };
+
+    // Refuse overlapping outputs that contradict each other before any guest
+    // access. No guest memory can satisfy both: a pre-call disagreement would
+    // fail validation after reads, and a post-call one would fail the final
+    // verification only after writes.
+    for (later_index, (later, later_output)) in outputs.iter().enumerate() {
+        let Some(later_address) = later.address else {
+            continue;
+        };
+        for (earlier, earlier_output) in &outputs[..later_index] {
+            let Some(earlier_address) = earlier.address else {
+                continue;
+            };
+            let post = overlap_disagrees(
+                earlier_address,
+                &earlier_output.bytes,
+                later_address,
+                &later_output.bytes,
+            );
+            let pre = efault
+                && overlap_disagrees(
+                    earlier_address,
+                    &earlier_output.pre_call_bytes,
+                    later_address,
+                    &later_output.pre_call_bytes,
+                );
+            if post || pre {
+                return Err(later.failure(format_args!(
+                    "recorded bytes contradict {} {} where the two outputs overlap",
+                    earlier.syscall, earlier.name
+                )));
+            }
+        }
+    }
 
     // 1. Validate every destination before any write. After EFAULT, guest
     // memory must still hold the recorded pre-call bytes, so that replay
@@ -882,8 +939,42 @@ mod tests {
 
     #[test]
     fn successful_replay_verifies_every_output_after_every_write() {
-        // tz aliases tv_usec. A faithful recording reads both snapshots from
-        // the same memory, so their shared bytes agree; these disagree.
+        // tz, at offset 8 of a second mapping of tv's page, aliases tv_usec
+        // physically, which no comparison of addresses can see. A faithful
+        // recording reads both snapshots from the same memory, so their shared
+        // bytes agree; these disagree, and only the final verification can
+        // catch it.
+        let read_write = libc::PROT_READ | libc::PROT_WRITE;
+        let alias = AliasedPage::new(read_write, read_write);
+        let tv = Destination::new(
+            "gettimeofday",
+            "tv",
+            AddrMut::<Timeval>::from_raw(alias.view_a),
+        );
+        let tz = Destination::new(
+            "gettimeofday",
+            "tz",
+            AddrMut::<Timezone>::from_raw(alias.view_b + 8),
+        );
+        let mut timeval_bytes = vec![0x11; 8];
+        timeval_bytes.extend([0x22; 8]);
+        let timeval = output(timeval_bytes, Vec::new());
+        let timezone = output(vec![0x33; 8], Vec::new());
+        let mut memory = TestMemory::new(None);
+        let error = replay(&mut memory, Ok(0), &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+        assert_eq!(
+            tool_message(error),
+            "captured clock output: gettimeofday tv: restored bytes differ from recording"
+        );
+        assert_eq!(memory.writes, 24);
+    }
+
+    #[test]
+    fn replay_refuses_overlapping_outputs_that_contradict_before_any_access() {
+        // tz overlaps tv_usec. A faithful recording reads both snapshots from
+        // the same memory, so their shared bytes agree. These disagree: first
+        // the post-call bytes of a successful call, then the pre-call bytes
+        // of an EFAULT call whose post-call bytes agree.
         let mut target = [0_u8; 16];
         let tv_address = target.as_mut_ptr() as usize;
         let tv = Destination::new(
@@ -898,14 +989,29 @@ mod tests {
         );
         let mut timeval_bytes = vec![0x11; 8];
         timeval_bytes.extend([0x22; 8]);
-        let timeval = output(timeval_bytes, Vec::new());
-        let timezone = output(vec![0x33; 8], Vec::new());
-        let mut memory = TestMemory::new(None);
-        let error = replay(&mut memory, Ok(0), &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
-        assert_eq!(
-            tool_message(error),
-            "captured clock output: gettimeofday tv: restored bytes differ from recording"
-        );
-        assert_eq!(memory.writes, 24);
+        for (result, timeval, timezone) in [
+            (
+                Ok(0),
+                output(timeval_bytes.clone(), Vec::new()),
+                output(vec![0x33; 8], Vec::new()),
+            ),
+            (
+                Err(Errno::EFAULT),
+                output(timeval_bytes.clone(), vec![0; 16]),
+                output(vec![0x22; 8], vec![0x33; 8]),
+            ),
+        ] {
+            let mut memory = TestMemory::new(None);
+            let error =
+                replay(&mut memory, result, &[(tv, &timeval), (tz, &timezone)]).unwrap_err();
+            assert_eq!(
+                tool_message(error),
+                "captured clock output: gettimeofday tz: recorded bytes contradict gettimeofday \
+                 tv where the two outputs overlap"
+            );
+            assert_eq!(memory.reads.get(), 0);
+            assert_eq!(memory.writes, 0);
+            assert_eq!(target, [0; 16]);
+        }
     }
 }
