@@ -132,9 +132,13 @@ pub struct ClockOutput {
     pub bytes: Vec<u8>,
     /// Pre-call bytes of the same readable prefix, kept only after EFAULT and
     /// then exactly as long as `bytes`; empty for every other result. A byte
-    /// that differs from `bytes` is one Linux stored before faulting. Replay
-    /// requires guest memory to hold these bytes, then writes only those
-    /// stores.
+    /// that differs from `bytes` changed during the call: Linux stored it
+    /// before faulting, through this destination or through another mapping of
+    /// the same memory. Replay requires guest memory to hold these bytes, then
+    /// writes only differing bytes that do not already hold their post-call
+    /// value, and refuses before any write if one of them is read-only. That
+    /// refusal is a limitation of hermit replay, not a fault in the program
+    /// (https://github.com/rrnewton/hermit/issues/3434).
     pub pre_call_bytes: Vec<u8>,
 }
 

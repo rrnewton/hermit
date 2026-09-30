@@ -153,9 +153,14 @@ impl RecordVersion {
 // For each destination (clock_gettime's tp, time's tloc, gettimeofday's tv and
 // tz) an event records whether the pointer was present and the readable prefix
 // of the destination after the call. An EFAULT event also records the same
-// prefix's pre-call bytes: a byte that differs is one Linux stored before it
-// faulted, and replay writes only those bytes, after proving that guest memory
-// still holds the pre-call bytes.
+// prefix's pre-call bytes: a byte that differs changed during the call, stored
+// by Linux before it faulted, through this destination or through another
+// mapping of the same memory. Replay writes only differing bytes that do not
+// already hold their post-call value, after proving that guest memory still
+// holds the pre-call bytes, and refuses before any write if one of them is
+// read-only. That refusal is a limitation of hermit replay, which does not
+// recreate an alias between shared file mappings, not a fault in the program
+// (https://github.com/rrnewton/hermit/issues/3434).
 // Older event variants remain structurally decodable, but their errno-only
 // clock failures cannot establish replay fidelity and are refused at admission.
 // Unlanded development heads of https://github.com/rrnewton/hermit/pull/3212
