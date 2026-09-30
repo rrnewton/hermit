@@ -7352,8 +7352,23 @@ mod tests {
         use std::cell::Cell;
         use std::rc::Rc;
 
+        // The monitor must bind the real reader once and keep it until the
+        // child is reaped; that lifetime is what this test checks. Its samples
+        // are synthetic so the counts below stay exact on any host. A real
+        // sample is a census of the whole host /proc with a one-second scan
+        // deadline, and it fails as a whole when a member of this fixture's
+        // group (the shell reaps a `sleep` every 20 ms) is reaped while the
+        // census pairs its pidfd with its stat file ("pidfd/stat generation
+        // mismatch"); either failure is then served to every call for 500 ms
+        // by proccpu's shared snapshot
+        // (https://github.com/rrnewton/hermit/issues/3377). Real samples
+        // through the monitor, with the monitor's one-second grace for
+        // unavailable samples, are checked by
+        // native_zombie_then_reaped_child_has_no_double_cpu_charge (every
+        // sample, across several 500 ms snapshots) and
+        // a_valid_cpu_sample_resets_the_unavailable_grace (one sample).
         struct ObservedReader {
-            reader: dagrun::proccpu::ProcessGroupCpu,
+            _reader: dagrun::proccpu::ProcessGroupCpu,
             pid: u32,
             registered: Instant,
             dropped_after_reap: Rc<Cell<bool>>,
@@ -7393,7 +7408,7 @@ mod tests {
                     registered_invocations.set(registered_invocations.get() + 1);
                     dagrun::proccpu::ProcessGroupCpu::new(pid)
                         .map(|reader| ObservedReader {
-                            reader,
+                            _reader: reader,
                             pid,
                             registered: Instant::now(),
                             dropped_after_reap: Rc::clone(&dropped_after_reap),
@@ -7402,8 +7417,8 @@ mod tests {
                 },
                 |reader| {
                     assert!(!dropped_after_reap.get());
-                    let seconds = reader.reader.seconds().map_err(|error| error.to_string())?;
                     samples.set(samples.get() + 1);
+                    let seconds = samples.get() as f64 / 1000.0;
                     if samples.get() >= 3
                         && reader.registered.elapsed() >= Duration::from_millis(700)
                     {
@@ -7417,7 +7432,7 @@ mod tests {
             assert_eq!(output.timeout, None);
             assert_eq!(registrations.get(), 1);
             assert!(samples.get() >= 3);
-            assert!(done.is_file(), "reader must outlive the shared cache TTL");
+            assert!(done.is_file(), "monitor must sample the reader for 700 ms");
             assert!(dropped_after_reap.get());
             assert!(owned_child_is_reaped(pid));
             assert_process_observation(&observation, &output);
