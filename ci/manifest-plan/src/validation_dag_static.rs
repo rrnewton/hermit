@@ -327,7 +327,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // log_diff_canonicalizes_host_addresses_only_when_the_child_offers_it
     // (https://github.com/rrnewton/hermit/issues/3412) retains all 726 prior
     // identities.
-    ("test.regular_crates", 727),
+    // hermit-manifest-plan's hermit_backend_is_passed_before_the_run_subcommand
+    // (https://github.com/rrnewton/hermit/pull/3439) retains all 727 prior
+    // identities.
+    ("test.regular_crates", 728),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -349,7 +352,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_bridge_is_not_installed_by_a_process_that_is_pid_1) retain all 754
     // prior identities (`cargo nextest list --profile ci` measured 758;
     // https://github.com/rrnewton/hermit/issues/3354).
-    ("test.hermit_unit", 758),
+    // subcommand_level_backend_is_a_usage_error_naming_the_global_form,
+    // misplaced_backend_is_only_moved_when_unambiguous and
+    // global_backend_with_namespace_only_is_a_usage_error
+    // (https://github.com/rrnewton/hermit/pull/3439) retain all 758 prior
+    // identities.
+    ("test.hermit_unit", 761),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -429,7 +437,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and a_malformed_finalize_budget_is_refused
     // (https://github.com/rrnewton/hermit/issues/3414) retain all 94 prior
     // selected CLI identities.
-    ("test.cli", 97),
+    // run_rejects_subcommand_level_backend and
+    // analyze_rejects_backend_in_its_run_arguments
+    // (https://github.com/rrnewton/hermit/pull/3439) retain all 97 prior
+    // selected CLI identities.
+    ("test.cli", 99),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -449,7 +461,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 97),
+    ("test.cli_on_host", 99),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -463,11 +475,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 849),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 177),
-    ("test.hermit_unit_on_host", 758),
+    ("test.hermit_unit_on_host", 761),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 727),
+    ("test.regular_crates_on_host", 728),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
