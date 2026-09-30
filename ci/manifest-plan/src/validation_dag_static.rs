@@ -368,7 +368,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // descriptor_is_closed_when_no_scratch_can_be_found) retain all 845 prior
     // identities (`cargo nextest list --profile ci` measured 848;
     // https://github.com/rrnewton/hermit/issues/3328).
-    ("test.detcore_unit", 848),
+    // io_buffers::event_tests::
+    // backend_runtime_bootstrap_syscall_is_handled_but_not_charged_to_guest_time
+    // retains all 848 prior identities (`cargo nextest list --profile ci`
+    // measured 849; https://github.com/rrnewton/hermit/issues/3338).
+    ("test.detcore_unit", 849),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -393,7 +397,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The nonleader-exec exit-only variant retains all 87 prior selected CLI
     // identities; its four PMU-subject siblings run in privileged-test.pmu_cli_cases.
     ("test.cli", 88),
-    ("test.liteinst_strict", 25),
+    // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
+    // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image retain
+    // all 25 prior identities (`cargo nextest list --profile ci` measured 27;
+    // https://github.com/rrnewton/hermit/issues/3338).
+    ("test.liteinst_strict", 27),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
@@ -421,12 +429,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 848),
+    ("test.detcore_unit_on_host", 849),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),
     ("test.ignored_syscall_regressions_on_host", 4),
-    ("test.liteinst_strict_on_host", 25),
+    ("test.liteinst_strict_on_host", 27),
     // The host node carries the identical selection.
     ("test.regular_crates_on_host", 723),
     ("test.rr_suite_contract_on_host", 1),

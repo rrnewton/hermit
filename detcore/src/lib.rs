@@ -1919,17 +1919,34 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         let syscall_cost_ns = syscall_time::cost_ns(call.number());
+        // A backend-resident runtime (the LiteInst preload constructor) issues
+        // several hundred syscalls on one thread between its validated begin
+        // trap and the trap that ends its bootstrap: the ready report, or the
+        // report that preparation failed. Reverie reports that window only for
+        // the bootstrapping thread; every other thread and forked process is
+        // charged as usual. The syscalls are still counted and fully handled
+        // below, so Detcore keeps tracking the fds, mappings and inodes they
+        // create. They are not guest work, though: charging them would make
+        // guest-visible virtual time (uptime, CLOCK_MONOTONIC, CPU time) depend
+        // on which backend ran the program. The clock is not stopped or reset;
+        // it simply does not advance for work the guest did not do, and resumes
+        // from the same value at the first guest syscall after the window. See
+        // https://github.com/rrnewton/hermit/issues/3338.
+        let charge_guest_time = !guest.is_backend_runtime_bootstrap();
         let new_count = {
             // which results from not being able to borrow guest twice.
             let thread_state = guest.thread_state_mut();
             thread_state.stats.count_syscall();
 
-            // Every intercepted syscall advances logical time, including configurations that do
-            // not serialize threads. This keeps virtual clocks productive during syscall loops.
-            thread_state
-                .thread_logical_time
-                .add_syscall_with_cost(syscall_cost_ns);
-            thread_state.account_process_cpu_time();
+            // Every intercepted guest syscall advances logical time, including configurations
+            // that do not serialize threads. This keeps virtual clocks productive during syscall
+            // loops.
+            if charge_guest_time {
+                thread_state
+                    .thread_logical_time
+                    .add_syscall_with_cost(syscall_cost_ns);
+                thread_state.account_process_cpu_time();
+            }
             thread_state.stats.syscall_count
         };
 

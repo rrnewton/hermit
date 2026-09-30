@@ -657,6 +657,7 @@ mod event_tests {
     use crate::tool_global::GlobalResponse;
     use crate::tool_global::ResumeStatus;
     use crate::types::DetPid;
+    use crate::types::LogicalTime;
     use crate::types::OpenFileId;
 
     const FD: i32 = 3;
@@ -840,6 +841,9 @@ mod event_tests {
         polls: Mutex<Vec<u32>>,
         releases: Mutex<usize>,
         retry_gate: Mutex<Option<RetryGate>>,
+        /// What this fake backend answers to
+        /// `Guest::is_backend_runtime_bootstrap`.
+        backend_runtime_bootstrap: bool,
     }
 
     impl EventGuest {
@@ -942,6 +946,10 @@ mod event_tests {
 
         fn ppid(&self) -> Option<Pid> {
             None
+        }
+
+        fn is_backend_runtime_bootstrap(&self) -> bool {
+            self.backend_runtime_bootstrap
         }
 
         fn memory(&self) -> Self::Memory {
@@ -1105,6 +1113,7 @@ mod event_tests {
             polls: Mutex::new(Vec::new()),
             releases: Mutex::new(0),
             retry_gate: Mutex::new(retry_gate),
+            backend_runtime_bootstrap: false,
         };
         (tool, guest)
     }
@@ -1194,6 +1203,101 @@ mod event_tests {
             ("preadv2", preadv2.into(), false),
             ("preadv2", preadv2.with_pos_l(u64::MAX).into(), true),
         ]
+    }
+
+    /// A syscall issued while the backend reports its own runtime bootstrap
+    /// (https://github.com/rrnewton/hermit/issues/3338) is counted and fully
+    /// handled, but charges neither the thread's logical clock nor process CPU
+    /// time. The first guest syscall after the window resumes from exactly the
+    /// clock value the window started at: it charges one syscall's cost, the
+    /// same as a run that never had the window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_runtime_bootstrap_syscall_is_handled_but_not_charged_to_guest_time() {
+        struct Observed {
+            result: i64,
+            bytes: Vec<u8>,
+            syscall_count: u64,
+            random_offset: u64,
+            clock_before: LogicalTime,
+            clock_after: LogicalTime,
+            system_before: LogicalTime,
+            system_after: LogicalTime,
+            process_system_before: LogicalTime,
+            process_system_after: LogicalTime,
+        }
+
+        async fn one_readv(tool: &Detcore, guest: &mut EventGuest) -> Observed {
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, 8);
+            let clock_before = guest.thread.thread_logical_time.as_nanos();
+            let system_before = guest.thread.thread_logical_time.system_cpu_time();
+            let process_system_before = guest.thread.process_cpu_time().system;
+            let result = tool.handle_syscall_event(guest, readv(1)).await.unwrap();
+            Observed {
+                result,
+                bytes: memory.bytes(FIRST_DEST, 8),
+                syscall_count: guest.thread.stats.syscall_count,
+                random_offset: guest
+                    .thread
+                    .with_detfd(FD, |fd| fd.random_device_offset())
+                    .unwrap(),
+                clock_before,
+                clock_after: guest.thread.thread_logical_time.as_nanos(),
+                system_before,
+                system_after: guest.thread.thread_logical_time.system_cpu_time(),
+                process_system_before,
+                process_system_after: guest.thread.process_cpu_time().system,
+            }
+        }
+
+        // Reference: an ordinary guest syscall is charged.
+        let (tool, mut plain) = event_guest(FdType::Rng, None);
+        let guest_call = one_readv(&tool, &mut plain).await;
+        assert!(
+            guest_call.clock_after > guest_call.clock_before,
+            "a guest syscall must advance logical time"
+        );
+        assert!(guest_call.system_after > guest_call.system_before);
+        assert!(guest_call.process_system_after > guest_call.process_system_before);
+
+        // The same syscall inside the backend's bootstrap window.
+        let (tool, mut booting) = event_guest(FdType::Rng, None);
+        booting.backend_runtime_bootstrap = true;
+        let bootstrap_call = one_readv(&tool, &mut booting).await;
+        // Still counted and handled exactly like the guest syscall: same
+        // result, same emulated random bytes written, same RNG cursor advance,
+        // same resource release.
+        assert_eq!(bootstrap_call.result, guest_call.result);
+        assert_eq!(bootstrap_call.bytes, guest_call.bytes);
+        assert_eq!(bootstrap_call.random_offset, guest_call.random_offset);
+        assert_eq!(bootstrap_call.syscall_count, 1);
+        assert_eq!(*booting.releases.lock().unwrap(), 1);
+        // But not charged to the guest.
+        assert_eq!(
+            bootstrap_call.clock_after, bootstrap_call.clock_before,
+            "a backend-bootstrap syscall must not advance guest logical time"
+        );
+        assert_eq!(bootstrap_call.system_after, bootstrap_call.system_before);
+        assert_eq!(
+            bootstrap_call.process_system_after,
+            bootstrap_call.process_system_before
+        );
+        assert_eq!(bootstrap_call.clock_before, guest_call.clock_before);
+
+        // The window closes; the next guest syscall resumes from the same clock
+        // value (no reset, no jump) and is charged one syscall's cost, so the
+        // clock matches the run that never had the window.
+        booting.backend_runtime_bootstrap = false;
+        let after_window = one_readv(&tool, &mut booting).await;
+        assert_eq!(after_window.syscall_count, 2);
+        assert_eq!(after_window.clock_before, bootstrap_call.clock_after);
+        assert_eq!(after_window.clock_after, guest_call.clock_after);
+        assert_eq!(after_window.system_after, guest_call.system_after);
+        assert_eq!(
+            after_window.process_system_after,
+            guest_call.process_system_after
+        );
+        assert!(after_window.clock_after > after_window.clock_before);
     }
 
     #[tokio::test(flavor = "current_thread")]
