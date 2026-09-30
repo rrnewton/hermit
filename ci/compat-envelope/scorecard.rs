@@ -15690,6 +15690,65 @@ fn self_test_commands() -> Result<(), String> {
     self_test_tier(true)
 }
 
+/// Gives `target` the bytes of `pristine` by cloning its extents (FICLONE), so
+/// a restore neither rewrites the file's data nor touches `pristine`. Where the
+/// filesystem cannot clone, `bytes` (the same content) are written instead.
+fn restore_history_file(pristine: &Path, target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let source = File::open(pristine)
+        .map_err(|e| format!("cannot open the pristine {}: {e}", pristine.display()))?;
+    let destination = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(target)
+        .map_err(|e| format!("cannot restore {}: {e}", target.display()))?;
+    if unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY) => {
+            drop(destination);
+            fs::write(target, bytes)
+                .map_err(|e| format!("cannot restore {}: {e}", target.display()))
+        }
+        _ => Err(format!(
+            "cannot clone {} into {}: {error}",
+            pristine.display(),
+            target.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod history_restore_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn a_restore_reproduces_the_pristine_bytes_and_leaves_them_untouched() {
+        let pristine_directory = tempfile::tempdir().unwrap();
+        let pristine = pristine_directory.path().join("cells.json");
+        let bytes = b"{\"cells\":[]}\n".repeat(4096);
+        fs::write(&pristine, &bytes).unwrap();
+        fs::set_permissions(&pristine, fs::Permissions::from_mode(0o444)).unwrap();
+        // Beside the pristine copy the filesystem may clone; on the tmpfs
+        // /dev/shm FICLONE fails and the restore writes the bytes instead.
+        let tmpfs_directory = tempfile::tempdir_in("/dev/shm").unwrap();
+        for directory in [pristine_directory.path(), tmpfs_directory.path()] {
+            let target = directory.join("restored.json");
+            fs::write(&target, b"a longer history a command wrote ".repeat(8192)).unwrap();
+            restore_history_file(&pristine, &target, &bytes).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), bytes, "{}", target.display());
+            // A command writing the restored file must not reach the pristine copy.
+            fs::write(&target, b"changed\n").unwrap();
+            assert_eq!(fs::read(&pristine).unwrap(), bytes, "{}", target.display());
+        }
+        let mode = fs::metadata(&pristine).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+    }
+}
+
 fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let _regression_ledger = (!include_commands)
         .then(|| HistoryFixtureEnvironment::set(Path::new(REGRESSION_TIER_LEDGER_ROOT), -1));
@@ -18930,18 +18989,33 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                     })
             })
         };
+        // Each restore clones read-only pristine copies of the two history files
+        // instead of writing the 81 MB history again. The clone only reads its
+        // source, so the pristine copies are never consumed.
+        use std::os::unix::fs::PermissionsExt;
+        let pristine_history = tempfile::tempdir()
+            .map_err(|e| format!("cannot create the pristine history copies: {e}"))?;
+        let pristine_scorecard = pristine_history.path().join("SCORECARD.md");
+        let pristine_cells = pristine_history.path().join("cells.json");
+        for (path, bytes) in [
+            (&pristine_scorecard, &result_command_before.scorecard),
+            (&pristine_cells, &result_command_before.cells),
+        ] {
+            fs::write(path, bytes)
+                .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(0o444)))
+                .map_err(|e| format!("cannot store the pristine {}: {e}", path.display()))?;
+        }
         let restore_generated = || -> Result<(), String> {
-            fs::write(
-                fixture_ledger.join(LEDGER_SCORECARD),
+            restore_history_file(
+                &pristine_scorecard,
+                &fixture_ledger.join(LEDGER_SCORECARD),
                 &result_command_before.scorecard,
+            )?;
+            restore_history_file(
+                &pristine_cells,
+                &fixture_ledger.join(LEDGER_CELLS),
+                &result_command_before.cells,
             )
-            .and_then(|()| {
-                fs::write(
-                    fixture_ledger.join(LEDGER_CELLS),
-                    &result_command_before.cells,
-                )
-            })
-            .map_err(|e| e.to_string())
         };
 
         write_result_row(&replay_row)?;
