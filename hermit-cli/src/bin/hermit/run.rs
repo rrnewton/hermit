@@ -3246,15 +3246,32 @@ impl RunOpts {
                  original guest path"
             );
         }
-        if self.namespace_only {
-            if let Some(explicit_backend) = self.backend {
-                anyhow::bail!(
-                    "--backend={} cannot be used with --namespace-only because namespace-only mode \
-                     bypasses instrumentation",
-                    explicit_backend.as_str()
-                );
-            }
-        } else if backend != Backend::Kvm {
+        if self.namespace_only
+            && let Some(explicit_backend) = self.backend
+        {
+            anyhow::bail!(
+                "--backend={} cannot be used with --namespace-only because namespace-only mode \
+                 bypasses instrumentation",
+                explicit_backend.as_str()
+            );
+        }
+        // ⚠️ HERE, NOT IN `run()`. The DBT arm below RETURNS `run_dbt(..)` and
+        // never reaches `RunOpts::run`, so a check placed there covers every
+        // backend except the one measured furthest from working. Same shape as
+        // the `--namespace-only` second launch path documented in `run()`: the
+        // first placement worked and was not yet complete. Measured: with the
+        // check in `run()`, `--backend dbt --timeout 3` still accepted the flag
+        // and ran unbounded.
+        //
+        // AND BEFORE THE AVAILABILITY PROBE. Whether `--timeout` is qualified on
+        // a backend is a static policy fact; whether the backend is compiled in
+        // depends on the build's features. Probing availability first made a
+        // build without `sabre` answer "backend unavailable" (125) where every
+        // other build answers "refused" (122), so the same command got a
+        // different verdict per build
+        // (https://github.com/rrnewton/hermit/issues/3418).
+        self.ensure_timeout_supported()?;
+        if !self.namespace_only && backend != Backend::Kvm {
             // E9patch's own availability check covers both its ptrace runtime and
             // the `e9patch` cargo feature (it reports "not included in this build"
             // when the feature is disabled), so it no longer needs a special case.
@@ -3267,14 +3284,6 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
-        // ⚠️ HERE, NOT IN `run()`. The DBT arm below RETURNS `run_dbt(..)` and
-        // never reaches `RunOpts::run`, so a check placed there covers every
-        // backend except the one measured furthest from working. Same shape as
-        // the `--namespace-only` second launch path documented in `run()`: the
-        // first placement worked and was not yet complete. Measured: with the
-        // check in `run()`, `--backend dbt --timeout 3` still accepted the flag
-        // and ran unbounded.
-        self.ensure_timeout_supported()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
         }

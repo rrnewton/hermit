@@ -407,7 +407,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The PMU-subject skid-overshoot case moves to privileged-test.pmu_cli_cases.
     // The nonleader-exec exit-only variant retains all 87 prior selected CLI
     // identities; its four PMU-subject siblings run in privileged-test.pmu_cli_cases.
-    ("test.cli", 88),
+    // run_timeout_refusal_does_not_depend_on_backend_availability
+    // (https://github.com/rrnewton/hermit/issues/3418) retains all 88 prior
+    // selected CLI identities.
+    ("test.cli", 89),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -427,7 +430,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 88),
+    ("test.cli_on_host", 89),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
