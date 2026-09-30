@@ -634,7 +634,17 @@ impl Scheduler {
             if self.blocked.sigchld_deferred.remove(&parent) {
                 self.run_queue.push_eager_io_repoll(parent);
             } else {
-                self.fire_alarm(parent, tid, signal);
+                // Where gated waits model interruption, send to the thread the
+                // kernel gives this shared-queue `SIGCHLD`: the child's creator
+                // (`tid`) if it does not block the signal, otherwise the next
+                // thread that does not. Only if that thread is a parked waiter
+                // is a wait woken (https://github.com/rrnewton/hermit/issues/3146).
+                let target = if self.sigchld_eligibility {
+                    self.kernel_sigchld_target(parent, tid).unwrap_or(tid)
+                } else {
+                    tid
+                };
+                self.fire_alarm(parent, target, signal);
             }
         } else {
             self.fire_alarm(id.process(), tid, signal);
