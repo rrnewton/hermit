@@ -7314,6 +7314,7 @@ mod tests {
             let pid = child.id();
             let registrations = Cell::new(0);
             let samples = Cell::new(0);
+            let unavailable = std::cell::RefCell::new(Vec::<String>::new());
             let dropped_after_reap = Rc::new(Cell::new(false));
             let output = monitor_process(
                 child,
@@ -7339,7 +7340,10 @@ mod tests {
                 },
                 |reader| {
                     assert!(!dropped_after_reap.get());
-                    let seconds = reader.reader.seconds().map_err(|error| error.to_string())?;
+                    let seconds = reader.reader.seconds().map_err(|error| {
+                        unavailable.borrow_mut().push(error.to_string());
+                        error.to_string()
+                    })?;
                     samples.set(samples.get() + 1);
                     if samples.get() >= 3
                         && reader.registered.elapsed() >= Duration::from_millis(700)
@@ -7360,9 +7364,38 @@ mod tests {
             assert_process_observation(&observation, &output);
             let live = enabled_cpu(&observation);
             assert_eq!(live.registration, RegistrationObservation::BoundOnce);
-            assert_eq!(live.source_sample_calls, samples.get());
-            assert_eq!(live.valid_polls, samples.get());
-            assert_eq!(live.unavailable_polls, 0);
+            // A loaded host can make a sample unavailable: the /proc census
+            // overruns its one-second scan deadline, or a member exits between
+            // its pidfd and stat reads
+            // (https://github.com/rrnewton/hermit/issues/3377). The monitor
+            // tolerates that for CELL_CPU_ACCOUNTING_GRACE, so this test
+            // tolerates at most one grace window of such polls, and only for
+            // those two reasons. Every successful read is still counted
+            // exactly.
+            let unavailable = unavailable.into_inner();
+            let unavailable_bound =
+                (CELL_CPU_ACCOUNTING_GRACE.as_millis() / CELL_CPU_POLL_INTERVAL.as_millis()) as u64;
+            assert!(
+                unavailable.len() as u64 <= unavailable_bound
+                    && unavailable.iter().all(|reason| {
+                        reason.contains("scan deadline")
+                            || reason.contains("pidfd/stat generation mismatch")
+                    }),
+                "{label}: {} unavailable sample(s) beside {} valid, bound {unavailable_bound}: {unavailable:?}",
+                unavailable.len(),
+                samples.get()
+            );
+            assert_eq!(
+                live.source_sample_calls,
+                samples.get() + unavailable.len() as u64,
+                "{label}: {unavailable:?}"
+            );
+            assert_eq!(live.valid_polls, samples.get(), "{label}: {unavailable:?}");
+            assert_eq!(
+                live.unavailable_polls,
+                unavailable.len() as u64,
+                "{label}: {unavailable:?}"
+            );
         }
         // Reaped invocations may legitimately reuse a numeric PID. Each still
         // constructs and drops its own reader through the factory above.
