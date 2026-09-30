@@ -220,17 +220,72 @@ fn terminal_stat_identity(raw: &[u8], parent: u32, group: u32) -> Result<(&str, 
 }
 
 fn group_members(group: u32) -> Result<Vec<u32>> {
-    let mut members = Vec::new();
+    let mut candidates = Vec::new();
     for entry in fs::read_dir("/proc").context("enumerate process census")? {
         let entry = entry.context("read process census directory entry")?;
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let path = entry.path().join("stat");
-        let actual = resolve_census_group(pid, || fs::read(&path))?;
-        if actual == Some(group) {
-            members.push(pid);
+        candidates.push((pid, entry.path().join("stat")));
+    }
+    scan_census(&candidates, group, |pid, path| {
+        resolve_census_group(pid, || fs::read(path))
+    })
+}
+
+// Each call still performs a fresh, complete census. Split only the independent
+// proc reads, never waits or signals. There is no cached membership and no
+// snapshot shared with another checkpoint or supervisor. Every admitted worker
+// is joined, including after an error; partial membership can never be returned.
+fn scan_census(
+    candidates: &[(u32, std::path::PathBuf)],
+    group: u32,
+    read: impl Fn(u32, &Path) -> Result<Option<u32>> + Sync,
+) -> Result<Vec<u32>> {
+    const WORKERS: usize = 2;
+    let results = std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        let mut admission_error = None;
+        for chunk in candidates.chunks(candidates.len().div_ceil(WORKERS).max(1)) {
+            let read = &read;
+            match std::thread::Builder::new().spawn_scoped(scope, move || {
+                let mut members = Vec::new();
+                for (pid, path) in chunk {
+                    if read(*pid, path)? == Some(group) {
+                        members.push(*pid);
+                    }
+                }
+                Ok(members)
+            }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    admission_error =
+                        Some(anyhow::Error::new(error).context("spawn census worker"));
+                    break;
+                }
+            }
         }
+        let mut results: Vec<Result<Vec<u32>>> = workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().unwrap_or_else(|panic| {
+                    let message = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic");
+                    Err(anyhow::anyhow!("process census worker panic: {message}"))
+                })
+            })
+            .collect();
+        if let Some(error) = admission_error {
+            results.push(Err(error));
+        }
+        results
+    });
+    let mut members = Vec::new();
+    for result in results {
+        members.extend(result?);
     }
     members.sort_unstable();
     Ok(members)
@@ -491,6 +546,99 @@ mod tests {
     use super::*;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn parallel_census_reads_every_candidate_and_sorts_exact_members() {
+        use std::sync::atomic::AtomicUsize;
+        let candidates: Vec<_> = [9, 3, 8, 2, 7, 1]
+            .into_iter()
+            .map(|pid| (pid, PathBuf::from(pid.to_string())))
+            .collect();
+        let visits: Vec<_> = (0..10).map(|_| AtomicUsize::new(0)).collect();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let members = scan_census(&candidates, 73, |pid, path| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            assert_eq!(path, Path::new(&pid.to_string()));
+            visits[pid as usize].fetch_add(1, Ordering::SeqCst);
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(if pid == 8 {
+                None
+            } else {
+                Some(if pid % 2 == 1 { 73 } else { 91 })
+            })
+        })
+        .unwrap();
+        assert_eq!(members, [1, 3, 7, 9]);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!((1..=2).contains(&peak.load(Ordering::SeqCst)));
+        for (pid, visit) in visits.iter().enumerate() {
+            assert_eq!(
+                visit.load(Ordering::SeqCst),
+                usize::from([9, 3, 8, 2, 7, 1].contains(&pid))
+            );
+        }
+        assert!(
+            scan_census(&[], 73, |_, _| panic!("empty census read"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parallel_census_errors_join_other_worker_and_never_return_partial_members() {
+        use std::sync::atomic::AtomicUsize;
+        let candidates: Vec<_> = (1..=4).map(|pid| (pid, PathBuf::new())).collect();
+        for errno in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EIO,
+            libc::EINTR,
+            libc::ECHILD,
+        ] {
+            let completed = AtomicUsize::new(0);
+            let result = scan_census(&candidates, 73, |pid, _| {
+                if pid == 1 {
+                    return Err(std::io::Error::from_raw_os_error(errno).into());
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(73))
+            });
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                2,
+                "other partition joined despite error"
+            );
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(errno)
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_census_panic_joins_other_worker_and_refuses_membership() {
+        use std::sync::atomic::AtomicUsize;
+        let candidates: Vec<_> = (1..=4).map(|pid| (pid, PathBuf::new())).collect();
+        let completed = AtomicUsize::new(0);
+        let result = scan_census(&candidates, 73, |pid, _| {
+            assert_ne!(pid, 1, "injected census reader panic");
+            completed.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(73))
+        });
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected census reader panic")
+        );
+    }
 
     fn fixture(script: &str) -> (OwnedChild, PathBuf) {
         own_descendants().unwrap();
