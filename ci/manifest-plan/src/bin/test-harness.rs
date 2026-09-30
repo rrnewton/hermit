@@ -75,7 +75,7 @@ Commands:
   build                            Prepare selected test programs
   audit-compile                    Compile selected C test programs
   run                              Execute selected cells
-  parity compare                   Measure parity cells from a finished run's retained logs
+  parity <compare|export>          Measure parity from retained logs, or export ledger rows
   selftest <NAME>                  Run one repository tool's self-test
 
 Selection options:
@@ -124,6 +124,7 @@ const RUN_ENVIRONMENT: &str =
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
+       test-harness parity export --e2e-root <DIR> [--expected-scope <FILE>]
 
 Measure parity cells from the logs a finished `run` retained, as its own
 post-pass does, without running any guest. Each cell compares TEST's verify
@@ -146,7 +147,25 @@ Options:
   -h, --help                       Print this help
 
 Environment:
-  HERMIT_BIN=<PATH>                      Hermit executable (default: target/debug/hermit)";
+  HERMIT_BIN=<PATH>                      Hermit executable (default: target/debug/hermit)
+
+`parity export` reads every DIR/<lane>/<node>/parity.status.json and the
+parity.jsonl beside it, and prints one parity ledger source row per parity
+cell those post-passes owed, as JSONL on stdout, for series.py append-parity.
+A complete post-pass yields one row per record. A failed or running one
+yields the records it wrote plus a record-missing row for each other cell its
+status names. With --expected-scope, a JSON object mapping \"<lane>/<node>\" to
+the \"<test>@<backend>\" cells that node should have measured, a planned node
+with no status yields a record-missing row per expected cell, and so does
+each expected cell a node's status leaves out of its scope. It runs no guest
+and writes nothing. Any inconsistency (a record that fails validation, a
+count that disagrees with its status, a record outside the scope) is an error
+and prints no rows. validate, which must not lose a cell, instead appends a
+record-missing row for each cell the refused node's expected scope owed.
+
+Export options:
+  --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/
+  --expected-scope <FILE>          The cells each planned node owed (see above)";
 
 const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
@@ -779,7 +798,10 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| fail("missing command; try `test-harness --help`"));
     let values = values.collect::<Vec<_>>();
     if command == "parity" {
-        let request = parse_parity_compare(values);
+        let request = match parse_parity(values) {
+            ParityRequest::Compare(request) => request,
+            ParityRequest::Export(request) => return parity_export(&request),
+        };
         let root = root();
         let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
         run_manifest_plan(&root);
@@ -2530,6 +2552,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             results_path.display()
         ))
     });
+    mark_parity_running(&parity_scope, &context, &results_path);
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
@@ -2837,6 +2860,35 @@ fn parity_scope(
     }
 }
 
+/// Before any cell runs, remove an earlier run's parity outputs and, with a
+/// cell in scope, write `parity.status.json` in the `running` state naming
+/// every cell in scope. A process killed before its post-pass finishes then
+/// still says which parity cells it owed, so the ledger export
+/// ([`parity::node_ledger_sources`]) reports each as `record-missing` instead
+/// of dropping it. Like the post-pass, a failure here is reported and changes
+/// nothing else.
+fn mark_parity_running(scope: &BTreeSet<ParityCellId>, context: &RunContext, results_path: &Path) {
+    let Some(artifacts) = results_path.parent() else {
+        return;
+    };
+    let config = parity::PostPassConfig::new(
+        artifacts,
+        &context.hermit_bin,
+        &context.run_id,
+        &context.source_sha,
+    );
+    let marked = if scope.is_empty() {
+        parity::clear_outputs(&config)
+    } else {
+        parity::mark_running(&config, scope)
+    };
+    if let Err(error) = marked {
+        eprintln!(
+            "test-harness: parity status not marked running (exit status unaffected): {error}"
+        );
+    }
+}
+
 /// Run the parity post-pass over this process's rows once `results.jsonl`,
 /// JUnit and `summary.json` are final. It writes only `parity.jsonl`,
 /// `parity.status.json` and `parity/` beside them, inside the enclosing
@@ -2902,19 +2954,89 @@ struct ParityCompareRequest {
     jobs: usize,
 }
 
-fn parse_parity_compare(values: Vec<String>) -> ParityCompareRequest {
+#[derive(Debug, PartialEq)]
+struct ParityExportRequest {
+    e2e_root: PathBuf,
+    expected_scope: Option<PathBuf>,
+}
+
+enum ParityRequest {
+    Compare(ParityCompareRequest),
+    Export(ParityExportRequest),
+}
+
+fn parse_parity(values: Vec<String>) -> ParityRequest {
     if values.iter().any(|value| is_help_flag(value)) {
         println!("{PARITY_HELP}");
         std::process::exit(0);
     }
     let mut values = values.into_iter();
     match values.next().as_deref() {
-        Some("compare") => {}
+        Some("compare") => ParityRequest::Compare(parse_parity_compare(values)),
+        Some("export") => ParityRequest::Export(parse_parity_export(values)),
         Some(other) => fail(format!(
-            "unknown parity command {other:?}; expected `parity compare`"
+            "unknown parity command {other:?}; expected `parity compare` or `parity export`"
         )),
         None => fail("parity requires a command; try `test-harness parity --help`"),
     }
+}
+
+fn parse_parity_export(mut values: impl Iterator<Item = String>) -> ParityExportRequest {
+    let mut e2e_root = None;
+    let mut expected_scope = None;
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--e2e-root" => set_once(&mut e2e_root, &mut values, "--e2e-root"),
+            "--expected-scope" => set_once(&mut expected_scope, &mut values, "--expected-scope"),
+            other => fail(format!(
+                "unknown option {other} for parity export; try `test-harness parity --help`"
+            )),
+        }
+    }
+    ParityExportRequest {
+        e2e_root: PathBuf::from(e2e_root.unwrap_or_else(|| {
+            fail(
+                "parity export requires --e2e-root <DIR>, the run's e2e result root \
+                     holding <lane>/<node>/parity.status.json",
+            )
+        })),
+        expected_scope: expected_scope.map(PathBuf::from),
+    }
+}
+
+/// `test-harness parity export`: the ledger source rows of a finished run's
+/// post-passes, one JSON object per line, for `series.py append-parity`.
+fn parity_export(request: &ParityExportRequest) -> ExitCode {
+    let expected = request.expected_scope.as_ref().map(|path| {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", path.display())));
+        parity::parse_expected_scope(&text)
+            .unwrap_or_else(|error| fail(format!("{}: {error}", path.display())))
+    });
+    let rows =
+        parity::ledger_sources(&request.e2e_root, expected.as_ref()).unwrap_or_else(|error| {
+            fail(format!(
+                "parity export printed no rows: {error}. Inspect the named parity file; \
+                 `test-harness parity compare --artifacts <that node> --cell <TEST@BACKEND>` \
+                 re-measures a cell from the run's retained logs"
+            ))
+        });
+    let mut out = std::io::stdout().lock();
+    for row in &rows {
+        let line = serde_json::to_string(row).expect("a validated ledger source row serializes");
+        if let Err(error) = writeln!(out, "{line}") {
+            fail(format!("cannot write parity export rows: {error}"));
+        }
+    }
+    eprintln!(
+        "test-harness: parity export: {} source row(s) from {}",
+        rows.len(),
+        request.e2e_root.display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn parse_parity_compare(mut values: impl Iterator<Item = String>) -> ParityCompareRequest {
     let mut artifacts = None;
     let mut output = None;
     let mut jobs = None;
