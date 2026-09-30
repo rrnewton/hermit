@@ -11,6 +11,12 @@
 # their own aggregate and excluded from both CI-covered and reason-recorded counts.
 # Discharge a row by registering the binary in ci/dag/*.json and deleting it, or
 # replace `none-recorded` with a concrete disposition and checkable reason.
+#
+# A row whose binary some step runs only through a test filter stays in this
+# file. The audit counts such a binary as CI-registered and prints "declaration
+# is superseded by CI registration" although most of its tests run in no step
+# (https://github.com/rrnewton/hermit/issues/3429). Today that applies to
+# analyze, flock_exclusion and record_replay; do not delete those rows.
 analyze	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 arch_prctl	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 block_inflight_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
@@ -25,7 +31,7 @@ cppc_feedback_determinism	none-recorded	No reason was recorded when this binary 
 cpuidle_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 dbt_copied_tty	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 dentry_state_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-flock_exclusion	fails-today-defect-filed	Measured 2026-08-26 on hermit@a787a547ea: 24 tests, 23 pass, 1 FAIL in 6.4s. contended_blocking_upgrade_is_fail_closed_under_strict observes Some(125) where it requires Some(1). Product defect, task a_guest_that_exits. Registering before the fix would make this a standing red.
+flock_exclusion	fails-today-defect-filed	Measured 2026-08-26 on hermit@a787a547ea: 24 tests, 23 pass, 1 FAIL in 6.4s. contended_blocking_upgrade_is_fail_closed_under_strict observes Some(125) where it requires Some(1). Product defect, task a_guest_that_exits. Registering before the fix would make this a standing red. Partly registered since https://github.com/rrnewton/hermit/pull/3420 -- step test.recorded_clocks (and its hosted twin test.recorded_clocks_on_host) runs 1 of its 24 tests, pre_flock_recordings_are_refused_by_the_version_gate, and the other 23 run in no step; the audit nevertheless reports this row as superseded (https://github.com/rrnewton/hermit/issues/3429). The recorded failure is probably stale: fb85f60365dda5ad830aedf6cdec5c308534b165 (https://github.com/rrnewton/hermit/pull/2659) changed contended_blocking_upgrade_is_fail_closed_under_strict to require HERMIT_POLICY_REFUSAL_EXIT 24 minutes after this row was written; NOT VERIFIED (not re-run).
 frontier_app_benchmarks	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 full_summary_futex_order	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 1 test, 1 pass, 0.3s. Green and effectively free; belongs in the DAG pending a memory sample for its hint block.
 getitimer_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
@@ -59,7 +65,7 @@ pselect6_simulation	none-recorded	No reason was recorded when this binary was le
 ptrace_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 random_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 random_uuid_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-record_replay	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+record_replay	none-recorded	No reason was recorded when this binary was left out of the CI DAG. Partly registered since https://github.com/rrnewton/hermit/pull/3420 -- step test.recorded_clocks (and its hosted twin test.recorded_clocks_on_host) runs 5 of its 81 tests (recorded_clocks_preserve_values_and_errno_event_order, uncaptured_clock_calls_remain_refused, replay_refuses_previous_clock_format_before_starting_guest, record_c_clock_exec_continuity, record_rs_clock_total_order), the super-lane step super.record_replay_matrix_diagnostic runs one more (record_replay_matrix; the audit does not recognize that step's $PWD/ci/run-nextest-counted.sh invocation), and the other 75 run in no step; the audit nevertheless reports this row as superseded (https://github.com/rrnewton/hermit/issues/3429).
 redis_strict	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 relaxed_flag_matrix	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 remap_file_pages_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
