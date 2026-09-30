@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/inode_identity_views.rs"]
+mod inode_identity_views;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
@@ -770,4 +773,55 @@ int main(void) {
     );
 
     assert_backend_parity_and_sabre_verify(&program, &[], &loader, "public libc getrandom");
+}
+
+// SaBRe embeds Detcore in the guest process, as DBT does. Keying another
+// process's pipe:[N] or socket:[N] link needs the pipefs or sockfs device
+// (https://github.com/rrnewton/hermit/issues/3307), and learning it must not
+// need a free slot in the guest's descriptor table. This guards that: the
+// fixture's child fills its table before reading the parent's links, and each
+// link must name the inode the child's own fstat of the inherited descriptor
+// reports.
+#[test]
+fn sabre_other_process_links_resolve_with_a_full_descriptor_table() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let guest = inode_identity_views::compile_guest("sabre-proc-fd-links");
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args([
+            "--log=error",
+            "run",
+            "--backend",
+            "sabre",
+            "--strict",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("proc-fd-links")
+        .stdin(Stdio::null());
+    inode_identity_views::limit_host_nofile(
+        &mut command,
+        inode_identity_views::PROC_FD_LINKS_HOST_NOFILE,
+    );
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "{rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "proc-fd-links pipe=agrees socket=agrees\n"
+    );
 }
