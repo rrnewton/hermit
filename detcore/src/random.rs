@@ -145,10 +145,20 @@ fn configuration_identity(config: &crate::Config) -> Result<[u8; 32], Errno> {
     }
     let mut writer = HashWriter(Sha256::new());
     writer.0.update(b"hermit-initial-random-state-v1\0");
+    // The Narf kernel build of Detcore is one artifact: no separately built
+    // plugin can decode this state against another Config. It also has no
+    // command-line parser to compute the fingerprint's canonical default with.
+    #[cfg(not(target_os = "none"))]
     writer.0.update(crate::config_wire_fingerprint());
     // Include actual effective values, not merely Config's type fingerprint.
     // Stream into the digest instead of allocating a second config copy.
+    #[cfg(not(target_os = "none"))]
     serde_json::to_writer(&mut writer, config).map_err(|_| Errno::EPROTO)?;
+    // Without std, serde_json has no writer; hash the same bytes as a buffer.
+    #[cfg(target_os = "none")]
+    writer
+        .0
+        .update(serde_json::to_vec(config).map_err(|_| Errno::EPROTO)?);
     Ok(writer.0.finalize().into())
 }
 

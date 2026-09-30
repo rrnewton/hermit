@@ -390,17 +390,18 @@ impl<R: Read + ?Sized> Read for Box<R> {
     }
 }
 
-/// The `eprintln!` sink: a `fn(fmt::Arguments<'_>)` stored as a pointer, null
+/// The `eprint!`/`eprintln!` sink: a `fn(fmt::Arguments<'_>)` stored as a pointer, null
 /// until the host registers one.
 static STDERR_SINK: core::sync::atomic::AtomicPtr<()> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Registers the function `eprintln!` writes through, replacing any earlier one.
+/// Registers the function `eprint!` and `eprintln!` write through, replacing
+/// any earlier one.
 pub fn set_stderr_sink(sink: fn(fmt::Arguments<'_>)) {
     STDERR_SINK.store(sink as *mut (), core::sync::atomic::Ordering::Release);
 }
 
-/// `eprintln!`'s back end; not for direct use.
+/// `eprint!` and `eprintln!`'s back end; not for direct use.
 #[doc(hidden)]
 pub fn _eprint(args: fmt::Arguments<'_>) {
     let sink = STDERR_SINK.load(core::sync::atomic::Ordering::Acquire);

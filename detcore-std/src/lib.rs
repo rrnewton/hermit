@@ -31,9 +31,9 @@
 //!   - `Instant`, `SystemTime` and `UNIX_EPOCH` as values;
 //!   - `f64::floor`, `ceil`, `round` and `powf`, which core lacks, as the
 //!     prelude trait `FloatMath` over libm (see its note on `powf`);
-//!   - `eprintln!`, formatting as std's does and handing the line to a sink
-//!     the embedding kernel registers with `io::set_stderr_sink`, or dropping
-//!     it if none is registered.
+//!   - `eprint!` and `eprintln!`, formatting as std's do and handing the text
+//!     to a sink the embedding kernel registers with `io::set_stderr_sink`, or
+//!     dropping it if none is registered.
 //!
 //! Anything that asks an operating system for something is absent, so each
 //! use is a compile error that Detcore must route through its backend or keep
@@ -169,8 +169,18 @@ pub mod prelude {
         pub use a::vec::Vec;
 
         pub use crate::FloatMath;
+        pub use crate::eprint;
         pub use crate::eprintln;
     }
+}
+
+/// std's `eprint!`: formats the arguments and passes them to the sink
+/// registered with `io::set_stderr_sink`. Without a sink they are dropped.
+#[macro_export]
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        $crate::io::_eprint(format_args!($($arg)*))
+    };
 }
 
 /// std's `eprintln!`: formats the arguments and a newline, then passes them to

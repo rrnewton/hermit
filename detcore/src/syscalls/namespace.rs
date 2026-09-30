@@ -22,7 +22,6 @@ use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
-use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 
 use super::deterministic_stdio_inode;
@@ -457,7 +456,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readlink,
     ) -> Result<i64, Error> {
-        let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let path: PathBuf =
+            crate::syscalls::read_guest_path(call.path().ok_or(Errno::EFAULT)?, &guest.memory())?;
         let (host_path, other_proc_fd) = if let Some((Some(subject), _)) = proc_fd_target(&path) {
             let current_pid = guest.inject(syscalls::Getpid::new()).await?;
             (
@@ -504,7 +504,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readlinkat,
     ) -> Result<i64, Error> {
-        let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let path: PathBuf =
+            crate::syscalls::read_guest_path(call.path().ok_or(Errno::EFAULT)?, &guest.memory())?;
         let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
             path
         } else {

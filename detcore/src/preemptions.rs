@@ -9,6 +9,7 @@
 //! A datatype to abstract a record of thread preemptions, as generated during chaos mode execution.
 
 use std::collections::BTreeMap;
+#[cfg(not(target_os = "none"))]
 use std::fs::File;
 use std::iter::FromIterator;
 use std::path::Path;
@@ -197,6 +198,7 @@ impl PreemptionRecord {
     }
 
     /// Save to disk.
+    #[cfg(not(target_os = "none"))]
     pub fn write_to_disk(&self, path: &Path) -> Result<(), String> {
         let mut str: String = self.to_string();
         str.push('\n');
@@ -213,6 +215,16 @@ impl PreemptionRecord {
                 path, err
             )),
         }
+    }
+
+    /// Without std there is no file system to save to, so this fails as the
+    /// host version does when it cannot create the file.
+    #[cfg(target_os = "none")]
+    pub fn write_to_disk(&self, path: &Path) -> Result<(), String> {
+        Err(format!(
+            "Failed to create file for preemption record {:?}, error: the Narf kernel build of Detcore has no file system",
+            path
+        ))
     }
 
     /// Perform internal invariant checks on the PreemptionRecord and return an error if
@@ -1095,10 +1107,26 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
     pr.global
 }
 
+/// The text of the preemption record at `path`. Panics if it cannot be read.
+#[cfg(not(target_os = "none"))]
+fn read_preemption_file(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", path, e))
+}
+
+/// Without std there is no file system to read the record from, so this
+/// panics as the host version does when the read fails.
+#[cfg(target_os = "none")]
+fn read_preemption_file(path: &Path) -> String {
+    panic!(
+        "Error reading file {:?}:\n the Narf kernel build of Detcore has no file system",
+        path
+    )
+}
+
 // TODO: we should implement streaming and not read this all at once.
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
-    let string = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", path, e));
+    let string = read_preemption_file(path);
     let pr: PreemptionRecord = serde_json::from_str(&string).unwrap_or_else(|e| {
         panic!(
             "Error parsing PreemptionRecord from JSON: {}\nJSON contents:\n{}",
@@ -1120,6 +1148,7 @@ fn read_preemption_record(path: &Path) -> PreemptionRecord {
 /// Unlike [`PreemptionReader::new`], this reports an unreadable or malformed
 /// file as an error instead of panicking, because the CLI consults it before
 /// any guest starts. `Ok(None)` means the record predates stored epochs.
+#[cfg(not(target_os = "none"))]
 pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String> {
     #[derive(Deserialize)]
     struct EpochOnly {
@@ -1131,6 +1160,16 @@ pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String>
     let record: EpochOnly = serde_json::from_reader(std::io::BufReader::new(file))
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
     Ok(record.epoch)
+}
+
+/// Without std there is no file system to read the record from, so this
+/// fails as the host version does when the file cannot be opened.
+#[cfg(target_os = "none")]
+pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String> {
+    Err(format!(
+        "cannot read preemption record {}: the Narf kernel build of Detcore has no file system",
+        path.display()
+    ))
 }
 
 // TODO: eventually this should do streaming IO, and abstract it behind this interface.

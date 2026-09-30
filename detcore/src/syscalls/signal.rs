@@ -11,10 +11,10 @@
 use std::time::Duration;
 
 use detcore_model::schedule::SigWrapper;
-use nix::sys::signal::Signal;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
+use reverie::Signal;
 use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;

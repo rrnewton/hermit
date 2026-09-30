@@ -7,9 +7,11 @@
  */
 
 use std::fmt;
+#[cfg(not(target_os = "none"))]
 use std::fs;
 use std::io;
 use std::ops;
+#[cfg(not(target_os = "none"))]
 use std::path::Path;
 use std::str::FromStr;
 
@@ -53,6 +55,7 @@ impl Digest {
     }
 
     /// Computes the digest by reading the file at the given path.
+    #[cfg(not(target_os = "none"))]
     pub fn digest_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::digest_reader(fs::File::open(path)?)
     }

@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(target_os = "none")]
+use libc::SiginfoExt as _;
+#[cfg(not(target_os = "none"))]
 use procfs::process::Process;
 use rand::Rng;
 use reverie::Error;
@@ -621,6 +624,7 @@ where
     Ok(None)
 }
 
+#[cfg(not(target_os = "none"))]
 pub(super) fn blocked_signal_mask() -> KernelSigset {
     // Preserve libc's definition of the blockable set (notably its reserved
     // NPTL signals) while converting the result to the kernel's one-word ABI.
@@ -636,6 +640,18 @@ pub(super) fn blocked_signal_mask() -> KernelSigset {
             mask
         }
     })
+}
+
+/// The blockable signal set, for the Narf kernel build of Detcore, which has
+/// no C library to ask. It is the set the host version computes: every signal
+/// except glibc's two reserved NPTL signals, 32 (`SIGCANCEL`) and 33
+/// (`SIGSETXID`), which glibc's `sigfillset` leaves out (measured with glibc
+/// 2.34), and Reverie's performance-event signal.
+#[cfg(target_os = "none")]
+pub(super) fn blocked_signal_mask() -> KernelSigset {
+    const GLIBC_RESERVED: KernelSigset = (1 << (32 - 1)) | (1 << (33 - 1));
+    let perf_event: KernelSigset = 1 << (reverie::PERF_EVENT_SIGNAL as u32 - 1);
+    !(GLIBC_RESERVED | perf_event)
 }
 
 pub(super) async fn block_signals_for_disposition<G, T>(
@@ -707,6 +723,7 @@ where
     guest.tail_inject(call).await
 }
 
+#[cfg(not(target_os = "none"))]
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
     let pgrp = Process::new(pid.as_raw())
         .and_then(|process| process.stat())
@@ -719,6 +736,15 @@ fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
     }
 }
 
+/// Without std the supervisor has no `/proc` of its own to read the process
+/// group from, so the wait is refused with `EOPNOTSUPP`, as when the host reads
+/// a process group of 0.
+#[cfg(target_os = "none")]
+fn snapshot_process_group(_pid: Pid) -> Result<libc::pid_t, Errno> {
+    Err(Errno::EOPNOTSUPP)
+}
+
+#[cfg(not(target_os = "none"))]
 fn guest_fd_status_flags(pid: Pid, fd: libc::c_int) -> Result<libc::c_int, Errno> {
     let path = format!("/proc/{}/fdinfo/{}", pid.as_raw(), fd);
     let contents = std::fs::read_to_string(path).map_err(|_| Errno::EBADF)?;
@@ -728,6 +754,16 @@ fn guest_fd_status_flags(pid: Pid, fd: libc::c_int) -> Result<libc::c_int, Errno
         .map(str::trim)
         .ok_or(Errno::EINVAL)?;
     libc::c_int::from_str_radix(flags, 8).map_err(|_| Errno::EINVAL)
+}
+
+/// Without std the supervisor has no `/proc` of its own to read the
+/// descriptor's flags from. The only caller is the blocking pidfd wait, which
+/// the host refuses with `EOPNOTSUPP` when the descriptor is blocking; without
+/// the flags every such wait is refused the same way, rather than reporting
+/// the descriptor as closed.
+#[cfg(target_os = "none")]
+fn guest_fd_status_flags(_pid: Pid, _fd: libc::c_int) -> Result<libc::c_int, Errno> {
+    Err(Errno::EOPNOTSUPP)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

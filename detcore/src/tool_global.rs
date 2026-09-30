@@ -18,10 +18,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt::Debug;
+#[cfg(not(target_os = "none"))]
 use std::fs;
+#[cfg(not(target_os = "none"))]
 use std::fs::File;
 use std::io::Write;
 use std::num::NonZeroUsize;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,8 +43,9 @@ use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 pub(crate) use exec_identity::reconnect_exec;
 pub(crate) use exec_identity::retire_exec;
+#[cfg(not(target_os = "none"))]
 use nix::sys::signal;
-use nix::sys::signal::Signal;
+#[cfg(not(target_os = "none"))]
 use nix::unistd::Pid;
 pub(crate) use parked::parked_wait_request;
 pub(crate) use parked::polled_read_request;
@@ -49,6 +53,10 @@ pub(crate) use parked::signal_dequeued;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
+// Without std, reverie-process's look-alike of nix's type, as in detcore-model.
+#[cfg(target_os = "none")]
+use reverie::Pid;
+use reverie::Signal;
 use reverie::Tid;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
@@ -425,6 +433,23 @@ impl DevicePool {
     }
 }
 
+/// Without std there are no host files, so no unsupported-syscall report file
+/// is ever open.
+#[cfg(target_os = "none")]
+#[derive(Debug)]
+enum File {}
+
+#[cfg(target_os = "none")]
+impl Write for File {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        match *self {}
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match *self {}
+    }
+}
+
 /// Global state associated with the detcore tool.
 ///
 /// This is a singleton, and the one object of this type lives inside a central
@@ -571,6 +596,7 @@ impl GlobalState {
             .map(|path| PreemptionReader::new(path));
         let range = Self::read_port_range();
 
+        #[cfg(not(target_os = "none"))]
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
             // This writer is internal controller state. In an in-process DBT
             // runtime it must not leak into the next guest image across exec
@@ -594,6 +620,16 @@ impl GlobalState {
                 Some(Mutex::new(unsafe { File::from_raw_fd(duplicate) }))
             }
         });
+        // Without std there are no host descriptors to duplicate, so a report
+        // descriptor is refused as the host refuses one it cannot duplicate.
+        #[cfg(target_os = "none")]
+        let unsupported_syscall_report_fd: Option<Mutex<File>> =
+            cfg.unsupported_syscall_report_fd.and_then(|fd| {
+                warn!(
+                    "failed to duplicate unsupported-syscall report fd {fd}: the Narf kernel build of Detcore has no host descriptors"
+                );
+                None
+            });
 
         Self {
             sched,
@@ -789,7 +825,15 @@ impl GlobalState {
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {
             let json = serde_json::to_string_pretty(&summary).unwrap();
+            #[cfg(not(target_os = "none"))]
             fs::write(path, json + "\n").unwrap();
+            // Without std there is no file system to write the summary to.
+            #[cfg(target_os = "none")]
+            panic!(
+                "Failed to write the run summary ({} bytes of JSON) to {:?}: the Narf kernel build of Detcore has no file system",
+                json.len(),
+                path
+            );
         }
 
         // Print human-readable summary:
@@ -2417,7 +2461,7 @@ impl GlobalState {
             if sched.thread_is_logically_killed(dettid)
                 || !sched.rpc_incarnation_matches(dettid, mm)
             {
-                return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+                return Some(SchedValue::Value(reverie::Errno::EINTR.into_raw() as u64));
             }
             let Some(resp_iv) = sched
                 .next_turns
@@ -2430,7 +2474,7 @@ impl GlobalState {
                     "[detcore, dtid {}] ignoring futex action after logical thread removal",
                     dettid
                 );
-                return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+                return Some(SchedValue::Value(reverie::Errno::EINTR.into_raw() as u64));
             };
             match action {
                 FutexAction::WaitRequest(maybe_timeout) => {
@@ -2450,7 +2494,7 @@ impl GlobalState {
                         },
                     ) {
                         sched.fail_parked(dettid, error);
-                        return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+                        return Some(SchedValue::Value(reverie::Errno::EINTR.into_raw() as u64));
                     }
                     sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
@@ -2479,7 +2523,9 @@ impl GlobalState {
                 );
                 answer
             }
-            SchedResponse::Signaled(_) => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
+            SchedResponse::Signaled(_) => {
+                Some(SchedValue::Value(reverie::Errno::EINTR.into_raw() as u64))
+            }
             SchedResponse::ObserveSignal(_) => {
                 self.sched
                     .lock()
@@ -2756,6 +2802,7 @@ impl GlobalState {
     // Ephemeral port range is in file /proc/sys/net/ipv4/ip_local_port_range"
     // This function reads from the file and returns the range
     // Start of range is at index 0, end of range is at index 1.
+    #[cfg(not(target_os = "none"))]
     fn read_port_range() -> Vec<u16> {
         let contents = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
             .expect("File should be present");
@@ -2764,6 +2811,13 @@ impl GlobalState {
             .filter_map(|number| number.parse().ok())
             .collect();
         range
+    }
+
+    // Without std there is no host `/proc` to read the range from. This is
+    // Linux's default range, which a host that has not configured one reads.
+    #[cfg(target_os = "none")]
+    fn read_port_range() -> Vec<u16> {
+        vec![32768, 60999]
     }
 
     // Reflect ephemeral port range updated outside of the tracer program internally.
@@ -3774,6 +3828,7 @@ where
 }
 
 /// Writes a structured json backtrace to a given file
+#[cfg(not(target_os = "none"))]
 fn write_backtrace<G, T>(guest: &mut G, m_path: Option<&PathBuf>)
 where
     G: Guest<Detcore<T>>,
@@ -3785,6 +3840,29 @@ where
             serde_json::to_writer(file, &backtrace.force_pretty()).unwrap();
         } else {
             eprintln!("{}", backtrace.force_pretty());
+        }
+    } else {
+        warn!("Could not read backtrace!");
+    }
+}
+
+/// Without std there is no file system and no symbolizer: with a path this
+/// fails as the host version does when it cannot create the file, and without
+/// one it prints the unsymbolized backtrace.
+#[cfg(target_os = "none")]
+fn write_backtrace<G, T>(guest: &mut G, m_path: Option<&PathBuf>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let Some(backtrace) = guest.backtrace() {
+        if let Some(path) = m_path {
+            panic!(
+                "Failed to open preemption stacktrace log file {:?}: the Narf kernel build of Detcore has no file system",
+                path
+            );
+        } else {
+            eprintln!("{}", backtrace);
         }
     } else {
         warn!("Could not read backtrace!");
@@ -3807,7 +3885,7 @@ struct CommandBootstrapInstructionPointer(NonZeroUsize);
 
 impl std::fmt::Debug for CommandBootstrapInstructionPointer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", crate::logdiff::host_addr(self.0.get()))
+        write!(f, "{}", crate::detlog::host_addr(self.0.get()))
     }
 }
 

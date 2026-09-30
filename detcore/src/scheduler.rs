@@ -43,8 +43,9 @@ use detcore_model::summary::TimesliceStats;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::Shared;
+#[cfg(not(target_os = "none"))]
 use nix::sys::signal;
-use nix::sys::signal::Signal;
+#[cfg(not(target_os = "none"))]
 use nix::unistd::Pid;
 use rand::RngExt as _;
 use rand::SeedableRng;
@@ -52,6 +53,10 @@ use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
+// Without std, reverie-process's look-alike of nix's type, as in detcore-model.
+#[cfg(target_os = "none")]
+use reverie::Pid;
+use reverie::Signal;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::DEFAULT_PRIORITY;
