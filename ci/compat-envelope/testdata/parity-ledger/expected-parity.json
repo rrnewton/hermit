@@ -15,7 +15,7 @@
       "conflicting_hermit_shas": [],
       "depth": null,
       "emitted_at": "2026-09-29T04:10:00Z",
-      "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 175 measured of 192 selected (0 no golden; 14 not compared; 3 unmeasured: no-result-row 3) [inputs not equalized]",
+      "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; excluded: 0 no golden; 14 not compared) [inputs not equalized]",
       "committed_unknown": null,
       "committed_cells_without_row": [],
       "cells_outside_committed": [],
@@ -121,7 +121,7 @@
             "reference_message": "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)",
             "candidate_message": "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"
           },
-          "line": "parity: 0/77 matched; selected 77 of 77 committed; mean 0.101 over 76 measured; floor 0.100 over 76 measured of 77 selected (0 no golden; 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]"
+          "line": "parity: 0/77 matched; selected 77 of 77 committed; mean 0.101 over 76 measured; floor 0.100 over 77 of 77 selected (counted as 0: 1 unmeasured: no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]"
         },
         "liteinst": {
           "selected": 99,
@@ -177,7 +177,7 @@
             "reference_message": "INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: access(0x7ffff7ff3580 -> \"/etc/ld-nix.so.preload\", Mode(S_IROTH)) = ?",
             "candidate_message": "INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 3, syscall_nanos: Some(270000), rcbs: 3713, weighted_rcbs: None, nondet_instrs: 24, extra_nanos: 0, starting_micros: 1790651878158333, multiplier: 1.0, inherited_nanos: LogicalTime(0) }"
           },
-          "line": "parity: 0/99 matched; selected 99 of 99 committed; mean 0.014 over 98 measured; floor 0.014 over 98 measured of 99 selected (0 no golden; 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]"
+          "line": "parity: 0/99 matched; selected 99 of 99 committed; mean 0.014 over 98 measured; floor 0.014 over 99 of 99 selected (counted as 0: 1 unmeasured: no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]"
         },
         "sabre": {
           "selected": 2,
@@ -233,7 +233,7 @@
             "reference_message": "INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0",
             "candidate_message": "INFO detcore::random: DETLOG [post_exec, dtid 3] init auxv AT_RANDOM value to [162, 205, 24, 211, 0, 83, 122, 92, 176, 131, 220, 72, 219, 250, 14, 242]"
           },
-          "line": "parity: 0/2 matched; selected 2 of 2 committed; mean 0.020 over 1 measured; floor 0.010 over 1 measured of 2 selected (0 no golden; 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]"
+          "line": "parity: 0/2 matched; selected 2 of 2 committed; mean 0.020 over 1 measured; floor 0.010 over 2 of 2 selected (counted as 0: 1 unmeasured: no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]"
         }
       },
       "total": {
@@ -290,7 +290,7 @@
           "reference_message": "INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: access(0x7ffff7ff3580 -> \"/etc/ld-nix.so.preload\", Mode(S_IROTH)) = ?",
           "candidate_message": "INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 3, syscall_nanos: Some(270000), rcbs: 3713, weighted_rcbs: None, nondet_instrs: 24, extra_nanos: 0, starting_micros: 1790651878158333, multiplier: 1.0, inherited_nanos: LogicalTime(0) }"
         },
-        "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 175 measured of 192 selected (0 no golden; 14 not compared; 3 unmeasured: no-result-row 3) [inputs not equalized]"
+        "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; excluded: 0 no golden; 14 not compared) [inputs not equalized]"
       },
       "cells": [
         {
@@ -4528,7 +4528,7 @@
       "depth": null,
       "emitted_at": "2026-09-29T04:10:00Z",
       "headline": true,
-      "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 175 measured of 192 selected (0 no golden; 14 not compared; 3 unmeasured: no-result-row 3) [inputs not equalized]"
+      "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; excluded: 0 no golden; 14 not compared) [inputs not equalized]"
     }
   ],
   "refused_rows": 0,
