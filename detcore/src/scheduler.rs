@@ -36,6 +36,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(not(target_os = "none"))]
 use std::time::Duration;
 use std::vec::IntoIter;
 
@@ -96,6 +97,8 @@ use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
+#[cfg(target_os = "none")]
+use crate::tool_global::yield_once;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -1195,6 +1198,7 @@ impl Backoff {
         Backoff { count: 0 }
     }
 
+    #[cfg(not(target_os = "none"))]
     async fn further(&mut self, blocking: bool) {
         self.count += 1;
         const YIELDS_FIRST: u64 = 10;
@@ -1215,6 +1219,16 @@ impl Backoff {
         }
     }
 
+    /// The Narf kernel build of Detcore has no host threads to yield to and no
+    /// clock to sleep on. Whatever `blocking` asks, this is pending once, as
+    /// `yield_once` is, so the executor that polls the scheduler runs its
+    /// other tasks before it polls the scheduler again.
+    #[cfg(target_os = "none")]
+    async fn further(&mut self, _blocking: bool) {
+        self.count += 1;
+        yield_once().await;
+    }
+
     fn reset(&mut self) {
         self.count = 0;
     }
@@ -1224,6 +1238,16 @@ impl Default for Backoff {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Let other host threads run before a busy-waiting scheduler step returns
+/// `SkipTurn`. The Narf kernel build of Detcore has no host threads, and here
+/// it holds the scheduler lock, a spin lock without std, so it waits only in
+/// `Backoff::further`, which the `SkipTurn` reaches after the lock is
+/// released.
+fn yield_host_thread() {
+    #[cfg(not(target_os = "none"))]
+    std::thread::yield_now();
 }
 
 pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
@@ -3079,7 +3103,7 @@ impl Scheduler {
             // Do not let runnable siblings advance while the backend catches
             // up to physical waitability; completion admits the waiter through
             // the next deterministic drain.
-            std::thread::yield_now();
+            yield_host_thread();
             return Err(SkipTurn);
         }
         self.step2a_wait_for_vfork_barrier()?;
@@ -3788,7 +3812,7 @@ impl Scheduler {
                     "[step2] eagerly waiting on external IO for dtids {:?}. spinning.",
                     &self.blocked.external_io_blockers
                 );
-                std::thread::yield_now();
+                yield_host_thread();
                 return Err(SkipTurn);
             } // End region which should be deleted.
 
@@ -3819,7 +3843,7 @@ impl Scheduler {
                     "[step2] TEMPORARY2: eagerly blocking on external IO for dtids {:?}.  SPINNING!",
                     &self.blocked.external_io_blockers
                 );
-                std::thread::yield_now();
+                yield_host_thread();
                 Err(SkipTurn)
             } else {
                 // Productive work to do, irrespcetive of what's blocked, so let's get to it.
@@ -4236,7 +4260,7 @@ impl Scheduler {
                     "waiting for physical process exits before empty-queue timer fast-forward: {:?}",
                     self.pending_physical_process_exits
                 );
-                std::thread::yield_now();
+                yield_host_thread();
                 return Err(SkipTurn);
             }
             // When the run queue is empty, we sometimes need to give things a kick.
@@ -4269,7 +4293,7 @@ impl Scheduler {
                             "[scheduler] empty run-queue with only indefinite waiters, but external IO is outstanding for dtids {:?}. SPINNING!",
                             &self.blocked.external_io_blockers
                         );
-                        std::thread::yield_now();
+                        yield_host_thread();
                         return Err(SkipTurn);
                     }
                     return Err(self.report_terminal_deadlock());
