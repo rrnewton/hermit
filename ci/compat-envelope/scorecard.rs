@@ -4899,8 +4899,10 @@ struct ParityStoreLine {
 /// The ledger's `parity/` store as read, before any row is interpreted.
 #[derive(Clone, Debug, Default)]
 struct ParityStoreInput {
-    /// False when the ledger has no `parity/` directory. An absent store means
-    /// no parity row was ever published, which is not a zero.
+    /// False when the ledger has no `parity` entry at all. An absent store
+    /// means no parity row was ever published, which is not a zero. An entry
+    /// the reader cannot read as a store is present, and refused
+    /// ([`ParityStoreInput::refused`]).
     present: bool,
     lines: Vec<ParityStoreLine>,
     /// Entries refused before any row was read: a file outside the shard
@@ -4911,6 +4913,23 @@ struct ParityStoreInput {
 }
 
 impl ParityStoreInput {
+    /// A store the reader could not read at all ([`read_parity_store`]
+    /// failed with `why`): no line, and one refusal of the whole store. The
+    /// parity section and `scorecard/parity.json` report it like any other
+    /// refusal, and the determinism files are written as usual, because
+    /// parity never stops them.
+    fn refused(why: String) -> Self {
+        Self {
+            present: true,
+            refusals: vec![ParityRefusal {
+                path: PARITY_STORE.to_string(),
+                line: None,
+                message: why,
+            }],
+            ..Self::default()
+        }
+    }
+
     /// Fold one shard into the input. The directory reader and the golden
     /// fixtures both come through here, so they split lines identically.
     fn add_shard(&mut self, path: String, bytes: &[u8], digest: &mut Sha256) {
@@ -4993,9 +5012,21 @@ fn parity_store_entry(
     }
 }
 
+/// The ledger's `parity/` store as the scorecard reads it
+/// ([`read_parity_store`]). A store the reader cannot read at all (a
+/// `parity` entry that is not a directory, or an entry that cannot be listed
+/// or read) is one store-level refusal ([`ParityStoreInput::refused`]), never
+/// an error: a parity failure must not stop the scorecard command before it
+/// writes the determinism files.
+fn parity_store_input(ledger: &Path) -> ParityStoreInput {
+    read_parity_store(ledger).unwrap_or_else(ParityStoreInput::refused)
+}
+
 /// Read the ledger's `parity/` store: every regular file at
 /// `parity/<team>/<host>/<file>.jsonl`, in path order. Anything else below
-/// `parity/` is refused by name rather than read or skipped silently.
+/// `parity/` is refused by name rather than read or skipped silently. An
+/// error means the store could not be read at all;
+/// [`parity_store_input`] turns it into one refusal of the whole store.
 fn read_parity_store(ledger: &Path) -> Result<ParityStoreInput, String> {
     let store = ledger.join(PARITY_STORE);
     match fs::symlink_metadata(&store) {
@@ -5682,11 +5713,13 @@ impl ParityTally {
                         .or_default()
                         .push(cell);
                 }
-                Some(verdict) => {
-                    let class = cell.unavailable_class.unwrap_or_else(|| {
-                        panic!("a validated {verdict} row always names its unavailable_class")
-                    });
-                    match class.group() {
+                Some(_) => match cell.unavailable_class {
+                    // A validated row always names its class
+                    // (`ParityLedgerRow::validate`). A cell without one is
+                    // counted as refused, in the floor as 0, rather than
+                    // stopping the scorecard: parity never gates it.
+                    None => tally.refused += 1,
+                    Some(class) => match class.group() {
                         UnavailableGroup::NoGolden => {
                             in_floor = false;
                             tally.no_golden += 1;
@@ -5701,8 +5734,8 @@ impl ParityTally {
                             *tally.unmeasured_by_class.entry(class).or_default() += 1;
                         }
                         UnavailableGroup::RecordMissing => tally.record_missing += 1,
-                    }
-                }
+                    },
+                },
             }
             if in_floor {
                 tally.floor_cells += 1;
@@ -6539,9 +6572,13 @@ fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
 /// A ledger without parity rows runs no Git process here; one with rows runs
 /// at most three, however many runs it holds ([`ParityCommitFacts`], and the
 /// tool's own commit, which only `scorecard/parity.json` records).
+///
+/// The only error is the ledger's own location ([`ledger_root`]), which the
+/// determinism files need as well. A store that cannot be read is refused in
+/// the summary instead ([`parity_store_input`]).
 fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySummary, String> {
     let ledger = ledger_root(root, false)?;
-    let input = read_parity_store(&ledger)?;
+    let input = parity_store_input(&ledger);
     let facts = ParityCommitFacts::read(root, &parity_store_shas(&input));
     let mut summary = summarize_parity(&input, tracked, &|sha| facts.depth(sha), &|sha| {
         facts.committed(sha)
@@ -36500,6 +36537,103 @@ mod parity_summary_tests {
             generated_files(&derived, &cells).unwrap().scorecard,
             without.scorecard
         );
+    }
+
+    #[test]
+    fn a_parity_store_that_cannot_be_read_is_refused_and_the_determinism_files_are_still_generated()
+    {
+        let (derived, cells) = determinism_fixture();
+        let heading = "\n## Parity (measured after determinism)\n";
+        let determinism = |files: &GeneratedFiles| {
+            let text = String::from_utf8(files.scorecard.clone()).unwrap();
+            let at = text
+                .find(heading)
+                .expect("the parity section follows determinism");
+            text[..at].to_string()
+        };
+        let without = generated_files(&derived, &cells).unwrap();
+        let why = "the ledger's parity entry is not a directory";
+        // A regular file named `parity`, and a symlink named `parity` to a
+        // directory holding a valid shard: neither is a store, and the
+        // symlink is not followed.
+        let file = tempfile::tempdir().unwrap();
+        fs::write(file.path().join(PARITY_STORE), "not a store\n").unwrap();
+        let link = tempfile::tempdir().unwrap();
+        let target = link.path().join("elsewhere");
+        fs::create_dir_all(target.join("hermit/fixture-host-b")).unwrap();
+        let valid = row(matched(&golden(1), KVM, 80, true));
+        fs::write(
+            target.join("hermit/fixture-host-b/2026-09.jsonl"),
+            format!("{}\n", line(&valid)),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, link.path().join(PARITY_STORE)).unwrap();
+        for ledger in [file.path(), link.path()] {
+            // The reader still refuses the entry as before...
+            assert_eq!(read_parity_store(ledger).unwrap_err(), why);
+            // ...and the scorecard records that as one refusal of the whole
+            // store instead of failing.
+            let input = parity_store_input(ledger);
+            assert!(input.present && input.lines.is_empty());
+            assert_eq!(input.store_sha256, None);
+            let refusal = ParityRefusal {
+                path: PARITY_STORE.into(),
+                line: None,
+                message: why.into(),
+            };
+            assert_eq!(input.refusals, [refusal.clone()]);
+            let summary = summarize_parity(&input, &cells, &|_| None, &|_| Ok(None));
+            assert!(summary.store_present);
+            assert!(summary.producers.is_empty() && summary.runs.is_empty());
+            assert_eq!((summary.rows_read, summary.refused_rows), (0, 0));
+            assert_eq!(summary.refusals, [refusal]);
+
+            // The determinism files are generated, exactly as without a store.
+            let files = generated_files_with_parity(&derived, &cells, &summary).unwrap();
+            assert_eq!(files.cells, without.cells);
+            assert_eq!(determinism(&files), determinism(&without));
+            // The parity section and parity.json name the refusal.
+            let rendered = String::from_utf8(files.scorecard.clone()).unwrap();
+            for expected in [
+                "The ledger's `parity/` store holds no admissible parity row (0 line(s) read, 0 \
+                 refused).\n",
+                "\n### Refused parity rows\n\n1 store entr(ies) were refused, verbatim below;",
+                "\n- `parity: the ledger's parity entry is not a directory`\n",
+            ] {
+                assert_contains(&rendered, expected);
+            }
+            let value = serde_json::from_slice::<JsonValue>(&files.parity.unwrap()).unwrap();
+            assert_eq!(value["store_present"], true);
+            assert_eq!(
+                value["refusals"],
+                serde_json::json!([{"path": "parity", "line": null, "message": why}])
+            );
+        }
+    }
+
+    #[test]
+    fn a_cell_without_the_class_its_verdict_needs_counts_as_refused_without_a_panic() {
+        let mut cell = ParityCellSummary::from_row(
+            &row(unmeasured(
+                &golden(1),
+                KVM,
+                ParityVerdict::Unavailable,
+                UnavailableClass::Timeout,
+                Some(ParityOperand::Candidate),
+                "the kvm candidate verify cell of c-programs/golden-1 timed out",
+            )),
+            &golden(1),
+        );
+        // Control: with its class, it is a no-golden cell outside the floor.
+        let tally = ParityTally::over([&cell]);
+        assert_eq!(counts(&tally), [1, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!((tally.floor_cells, tally.floor_credit), (0, None));
+        // Without it (validation never admits such a row), it is refused and
+        // counts as 0 in the floor.
+        cell.unavailable_class = None;
+        let tally = ParityTally::over([&cell]);
+        assert_eq!(counts(&tally), [1, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!((tally.floor_cells, tally.floor_credit), (1, Some(0.0)));
     }
 
     fn fixture_dir() -> PathBuf {
