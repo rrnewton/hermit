@@ -132,7 +132,7 @@ and the reason is documented.
 
 ## Workspace Map
 
-The root Cargo workspace has sixteen members:
+The root Cargo workspace has seventeen members:
 
 | Path | Role |
 | --- | --- |
@@ -143,6 +143,7 @@ The root Cargo workspace has sixteen members:
 | `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
 | `detcore-std` | The parts of `std` Detcore and `detcore-model` use, over `core` and `alloc`, for building them without `std` on the Narf kernel target (`x86_64-unknown-none`); empty on every other target. |
 | `detcore-libc` | The `libc` definitions Detcore and `detcore-model` use without `std`, over Reverie's no-std `libc` module; empty on every other target. |
+| `detcore-clap` | The `clap` derive `detcore-model` sees without `std` on the Narf kernel target: it accepts the `#[clap(...)]` attributes and generates nothing, as the host parses the command line there. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
 | `common/test-allocator` | Test allocator and supporting test binary. |

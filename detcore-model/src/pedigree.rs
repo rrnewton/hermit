@@ -14,7 +14,11 @@ use std::mem;
 
 use bitvec::prelude::*;
 use libc::pid_t;
+#[cfg(not(target_os = "none"))]
 use nix::unistd::Pid;
+// Without std, reverie-process's look-alike of nix's type.
+#[cfg(target_os = "none")]
+use reverie_process::Pid;
 use serde::Deserialize;
 use serde::Serialize;
 

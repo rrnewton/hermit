@@ -10,7 +10,11 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
+#[cfg(not(target_os = "none"))]
 use nix::sys::signal::Signal;
+// Without std, reverie-process's look-alike of nix's type.
+#[cfg(target_os = "none")]
+use reverie_process::Signal;
 use reverie_syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
