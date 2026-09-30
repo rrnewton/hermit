@@ -103,8 +103,10 @@ const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
 const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_ledger.git";
 /// `scorecard/parity.json`, the one parity summary both the ledger scorecard
 /// and the compatibility website read. See
-/// <https://github.com/rrnewton/hermit/issues/3301>.
-const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v1";
+/// <https://github.com/rrnewton/hermit/issues/3301>. Version 2 adds each
+/// row's source tree state, and only a run from a clean source tree can be a
+/// headline (<https://github.com/rrnewton/dev-hermit/issues/463>).
+const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v2";
 const LEDGER_PARITY_SUMMARY: &str = "scorecard/parity.json";
 /// The ledger store `series.py append-parity` publishes `parity-ledger/v1`
 /// rows into, as `parity/<team>/<host>/<YYYY-MM>.jsonl`.
@@ -6428,6 +6430,10 @@ struct ParityRunSummary {
     /// `emitted_at` as parsed, which orders runs; the text is kept verbatim.
     #[serde(skip)]
     emitted_instant: Option<UtcInstant>,
+    /// The run's source tree state ([`parity_run_tree_state`]): `true`,
+    /// `false`, or `null` for a run that did not report it. Only a `false`
+    /// run can be a headline, so a run in `producers` always carries `false`.
+    source_tree_dirty: Option<bool>,
     line: String,
     /// Why the run's committed selection is unknown, when it is.
     committed_unknown: Option<String>,
@@ -6449,6 +6455,8 @@ struct ParityRunBrief {
     hermit_sha: Option<String>,
     depth: Option<SourceDepth>,
     emitted_at: Option<String>,
+    /// The run's source tree state, as [`ParityRunSummary::source_tree_dirty`].
+    source_tree_dirty: Option<bool>,
     headline: bool,
     line: String,
 }
@@ -6515,6 +6523,12 @@ struct ParitySummary {
     refused_rows: usize,
     /// Rows of a cell a run had already reported; the most adverse was kept.
     duplicate_rows: usize,
+    /// Lines that pass the row check with `"source_tree_dirty": true`,
+    /// duplicates and rows a conflicting commit refuses included.
+    source_tree_dirty_rows: usize,
+    /// Lines that pass the row check only once `"source_tree_dirty": false`
+    /// is added, counted the same way ([`classify_parity_row`]).
+    source_tree_unreported_rows: usize,
     /// Every refusal, in (shard, line, message) order.
     refusals: Vec<ParityRefusal>,
     legacy_rerun: LegacyRerunSummary,
@@ -6539,6 +6553,151 @@ fn attribute_refused_parity_row(
     let test_id = value.get("test_id")?.as_str()?;
     let backend = ParityBackend::parse(value.get("backend")?.as_str()?).ok()?;
     Some((producer, run_id.to_string(), test_id.to_string(), backend))
+}
+
+/// A parity row's source tree state, by the rule of section 7 of the parity
+/// summary format, version 3
+/// (<https://github.com/rrnewton/dev-hermit/issues/463>).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParityRowTree {
+    /// `"source_tree_dirty": false`.
+    Clean,
+    /// `"source_tree_dirty": true`.
+    Dirty,
+    /// No `source_tree_dirty` key, in a row that passes the row check once
+    /// `"source_tree_dirty": false` is added. A missing value is never read
+    /// as clean.
+    Unreported,
+}
+
+/// The row check: `text` parsed as a [`ParityLedgerRow`], validated, and its
+/// `emitted_at` parsed. It decides row by row; the refusal of a run whose
+/// rows name more than one Hermit commit comes later, in [`summarize_parity`].
+fn parity_row_check(text: &str) -> Result<(ParityLedgerRow, UtcInstant), String> {
+    serde_json::from_str::<ParityLedgerRow>(text)
+        .map_err(|error| format!("not a parity-ledger/v1 row: {error}"))
+        .and_then(|row| row.validate().map(|()| row))
+        .and_then(|row| {
+            parse_utc_timestamp(&row.emitted_at)
+                .map(|instant| (row, instant))
+                .map_err(|error| format!("emitted_at: {error}"))
+        })
+}
+
+/// `text` with `"source_tree_dirty":false` written in as its first member,
+/// when `text` is a JSON object without that key; `None` otherwise, which
+/// includes an object whose `source_tree_dirty` is null or not a boolean.
+///
+/// The key is added to the text, not to a parsed value, so every other defect
+/// of the line -- a repeated key, an unknown key -- is still there for
+/// [`parity_row_check`] to refuse. A JSON value keeps only the last of two
+/// equal keys, and serializing it would drop the first one.
+fn with_source_tree_state_added(text: &str) -> Option<String> {
+    let JsonValue::Object(members) = serde_json::from_str::<JsonValue>(text).ok()? else {
+        return None;
+    };
+    if members.contains_key("source_tree_dirty") {
+        return None;
+    }
+    // A line that parses as a JSON object opens it with its first byte that
+    // is not whitespace.
+    let open = text.find('{')?;
+    let separator = if members.is_empty() { "" } else { "," };
+    Some(format!(
+        "{}\"source_tree_dirty\":false{separator}{}",
+        &text[..=open],
+        &text[open + 1..]
+    ))
+}
+
+/// Classify one line of the store (section 7 of the parity summary format,
+/// version 3, <https://github.com/rrnewton/dev-hermit/issues/463>):
+///
+/// - it passes [`parity_row_check`] with `"source_tree_dirty": false`: clean;
+/// - it passes with `true`: dirty;
+/// - it is a JSON object without the `source_tree_dirty` key that passes once
+///   `"source_tree_dirty": false` is added: not reported. It is admitted like
+///   a clean or dirty row; the row this returns then holds the added `false`,
+///   so its state is read from the returned [`ParityRowTree`], never from it;
+/// - anything else is refused, as before, with the message the row check
+///   gives the line as written: a null or non-boolean value, a line that is
+///   not a JSON object, and a missing key beside another defect.
+fn classify_parity_row(text: &str) -> Result<(ParityLedgerRow, UtcInstant, ParityRowTree), String> {
+    match parity_row_check(text) {
+        Ok((row, instant)) => {
+            let tree = if row.source_tree_dirty {
+                ParityRowTree::Dirty
+            } else {
+                ParityRowTree::Clean
+            };
+            Ok((row, instant, tree))
+        }
+        Err(message) => {
+            match with_source_tree_state_added(text).and_then(|added| parity_row_check(&added).ok())
+            {
+                Some((row, instant)) => Ok((row, instant, ParityRowTree::Unreported)),
+                None => Err(message),
+            }
+        }
+    }
+}
+
+/// A run's source tree state, over its rows that pass the row check, those a
+/// conflicting commit later refuses included: `true` if any of them is dirty;
+/// otherwise `None` (`null`) if any of them is not reported or none of the
+/// run's rows passes; otherwise `false`. A row the row check refuses does not
+/// change it. Only a `false` run can be a headline.
+fn parity_run_tree_state(trees: &[ParityRowTree]) -> Option<bool> {
+    if trees.contains(&ParityRowTree::Dirty) {
+        Some(true)
+    } else if trees.is_empty() || trees.contains(&ParityRowTree::Unreported) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// `N parity row(s)`, spelled as section 7 of the parity summary format,
+/// version 3, spells it: plain digits, `row` only for exactly one.
+fn parity_rows_text(count: usize) -> String {
+    format!("{count} parity {}", if count == 1 { "row" } else { "rows" })
+}
+
+/// The two lines that count the rows outside every clean headline, byte for
+/// byte as section 7 of the parity summary format, version 3, gives them and
+/// the site's parity panel prints them: the rows from a dirty source tree,
+/// then the rows that did not report their source tree state.
+fn parity_tree_state_lines(summary: &ParitySummary) -> (String, String) {
+    let unreported = summary.source_tree_unreported_rows;
+    (
+        format!(
+            "Outside the clean headline: {} from a dirty source tree.",
+            parity_rows_text(summary.source_tree_dirty_rows)
+        ),
+        format!(
+            "Outside the clean headline: {} that did not report {} source tree state.",
+            parity_rows_text(unreported),
+            if unreported == 1 { "its" } else { "their" }
+        ),
+    )
+}
+
+/// What follows a run's Hermit commit in the list of other runs: its source
+/// tree state, unless it is clean.
+fn parity_tree_state_mark(state: Option<bool>) -> &'static str {
+    match state {
+        Some(true) => " (from a dirty source tree)",
+        None => " (did not report its source tree state)",
+        Some(false) => "",
+    }
+}
+
+/// Said in place of the headline section of a producer that has runs in the
+/// store but none whose source tree state is clean.
+fn parity_no_clean_headline_text(producer: ParityProducer) -> String {
+    format!(
+        "No clean headline for {producer}: every {producer} run in the store is from a dirty source tree or did not report its source tree state."
+    )
 }
 
 #[derive(Default)]
@@ -6589,6 +6748,21 @@ impl ParityRunAccumulator {
 /// ([`ParityCommitFacts`]); each run is measured against its own
 /// commit's selection, so a partial run is marked partial and headlines only
 /// when no complete run exists.
+///
+/// Each line is also classified by its source tree state
+/// ([`classify_parity_row`]), by the rule of section 7 of the parity summary
+/// format, version 3 (sha256
+/// 2cf28f143ff8d4a45b8cfc4d69b6fcb35454a8a8f61501c0d9babf0bb8bfb6f8,
+/// <https://github.com/rrnewton/dev-hermit/issues/463>). The rule is stated
+/// per row, because the value is stored on each row and the summary reads
+/// only rows: `source_tree_dirty_rows` and `source_tree_unreported_rows`
+/// count every classified line, duplicates and rows a conflicting commit
+/// refuses included, and a run's state is taken over its classified rows
+/// ([`parity_run_tree_state`]). Only a run whose state is `false` can be a
+/// headline, and a producer with no such run has none. The writer
+/// (`series.py append-parity`) puts one value on every row of a run and on
+/// its marker, and refuses any disagreement, so for the runs it writes the
+/// rule keeps or excludes whole runs.
 fn summarize_parity(
     input: &ParityStoreInput,
     tracked: &TrackedCells,
@@ -6602,27 +6776,30 @@ fn summarize_parity(
     lines.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     let parsed = lines
         .iter()
-        .map(|line| {
-            serde_json::from_str::<ParityLedgerRow>(&line.text)
-                .map_err(|error| format!("not a parity-ledger/v1 row: {error}"))
-                .and_then(|row| row.validate().map(|()| row))
-                .and_then(|row| {
-                    parse_utc_timestamp(&row.emitted_at)
-                        .map(|instant| (row, instant))
-                        .map_err(|error| format!("emitted_at: {error}"))
-                })
-        })
+        .map(|line| classify_parity_row(&line.text))
         .collect::<Vec<_>>();
+    // One entry of `parsed` per line read, and at most one count per entry,
+    // so each count, and their sum, is at most `rows_read`.
+    let mut source_tree_dirty_rows = 0usize;
+    let mut source_tree_unreported_rows = 0usize;
     let mut run_shas: BTreeMap<(ParityProducer, String), BTreeSet<String>> = BTreeMap::new();
-    for (row, _) in parsed.iter().flatten() {
+    let mut run_trees: BTreeMap<(ParityProducer, String), Vec<ParityRowTree>> = BTreeMap::new();
+    for (row, _, tree) in parsed.iter().flatten() {
+        let key = (row.producer, row.run_id.clone());
         run_shas
-            .entry((row.producer, row.run_id.clone()))
+            .entry(key.clone())
             .or_default()
             .insert(row.hermit_sha.clone());
+        run_trees.entry(key).or_default().push(*tree);
+        match tree {
+            ParityRowTree::Dirty => source_tree_dirty_rows += 1,
+            ParityRowTree::Unreported => source_tree_unreported_rows += 1,
+            ParityRowTree::Clean => {}
+        }
     }
     let mut runs: BTreeMap<(ParityProducer, String), ParityRunAccumulator> = BTreeMap::new();
     for (line, parsed) in lines.into_iter().zip(parsed) {
-        let admitted = parsed.and_then(|(row, instant)| {
+        let admitted = parsed.and_then(|(row, instant, _)| {
             let shas = &run_shas[&(row.producer, row.run_id.clone())];
             if shas.len() > 1 {
                 return Err(format!(
@@ -6686,6 +6863,13 @@ fn summarize_parity(
 
     let mut summaries = Vec::new();
     for ((producer, run_id), run) in runs {
+        // A run only refused rows name has no classified row, so its state
+        // is `null`.
+        let source_tree_dirty = parity_run_tree_state(
+            &run_trees
+                .remove(&(producer, run_id.clone()))
+                .unwrap_or_default(),
+        );
         let depth = run.hermit_sha.as_deref().and_then(depth_of);
         let cells = run.cells.into_values().collect::<Vec<_>>();
         let (committed, committed_unknown) = match run.hermit_sha.as_deref() {
@@ -6745,6 +6929,7 @@ fn summarize_parity(
             depth,
             emitted_at: run.emitted_at.as_ref().map(|(_, text)| text.clone()),
             emitted_instant: run.emitted_at.map(|(instant, _)| instant),
+            source_tree_dirty,
             line: total.line.clone(),
             committed_unknown,
             committed_cells_without_row,
@@ -6754,10 +6939,12 @@ fn summarize_parity(
             cells,
         });
     }
-    // The headline of a producer is its run that reported every cell its own
-    // commit's selection owes; a partial run headlines only when no complete
-    // run exists, the most complete first. Then the deepest Hermit commit
-    // this checkout can place, the latest emission, and the run id.
+    // Only a run whose source tree state is `false` can be a headline. Among
+    // a producer's such runs, the headline is its run that reported every
+    // cell its own commit's selection owes; a partial run headlines only when
+    // no complete run exists, the most complete first. Then the deepest
+    // Hermit commit this checkout can place, the latest emission, and the run
+    // id.
     let headline_key = |run: &ParityRunSummary| {
         let complete = run.total.complete();
         (
@@ -6775,6 +6962,13 @@ fn summarize_parity(
     };
     let mut headlines: BTreeMap<ParityProducer, usize> = BTreeMap::new();
     for (index, run) in summaries.iter().enumerate() {
+        // A dirty run, and one that did not report its state, stay in `runs`
+        // with their own line; a producer none of whose runs is `false` has
+        // no headline. So every run in `producers` is `false`, and every
+        // `false` run's producer has a headline.
+        if run.source_tree_dirty != Some(false) {
+            continue;
+        }
         let better = headlines
             .get(&run.producer)
             .is_none_or(|&current| headline_key(run) > headline_key(&summaries[current]));
@@ -6791,6 +6985,7 @@ fn summarize_parity(
             hermit_sha: run.hermit_sha.clone(),
             depth: run.depth,
             emitted_at: run.emitted_at.clone(),
+            source_tree_dirty: run.source_tree_dirty,
             headline: headlines.get(&run.producer) == Some(&index),
             line: run.line.clone(),
         })
@@ -6827,6 +7022,8 @@ fn summarize_parity(
         runs: briefs,
         refused_rows,
         duplicate_rows,
+        source_tree_dirty_rows,
+        source_tree_unreported_rows,
         refusals,
         legacy_rerun,
         legacy_dropped,
@@ -7145,13 +7342,30 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
         out.push_str(&format!(
             "No parity rows in this ledger: it has no `{PARITY_STORE}/` store yet, so no current parity is reported. This is not a zero.\n"
         ));
-    } else if summary.producers.is_empty() {
+    } else if summary.runs.is_empty() {
         out.push_str(&format!(
             "The ledger's `{PARITY_STORE}/` store holds no admissible parity row ({} line(s) read, {} refused).\n",
             summary.rows_read, summary.refused_rows
         ));
     }
-    for run in &summary.producers {
+    // Each producer with runs in the store leads with its headline, which is
+    // always a run from a clean source tree, or says that it has none
+    // (section 7 of the parity summary format, version 3,
+    // https://github.com/rrnewton/dev-hermit/issues/463).
+    let producers_with_runs = summary
+        .runs
+        .iter()
+        .map(|brief| brief.producer)
+        .collect::<BTreeSet<_>>();
+    for producer in producers_with_runs {
+        let Some(run) = summary
+            .producers
+            .iter()
+            .find(|run| run.producer == producer)
+        else {
+            out.push_str(&format!("\n{}\n", parity_no_clean_headline_text(producer)));
+            continue;
+        };
         let short = |sha: &str| format!("`{}`", &sha[..sha.len().min(12)]);
         let sha = match run.hermit_sha.as_deref() {
             Some(sha) => format!("at {}", short(sha)),
@@ -7326,28 +7540,38 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
             }
         }
     }
-    if summary.runs.len() > summary.producers.len() {
-        out.push_str(
-            "\n### Runs in the parity store\n\n\
-The headline run of each producer is the one that reported every cell its own Hermit commit's selection owes; \
-a partial run headlines only when no complete run exists, the most complete first. Then the deepest Hermit \
-commit this checkout can place, then the latest emission.\n\n\
-| Producer | Run | Hermit commit | Headline | Parity |\n\
-| --- | --- | --- | --- | --- |\n",
-        );
-        for run in &summary.runs {
+    // Both lines, each its own paragraph, after every producer's headline
+    // section, and both even when the count is 0 (section 7 of the parity
+    // summary format, version 3).
+    let (dirty_line, unreported_line) = parity_tree_state_lines(summary);
+    out.push_str(&format!("\n{dirty_line}\n\n{unreported_line}\n"));
+    let others = summary
+        .runs
+        .iter()
+        .filter(|brief| !brief.headline)
+        .collect::<Vec<_>>();
+    if !others.is_empty() {
+        out.push_str(&format!(
+            "\n### {} other parity run(s) in the store\n\n\
+Only a run from a clean source tree can be its producer's headline: at least one of its rows says \
+`\"source_tree_dirty\": false`, and none says `true` or leaves the value out. A row refused for its own defect \
+does not count; one refused only because its run's rows name more than one Hermit commit does. Among those runs, \
+the headline is the run that reported every cell its own Hermit commit's selection owes; a partial run headlines \
+only when no complete run exists, the most complete first. Then the deepest Hermit commit this checkout can place, \
+then the latest emission.\n\n",
+            others.len()
+        ));
+        for brief in others {
+            let at = brief.hermit_sha.as_deref().map_or_else(
+                || "with no Hermit commit recorded".to_string(),
+                |sha| format!("at Hermit `{}`", &sha[..sha.len().min(12)]),
+            );
             out.push_str(&format!(
-                "| {} | `{}` | {} | {} | `{}` |\n",
-                run.producer,
-                run.run_id,
-                run.hermit_sha
-                    .as_deref()
-                    .map_or("unknown".to_string(), |sha| format!(
-                        "`{}`",
-                        &sha[..sha.len().min(12)]
-                    )),
-                if run.headline { "yes" } else { "no" },
-                run.line
+                "- {} run `{}` {at}{}: `{}`\n",
+                brief.producer,
+                brief.run_id,
+                parity_tree_state_mark(brief.source_tree_dirty),
+                brief.line
             ));
         }
     }
@@ -36743,7 +36967,7 @@ mod parity_summary_tests {
             matched_prefix: Some(5),
             ..base_record(&golden(1), KVM, ParityVerdict::Matched)
         };
-        let lines = [line(&row(half)), "{not json".to_string()];
+        let lines = [line(&row(half.clone())), "{not json".to_string()];
         let mut input = store(&lines);
         input.add_shard(
             "parity/hermit/fixture-host-b/2026-10.jsonl".into(),
@@ -36757,42 +36981,84 @@ mod parity_summary_tests {
             .map(ParityRefusal::located)
             .collect::<Vec<_>>();
         // In (shard, line) order, whatever order the reader produced them in.
-        assert_eq!(messages.len(), 3, "{messages:#?}");
         assert_eq!(
-            messages[0],
-            format!(
-                "{SHARD}:1: parity ledger row c-programs/golden-1@kvm (validate run {RUN}): \
-                 parity record c-programs/golden-1@kvm: a match must be full credit, got Some(0.5)"
-            )
-        );
-        assert!(
-            messages[1].starts_with(&format!("{SHARD}:2: not a parity-ledger/v1 row: ")),
-            "{}",
-            messages[1]
-        );
-        assert_eq!(
-            messages[2],
-            "parity/hermit/fixture-host-b/2026-10.jsonl:1: blank line in a parity shard"
+            messages,
+            [
+                format!(
+                    "{SHARD}:1: parity ledger row c-programs/golden-1@kvm (validate run {RUN}): \
+                     parity record c-programs/golden-1@kvm: a match must be full credit, got \
+                     Some(0.5)"
+                ),
+                format!(
+                    "{SHARD}:2: not a parity-ledger/v1 row: key must be a string at line 1 column \
+                     2"
+                ),
+                "parity/hermit/fixture-host-b/2026-10.jsonl:1: blank line in a parity shard"
+                    .to_string(),
+            ]
         );
         assert_eq!(summary.refused_rows, 2);
+        // A row the row check refuses has no source tree state to count.
+        assert_eq!(
+            (
+                summary.source_tree_dirty_rows,
+                summary.source_tree_unreported_rows
+            ),
+            (0, 0)
+        );
+        // The run's only row is refused, so none of its rows reports its
+        // source tree state: the run is `null` and cannot be a headline. It
+        // stays in `runs`, its refused cell counted as 0, not clamped to the
+        // half credit.
+        assert!(summary.producers.is_empty(), "{:#?}", summary.producers);
+        assert_eq!(
+            summary.runs,
+            [brief(
+                ParityProducer::Validate,
+                RUN,
+                None,
+                None,
+                None,
+                false,
+                REFUSED_ONE
+            )]
+        );
+        let rendered = render_parity_section(&summary);
+        assert_eq!(
+            span(&rendered, "\nNo clean headline for ", COUNT_LINES),
+            format!("\n{NO_CLEAN_VALIDATE}\n")
+        );
+        assert_eq!(
+            span(&rendered, "\n- validate run ", "\n### Refused parity rows"),
+            format!(
+                "\n- validate run `{RUN}` with no Hermit commit recorded (did not report its \
+                 source tree state): `{REFUSED_ONE}`\n"
+            )
+        );
+        assert!(!rendered.contains("\n### validate run "), "{rendered}");
+
+        // Beside a row that passes, the run is clean and headlines, and the
+        // refused cell still counts as 0 in it.
+        let summary = summarize_lines(&[
+            line(&row(half)),
+            "{not json".to_string(),
+            line(&row(matched(&golden(2), KVM, 40, false))),
+        ]);
+        assert_eq!(summary.refused_rows, 2);
         let run = only_run(&summary);
+        assert_eq!(run.source_tree_dirty, Some(false));
         let refused = cell(run, "c-programs/golden-1@kvm");
         assert_eq!((refused.verdict, refused.credit), ("refused", None));
         assert_eq!(
             (run.total.matched, run.total.measured, run.total.refused),
-            (0, 0, 1)
+            (1, 1, 1)
         );
-        // No row was admitted, so no row names the run's commit.
-        assert_eq!(run.hermit_sha, None);
-        assert_eq!(
-            run.committed_unknown.as_deref(),
-            Some("no admitted row names the run's Hermit commit")
-        );
+        assert_eq!(run.hermit_sha.as_deref(), Some(SHA));
         assert_eq!(
             run.line,
-            "parity: 0/1 matched; committed selection unknown; mean n/a over 0 measured; \
-             floor 0.000 over 1 of 1 selected (counted as 0: 1 refused; excluded: 0 no golden; \
-             0 not compared)"
+            "parity: 1/2 matched; committed selection unknown; mean 1.000 over 1 measured; \
+             floor 0.500 over 2 of 2 selected (counted as 0: 1 refused; excluded: 0 no golden; \
+             0 not compared) [inputs not equalized]"
         );
     }
 
@@ -36934,7 +37200,8 @@ mod parity_summary_tests {
             "| `c-programs/golden-2@liteinst` | candidate-missing[no-result-row] | — |",
             "| `c-programs/golden-1@dbt` | inputs-not-equalized | — | dbt runs a rewritten program |\n",
             "### pressure-test run `pressure-run` at `0123456789ab`",
-            "| validate | `validate-older-run` | `0123456789ab` | no | `parity: 1/1 matched;",
+            "\n### 1 other parity run(s) in the store\n\n",
+            "\n- validate run `validate-older-run` at Hermit `0123456789ab`: `parity: 1/1 matched;",
             "1 duplicate row(s) reported a cell its run had already reported",
         ] {
             assert_contains(&rendered, expected);
@@ -36947,7 +37214,7 @@ mod parity_summary_tests {
         let encoded =
             String::from_utf8(encoded_parity_summary(&summary).unwrap().unwrap()).unwrap();
         let value: JsonValue = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v1");
+        assert_eq!(value["schema"], "parity-summary/v2");
         assert_eq!(
             value["producers"][0]["total"]["floor_credit"]
                 .as_f64()
@@ -37405,7 +37672,7 @@ mod parity_summary_tests {
             assert_contains(
                 &rendered,
                 &format!(
-                    "| validate | `{run_id}` | `{}` | no | `{partial_line}` |\n",
+                    "\n- validate run `{run_id}` at Hermit `{}`: `{partial_line}`\n",
                     &sha[..12]
                 ),
             );
@@ -37969,6 +38236,15 @@ mod parity_summary_tests {
         });
         assert_eq!((summary.refused_rows, summary.duplicate_rows), (0, 0));
         let run = only_run(&summary);
+        // Every row of the run reports a clean source tree.
+        assert_eq!(
+            (
+                summary.source_tree_dirty_rows,
+                summary.source_tree_unreported_rows
+            ),
+            (0, 0)
+        );
+        assert_eq!(run.source_tree_dirty, Some(false));
         assert_eq!(
             run.run_id,
             "validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da"
@@ -38186,5 +38462,1109 @@ mod parity_summary_tests {
         assert_eq!(fs::read(&scorecard).unwrap(), bare.scorecard);
         assert_eq!(fs::read(&cells_json).unwrap(), bare.cells);
         assert_eq!(fs::read(&parity).unwrap(), bytes);
+    }
+
+    const OTHER_SHA: &str = "6be37a833df89f7836c2aa5dbe47a95569aada62";
+    /// The line of a run of one equalized match, its selection unknown.
+    const ONE_MATCH: &str = "parity: 1/1 matched; committed selection unknown; mean 1.000 over 1 \
+                             measured; floor 1.000 over 1 of 1 selected (excluded: 0 no golden; 0 \
+                             not compared)";
+    /// The line of a run whose one row was refused.
+    const REFUSED_ONE: &str = "parity: 0/1 matched; committed selection unknown; mean n/a over 0 \
+                               measured; floor 0.000 over 1 of 1 selected (counted as 0: 1 \
+                               refused; excluded: 0 no golden; 0 not compared)";
+    /// The paragraph under the title of the other runs.
+    const OTHER_RUNS_TEXT: &str = "Only a run from a clean source tree can be its producer's \
+        headline: at least one of its rows says `\"source_tree_dirty\": false`, and none says \
+        `true` or leaves the value out. A row refused for its own defect does not count; one \
+        refused only because its run's rows name more than one Hermit commit does. Among those \
+        runs, the headline is the run that reported every cell its own Hermit commit's selection \
+        owes; a partial run headlines only when no complete run exists, the most complete first. \
+        Then the deepest Hermit commit this checkout can place, then the latest emission.";
+    /// Where the two lines that count the rows outside the clean headline
+    /// begin.
+    const COUNT_LINES: &str = "\nOutside the clean headline: ";
+    const LEGACY_HEADING: &str = "\n### legacy-rerun history\n";
+    const NO_CLEAN_VALIDATE: &str = "No clean headline for validate: every validate run in the \
+                                     store is from a dirty source tree or did not report its \
+                                     source tree state.";
+    const NO_CLEAN_PRESSURE: &str = "No clean headline for pressure-test: every pressure-test run \
+                                     in the store is from a dirty source tree or did not report \
+                                     its source tree state.";
+
+    /// `row` from a dirty source tree.
+    fn dirty(mut row: ParityLedgerRow) -> ParityLedgerRow {
+        row.source_tree_dirty = true;
+        row
+    }
+
+    /// The line of `row`, a row from a clean source tree, with its
+    /// `"source_tree_dirty":false,` member replaced by `member`.
+    fn with_tree_member(row: &ParityLedgerRow, member: &str) -> String {
+        assert!(!row.source_tree_dirty);
+        let text = line(row);
+        let clean = "\"source_tree_dirty\":false,";
+        assert_eq!(text.matches(clean).count(), 1, "{text}");
+        text.replacen(clean, member, 1)
+    }
+
+    /// The line of `row` without its `source_tree_dirty` key: a row that did
+    /// not report its source tree state.
+    fn unreported(row: &ParityLedgerRow) -> String {
+        with_tree_member(row, "")
+    }
+
+    /// The summary of `lines`, verbatim, in one shard, with no commit's parity
+    /// selection readable.
+    fn summarize_lines(lines: &[String]) -> ParitySummary {
+        summarize_parity(&store(lines), &no_cells(), &|_| None, &|_| Ok(None))
+    }
+
+    /// The brief of a run whose commit this checkout cannot place.
+    fn brief(
+        producer: ParityProducer,
+        run_id: &str,
+        hermit_sha: Option<&str>,
+        emitted_at: Option<&str>,
+        source_tree_dirty: Option<bool>,
+        headline: bool,
+        line: &str,
+    ) -> ParityRunBrief {
+        ParityRunBrief {
+            producer,
+            run_id: run_id.into(),
+            hermit_sha: hermit_sha.map(str::to_string),
+            depth: None,
+            emitted_at: emitted_at.map(str::to_string),
+            source_tree_dirty,
+            headline,
+            line: line.into(),
+        }
+    }
+
+    /// The keys pretty-printed JSON `text` prints at `indent` spaces, in
+    /// order.
+    fn printed_keys(text: &str, indent: usize) -> Vec<&str> {
+        let margin = " ".repeat(indent);
+        text.lines()
+            .filter_map(|printed| printed.strip_prefix(margin.as_str())?.strip_prefix('"'))
+            .map(|rest| rest.split_once("\": ").map_or(rest, |(key, _)| key))
+            .collect()
+    }
+
+    /// `text` from its first `from` up to the first `to` after it.
+    fn span<'a>(text: &'a str, from: &str, to: &str) -> &'a str {
+        let start = text
+            .find(from)
+            .unwrap_or_else(|| panic!("no {from:?} in:\n{text}"));
+        let after = start + from.len();
+        let end = text[after..]
+            .find(to)
+            .unwrap_or_else(|| panic!("no {to:?} after {from:?} in:\n{text}"));
+        &text[start..after + end]
+    }
+
+    /// The byte just past the first `token` of the one-line `text`: the column
+    /// serde_json names for an error found at the end of `token`.
+    fn end_of(text: &str, token: &str) -> usize {
+        text.find(token)
+            .unwrap_or_else(|| panic!("no {token:?} in {text}"))
+            + token.len()
+    }
+
+    /// The row pressure-test run `run_id` publishes for `record`.
+    fn pressure(mut record: ParityRecord, run_id: &str, emitted_at: &str) -> ParityLedgerRow {
+        record.run_id = run_id.into();
+        let (test, backend) = (record.test_id.clone(), record.backend);
+        let verdict = LedgerVerdict::from(record.verdict);
+        let reason = record.reason.clone();
+        envelope(
+            ParityProducer::PressureTest,
+            run_id,
+            emitted_at,
+            &test,
+            backend,
+            verdict,
+            reason.as_deref(),
+            origin(LedgerPostPassState::Complete, "post-pass"),
+            Some(record),
+        )
+    }
+
+    /// Section 7 of the parity summary format, version 3, gives the key order
+    /// of the summary, of a run in `producers` and of a brief in `runs`.
+    #[test]
+    fn the_summary_run_and_brief_keys_are_in_the_formats_order() {
+        const SUMMARY_KEYS: [&str; 14] = [
+            "schema",
+            "generated_from",
+            "store_present",
+            "rows_read",
+            "producers",
+            "runs",
+            "refused_rows",
+            "duplicate_rows",
+            "source_tree_dirty_rows",
+            "source_tree_unreported_rows",
+            "refusals",
+            "legacy_rerun",
+            "legacy_dropped",
+            "legacy_dropped_cells",
+        ];
+        const RUN_KEYS: [&str; 14] = [
+            "producer",
+            "run_id",
+            "hermit_sha",
+            "conflicting_hermit_shas",
+            "depth",
+            "emitted_at",
+            "source_tree_dirty",
+            "line",
+            "committed_unknown",
+            "committed_cells_without_row",
+            "cells_outside_committed",
+            "per_backend",
+            "total",
+            "cells",
+        ];
+        const BRIEF_KEYS: [&str; 8] = [
+            "producer",
+            "run_id",
+            "hermit_sha",
+            "depth",
+            "emitted_at",
+            "source_tree_dirty",
+            "headline",
+            "line",
+        ];
+        let clean = row(matched(&golden(1), KVM, 40, true));
+        let bytes = parity_summary_bytes(&summarize_lines(&[line(&clean)])).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(printed_keys(text, 2), SUMMARY_KEYS);
+        assert_eq!(
+            printed_keys(span(text, "\n  \"producers\": [\n", "\n  \"runs\": [\n"), 6),
+            RUN_KEYS
+        );
+        assert_eq!(
+            printed_keys(span(text, "\n  \"runs\": [\n", "\n  \"refused_rows\": "), 6),
+            BRIEF_KEYS
+        );
+        let value: JsonValue = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema"], "parity-summary/v2");
+        assert_eq!(value["producers"][0]["source_tree_dirty"], false);
+        assert_eq!(value["runs"][0]["source_tree_dirty"], false);
+        assert_eq!(value["runs"][0]["headline"], true);
+        assert_eq!(value["source_tree_dirty_rows"], 0);
+        assert_eq!(value["source_tree_unreported_rows"], 0);
+        // A run that did not report its state has no headline, so
+        // `producers` is empty, and its brief says `null`.
+        let bytes = parity_summary_bytes(&summarize_lines(&[unreported(&clean)])).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(printed_keys(text, 2), SUMMARY_KEYS);
+        assert_eq!(
+            span(text, "\n  \"producers\": ", "\n  \"runs\": "),
+            "\n  \"producers\": [],"
+        );
+        assert_eq!(
+            printed_keys(span(text, "\n  \"runs\": [\n", "\n  \"refused_rows\": "), 6),
+            BRIEF_KEYS
+        );
+        let value: JsonValue = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["runs"][0]["source_tree_dirty"], JsonValue::Null);
+        assert_eq!(value["runs"][0]["headline"], false);
+        assert_eq!(value["source_tree_dirty_rows"], 0);
+        assert_eq!(value["source_tree_unreported_rows"], 1);
+    }
+
+    /// A row with `false` is clean, with `true` dirty, and without the key,
+    /// when it passes the row check once `false` is added, not reported; a
+    /// null or other non-boolean value, a line that is not an object, and a
+    /// missing key beside another defect are refused with the message the
+    /// row check gives the line as written.
+    #[test]
+    fn a_rows_source_tree_state_is_clean_dirty_not_reported_or_refused() {
+        let clean = row(matched(&golden(1), KVM, 40, true));
+        let clean_line = line(&clean);
+        let bare = unreported(&clean);
+        let not_a_row = |error: String| format!("not a parity-ledger/v1 row: {error}");
+        // The row check itself refuses a missing key, as serde reads it.
+        assert_eq!(
+            parity_row_check(&bare).unwrap_err(),
+            not_a_row(format!(
+                "missing field `source_tree_dirty` at line 1 column {}",
+                bare.len()
+            ))
+        );
+        for (text, tree, state, tree_counts) in [
+            (
+                clean_line.clone(),
+                ParityRowTree::Clean,
+                Some(false),
+                (0, 0),
+            ),
+            (
+                line(&dirty(clean.clone())),
+                ParityRowTree::Dirty,
+                Some(true),
+                (1, 0),
+            ),
+            (bare.clone(), ParityRowTree::Unreported, None, (0, 1)),
+        ] {
+            let (checked, _, class) = classify_parity_row(&text).unwrap();
+            assert_eq!(class, tree, "{text}");
+            // A row that did not report its state holds the added `false`.
+            assert_eq!(checked.source_tree_dirty, tree == ParityRowTree::Dirty);
+            let summary = summarize_lines(&[text.clone()]);
+            assert_eq!((summary.rows_read, summary.refused_rows), (1, 0));
+            assert_eq!(
+                (
+                    summary.source_tree_dirty_rows,
+                    summary.source_tree_unreported_rows
+                ),
+                tree_counts
+            );
+            assert_eq!(
+                summary.runs,
+                [brief(
+                    ParityProducer::Validate,
+                    RUN,
+                    Some(SHA),
+                    Some("2026-09-29T04:10:00Z"),
+                    state,
+                    state == Some(false),
+                    ONE_MATCH
+                )]
+            );
+            assert_eq!(summary.producers.len(), usize::from(state == Some(false)));
+        }
+        // The key is written in as the first member, and only when it is
+        // missing.
+        assert_eq!(
+            with_source_tree_state_added(&bare),
+            Some(format!("{{\"source_tree_dirty\":false,{}", &bare[1..]))
+        );
+        assert_eq!(
+            with_source_tree_state_added("{}"),
+            Some("{\"source_tree_dirty\":false}".to_string())
+        );
+        assert_eq!(with_source_tree_state_added(&clean_line), None);
+
+        // The line with the key written in front, as an independent check of
+        // the columns it moves 26 bytes on.
+        let added = |text: &str| format!("{{\"source_tree_dirty\":false,{}", &text[1..]);
+        let null = with_tree_member(&clean, "\"source_tree_dirty\":null,");
+        let string = with_tree_member(&clean, "\"source_tree_dirty\":\"false\",");
+        let zero = with_tree_member(&clean, "\"source_tree_dirty\":0,");
+        let extra = format!("{},\"extra\":1}}", &bare[..bare.len() - 1]);
+        let doubled = bare.replacen(
+            "\"team\":\"hermit\",",
+            "\"team\":\"hermit\",\"team\":\"hermit\",",
+            1,
+        );
+        let upper = bare.replacen(
+            &format!("\"hermit_sha\":\"{SHA}\""),
+            &format!("\"hermit_sha\":\"{}\"", SHA.to_uppercase()),
+            1,
+        );
+        for changed in [&extra, &doubled, &upper] {
+            assert_ne!(changed, &bare);
+        }
+        let fields = "`schema`, `event_type`, `event_id`, `team`, `host`, `emitted_at`, \
+                      `producer`, `run_id`, `hermit_sha`, `source_tree_dirty`, `cell`, \
+                      `test_id`, `backend`, `verdict`, `unavailable_class`, `operand`, `reason`, \
+                      `source`, `record`";
+        let unknown = |text: &str| {
+            not_a_row(format!(
+                "unknown field `extra`, expected one of {fields} at line 1 column {}",
+                end_of(text, "\"extra\"")
+            ))
+        };
+        let duplicate = |text: &str| {
+            not_a_row(format!(
+                "duplicate field `team` at line 1 column {}",
+                text.rfind("\"team\"").unwrap() + "\"team\"".len()
+            ))
+        };
+        // (line, the row check's message for it as written, its message once
+        // the key is added, whether its run and cell can still be read)
+        let cases = [
+            (
+                null.clone(),
+                not_a_row(format!(
+                    "invalid type: null, expected a boolean at line 1 column {}",
+                    end_of(&null, "\"source_tree_dirty\":null")
+                )),
+                None,
+                true,
+            ),
+            (
+                string.clone(),
+                not_a_row(format!(
+                    "invalid type: string \"false\", expected a boolean at line 1 column {}",
+                    end_of(&string, "\"source_tree_dirty\":\"false\"")
+                )),
+                None,
+                true,
+            ),
+            (
+                zero.clone(),
+                not_a_row(format!(
+                    "invalid type: integer `0`, expected a boolean at line 1 column {}",
+                    end_of(&zero, "\"source_tree_dirty\":0")
+                )),
+                None,
+                true,
+            ),
+            (
+                "42".to_string(),
+                not_a_row(
+                    "invalid type: integer `42`, expected struct ParityLedgerRow at line 1 \
+                     column 2"
+                        .to_string(),
+                ),
+                None,
+                false,
+            ),
+            (
+                "[1]".to_string(),
+                not_a_row("invalid type: integer `1`, expected a string at line 1 column 2".into()),
+                None,
+                false,
+            ),
+            // A missing key beside another defect.
+            (
+                extra.clone(),
+                unknown(&extra),
+                Some(unknown(&added(&extra))),
+                true,
+            ),
+            (
+                doubled.clone(),
+                duplicate(&doubled),
+                Some(duplicate(&added(&doubled))),
+                true,
+            ),
+            (
+                upper.clone(),
+                not_a_row(format!(
+                    "missing field `source_tree_dirty` at line 1 column {}",
+                    upper.len()
+                )),
+                Some(format!(
+                    "parity ledger row c-programs/golden-1@kvm (validate run {RUN}): hermit_sha \
+                     must be 40 lowercase hex digits, got \"{}\"",
+                    SHA.to_uppercase()
+                )),
+                true,
+            ),
+        ];
+        for (text, written, once_added, attributed) in cases {
+            assert_eq!(parity_row_check(&text).unwrap_err(), written);
+            assert_eq!(classify_parity_row(&text).unwrap_err(), written);
+            assert_eq!(
+                with_source_tree_state_added(&text)
+                    .map(|added| parity_row_check(&added).unwrap_err()),
+                once_added,
+                "{text}"
+            );
+            let summary = summarize_lines(&[text.clone()]);
+            assert_eq!(
+                (
+                    summary.rows_read,
+                    summary.refused_rows,
+                    summary.source_tree_dirty_rows,
+                    summary.source_tree_unreported_rows
+                ),
+                (1, 1, 0, 0),
+                "{text}"
+            );
+            assert_eq!(
+                summary.refusals,
+                [ParityRefusal {
+                    path: SHARD.into(),
+                    line: Some(1),
+                    message: written.clone(),
+                }]
+            );
+            assert!(summary.producers.is_empty(), "{text}");
+            let runs = if attributed {
+                vec![brief(
+                    ParityProducer::Validate,
+                    RUN,
+                    None,
+                    None,
+                    None,
+                    false,
+                    REFUSED_ONE,
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(summary.runs, runs, "{text}");
+        }
+    }
+
+    /// Both counts take every line that passes the row check: a duplicate,
+    /// and a row refused only because its run's rows name two commits.
+    #[test]
+    fn the_tree_counts_include_duplicates_and_rows_a_conflicting_commit_refuses() {
+        let first = row(matched(&golden(1), KVM, 40, true));
+        let second = row(matched(&golden(2), KVM, 40, true));
+        let null_row = with_tree_member(
+            &rerun(
+                second.clone(),
+                "validate-clean",
+                SHA,
+                "2026-09-29T03:00:00Z",
+            ),
+            "\"source_tree_dirty\":null,",
+        );
+        let lines = [
+            // The golden run: a dirty row, the same cell again from another
+            // node, and a row that did not report its state.
+            line(&dirty(first.clone())),
+            line(&from_node(
+                dirty(first.clone()),
+                "manifest_c_programs_on_host",
+            )),
+            unreported(&second),
+            // A run whose rows name two Hermit commits: both are refused, and
+            // both are counted.
+            line(&dirty(rerun(
+                first.clone(),
+                "validate-conflict",
+                SHA,
+                "2026-09-29T04:20:00Z",
+            ))),
+            unreported(&rerun(
+                second,
+                "validate-conflict",
+                OTHER_SHA,
+                "2026-09-29T04:20:00Z",
+            )),
+            // A clean run beside a null row, which the row check refuses and
+            // neither count takes.
+            line(&rerun(first, "validate-clean", SHA, "2026-09-29T03:00:00Z")),
+            null_row.clone(),
+        ];
+        let summary = summarize_lines(&lines);
+        assert_eq!(
+            (
+                summary.rows_read,
+                summary.refused_rows,
+                summary.duplicate_rows,
+                summary.source_tree_dirty_rows,
+                summary.source_tree_unreported_rows
+            ),
+            (7, 3, 1, 3, 2)
+        );
+        let conflict = |name: &str| {
+            format!(
+                "parity ledger row {name} (validate run validate-conflict): the run's rows name 2 \
+                 Hermit commits ({SHA}, {OTHER_SHA}), so none of its rows is admitted"
+            )
+        };
+        let refusal = |at: usize, message: String| ParityRefusal {
+            path: SHARD.into(),
+            line: Some(at),
+            message,
+        };
+        assert_eq!(
+            summary.refusals,
+            [
+                refusal(4, conflict("c-programs/golden-1@kvm")),
+                refusal(5, conflict("c-programs/golden-2@kvm")),
+                refusal(
+                    7,
+                    format!(
+                        "not a parity-ledger/v1 row: invalid type: null, expected a boolean at \
+                         line 1 column {}",
+                        end_of(&null_row, "\"source_tree_dirty\":null")
+                    )
+                ),
+            ]
+        );
+        let one_of_two = "parity: 1/2 matched; committed selection unknown; mean 1.000 over 1 \
+                          measured; floor 0.500 over 2 of 2 selected (counted as 0: 1 refused; \
+                          excluded: 0 no golden; 0 not compared)";
+        let two_refused = "parity: 0/2 matched; committed selection unknown; mean n/a over 0 \
+                           measured; floor 0.000 over 2 of 2 selected (counted as 0: 2 refused; \
+                           excluded: 0 no golden; 0 not compared)";
+        let two_matched = "parity: 2/2 matched; committed selection unknown; mean 1.000 over 2 \
+                           measured; floor 1.000 over 2 of 2 selected (excluded: 0 no golden; 0 \
+                           not compared)";
+        assert_eq!(
+            summary.runs,
+            [
+                brief(
+                    ParityProducer::Validate,
+                    "validate-clean",
+                    Some(SHA),
+                    Some("2026-09-29T03:00:00Z"),
+                    Some(false),
+                    true,
+                    one_of_two
+                ),
+                brief(
+                    ParityProducer::Validate,
+                    "validate-conflict",
+                    None,
+                    None,
+                    Some(true),
+                    false,
+                    two_refused
+                ),
+                brief(
+                    ParityProducer::Validate,
+                    RUN,
+                    Some(SHA),
+                    Some("2026-09-29T04:10:00Z"),
+                    Some(true),
+                    false,
+                    two_matched
+                ),
+            ]
+        );
+        let rendered = render_parity_section(&summary);
+        assert_eq!(
+            span(&rendered, COUNT_LINES, "\n1 duplicate row(s) reported"),
+            format!(
+                "\nOutside the clean headline: 3 parity rows from a dirty source tree.\n\
+                 \nOutside the clean headline: 2 parity rows that did not report their source \
+                 tree state.\n\
+                 \n### 2 other parity run(s) in the store\n\
+                 \n{OTHER_RUNS_TEXT}\n\
+                 \n- validate run `validate-conflict` with no Hermit commit recorded (from a \
+                 dirty source tree): `{two_refused}`\n\
+                 - validate run `{RUN}` at Hermit `0123456789ab` (from a dirty source tree): \
+                 `{two_matched}`\n"
+            )
+        );
+        assert_eq!(rendered.matches("Outside the clean headline: ").count(), 2);
+    }
+
+    /// A run is dirty if any of its rows that pass the row check is dirty;
+    /// otherwise not reported if any of them is not reported, or none of its
+    /// rows passes; otherwise clean. Only a clean run can be a headline.
+    #[test]
+    fn a_runs_tree_state_is_dirty_then_not_reported_then_clean() {
+        let table: [(Vec<ParityRowTree>, Option<bool>); 9] = [
+            (vec![], None),
+            (vec![ParityRowTree::Clean], Some(false)),
+            (
+                vec![ParityRowTree::Clean, ParityRowTree::Clean],
+                Some(false),
+            ),
+            (vec![ParityRowTree::Dirty], Some(true)),
+            (vec![ParityRowTree::Unreported], None),
+            (vec![ParityRowTree::Clean, ParityRowTree::Unreported], None),
+            (vec![ParityRowTree::Clean, ParityRowTree::Dirty], Some(true)),
+            (
+                vec![ParityRowTree::Unreported, ParityRowTree::Dirty],
+                Some(true),
+            ),
+            (
+                vec![
+                    ParityRowTree::Dirty,
+                    ParityRowTree::Unreported,
+                    ParityRowTree::Clean,
+                ],
+                Some(true),
+            ),
+        ];
+        for (trees, state) in table {
+            assert_eq!(parity_run_tree_state(&trees), state, "{trees:?}");
+        }
+        let record = |n: usize| row(matched(&golden(n), KVM, 40, true));
+        let clean = |n: usize| line(&record(n));
+        let dirty_row = |n: usize| line(&dirty(record(n)));
+        let not_reported = |n: usize| unreported(&record(n));
+        let null_row = |n: usize| with_tree_member(&record(n), "\"source_tree_dirty\":null,");
+        for (lines, state) in [
+            ([clean(1), clean(2)], Some(false)),
+            ([clean(1), dirty_row(2)], Some(true)),
+            ([not_reported(1), dirty_row(2)], Some(true)),
+            ([clean(1), not_reported(2)], None),
+            // A row the row check refuses does not change the state...
+            ([clean(1), null_row(2)], Some(false)),
+            ([dirty_row(1), null_row(2)], Some(true)),
+            ([not_reported(1), null_row(2)], None),
+            // ...and a run with no row that passes did not report it.
+            ([null_row(1), null_row(2)], None),
+        ] {
+            let summary = summarize_lines(&lines);
+            let states = summary
+                .runs
+                .iter()
+                .map(|brief| (brief.source_tree_dirty, brief.headline))
+                .collect::<Vec<_>>();
+            assert_eq!(states, [(state, state == Some(false))], "{lines:?}");
+            let headlines = summary
+                .producers
+                .iter()
+                .map(|run| run.source_tree_dirty)
+                .collect::<Vec<_>>();
+            let expected: &[Option<bool>] = if state == Some(false) {
+                &[Some(false)]
+            } else {
+                &[]
+            };
+            assert_eq!(headlines, expected, "{lines:?}");
+        }
+    }
+
+    /// Section 7's worked example: run-a, clean, emitted at 10:00, and run-b,
+    /// dirty, emitted at 11:00, 192 rows each. run-a is the headline although
+    /// run-b is later.
+    #[test]
+    fn only_a_clean_run_headlines_the_worked_example() {
+        let mut lines = Vec::new();
+        for (run_id, sha, emitted_at, from_dirty_tree) in [
+            ("run-a", SHA, "2026-10-01T10:00:00Z", false),
+            ("run-b", OTHER_SHA, "2026-10-01T11:00:00Z", true),
+        ] {
+            for n in 1..=192 {
+                let mut parity_row = rerun(
+                    row(matched(&golden(n), KVM, 40, true)),
+                    run_id,
+                    sha,
+                    emitted_at,
+                );
+                parity_row.source_tree_dirty = from_dirty_tree;
+                lines.push(line(&parity_row));
+            }
+        }
+        let summary = summarize_lines(&lines);
+        assert_eq!((summary.rows_read, summary.refused_rows), (384, 0));
+        assert_eq!(
+            (
+                summary.source_tree_dirty_rows,
+                summary.source_tree_unreported_rows
+            ),
+            (192, 0)
+        );
+        let all = "parity: 192/192 matched; committed selection unknown; mean 1.000 over 192 \
+                   measured; floor 1.000 over 192 of 192 selected (excluded: 0 no golden; 0 not \
+                   compared)";
+        assert_eq!(
+            summary.runs,
+            [
+                brief(
+                    ParityProducer::Validate,
+                    "run-a",
+                    Some(SHA),
+                    Some("2026-10-01T10:00:00Z"),
+                    Some(false),
+                    true,
+                    all
+                ),
+                brief(
+                    ParityProducer::Validate,
+                    "run-b",
+                    Some(OTHER_SHA),
+                    Some("2026-10-01T11:00:00Z"),
+                    Some(true),
+                    false,
+                    all
+                ),
+            ]
+        );
+        assert_eq!(only_run(&summary).run_id, "run-a");
+        let rendered = render_parity_section(&summary);
+        assert_eq!(
+            span(&rendered, "\n### validate run ", "| Candidate backend"),
+            format!("\n### validate run `run-a` at `0123456789ab`\n\n`{all}`\n\n")
+        );
+        assert_eq!(rendered.matches("\n### validate run ").count(), 1);
+        assert_eq!(
+            span(&rendered, COUNT_LINES, LEGACY_HEADING),
+            format!(
+                "\nOutside the clean headline: 192 parity rows from a dirty source tree.\n\
+                 \nOutside the clean headline: 0 parity rows that did not report their source \
+                 tree state.\n\
+                 \n### 1 other parity run(s) in the store\n\
+                 \n{OTHER_RUNS_TEXT}\n\
+                 \n- validate run `run-b` at Hermit `6be37a833df8` (from a dirty source tree): \
+                 `{all}`\n"
+            )
+        );
+    }
+
+    /// Without the source tree rule the latest run would be the headline;
+    /// with it, a later dirty run and a later run that did not report its
+    /// state are both passed over.
+    #[test]
+    fn a_headline_skips_a_later_dirty_run_and_a_later_not_reported_run() {
+        let at = |run_id: &str, emitted_at: &str| {
+            rerun(
+                row(matched(&golden(1), KVM, 40, true)),
+                run_id,
+                SHA,
+                emitted_at,
+            )
+        };
+        let earlier = at(RUN, "2026-09-29T04:10:00Z");
+        let later_dirty = at("validate-later-dirty", "2026-09-29T05:00:00Z");
+        let later_unreported = at("validate-later-unreported", "2026-09-29T06:00:00Z");
+        let all_clean =
+            summarize_lines(&[line(&earlier), line(&later_dirty), line(&later_unreported)]);
+        assert_eq!(
+            all_clean
+                .runs
+                .iter()
+                .map(|brief| brief.headline)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        let summary = summarize_lines(&[
+            line(&earlier),
+            line(&dirty(later_dirty)),
+            unreported(&later_unreported),
+        ]);
+        assert_eq!(
+            summary.runs,
+            [
+                brief(
+                    ParityProducer::Validate,
+                    RUN,
+                    Some(SHA),
+                    Some("2026-09-29T04:10:00Z"),
+                    Some(false),
+                    true,
+                    ONE_MATCH
+                ),
+                brief(
+                    ParityProducer::Validate,
+                    "validate-later-dirty",
+                    Some(SHA),
+                    Some("2026-09-29T05:00:00Z"),
+                    Some(true),
+                    false,
+                    ONE_MATCH
+                ),
+                brief(
+                    ParityProducer::Validate,
+                    "validate-later-unreported",
+                    Some(SHA),
+                    Some("2026-09-29T06:00:00Z"),
+                    None,
+                    false,
+                    ONE_MATCH
+                ),
+            ]
+        );
+        assert_eq!(only_run(&summary).run_id, RUN);
+        let rendered = render_parity_section(&summary);
+        assert_eq!(
+            span(&rendered, "\n### validate run ", "| Candidate backend"),
+            format!("\n### validate run `{RUN}` at `0123456789ab`\n\n`{ONE_MATCH}`\n\n")
+        );
+        assert_eq!(
+            span(&rendered, COUNT_LINES, LEGACY_HEADING),
+            format!(
+                "\nOutside the clean headline: 1 parity row from a dirty source tree.\n\
+                 \nOutside the clean headline: 1 parity row that did not report its source tree \
+                 state.\n\
+                 \n### 2 other parity run(s) in the store\n\
+                 \n{OTHER_RUNS_TEXT}\n\
+                 \n- validate run `validate-later-dirty` at Hermit `0123456789ab` (from a dirty \
+                 source tree): `{ONE_MATCH}`\n\
+                 - validate run `validate-later-unreported` at Hermit `0123456789ab` (did not \
+                 report its source tree state): `{ONE_MATCH}`\n"
+            )
+        );
+    }
+
+    /// A producer whose every run is dirty or did not report its state gets
+    /// no `producers` entry and says so in place of its headline section.
+    #[test]
+    fn a_producer_with_no_clean_run_has_no_headline_and_says_so() {
+        let validate = row(matched(&golden(1), KVM, 40, true));
+        let later = rerun(
+            validate.clone(),
+            "validate-unreported",
+            SHA,
+            "2026-09-29T05:00:00Z",
+        );
+        let pressure_run = pressure(
+            matched(&golden(1), KVM, 40, true),
+            "pressure-run",
+            "2026-09-29T05:30:00Z",
+        );
+        // validate: a dirty run and a run that did not report its state;
+        // pressure-test: a clean run, its headline.
+        let summary = summarize_lines(&[
+            line(&dirty(validate.clone())),
+            unreported(&later),
+            line(&pressure_run),
+        ]);
+        let producers = summary
+            .producers
+            .iter()
+            .map(|run| (run.producer, run.run_id.as_str(), run.source_tree_dirty))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            producers,
+            [(ParityProducer::PressureTest, "pressure-run", Some(false))]
+        );
+        assert_eq!(
+            summary.runs,
+            [
+                brief(
+                    ParityProducer::Validate,
+                    RUN,
+                    Some(SHA),
+                    Some("2026-09-29T04:10:00Z"),
+                    Some(true),
+                    false,
+                    ONE_MATCH
+                ),
+                brief(
+                    ParityProducer::Validate,
+                    "validate-unreported",
+                    Some(SHA),
+                    Some("2026-09-29T05:00:00Z"),
+                    None,
+                    false,
+                    ONE_MATCH
+                ),
+                brief(
+                    ParityProducer::PressureTest,
+                    "pressure-run",
+                    Some(SHA),
+                    Some("2026-09-29T05:30:00Z"),
+                    Some(false),
+                    true,
+                    ONE_MATCH
+                ),
+            ]
+        );
+        let rendered = render_parity_section(&summary);
+        assert_eq!(
+            span(&rendered, "\nNo clean headline for ", "| Candidate backend"),
+            format!(
+                "\n{NO_CLEAN_VALIDATE}\n\
+                 \n### pressure-test run `pressure-run` at `0123456789ab`\n\
+                 \n`{ONE_MATCH}`\n\n"
+            )
+        );
+        assert_eq!(
+            span(&rendered, COUNT_LINES, LEGACY_HEADING),
+            format!(
+                "\nOutside the clean headline: 1 parity row from a dirty source tree.\n\
+                 \nOutside the clean headline: 1 parity row that did not report its source tree \
+                 state.\n\
+                 \n### 2 other parity run(s) in the store\n\
+                 \n{OTHER_RUNS_TEXT}\n\
+                 \n- validate run `{RUN}` at Hermit `0123456789ab` (from a dirty source tree): \
+                 `{ONE_MATCH}`\n\
+                 - validate run `validate-unreported` at Hermit `0123456789ab` (did not report \
+                 its source tree state): `{ONE_MATCH}`\n"
+            )
+        );
+        // Neither producer has a clean run, so neither has a headline,
+        // although the store holds admissible rows.
+        let summary = summarize_lines(&[line(&dirty(validate)), unreported(&pressure_run)]);
+        assert!(summary.producers.is_empty(), "{:#?}", summary.producers);
+        assert_eq!(
+            summary.runs,
+            [
+                brief(
+                    ParityProducer::Validate,
+                    RUN,
+                    Some(SHA),
+                    Some("2026-09-29T04:10:00Z"),
+                    Some(true),
+                    false,
+                    ONE_MATCH
+                ),
+                brief(
+                    ParityProducer::PressureTest,
+                    "pressure-run",
+                    Some(SHA),
+                    Some("2026-09-29T05:30:00Z"),
+                    None,
+                    false,
+                    ONE_MATCH
+                ),
+            ]
+        );
+        let rendered = render_parity_section(&summary);
+        assert_eq!(
+            span(&rendered, "\nNo clean headline for ", COUNT_LINES),
+            format!("\n{NO_CLEAN_VALIDATE}\n\n{NO_CLEAN_PRESSURE}\n")
+        );
+        for absent in [
+            "holds no admissible parity row",
+            "\n### validate run ",
+            "\n### pressure-test run ",
+        ] {
+            assert!(!rendered.contains(absent), "{absent:?} in:\n{rendered}");
+        }
+    }
+
+    /// The texts of section 7, byte for byte, with the one-row forms.
+    #[test]
+    fn the_tree_state_texts_are_exact_for_zero_one_and_many() {
+        assert_eq!(
+            [0, 1, 2, 192, 1000].map(parity_rows_text),
+            [
+                "0 parity rows",
+                "1 parity row",
+                "2 parity rows",
+                "192 parity rows",
+                "1000 parity rows"
+            ]
+        );
+        let mut summary = parity_summary_without_store(&no_cells());
+        for (dirty_rows, unreported_rows, dirty_line, unreported_line) in [
+            (
+                0,
+                0,
+                "Outside the clean headline: 0 parity rows from a dirty source tree.",
+                "Outside the clean headline: 0 parity rows that did not report their source \
+                 tree state.",
+            ),
+            (
+                1,
+                1,
+                "Outside the clean headline: 1 parity row from a dirty source tree.",
+                "Outside the clean headline: 1 parity row that did not report its source tree \
+                 state.",
+            ),
+            (
+                192,
+                3,
+                "Outside the clean headline: 192 parity rows from a dirty source tree.",
+                "Outside the clean headline: 3 parity rows that did not report their source \
+                 tree state.",
+            ),
+            (
+                1000,
+                1,
+                "Outside the clean headline: 1000 parity rows from a dirty source tree.",
+                "Outside the clean headline: 1 parity row that did not report its source tree \
+                 state.",
+            ),
+            (
+                1,
+                2,
+                "Outside the clean headline: 1 parity row from a dirty source tree.",
+                "Outside the clean headline: 2 parity rows that did not report their source \
+                 tree state.",
+            ),
+        ] {
+            summary.source_tree_dirty_rows = dirty_rows;
+            summary.source_tree_unreported_rows = unreported_rows;
+            assert_eq!(
+                parity_tree_state_lines(&summary),
+                (dirty_line.to_string(), unreported_line.to_string())
+            );
+        }
+        assert_eq!(
+            [Some(true), None, Some(false)].map(parity_tree_state_mark),
+            [
+                " (from a dirty source tree)",
+                " (did not report its source tree state)",
+                ""
+            ]
+        );
+        assert_eq!(
+            [ParityProducer::Validate, ParityProducer::PressureTest]
+                .map(parity_no_clean_headline_text),
+            [NO_CLEAN_VALIDATE, NO_CLEAN_PRESSURE]
+        );
+        // Both lines are printed even with no store.
+        let rendered = render_parity_section(&parity_summary_without_store(&no_cells()));
+        assert_eq!(
+            span(&rendered, "No parity rows in this ledger", LEGACY_HEADING),
+            "No parity rows in this ledger: it has no `parity/` store yet, so no current parity \
+             is reported. This is not a zero.\n\
+             \nOutside the clean headline: 0 parity rows from a dirty source tree.\n\
+             \nOutside the clean headline: 0 parity rows that did not report their source tree \
+             state.\n"
+        );
+        assert_eq!(rendered.matches("Outside the clean headline: ").count(), 2);
+    }
+
+    /// Section 8: the legacy line has three forms, and K in the second is the
+    /// sum of the dropped counts by piece of evidence, not by cell.
+    #[test]
+    fn the_legacy_rerun_line_has_exactly_three_forms() {
+        let pass = || observation(&["pass"], &[]);
+        let lost = || observation(&["parity-failure"], &[]);
+        let dropped_only = tracked(vec![
+            tracked_cell(
+                &golden(1),
+                "kvm",
+                vec![
+                    pass(),
+                    observation(
+                        &["parity-failure"],
+                        &[comparison("kvm", LogDiffVerdict::NoResult, None, 1990)],
+                    ),
+                ],
+            ),
+            tracked_cell(&golden(3), "kvm", vec![pass(), lost()]),
+        ]);
+        let lost_four = tracked(vec![
+            tracked_cell(&golden(1), "kvm", vec![lost(), lost()]),
+            tracked_cell("backend-parity-c/pidfd-open-self", "kvm", vec![lost()]),
+            tracked_cell("c-programs/pidfd-open-self-pair", "kvm", vec![lost()]),
+        ]);
+        for (cells, entries, dropped, dropped_cells, expected) in [
+            (
+                legacy_cells(),
+                2,
+                2,
+                2,
+                "legacy-rerun (retired ptrace rerun on 2 cell(s), last at abcdef012345): 1 \
+                 matched / 1 diverged",
+            ),
+            (
+                dropped_only,
+                0,
+                2,
+                2,
+                "legacy-rerun (retired ptrace rerun on 0 cell(s)): 0 matched / 0 diverged; 2 \
+                 piece(s) of evidence dropped",
+            ),
+            (
+                lost_four,
+                0,
+                4,
+                2,
+                "legacy-rerun (retired ptrace rerun on 0 cell(s)): 0 matched / 0 diverged; 4 \
+                 piece(s) of evidence dropped",
+            ),
+            (
+                no_cells(),
+                0,
+                0,
+                0,
+                "legacy-rerun: no retired ptrace-rerun comparison is retained",
+            ),
+        ] {
+            let summary = parity_summary_without_store(&cells);
+            let legacy = &summary.legacy_rerun;
+            assert_eq!(
+                (
+                    legacy.entries.len(),
+                    summary.legacy_dropped.values().sum::<usize>(),
+                    summary.legacy_dropped_cells.values().sum::<usize>()
+                ),
+                (entries, dropped, dropped_cells),
+                "{expected}"
+            );
+            assert_eq!(legacy.line, expected);
+            assert_eq!(
+                span(
+                    &render_parity_section(&summary),
+                    LEGACY_HEADING,
+                    "These verdicts"
+                ),
+                format!("{LEGACY_HEADING}\n`{expected}`\n\n")
+            );
+        }
     }
 }
