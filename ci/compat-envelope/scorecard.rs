@@ -6429,12 +6429,28 @@ impl ParityTally {
         }
     }
 
-    /// The one-line parity summary, which names each denominator, for
-    /// example `parity: 0/77 matched; selected 77 of 77 committed; mean 0.100
-    /// over 76 measured; floor 0.100 over 76 measured of 77 selected (1 no
-    /// golden: determinism-mismatch 1; 0 not compared) [inputs not
-    /// equalized]`. The nonzero classes are listed in print order. A tally
-    /// whose every cell was not compared says only that, with its coverage.
+    /// The one-line parity summary, which prints each figure beside its
+    /// denominator, for example `parity: 0/77 matched; selected 77 of 77
+    /// committed; mean 0.101 over 76 measured; floor 0.100 over 77 of 77
+    /// selected (counted as 0: 1 unmeasured: no-result-row 1; excluded: 0 no
+    /// golden; 0 not compared) [inputs not equalized]`. The floor is over the
+    /// measured cells and those counted as 0; the cells listed as excluded
+    /// are the rest of the selection. The nonzero classes are listed in print
+    /// order. A tally whose every cell was not compared says only that, with
+    /// its coverage.
+    ///
+    /// A record-missing or refused cell is counted as 0 unless its backend's
+    /// inputs cannot be equalized, which excludes it. Such a backend has no
+    /// measured or unmeasured cell (`check_class` in
+    /// `ci/manifest-plan/src/parity.rs`), so `selected - no_golden -
+    /// not_compared - floor_cells` counts exactly the excluded record-missing
+    /// and refused cells. When the cells of both kinds are all on one side
+    /// the line names each kind; otherwise, which only a total over several
+    /// backends can be, it gives the two kinds' sum on each side.
+    /// The line reads nothing but the tally's own fields: dev-hermit's
+    /// `ci-hub/compatibility-website/parity_summary.py`, added by slice D5 of
+    /// <https://github.com/rrnewton/hermit/issues/3301>, renders it again
+    /// from them and refuses a summary whose line differs.
     fn render_line(&self) -> String {
         if self.selected > 0 && self.not_compared == self.selected {
             return format!(
@@ -6452,48 +6468,68 @@ impl ParityTally {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let mut no_golden = format!("{} no golden", self.no_golden);
-        if self.no_golden > 0 {
-            no_golden.push_str(&format!(": {}", classes(&self.no_golden_by_class)));
-        }
-        let mut parts = vec![no_golden, format!("{} not compared", self.not_compared)];
+        // Counted as 0 in the floor.
+        let mut counted_as_zero = Vec::new();
         if self.unmeasured > 0 {
-            parts.push(format!(
+            counted_as_zero.push(format!(
                 "{} unmeasured: {}",
                 self.unmeasured,
                 classes(&self.unmeasured_by_class)
             ));
         }
+        // Excluded from every floor.
+        let mut no_golden = format!("{} no golden", self.no_golden);
+        if self.no_golden > 0 {
+            no_golden.push_str(&format!(": {}", classes(&self.no_golden_by_class)));
+        }
+        let mut excluded = vec![no_golden, format!("{} not compared", self.not_compared)];
+        let mut kinds = Vec::new();
         if self.record_missing > 0 {
-            parts.push(format!("{} record-missing", self.record_missing));
+            kinds.push(format!("{} record-missing", self.record_missing));
         }
         if self.refused > 0 {
-            parts.push(format!("{} refused", self.refused));
+            kinds.push(format!("{} refused", self.refused));
         }
+        // The record-missing and refused cells of a backend whose inputs
+        // cannot be equalized are excluded; the rest are counted as 0.
         let unequalizable = self
             .selected
             .saturating_sub(self.no_golden + self.not_compared + self.floor_cells);
-        if unequalizable > 0 {
-            parts.push(format!(
-                "floor excludes {unequalizable} record-missing or refused cell(s) whose inputs cannot be equalized"
+        let missing_or_refused = self.record_missing + self.refused;
+        if unequalizable == 0 {
+            counted_as_zero.extend(kinds);
+        } else if unequalizable == missing_or_refused {
+            let kinds = kinds.join(" and ");
+            excluded.push(format!("{kinds} whose inputs cannot be equalized"));
+        } else {
+            // The tally's fields do not say which kind each side's cells are.
+            let in_floor = missing_or_refused.saturating_sub(unequalizable);
+            counted_as_zero.push(format!("{in_floor} record-missing or refused"));
+            excluded.push(format!(
+                "{unequalizable} record-missing or refused whose inputs cannot be equalized"
             ));
         }
+        let mut groups = Vec::new();
+        if !counted_as_zero.is_empty() {
+            groups.push(format!("counted as 0: {}", counted_as_zero.join("; ")));
+        }
+        groups.push(format!("excluded: {}", excluded.join("; ")));
         let credited = if self.credited != self.measured {
             format!(" ({} credited)", self.credited)
         } else {
             String::new()
         };
         format!(
-            "parity: {}/{} matched; {}; mean {} over {} measured{credited}; floor {} over {} measured of {} selected ({}){}",
+            "parity: {}/{} matched; {}; mean {} over {} measured{credited}; floor {} over {} of {} selected ({}){}",
             self.matched,
             self.selected,
             self.coverage(),
             credit_text(self.mean_credit),
             self.measured,
             credit_text(self.floor_credit),
-            self.measured,
+            self.floor_cells,
             self.selected,
-            parts.join("; "),
+            groups.join("; "),
             self.inputs_marker()
         )
     }
@@ -36046,13 +36082,13 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/12 matched; committed selection unknown; mean 0.117 over 12 measured; \
-             floor 0.117 over 12 measured of 12 selected (0 no golden; 0 not compared) \
+             floor 0.117 over 12 of 12 selected (excluded: 0 no golden; 0 not compared) \
              [inputs not equalized]"
         );
         assert_eq!(
             run.per_backend[&KVM].line,
             "parity: 0/4 matched; committed selection unknown; mean 0.100 over 4 measured; \
-             floor 0.100 over 4 measured of 4 selected (0 no golden; 0 not compared) \
+             floor 0.100 over 4 of 4 selected (excluded: 0 no golden; 0 not compared) \
              [inputs not equalized]"
         );
         assert_eq!(run.per_backend[&DBT].selected, 0);
@@ -36063,7 +36099,7 @@ mod parity_summary_tests {
         assert_contains(
             &rendered,
             "\n`parity: 0/12 matched; committed selection unknown; mean 0.117 over 12 measured; \
-             floor 0.117 over 12 measured of 12 selected (0 no golden; 0 not compared) \
+             floor 0.117 over 12 of 12 selected (excluded: 0 no golden; 0 not compared) \
              [inputs not equalized]`\n",
         );
         assert_contains(
@@ -36123,8 +36159,8 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/12 matched; committed selection unknown; mean 0.117 over 9 measured; \
-             floor 0.088 over 9 measured of 12 selected (0 no golden; 0 not compared; \
-             3 record-missing) [inputs not equalized]"
+             floor 0.088 over 12 of 12 selected (counted as 0: 3 record-missing; excluded: \
+             0 no golden; 0 not compared) [inputs not equalized]"
         );
         let all_diverged = summarize_rows(&twelve_diverged(), &no_cells());
         assert!(run.total.floor_credit < only_run(&all_diverged).total.floor_credit);
@@ -36152,6 +36188,61 @@ mod parity_summary_tests {
         assert_contains(
             &rendered,
             &format!("| `c-programs/golden-4@kvm` | record-missing | — | {TIMED_OUT} |\n"),
+        );
+    }
+
+    /// A record-missing or refused cell of a backend whose inputs cannot be
+    /// equalized is excluded from every floor. A backend's own line names each
+    /// kind on its side; a total with such cells beside ones counted as 0
+    /// cannot tell the kinds apart and gives each side's sum.
+    #[test]
+    fn unequalizable_record_missing_and_refused_cells_are_excluded_from_the_floor() {
+        let rows = [
+            row(diverged(&golden(1), KVM, 10, 100, 11, 12, false)),
+            missing(&golden(2), KVM),
+            missing(&golden(2), DBT),
+            // dbt is never compared, so a measured dbt row is refused.
+            row(diverged(&golden(3), DBT, 10, 100, 11, 12, false)),
+        ];
+        let summary = summarize_rows(&rows, &no_cells());
+        let why = DBT.inputs_not_equalizable().unwrap();
+        assert_eq!(
+            summary.refusals,
+            [ParityRefusal {
+                path: SHARD.into(),
+                line: Some(4),
+                message: format!(
+                    "parity ledger row c-programs/golden-3@dbt (validate run {RUN}): dbt inputs \
+                     cannot be equalized, so it reports no measured comparison and never equal \
+                     inputs: {why}"
+                ),
+            }]
+        );
+        assert_eq!(summary.refused_rows, 1);
+        let run = only_run(&summary);
+        assert_eq!(cell(run, "c-programs/golden-3@dbt").verdict, "refused");
+        assert_eq!(counts(&run.total), [4, 1, 0, 1, 0, 0, 0, 2, 1]);
+        assert_eq!(run.total.floor_cells, 2);
+        assert_eq!(counts(&run.per_backend[&DBT]), [2, 0, 0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(run.per_backend[&DBT].floor_cells, 0);
+        assert_eq!(
+            run.line,
+            "parity: 0/4 matched; committed selection unknown; mean 0.100 over 1 measured; \
+             floor 0.050 over 2 of 4 selected (counted as 0: 1 record-missing or refused; \
+             excluded: 0 no golden; 0 not compared; 2 record-missing or refused whose inputs \
+             cannot be equalized) [inputs not equalized]"
+        );
+        assert_eq!(
+            run.per_backend[&KVM].line,
+            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
+             floor 0.050 over 2 of 2 selected (counted as 0: 1 record-missing; excluded: \
+             0 no golden; 0 not compared) [inputs not equalized]"
+        );
+        assert_eq!(
+            run.per_backend[&DBT].line,
+            "parity: 0/2 matched; committed selection unknown; mean n/a over 0 measured; \
+             floor n/a over 0 of 2 selected (excluded: 0 no golden; 0 not compared; \
+             1 record-missing and 1 refused whose inputs cannot be equalized)"
         );
     }
 
@@ -36202,7 +36293,7 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.100 over 1 measured of 2 selected (1 no golden: determinism-mismatch 1; \
+             floor 0.100 over 1 of 2 selected (excluded: 1 no golden: determinism-mismatch 1; \
              0 not compared) [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
@@ -36524,8 +36615,8 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.050 over 1 measured of 2 selected (0 no golden; 0 not compared; 1 refused) \
-             [inputs not equalized]"
+             floor 0.050 over 2 of 2 selected (counted as 0: 1 refused; excluded: 0 no golden; \
+             0 not compared) [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(&rendered, "### Refused parity rows");
@@ -36594,7 +36685,8 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/1 matched; committed selection unknown; mean n/a over 0 measured; \
-             floor 0.000 over 0 measured of 1 selected (0 no golden; 0 not compared; 1 refused)"
+             floor 0.000 over 1 of 1 selected (counted as 0: 1 refused; excluded: 0 no golden; \
+             0 not compared)"
         );
     }
 
@@ -36704,10 +36796,10 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 2/9 matched; committed selection unknown; mean 0.700 over 4 measured; \
-             floor 0.400 over 4 measured of 9 selected (1 no golden: determinism-mismatch 1; \
-             1 not compared; 1 unmeasured: no-result-row 1; 1 record-missing; 1 refused) \
-             [inputs equalized for 2 of 4 credited: mean 0.650 over 2 with equal inputs; \
-             mean 0.750 over 2 with unequal inputs]"
+             floor 0.400 over 7 of 9 selected (counted as 0: 1 unmeasured: no-result-row 1; \
+             1 record-missing; 1 refused; excluded: 1 no golden: determinism-mismatch 1; \
+             1 not compared) [inputs equalized for 2 of 4 credited: mean 0.650 over 2 with \
+             equal inputs; mean 0.750 over 2 with unequal inputs]"
         );
         assert_eq!(
             (
@@ -37121,8 +37213,8 @@ mod parity_summary_tests {
             assert_eq!(
                 run.line,
                 "parity: 0/13 matched; committed selection unknown; mean n/a over 0 measured; \
-                 floor 0.000 over 0 measured of 13 selected (0 no golden; 0 not compared; \
-                 13 refused)"
+                 floor 0.000 over 13 of 13 selected (counted as 0: 13 refused; excluded: \
+                 0 no golden; 0 not compared)"
             );
             let messages = summary
                 .refusals
@@ -37171,10 +37263,10 @@ mod parity_summary_tests {
             summarize_parity(&store(&lines), &no_cells(), &depth_of, &committed_of)
         };
         let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; mean 0.100 over 3 \
-                             measured; floor 0.100 over 3 measured of 3 selected (0 no golden; \
+                             measured; floor 0.100 over 3 of 3 selected (excluded: 0 no golden; \
                              0 not compared) [inputs not equalized]";
         let partial_line = "parity: 1/1 matched; selected 1 of 3 committed (partial); mean 1.000 \
-                            over 1 measured; floor 1.000 over 1 measured of 1 selected (0 no \
+                            over 1 measured; floor 1.000 over 1 of 1 selected (excluded: 0 no \
                             golden; 0 not compared) [inputs not equalized]";
         // A later partial run at the same commit, and a partial run at a
         // deeper commit.
@@ -37277,8 +37369,8 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/3 matched; selected 2 of 4 committed (partial); 1 outside the committed \
-             selection; mean 0.083 over 3 measured; floor 0.083 over 3 measured of 3 selected \
-             (0 no golden; 0 not compared) [inputs not equalized]"
+             selection; mean 0.083 over 3 measured; floor 0.083 over 3 of 3 selected \
+             (excluded: 0 no golden; 0 not compared) [inputs not equalized]"
         );
         assert_eq!(
             run.committed_cells_without_row,
@@ -37683,8 +37775,8 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; \
-             floor 0.051 over 175 measured of 192 selected (0 no golden; 14 not compared; \
-             3 unmeasured: no-result-row 3) [inputs not equalized]"
+             floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; \
+             excluded: 0 no golden; 14 not compared) [inputs not equalized]"
         );
         assert!(run.committed_cells_without_row.is_empty());
         assert!(run.cells_outside_committed.is_empty());
@@ -37700,14 +37792,14 @@ mod parity_summary_tests {
                 "dbt: parity: not compared: 0 measured of 14 selected (inputs cannot be \
                  equalized); selected 14 of 14 committed",
                 "kvm: parity: 0/77 matched; selected 77 of 77 committed; mean 0.101 over 76 \
-                 measured; floor 0.100 over 76 measured of 77 selected (0 no golden; \
-                 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]",
+                 measured; floor 0.100 over 77 of 77 selected (counted as 0: 1 unmeasured: \
+                 no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]",
                 "liteinst: parity: 0/99 matched; selected 99 of 99 committed; mean 0.014 over 98 \
-                 measured; floor 0.014 over 98 measured of 99 selected (0 no golden; \
-                 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]",
+                 measured; floor 0.014 over 99 of 99 selected (counted as 0: 1 unmeasured: \
+                 no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]",
                 "sabre: parity: 0/2 matched; selected 2 of 2 committed; mean 0.020 over 1 \
-                 measured; floor 0.010 over 1 measured of 2 selected (0 no golden; \
-                 0 not compared; 1 unmeasured: no-result-row 1) [inputs not equalized]",
+                 measured; floor 0.010 over 2 of 2 selected (counted as 0: 1 unmeasured: \
+                 no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]",
             ]
         );
         assert_eq!(run.total.not_compared, 14);
