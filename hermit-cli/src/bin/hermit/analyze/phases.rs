@@ -187,7 +187,8 @@ impl AnalyzeOpts {
     fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
         let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
-            ":: {} hermit run {}",
+            // `to_repro` is already a complete `hermit ... run ...` command.
+            ":: {} {}",
             "Studying target execution: ".yellow().bold(),
             run1data.to_repro()
         );
@@ -724,7 +725,15 @@ impl AnalyzeOpts {
         }
     }
 
+    /// Take the settings `analyze` inherits from the global options: every
+    /// trial runs on the globally selected backend
+    /// (`hermit --backend <BACKEND> analyze ...`).
+    pub fn apply_global(&mut self, global: &GlobalOpts) {
+        self.backend = global.backend;
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+        self.apply_global(global);
         // Not implemented yet:
         if self.run1_schedule.is_some() {
             unimplemented!()

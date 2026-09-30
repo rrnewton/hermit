@@ -171,25 +171,29 @@ impl RunData {
         self.sched_path_out = Some(normalized_path);
     }
 
-    /// Execute the run. (Including setting up logging and temp dir binding.)
-    pub fn launch(&mut self) -> anyhow::Result<()> {
-        let root = self.root_path();
+    /// The global options a trial run is launched with. The backend is the one
+    /// `hermit --backend <BACKEND> analyze` selected: `RunOpts::main` takes its
+    /// backend from these options, so this is what makes every trial run on it.
+    fn trial_global_opts(&self) -> GlobalOpts {
         let log_path = self.root_path().with_extension(LOG_EXT);
-        let gopts = GlobalOpts {
+        GlobalOpts {
             log: Some(self.log_level),
             log_file: if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
                 Some(log_path)
             } else {
                 None
             },
-            // Analyze always runs its trials on the default (ptrace) backend:
-            // `validate_backend_scope` refuses every other global `--backend` for
-            // `analyze`, and `run` has no subcommand-level `--backend`.
-            backend: None,
+            backend: self.analyze_opts.backend,
             log_file_handle: None,
             run_evidence_log_handle: None,
             run_evidence_write_error: None,
-        };
+        }
+    }
+
+    /// Execute the run. (Including setting up logging and temp dir binding.)
+    pub fn launch(&mut self) -> anyhow::Result<()> {
+        let root = self.root_path();
+        let gopts = self.trial_global_opts();
         // Open it HERE, on the host, for the same reason `main` does: `launch` runs
         // before the container exists, and opening later would resolve this path in
         // the guest namespace. Analyze's log lands under the run's own directory, so
@@ -386,24 +390,36 @@ impl RunData {
         for arg in &aopts.run_args {
             run_cmd.push(arg.to_string());
         }
-        RunOpts::try_parse_from(run_cmd.iter()).unwrap_or_else(|error| {
+        let mut runopts = RunOpts::try_parse_from(run_cmd.iter()).unwrap_or_else(|error| {
             if crate::misplaced_backend_argument(&error).is_some() {
-                // Before `run` lost its own `--backend`, a `--run-arg=--backend=X`
-                // silently ran analyze's trials on backend X, although
-                // `validate_backend_scope` refuses every non-ptrace global
-                // `--backend` for `analyze`. Say so instead of letting clap
-                // suggest an unrelated `--backend-engagement-json`.
+                // `--backend` is global. Point at the spelling that selects the
+                // trials' backend instead of letting clap suggest the unrelated
+                // `--backend-engagement-json`. clap reports only the flag name,
+                // so read the value from the run arguments themselves.
+                let value = run_cmd
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("--backend="))
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .unwrap_or("<BACKEND>");
                 clap::Error::raw(
                     clap::error::ErrorKind::UnknownArgument,
-                    "`--backend` is not a `run` option, so it cannot be passed to `hermit \
-                     analyze` through --run-arg or the run arguments. `hermit analyze` runs \
-                     every trial on the default ptrace backend: drop `--backend` from the \
-                     run arguments.\n",
+                    format!(
+                        "`--backend` is not a `run` option, so it cannot be passed through \
+                         the run arguments of `hermit analyze` or `hermit bisect`. It is a \
+                         global option: select the backend for every trial with `hermit \
+                         --backend={value} analyze ...` or `hermit --backend={value} bisect \
+                         ...`.\n"
+                    ),
                 )
                 .exit()
             }
             error.exit()
-        })
+        });
+        // Apply the global backend before `get_base_runopts` validates these
+        // options, so backend-specific validation sees the backend the trials
+        // will run on.
+        runopts.set_backend(aopts.backend);
+        runopts
     }
 
     /// Extract the (initial) RunOpts for target/run1 that are implied by all of hermit analyze's arguments.
@@ -541,6 +557,50 @@ impl RunData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the
+    /// only way to choose the trials' backend. The selection must pass the
+    /// scope check and reach the options every trial is launched with: the
+    /// `GlobalOpts` that `RunOpts::main` takes its backend from, the validated
+    /// trial `RunOpts`, and the printed reproducer.
+    #[test]
+    fn global_backend_reaches_every_trial_run() {
+        for flag in ["ptrace", "kvm", "liteinst"] {
+            let argv = [
+                "hermit".to_owned(),
+                format!("--backend={flag}"),
+                "analyze".to_owned(),
+                "--".to_owned(),
+                "/bin/true".to_owned(),
+            ];
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            args.command
+                .validate_backend_scope(args.global.backend)
+                .unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run = RunData::new_baseline(&options, "backend".to_owned())
+                .unwrap_or_else(|error| panic!("{flag}: {error:#}"));
+            assert_eq!(
+                run.trial_global_opts().backend,
+                args.global.backend,
+                "{flag}"
+            );
+            assert_eq!(
+                run.runopts.global_backend_arg(),
+                format!(" --backend={flag}")
+            );
+            let repro = run.to_repro();
+            assert!(
+                repro.contains(&format!(" --backend={flag} run ")),
+                "{flag}: reproducer does not select the backend: {repro}"
+            );
+        }
+    }
 
     #[test]
     fn analyzer_reproducer_retains_actual_default_and_fractional_epoch() {

@@ -354,10 +354,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/3354).
     // subcommand_level_backend_is_a_usage_error_naming_the_global_form,
     // misplaced_backend_is_only_moved_when_unambiguous and
-    // global_backend_with_namespace_only_is_a_usage_error
+    // global_backend_with_namespace_only_is_a_usage_error,
+    // analyze_and_bisect_accept_every_run_backend and
+    // global_backend_reaches_every_trial_run
     // (https://github.com/rrnewton/hermit/pull/3439) retain all 758 prior
     // identities.
-    ("test.hermit_unit", 761),
+    ("test.hermit_unit", 763),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -475,7 +477,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 849),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 177),
-    ("test.hermit_unit_on_host", 761),
+    ("test.hermit_unit_on_host", 763),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.

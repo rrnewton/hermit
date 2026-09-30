@@ -1576,13 +1576,19 @@ fn run_rejects_subcommand_level_backend() {
 #[test]
 fn analyze_rejects_backend_in_its_run_arguments() {
     // `hermit analyze` builds its trials' `run` options from --run-arg and its
-    // trailing run arguments. `run` has no `--backend`, and analyze runs its
-    // trials on ptrace, so a backend there must be refused with the working
-    // path rather than clap's unrelated `--backend-engagement-json` hint.
+    // trailing run arguments. `run` has no `--backend`, so a backend there must
+    // be refused with the working global spelling rather than clap's unrelated
+    // `--backend-engagement-json` hint.
     let hermit_binary = env!("CARGO_BIN_EXE_hermit");
-    for args in [
-        &["analyze", "--run-arg=--backend=kvm", "--", "/bin/true"][..],
-        &["analyze", "--", "--backend", "dbt", "/bin/true"][..],
+    for (args, corrected) in [
+        (
+            &["analyze", "--run-arg=--backend=kvm", "--", "/bin/true"][..],
+            "hermit --backend=kvm analyze ...",
+        ),
+        (
+            &["analyze", "--", "--backend", "dbt", "/bin/true"][..],
+            "hermit --backend=<BACKEND> analyze ...",
+        ),
     ] {
         let output = Command::new(hermit_binary)
             .args(args)
@@ -1595,9 +1601,8 @@ fn analyze_rejects_backend_in_its_run_arguments() {
             "{args:?} must be a usage error:\n{message}"
         );
         assert!(
-            message.contains("runs every trial on the default ptrace backend")
-                && message.contains("drop `--backend` from the run arguments"),
-            "{args:?}: error does not give the working path:\n{message}"
+            message.contains("It is a global option") && message.contains(corrected),
+            "{args:?}: error does not give the working path {corrected:?}:\n{message}"
         );
         assert!(
             !message.contains("backend-engagement-json"),
