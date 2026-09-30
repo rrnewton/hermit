@@ -7114,13 +7114,19 @@ fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySumm
 }
 
 /// `scorecard/parity.json`, written only when the ledger has a parity store.
+/// A file that already exists is never removed ([`history_generated_files`]).
 fn encoded_parity_summary(summary: &ParitySummary) -> Result<Option<Vec<u8>>, String> {
     if !summary.store_present {
         return Ok(None);
     }
+    parity_summary_bytes(summary).map(Some)
+}
+
+/// `summary` as `scorecard/parity.json` holds it.
+fn parity_summary_bytes(summary: &ParitySummary) -> Result<Vec<u8>, String> {
     let mut text = serde_json::to_string_pretty(summary).map_err(|error| error.to_string())?;
     text.push('\n');
-    Ok(Some(text.into_bytes()))
+    Ok(text.into_bytes())
 }
 
 fn markdown_cell(text: &str) -> String {
@@ -8643,8 +8649,9 @@ struct GeneratedFiles {
     cells: Vec<u8>,
     /// The ledger's `scorecard/parity.json`: `None` when it does not exist,
     /// and always `None` for the in-tree pair, which has no parity file. It
-    /// is written only when the ledger has a parity store (see
-    /// [`encoded_parity_summary`]).
+    /// is created only when the ledger has a parity store (see
+    /// [`encoded_parity_summary`]) and never removed once it exists (see
+    /// [`history_generated_files`]).
     parity: Option<Vec<u8>>,
 }
 
@@ -10030,7 +10037,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let parity = load_parity_summary(root, &tracked)?;
-    let updated = generated_files_with_parity(&derived, &tracked, &parity)?;
+    let updated = history_generated_files(&derived, &tracked, &parity, &original)?;
     let verify_inputs = || -> Result<(), String> {
         census.verify()?;
         check_observation_worktree(root)?;
@@ -11487,7 +11494,7 @@ where
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let parity = load_parity_summary(root, &tracked)?;
-    let updated = generated_files_with_parity(&derived, &tracked, &parity)?;
+    let updated = history_generated_files(&derived, &tracked, &parity, &original)?;
     let partial_scorecard = updated.scorecard.clone();
 
     let changed = replace_history_files_with(
@@ -11584,6 +11591,28 @@ fn generated_files_with_parity(
         cells: encoded_cells(tracked)?.into_bytes(),
         parity: encoded_parity_summary(parity)?,
     })
+}
+
+/// [`generated_files_with_parity`] for the ledger's history files, given
+/// `existing`, the history files as read before this write.
+///
+/// `scorecard/parity.json` is created only for a ledger with a parity store
+/// ([`encoded_parity_summary`]), but once it exists the scorecard never
+/// removes it. A ledger whose store is gone gets the summary without one
+/// (`store_present` false, no row, no run), which is the summary its parity
+/// section renders. The ledger publisher refuses a removed summary, and
+/// that refusal would stop the whole publication; parity never stops it.
+fn history_generated_files(
+    derived: &Derived,
+    tracked: &TrackedCells,
+    parity: &ParitySummary,
+    existing: &GeneratedFiles,
+) -> Result<GeneratedFiles, String> {
+    let mut files = generated_files_with_parity(derived, tracked, parity)?;
+    if files.parity.is_none() && existing.parity.is_some() {
+        files.parity = Some(parity_summary_bytes(parity)?);
+    }
+    Ok(files)
 }
 
 const SCORECARD_TITLE: &str = "# Compatibility scorecard\n\n";
@@ -11715,7 +11744,7 @@ fn write_observation_files(
 ) -> Result<(), String> {
     let original = read_history_files(root)?;
     let parity = load_parity_summary(root, tracked)?;
-    let generated = generated_files_with_parity(derived, tracked, &parity)?;
+    let generated = history_generated_files(derived, tracked, &parity, &original)?;
     replace_history_files_with(
         root,
         &original,
@@ -11823,10 +11852,14 @@ fn replace_generated_files_with(
 }
 
 /// The `scorecard/parity.json` step of replacing `original` with `updated`:
-/// `Some(path)` writes the new summary at `path`, or removes the file when
-/// `updated` has none; `None` when the summary is unchanged. Only the history
-/// pair has a parity file (`parity` is its path), so a parity summary for the
-/// in-tree pair is refused before anything is written.
+/// `Some(path)` writes `updated`'s summary at `path`; `None` when there is
+/// nothing to write, because the summary is unchanged or `updated` carries
+/// none. Nothing removes the file: once it exists, the history writers always
+/// carry a summary for it ([`history_generated_files`]), and an update
+/// without one leaves it in place rather than failing, because parity never
+/// stops the scorecard. Only the history pair has a parity file (`parity` is
+/// its path), so a parity summary for the in-tree pair is refused before
+/// anything is written.
 fn parity_replacement_step<'a>(
     parity: Option<&'a Path>,
     original: &GeneratedFiles,
@@ -11837,15 +11870,16 @@ fn parity_replacement_step<'a>(
             "{LEDGER_PARITY_SUMMARY} is written only beside the ledger's history files"
         )),
         None => Ok(None),
-        Some(_) if original.parity == updated.parity => Ok(None),
+        Some(_) if updated.parity.is_none() || original.parity == updated.parity => Ok(None),
         Some(path) => Ok(Some(path)),
     }
 }
 
 /// Replace the generated files in order: the scorecard, then the cells, then
-/// (history only) `scorecard/parity.json` ([`parity_replacement_step`]).
-/// `before_replace` runs before the first two steps only, so its callers keep
-/// their two-step contract. A failed later step restores every earlier one.
+/// (history only) `scorecard/parity.json` ([`parity_replacement_step`]),
+/// which is written but never removed. `before_replace` runs before the first
+/// two steps only, so its callers keep their two-step contract. A failed
+/// later step restores every earlier one.
 fn replace_generated_paths_with(
     scorecard: &Path,
     cells: &Path,
@@ -11868,7 +11902,9 @@ fn replace_generated_paths_with(
         None => None,
     };
     let new_parity = match (parity_step, &updated.parity) {
-        (Some(path), Some(bytes)) => Some(prepared_replacement_like(path, bytes, scorecard)?),
+        (Some(path), Some(bytes)) => {
+            Some((path, prepared_replacement_like(path, bytes, scorecard)?))
+        }
         _ => None,
     };
     guard()?;
@@ -11888,15 +11924,11 @@ fn replace_generated_paths_with(
             vec![(old_scorecard, scorecard, SCORECARD)],
         ));
     }
-    if let Some(path) = parity_step {
-        let third = match new_parity {
-            Some(new_parity) => new_parity
-                .persist(path)
-                .map(|_| ())
-                .map_err(|e| format!("cannot replace {LEDGER_PARITY_SUMMARY}: {}", e.error)),
-            None => fs::remove_file(path)
-                .map_err(|e| format!("cannot remove {LEDGER_PARITY_SUMMARY}: {e}")),
-        };
+    if let Some((path, new_parity)) = new_parity {
+        let third = new_parity
+            .persist(path)
+            .map(|_| ())
+            .map_err(|e| format!("cannot replace {LEDGER_PARITY_SUMMARY}: {}", e.error));
         if let Err(error) = third {
             let old_cells = old_cells.expect("a parity step prepares the original cells");
             return Err(restore_generated_files(
@@ -12925,7 +12957,7 @@ fn bind_retained_attempts(root: &Path, inputs: &[RetainedBindingInput]) -> Resul
     let attempts = validate_attempt_bindings(&tracked, Some(&events))?;
     let _ = direct_representation(&tracked, &events, &attempts)?;
     let parity = load_parity_summary(root, &tracked)?;
-    let updated = generated_files_with_parity(&derived, &tracked, &parity)?;
+    let updated = history_generated_files(&derived, &tracked, &parity, &original)?;
     let mut unchanged: JsonValue =
         serde_json::from_slice(&original.cells).map_err(|error| error.to_string())?;
     let proposed: JsonValue =
@@ -37949,10 +37981,9 @@ mod parity_summary_tests {
     }
 
     #[test]
-    fn only_the_history_pair_writes_or_removes_the_parity_file() {
+    fn only_the_history_pair_writes_the_parity_file_and_nothing_removes_it() {
         let path = Path::new("ledger/scorecard/parity.json");
-        // A new or changed summary is written; a summary that is gone is
-        // removed.
+        // A new or changed summary is written.
         assert_eq!(
             parity_replacement_step(Some(path), &files("old", None), &files("new", Some("{}\n"))),
             Ok(Some(path))
@@ -37965,13 +37996,17 @@ mod parity_summary_tests {
             ),
             Ok(Some(path))
         );
+        // An update that carries no summary leaves an existing file in place:
+        // nothing removes it (the history writers carry the summary without a
+        // store instead, see
+        // `an_existing_parity_file_is_never_removed_and_gets_the_summary_without_a_store`).
         assert_eq!(
             parity_replacement_step(
                 Some(path),
                 &files("new", Some("{}\n")),
                 &files("newer", None)
             ),
-            Ok(Some(path))
+            Ok(None)
         );
         // An unchanged summary is left alone while the pair changes.
         for parity in [None, Some("{}\n")] {
@@ -38004,5 +38039,90 @@ mod parity_summary_tests {
             ),
             Err(refusal.to_string())
         );
+    }
+
+    #[test]
+    fn an_existing_parity_file_is_never_removed_and_gets_the_summary_without_a_store() {
+        let (derived, cells) = determinism_fixture();
+        let without = parity_summary_without_store(&cells);
+        let plain = generated_files(&derived, &cells).unwrap();
+        let no_file = files("old", None);
+        let old_file = files("old", Some("{\"old\":true}\n"));
+        // Without a store and without a file, no file is created.
+        assert!(history_generated_files(&derived, &cells, &without, &no_file).unwrap() == plain);
+        // Once the file exists, a ledger without a store gets the summary
+        // without one, and the parity section renders that same summary.
+        let kept = history_generated_files(&derived, &cells, &without, &old_file).unwrap();
+        assert!(kept.scorecard == plain.scorecard && kept.cells == plain.cells);
+        let bytes = kept
+            .parity
+            .clone()
+            .expect("an existing parity file is kept");
+        let mut expected = serde_json::to_string_pretty(&without).unwrap();
+        expected.push('\n');
+        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
+        let value = serde_json::from_slice::<JsonValue>(&bytes).unwrap();
+        assert_eq!(value["store_present"], false);
+        assert_eq!(value["rows_read"], 0);
+        assert_eq!(value["refused_rows"], 0);
+        assert_eq!(value["generated_from"]["store_sha256"], JsonValue::Null);
+        for empty in ["producers", "runs", "refusals"] {
+            assert_eq!(value[empty], serde_json::json!([]), "{empty}");
+        }
+        assert_contains(
+            &String::from_utf8(kept.scorecard.clone()).unwrap(),
+            "No parity rows in this ledger: it has no `parity/` store yet",
+        );
+        // A ledger with a store gets its summary whether or not the file
+        // exists yet.
+        let summary = summarize_rows(&[row(matched(&golden(1), KVM, 80, true))], &cells);
+        let stored = encoded_parity_summary(&summary).unwrap();
+        assert!(stored.is_some());
+        for existing in [&no_file, &old_file] {
+            let generated = history_generated_files(&derived, &cells, &summary, existing).unwrap();
+            assert_eq!(generated.parity, stored);
+        }
+
+        // On disk: the existing file is rewritten with the summary without a
+        // store...
+        let dir = tempfile::tempdir().unwrap();
+        let scorecard = dir.path().join("SCORECARD.md");
+        let cells_json = dir.path().join("cells.json");
+        let parity = dir.path().join("parity.json");
+        fs::write(&scorecard, &old_file.scorecard).unwrap();
+        fs::write(&cells_json, &old_file.cells).unwrap();
+        fs::write(&parity, old_file.parity.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            replace_generated_paths_with(
+                &scorecard,
+                &cells_json,
+                Some(parity.as_path()),
+                &old_file,
+                &kept,
+                || Ok(()),
+                |_| Ok(()),
+            ),
+            Ok(true)
+        );
+        assert_eq!(fs::read(&scorecard).unwrap(), plain.scorecard);
+        assert_eq!(fs::read(&parity).unwrap(), bytes);
+        // ...and an update that carries no summary replaces the pair and
+        // leaves that file in place.
+        let bare = files("new", None);
+        assert_eq!(
+            replace_generated_paths_with(
+                &scorecard,
+                &cells_json,
+                Some(parity.as_path()),
+                &kept,
+                &bare,
+                || Ok(()),
+                |_| Ok(()),
+            ),
+            Ok(true)
+        );
+        assert_eq!(fs::read(&scorecard).unwrap(), bare.scorecard);
+        assert_eq!(fs::read(&cells_json).unwrap(), bare.cells);
+        assert_eq!(fs::read(&parity).unwrap(), bytes);
     }
 }
