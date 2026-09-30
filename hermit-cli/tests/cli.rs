@@ -86,6 +86,7 @@ static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -500,6 +501,35 @@ fn stdio_inode_identity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "stdio-inode fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Two spinning threads plus eight absolute CLOCK_REALTIME samples; see
+/// `tests/c/replay_epoch_probe.c`.
+fn replay_epoch_guest() -> &'static Path {
+    REPLAY_EPOCH_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("replay-epoch-probe");
+        fs::create_dir_all(&build_root).expect("failed to create replay-epoch build directory");
+        let guest = build_root.join("replay_epoch_probe");
+        let output = Command::new("cc")
+            .args([
+                "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            ])
+            .arg(repository.join("tests/c/replay_epoch_probe.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the replay-epoch probe");
+        assert!(
+            output.status.success(),
+            "replay-epoch probe compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -5034,6 +5064,103 @@ fn run_ptrace_nonleader_exec_preserves_preemption() {
 #[test]
 fn run_ptrace_nonleader_exec_displaces_runnable_leader() {
     nonleader_exec::run_runnable_leader();
+}
+
+/// The panic of <https://github.com/rrnewton/hermit/issues/3413>, end to end.
+///
+/// A `--chaos` recording carries per-thread preemption points: timeslice ends
+/// at absolute virtual instants, i.e. offsets from the recording's epoch. A
+/// replay that omits `--epoch` used to sample a fresh host-clock epoch, so every
+/// recorded end was already in the past and detcore panicked with "Cannot set
+/// end of timeslice ... when current thread logical time is already ...". The
+/// replay now starts from the recorded epoch
+/// (<https://github.com/rrnewton/hermit/issues/3411>) and reproduces the whole
+/// clock trajectory the recording printed.
+///
+/// PMU SUBJECT: chaos preemption points come from the PMU timer, so without a
+/// PMU the recording has none and this case proves nothing. test.cli and
+/// test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases runs
+/// it after privileged-pmu.preemption has shown the PMU works. The PMU-free
+/// epoch-adoption and refusal cases live in hermit-cli/tests/clock_determinism.rs.
+#[test]
+fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("chaos-preemptions.json");
+    let guest = replay_epoch_guest().to_str().unwrap();
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    let recording_args = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=3",
+        "--epoch=2000-12-31T23:59:59.123456789Z",
+        &record_arg,
+        "--",
+        guest,
+    ];
+    // Both runs must see only the epochs this test gives them: a harness that
+    // pins HERMIT_EPOCH would otherwise supply the replay's epoch too.
+    let recorded = hermit_command(&recording_args)
+        .env_remove("HERMIT_EPOCH")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    assert_success(&recorded, &recording_args);
+
+    // The premise: real preemption points, at absolute instants after the epoch.
+    let epoch_nanos: u64 = 978_307_199_123_456_789;
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    assert_eq!(json["epoch"], "2000-12-31T23:59:59.123456789Z", "{json}");
+    let ends: Vec<u64> = json["per_thread"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|thread| thread["prio_changes"].as_array().unwrap().clone())
+        .map(|change| change[0].as_u64().unwrap())
+        .collect();
+    assert!(
+        !ends.is_empty(),
+        "the chaos recording has no preemption points, so this case cannot \
+         reach the replayed-timeslice path: {json}"
+    );
+    assert!(ends.iter().all(|end| *end > epoch_nanos), "{ends:?}");
+
+    let replay_args = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=3",
+        &replay_arg,
+        "--",
+        guest,
+    ];
+    let replayed = hermit_command(&replay_args)
+        .env_remove("HERMIT_EPOCH")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let replay_stderr = stderr(&replayed);
+    assert!(
+        !replay_stderr.contains("Cannot set end of timeslice"),
+        "{replay_stderr}"
+    );
+    assert_success(&replayed, &replay_args);
+    assert!(
+        replay_stderr
+            .contains("virtual-time epoch=2000-12-31T23:59:59.123456789+00:00 source=recording"),
+        "{replay_stderr}"
+    );
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+    assert_eq!(
+        stdout(&recorded)
+            .lines()
+            .filter(|line| line.starts_with("sample "))
+            .count(),
+        8
+    );
 }
 
 #[test]

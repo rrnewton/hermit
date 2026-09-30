@@ -1531,6 +1531,12 @@
       "why": "tests/c/renameat2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/replay_epoch_probe.c",
+      "runner": "cargo test -p hermit --test clock_determinism and --test cli",
+      "why": "tests/c/replay_epoch_probe.c is compiled and exercised by hermit-cli/tests/clock_determinism.rs and hermit-cli/tests/cli.rs: two spinning threads plus eight absolute CLOCK_REALTIME samples prove that a preemption or schedule replay started without --epoch reuses the recording's virtual-time epoch and reproduces the recorded samples, that a contradicting explicit epoch is refused before the guest runs, and (PMU hosts, privileged-test.pmu_cli_cases) that a --chaos recording's absolute preemption points replay without the \"Cannot set end of timeslice\" panic (https://github.com/rrnewton/hermit/issues/3411, https://github.com/rrnewton/hermit/issues/3413)"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/request_key_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

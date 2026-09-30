@@ -318,7 +318,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (runner::tests::a_chaos_timeout_leads_the_reason_and_is_not_counted_as_a_pass
     // and runner::tests::a_chaos_timeout_keeps_an_earlier_seeds_failure_reason)
     // retain all 721 prior identities.
-    ("test.regular_crates", 723),
+    // The replay-epoch fix (https://github.com/rrnewton/hermit/issues/3411)
+    // adds three hermit-verify common::opts::tests (one_captured_epoch_is_given_to_every_run,
+    // an_explicit_epoch_is_never_replaced_or_duplicated,
+    // an_environment_epoch_is_inherited_without_reading_the_clock) and retains
+    // all 723 prior identities.
+    ("test.regular_crates", 726),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -368,7 +373,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // descriptor_is_closed_when_no_scratch_can_be_found) retain all 845 prior
     // identities (`cargo nextest list --profile ci` measured 848;
     // https://github.com/rrnewton/hermit/issues/3328).
-    ("test.detcore_unit", 848),
+    // preemptions::tests::recorded_epoch_round_trips_and_legacy_records_have_none
+    // (https://github.com/rrnewton/hermit/issues/3411) retains all 848 prior
+    // identities.
+    ("test.detcore_unit", 849),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -384,7 +392,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3354) adds one more. Both
     // retain all 171 prior identities (`cargo nextest list --profile ci`
     // measured 173).
-    ("test.hermit_integration", 173),
+    // Four clock_determinism replay-epoch tests
+    // (replay_with_an_omitted_epoch_starts_from_the_recorded_epoch,
+    // replay_of_a_host_clock_recording_reuses_its_epoch,
+    // replay_refuses_an_explicit_epoch_that_contradicts_the_recording and
+    // replay_without_virtual_time_adopts_the_recorded_epoch;
+    // https://github.com/rrnewton/hermit/issues/3411) retain all 173 prior
+    // identities.
+    ("test.hermit_integration", 177),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -406,7 +421,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/actions/runs/36499357369).
     ("privileged-test.pmu_ptrace_completion_cases", 5),
     // Four PMU-subject ptrace nonleader-exec cases join the skid-overshoot case.
-    ("privileged-test.pmu_cli_cases", 5),
+    // run_chaos_preemption_replay_reuses_the_recorded_epoch
+    // (https://github.com/rrnewton/hermit/issues/3413) joins the five PMU cases.
+    ("privileged-test.pmu_cli_cases", 6),
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
@@ -421,14 +438,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 848),
+    ("test.detcore_unit_on_host", 849),
     // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 173),
+    ("test.hermit_integration_on_host", 177),
     ("test.hermit_unit_on_host", 758),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 723),
+    ("test.regular_crates_on_host", 726),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -2715,7 +2732,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
         description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -2748,7 +2765,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
         description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -3254,9 +3271,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"privileged-test"########,
         job: r########"pmu_cli_cases"########,
         desc: r########"Run the CLI cases whose subject is the PMU"########,
-        description: r########"skid_overshoot_and_guest_failure_have_different_exit_codes asserts that the skid injector induces a PMU overshoot, so the PMU is its subject; on a host without one it fails with skid injector did not induce an overshoot. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.cli and test.cli_on_host skip exactly this case and this node runs it in full. The four ptrace nonleader-exec cases run_ptrace_nonleader_exec_{preserves_identity_and_time,preserves_preemption,displaces_runnable_leader,refuses_preemption_artifacts} assert the actual PMU counter, the PMU timer and PMU preemption across exec; with perf_event_open blocked (EACCES) they fail with worker clock accounted before exec or actual PMU preemption, or the displaced leader never yields and hits its 54 s wall limit, while run_ptrace_nonleader_exec_exit_only passes and stays in test.cli (https://github.com/rrnewton/hermit/pull/3268). They are skipped by exact name in test.cli and test.cli_on_host and run here, after privileged-pmu.preemption has shown the PMU works. It consumes the shared cli binary published by privileged-build.privileged_tests and therefore holds the integration_test_binaries.cli token like the other consumers. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts": 0.44 s for the skid case alone, and 23.2-30.7 s of nextest time for all five cases together over 20 runs at one-minute load averages of 63-226, so the wall limit is 300 s."########,
+        description: r########"skid_overshoot_and_guest_failure_have_different_exit_codes asserts that the skid injector induces a PMU overshoot, so the PMU is its subject; on a host without one it fails with skid injector did not induce an overshoot. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.cli and test.cli_on_host skip exactly this case and this node runs it in full. The four ptrace nonleader-exec cases run_ptrace_nonleader_exec_{preserves_identity_and_time,preserves_preemption,displaces_runnable_leader,refuses_preemption_artifacts} assert the actual PMU counter, the PMU timer and PMU preemption across exec; with perf_event_open blocked (EACCES) they fail with worker clock accounted before exec or actual PMU preemption, or the displaced leader never yields and hits its 54 s wall limit, while run_ptrace_nonleader_exec_exit_only passes and stays in test.cli (https://github.com/rrnewton/hermit/pull/3268). They are skipped by exact name in test.cli and test.cli_on_host and run here, after privileged-pmu.preemption has shown the PMU works. run_chaos_preemption_replay_reuses_the_recorded_epoch (https://github.com/rrnewton/hermit/issues/3413) records a --chaos run, requires its PMU-timer preemption points to be present, and replays them without --epoch; without a PMU the recording has no preemption points and the case fails its own premise check, so it is skipped the same way and runs here. It consumes the shared cli binary published by privileged-build.privileged_tests and therefore holds the integration_test_binaries.cli token like the other consumers. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts": 0.44 s for the skid case alone, and 23.2-30.7 s of nextest time for all five cases together over 20 runs at one-minute load averages of 63-226, so the wall limit is 300 s."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(=skid_overshoot_and_guest_failure_have_different_exit_codes) | test(=run_ptrace_nonleader_exec_preserves_identity_and_time) | test(=run_ptrace_nonleader_exec_preserves_preemption) | test(=run_ptrace_nonleader_exec_displaces_runnable_leader) | test(=run_ptrace_nonleader_exec_refuses_preemption_artifacts)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(=skid_overshoot_and_guest_failure_have_different_exit_codes) | test(=run_ptrace_nonleader_exec_preserves_identity_and_time) | test(=run_ptrace_nonleader_exec_preserves_preemption) | test(=run_ptrace_nonleader_exec_displaces_runnable_leader) | test(=run_ptrace_nonleader_exec_refuses_preemption_artifacts) | test(=run_chaos_preemption_replay_reuses_the_recorded_epoch)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),

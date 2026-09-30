@@ -389,6 +389,16 @@ pub struct RunOpts {
     #[clap(skip)]
     epoch_captured_from_host: bool,
 
+    /// Whether neither `--epoch` nor `HERMIT_EPOCH` supplied the epoch, whether
+    /// or not virtual time then sampled the host clock for it.
+    #[clap(skip)]
+    epoch_omitted: bool,
+
+    /// Whether the epoch was taken from the preemption record being replayed,
+    /// replacing an omitted one. See `adopt_replayed_schedule_epoch`.
+    #[clap(skip)]
+    epoch_from_recording: bool,
+
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
@@ -2890,6 +2900,7 @@ impl RunOpts {
     /// guest launch. Both halves of `--verify` and every backend then receive the
     /// same concrete `DateTime`; Detcore never reads the host clock itself.
     pub(crate) fn capture_default_epoch(&mut self, capture_now: impl FnOnce() -> SystemTime) {
+        self.epoch_omitted = true;
         if self.uses_virtual_time_determinization() {
             self.det_opts
                 .det_config
@@ -2923,6 +2934,61 @@ impl RunOpts {
 
     fn epoch_rfc3339(&self) -> String {
         self.det_opts.det_config.epoch.to_rfc3339()
+    }
+
+    /// Start a replay from the virtual-time epoch its recording was made under.
+    ///
+    /// A preemption record stores absolute logical times, i.e. offsets from the
+    /// recording run's epoch
+    /// (<https://github.com/rrnewton/hermit/issues/3411>). A replay whose clock
+    /// starts anywhere else sees every recorded timeslice end shifted by the
+    /// difference, and detcore used to panic on the first one already in the
+    /// past (<https://github.com/rrnewton/hermit/issues/3413>).
+    ///
+    /// So when this invocation omitted the epoch, the recorded epoch replaces
+    /// the default. An explicit epoch (`--epoch` or `HERMIT_EPOCH`) that
+    /// disagrees is refused before any guest starts. A record written before
+    /// epochs were stored carries none and is replayed against this run's epoch
+    /// exactly as before.
+    ///
+    /// This holds with `--no-virtualize-time` too: detcore's logical clock, and
+    /// so every recorded timeslice end, still starts at the epoch. Only
+    /// `--namespace-only`, which bypasses detcore, has nothing to reconcile.
+    fn adopt_replayed_schedule_epoch(&mut self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let Some(path) = config
+            .replay_preemptions_from
+            .as_ref()
+            .or(config.replay_schedule_from.as_ref())
+        else {
+            return Ok(());
+        };
+        let Some(recorded) = detcore::preemptions::read_recorded_epoch(path).map_err(Error::msg)?
+        else {
+            return Ok(());
+        };
+        if self.epoch_omitted {
+            self.det_opts.det_config.epoch = recorded;
+            self.epoch_captured_from_host = false;
+            self.epoch_from_recording = true;
+            return Ok(());
+        }
+        if config.epoch != recorded {
+            let recorded = recorded.to_rfc3339();
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
+                 the epoch {recorded} that {} was recorded under. The recording's timeslice \
+                 ends are absolute virtual times measured from its own epoch, so replaying \
+                 them from another epoch cannot reproduce the run. Omit --epoch to replay \
+                 from the recorded epoch, or pass --epoch={recorded}.",
+                config.epoch.to_rfc3339(),
+                path.display(),
+            )));
+        }
+        Ok(())
     }
 
     /// Point this run at an OCI image rootfs, as `--image` does.
@@ -3153,10 +3219,13 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
+        self.adopt_replayed_schedule_epoch()?;
         if self.uses_virtual_time_determinization() {
             let epoch = self.epoch_rfc3339();
             let source = if self.epoch_captured_from_host {
                 "host-now"
+            } else if self.epoch_from_recording {
+                "recording"
             } else {
                 "explicit"
             };

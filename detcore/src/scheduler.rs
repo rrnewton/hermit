@@ -1740,7 +1740,7 @@ impl Scheduler {
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
             preemption_writer: if cfg.record_preemptions {
-                Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()))
+                Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()).with_epoch(cfg.epoch))
             } else {
                 None
             },
