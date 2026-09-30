@@ -25,8 +25,10 @@ const RUN: &str = "validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-d
 
 /// One record copied byte-for-byte from RUN 1953's
 /// `e2e/portable/manifest_backend_parity_c/parity.jsonl` (its first line):
-/// the kvm `brk(NULL)` divergence at record 13.
-const REAL_RECORD: &str = r#"{"schema":1,"test_id":"backend-parity-c/aio-refusal","backend":"kvm","verdict":"diverged","inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"/results/portable/manifest_backend_parity_c/parity/golden/backend-parity-c/aio-refusal.detlog","candidate_log":"/results/runs/validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1/run1_log_2p5r0","run_id":"validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da","hermit_sha":"d3a0a4ae3d168565595ae4157b25ab8efbb1861a"}"#;
+/// the kvm `brk(NULL)` divergence at record 13, with the `unavailable_class`
+/// and `operand` every record now carries (both `null` for a measured
+/// verdict) inserted after its verdict.
+const REAL_RECORD: &str = r#"{"schema":1,"test_id":"backend-parity-c/aio-refusal","backend":"kvm","verdict":"diverged","unavailable_class":null,"operand":null,"inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"/results/portable/manifest_backend_parity_c/parity/golden/backend-parity-c/aio-refusal.detlog","candidate_log":"/results/runs/validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1/run1_log_2p5r0","run_id":"validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da","hermit_sha":"d3a0a4ae3d168565595ae4157b25ab8efbb1861a"}"#;
 
 fn scratch(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -230,6 +232,23 @@ fn export_refuses_an_inconsistent_node_and_prints_no_rows() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("parity record backend-parity-c/aio-refusal@kvm"),
+        "{stderr}"
+    );
+
+    // A record written before every record carried its typed class is
+    // refused, not read without one.
+    let untyped = REAL_RECORD.replace(r#""unavailable_class":null,"operand":null,"#, "");
+    write_node(
+        &root.join("portable/manifest_c_programs"),
+        None,
+        Some(&format!("{untyped}\n")),
+    );
+    let output = export(&["--e2e-root", root.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("missing field `unavailable_class`"),
         "{stderr}"
     );
 
