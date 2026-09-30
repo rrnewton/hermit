@@ -138,11 +138,16 @@ impl SerializableError {
 /// ⚠️ IT IS STILL A TYPE TEST, NOT A STRING MATCH. Matching the Display text would
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
+///
+/// Two refusals have a type: record mode's `UnsupportedSyscallError`, and
+/// replay's `UnreplayableClockOutput`, which refuses, before any guest write, a
+/// recorded `EFAULT` call that replay cannot reproduce
+/// (https://github.com/rrnewton/hermit/issues/3434).
 fn is_policy_refusal(err: &Error) -> bool {
-    if err
-        .chain()
-        .any(|cause| cause.is::<detcore::UnsupportedSyscallError>())
-    {
+    if err.chain().any(|cause| {
+        cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<crate::clock_output::UnreplayableClockOutput>()
+    }) {
         return true;
     }
     // The wrapper case: reverie hands the tool's error back inside `Tool`, whose
@@ -150,13 +155,13 @@ fn is_policy_refusal(err: &Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<reverie::Error>()
-            .and_then(|reverie_error| match reverie_error {
+            .is_some_and(|reverie_error| match reverie_error {
                 reverie::Error::Tool(inner) => {
-                    inner.downcast_ref::<detcore::UnsupportedSyscallError>()
+                    inner.is::<detcore::UnsupportedSyscallError>()
+                        || inner.is::<crate::clock_output::UnreplayableClockOutput>()
                 }
-                _ => None,
+                _ => false,
             })
-            .is_some()
     })
 }
 
