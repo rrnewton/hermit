@@ -2843,6 +2843,26 @@ mod tests {
     }
 
     #[test]
+    fn write_accepts_a_success_that_read_refuses_under_a_declared_exit() {
+        use SeriesExpectedExit::Code;
+        use SeriesExpectedExit::Signal;
+        // A known gap while write keeps the success-only rule: a declared row
+        // whose matched attempt exited 0 passes write, but read accepts only
+        // the declared exit. The parent writer refuses a matched attempt that
+        // did not end as its row declares, so it never proposes such a row.
+        // The gap closes when write honours the declaration too.
+        for declared in [Code(3), Signal(11)] {
+            let value = declared_pressure_row(Some(declared), Some(0), None);
+            value
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{declared:?}: {error}"));
+            for verdict in read_and_projection(&value) {
+                assert_eq!(verdict.unwrap_err(), MATCHED_CONTRADICTION, "{declared:?}");
+            }
+        }
+    }
+
+    #[test]
     fn only_a_completed_pass_gets_the_shell_encoded_signal_refusal() {
         use SeriesExpectedExit::Signal;
         // A matched attempt that did not complete as a PASS is refused with the
