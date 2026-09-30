@@ -290,15 +290,23 @@ mod tests {
     }
 
     /// What a Rust source names by path: `#[path = "..."]` module files, with
-    /// any spacing and inside `cfg_attr`, and the files `include_str!`,
-    /// `include_bytes!` and `include!` read. Comments, string literals and
-    /// character literals are skipped, so text that only mentions these forms
-    /// names nothing. An include whose argument is not a string literal is
-    /// `Err` with the macro's name, because its file cannot be read off the
-    /// source.
+    /// any spacing, inside `cfg_attr` and as raw identifiers; bodyless
+    /// `mod x;` declarations; and the files `include_str!`, `include_bytes!`
+    /// and `include!` read, with any of the three delimiters. Comments, string
+    /// literals and character literals are skipped, so text that only
+    /// mentions these forms names nothing. A `#[path]` or include whose value
+    /// is not a string literal is `Err`, because its file cannot be read off
+    /// the source.
     #[derive(Debug, PartialEq)]
     enum Reference {
-        Module(String),
+        /// A `#[path]` module's file, or the attribute when its value is not
+        /// a string literal.
+        Module(Result<String, String>),
+        /// A bodyless `mod x;`, whose file is found by its name unless a
+        /// `#[path]` attribute names it.
+        Plain(String),
+        /// An included file, or the macro when its argument is not a string
+        /// literal.
         Include(Result<String, String>),
     }
 
@@ -387,6 +395,17 @@ mod tests {
                     // The prefix of a byte or C string: the next pass reads it.
                 } else if ident == "b" && at(i) == '\'' {
                     // The prefix of a byte character: the next pass skips it.
+                } else if ident == "r"
+                    && at(i) == '#'
+                    && (at(i + 1).is_alphabetic() || at(i + 1) == '_')
+                {
+                    // A raw identifier: `r#path` is the identifier `path`.
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                        i += 1;
+                    }
+                    tokens.push(Token::Ident(chars[start..i].iter().collect()));
                 } else {
                     tokens.push(Token::Ident(ident));
                 }
@@ -420,9 +439,10 @@ mod tests {
                             }
                         }
                         Token::Ident(name) if name == "path" && punct(j + 1, '=') => {
-                            if let Some(Token::Str(target)) = tokens.get(j + 2) {
-                                references.push(Reference::Module(target.clone()));
-                            }
+                            references.push(Reference::Module(match tokens.get(j + 2) {
+                                Some(Token::Str(target)) => Ok(target.clone()),
+                                _ => Err("#[path]".to_string()),
+                            }));
                         }
                         _ => {}
                     }
@@ -431,12 +451,22 @@ mod tests {
             let Some(Token::Ident(name)) = tokens.get(i) else {
                 continue;
             };
+            if name == "mod" && punct(i + 2, ';') {
+                if let Some(Token::Ident(module)) = tokens.get(i + 1) {
+                    references.push(Reference::Plain(module.clone()));
+                }
+            }
+            let close = match tokens.get(i + 2) {
+                Some(Token::Punct('(')) => ')',
+                Some(Token::Punct('[')) => ']',
+                Some(Token::Punct('{')) => '}',
+                _ => continue,
+            };
             if matches!(name.as_str(), "include" | "include_str" | "include_bytes")
                 && punct(i + 1, '!')
-                && punct(i + 2, '(')
             {
                 references.push(Reference::Include(
-                    match (tokens.get(i + 3), punct(i + 4, ')')) {
+                    match (tokens.get(i + 3), punct(i + 4, close)) {
                         (Some(Token::Str(target)), true) => Ok(target.clone()),
                         _ => Err(format!("{name}!")),
                     },
@@ -469,28 +499,54 @@ mod tests {
             );
             include!("g.rs");
             const K: &str = include_str!(concat!("h", ".json"));
+            #[r#path = "raw.rs"] mod raw;
+            #[r#cfg_attr(all(), r#path = "raw-cfg.rs")] mod raw_cfg;
+            #[path = MACRO] mod unreadable;
+            const L: &str = include_str!{"brace.json"};
+            const M: &[u8] = r#include_bytes!["bracket.bin"];
+            fn g<'r>(x: &'r str) -> &'r str { x }
+            mod plain;
+            pub(crate) mod visible;
+            mod inline { include!("inline.rs"); }
         "##;
         use Reference::*;
         assert_eq!(
             rust_references(source),
             [
-                Module("a.rs".to_string()),
-                Module("b.rs".to_string()),
-                Module("c.rs".to_string()),
-                Module("d.rs".to_string()),
+                Module(Ok("a.rs".to_string())),
+                Plain("a".to_string()),
+                Module(Ok("b.rs".to_string())),
+                Plain("b".to_string()),
+                Module(Ok("c.rs".to_string())),
+                Plain("c".to_string()),
+                Module(Ok("d.rs".to_string())),
+                Plain("d".to_string()),
+                Plain("e".to_string()),
                 Include(Ok("e.json".to_string())),
                 Include(Ok("f.bin".to_string())),
                 Include(Ok("g.rs".to_string())),
                 Include(Err("include_str!".to_string())),
+                Module(Ok("raw.rs".to_string())),
+                Plain("raw".to_string()),
+                Module(Ok("raw-cfg.rs".to_string())),
+                Plain("raw_cfg".to_string()),
+                Module(Err("#[path]".to_string())),
+                Plain("unreadable".to_string()),
+                Include(Ok("brace.json".to_string())),
+                Include(Ok("bracket.bin".to_string())),
+                Plain("plain".to_string()),
+                Plain("visible".to_string()),
+                Include(Ok("inline.rs".to_string())),
             ]
         );
     }
 
     /// Every way `inputs` and `non_inputs` can drift from the tracked tree:
     /// an unclassified or doubly classified file under `roots`, a stale
-    /// non-input, an input's `#[path]` module that no input covers, and a file
-    /// an input includes that is neither an input nor a non-input. A
-    /// non-input outside `roots` must be a file some input includes.
+    /// non-input, an input's `#[path]` module that no input covers, and a
+    /// file an input includes, or a tracked file of a plain `mod x;` it
+    /// declares, that is neither an input nor a non-input. A non-input
+    /// outside `roots` must be exactly such a file.
     fn scorecard_input_violations(
         root: &Path,
         tracked: &[String],
@@ -509,16 +565,44 @@ mod tests {
         {
             let source = std::fs::read_to_string(root.join(path)).unwrap();
             let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+            let stem = path.strip_suffix(".rs").unwrap_or(path);
             let mut seen = BTreeSet::new();
             for reference in rust_references(&source) {
                 let (target, module) = match reference {
-                    Reference::Module(target) => (target, true),
+                    Reference::Module(Ok(target)) => (target, true),
                     Reference::Include(Ok(target)) => (target, false),
-                    Reference::Include(Err(name)) => {
+                    Reference::Module(Err(name)) | Reference::Include(Err(name)) => {
                         reference_violations.push(format!(
-                            "{path} calls {name} on something other than a string literal, \
+                            "{path} gives {name} something other than a string literal, \
                              so its file cannot be classified"
                         ));
+                        continue;
+                    }
+                    Reference::Plain(name) => {
+                        // Its file is `x.rs` or `x/mod.rs` beside a crate
+                        // root or `mod.rs`, and under `<stem>/` otherwise.
+                        // Every tracked candidate is classified like an
+                        // included file (a `#[cfg(test)] mod tests;` names a
+                        // non-input); with none tracked, a `#[path]` names
+                        // the file or nothing builds.
+                        for candidate in [
+                            format!("{dir}/{name}.rs"),
+                            format!("{dir}/{name}/mod.rs"),
+                            format!("{stem}/{name}.rs"),
+                            format!("{stem}/{name}/mod.rs"),
+                        ] {
+                            let candidate = normalize(&candidate);
+                            if !tracked.contains(&candidate) || !seen.insert(candidate.clone()) {
+                                continue;
+                            }
+                            if !is_input(&candidate) && !is_non_input(&candidate) {
+                                reference_violations.push(format!(
+                                    "{path} declares mod {name}, whose file {candidate} \
+                                     is neither an input nor a non-input"
+                                ));
+                            }
+                            included.insert(candidate);
+                        }
                         continue;
                     }
                 };
@@ -544,9 +628,7 @@ mod tests {
             if reason.trim().is_empty() {
                 violations.push(format!("non-input {entry} has no reason"));
             }
-            if !roots.iter().any(|dir| is_under(entry, dir))
-                && !included.iter().any(|path| is_under(path, entry))
-            {
+            if !roots.iter().any(|dir| is_under(entry, dir)) && !included.contains(*entry) {
                 violations.push(format!(
                     "non-input {entry} is outside the input roots and no input includes it"
                 ));
@@ -573,9 +655,10 @@ mod tests {
 
     /// The scorecard's triggers cover everything its builds and runs read: a
     /// file under an input root must be classified, a `#[path]` module an
-    /// input declares from anywhere in the tree must be an input (so the scan
-    /// follows `scripts/validate.rs`'s module tree), and a file an input
-    /// includes must be classified. Planted drifts show each check refuses.
+    /// input declares from anywhere in the tree must be an input, and a file
+    /// an input includes, or the tracked file of a plain module it declares,
+    /// must be classified (so the scan follows `scripts/validate.rs`'s module
+    /// tree). Planted drifts show each check refuses.
     #[test]
     fn scorecard_inputs_cover_every_file_and_path_module() {
         use crate::validation_dag::SCORECARD_INPUT_ROOTS;
@@ -636,7 +719,11 @@ mod tests {
                 &without("ci/manifest-plan/src/timeouts.rs"),
                 SCORECARD_NON_INPUTS
             ),
-            ["ci/manifest-plan/src/timeouts.rs is neither an input nor a non-input"]
+            [
+                "ci/manifest-plan/src/timeouts.rs is neither an input nor a non-input",
+                "ci/manifest-plan/src/lib.rs declares mod timeouts, whose file \
+                 ci/manifest-plan/src/timeouts.rs is neither an input nor a non-input",
+            ]
         );
         let without_non_input = |dropped: &str| -> Vec<(&str, &str)> {
             let kept: Vec<(&str, &str)> = SCORECARD_NON_INPUTS
@@ -667,16 +754,33 @@ mod tests {
                  which is neither an input nor a non-input"
             ]
         );
+        // A plain `mod admission;` in ledger.rs, which is not a crate root,
+        // names ledger/admission.rs.
+        assert_eq!(
+            check(
+                &without("ci/manifest-plan/src/ledger/admission.rs"),
+                SCORECARD_NON_INPUTS
+            ),
+            [
+                "ci/manifest-plan/src/ledger/admission.rs is neither an input nor a non-input",
+                "ci/manifest-plan/src/ledger.rs declares mod admission, whose file \
+                 ci/manifest-plan/src/ledger/admission.rs is neither an input nor a non-input",
+            ]
+        );
         let mut doubled = SCORECARD_NON_INPUTS.to_vec();
         doubled.push(("ci/compat-envelope/cells.json", "planted"));
         doubled.push(("ci/compat-envelope/gone.json", ""));
         doubled.push(("README.md", "planted"));
+        // Only the included file itself, not a directory holding it.
+        doubled.push(("tests/fixtures/scorecard-writeback/", "planted"));
         assert_eq!(
             check(SCORECARD_INPUTS, &doubled),
             [
                 "non-input ci/compat-envelope/gone.json has no reason",
                 "non-input ci/compat-envelope/gone.json names no tracked path",
                 "non-input README.md is outside the input roots and no input includes it",
+                "non-input tests/fixtures/scorecard-writeback/ is outside the input roots \
+                 and no input includes it",
                 "ci/compat-envelope/cells.json is both an input and a non-input",
             ]
         );

@@ -138,9 +138,9 @@ impl ToolSelfTest {
 /// file under [`SCORECARD_INPUT_ROOTS`] must be under an entry here or in
 /// [`SCORECARD_NON_INPUTS`], every `#[path]` module an input's source declares
 /// must be under an entry here, and every file an input's source includes
-/// (`include_str!`, `include_bytes!`, `include!`) must be under an entry here
-/// or in [`SCORECARD_NON_INPUTS`] (`self_test_selection`'s tests check all
-/// four).
+/// (`include_str!`, `include_bytes!`, `include!`), like every tracked default
+/// file of a plain `mod x;` it declares, must be under an entry here or in
+/// [`SCORECARD_NON_INPUTS`] (`self_test_selection`'s tests check all four).
 ///
 /// Derived 2026-09-30 from the dep-info of the scorecard's release and test
 /// builds, of `hermit-manifest-plan`, of `test-harness` and of the release
@@ -153,24 +153,35 @@ impl ToolSelfTest {
 ///
 /// The regression tier runs the whole DAG generator,
 /// `validation_dag::generate`, which executes `scripts/validate.rs`. That
-/// script, every `scripts/lib/` module it declares through `#[path]`, and the
-/// files it includes are listed here one path each, so the module scan above
-/// follows its module tree: a new module or included file breaks the test
-/// until it is classified. The generator's run also opens the four compat
-/// corpora under `ci/compat/` and the committed `ci/dag/validate.json`,
-/// which are listed here too. A new file that the generator opens at run time
-/// is not visible to that scan; the backstop is
+/// script and every `scripts/lib/` module it declares through `#[path]` are
+/// listed here one path each, as is every file its non-test build includes;
+/// the two fixtures its `#[cfg(test)]` module includes are non-inputs. So the
+/// module scan above follows its module tree: a new `#[path]` module, a new
+/// plain `mod x;` whose default file is tracked, or a new included file
+/// breaks the test until it is classified. The generator's run also opens
+/// the four compat corpora under `ci/compat/` and the committed
+/// `ci/dag/validate.json`, which are listed here too. A new file that the
+/// generator opens at run time is not visible to that scan; the backstop is
 /// `validation_dag::tests::full_generator_refuses_static_artifact_mutations`,
-/// run by test.regular_crates in every validation, which requires the
-/// generator's output to equal `ci/dag/validate.json`.
+/// which requires the generator's output to equal `ci/dag/validate.json`. It
+/// runs in test.regular_crates (the full and portable profiles) and in
+/// test.regular_crates_on_host (the hosted-portable profile). It does not run
+/// in the quick and super lanes, where
+/// quick-super-selftest.scorecard_commands selects on this same list.
+///
+/// A non-input outside [`SCORECARD_INPUT_ROOTS`] must be exactly a file that
+/// an input includes or declares as a plain module. Its reason says the include is test-only; nothing
+/// checks that claim, so a later non-test include of the same file would
+/// pass the scan.
 ///
 /// `tests/` is selected through a stand-in (accepted by the coordinator
 /// 2026-09-30): the helper refuses a `tests/` tree whose files differ from
 /// its inventory. That depends on which paths exist under `tests/`, not on
 /// their contents (the traced run listed and stat'ed them and opened none),
 /// and the inventory is `tests/e2e/manifests/inventory/test-files.json`,
-/// which gate.manifest's `test-harness validate` holds equal to the tree in
-/// every validation.
+/// which `test-harness validate` holds equal to the tree in every lane that
+/// runs these nodes: gate.manifest in the full, portable and hosted-portable
+/// profiles, and quick-super-gate.manifest in the quick and super lanes.
 pub const SCORECARD_INPUTS: &[&str] = &[
     // The scorecard, its cell list and its series-snapshot fixture.
     "ci/compat-envelope/scorecard.rs",
@@ -441,10 +452,9 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
     // dependencies, the Cargo manifests and lock, the prepared rust-script
     // launchers, the script that pins its ledger corpus, and the E2E
     // manifests its cells and its `system-utils/record-getpid` command
-    // fixture come from). The one input the list cannot name is the history
-    // it reads through `HEAD^`; an exact-head validation before each landing
-    // selects on every commit being pushed, so that history is the one
-    // validated.
+    // fixture come from). It also runs always on main, which catches a
+    // change elsewhere that it reads, such as the history it reads through
+    // `HEAD^`, which the list cannot name.
     ToolSelfTest {
         name: "scorecard_commands",
         program: "ci/compat-envelope/scorecard.rs",
