@@ -80,6 +80,7 @@ use crate::runner::CellResult;
 use crate::runner::EQUALIZED_INPUTS;
 use crate::runner::ManifestSet;
 use crate::runner::ModeRecipe;
+use crate::runner::ObservedResult;
 use crate::runner::Population;
 use crate::runner::Selection;
 use crate::runner::TestRecipe;
@@ -423,19 +424,25 @@ pub fn credit_from_report(report: &LogDiffReport) -> Option<f64> {
     }
 }
 
-/// The outcome of one parity cell in one run.
+/// The outcome of one parity cell in one run. Every verdict but `matched` and
+/// `diverged` carries the [`UnavailableClass`] that caused it; the class, not
+/// the verdict, decides where the cell counts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ParityVerdict {
     Matched,
     Diverged,
+    /// An operand's own `verify` cell diverged between its two runs, so it
+    /// has no deterministic log and no comparison is made
+    /// ([`UnavailableClass::DeterminismMismatch`]).
+    Nondeterministic,
     /// The ptrace `verify` run left no retained log to compare.
     ReferenceMissing,
     /// The candidate `verify` run left no retained log to compare.
     CandidateMissing,
-    /// Both logs exist but no comparison verdict could be reached (the
-    /// log-diff refused, found nothing comparable, or produced a report that is
-    /// not cross-backend evidence).
+    /// No comparison verdict could be reached: an operand ended without a
+    /// deterministic log, or the parity tool could not compare two logs (see
+    /// [`UnavailableClass::LogDiffFailed`]).
     Unavailable,
     /// The candidate backend cannot be given the reference's inputs at all
     /// (see [`ParityBackend::inputs_not_equalizable`]), so any comparison would
@@ -466,6 +473,18 @@ pub struct ParityFirstDifference {
     pub candidate_message: Option<String>,
 }
 
+/// Deserialize an `Option` field that must be present, as `null` or a value.
+/// Serde reads a missing `Option` field as `None` unless the field names its
+/// own deserializer, so a row that omits the field is refused rather than
+/// read as having no value.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// One line of `parity.jsonl`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -474,6 +493,16 @@ pub struct ParityRecord {
     pub test_id: String,
     pub backend: ParityBackend,
     pub verdict: ParityVerdict,
+    /// The one cause of an unmeasured verdict, typed; `None` exactly for a
+    /// measured (`matched` or `diverged`) verdict. See [`check_class`].
+    /// Required, `null` included.
+    #[serde(deserialize_with = "present")]
+    pub unavailable_class: Option<UnavailableClass>,
+    /// The side [`ParityRecord::unavailable_class`] concerns, or `None` when
+    /// it concerns the comparison rather than one side. Required, `null`
+    /// included.
+    #[serde(deserialize_with = "present")]
+    pub operand: Option<ParityOperand>,
     /// Whether the ptrace and candidate runs were given the same input paths
     /// (HOME, XDG_CONFIG_HOME, the fixture directory and the program path),
     /// as [`inputs_equalized`] decides from how both were launched. False
@@ -510,11 +539,13 @@ pub struct ParityRecord {
 impl ParityRecord {
     /// Record the comparison of two retained logs.
     ///
-    /// A report whose verdict is not matched or diverged, or which fails the
-    /// cross-backend evidence policy, becomes `unavailable` with the reason.
-    /// It never becomes a zero-credit divergence. A backend that cannot be
-    /// given the reference's inputs becomes `inputs-not-equalized` whatever the
-    /// report says, and claiming equal inputs for it is an error.
+    /// A backend that cannot be given the reference's inputs becomes
+    /// `inputs-not-equalized` whatever the report says, and claiming equal
+    /// inputs for it is an error; that is decided first. Otherwise a report
+    /// whose verdict is not matched or diverged, or which fails the
+    /// cross-backend evidence policy, becomes `unavailable` with class
+    /// [`UnavailableClass::LogDiffFailed`], no operand, and the specific cause
+    /// as its reason. It never becomes a zero-credit divergence.
     ///
     /// A matched or diverged report that passes the evidence policy but still
     /// contradicts its verdict, for example a match that names a first
@@ -542,6 +573,8 @@ impl ParityRecord {
             return Self::unmeasured(
                 cell,
                 ParityVerdict::InputsNotEqualized,
+                UnavailableClass::InputsNotEqualized,
+                Some(ParityOperand::Candidate),
                 false,
                 why,
                 Some(reference_log),
@@ -550,10 +583,15 @@ impl ParityRecord {
                 hermit_sha,
             );
         }
+        // Both logs were deterministic and retained, so a report that yields
+        // no usable verdict is the parity tool's failure: it concerns the
+        // comparison, not either side.
         let unavailable = |reason: String| {
             Self::unmeasured(
                 cell,
                 ParityVerdict::Unavailable,
+                UnavailableClass::LogDiffFailed,
+                None,
                 inputs_equalized,
                 &reason,
                 Some(reference_log),
@@ -612,6 +650,8 @@ impl ParityRecord {
             test_id: cell.test_id.clone(),
             backend: cell.backend,
             verdict,
+            unavailable_class: None,
+            operand: None,
             inputs_equalized,
             reason: None,
             credit: measured.filter(|_| inputs_equalized),
@@ -630,11 +670,15 @@ impl ParityRecord {
         Ok(record)
     }
 
-    /// Record a cell that could not be measured.
+    /// Record a cell that could not be measured, with the one typed cause
+    /// (`class`, and the side it concerns) that [`check_class`] accepts for
+    /// `verdict`, and the specific cause in `reason`.
     #[allow(clippy::too_many_arguments)]
     pub fn unmeasured(
         cell: &ParityCellId,
         verdict: ParityVerdict,
+        class: UnavailableClass,
+        operand: Option<ParityOperand>,
         inputs_equalized: bool,
         reason: &str,
         reference_log: Option<&str>,
@@ -647,6 +691,8 @@ impl ParityRecord {
             test_id: cell.test_id.clone(),
             backend: cell.backend,
             verdict,
+            unavailable_class: Some(class),
+            operand,
             inputs_equalized,
             reason: Some(reason.to_string()),
             credit: None,
@@ -713,21 +759,25 @@ impl ParityRecord {
                 "{at}: unequalized_credit is set but the inputs were equalized"
             ));
         }
+        // Such a backend is never compared, so none of its records claims
+        // equal inputs; `check_class` refuses its measured verdicts and an
+        // `inputs-not-equalized` verdict of any other backend.
         if let Some(why) = self.backend.inputs_not_equalizable() {
-            if self.inputs_equalized || self.verdict.is_measured() {
+            if self.inputs_equalized {
                 return Err(format!(
                     "{at}: {} inputs cannot be equalized, so it reports no measured \
                      comparison and never equal inputs: {why}",
                     self.backend
                 ));
             }
-        } else if self.verdict == ParityVerdict::InputsNotEqualized {
-            return Err(format!(
-                "{at}: {} inputs can be equalized; a comparison with unequal inputs is \
-                 measured and reports unequalized_credit",
-                self.backend
-            ));
         }
+        check_class(
+            &at,
+            self.backend,
+            LedgerVerdict::from(self.verdict),
+            self.unavailable_class,
+            self.operand,
+        )?;
         if self.verdict.is_measured() {
             if self.reason.is_some() {
                 return Err(format!("{at}: a measured verdict carries no reason"));
@@ -1520,11 +1570,42 @@ pub struct PostPassConfig {
     /// Concurrent `log-diff` comparisons.
     pub jobs: usize,
     /// `(test, backend)` verify cells whose result rows the caller refused
-    /// to hand over, with its reason. Such a cell ran but has no row a
-    /// comparison can trust, so an operand here is `unavailable` with that
-    /// reason rather than missing. Empty for the harness, which hands over
-    /// every row of its process.
-    pub rejected: BTreeMap<(String, String), String>,
+    /// to hand over, with its typed reason. Such a cell ran but has no row a
+    /// comparison can trust, so an operand here is `unavailable` with the
+    /// rejection's class and reason rather than missing. Empty for the
+    /// harness, which hands over every row of its process.
+    pub rejected: BTreeMap<(String, String), ParityRejection>,
+    /// `(test, backend)` verify cells the caller saw diverge between their
+    /// two runs outside the rows it handed over, such as in a later pressure
+    /// repetition, with where. Such an operand is `nondeterministic` like one
+    /// whose own history records a determinism failure. Empty for the harness.
+    pub nondeterministic: BTreeMap<(String, String), String>,
+}
+
+/// Why a caller refused to hand over a verify cell's result row
+/// ([`PostPassConfig::rejected`]); the variant decides the operand's class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParityRejection {
+    /// The cell's evidence could not be checked or was wrong, such as an
+    /// unreadable report: [`UnavailableClass::InfrastructureError`].
+    EvidenceError(String),
+    /// The cell left no valid result row: [`UnavailableClass::NoResultRow`].
+    InvalidRow(String),
+}
+
+impl ParityRejection {
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::EvidenceError(reason) | Self::InvalidRow(reason) => reason,
+        }
+    }
+
+    pub fn class(&self) -> UnavailableClass {
+        match self {
+            Self::EvidenceError(_) => UnavailableClass::InfrastructureError,
+            Self::InvalidRow(_) => UnavailableClass::NoResultRow,
+        }
+    }
 }
 
 impl PostPassConfig {
@@ -1541,6 +1622,7 @@ impl PostPassConfig {
             outer_deadline: None,
             jobs: 1,
             rejected: BTreeMap::new(),
+            nondeterministic: BTreeMap::new(),
         }
     }
 
@@ -1740,16 +1822,43 @@ pub struct PostPassReport {
 }
 
 impl PostPassReport {
-    /// One line of honest accounting: every verdict count, the mean clean
-    /// credit over the cells measured with equal inputs, and apart from it the
-    /// mean credit over the cells measured with unequal inputs. Neither mean
-    /// counts an unmeasured cell.
+    /// One line of honest accounting: every verdict count; the cells
+    /// measured, and those with no golden, not compared or unmeasured, each
+    /// group with its nonzero [`UnavailableClass`] counts, the same counts
+    /// the scorecard prints; the mean clean credit over the cells measured
+    /// with equal inputs, and apart from it the mean credit over the cells
+    /// measured with unequal inputs. Neither mean counts an unmeasured cell.
     pub fn summary_line(&self) -> String {
         let count = |verdict| {
             self.records
                 .iter()
                 .filter(|record| record.verdict == verdict)
                 .count()
+        };
+        let group = |group: UnavailableGroup, label: &str| {
+            let classes = UnavailableClass::ALL
+                .into_iter()
+                .filter(|class| class.group() == group)
+                .map(|class| {
+                    let cells = self
+                        .records
+                        .iter()
+                        .filter(|record| record.unavailable_class == Some(class))
+                        .count();
+                    (class, cells)
+                })
+                .filter(|(_, cells)| *cells > 0)
+                .collect::<Vec<_>>();
+            let total = classes.iter().map(|(_, cells)| cells).sum::<usize>();
+            if total == 0 || group == UnavailableGroup::NotCompared {
+                format!("{label} {total}")
+            } else {
+                let classes = classes
+                    .iter()
+                    .map(|(class, cells)| format!("{class} {cells}"))
+                    .collect::<Vec<_>>();
+                format!("{label} {total} ({})", classes.join(", "))
+            }
         };
         let mean = |credits: Vec<f64>, inputs: &str| {
             if credits.is_empty() {
@@ -1778,17 +1887,23 @@ impl PostPassReport {
         );
         let mean = format!("{clean}; {unequalized}");
         format!(
-            "parity: {} cell(s) -> {}: matched {}, diverged {}, reference-missing {}, \
-             candidate-missing {}, unavailable {}, inputs-not-equalized {}; {mean}; \
+            "parity: {} cell(s) -> {}: matched {}, diverged {}, nondeterministic {}, \
+             reference-missing {}, candidate-missing {}, unavailable {}, \
+             inputs-not-equalized {}; measured {}; {}; {}; {}; {mean}; \
              {} log-diff comparison(s), 0 guest runs",
             self.records.len(),
             self.path.display(),
             count(ParityVerdict::Matched),
             count(ParityVerdict::Diverged),
+            count(ParityVerdict::Nondeterministic),
             count(ParityVerdict::ReferenceMissing),
             count(ParityVerdict::CandidateMissing),
             count(ParityVerdict::Unavailable),
             count(ParityVerdict::InputsNotEqualized),
+            count(ParityVerdict::Matched) + count(ParityVerdict::Diverged),
+            group(UnavailableGroup::NoGolden, "no golden"),
+            group(UnavailableGroup::NotCompared, "not compared"),
+            group(UnavailableGroup::Unmeasured, "unmeasured"),
             self.log_diff_runs,
         )
     }
@@ -1965,11 +2080,15 @@ struct Operand {
     inputs: ParityGuestInputs,
 }
 
-/// Why one side of a cell cannot be compared.
+/// Why one side of a cell cannot be compared: the verdict and the typed
+/// class its record carries, the side the class concerns, and the specific
+/// cause.
+#[derive(Clone, Debug)]
 struct Unusable {
     verdict: ParityVerdict,
+    class: UnavailableClass,
+    operand: Option<ParityOperand>,
     reason: String,
-    log: Option<PathBuf>,
 }
 
 struct Comparison {
@@ -1984,15 +2103,29 @@ struct Comparison {
 /// Write `parity.jsonl` for `scope` from the verify rows of one harness
 /// process (every attempt, in any order) and their retained logs.
 ///
-/// It runs no guest. For each measurable cell it runs one `hermit log-diff`
-/// with [`PARITY_RECORD_ENVELOPE`] between the ptrace golden and the
-/// candidate's first-run log, and records it with
-/// [`ParityRecord::from_comparison`]. A missing operand is
-/// [`ParityVerdict::ReferenceMissing`] or [`ParityVerdict::CandidateMissing`];
-/// an operand that is not a passing verify cell, operands run with different
-/// `HERMIT_EPOCH` values, or a comparison that cannot be trusted or recorded,
-/// is [`ParityVerdict::Unavailable`]. Every cell in scope gets exactly one
-/// line.
+/// It runs no guest. Each cell is decided in this order, and every record
+/// that is not `matched` or `diverged` carries the typed
+/// [`UnavailableClass`] of the step that decided it:
+/// - a) the ptrace reference left no deterministic golden
+///   ([`UnavailableGroup::NoGolden`], see [`evaluate_history`]). A
+///   determinism failure on any attempt, or one the caller reports in
+///   [`PostPassConfig::nondeterministic`], is
+///   [`ParityVerdict::Nondeterministic`]; no golden is written for it;
+/// - b) the candidate left no deterministic log, by the same rules;
+/// - c) the backend cannot be given the reference's inputs
+///   ([`ParityVerdict::InputsNotEqualized`]), whatever its rows or logs;
+/// - d) both operands should have a golden, but the cell cannot be measured
+///   ([`UnavailableGroup::Unmeasured`]): a missing result row, a log that
+///   was not retained or cannot be read, an invalid test id, a
+///   `HERMIT_EPOCH` the operands cannot be shown to share, or a golden that
+///   could not be written;
+/// - e) otherwise one `hermit log-diff` with [`PARITY_RECORD_ENVELOPE`]
+///   compares the ptrace golden with the candidate's first-run log, and
+///   [`ParityRecord::from_comparison`] records it. A comparison that cannot
+///   run or report is [`UnavailableClass::LogDiffFailed`].
+///
+/// No log is read before d), so an operand that diverged is never compared,
+/// whatever logs it retained. Every cell in scope gets exactly one line.
 ///
 /// Before anything that can fail it removes the previous outputs
 /// ([`clear_outputs`]) and marks [`PARITY_STATUS_JSON`] `running`; it ends it
@@ -2050,6 +2183,8 @@ fn measure(
         ParityRecord::unmeasured(
             cell,
             ParityVerdict::Unavailable,
+            UnavailableClass::InfrastructureError,
+            Some(ParityOperand::Reference),
             false,
             "configuration probe",
             None,
@@ -2074,130 +2209,265 @@ fn measure(
     let history = |test: &str, backend: &str| -> Option<&Vec<CellResult>> {
         histories.get(&(test.to_string(), backend.to_string()))
     };
-    let rejected = |test: &str, backend: &str| -> Option<&str> {
+    let rejected = |test: &str, backend: &str| -> Option<&ParityRejection> {
         config
             .rejected
             .get(&(test.to_string(), backend.to_string()))
+    };
+    let nondeterministic = |test: &str, backend: &str| -> Option<&str> {
+        config
+            .nondeterministic
+            .get(&(test.to_string(), backend.to_string()))
             .map(String::as_str)
+    };
+    let reference_role = format!("{PARITY_REFERENCE_BACKEND} reference");
+    // One test's golden, written once for every candidate that needs it.
+    let golden_of = |goldens: &mut BTreeMap<String, Result<Operand, Unusable>>,
+                     test: &str,
+                     row: &CellResult| {
+        goldens
+            .entry(test.to_string())
+            .or_insert_with(|| reference_golden(config, test, &reference_role, row))
+            .clone()
     };
 
     let mut records: Vec<Option<ParityRecord>> = vec![None; scope.len()];
     let mut comparisons = Vec::new();
+    let mut references: BTreeMap<String, Result<CellResult, Unusable>> = BTreeMap::new();
     let mut goldens: BTreeMap<String, Result<Operand, Unusable>> = BTreeMap::new();
     for (index, cell) in scope.iter().enumerate() {
-        let unmeasured =
-            |verdict, reason: &str, reference: Option<&Path>, candidate: Option<&Path>| {
-                // Decided before a comparison is chosen, so the inputs are not
-                // shown to be equal.
-                ParityRecord::unmeasured(
-                    cell,
-                    verdict,
-                    false,
-                    reason,
-                    reference.map(path_text).as_deref(),
-                    candidate.map(path_text).as_deref(),
-                    &config.run_id,
-                    &config.hermit_sha,
+        let test = cell.test_id.as_str();
+        let backend = cell.backend.as_str();
+        // Decided before a comparison is chosen, so the inputs are not shown
+        // to be equal.
+        let record = |verdict,
+                      class,
+                      operand,
+                      reason: &str,
+                      reference: Option<&Path>,
+                      candidate: Option<&Path>| {
+            ParityRecord::unmeasured(
+                cell,
+                verdict,
+                class,
+                operand,
+                false,
+                reason,
+                reference.map(path_text).as_deref(),
+                candidate.map(path_text).as_deref(),
+                &config.run_id,
+                &config.hermit_sha,
+            )
+        };
+        let unusable_record =
+            |unusable: &Unusable, reference: Option<&Path>, candidate: Option<&Path>| {
+                record(
+                    unusable.verdict,
+                    unusable.class,
+                    unusable.operand,
+                    &unusable.reason,
+                    reference,
+                    candidate,
                 )
             };
+        let reference_history = history(test, PARITY_REFERENCE_BACKEND);
+        let reference = &*references.entry(cell.test_id.clone()).or_insert_with(|| {
+            evaluate_history(
+                test,
+                ParityOperand::Reference,
+                &reference_role,
+                reference_history,
+                rejected(test, PARITY_REFERENCE_BACKEND),
+                nondeterministic(test, PARITY_REFERENCE_BACKEND),
+                ParityVerdict::ReferenceMissing,
+            )
+        });
+        // a) The reference left no deterministic golden, so no candidate of
+        // this test is compared and neither side's log is read.
+        if let Err(unusable) = reference {
+            if unusable.class.group() == UnavailableGroup::NoGolden {
+                records[index] = Some(unusable_record(unusable, None, None)?);
+                continue;
+            }
+        }
+        let candidate_role = format!("{} candidate", cell.backend);
+        let candidate_history = history(test, backend);
+        let candidate_rejected = rejected(test, backend);
+        let candidate_nondeterministic = nondeterministic(test, backend);
+        let candidate = evaluate_history(
+            test,
+            ParityOperand::Candidate,
+            &candidate_role,
+            candidate_history,
+            candidate_rejected,
+            candidate_nondeterministic,
+            ParityVerdict::CandidateMissing,
+        );
+        // b) The candidate left no deterministic log, so it is not compared
+        // and its logs are not read. A compared backend still names the
+        // golden.
+        if let Err(unusable) = &candidate {
+            if unusable.class.group() == UnavailableGroup::NoGolden {
+                let golden = match reference {
+                    Ok(row) if cell.backend.inputs_not_equalizable().is_none() => {
+                        golden_of(&mut goldens, test, row).ok()
+                    }
+                    _ => None,
+                };
+                records[index] = Some(unusable_record(
+                    unusable,
+                    golden.as_ref().map(|golden| golden.log.as_path()),
+                    None,
+                )?);
+                continue;
+            }
+        }
+        // c) Not compared: whatever its rows or logs, such a backend stops
+        // here.
         if let Some(why) = cell.backend.inputs_not_equalizable() {
-            records[index] = Some(unmeasured(
+            records[index] = Some(record(
                 ParityVerdict::InputsNotEqualized,
+                UnavailableClass::InputsNotEqualized,
+                Some(ParityOperand::Candidate),
                 why,
                 None,
                 None,
             )?);
             continue;
         }
-        let candidate_role = format!("{} candidate", cell.backend);
-        let candidate_history = history(&cell.test_id, cell.backend.as_str());
-        let candidate_rejected = rejected(&cell.test_id, cell.backend.as_str());
-        if candidate_history.is_none()
-            && candidate_rejected.is_none()
-            && history(&cell.test_id, PARITY_REFERENCE_BACKEND).is_some()
-        {
-            // The candidate was planned elsewhere or not at all, so this
-            // process retained no ptrace log for it and writes no golden.
-            records[index] = Some(unmeasured(
+        // d) Both operands should have a deterministic log, but the cell
+        // cannot be measured. In order: a missing result row, an operand's
+        // log (the reference's first), an invalid test id, a HERMIT_EPOCH the
+        // operands cannot be shown to share, and a golden that could not be
+        // written.
+        let candidate_operand = |row: &CellResult| {
+            retained_log(
+                test,
+                ParityOperand::Candidate,
+                &candidate_role,
+                row,
                 ParityVerdict::CandidateMissing,
-                &no_result_row(&cell.test_id, &candidate_role),
-                None,
-                None,
+            )
+            .and_then(|log| {
+                hashed(&log, ParityGuestInputs::from_result(row)).map_err(|error| Unusable {
+                    verdict: ParityVerdict::CandidateMissing,
+                    class: UnavailableClass::LogUnreadable,
+                    operand: Some(ParityOperand::Candidate),
+                    reason: format!(
+                        "the {candidate_role} verify cell of {test} retained a log that cannot \
+                         be read: {error}"
+                    ),
+                })
+            })
+        };
+        let (reference_row, candidate_row) = match (reference, &candidate) {
+            (Ok(reference_row), Ok(candidate_row)) => (reference_row, candidate_row),
+            (Err(unusable), candidate) => {
+                let candidate = candidate
+                    .as_ref()
+                    .ok()
+                    .and_then(|row| candidate_operand(row).ok());
+                records[index] = Some(unusable_record(
+                    unusable,
+                    None,
+                    candidate.as_ref().map(|operand| operand.log.as_path()),
+                )?);
+                continue;
+            }
+            (Ok(reference_row), Err(unusable)) => {
+                // A candidate planned elsewhere or not at all: this process
+                // retained no ptrace log for it and writes no golden.
+                let planned_elsewhere = candidate_history.is_none() && candidate_rejected.is_none();
+                let golden = if planned_elsewhere {
+                    None
+                } else {
+                    golden_of(&mut goldens, test, reference_row).ok()
+                };
+                records[index] = Some(unusable_record(
+                    unusable,
+                    golden.as_ref().map(|golden| golden.log.as_path()),
+                    None,
+                )?);
+                continue;
+            }
+        };
+        let golden = golden_of(&mut goldens, test, reference_row);
+        if let Err(unusable) = &golden {
+            if matches!(
+                unusable.class,
+                UnavailableClass::LogNotRetained | UnavailableClass::LogUnreadable
+            ) {
+                let candidate = candidate_operand(candidate_row).ok();
+                records[index] = Some(unusable_record(
+                    unusable,
+                    None,
+                    candidate.as_ref().map(|operand| operand.log.as_path()),
+                )?);
+                continue;
+            }
+        }
+        let candidate = match candidate_operand(candidate_row) {
+            Ok(candidate) => candidate,
+            Err(unusable) => {
+                records[index] = Some(unusable_record(
+                    &unusable,
+                    golden.as_ref().ok().map(|golden| golden.log.as_path()),
+                    None,
+                )?);
+                continue;
+            }
+        };
+        if let Err(unusable) = &golden {
+            if unusable.class == UnavailableClass::InvalidTestId {
+                records[index] = Some(unusable_record(unusable, None, Some(&candidate.log))?);
+                continue;
+            }
+        }
+        let reference_epoch = ParityGuestInputs::from_result(reference_row).epoch;
+        let candidate_epoch = candidate.inputs.epoch.clone();
+        if reference_epoch.is_none() || reference_epoch != candidate_epoch {
+            let operand = match (&reference_epoch, &candidate_epoch) {
+                (None, Some(_)) => Some(ParityOperand::Reference),
+                (Some(_), None) => Some(ParityOperand::Candidate),
+                _ => None,
+            };
+            let shown =
+                |epoch: &Option<String>| epoch.clone().unwrap_or_else(|| "unrecorded".to_string());
+            let reason = if reference_epoch.is_some() && candidate_epoch.is_some() {
+                "the operands ran with different HERMIT_EPOCH values"
+            } else {
+                "the operands cannot be shown to share a HERMIT_EPOCH"
+            };
+            records[index] = Some(record(
+                ParityVerdict::Unavailable,
+                UnavailableClass::EpochNotShared,
+                operand,
+                &format!(
+                    "{reason}: {PARITY_REFERENCE_BACKEND} reference {}, {} candidate {}",
+                    shown(&reference_epoch),
+                    cell.backend,
+                    shown(&candidate_epoch)
+                ),
+                golden.as_ref().ok().map(|golden| golden.log.as_path()),
+                Some(&candidate.log),
             )?);
             continue;
         }
-        let reference = goldens.entry(cell.test_id.clone()).or_insert_with(|| {
-            reference_golden(
-                config,
-                &cell.test_id,
-                history(&cell.test_id, PARITY_REFERENCE_BACKEND),
-                rejected(&cell.test_id, PARITY_REFERENCE_BACKEND),
-            )
-        });
-        let candidate = retained_operand(
-            &cell.test_id,
-            &candidate_role,
-            candidate_history,
-            candidate_rejected,
-            ParityVerdict::CandidateMissing,
-        )
-        .and_then(|(row, log)| {
-            hashed(&log, ParityGuestInputs::from_result(&row)).map_err(|reason| Unusable {
-                verdict: ParityVerdict::CandidateMissing,
-                reason,
-                log: None,
-            })
-        });
-        let record = match (&*reference, candidate) {
-            (Ok(reference), Ok(candidate))
-                if reference.inputs.epoch == candidate.inputs.epoch
-                    && reference.inputs.epoch.is_some() =>
-            {
-                comparisons.push(Comparison {
-                    index,
-                    cell: cell.clone(),
-                    reference: reference.clone(),
-                    inputs_equalized: inputs_equalized(&reference.inputs, &candidate.inputs),
-                    candidate,
-                });
+        let golden = match golden {
+            Ok(golden) => golden,
+            Err(unusable) => {
+                records[index] = Some(unusable_record(&unusable, None, Some(&candidate.log))?);
                 continue;
             }
-            (Ok(reference), Ok(candidate)) => {
-                let shown = |epoch: &Option<String>| {
-                    epoch.clone().unwrap_or_else(|| "unrecorded".to_string())
-                };
-                let reason = if reference.inputs.epoch.is_some() && candidate.inputs.epoch.is_some()
-                {
-                    "the operands ran with different HERMIT_EPOCH values"
-                } else {
-                    "the operands cannot be shown to share a HERMIT_EPOCH"
-                };
-                unmeasured(
-                    ParityVerdict::Unavailable,
-                    &format!(
-                        "{reason}: {PARITY_REFERENCE_BACKEND} reference {}, {} candidate {}",
-                        shown(&reference.inputs.epoch),
-                        cell.backend,
-                        shown(&candidate.inputs.epoch)
-                    ),
-                    Some(&reference.log),
-                    Some(&candidate.log),
-                )?
-            }
-            (Err(unusable), candidate) => unmeasured(
-                unusable.verdict,
-                &unusable.reason,
-                unusable.log.as_deref(),
-                candidate.as_ref().ok().map(|operand| operand.log.as_path()),
-            )?,
-            (Ok(reference), Err(unusable)) => unmeasured(
-                unusable.verdict,
-                &unusable.reason,
-                Some(&reference.log),
-                unusable.log.as_deref(),
-            )?,
         };
-        records[index] = Some(record);
+        // e) Compare.
+        comparisons.push(Comparison {
+            index,
+            cell: cell.clone(),
+            inputs_equalized: inputs_equalized(&golden.inputs, &candidate.inputs),
+            reference: golden,
+            candidate,
+        });
     }
 
     let log_diff_runs = AtomicUsize::new(0);
@@ -2241,18 +2511,7 @@ fn measure(
         {
             let record = match record {
                 Ok(record) => record,
-                // A report no record can carry is this cell's problem, not
-                // the post-pass's.
-                Err(error) => ParityRecord::unmeasured(
-                    &comparison.cell,
-                    ParityVerdict::Unavailable,
-                    comparison.inputs_equalized,
-                    &format!("the comparison could not be recorded: {error}"),
-                    Some(&path_text(&comparison.reference.log)),
-                    Some(&path_text(&comparison.candidate.log)),
-                    &config.run_id,
-                    &config.hermit_sha,
-                )?,
+                Err(error) => unrecorded_comparison(config, comparison, &error)?,
             };
             records[comparison.index] = Some(record);
         }
@@ -2275,6 +2534,28 @@ fn measure(
         records,
         log_diff_runs: log_diff_runs.into_inner(),
     })
+}
+
+/// The record for a comparison whose report no record can carry. That is
+/// this cell's problem, not the post-pass's: the comparison failed, not
+/// either side, so it names no operand and counts in the floor as 0.
+fn unrecorded_comparison(
+    config: &PostPassConfig,
+    comparison: &Comparison,
+    error: &str,
+) -> Result<ParityRecord, String> {
+    ParityRecord::unmeasured(
+        &comparison.cell,
+        ParityVerdict::Unavailable,
+        UnavailableClass::LogDiffFailed,
+        None,
+        comparison.inputs_equalized,
+        &format!("the comparison could not be recorded: {error}"),
+        Some(&path_text(&comparison.reference.log)),
+        Some(&path_text(&comparison.candidate.log)),
+        &config.run_id,
+        &config.hermit_sha,
+    )
 }
 
 fn no_result_row(test: &str, role: &str) -> String {
@@ -2310,75 +2591,167 @@ fn program_independent_of_cwd(program: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// The final row of one verify cell, and its single retained first-run log.
-/// A cell whose row the caller rejected (`rejected`, with its reason) is
-/// unavailable whatever rows it has.
-fn retained_operand(
+/// What a side's lack of a deterministic log means for its cell.
+fn no_golden_consequence(operand: ParityOperand) -> &'static str {
+    match operand {
+        ParityOperand::Reference => "there is no deterministic golden log to compare against",
+        ParityOperand::Candidate => "it has no deterministic log to compare",
+    }
+}
+
+/// The row of one verify cell whose single retained first-run log is to be
+/// compared, or the typed cause that it has none, decided from the typed
+/// result fields ([`CellResult::result`], [`CellResult::outcome`] and
+/// [`CellResult::error_kind`]) and never from reason text. Every cause names
+/// `operand`.
+///
+/// In order:
+/// - any attempt of `history` whose result is `determinism-failure`, or a
+///   mismatch the caller saw outside `history` (`nondeterministic`), is
+///   [`UnavailableClass::DeterminismMismatch`] with verdict `nondeterministic`,
+///   even when a later attempt passed: such a cell has no deterministic log;
+/// - a row the caller rejected (`rejected`) takes the rejection's class;
+/// - no history, or one [`crate::runner::cell_result_after_retries`] refuses,
+///   is [`UnavailableClass::NoResultRow`];
+/// - the selected row passed: it is returned. Earlier failures other than a
+///   mismatch, such as a timeout, are not evidence that the passing
+///   attempt's log is nondeterministic;
+/// - otherwise the row's own cause: host-inapplicable, its typed result
+///   (timeout, crash, oom, infrastructure-error or sandbox-denied), a `FAIL`
+///   with no typed cause ([`UnavailableClass::FailedUntyped`]), or another
+///   outcome ([`UnavailableClass::Ended`]).
+///
+/// `missing` is the verdict for a side that left no log at all:
+/// `reference-missing` or `candidate-missing`.
+fn evaluate_history(
     test: &str,
+    operand: ParityOperand,
     role: &str,
     history: Option<&Vec<CellResult>>,
-    rejected: Option<&str>,
+    rejected: Option<&ParityRejection>,
+    nondeterministic: Option<&str>,
     missing: ParityVerdict,
-) -> Result<(CellResult, PathBuf), Unusable> {
-    let unusable = |verdict, reason: String| Unusable {
+) -> Result<CellResult, Unusable> {
+    let unusable = |verdict, class, reason: String| Unusable {
         verdict,
+        class,
+        operand: Some(operand),
         reason,
-        log: None,
     };
-    if let Some(why) = rejected {
+    let consequence = no_golden_consequence(operand);
+    if let Some(row) = history
+        .into_iter()
+        .flatten()
+        .find(|row| row.result == Some(ObservedResult::DeterminismFailure))
+    {
+        return Err(unusable(
+            ParityVerdict::Nondeterministic,
+            UnavailableClass::DeterminismMismatch,
+            format!(
+                "the {role} verify cell of {test} failed determinism on attempt {} (its two \
+                 runs diverged), so {consequence}: {}",
+                row.attempt,
+                row.reason.as_deref().unwrap_or("no reason recorded")
+            ),
+        ));
+    }
+    if let Some(why) = nondeterministic {
+        return Err(unusable(
+            ParityVerdict::Nondeterministic,
+            UnavailableClass::DeterminismMismatch,
+            format!("the {role} verify cell of {test} failed determinism: {why}, so {consequence}"),
+        ));
+    }
+    if let Some(rejection) = rejected {
         return Err(unusable(
             ParityVerdict::Unavailable,
-            format!("the {role} verify cell of {test}: {why}"),
+            rejection.class(),
+            format!("the {role} verify cell of {test}: {}", rejection.reason()),
         ));
     }
     let Some(history) = history else {
-        return Err(unusable(missing, no_result_row(test, role)));
+        return Err(unusable(
+            missing,
+            UnavailableClass::NoResultRow,
+            no_result_row(test, role),
+        ));
     };
-    let row = crate::runner::cell_result_after_retries(history)
-        .map_err(|error| {
-            unusable(
-                ParityVerdict::Unavailable,
-                format!("the {role} verify cell of {test} has no valid result history: {error}"),
-            )
-        })?
-        .clone();
-    let detail = || {
-        row.reason
-            .as_deref()
-            .unwrap_or("no reason recorded")
-            .to_string()
-    };
-    match row.outcome.as_str() {
-        "PASS" => {}
-        "HOST-INAPPLICABLE" => {
-            return Err(unusable(
-                missing,
-                format!(
-                    "the {role} verify cell of {test} was host-inapplicable, so it left no log: {}",
-                    detail()
-                ),
-            ));
-        }
-        "FAIL" => {
-            return Err(unusable(
-                ParityVerdict::Unavailable,
-                format!(
-                    "the {role} verify cell of {test} failed determinism: {}",
-                    detail()
-                ),
-            ));
-        }
-        other => {
-            return Err(unusable(
-                ParityVerdict::Unavailable,
-                format!(
-                    "the {role} verify cell of {test} ended {other} ({}): {}",
-                    row.error_kind.as_deref().unwrap_or("no error kind"),
-                    detail()
-                ),
-            ));
-        }
+    let row = crate::runner::cell_result_after_retries(history).map_err(|error| {
+        unusable(
+            ParityVerdict::Unavailable,
+            UnavailableClass::NoResultRow,
+            format!("the {role} verify cell of {test} has no valid result history: {error}"),
+        )
+    })?;
+    let detail = row.reason.as_deref().unwrap_or("no reason recorded");
+    let kind = row.error_kind.as_deref().unwrap_or("no error kind");
+    let typed = row.result.and_then(|result| match result {
+        ObservedResult::Timeout => Some(UnavailableClass::Timeout),
+        ObservedResult::CrashError => Some(UnavailableClass::Crash),
+        ObservedResult::Oom => Some(UnavailableClass::Oom),
+        ObservedResult::InfrastructureError => Some(UnavailableClass::InfrastructureError),
+        ObservedResult::SandboxDenied => Some(UnavailableClass::SandboxDenied),
+        ObservedResult::Pass
+        | ObservedResult::DeterminismFailure
+        | ObservedResult::ParityFailure
+        | ObservedResult::ReplayFailure => None,
+    });
+    let result = row.result.map_or_else(
+        || "no typed result".to_string(),
+        |result| format!("result {}", result.as_str()),
+    );
+    match (row.outcome.as_str(), typed) {
+        ("PASS", _) => Ok(row.clone()),
+        ("HOST-INAPPLICABLE", _) => Err(unusable(
+            missing,
+            UnavailableClass::HostInapplicable,
+            format!(
+                "the {role} verify cell of {test} was host-inapplicable, so it left no log: \
+                 {detail}"
+            ),
+        )),
+        (outcome, Some(class)) => Err(unusable(
+            ParityVerdict::Unavailable,
+            class,
+            format!(
+                "the {role} verify cell of {test} ended {outcome} with {result} ({kind}): {detail}"
+            ),
+        )),
+        ("FAIL", None) => Err(unusable(
+            ParityVerdict::Unavailable,
+            UnavailableClass::FailedUntyped,
+            format!("the {role} verify cell of {test} failed with {result} ({kind}): {detail}"),
+        )),
+        (outcome, None) => Err(unusable(
+            ParityVerdict::Unavailable,
+            UnavailableClass::Ended,
+            format!(
+                "the {role} verify cell of {test} ended {outcome} with {result} ({kind}): {detail}"
+            ),
+        )),
     }
+}
+
+/// The single retained first-run log of the passing verify cell `row`, or
+/// why there is none: [`UnavailableClass::LogNotRetained`] when the cell did
+/// not retain exactly one nonempty first-run log, and
+/// [`UnavailableClass::LogUnreadable`] when its one log exists but cannot be
+/// read. Only first-run logs are considered; a second-run log kept for
+/// determinism debugging is never read.
+fn retained_log(
+    test: &str,
+    operand: ParityOperand,
+    role: &str,
+    row: &CellResult,
+    missing: ParityVerdict,
+) -> Result<PathBuf, Unusable> {
+    let unusable = |class, reason: String| Unusable {
+        verdict: missing,
+        class,
+        operand: Some(operand),
+        reason,
+    };
+    let not_retained = |reason: String| unusable(UnavailableClass::LogNotRetained, reason);
     let Some(directory) = row
         .argv
         .iter()
@@ -2386,13 +2759,10 @@ fn retained_operand(
         .and_then(|flag| row.argv.get(flag + 1))
         .map(PathBuf::from)
     else {
-        return Err(unusable(
-            missing,
-            format!(
-                "the {role} verify cell of {test} retained no logs (its argv has no \
-                 {VERIFY_LOG_DIR_FLAG})"
-            ),
-        ));
+        return Err(not_retained(format!(
+            "the {role} verify cell of {test} retained no logs (its argv has no \
+             {VERIFY_LOG_DIR_FLAG})"
+        )));
     };
     let mut logs = match fs::read_dir(&directory) {
         Ok(entries) => entries
@@ -2405,80 +2775,90 @@ fn retained_operand(
             })
             .collect::<Vec<_>>(),
         Err(error) => {
-            return Err(unusable(
-                missing,
-                format!(
-                    "the {role} verify cell of {test} retained no readable log directory {}: {error}",
-                    directory.display()
-                ),
-            ));
+            return Err(not_retained(format!(
+                "the {role} verify cell of {test} retained no readable log directory {}: {error}",
+                directory.display()
+            )));
         }
     };
     logs.sort();
     match logs.as_slice() {
-        [log] if log.metadata().is_ok_and(|metadata| metadata.len() > 0) => {
-            let log = log.clone();
-            Ok((row, log))
-        }
-        [log] => Err(unusable(
-            missing,
-            format!(
+        [log] => match log.metadata() {
+            Ok(metadata) if metadata.len() > 0 => Ok(log.clone()),
+            Ok(_) => Err(not_retained(format!(
                 "the {role} verify cell of {test} retained an empty log {}",
                 log.display()
-            ),
-        )),
-        _ => Err(unusable(
-            missing,
-            format!(
-                "the {role} verify cell of {test} retained {} {RETAINED_LOG_PREFIX}* logs in {}; \
-                 expected exactly one",
-                logs.len(),
-                directory.display()
-            ),
-        )),
+            ))),
+            Err(error) => Err(unusable(
+                UnavailableClass::LogUnreadable,
+                format!(
+                    "the {role} verify cell of {test} retained a log that cannot be read: {}: \
+                     {error}",
+                    log.display()
+                ),
+            )),
+        },
+        _ => Err(not_retained(format!(
+            "the {role} verify cell of {test} retained {} {RETAINED_LOG_PREFIX}* logs in {}; \
+             expected exactly one",
+            logs.len(),
+            directory.display()
+        ))),
     }
 }
 
-/// Write the ptrace golden and its sidecar below `config.output_dir` from the
-/// reference's retained log. When that log is gone, a golden already written
-/// from the same run, cell attempt and artifact directory is used if it still
-/// has its recorded hash: first the one below `config.output_dir`, then the
-/// one the harness wrote below `config.artifacts`.
+/// The ptrace golden of `test`, from the passing reference row `row`: its
+/// single retained log is hashed, then linked or copied below
+/// `config.output_dir` beside a sidecar. When that log is gone, a golden
+/// already written from the same run, cell attempt and artifact directory is
+/// used if it still has its recorded hash: first the one below
+/// `config.output_dir`, then the one the harness wrote below
+/// `config.artifacts`.
+///
+/// Its errors are unmeasured classes: the reference's log
+/// ([`retained_log`]), a test id that is not a plain relative path
+/// ([`UnavailableClass::InvalidTestId`]), or a golden or sidecar that could
+/// not be written ([`UnavailableClass::GoldenNotWritten`]).
 fn reference_golden(
     config: &PostPassConfig,
     test: &str,
-    history: Option<&Vec<CellResult>>,
-    rejected: Option<&str>,
+    role: &str,
+    row: &CellResult,
 ) -> Result<Operand, Unusable> {
-    let role = format!("{PARITY_REFERENCE_BACKEND} reference");
-    let unavailable = |reason: String| Unusable {
-        verdict: ParityVerdict::Unavailable,
-        reason,
-        log: None,
-    };
-    let (golden, sidecar_path) = golden_paths(&config.output_dir, test).map_err(&unavailable)?;
-    let (row, source) = match retained_operand(
+    let paths = golden_paths(&config.output_dir, test);
+    let source = match retained_log(
         test,
-        &role,
-        history,
-        rejected,
+        ParityOperand::Reference,
+        role,
+        row,
         ParityVerdict::ReferenceMissing,
     ) {
-        Ok(found) => found,
+        Ok(source) => source,
         Err(unusable) => {
-            let reusable = (unusable.verdict == ParityVerdict::ReferenceMissing)
-                .then_some(history)
-                .flatten()
-                .and_then(|history| crate::runner::cell_result_after_retries(history).ok())
-                .and_then(|row| {
-                    existing_golden(&golden, &sidecar_path, row).or_else(|| {
-                        let (golden, sidecar) = golden_paths(&config.artifacts, test).ok()?;
-                        existing_golden(&golden, &sidecar, row)
-                    })
-                });
+            let reusable = paths.as_ref().ok().and_then(|(golden, sidecar)| {
+                existing_golden(golden, sidecar, row).or_else(|| {
+                    let (golden, sidecar) = golden_paths(&config.artifacts, test).ok()?;
+                    existing_golden(&golden, &sidecar, row)
+                })
+            });
             return reusable.ok_or(unusable);
         }
     };
+    let guest_inputs = ParityGuestInputs::from_result(row);
+    let source = hashed(&source, guest_inputs.clone()).map_err(|error| Unusable {
+        verdict: ParityVerdict::ReferenceMissing,
+        class: UnavailableClass::LogUnreadable,
+        operand: Some(ParityOperand::Reference),
+        reason: format!(
+            "the {role} verify cell of {test} retained a log that cannot be read: {error}"
+        ),
+    })?;
+    let (golden, sidecar_path) = paths.map_err(|reason| Unusable {
+        verdict: ParityVerdict::Unavailable,
+        class: UnavailableClass::InvalidTestId,
+        operand: None,
+        reason,
+    })?;
     let write = || -> Result<Operand, String> {
         let parent = golden
             .parent()
@@ -2491,16 +2871,15 @@ fn reference_golden(
             Err(error) => return Err(format!("cannot replace {}: {error}", golden.display())),
         }
         // A hard link costs no disk; a copy is the fallback across filesystems.
-        if fs::hard_link(&source, &golden).is_err() {
-            fs::copy(&source, &golden).map_err(|error| {
+        if fs::hard_link(&source.log, &golden).is_err() {
+            fs::copy(&source.log, &golden).map_err(|error| {
                 format!(
                     "cannot copy {} to {}: {error}",
-                    source.display(),
+                    source.log.display(),
                     golden.display()
                 )
             })?;
         }
-        let guest_inputs = ParityGuestInputs::from_result(&row);
         let operand = hashed(&golden, guest_inputs.clone())?;
         let guest_inputs_sha256 =
             sha256_hex(&serde_json::to_vec(&guest_inputs).map_err(|error| error.to_string())?);
@@ -2515,10 +2894,10 @@ fn reference_golden(
             binary_sha256: row.binary_sha256.clone(),
             outcome: row.outcome.clone(),
             artifact_dir: row.artifact_dir.clone(),
-            source_log: path_text(&independent_of_cwd(&source)?),
+            source_log: path_text(&source.log),
             log_sha256: operand.sha256.clone(),
             log_bytes: operand.bytes,
-            guest_inputs,
+            guest_inputs: guest_inputs.clone(),
             guest_inputs_sha256,
         };
         let mut text = serde_json::to_vec_pretty(&sidecar).map_err(|error| error.to_string())?;
@@ -2526,7 +2905,12 @@ fn reference_golden(
         write_atomically(&sidecar_path, &text)?;
         Ok(operand)
     };
-    write().map_err(|error| unavailable(format!("cannot write the {role} golden: {error}")))
+    write().map_err(|error| Unusable {
+        verdict: ParityVerdict::Unavailable,
+        class: UnavailableClass::GoldenNotWritten,
+        operand: Some(ParityOperand::Reference),
+        reason: format!("cannot write the {role} golden: {error}"),
+    })
 }
 
 /// A golden already written from `row`, if its sidecar still describes it:
@@ -2557,10 +2941,15 @@ fn compare(
     let cell = &comparison.cell;
     let reference_log = path_text(&comparison.reference.log);
     let candidate_log = path_text(&comparison.candidate.log);
+    // Both operands are deterministic and retained, so every way the
+    // comparison fails to run or report is the parity tool's failure: it
+    // concerns the comparison, not either side.
     let unavailable = |reason: String| {
         ParityRecord::unmeasured(
             cell,
             ParityVerdict::Unavailable,
+            UnavailableClass::LogDiffFailed,
+            None,
             comparison.inputs_equalized,
             &reason,
             Some(&reference_log),
@@ -2822,6 +3211,7 @@ pub const PRESSURE_TEST_LEDGER_NODE: &str = "post-pass";
 #[serde(rename_all = "kebab-case")]
 pub enum LedgerVerdict {
     RecordMissing,
+    Nondeterministic,
     Unavailable,
     ReferenceMissing,
     CandidateMissing,
@@ -2834,6 +3224,7 @@ impl LedgerVerdict {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RecordMissing => "record-missing",
+            Self::Nondeterministic => "nondeterministic",
             Self::Unavailable => "unavailable",
             Self::ReferenceMissing => "reference-missing",
             Self::CandidateMissing => "candidate-missing",
@@ -2846,6 +3237,16 @@ impl LedgerVerdict {
     pub fn is_measured(self) -> bool {
         matches!(self, Self::Matched | Self::Diverged)
     }
+
+    /// The side a verdict itself names: `reference-missing` and
+    /// `candidate-missing` say which log is missing.
+    pub fn operand(self) -> Option<ParityOperand> {
+        match self {
+            Self::ReferenceMissing => Some(ParityOperand::Reference),
+            Self::CandidateMissing => Some(ParityOperand::Candidate),
+            _ => None,
+        }
+    }
 }
 
 impl From<ParityVerdict> for LedgerVerdict {
@@ -2853,6 +3254,7 @@ impl From<ParityVerdict> for LedgerVerdict {
         match verdict {
             ParityVerdict::Matched => Self::Matched,
             ParityVerdict::Diverged => Self::Diverged,
+            ParityVerdict::Nondeterministic => Self::Nondeterministic,
             ParityVerdict::ReferenceMissing => Self::ReferenceMissing,
             ParityVerdict::CandidateMissing => Self::CandidateMissing,
             ParityVerdict::Unavailable => Self::Unavailable,
@@ -2867,9 +3269,31 @@ impl fmt::Display for LedgerVerdict {
     }
 }
 
-/// Why a cell that is neither measured nor record-missing was not measured,
-/// derived from its verdict and the reason templates [`post_pass`] writes.
-/// Declared in the order the scorecard prints the classes.
+/// Where a cell of an [`UnavailableClass`] counts. The scorecard's floor
+/// divides the credit by every selected cell except the `no-golden` and
+/// `not-compared` ones; its mean divides by the measured cells only.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UnavailableGroup {
+    /// An operand's own outcome left no deterministic golden log, so there
+    /// was nothing to compare: outside the mean and the floor.
+    NoGolden,
+    /// The backend's inputs cannot be equalized with the reference's, so it
+    /// is never compared: outside the mean and the floor.
+    NotCompared,
+    /// A golden log could exist but no comparison was made, a harness or
+    /// parity-tool defect: in the floor as 0.
+    Unmeasured,
+    /// The run owed the cell a record and wrote none: in the floor as 0.
+    RecordMissing,
+}
+
+/// The one cause of a verdict other than `matched` or `diverged`: a closed
+/// set, with no umbrella or `other` class. The post-pass derives it from the
+/// operands' typed result fields ([`CellResult::result`],
+/// [`CellResult::outcome`] and [`CellResult::error_kind`]) and from which
+/// step failed, never from reason text; the record's `reason` keeps the
+/// specific cause. Declared in the order the scorecard prints the classes,
+/// group by group ([`UnavailableClass::group`]).
 #[derive(
     Clone,
     Copy,
@@ -2884,47 +3308,183 @@ impl fmt::Display for LedgerVerdict {
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum UnavailableClass {
-    /// An operand's verify cell failed determinism.
-    DeterminismFail,
-    /// An operand's verify cell was host-inapplicable, so it left no log.
+    // No golden.
+    /// An operand's `verify` cell diverged between its two runs on some
+    /// attempt (its result `determinism-failure`), so it has no deterministic
+    /// log. Only verdict `nondeterministic`.
+    DeterminismMismatch,
+    /// An operand's final attempt timed out (result `timeout`).
+    Timeout,
+    /// An operand's final attempt crashed or exited wrongly (result
+    /// `crash-error`).
+    Crash,
+    /// An operand's final attempt ran out of memory (result `oom`).
+    Oom,
+    /// An operand's cell failed for an infrastructure cause (result
+    /// `infrastructure-error`), or the caller refused its result row because
+    /// of an evidence error.
+    InfrastructureError,
+    /// A sandbox denied an operation an operand's cell needed (result
+    /// `sandbox-denied`).
+    SandboxDenied,
+    /// An operand's cell `FAIL`ed with no typed cause parity can name: no
+    /// result, or a `replay-failure` or `parity-failure` result. The reason
+    /// names the value.
+    FailedUntyped,
+    /// An operand's cell ended with an outcome other than `PASS`, `FAIL` or
+    /// `HOST-INAPPLICABLE`, and no typed cause. The reason names the outcome
+    /// and the error kind.
+    Ended,
+    /// An operand's cell was host-inapplicable, so it left no log.
     HostInapplicable,
-    /// An operand's verify cell ended some other way (timeout, crash, ...).
-    OperandEnded,
-    /// An operand passed but its log was not retained, was empty, or was not
-    /// exactly one file.
-    LogNotRetained,
-    /// The backend cannot be given the reference's inputs.
+    // Not compared.
+    /// The backend cannot be given the reference's inputs
+    /// ([`ParityBackend::inputs_not_equalizable`]). Only verdict
+    /// `inputs-not-equalized`, operand `candidate`.
     InputsNotEqualized,
-    /// The reference verify cell has no result row in the run.
-    ReferenceMissing,
-    /// The candidate verify cell has no result row in the run.
-    CandidateMissing,
-    /// Anything else, such as a log-diff refusal.
-    Other,
+    // Unmeasured.
+    /// An operand passed but did not retain exactly one nonempty first-run
+    /// log (no `--verify-log-dir`, no readable directory, an empty log, or
+    /// not exactly one).
+    LogNotRetained,
+    /// An operand's single retained log exists but cannot be resolved, read
+    /// or hashed. Verdict `reference-missing` or `candidate-missing`.
+    LogUnreadable,
+    /// An operand has no usable result row: none in the run, a history
+    /// [`crate::runner::cell_result_after_retries`] refuses, or a row the
+    /// caller rejected as invalid.
+    NoResultRow,
+    /// The parity tool could not produce a usable comparison of two
+    /// deterministic, retained logs. Three cases: (1) `hermit log-diff`
+    /// returned a non-verdict report -- `NoResult`, `Refused`,
+    /// `NoComparableMessages` or `IdenticalSoFar` (`IdenticalSoFar` should be
+    /// impossible in one-shot mode, so seeing it means a tool defect); (2) a
+    /// matched or diverged report failed
+    /// [`LogDiffReport::require_cross_backend_evidence`]; (3) a report
+    /// [`ParityRecord::from_comparison`] cannot record. Every way the
+    /// comparison itself fails to run or report (its deadline, its output
+    /// directory, its paths, the spawn, its time bound, an unreadable or
+    /// contradictory report, a report over the wrong inputs) is also this
+    /// class. Verdict `unavailable`, no operand, no credit; in the floor as 0.
+    LogDiffFailed,
+    /// The test id is not a plain relative path, so no golden can be
+    /// written below it. No operand.
+    InvalidTestId,
+    /// The reference's golden log or its sidecar could not be written.
+    /// Operand `reference`.
+    GoldenNotWritten,
+    /// The operands cannot be shown to share a `HERMIT_EPOCH`: operand the
+    /// side that recorded none when exactly one did not, no operand when
+    /// both recorded different values or neither recorded one.
+    EpochNotShared,
+    // Ledger.
+    /// The run owed the cell a record and wrote none. Only verdict
+    /// `record-missing`, no operand; a record never carries it.
+    RecordMissing,
 }
 
 impl UnavailableClass {
-    pub const ALL: [Self; 8] = [
-        Self::DeterminismFail,
+    pub const ALL: [Self; 18] = [
+        Self::DeterminismMismatch,
+        Self::Timeout,
+        Self::Crash,
+        Self::Oom,
+        Self::InfrastructureError,
+        Self::SandboxDenied,
+        Self::FailedUntyped,
+        Self::Ended,
         Self::HostInapplicable,
-        Self::OperandEnded,
-        Self::LogNotRetained,
         Self::InputsNotEqualized,
-        Self::ReferenceMissing,
-        Self::CandidateMissing,
-        Self::Other,
+        Self::LogNotRetained,
+        Self::LogUnreadable,
+        Self::NoResultRow,
+        Self::LogDiffFailed,
+        Self::InvalidTestId,
+        Self::GoldenNotWritten,
+        Self::EpochNotShared,
+        Self::RecordMissing,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::DeterminismFail => "determinism-fail",
+            Self::DeterminismMismatch => "determinism-mismatch",
+            Self::Timeout => "timeout",
+            Self::Crash => "crash",
+            Self::Oom => "oom",
+            Self::InfrastructureError => "infrastructure-error",
+            Self::SandboxDenied => "sandbox-denied",
+            Self::FailedUntyped => "failed-untyped",
+            Self::Ended => "ended",
             Self::HostInapplicable => "host-inapplicable",
-            Self::OperandEnded => "operand-ended",
-            Self::LogNotRetained => "log-not-retained",
             Self::InputsNotEqualized => "inputs-not-equalized",
-            Self::ReferenceMissing => "reference-missing",
-            Self::CandidateMissing => "candidate-missing",
-            Self::Other => "other",
+            Self::LogNotRetained => "log-not-retained",
+            Self::LogUnreadable => "log-unreadable",
+            Self::NoResultRow => "no-result-row",
+            Self::LogDiffFailed => "log-diff-failed",
+            Self::InvalidTestId => "invalid-test-id",
+            Self::GoldenNotWritten => "golden-not-written",
+            Self::EpochNotShared => "epoch-not-shared",
+            Self::RecordMissing => "record-missing",
+        }
+    }
+
+    pub fn group(self) -> UnavailableGroup {
+        match self {
+            Self::DeterminismMismatch
+            | Self::Timeout
+            | Self::Crash
+            | Self::Oom
+            | Self::InfrastructureError
+            | Self::SandboxDenied
+            | Self::FailedUntyped
+            | Self::Ended
+            | Self::HostInapplicable => UnavailableGroup::NoGolden,
+            Self::InputsNotEqualized => UnavailableGroup::NotCompared,
+            Self::LogNotRetained
+            | Self::LogUnreadable
+            | Self::NoResultRow
+            | Self::LogDiffFailed
+            | Self::InvalidTestId
+            | Self::GoldenNotWritten
+            | Self::EpochNotShared => UnavailableGroup::Unmeasured,
+            Self::RecordMissing => UnavailableGroup::RecordMissing,
+        }
+    }
+
+    /// The verdicts the class may go with.
+    pub fn verdicts(self) -> &'static [LedgerVerdict] {
+        match self {
+            Self::DeterminismMismatch => &[LedgerVerdict::Nondeterministic],
+            Self::InputsNotEqualized => &[LedgerVerdict::InputsNotEqualized],
+            Self::RecordMissing => &[LedgerVerdict::RecordMissing],
+            Self::LogUnreadable => &[
+                LedgerVerdict::ReferenceMissing,
+                LedgerVerdict::CandidateMissing,
+            ],
+            _ => &[
+                LedgerVerdict::Unavailable,
+                LedgerVerdict::ReferenceMissing,
+                LedgerVerdict::CandidateMissing,
+            ],
+        }
+    }
+
+    /// The operands the class may name; `None` is no operand.
+    pub fn operands(self) -> &'static [Option<ParityOperand>] {
+        const EITHER: &[Option<ParityOperand>] = &[
+            Some(ParityOperand::Reference),
+            Some(ParityOperand::Candidate),
+        ];
+        match self {
+            Self::InputsNotEqualized => &[Some(ParityOperand::Candidate)],
+            Self::LogDiffFailed | Self::InvalidTestId | Self::RecordMissing => &[None],
+            Self::GoldenNotWritten => &[Some(ParityOperand::Reference)],
+            Self::EpochNotShared => &[
+                Some(ParityOperand::Reference),
+                Some(ParityOperand::Candidate),
+                None,
+            ],
+            _ => EITHER,
         }
     }
 }
@@ -2935,52 +3495,137 @@ impl fmt::Display for UnavailableClass {
     }
 }
 
-/// The unavailable class of one cell, or `None` for a measured or
-/// record-missing cell. It reads the `the <role> verify cell of <test> ...`
-/// templates of the operand checks; a reason it does not recognize is
-/// classed by its verdict alone, and an unrecognized `unavailable` reason is
-/// [`UnavailableClass::Other`].
-pub fn unavailable_class(verdict: LedgerVerdict, reason: Option<&str>) -> Option<UnavailableClass> {
-    let by_verdict = match verdict {
-        LedgerVerdict::Matched | LedgerVerdict::Diverged | LedgerVerdict::RecordMissing => {
-            return None;
-        }
-        LedgerVerdict::InputsNotEqualized => return Some(UnavailableClass::InputsNotEqualized),
-        LedgerVerdict::ReferenceMissing => UnavailableClass::ReferenceMissing,
-        LedgerVerdict::CandidateMissing => UnavailableClass::CandidateMissing,
-        LedgerVerdict::Unavailable => UnavailableClass::Other,
-    };
-    let Some((role, rest)) = reason.and_then(operand_reason) else {
-        return Some(by_verdict);
-    };
-    Some(if rest.starts_with("failed determinism:") {
-        UnavailableClass::DeterminismFail
-    } else if rest.starts_with("was host-inapplicable, so it left no log") {
-        UnavailableClass::HostInapplicable
-    } else if rest.starts_with("ended ") {
-        UnavailableClass::OperandEnded
-    } else if rest.starts_with("retained ") {
-        UnavailableClass::LogNotRetained
-    } else if rest == "has no result row in this run" {
-        if role == "reference" {
-            UnavailableClass::ReferenceMissing
-        } else {
-            UnavailableClass::CandidateMissing
-        }
-    } else {
-        by_verdict
-    })
+/// One side of a parity comparison.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ParityOperand {
+    /// The ptrace reference.
+    Reference,
+    /// The candidate backend.
+    Candidate,
 }
 
-/// Split `the <role> verify cell of <test> <rest>` into the role's last word
-/// (`candidate` or `reference`) and `rest`. The post-pass names a role in two
-/// words, `<backend> candidate` and `ptrace reference`, so the role is
-/// everything before ` verify cell of `, not one word.
-fn operand_reason(reason: &str) -> Option<(&str, &str)> {
-    let rest = reason.strip_prefix("the ")?;
-    let (role, rest) = rest.split_once(" verify cell of ")?;
-    let (_test, rest) = rest.split_once(' ')?;
-    Some((role.rsplit(' ').next()?, rest))
+impl ParityOperand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
+impl fmt::Display for ParityOperand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn shown_operand(operand: Option<ParityOperand>) -> &'static str {
+    operand.map_or("null", ParityOperand::as_str)
+}
+
+/// The typed reason a record or ledger row gives for its verdict.
+///
+/// `class` is `None` exactly on a measured (`matched` or `diverged`) verdict.
+/// Otherwise it is one class of the closed set, it fits the verdict
+/// ([`UnavailableClass::verdicts`]: `determinism-mismatch` goes with exactly
+/// `nondeterministic`, and so on), and `operand` is a side the class may
+/// concern ([`UnavailableClass::operands`]), which a `reference-missing` or
+/// `candidate-missing` verdict also names. A backend declared
+/// [`ParityBackend::inputs_not_equalizable`] is never compared: it has no
+/// measured verdict and no unmeasured class, and no other backend has an
+/// `inputs-not-equalized` verdict. The reason text is never read. dev-hermit's
+/// `ci-hub/series/parity_ledger.py` `check_class`, added by slice D5 of
+/// https://github.com/rrnewton/hermit/issues/3301, makes the same checks with
+/// the same messages.
+pub fn check_class(
+    at: &str,
+    backend: ParityBackend,
+    verdict: LedgerVerdict,
+    class: Option<UnavailableClass>,
+    operand: Option<ParityOperand>,
+) -> Result<(), String> {
+    let why = backend.inputs_not_equalizable();
+    if verdict == LedgerVerdict::InputsNotEqualized && why.is_none() {
+        return Err(format!(
+            "{at}: {backend} inputs can be equalized; a comparison with unequal inputs is \
+             measured and reports unequalized_credit"
+        ));
+    }
+    if verdict.is_measured() {
+        if let Some(why) = why {
+            return Err(format!(
+                "{at}: {backend} inputs cannot be equalized, so it reports no measured \
+                 comparison and never equal inputs: {why}"
+            ));
+        }
+        if let Some(class) = class {
+            return Err(format!(
+                "{at}: a {verdict} verdict is measured and carries no unavailable_class, \
+                 got {class}"
+            ));
+        }
+        if let Some(operand) = operand {
+            return Err(format!(
+                "{at}: a {verdict} verdict is measured and names no operand, got {operand}"
+            ));
+        }
+        return Ok(());
+    }
+    let Some(class) = class else {
+        return Err(format!(
+            "{at}: verdict {verdict} needs an unavailable_class"
+        ));
+    };
+    let verdicts = class.verdicts();
+    if !verdicts.contains(&verdict) {
+        return Err(format!(
+            "{at}: unavailable_class {class} cannot go with verdict {verdict}; it needs {}",
+            verdicts
+                .iter()
+                .map(|verdict| verdict.as_str())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ));
+    }
+    if why.is_some() && class.group() == UnavailableGroup::Unmeasured {
+        return Err(format!(
+            "{at}: {backend} inputs cannot be equalized, so no comparison is attempted and \
+             it carries no unmeasured class, got {class}"
+        ));
+    }
+    let operands = class.operands();
+    if !operands.contains(&operand) {
+        return Err(format!(
+            "{at}: unavailable_class {class} needs operand {}, got {}",
+            operands
+                .iter()
+                .map(|side| shown_operand(*side))
+                .collect::<Vec<_>>()
+                .join(" or "),
+            shown_operand(operand)
+        ));
+    }
+    if let Some(side) = verdict.operand() {
+        if operand != Some(side) {
+            return Err(format!(
+                "{at}: verdict {verdict} names the {side} operand, got {}",
+                shown_operand(operand)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// How far the node's post-pass got, as the ledger records it.
@@ -3049,6 +3694,15 @@ pub struct ParityLedgerSource {
     pub test_id: String,
     pub backend: ParityBackend,
     pub verdict: LedgerVerdict,
+    /// The record's [`ParityRecord::unavailable_class`], or
+    /// [`UnavailableClass::RecordMissing`] for a `record-missing` row.
+    /// Required, `null` included.
+    #[serde(deserialize_with = "present")]
+    pub unavailable_class: Option<UnavailableClass>,
+    /// The record's [`ParityRecord::operand`]; `None` for `record-missing`.
+    /// Required, `null` included.
+    #[serde(deserialize_with = "present")]
+    pub operand: Option<ParityOperand>,
     pub reason: Option<String>,
     pub run_id: Option<String>,
     pub hermit_sha: Option<String>,
@@ -3112,6 +3766,12 @@ pub struct ParityLedgerRow {
     pub test_id: String,
     pub backend: ParityBackend,
     pub verdict: LedgerVerdict,
+    /// [`ParityLedgerSource::unavailable_class`]. Required, `null` included.
+    #[serde(deserialize_with = "present")]
+    pub unavailable_class: Option<UnavailableClass>,
+    /// [`ParityLedgerSource::operand`]. Required, `null` included.
+    #[serde(deserialize_with = "present")]
+    pub operand: Option<ParityOperand>,
     pub reason: Option<String>,
     pub source: ParityLedgerOrigin,
     pub record: Option<ParityRecord>,
@@ -3250,10 +3910,11 @@ pub fn parse_utc_timestamp(text: &str) -> Result<UtcInstant, String> {
 }
 
 /// The checks a source row and a published row share: the cell names its
-/// test and backend, the record is present exactly when the verdict is not
-/// `record-missing` and agrees with the row, the record passes
-/// [`ParityRecord::validate`] (every credit invariant), and a reason is given
-/// for every verdict but `matched` and `diverged`.
+/// test and backend, a reason is given for every verdict but `matched` and
+/// `diverged`, the class and operand fit the verdict ([`check_class`]), the
+/// record is present exactly when the verdict is not `record-missing` and
+/// agrees with the row (verdict, cell, class, operand, reason, run and tree),
+/// and the record passes [`ParityRecord::validate`] (every credit invariant).
 #[allow(clippy::too_many_arguments)]
 fn check_ledger_fields(
     at: &str,
@@ -3261,6 +3922,8 @@ fn check_ledger_fields(
     test_id: &str,
     backend: ParityBackend,
     verdict: LedgerVerdict,
+    class: Option<UnavailableClass>,
+    operand: Option<ParityOperand>,
     reason: Option<&str>,
     run_id: Option<&str>,
     hermit_sha: Option<&str>,
@@ -3276,6 +3939,7 @@ fn check_ledger_fields(
     if !verdict.is_measured() && reason.is_none_or(|reason| reason.trim().is_empty()) {
         return Err(format!("{at}: verdict {verdict} needs a reason"));
     }
+    check_class(at, backend, verdict, class, operand)?;
     match source.post_pass_state {
         LedgerPostPassState::Absent if verdict != LedgerVerdict::RecordMissing => {
             return Err(format!(
@@ -3312,6 +3976,23 @@ fn check_ledger_fields(
                     record.test_id, record.backend
                 ));
             }
+            if record.unavailable_class != class {
+                let shown = |class: Option<UnavailableClass>| {
+                    class.map_or("null", UnavailableClass::as_str)
+                };
+                return Err(format!(
+                    "{at}: row unavailable_class {} disagrees with the record's {}",
+                    shown(class),
+                    shown(record.unavailable_class)
+                ));
+            }
+            if record.operand != operand {
+                return Err(format!(
+                    "{at}: row operand {} disagrees with the record's {}",
+                    shown_operand(operand),
+                    shown_operand(record.operand)
+                ));
+            }
             if record.reason.as_deref() != reason {
                 return Err(format!("{at}: row reason disagrees with the record's"));
             }
@@ -3342,6 +4023,8 @@ impl ParityLedgerSource {
             &self.test_id,
             self.backend,
             self.verdict,
+            self.unavailable_class,
+            self.operand,
             self.reason.as_deref(),
             self.run_id.as_deref(),
             self.hermit_sha.as_deref(),
@@ -3404,6 +4087,8 @@ impl ParityLedgerRow {
             &self.test_id,
             self.backend,
             self.verdict,
+            self.unavailable_class,
+            self.operand,
             self.reason.as_deref(),
             Some(&self.run_id),
             Some(&self.hermit_sha),
@@ -3664,6 +4349,8 @@ pub fn node_ledger_sources(
         test_id: record.test_id.clone(),
         backend: record.backend,
         verdict: record.verdict.into(),
+        unavailable_class: record.unavailable_class,
+        operand: record.operand,
         reason: record.reason.clone(),
         run_id: Some(status.run_id.clone()),
         hermit_sha: Some(status.hermit_sha.clone()),
@@ -3793,6 +4480,8 @@ fn missing_row(
         test_id: cell.test_id.clone(),
         backend: cell.backend,
         verdict: LedgerVerdict::RecordMissing,
+        unavailable_class: Some(UnavailableClass::RecordMissing),
+        operand: None,
         reason: Some(reason.to_string()),
         run_id: status.map(|status| status.run_id.clone()),
         hermit_sha: status.map(|status| status.hermit_sha.clone()),
@@ -4646,6 +5335,8 @@ mod tests {
         let missing = ParityRecord::unmeasured(
             &cell(),
             ParityVerdict::ReferenceMissing,
+            UnavailableClass::LogNotRetained,
+            Some(ParityOperand::Reference),
             false,
             "ptrace verify retained no log",
             None,
@@ -4667,13 +5358,15 @@ mod tests {
         let current = LOG_DIFF_REPORT_SCHEMA;
         let matched = record_for(&report(current, LogDiffVerdict::Matched, 3, 3, Some(3)));
         let diverged = record_for(&report(current, LogDiffVerdict::Diverged, 4, 4, Some(2)));
-        let cases: Vec<(&str, ParityRecord)> = vec![
+        let prefix = "disagrees with matched prefix";
+        let cases: Vec<(&str, ParityRecord, &str)> = vec![
             (
                 "a partial-credit match",
                 ParityRecord {
                     credit: Some(0.5),
                     ..matched.clone()
                 },
+                prefix,
             ),
             (
                 "a zero-credit match",
@@ -4681,6 +5374,7 @@ mod tests {
                     credit: Some(0.0),
                     ..matched.clone()
                 },
+                prefix,
             ),
             (
                 "an unmeasured match",
@@ -4688,6 +5382,7 @@ mod tests {
                     credit: None,
                     ..matched.clone()
                 },
+                prefix,
             ),
             (
                 "a full-credit divergence",
@@ -4695,6 +5390,7 @@ mod tests {
                     credit: Some(1.0),
                     ..diverged.clone()
                 },
+                prefix,
             ),
             (
                 "credit disagreeing with the prefix",
@@ -4702,6 +5398,7 @@ mod tests {
                     credit: Some(0.25),
                     ..diverged.clone()
                 },
+                prefix,
             ),
             (
                 "a measured verdict with a reason",
@@ -4709,6 +5406,7 @@ mod tests {
                     reason: Some("why".into()),
                     ..diverged.clone()
                 },
+                "a measured verdict carries no reason",
             ),
             (
                 "a short hermit sha",
@@ -4716,30 +5414,41 @@ mod tests {
                     hermit_sha: "abc".into(),
                     ..matched.clone()
                 },
+                "hermit_sha must be 40 lowercase hex digits",
             ),
+            // These three carry the class and operand their verdict needs, so
+            // each is refused for the contradiction its label names.
             (
                 "an unmeasured verdict with credit",
                 ParityRecord {
                     verdict: ParityVerdict::CandidateMissing,
+                    unavailable_class: Some(UnavailableClass::LogNotRetained),
+                    operand: Some(ParityOperand::Candidate),
                     reason: Some("no log".into()),
                     candidate_log: None,
                     ..matched.clone()
                 },
+                "CandidateMissing is unmeasured and carries no credit or divergence",
             ),
             (
                 "an unmeasured verdict without a reason",
                 ParityRecord {
                     verdict: ParityVerdict::Unavailable,
+                    unavailable_class: Some(UnavailableClass::LogDiffFailed),
+                    operand: None,
                     reason: None,
                     credit: None,
                     matched_prefix: None,
                     ..matched.clone()
                 },
+                "Unavailable needs a reason",
             ),
             (
                 "a missing log that is named",
                 ParityRecord {
                     verdict: ParityVerdict::CandidateMissing,
+                    unavailable_class: Some(UnavailableClass::LogNotRetained),
+                    operand: Some(ParityOperand::Candidate),
                     reason: Some("no log".into()),
                     credit: None,
                     matched_prefix: None,
@@ -4747,10 +5456,14 @@ mod tests {
                     right_len: None,
                     ..matched.clone()
                 },
+                "CandidateMissing names the log it says is missing",
             ),
         ];
-        for (label, record) in cases {
-            assert!(record.validate().is_err(), "{label} must be refused");
+        for (label, record, expected) in cases {
+            let Err(error) = record.validate() else {
+                panic!("{label} must be refused");
+            };
+            assert!(error.contains(expected), "{label}: {error}");
         }
     }
 
@@ -4922,6 +5635,299 @@ mod tests {
             ParityBackend::Sabre,
         ] {
             assert_eq!(backend.inputs_not_equalizable(), None);
+        }
+    }
+
+    /// The first `log-diff-failed` site: a report whose verdict is not a
+    /// measurement is `unavailable` with class `log-diff-failed`, no operand,
+    /// both logs, and the verdict and any refusal as its reason, unless the
+    /// backend is never compared, which is decided first.
+    #[test]
+    fn a_log_diff_verdict_that_is_not_a_measurement_is_log_diff_failed() {
+        let current = LOG_DIFF_REPORT_SCHEMA;
+        for verdict in [
+            LogDiffVerdict::Refused,
+            LogDiffVerdict::NoResult,
+            LogDiffVerdict::NoComparableMessages,
+            LogDiffVerdict::IdenticalSoFar,
+        ] {
+            let record = record_for(&report(current, verdict, 0, 0, None));
+            record.validate().unwrap();
+            assert_eq!(
+                (record.verdict, record.unavailable_class, record.operand),
+                (
+                    ParityVerdict::Unavailable,
+                    Some(UnavailableClass::LogDiffFailed),
+                    None
+                ),
+                "{verdict:?}"
+            );
+            assert_eq!(
+                record.reason,
+                Some(format!("log-diff verdict was {verdict:?}"))
+            );
+            assert_eq!(record.measured_credit(), None, "{verdict:?}");
+            assert_eq!(
+                (
+                    record.reference_log.as_deref(),
+                    record.candidate_log.as_deref()
+                ),
+                (Some("ref.log"), Some("cand.log")),
+                "{verdict:?}"
+            );
+        }
+        let mut refused = report(current, LogDiffVerdict::Refused, 0, 0, None);
+        refused.refusal = Some("detail".into());
+        assert_eq!(
+            record_for(&refused).reason.as_deref(),
+            Some("log-diff verdict was Refused: detail")
+        );
+        let why = ParityBackend::Dbt.inputs_not_equalizable().unwrap();
+        let dbt = record_on(ParityBackend::Dbt, &refused, false);
+        assert_eq!(
+            (dbt.verdict, dbt.unavailable_class, dbt.operand),
+            (
+                ParityVerdict::InputsNotEqualized,
+                Some(UnavailableClass::InputsNotEqualized),
+                Some(ParityOperand::Candidate)
+            )
+        );
+        assert_eq!(dbt.reason.as_deref(), Some(why));
+        let dbt_cell = ParityCellId {
+            backend: ParityBackend::Dbt,
+            ..cell()
+        };
+        assert_eq!(
+            ParityRecord::from_comparison(
+                &dbt_cell, &refused, true, "ref.log", "cand.log", "run-1", SHA,
+            ),
+            Err(format!(
+                "parity cell {dbt_cell}: inputs cannot be equalized: {why}"
+            ))
+        );
+    }
+
+    /// The second `log-diff-failed` site: a matched or diverged report that
+    /// fails the cross-backend evidence policy is `unavailable` with class
+    /// `log-diff-failed` and the policy's refusal as its reason, never a
+    /// measured verdict.
+    #[test]
+    fn a_report_that_is_not_cross_backend_evidence_is_log_diff_failed() {
+        let bad = report(
+            LOG_DIFF_REPORT_SCHEMA,
+            LogDiffVerdict::Matched,
+            3,
+            3,
+            Some(2),
+        );
+        let refusal = bad.require_cross_backend_evidence().unwrap_err();
+        assert!(
+            refusal.contains("matched 2 of 3 | 3 selected messages"),
+            "{refusal}"
+        );
+        let record = record_for(&bad);
+        record.validate().unwrap();
+        assert_eq!(
+            (record.verdict, record.unavailable_class, record.operand),
+            (
+                ParityVerdict::Unavailable,
+                Some(UnavailableClass::LogDiffFailed),
+                None
+            )
+        );
+        assert_eq!(
+            record.reason,
+            Some(format!(
+                "log-diff report is not cross-backend evidence: {refusal}"
+            ))
+        );
+        assert_eq!((record.credit, record.unequalized_credit), (None, None));
+        assert_eq!(
+            (record.left_len, record.right_len, record.matched_prefix),
+            (None, None, None)
+        );
+        assert_eq!(
+            (
+                record.reference_log.as_deref(),
+                record.candidate_log.as_deref()
+            ),
+            (Some("ref.log"), Some("cand.log"))
+        );
+    }
+
+    /// The third `log-diff-failed` site: a comparison whose report no record
+    /// can carry names both logs and no operand; a backend that is never
+    /// compared cannot carry that class.
+    #[test]
+    fn a_comparison_no_record_can_carry_is_log_diff_failed_with_both_logs() {
+        let inputs = ParityGuestInputs {
+            guest_argv: vec!["/bin/true".into()],
+            guest_env: BTreeMap::new(),
+            workdir: None,
+            mounts: Vec::new(),
+            epoch: Some(EPOCH.into()),
+        };
+        let operand = |log: &str, digit: &str| Operand {
+            log: PathBuf::from(log),
+            sha256: digit.repeat(64),
+            bytes: 100,
+            inputs: inputs.clone(),
+        };
+        let golden = "/artifacts/parity/golden/fixture/parity.detlog";
+        let log = "/artifacts/fixture-parity-verify-kvm/run1_log_fixture.log";
+        let (reference, candidate) = (operand(golden, "a"), operand(log, "b"));
+        let config = PostPassConfig::new(
+            Path::new("/artifacts"),
+            Path::new("/bin/hermit"),
+            "run-1",
+            SHA,
+        );
+        let comparison = |backend, inputs_equalized| Comparison {
+            index: 0,
+            cell: ParityCellId { backend, ..cell() },
+            reference: reference.clone(),
+            candidate: candidate.clone(),
+            inputs_equalized,
+        };
+        let record =
+            unrecorded_comparison(&config, &comparison(ParityBackend::Kvm, true), "planted")
+                .unwrap();
+        record.validate().unwrap();
+        assert_eq!(
+            (record.verdict, record.unavailable_class, record.operand),
+            (
+                ParityVerdict::Unavailable,
+                Some(UnavailableClass::LogDiffFailed),
+                None
+            )
+        );
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("the comparison could not be recorded: planted")
+        );
+        assert_eq!(
+            (
+                record.reference_log.as_deref(),
+                record.candidate_log.as_deref()
+            ),
+            (Some(golden), Some(log))
+        );
+        assert!(record.inputs_equalized);
+        assert_eq!(record.measured_credit(), None);
+        assert_eq!(
+            (record.run_id.as_str(), record.hermit_sha.as_str()),
+            ("run-1", SHA)
+        );
+        let error =
+            unrecorded_comparison(&config, &comparison(ParityBackend::Dbt, false), "planted")
+                .unwrap_err();
+        assert!(error.contains("no comparison is attempted"), "{error}");
+    }
+
+    /// Only a backend whose inputs cannot be equalized reports
+    /// `inputs-not-equalized`, and such a backend reports nothing else of a
+    /// comparison: no measured verdict and no unmeasured class.
+    #[test]
+    fn inputs_not_equalized_is_for_a_backend_that_cannot_be_equalized_only() {
+        let at = |backend: ParityBackend| format!("parity record fixture/parity@{backend}");
+        let why = ParityBackend::Dbt.inputs_not_equalizable().unwrap();
+        let (ine, candidate) = (
+            Some(UnavailableClass::InputsNotEqualized),
+            Some(ParityOperand::Candidate),
+        );
+        for backend in [
+            ParityBackend::Kvm,
+            ParityBackend::Liteinst,
+            ParityBackend::Sabre,
+        ] {
+            assert_eq!(
+                check_class(
+                    &at(backend),
+                    backend,
+                    LedgerVerdict::InputsNotEqualized,
+                    ine,
+                    candidate
+                ),
+                Err(format!(
+                    "{}: {backend} inputs can be equalized; a comparison with unequal inputs \
+                     is measured and reports unequalized_credit",
+                    at(backend)
+                ))
+            );
+        }
+        let (dbt, kvm) = (ParityBackend::Dbt, ParityBackend::Kvm);
+        assert_eq!(
+            check_class(
+                &at(dbt),
+                dbt,
+                LedgerVerdict::InputsNotEqualized,
+                ine,
+                candidate
+            ),
+            Ok(())
+        );
+        let never_measured = format!(
+            "{}: dbt inputs cannot be equalized, so it reports no measured comparison and \
+             never equal inputs: {why}",
+            at(dbt)
+        );
+        for verdict in [LedgerVerdict::Matched, LedgerVerdict::Diverged] {
+            assert_eq!(
+                check_class(&at(dbt), dbt, verdict, None, None),
+                Err(never_measured.clone())
+            );
+        }
+        for class in UnavailableClass::ALL {
+            let (verdict, operand) = (class.verdicts()[0], class.operands()[0]);
+            let on_dbt = check_class(&at(dbt), dbt, verdict, Some(class), operand);
+            if class.group() == UnavailableGroup::Unmeasured {
+                assert_eq!(
+                    on_dbt,
+                    Err(format!(
+                        "{}: dbt inputs cannot be equalized, so no comparison is attempted \
+                         and it carries no unmeasured class, got {class}",
+                        at(dbt)
+                    ))
+                );
+            } else {
+                assert_eq!(on_dbt, Ok(()), "{class}");
+            }
+            assert_eq!(
+                check_class(&at(kvm), kvm, verdict, Some(class), operand).is_ok(),
+                class != UnavailableClass::InputsNotEqualized,
+                "{class}"
+            );
+        }
+        // The record check refuses the same contradictions.
+        let matched = report(
+            LOG_DIFF_REPORT_SCHEMA,
+            LogDiffVerdict::Matched,
+            3,
+            3,
+            Some(3),
+        );
+        let error = ParityRecord {
+            backend: kvm,
+            ..record_on(dbt, &matched, false)
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("kvm inputs can be equalized"), "{error}");
+        let clean = record_for(&matched);
+        for record in [
+            ParityRecord {
+                backend: dbt,
+                inputs_equalized: false,
+                credit: None,
+                unequalized_credit: Some(1.0),
+                ..clean.clone()
+            },
+            ParityRecord {
+                backend: dbt,
+                ..clean
+            },
+        ] {
+            assert_eq!(record.validate(), Err(never_measured.clone()));
         }
     }
 
@@ -5324,6 +6330,30 @@ mod tests {
         row
     }
 
+    /// `row` with the typed result and error kind the runner derived for it.
+    fn typed(mut row: CellResult, result: ObservedResult, error_kind: Option<&str>) -> CellResult {
+        row.result = Some(result);
+        row.error_kind = error_kind.map(str::to_string);
+        row
+    }
+
+    /// The `--verify-log-dir` of `row`.
+    fn log_dir(row: &CellResult) -> PathBuf {
+        let flag = row
+            .argv
+            .iter()
+            .position(|arg| arg == VERIFY_LOG_DIR_FLAG)
+            .unwrap();
+        PathBuf::from(&row.argv[flag + 1])
+    }
+
+    /// `row` with its second run's log kept beside its first run's, as
+    /// `--keep-logs` keeps both for determinism debugging.
+    fn keep_second_run(row: CellResult, log: &str) -> CellResult {
+        fs::write(log_dir(&row).join("run2_log_fixture.log"), log).unwrap();
+        row
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             if !std::thread::panicking() {
@@ -5345,7 +6375,11 @@ mod tests {
 
     /// Every cell in scope gets one line, in scope order, from the retained
     /// logs alone: measured cells carry credit and the first divergence,
-    /// unmeasured cells a verdict and a reason with null credit.
+    /// unmeasured cells a verdict, a typed class and a reason with null
+    /// credit. A determinism failure on any attempt of either operand is
+    /// `nondeterministic` even when a later attempt passed, and a mismatched
+    /// reference writes no golden; another failure followed by a pass is not
+    /// evidence against the passing log, which is compared.
     #[test]
     fn the_post_pass_measures_each_cell_from_retained_logs_only() {
         let fixture = Fixture::new("measures");
@@ -5361,9 +6395,13 @@ mod tests {
                 "PASS",
                 Some(&format!("{noise}{REFERENCE}")),
             ),
-            // A retried candidate: the passing attempt's log is the one
-            // compared, not the first attempt's.
-            fixture.row("fx/same", "liteinst", 1, "FAIL", Some(REFERENCE)),
+            // A retried candidate whose first attempt timed out: the passing
+            // attempt's log is the one compared, not the first attempt's.
+            typed(
+                fixture.row("fx/same", "liteinst", 1, "FAIL", Some(REFERENCE)),
+                ObservedResult::Timeout,
+                Some("wall-timeout"),
+            ),
             fixture.row("fx/same", "liteinst", 2, "PASS", Some(DIVERGENT)),
             fixture.row("fx/nolog", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/nolog", "kvm", 1, "PASS", Some(REFERENCE)),
@@ -5375,6 +6413,21 @@ mod tests {
             fixture.row("fx/candidate-failed", "kvm", 1, "FAIL", Some(REFERENCE)),
             fixture.row("fx/not-retained", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/not-retained", "kvm", 1, "PASS", None),
+            // A mismatch then a pass, on the candidate and on the reference.
+            fixture.row("fx/df-candidate", "ptrace", 1, "PASS", Some(REFERENCE)),
+            typed(
+                fixture.row("fx/df-candidate", "kvm", 1, "FAIL", Some(REFERENCE)),
+                ObservedResult::DeterminismFailure,
+                None,
+            ),
+            fixture.row("fx/df-candidate", "kvm", 2, "PASS", Some(REFERENCE)),
+            typed(
+                fixture.row("fx/df-reference", "ptrace", 1, "FAIL", Some(REFERENCE)),
+                ObservedResult::DeterminismFailure,
+                None,
+            ),
+            fixture.row("fx/df-reference", "ptrace", 2, "PASS", Some(REFERENCE)),
+            fixture.row("fx/df-reference", "kvm", 1, "PASS", Some(REFERENCE)),
         ];
         // Rows from another mode never stand in for a verify cell.
         let mut chaos = fixture.row("fx/absent", "ptrace", 1, "PASS", Some(REFERENCE));
@@ -5404,6 +6457,8 @@ mod tests {
             parity_cell("fx/candidate-failed", ParityBackend::Kvm),
             parity_cell("fx/not-retained", ParityBackend::Kvm),
             parity_cell("fx/absent", ParityBackend::Kvm),
+            parity_cell("fx/df-candidate", ParityBackend::Kvm),
+            parity_cell("fx/df-reference", ParityBackend::Kvm),
         ]);
         let config = fixture.config();
         let report = post_pass(&config, &scope, &rows).unwrap();
@@ -5452,6 +6507,7 @@ mod tests {
 
         let matched = by_cell("fx/same", ParityBackend::Kvm);
         assert_eq!(matched.verdict, ParityVerdict::Matched);
+        assert_eq!((matched.unavailable_class, matched.operand), (None, None));
         assert_eq!(matched.unequalized_credit, Some(1.0));
         assert_eq!((matched.left_len, matched.right_len), (Some(3), Some(3)));
         assert_eq!(matched.matched_prefix, Some(3));
@@ -5459,6 +6515,7 @@ mod tests {
 
         let diverged = by_cell("fx/same", ParityBackend::Liteinst);
         assert_eq!(diverged.verdict, ParityVerdict::Diverged, "{diverged:?}");
+        assert_eq!((diverged.unavailable_class, diverged.operand), (None, None));
         assert_eq!(diverged.matched_prefix, Some(1));
         assert_eq!(diverged.first_divergent_record, Some(2));
         assert_eq!(diverged.unequalized_credit, credit(1, 3, 3));
@@ -5489,59 +6546,113 @@ mod tests {
             Some(path_text(&golden_path).as_str())
         );
         assert_eq!(fs::read_to_string(&golden_path).unwrap(), REFERENCE);
+        let (reference, candidate) = (
+            Some(ParityOperand::Reference),
+            Some(ParityOperand::Candidate),
+        );
         let unmeasured = [
             (
                 "fx/same",
                 ParityBackend::Dbt,
                 ParityVerdict::InputsNotEqualized,
+                UnavailableClass::InputsNotEqualized,
+                candidate,
                 "refuses --bind and --mount",
             ),
             (
                 "fx/nolog",
                 ParityBackend::Kvm,
                 ParityVerdict::CandidateMissing,
+                UnavailableClass::LogNotRetained,
+                candidate,
                 "retained 0 run1_log_* logs",
             ),
             (
                 "fx/failed",
                 ParityBackend::Kvm,
                 ParityVerdict::Unavailable,
-                "ptrace reference verify cell of fx/failed failed determinism: fixture FAIL",
+                UnavailableClass::FailedUntyped,
+                reference,
+                "the ptrace reference verify cell of fx/failed failed with no typed result (no \
+                 error kind): fixture FAIL",
             ),
             (
                 "fx/inapplicable",
                 ParityBackend::Kvm,
                 ParityVerdict::CandidateMissing,
+                UnavailableClass::HostInapplicable,
+                candidate,
                 "host-inapplicable",
             ),
             (
                 "fx/candidate-failed",
                 ParityBackend::Kvm,
                 ParityVerdict::Unavailable,
-                "kvm candidate verify cell of fx/candidate-failed failed determinism",
+                UnavailableClass::FailedUntyped,
+                candidate,
+                "the kvm candidate verify cell of fx/candidate-failed failed with no typed \
+                 result (no error kind): fixture FAIL",
             ),
             (
                 "fx/not-retained",
                 ParityBackend::Kvm,
                 ParityVerdict::CandidateMissing,
+                UnavailableClass::LogNotRetained,
+                candidate,
                 "retained no logs",
             ),
             (
                 "fx/absent",
                 ParityBackend::Kvm,
                 ParityVerdict::ReferenceMissing,
+                UnavailableClass::NoResultRow,
+                reference,
                 "has no result row in this run",
             ),
+            (
+                "fx/df-candidate",
+                ParityBackend::Kvm,
+                ParityVerdict::Nondeterministic,
+                UnavailableClass::DeterminismMismatch,
+                candidate,
+                "the kvm candidate verify cell of fx/df-candidate failed determinism on \
+                 attempt 1 (its two runs diverged)",
+            ),
+            (
+                "fx/df-reference",
+                ParityBackend::Kvm,
+                ParityVerdict::Nondeterministic,
+                UnavailableClass::DeterminismMismatch,
+                reference,
+                "the ptrace reference verify cell of fx/df-reference failed determinism on \
+                 attempt 1 (its two runs diverged)",
+            ),
         ];
-        for (test, backend, verdict, reason) in unmeasured {
+        for (test, backend, verdict, class, operand, reason) in unmeasured {
             let record = by_cell(test, backend);
             assert_eq!(record.verdict, verdict, "{record:?}");
+            assert_eq!(record.unavailable_class, Some(class), "{record:?}");
+            assert_eq!(record.operand, operand, "{record:?}");
             assert!(
                 record.reason.as_deref().unwrap().contains(reason),
                 "{test}@{backend}: {record:?}"
             );
             assert_eq!(record.unequalized_credit, None, "{record:?}");
             assert_eq!(record.matched_prefix, None, "{record:?}");
+        }
+        // Only a mismatch is called one.
+        for record in written
+            .iter()
+            .filter(|record| record.verdict != ParityVerdict::Nondeterministic)
+        {
+            assert!(
+                !record
+                    .reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("determinism"),
+                "{record:?}"
+            );
         }
         // A candidate that is missing still names the golden it would have
         // been compared with; a missing reference names none.
@@ -5560,6 +6671,19 @@ mod tests {
             )
         );
         assert_eq!(by_cell("fx/absent", ParityBackend::Kvm).reference_log, None);
+        // A reference with no golden names no log, and a mismatched candidate
+        // names only the golden; neither mismatched log is read.
+        for (test, golden) in [
+            ("fx/failed", None),
+            ("fx/df-reference", None),
+            ("fx/df-candidate", Some("fx/df-candidate.detlog")),
+        ] {
+            let record = by_cell(test, ParityBackend::Kvm);
+            let golden = golden
+                .map(|name| path_text(&fixture.artifacts().join(PARITY_GOLDEN_DIR).join(name)));
+            assert_eq!(record.reference_log, golden, "{record:?}");
+            assert_eq!(record.candidate_log, None, "{record:?}");
+        }
         assert!(
             !fixture
                 .artifacts()
@@ -5567,13 +6691,10 @@ mod tests {
                 .join("fx/absent.detlog")
                 .exists()
         );
-        assert!(
-            !fixture
-                .artifacts()
-                .join(PARITY_GOLDEN_DIR)
-                .join("fx/failed.detlog")
-                .exists()
-        );
+        for test in ["fx/failed", "fx/df-reference"] {
+            let (golden, sidecar) = golden_paths(&fixture.artifacts(), test).unwrap();
+            assert!(!golden.exists() && !sidecar.exists(), "{test}");
+        }
 
         // The sidecar describes the golden and the reference's guest inputs.
         let sidecar: ParityGoldenSidecar = serde_json::from_slice(
@@ -5609,8 +6730,12 @@ mod tests {
         );
         let summary = report.summary_line();
         for part in [
-            "9 cell(s)",
-            "matched 1, diverged 1, reference-missing 1, candidate-missing 3, unavailable 2, inputs-not-equalized 1",
+            "11 cell(s)",
+            "matched 1, diverged 1, nondeterministic 2, reference-missing 1, candidate-missing 3, \
+             unavailable 2, inputs-not-equalized 1",
+            "measured 2; no golden 5 (determinism-mismatch 2, failed-untyped 2, \
+             host-inapplicable 1); not compared 1; unmeasured 3 (log-not-retained 2, \
+             no-result-row 1)",
             "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
             "2 log-diff comparison(s), 0 guest runs",
         ] {
@@ -5822,6 +6947,13 @@ mod tests {
         assert_eq!(dbt.verdict, ParityVerdict::InputsNotEqualized);
         assert!(!dbt.inputs_equalized);
         assert_eq!(dbt.measured_credit(), None);
+        assert_eq!(
+            (dbt.unavailable_class, dbt.operand),
+            (
+                Some(UnavailableClass::InputsNotEqualized),
+                Some(ParityOperand::Candidate)
+            )
+        );
 
         let summary = report.summary_line();
         assert!(
@@ -5893,6 +7025,11 @@ mod tests {
                     "{mode}: {record:?}"
                 );
                 assert_eq!(record.unequalized_credit, None, "{mode}");
+                assert_eq!(
+                    (record.unavailable_class, record.operand),
+                    (Some(UnavailableClass::LogDiffFailed), None),
+                    "{mode}: {record:?}"
+                );
             }
         }
 
@@ -5905,6 +7042,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(30));
         for record in &report.records {
             assert_eq!(record.verdict, ParityVerdict::Unavailable, "{record:?}");
+            assert_eq!(
+                (record.unavailable_class, record.operand),
+                (Some(UnavailableClass::LogDiffFailed), None),
+                "{record:?}"
+            );
             assert!(
                 record
                     .reason
@@ -5924,6 +7066,11 @@ mod tests {
         assert_eq!(fixture.log_diff_calls(), before);
         for record in &report.records {
             assert_eq!(record.verdict, ParityVerdict::Unavailable);
+            assert_eq!(
+                (record.unavailable_class, record.operand),
+                (Some(UnavailableClass::LogDiffFailed), None),
+                "{record:?}"
+            );
             assert!(
                 record
                     .reason
@@ -5947,6 +7094,11 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("NoComparableMessages"),
+            "{record:?}"
+        );
+        assert_eq!(
+            (record.unavailable_class, record.operand),
+            (Some(UnavailableClass::LogDiffFailed), None),
             "{record:?}"
         );
     }
@@ -5976,7 +7128,19 @@ mod tests {
         let mut sidecar: ParityGoldenSidecar = serde_json::from_slice(&recorded).unwrap();
         sidecar.guest_inputs.workdir = Some("/elsewhere".into());
         fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
-        assert_eq!(verdict().verdict, ParityVerdict::ReferenceMissing);
+        let mismatched = verdict();
+        assert_eq!(
+            mismatched.verdict,
+            ParityVerdict::ReferenceMissing,
+            "{mismatched:?}"
+        );
+        assert_eq!(
+            (mismatched.unavailable_class, mismatched.operand),
+            (
+                Some(UnavailableClass::LogNotRetained),
+                Some(ParityOperand::Reference)
+            )
+        );
         fs::write(&sidecar_path, &recorded).unwrap();
         assert_eq!(verdict().verdict, ParityVerdict::Matched);
 
@@ -5988,6 +7152,13 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(refused.reference_log, None);
+        assert_eq!(
+            (refused.unavailable_class, refused.operand),
+            (
+                Some(UnavailableClass::LogNotRetained),
+                Some(ParityOperand::Reference)
+            )
+        );
     }
 
     /// A comparison no longer fits once an outer bound, such as the
@@ -6028,6 +7199,11 @@ mod tests {
             .iter()
             .map(|record| {
                 assert_eq!(record.verdict, ParityVerdict::Unavailable, "{record:?}");
+                assert_eq!(
+                    (record.unavailable_class, record.operand),
+                    (Some(UnavailableClass::LogDiffFailed), None),
+                    "{record:?}"
+                );
                 record.reason.clone().unwrap()
             })
             .collect::<Vec<_>>();
@@ -6174,6 +7350,15 @@ mod tests {
                 .starts_with("the comparison could not be recorded: "),
             "{kvm:?}"
         );
+        assert_eq!(
+            (kvm.unavailable_class, kvm.operand),
+            (Some(UnavailableClass::LogDiffFailed), None),
+            "{kvm:?}"
+        );
+        assert!(
+            kvm.reference_log.is_some() && kvm.candidate_log.is_some(),
+            "{kvm:?}"
+        );
         assert_eq!(report.records[1].verdict, ParityVerdict::Diverged);
         assert_eq!(read_records(&config.output).len(), 2);
         assert_eq!(status(&config).state, PostPassState::Complete);
@@ -6198,6 +7383,13 @@ mod tests {
             Some("the kvm candidate verify cell of fx/one has no result row in this run")
         );
         assert_eq!(
+            (record.unavailable_class, record.operand),
+            (
+                Some(UnavailableClass::NoResultRow),
+                Some(ParityOperand::Candidate)
+            )
+        );
+        assert_eq!(
             (record.reference_log.as_ref(), record.candidate_log.as_ref()),
             (None, None)
         );
@@ -6212,7 +7404,10 @@ mod tests {
 
     /// A verify cell whose row the caller rejected ran, so it is
     /// `unavailable` with the caller's reason, never missing and never
-    /// compared: as the candidate or the reference, with or without rows.
+    /// compared: as the candidate or the reference, with or without rows. The
+    /// rejection's variant is its class: an evidence error is
+    /// `infrastructure-error`, which leaves that side no golden, and an
+    /// invalid row is `no-result-row`, which leaves the cell unmeasured.
     #[test]
     fn a_rejected_operand_is_unavailable_with_the_callers_reason() {
         let fixture = Fixture::new("rejected");
@@ -6221,17 +7416,22 @@ mod tests {
             fixture.row("fx/two", "kvm", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/three", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/three", "kvm", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/four", "kvm", 1, "PASS", Some(REFERENCE)),
         ];
         let scope = BTreeSet::from([
             parity_cell("fx/one", ParityBackend::Kvm),
             parity_cell("fx/two", ParityBackend::Kvm),
             parity_cell("fx/three", ParityBackend::Kvm),
+            parity_cell("fx/four", ParityBackend::Kvm),
         ]);
         let mut config = fixture.config();
+        let evidence = |why: &str| ParityRejection::EvidenceError(why.to_string());
+        let invalid = |why: &str| ParityRejection::InvalidRow(why.to_string());
         config.rejected = BTreeMap::from([
-            (("fx/one".into(), "kvm".into()), "why one".to_string()),
-            (("fx/two".into(), "ptrace".into()), "why two".to_string()),
-            (("fx/three".into(), "kvm".into()), "why three".to_string()),
+            (("fx/one".into(), "kvm".into()), evidence("why one")),
+            (("fx/two".into(), "ptrace".into()), evidence("why two")),
+            (("fx/three".into(), "kvm".into()), invalid("why three")),
+            (("fx/four".into(), "ptrace".into()), invalid("why four")),
         ]);
         let report = post_pass(&config, &scope, &rows).unwrap();
         assert_eq!(fixture.log_diff_calls(), 0);
@@ -6242,35 +7442,70 @@ mod tests {
                 (
                     record.test_id.as_str(),
                     record.verdict,
+                    record.unavailable_class,
+                    record.operand,
                     record.reason.as_deref().unwrap_or(""),
                 )
             })
             .collect::<Vec<_>>();
+        let (reference, candidate) = (
+            Some(ParityOperand::Reference),
+            Some(ParityOperand::Candidate),
+        );
         assert_eq!(
             found,
             [
                 (
+                    "fx/four",
+                    ParityVerdict::Unavailable,
+                    Some(UnavailableClass::NoResultRow),
+                    reference,
+                    "the ptrace reference verify cell of fx/four: why four"
+                ),
+                (
                     "fx/one",
                     ParityVerdict::Unavailable,
+                    Some(UnavailableClass::InfrastructureError),
+                    candidate,
                     "the kvm candidate verify cell of fx/one: why one"
                 ),
                 (
                     "fx/three",
                     ParityVerdict::Unavailable,
+                    Some(UnavailableClass::NoResultRow),
+                    candidate,
                     "the kvm candidate verify cell of fx/three: why three"
                 ),
                 (
                     "fx/two",
                     ParityVerdict::Unavailable,
+                    Some(UnavailableClass::InfrastructureError),
+                    reference,
                     "the ptrace reference verify cell of fx/two: why two"
                 ),
             ]
         );
         // The reference of a rejected candidate is still good: its golden is
         // written and named, so a later `parity compare` can reuse it.
-        assert!(report.records[0].reference_log.is_some());
-        assert!(report.records[0].candidate_log.is_none());
-        assert!(report.records[2].reference_log.is_none());
+        for record in [&report.records[1], &report.records[2]] {
+            assert!(record.reference_log.is_some(), "{record:?}");
+            assert!(record.candidate_log.is_none(), "{record:?}");
+        }
+        // A rejected reference names no golden and writes none. Its good
+        // candidate is named only where the cell is unmeasured, not where
+        // the reference left no golden at all.
+        assert!(report.records[0].reference_log.is_none());
+        assert!(report.records[0].candidate_log.is_some());
+        assert_eq!(
+            (
+                &report.records[3].reference_log,
+                &report.records[3].candidate_log
+            ),
+            (&None, &None)
+        );
+        for test in ["fx/two", "fx/four"] {
+            assert!(!golden_paths(&fixture.artifacts(), test).unwrap().0.exists());
+        }
     }
 
     /// Operands run under different or unrecorded `HERMIT_EPOCH` values are
@@ -6305,6 +7540,11 @@ mod tests {
             .map(|record| {
                 assert_eq!(record.verdict, ParityVerdict::Unavailable, "{record:?}");
                 assert!(record.reference_log.is_some() && record.candidate_log.is_some());
+                assert_eq!(
+                    record.unavailable_class,
+                    Some(UnavailableClass::EpochNotShared),
+                    "{record:?}"
+                );
                 record.reason.clone().unwrap()
             })
             .collect::<Vec<_>>();
@@ -6324,6 +7564,633 @@ mod tests {
                     .to_string(),
             ]
         );
+        // The operand is the side that recorded no epoch when only one did.
+        assert_eq!(
+            report
+                .records
+                .iter()
+                .map(|record| record.operand)
+                .collect::<Vec<_>>(),
+            [None, Some(ParityOperand::Candidate), None]
+        );
+    }
+
+    /// A verify cell that recorded a mismatch has no deterministic log even
+    /// when both of its runs' logs were kept: as the candidate or as the
+    /// reference, and when a later attempt passed or the mismatch was seen in
+    /// an earlier repetition, the cell is `nondeterministic` with no credit,
+    /// nothing is compared, and a mismatched reference writes no golden.
+    #[test]
+    fn a_mismatched_operand_is_never_compared_even_with_both_logs_retained() {
+        let fixture = Fixture::new("mismatch-logs");
+        let mismatch = |test: &str, backend: &str, attempt: u64| {
+            keep_second_run(
+                typed(
+                    fixture.row(test, backend, attempt, "FAIL", Some(REFERENCE)),
+                    ObservedResult::DeterminismFailure,
+                    None,
+                ),
+                DIVERGENT,
+            )
+        };
+        let mut rows = vec![
+            fixture.row("fx/candidate", "ptrace", 1, "PASS", Some(REFERENCE)),
+            mismatch("fx/candidate", "kvm", 1),
+            fixture.row("fx/candidate-passed", "ptrace", 1, "PASS", Some(REFERENCE)),
+            mismatch("fx/candidate-passed", "kvm", 1),
+            fixture.row("fx/candidate-passed", "kvm", 2, "PASS", Some(REFERENCE)),
+            mismatch("fx/reference", "ptrace", 1),
+        ];
+        for backend in ParityBackend::ALL {
+            rows.push(fixture.row("fx/reference", backend.as_str(), 1, "PASS", Some(REFERENCE)));
+        }
+        for test in ["fx/repeated", "fx/repeated-reference"] {
+            rows.push(fixture.row(test, "ptrace", 1, "PASS", Some(REFERENCE)));
+            rows.push(fixture.row(test, "kvm", 1, "PASS", Some(REFERENCE)));
+        }
+        // Both runs' logs are on disk for every mismatched attempt.
+        for row in rows
+            .iter()
+            .filter(|row| row.result == Some(ObservedResult::DeterminismFailure))
+        {
+            for log in ["run1_log_fixture.log", "run2_log_fixture.log"] {
+                let log = log_dir(row).join(log);
+                assert!(fs::metadata(&log).unwrap().len() > 0, "{}", log.display());
+            }
+        }
+        let mut config = fixture.config();
+        let repeated = "repetition 2 attempt 1 recorded a verify mismatch";
+        config.nondeterministic = BTreeMap::from([
+            (("fx/repeated".into(), "kvm".into()), repeated.to_string()),
+            (
+                ("fx/repeated-reference".into(), "ptrace".into()),
+                repeated.to_string(),
+            ),
+        ]);
+        let mut scope = BTreeSet::from([
+            parity_cell("fx/candidate", ParityBackend::Kvm),
+            parity_cell("fx/candidate-passed", ParityBackend::Kvm),
+            parity_cell("fx/repeated", ParityBackend::Kvm),
+            parity_cell("fx/repeated-reference", ParityBackend::Kvm),
+        ]);
+        scope.extend(ParityBackend::ALL.map(|backend| parity_cell("fx/reference", backend)));
+        let report = post_pass(&config, &scope, &rows).unwrap();
+        assert_eq!(report.records.len(), 8);
+        assert_eq!((report.log_diff_runs, fixture.log_diff_calls()), (0, 0));
+
+        let golden = |test: &str| path_text(&golden_paths(&fixture.artifacts(), test).unwrap().0);
+        let on_attempt = |role: &str, test: &str, consequence: &str| {
+            format!(
+                "the {role} verify cell of {test} failed determinism on attempt 1 (its two runs \
+                 diverged), so {consequence}: fixture FAIL"
+            )
+        };
+        let earlier = |role: &str, test: &str, consequence: &str| {
+            format!(
+                "the {role} verify cell of {test} failed determinism: {repeated}, so {consequence}"
+            )
+        };
+        let (no_log, no_golden) = (
+            "it has no deterministic log to compare",
+            "there is no deterministic golden log to compare against",
+        );
+        let (reference, candidate) = (ParityOperand::Reference, ParityOperand::Candidate);
+        let mut expected = vec![
+            (
+                parity_cell("fx/candidate", ParityBackend::Kvm),
+                candidate,
+                on_attempt("kvm candidate", "fx/candidate", no_log),
+                Some(golden("fx/candidate")),
+            ),
+            (
+                parity_cell("fx/candidate-passed", ParityBackend::Kvm),
+                candidate,
+                on_attempt("kvm candidate", "fx/candidate-passed", no_log),
+                Some(golden("fx/candidate-passed")),
+            ),
+            (
+                parity_cell("fx/repeated", ParityBackend::Kvm),
+                candidate,
+                earlier("kvm candidate", "fx/repeated", no_log),
+                Some(golden("fx/repeated")),
+            ),
+            (
+                parity_cell("fx/repeated-reference", ParityBackend::Kvm),
+                reference,
+                earlier("ptrace reference", "fx/repeated-reference", no_golden),
+                None,
+            ),
+        ];
+        for backend in ParityBackend::ALL {
+            expected.push((
+                parity_cell("fx/reference", backend),
+                reference,
+                on_attempt("ptrace reference", "fx/reference", no_golden),
+                None,
+            ));
+        }
+        for (cell, operand, reason, reference_log) in expected {
+            let record = report
+                .records
+                .iter()
+                .find(|record| record.test_id == cell.test_id && record.backend == cell.backend)
+                .unwrap();
+            record.validate().unwrap();
+            assert_eq!(
+                (record.verdict, record.unavailable_class, record.operand),
+                (
+                    ParityVerdict::Nondeterministic,
+                    Some(UnavailableClass::DeterminismMismatch),
+                    Some(operand)
+                ),
+                "{cell}"
+            );
+            assert_eq!(record.reason.as_deref(), Some(reason.as_str()), "{cell}");
+            assert_eq!(
+                (record.credit, record.unequalized_credit),
+                (None, None),
+                "{cell}"
+            );
+            assert!(!record.inputs_equalized, "{cell}");
+            // A mismatched log is never named, so never read.
+            assert_eq!(
+                (
+                    record.reference_log.clone(),
+                    record.candidate_log.as_deref()
+                ),
+                (reference_log, None),
+                "{cell}"
+            );
+        }
+        // Outside the mean and the floor.
+        assert_eq!(
+            UnavailableClass::DeterminismMismatch.group(),
+            UnavailableGroup::NoGolden
+        );
+        for test in ["fx/reference", "fx/repeated-reference"] {
+            let (golden, sidecar) = golden_paths(&fixture.artifacts(), test).unwrap();
+            assert!(!golden.exists() && !sidecar.exists(), "{test}");
+        }
+        let summary = report.summary_line();
+        for part in [
+            "8 cell(s)",
+            "matched 0, diverged 0, nondeterministic 8, reference-missing 0, candidate-missing 0, \
+             unavailable 0, inputs-not-equalized 0",
+            "measured 0; no golden 8 (determinism-mismatch 8); not compared 0; unmeasured 0",
+            "none measured with equal inputs; none measured with unequal inputs",
+            "0 log-diff comparison(s), 0 guest runs",
+        ] {
+            assert!(summary.contains(part), "{part:?} not in {summary}");
+        }
+    }
+
+    /// A timeout is not a mismatch: as the candidate or as the reference it
+    /// is `unavailable` with class `timeout`, a side with no golden that is
+    /// outside the floor, and never called a determinism failure.
+    #[test]
+    fn a_timeout_is_unavailable_with_its_own_class() {
+        let fixture = Fixture::new("timeout");
+        let timed_out = |test: &str, backend: &str, kind: &str| {
+            typed(
+                fixture.row(test, backend, 1, "FAIL", Some(REFERENCE)),
+                ObservedResult::Timeout,
+                Some(kind),
+            )
+        };
+        let rows = vec![
+            fixture.row("fx/candidate", "ptrace", 1, "PASS", Some(REFERENCE)),
+            timed_out("fx/candidate", "kvm", "wall-timeout"),
+            timed_out("fx/reference", "ptrace", "cpu-timeout"),
+            fixture.row("fx/reference", "kvm", 1, "PASS", Some(REFERENCE)),
+        ];
+        let scope = BTreeSet::from([
+            parity_cell("fx/candidate", ParityBackend::Kvm),
+            parity_cell("fx/reference", ParityBackend::Kvm),
+        ]);
+        let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
+        assert_eq!(fixture.log_diff_calls(), 0);
+        let found = report
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.test_id.as_str(),
+                    record.verdict,
+                    record.unavailable_class,
+                    record.operand,
+                    record.reason.as_deref().unwrap_or(""),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                (
+                    "fx/candidate",
+                    ParityVerdict::Unavailable,
+                    Some(UnavailableClass::Timeout),
+                    Some(ParityOperand::Candidate),
+                    "the kvm candidate verify cell of fx/candidate ended FAIL with result \
+                     timeout (wall-timeout): fixture FAIL"
+                ),
+                (
+                    "fx/reference",
+                    ParityVerdict::Unavailable,
+                    Some(UnavailableClass::Timeout),
+                    Some(ParityOperand::Reference),
+                    "the ptrace reference verify cell of fx/reference ended FAIL with result \
+                     timeout (cpu-timeout): fixture FAIL"
+                ),
+            ]
+        );
+        for record in &report.records {
+            record.validate().unwrap();
+            assert_eq!(record.measured_credit(), None, "{record:?}");
+            assert_eq!(record.candidate_log, None, "{record:?}");
+            assert!(
+                !record.reason.as_deref().unwrap().contains("determinism"),
+                "{record:?}"
+            );
+        }
+        assert_eq!(
+            UnavailableClass::Timeout.group(),
+            UnavailableGroup::NoGolden
+        );
+        // The timed-out candidate's reference is good, so its golden is
+        // written and named; the timed-out reference has none.
+        let (golden, _) = golden_paths(&fixture.artifacts(), "fx/candidate").unwrap();
+        assert_eq!(
+            report.records[0].reference_log.as_deref(),
+            Some(path_text(&golden).as_str())
+        );
+        assert_eq!(report.records[1].reference_log, None);
+        let (golden, sidecar) = golden_paths(&fixture.artifacts(), "fx/reference").unwrap();
+        assert!(!golden.exists() && !sidecar.exists());
+        let summary = report.summary_line();
+        for part in [
+            "matched 0, diverged 0, nondeterministic 0, reference-missing 0, candidate-missing 0, \
+             unavailable 2, inputs-not-equalized 0",
+            "measured 0; no golden 2 (timeout 2); not compared 0; unmeasured 0",
+        ] {
+            assert!(summary.contains(part), "{part:?} not in {summary}");
+        }
+    }
+
+    /// One cell for each class a post-pass decides: each record carries its
+    /// typed class and operand and counts in exactly one group, so the
+    /// summary accounts for every cell once.
+    #[test]
+    fn every_class_a_post_pass_decides_is_typed_and_counted_once() {
+        use ParityBackend::Dbt;
+        use ParityBackend::Kvm;
+        use ParityVerdict as V;
+        use UnavailableClass as C;
+        let fixture = Fixture::new("every-class");
+        let tests = [
+            "../c-escape",
+            "c/crash",
+            "c/diverged",
+            "c/ended",
+            "c/epoch",
+            "c/inapplicable",
+            "c/infra",
+            "c/matched",
+            "c/mismatch",
+            "c/no-messages",
+            "c/no-row",
+            "c/not-retained",
+            "c/oom",
+            "c/sandbox",
+            "c/timeout",
+            "c/unreadable",
+            "c/untyped",
+            "c/unwritable",
+        ];
+        let mut rows = tests
+            .iter()
+            .map(|test| fixture.row(test, "ptrace", 1, "PASS", Some(REFERENCE)))
+            .collect::<Vec<_>>();
+        let kvm = |test: &str, outcome: &str| fixture.row(test, "kvm", 1, outcome, Some(REFERENCE));
+        let mut ended = kvm("c/ended", "ERROR");
+        ended.error_kind = Some("infrastructure".into());
+        let mut epoch = kvm("c/epoch", "PASS");
+        epoch
+            .env
+            .insert("HERMIT_EPOCH".into(), "2000-01-01T00:00:00Z".into());
+        // A retained log that exists but cannot be read.
+        let unreadable = kvm("c/unreadable", "PASS");
+        let log = log_dir(&unreadable).join("run1_log_fixture.log");
+        fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(fixture.dir.join("no-such-log"), &log).unwrap();
+        rows.extend([
+            kvm("../c-escape", "PASS"),
+            typed(kvm("c/crash", "FAIL"), ObservedResult::CrashError, None),
+            fixture.row("c/diverged", "kvm", 1, "PASS", Some(DIVERGENT)),
+            ended,
+            epoch,
+            fixture.row("c/inapplicable", "kvm", 1, "HOST-INAPPLICABLE", None),
+            typed(
+                kvm("c/infra", "ERROR"),
+                ObservedResult::InfrastructureError,
+                None,
+            ),
+            fixture.row("c/matched", "dbt", 1, "PASS", Some(REFERENCE)),
+            kvm("c/matched", "PASS"),
+            typed(
+                kvm("c/mismatch", "FAIL"),
+                ObservedResult::DeterminismFailure,
+                None,
+            ),
+            fixture.row(
+                "c/no-messages",
+                "kvm",
+                1,
+                "PASS",
+                Some("DEBUG reverie: nothing selected\n"),
+            ),
+            fixture.row("c/not-retained", "kvm", 1, "PASS", None),
+            typed(kvm("c/oom", "FAIL"), ObservedResult::Oom, None),
+            typed(
+                kvm("c/sandbox", "ERROR"),
+                ObservedResult::SandboxDenied,
+                None,
+            ),
+            typed(
+                kvm("c/timeout", "FAIL"),
+                ObservedResult::Timeout,
+                Some("wall-timeout"),
+            ),
+            unreadable,
+            typed(
+                kvm("c/untyped", "FAIL"),
+                ObservedResult::ReplayFailure,
+                None,
+            ),
+            kvm("c/unwritable", "PASS"),
+        ]);
+        // A directory where the golden goes cannot be replaced by it.
+        fs::create_dir_all(
+            golden_paths(&fixture.artifacts(), "c/unwritable")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        let mut scope = tests
+            .iter()
+            .map(|test| parity_cell(test, Kvm))
+            .collect::<BTreeSet<_>>();
+        scope.insert(parity_cell("c/matched", Dbt));
+        let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
+        assert_eq!(
+            (report.log_diff_runs, fixture.log_diff_calls()),
+            (3, 3),
+            "only c/matched@kvm, c/diverged and c/no-messages are compared"
+        );
+        let (reference, candidate) = (
+            Some(ParityOperand::Reference),
+            Some(ParityOperand::Candidate),
+        );
+        let found = report
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.test_id.as_str(),
+                    record.backend,
+                    record.verdict,
+                    record.unavailable_class,
+                    record.operand,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                (
+                    "../c-escape",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::InvalidTestId),
+                    None
+                ),
+                ("c/crash", Kvm, V::Unavailable, Some(C::Crash), candidate),
+                ("c/diverged", Kvm, V::Diverged, None, None),
+                ("c/ended", Kvm, V::Unavailable, Some(C::Ended), candidate),
+                (
+                    "c/epoch",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::EpochNotShared),
+                    None
+                ),
+                (
+                    "c/inapplicable",
+                    Kvm,
+                    V::CandidateMissing,
+                    Some(C::HostInapplicable),
+                    candidate
+                ),
+                (
+                    "c/infra",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::InfrastructureError),
+                    candidate
+                ),
+                (
+                    "c/matched",
+                    Dbt,
+                    V::InputsNotEqualized,
+                    Some(C::InputsNotEqualized),
+                    candidate
+                ),
+                ("c/matched", Kvm, V::Matched, None, None),
+                (
+                    "c/mismatch",
+                    Kvm,
+                    V::Nondeterministic,
+                    Some(C::DeterminismMismatch),
+                    candidate
+                ),
+                (
+                    "c/no-messages",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::LogDiffFailed),
+                    None
+                ),
+                (
+                    "c/no-row",
+                    Kvm,
+                    V::CandidateMissing,
+                    Some(C::NoResultRow),
+                    candidate
+                ),
+                (
+                    "c/not-retained",
+                    Kvm,
+                    V::CandidateMissing,
+                    Some(C::LogNotRetained),
+                    candidate
+                ),
+                ("c/oom", Kvm, V::Unavailable, Some(C::Oom), candidate),
+                (
+                    "c/sandbox",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::SandboxDenied),
+                    candidate
+                ),
+                (
+                    "c/timeout",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::Timeout),
+                    candidate
+                ),
+                (
+                    "c/unreadable",
+                    Kvm,
+                    V::CandidateMissing,
+                    Some(C::LogUnreadable),
+                    candidate
+                ),
+                (
+                    "c/untyped",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::FailedUntyped),
+                    candidate
+                ),
+                (
+                    "c/unwritable",
+                    Kvm,
+                    V::Unavailable,
+                    Some(C::GoldenNotWritten),
+                    reference
+                ),
+            ]
+        );
+        for record in &report.records {
+            record.validate().unwrap();
+            if record.verdict != V::Nondeterministic {
+                assert!(
+                    !record
+                        .reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("determinism"),
+                    "{record:?}"
+                );
+            }
+        }
+        // Every class a record can carry, once; record-missing is the
+        // ledger's, never a record's.
+        for class in C::ALL {
+            let cells = report
+                .records
+                .iter()
+                .filter(|record| record.unavailable_class == Some(class))
+                .count();
+            assert_eq!(cells, usize::from(class != C::RecordMissing), "{class}");
+        }
+        let in_group = |wanted: UnavailableGroup| {
+            report
+                .records
+                .iter()
+                .filter(|record| record.unavailable_class.map(C::group) == Some(wanted))
+                .count()
+        };
+        let measured = report
+            .records
+            .iter()
+            .filter(|record| record.verdict.is_measured())
+            .count();
+        assert_eq!(
+            (
+                measured,
+                in_group(UnavailableGroup::NoGolden),
+                in_group(UnavailableGroup::NotCompared),
+                in_group(UnavailableGroup::Unmeasured),
+                in_group(UnavailableGroup::RecordMissing),
+            ),
+            (2, 9, 1, 7, 0)
+        );
+        let by_cell = |test: &str, backend: ParityBackend| {
+            report
+                .records
+                .iter()
+                .find(|record| record.test_id == test && record.backend == backend)
+                .unwrap()
+        };
+        assert_eq!(by_cell("c/matched", Kvm).unequalized_credit, Some(1.0));
+        assert_eq!(
+            by_cell("c/diverged", Kvm).unequalized_credit,
+            credit(1, 3, 3)
+        );
+        assert_eq!(
+            by_cell("c/ended", Kvm).reason.as_deref(),
+            Some(
+                "the kvm candidate verify cell of c/ended ended ERROR with no typed result \
+                 (infrastructure): fixture ERROR"
+            )
+        );
+        assert_eq!(
+            by_cell("c/no-messages", Kvm).reason.as_deref(),
+            Some("log-diff verdict was NoComparableMessages")
+        );
+        let escape = by_cell("../c-escape", Kvm);
+        assert_eq!(
+            escape.reason,
+            golden_paths(&fixture.artifacts(), "../c-escape").err()
+        );
+        assert!(
+            escape.reference_log.is_none() && escape.candidate_log.is_some(),
+            "{escape:?}"
+        );
+        let unwritable = by_cell("c/unwritable", Kvm);
+        assert!(
+            unwritable
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("cannot write the ptrace reference golden: cannot replace "),
+            "{unwritable:?}"
+        );
+        let no_row = by_cell("c/no-row", Kvm);
+        assert_eq!(
+            (&no_row.reference_log, &no_row.candidate_log),
+            (&None, &None)
+        );
+        assert!(
+            !golden_paths(&fixture.artifacts(), "c/no-row")
+                .unwrap()
+                .0
+                .exists()
+        );
+        assert_eq!(
+            by_cell("c/inapplicable", Kvm).reference_log,
+            Some(path_text(
+                &golden_paths(&fixture.artifacts(), "c/inapplicable")
+                    .unwrap()
+                    .0
+            ))
+        );
+        let summary = report.summary_line();
+        for part in [
+            "19 cell(s)",
+            "matched 1, diverged 1, nondeterministic 1, reference-missing 0, candidate-missing 4, \
+             unavailable 11, inputs-not-equalized 1",
+            "measured 2; no golden 9 (determinism-mismatch 1, timeout 1, crash 1, oom 1, \
+             infrastructure-error 1, sandbox-denied 1, failed-untyped 1, ended 1, \
+             host-inapplicable 1); not compared 1; unmeasured 7 (log-not-retained 1, \
+             log-unreadable 1, no-result-row 1, log-diff-failed 1, invalid-test-id 1, \
+             golden-not-written 1, epoch-not-shared 1)",
+            "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
+            "3 log-diff comparison(s), 0 guest runs",
+        ] {
+            assert!(summary.contains(part), "{part:?} not in {summary}");
+        }
     }
 
     /// `path` spelled relative to this process's working directory.
@@ -6567,6 +8434,8 @@ mod tests {
             test_id: test.into(),
             backend,
             verdict: ParityVerdict::Diverged,
+            unavailable_class: None,
+            operand: None,
             inputs_equalized: false,
             reason: None,
             credit: None,
@@ -6596,11 +8465,15 @@ mod tests {
         test: &str,
         backend: ParityBackend,
         verdict: ParityVerdict,
+        class: UnavailableClass,
+        operand: Option<ParityOperand>,
         reason: &str,
     ) -> ParityRecord {
         ParityRecord::unmeasured(
             &parity_cell(test, backend),
             verdict,
+            class,
+            operand,
             false,
             reason,
             None,
@@ -6722,7 +8595,9 @@ mod tests {
             ledger_unmeasured(
                 "c-programs/b",
                 ParityBackend::Sabre,
-                ParityVerdict::Unavailable,
+                ParityVerdict::Nondeterministic,
+                UnavailableClass::DeterminismMismatch,
+                Some(ParityOperand::Candidate),
                 "the candidate verify cell of c-programs/b failed determinism: run 2 differed",
             ),
         ];
@@ -7575,101 +9450,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unavailable_reasons_are_classed_by_their_templates() {
-        let class = |verdict, reason: &str| unavailable_class(verdict, Some(reason));
-        use LedgerVerdict as V;
-        use UnavailableClass as C;
-        assert_eq!(unavailable_class(V::Matched, None), None);
-        assert_eq!(unavailable_class(V::Diverged, None), None);
-        assert_eq!(unavailable_class(V::RecordMissing, Some("x")), None);
-        assert_eq!(
-            class(
-                V::Unavailable,
-                "the candidate verify cell of c-programs/x failed determinism: y"
-            ),
-            Some(C::DeterminismFail)
-        );
-        // The roles exactly as the post-pass spells them: `<backend> candidate`
-        // and `ptrace reference`, two words each.
-        assert_eq!(
-            class(
-                V::Unavailable,
-                "the kvm candidate verify cell of c-programs/x failed determinism: y"
-            ),
-            Some(C::DeterminismFail)
-        );
-        assert_eq!(
-            class(
-                V::Unavailable,
-                "the ptrace reference verify cell of c-programs/x ended TIMEOUT (wall): y"
-            ),
-            Some(C::OperandEnded)
-        );
-        assert_eq!(
-            class(
-                V::CandidateMissing,
-                &no_result_row("t/x", "liteinst candidate")
-            ),
-            Some(C::CandidateMissing)
-        );
-        assert_eq!(
-            class(
-                V::ReferenceMissing,
-                &no_result_row("t/x", "ptrace reference")
-            ),
-            Some(C::ReferenceMissing)
-        );
-        assert_eq!(
-            class(
-                V::ReferenceMissing,
-                "the reference verify cell of c-programs/x was host-inapplicable, so it left no log: z"
-            ),
-            Some(C::HostInapplicable)
-        );
-        assert_eq!(
-            class(
-                V::Unavailable,
-                "the candidate verify cell of c-programs/x ended TIMEOUT (wall): y"
-            ),
-            Some(C::OperandEnded)
-        );
-        for retained in [
-            "retained no logs (its argv has no --verify-log-dir)",
-            "retained no readable log directory /d: gone",
-            "retained an empty log /d/run1_log_x",
-            "retained 2 run1_log_* logs in /d; expected exactly one",
-        ] {
-            assert_eq!(
-                class(
-                    V::CandidateMissing,
-                    &format!("the candidate verify cell of t/x {retained}")
-                ),
-                Some(C::LogNotRetained)
-            );
-        }
-        assert_eq!(
-            class(V::CandidateMissing, &no_result_row("t/x", "candidate")),
-            Some(C::CandidateMissing)
-        );
-        assert_eq!(
-            class(V::ReferenceMissing, &no_result_row("t/x", "reference")),
-            Some(C::ReferenceMissing)
-        );
-        assert_eq!(
-            class(V::InputsNotEqualized, DBT_INPUTS_NOT_EQUALIZABLE),
-            Some(C::InputsNotEqualized)
-        );
-        assert_eq!(
-            class(V::Unavailable, "log-diff verdict was Refused"),
-            Some(C::Other)
-        );
-        assert_eq!(
-            class(V::ReferenceMissing, "something new"),
-            Some(C::ReferenceMissing)
-        );
-    }
-
     fn envelope(source: &ParityLedgerSource, producer: ParityProducer) -> ParityLedgerRow {
         let run_id = source.run_id.clone().unwrap_or_else(|| LEDGER_RUN.into());
         ParityLedgerRow {
@@ -7693,6 +9473,8 @@ mod tests {
             test_id: source.test_id.clone(),
             backend: source.backend,
             verdict: source.verdict,
+            unavailable_class: source.unavailable_class,
+            operand: source.operand,
             reason: source.reason.clone(),
             source: source.source.clone(),
             record: source.record.clone(),
