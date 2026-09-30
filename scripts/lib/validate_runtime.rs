@@ -51,9 +51,9 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
@@ -360,14 +360,20 @@ pub fn tree_cpu_seconds(root: i32) -> f64 {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else { continue };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
         let Some(rp) = stat.rfind(')') else { continue };
         let f: Vec<&str> = stat[rp + 2..].split_whitespace().collect();
         if f.len() < 13 {
             continue;
         }
-        let Ok(pp) = f[1].parse::<i32>() else { continue };
+        let Ok(pp) = f[1].parse::<i32>() else {
+            continue;
+        };
         let ut: f64 = f[11].parse().unwrap_or(0.0);
         let st: f64 = f[12].parse().unwrap_or(0.0);
         ppid.insert(pid, pp);
@@ -386,7 +392,11 @@ pub fn tree_cpu_seconds(root: i32) -> f64 {
             }
         }
     }
-    let total: f64 = ticks.iter().filter(|(p, _)| in_tree.contains(p)).map(|(_, t)| *t).sum();
+    let total: f64 = ticks
+        .iter()
+        .filter(|(p, _)| in_tree.contains(p))
+        .map(|(_, t)| *t)
+        .sum();
     total / clk_tck()
 }
 
@@ -425,8 +435,11 @@ pub fn cpu_wall_line(
     host_cpus: usize,
 ) -> String {
     let cpu = user + sys;
-    let ratio =
-        if wall > 0.0 { format!("{:.1}", cpu / wall) } else { "n/a".to_string() };
+    let ratio = if wall > 0.0 {
+        format!("{:.1}", cpu / wall)
+    } else {
+        "n/a".to_string()
+    };
     let hint = cpu_wall_hint(cpu, wall, host_cpus)
         .map(|h| format!("  ({h})"))
         .unwrap_or_default();
@@ -478,7 +491,9 @@ fn is_ancestor(want: i32, start: i32) -> bool {
         let Some(line) = status.lines().find(|l| l.starts_with("PPid:")) else {
             return false;
         };
-        let Ok(pp) = line[5..].trim().parse::<i32>() else { return false };
+        let Ok(pp) = line[5..].trim().parse::<i32>() else {
+            return false;
+        };
         cur = pp;
     }
     false
@@ -516,7 +531,9 @@ pub fn identity_in_ancestry(want: i32, want_start_ticks: u64) -> bool {
         let Some(line) = status.lines().find(|line| line.starts_with("PPid:")) else {
             return false;
         };
-        let Ok(parent) = line[5..].trim().parse::<i32>() else { return false };
+        let Ok(parent) = line[5..].trim().parse::<i32>() else {
+            return false;
+        };
         cur = parent;
     }
     false
@@ -539,16 +556,32 @@ pub fn identity_in_ancestry(want: i32, want_start_ticks: u64) -> bool {
 pub fn detect_nesting() -> Nesting {
     let raw = std::env::var(ACTIVE_ENV).unwrap_or_default();
     let Ok(outer) = raw.trim().parse::<i32>() else {
-        return Nesting { nested: false, outer_pid: None, stale_marker: None };
+        return Nesting {
+            nested: false,
+            outer_pid: None,
+            stale_marker: None,
+        };
     };
     if outer <= 0 {
-        return Nesting { nested: false, outer_pid: None, stale_marker: None };
+        return Nesting {
+            nested: false,
+            outer_pid: None,
+            stale_marker: None,
+        };
     }
     let me = std::process::id() as i32;
     if is_ancestor(outer, me) {
-        Nesting { nested: true, outer_pid: Some(outer), stale_marker: None }
+        Nesting {
+            nested: true,
+            outer_pid: Some(outer),
+            stale_marker: None,
+        }
     } else {
-        Nesting { nested: false, outer_pid: None, stale_marker: Some(outer) }
+        Nesting {
+            nested: false,
+            outer_pid: None,
+            stale_marker: Some(outer),
+        }
     }
 }
 
@@ -587,7 +620,10 @@ pub enum LockOutcome {
     Acquired(InvocationLock),
     /// Another validate holds it. `detail` belongs in the common summary;
     /// `epilogue` is rendered after that summary so an action stays last.
-    Busy { detail: Vec<String>, epilogue: Vec<String> },
+    Busy {
+        detail: Vec<String>,
+        epilogue: Vec<String>,
+    },
     /// The metadata guard itself could not be established. Proceeding would
     /// disable the primary exclusion guarantee, so the caller must fail closed.
     SafetyRefusal(String),
@@ -644,11 +680,13 @@ fn flock_unlock(fd: i32) {
 /// definition, so the writer, the refusal reader, and the log-path update
 /// cannot drift onto different files.
 fn invocation_holder_path(root: &Path) -> PathBuf {
-    root.join("target/validation").join("validate-invocation.holder")
+    root.join("target/validation")
+        .join("validate-invocation.holder")
 }
 
 fn invocation_holder_guard_path(root: &Path) -> PathBuf {
-    root.join("target/validation").join("validate-invocation-holder.lock")
+    root.join("target/validation")
+        .join("validate-invocation-holder.lock")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -745,9 +783,7 @@ impl InvocationHolderRecord {
             "checkout_hex",
             "log_hex",
         ];
-        if fields.keys().any(|key| !allowed.contains(key))
-            || fields.get("version") != Some(&"1")
-        {
+        if fields.keys().any(|key| !allowed.contains(key)) || fields.get("version") != Some(&"1") {
             return None;
         }
         let pid = fields.get("pid")?.parse().ok()?;
@@ -843,20 +879,25 @@ fn acquire_invocation_lock_with_hook(
     let lock_path = dir.join("validate-invocation.lock");
     let holder = invocation_holder_path(root);
     let guard_path = invocation_holder_guard_path(root);
-    let guard = match std::fs::OpenOptions::new().create(true).append(true).open(&guard_path) {
+    let guard = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&guard_path)
+    {
         Ok(file) => file,
         Err(error) => {
             return LockOutcome::SafetyRefusal(format!(
                 "cannot open holder metadata guard {}: {error}; refusing rather than running \
                  without primary invocation exclusion",
                 guard_path.display(),
-            ))
+            ));
         }
     };
     match flock_nb_result(guard.as_raw_fd()) {
         Ok(true) => {}
-        Ok(false) => return LockOutcome::Busy {
-            detail: vec![
+        Ok(false) => {
+            return LockOutcome::Busy {
+                detail: vec![
                 "another validate is already running or changing ownership in THIS checkout"
                     .into(),
                 format!("checkout: {root:?}"),
@@ -866,20 +907,25 @@ fn acquire_invocation_lock_with_hook(
                 "this is an immediate refusal, not a wait; retry after the transition completes"
                     .into(),
             ],
-            epilogue: Vec::new(),
-        },
+                epilogue: Vec::new(),
+            };
+        }
         Err(error) => {
             return LockOutcome::SafetyRefusal(format!(
                 "cannot lock holder metadata guard {}: {error}; refusing rather than running \
                  without primary invocation exclusion",
                 guard_path.display(),
-            ))
+            ));
         }
     }
-    let file = match std::fs::OpenOptions::new().create(true).append(true).open(&lock_path) {
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&lock_path)
+    {
         Ok(f) => f,
         Err(e) => {
-            return LockOutcome::Unavailable(format!("cannot open {}: {e}", lock_path.display()))
+            return LockOutcome::Unavailable(format!("cannot open {}: {e}", lock_path.display()));
         }
     };
     if !flock_nb(file.as_raw_fd()) {
@@ -939,7 +985,10 @@ fn acquire_invocation_lock_with_hook(
                 .into(),
         );
         msg.push("wait for the holder to finish, or run in a different checkout".into());
-        return LockOutcome::Busy { detail: msg, epilogue: watch };
+        return LockOutcome::Busy {
+            detail: msg,
+            epilogue: watch,
+        };
     }
     after_lock_acquired();
     // The holder guard spans invocation-lock acquisition and record
@@ -957,7 +1006,12 @@ fn acquire_invocation_lock_with_hook(
     };
     let _ = write_invocation_holder(&holder, &record);
     flock_unlock(guard.as_raw_fd());
-    LockOutcome::Acquired(InvocationLock { _file: file, guard, holder, record })
+    LockOutcome::Acquired(InvocationLock {
+        _file: file,
+        guard,
+        holder,
+        record,
+    })
 }
 
 // ------------------------------------------------------------------ box-wide live-run registry
@@ -1031,9 +1085,12 @@ fn register_run_with_hooks(
             ));
         }
     }
-    let opened = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect locked live-run record {}: {error}", path.display()))?;
+    let opened = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect locked live-run record {}: {error}",
+            path.display()
+        )
+    })?;
     let published = std::fs::metadata(&path).map_err(|error| {
         format!(
             "locked live-run record {} is no longer published: {error}; refusing rather than \
@@ -1048,20 +1105,33 @@ fn register_run_with_hooks(
             path.display()
         ));
     }
-    let contents = format!("pid={pid}\nprofile={profile}\ncheckout={}\n", checkout.display());
-    if let Err(error) = file.set_len(0).and_then(|()| write_record(&mut file, contents.as_bytes())) {
+    let contents = format!(
+        "pid={pid}\nprofile={profile}\ncheckout={}\n",
+        checkout.display()
+    );
+    if let Err(error) = file
+        .set_len(0)
+        .and_then(|()| write_record(&mut file, contents.as_bytes()))
+    {
         // Remove the unpublished record while its flock is still held. Leaving a
         // partial record behind would make a later census manufacture a peer.
         let _ = std::fs::remove_file(&path);
-        return Err(format!("cannot write live-run record {}: {error}", path.display()));
+        return Err(format!(
+            "cannot write live-run record {}: {error}",
+            path.display()
+        ));
     }
     Ok(RunRecord { _file: file, path })
 }
 
 pub fn register_run(dir: &Path, profile: &str, checkout: &Path) -> Result<RunRecord, String> {
-    register_run_with_hooks(dir, profile, checkout, |_| {}, |file, contents| {
-        file.write_all(contents)
-    })
+    register_run_with_hooks(
+        dir,
+        profile,
+        checkout,
+        |_| {},
+        |file, contents| file.write_all(contents),
+    )
 }
 
 /// A peer top-level validate observed by the monitor.
@@ -1087,20 +1157,20 @@ fn record_pid(path: &Path) -> Option<i32> {
 /// means the KERNEL already released it, i.e. the owner is dead, and the record
 /// is reaped. Failure (`EWOULDBLOCK`) means a live process still holds it. There
 /// is no dead-owner state to represent.
-pub fn census_peers(
-    dir: &Path,
-    self_pid: i32,
-    previous: &mut BTreeMap<i32, f64>,
-) -> PeerCensus {
+pub fn census_peers(dir: &Path, self_pid: i32, previous: &mut BTreeMap<i32, f64>) -> PeerCensus {
     let mut c = PeerCensus::default();
-    let Ok(entries) = std::fs::read_dir(dir) else { return c };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return c;
+    };
     let mut seen: Vec<i32> = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|s| s.to_str()) != Some("run") {
             continue;
         }
-        let Some(pid) = record_pid(&path) else { continue };
+        let Some(pid) = record_pid(&path) else {
+            continue;
+        };
         if pid == self_pid {
             continue;
         }
@@ -1164,7 +1234,10 @@ impl ConcurrencyMonitor {
     /// Stop sampling and report `(peak_cpu_active, peak_live)`.
     pub fn finish(&self) -> (usize, usize) {
         self.stop.store(true, Ordering::Relaxed);
-        (self.peak_active.load(Ordering::Relaxed), self.peak_live.load(Ordering::Relaxed))
+        (
+            self.peak_active.load(Ordering::Relaxed),
+            self.peak_live.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1175,7 +1248,9 @@ pub const STOP_TEST_ENV: &str = "HERMIT_VALIDATE_STOP_TEST_MODE";
 
 /// Is this invocation the stop-path fixture?
 pub fn stop_test_requested() -> bool {
-    std::env::var(STOP_TEST_ENV).map(|v| v == "1").unwrap_or(false)
+    std::env::var(STOP_TEST_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn env_is(name: &str, want: &str) -> bool {
@@ -1183,7 +1258,10 @@ fn env_is(name: &str, want: &str) -> bool {
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// How long an orphaned stop-test fixture may live before self-terminating.
@@ -1219,7 +1297,10 @@ pub fn stop_test_park(interrupted: fn() -> Option<&'static str>) -> StopTestExit
     if env_is("VALIDATE_STOP_TEST_EXIT_EARLY", "1") {
         return StopTestExit::EarlyExit;
     }
-    let max = env_f64("VALIDATE_STOP_TEST_MAX_SECONDS", STOP_TEST_MAX_SECONDS_DEFAULT);
+    let max = env_f64(
+        "VALIDATE_STOP_TEST_MAX_SECONDS",
+        STOP_TEST_MAX_SECONDS_DEFAULT,
+    );
     let start = std::time::Instant::now();
     loop {
         if interrupted().is_some() {
@@ -1249,7 +1330,9 @@ pub fn stop_test_announce() {
 /// The cleanup-race hook: signal readiness, then linger inside the critical
 /// section while the test hammers the process with `SIGTERM`.
 pub fn stop_test_cleanup_hook() {
-    let Ok(p) = std::env::var("VALIDATE_STOP_TEST_CLEANUP_READY_FILE") else { return };
+    let Ok(p) = std::env::var("VALIDATE_STOP_TEST_CLEANUP_READY_FILE") else {
+        return;
+    };
     if p.is_empty() {
         return;
     }
@@ -1324,8 +1407,12 @@ pub fn self_test() -> Result<String, String> {
     // And the collapse is one-way ONLY: both non-denials read as `None` through
     // the legacy view, which is why anything needing to tell them apart must not
     // use it.
-    if environmental_block_class("   ").is_some() || environmental_block_class("plain failure").is_some() {
-        return Err("three-state: the legacy view must report neither non-denial as a class".into());
+    if environmental_block_class("   ").is_some()
+        || environmental_block_class("plain failure").is_some()
+    {
+        return Err(
+            "three-state: the legacy view must report neither non-denial as a class".into(),
+        );
     }
 
     // The current writer records the owner's four failure classes directly.
@@ -1508,7 +1595,7 @@ pub fn self_test() -> Result<String, String> {
             other => {
                 return Err(format!(
                     "environmental: {text:?} must classify as {want}, got {other:?}"
-                ))
+                ));
             }
         }
     }
@@ -1635,10 +1722,14 @@ pub fn self_test() -> Result<String, String> {
     }
 
     // ---- CPU-vs-wall hints, both directions ----
-    if cpu_wall_hint(5.0, 600.0, 316) != Some("low CPU vs wall — mostly waiting/blocked, not compute-bound") {
+    if cpu_wall_hint(5.0, 600.0, 316)
+        != Some("low CPU vs wall — mostly waiting/blocked, not compute-bound")
+    {
         return Err("cpu/wall: 5s CPU over 600s wall must read as blocked".into());
     }
-    if cpu_wall_hint(600.0, 600.0, 316) != Some("~1 core busy — single-threaded or possibly spinning") {
+    if cpu_wall_hint(600.0, 600.0, 316)
+        != Some("~1 core busy — single-threaded or possibly spinning")
+    {
         return Err("cpu/wall: 1.0x on 316 cores must read as ~1 core busy".into());
     }
     if cpu_wall_hint(4000.0, 600.0, 316).is_some() {
@@ -1649,7 +1740,9 @@ pub fn self_test() -> Result<String, String> {
     }
     let line = cpu_wall_line(|s| format!("{}s", s.round() as i64), 600.0, 30.0, 10.0, 316);
     if !line.contains("CPU/wall 0.1x across 316 cores") || !line.contains("mostly waiting") {
-        return Err(format!("cpu/wall: line must carry ratio AND hint, got {line:?}"));
+        return Err(format!(
+            "cpu/wall: line must carry ratio AND hint, got {line:?}"
+        ));
     }
 
     // ---- process CPU accounting must be live, not a stub ----
@@ -1668,14 +1761,18 @@ pub fn self_test() -> Result<String, String> {
     // pid 1 IS an ancestor of everything, so this is the qualifying positive.
     let positive = detect_nesting();
     if !positive.nested || positive.outer_pid != Some(1) {
-        return Err(format!("nesting: pid 1 must be seen as an ancestor, got {positive:?}"));
+        return Err(format!(
+            "nesting: pid 1 must be seen as an ancestor, got {positive:?}"
+        ));
     }
     // A pid that is NOT in our ancestry is a STALE marker, not nesting. (2^22 is
     // above the default pid_max, so it cannot name a live process.)
     std::env::set_var(ACTIVE_ENV, "4194303");
     let negative = detect_nesting();
     if negative.nested || negative.stale_marker != Some(4194303) {
-        return Err(format!("nesting: a non-ancestor marker must be STALE, got {negative:?}"));
+        return Err(format!(
+            "nesting: a non-ancestor marker must be STALE, got {negative:?}"
+        ));
     }
     std::env::set_var(ACTIVE_ENV, "not-a-pid");
     if detect_nesting().nested {
@@ -1694,7 +1791,8 @@ pub fn self_test() -> Result<String, String> {
     //
     // Both directions matter equally: a guard that refuses the sequential case
     // too is a worse outage than the concurrency it prevents.
-    let sandbox = std::env::temp_dir().join(format!("validate-lock-selftest-{}", std::process::id()));
+    let sandbox =
+        std::env::temp_dir().join(format!("validate-lock-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&sandbox);
     std::fs::create_dir_all(&sandbox).map_err(|e| format!("lock bracket: {e}"))?;
     let mut lock_accept = 0usize;
@@ -1709,10 +1807,10 @@ pub fn self_test() -> Result<String, String> {
             LockOutcome::Busy { detail, epilogue } => {
                 return Err(format!(
                     "lock: a free slot must be granted: detail={detail:?} epilogue={epilogue:?}"
-                ))
+                ));
             }
             LockOutcome::SafetyRefusal(e) => {
-                return Err(format!("lock: sandbox safety guard refused: {e}"))
+                return Err(format!("lock: sandbox safety guard refused: {e}"));
             }
             LockOutcome::Unavailable(e) => return Err(format!("lock: sandbox unusable: {e}")),
         };
@@ -1727,8 +1825,11 @@ pub fn self_test() -> Result<String, String> {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
-                if !joined.contains("is LIVE") || !joined.contains(&std::process::id().to_string()) {
-                    return Err(format!("lock: refusal must name the LIVE holder pid: {joined}"));
+                if !joined.contains("is LIVE") || !joined.contains(&std::process::id().to_string())
+                {
+                    return Err(format!(
+                        "lock: refusal must name the LIVE holder pid: {joined}"
+                    ));
                 }
                 // Before the holder records a log there is nothing to tail, and
                 // the refusal must SAY so rather than print a guessed path.
@@ -1756,11 +1857,13 @@ pub fn self_test() -> Result<String, String> {
             "holder\nnewline.log",
         ] {
             let fake_log = sandbox.join(name);
-            std::fs::write(&fake_log, "holder log\n")
-                .map_err(|e| format!("lock bracket: {e}"))?;
+            std::fs::write(&fake_log, "holder log\n").map_err(|e| format!("lock bracket: {e}"))?;
             record_invocation_log_path(&mut first, &fake_log);
             match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
-                LockOutcome::Busy { detail: _, epilogue } => {
+                LockOutcome::Busy {
+                    detail: _,
+                    epilogue,
+                } => {
                     lock_refuse += 1;
                     let quoted = shell_quote_path(&fake_log);
                     let want = format!("  tail -F -- {quoted}");
@@ -1888,7 +1991,9 @@ pub fn self_test() -> Result<String, String> {
     let (contender_tx, contender_rx) = std::sync::mpsc::sync_channel(0);
     let contender_root = sandbox.clone();
     let contender = std::thread::spawn(move || {
-        contender_started_tx.send(()).expect("handoff receiver exists");
+        contender_started_tx
+            .send(())
+            .expect("handoff receiver exists");
         let outcome = acquire_invocation_lock(&contender_root, "self-test", "contender-commit");
         contender_tx.send(outcome).expect("handoff receiver exists");
     });
@@ -1909,11 +2014,18 @@ pub fn self_test() -> Result<String, String> {
             ));
         }
     };
-    contender.join().map_err(|_| "lock handoff contender panicked")?;
+    contender
+        .join()
+        .map_err(|_| "lock handoff contender panicked")?;
     match transition_outcome {
         LockOutcome::Busy { detail, epilogue } => {
             lock_refuse += 1;
-            let joined = detail.iter().chain(&epilogue).cloned().collect::<Vec<_>>().join("\n");
+            let joined = detail
+                .iter()
+                .chain(&epilogue)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
             if !joined.contains("metadata is transitioning")
                 || joined.contains("predecessor-commit")
                 || joined.contains("tail -F")
@@ -1925,28 +2037,37 @@ pub fn self_test() -> Result<String, String> {
             }
         }
         LockOutcome::Acquired(_) => {
-            return Err("lock handoff: contender acquired during publication".into())
+            return Err("lock handoff: contender acquired during publication".into());
         }
         LockOutcome::SafetyRefusal(error) => {
-            return Err(format!("lock handoff: transition safety-refused unexpectedly: {error}"))
+            return Err(format!(
+                "lock handoff: transition safety-refused unexpectedly: {error}"
+            ));
         }
         LockOutcome::Unavailable(error) => {
-            return Err(format!("lock handoff: transition became unguarded: {error}"))
+            return Err(format!(
+                "lock handoff: transition became unguarded: {error}"
+            ));
         }
     }
-    publish_tx.send(()).map_err(|e| format!("lock handoff publish release: {e}"))?;
-    let new_lock = match new_holder.join().map_err(|_| "lock handoff new holder panicked")? {
+    publish_tx
+        .send(())
+        .map_err(|e| format!("lock handoff publish release: {e}"))?;
+    let new_lock = match new_holder
+        .join()
+        .map_err(|_| "lock handoff new holder panicked")?
+    {
         LockOutcome::Acquired(lock) => lock,
         LockOutcome::Busy { detail, epilogue } => {
             return Err(format!(
                 "lock handoff: new holder was refused: detail={detail:?} epilogue={epilogue:?}"
-            ))
+            ));
         }
         LockOutcome::SafetyRefusal(error) => {
-            return Err(format!("lock handoff: new holder safety-refused: {error}"))
+            return Err(format!("lock handoff: new holder safety-refused: {error}"));
         }
         LockOutcome::Unavailable(error) => {
-            return Err(format!("lock handoff: new holder unavailable: {error}"))
+            return Err(format!("lock handoff: new holder unavailable: {error}"));
         }
     };
     match acquire_invocation_lock(&sandbox, "self-test", "post-publication-contender") {
@@ -1965,13 +2086,13 @@ pub fn self_test() -> Result<String, String> {
             }
         }
         LockOutcome::Acquired(_) => {
-            return Err("lock handoff: contender acquired while new holder was live".into())
+            return Err("lock handoff: contender acquired while new holder was live".into());
         }
         LockOutcome::SafetyRefusal(error) => {
-            return Err(format!("lock handoff: contender safety-refused: {error}"))
+            return Err(format!("lock handoff: contender safety-refused: {error}"));
         }
         LockOutcome::Unavailable(error) => {
-            return Err(format!("lock handoff: contender unavailable: {error}"))
+            return Err(format!("lock handoff: contender unavailable: {error}"));
         }
     }
     drop(new_lock);
@@ -1983,22 +2104,26 @@ pub fn self_test() -> Result<String, String> {
     std::fs::remove_file(&guard_path).map_err(|e| format!("lock guard failure cleanup: {e}"))?;
     std::fs::create_dir(&guard_path).map_err(|e| format!("lock guard failure setup: {e}"))?;
     match acquire_invocation_lock(&sandbox, "self-test", "guard-failure") {
-        LockOutcome::SafetyRefusal(error) if error.contains("cannot open holder metadata guard") => {
+        LockOutcome::SafetyRefusal(error)
+            if error.contains("cannot open holder metadata guard") =>
+        {
             lock_safety_refuse += 1;
         }
         LockOutcome::SafetyRefusal(error) => {
-            return Err(format!("lock guard failure named the wrong cause: {error}"))
+            return Err(format!("lock guard failure named the wrong cause: {error}"));
         }
         LockOutcome::Unavailable(error) => {
-            return Err(format!("lock guard failure incorrectly permitted unguarded execution: {error}"))
+            return Err(format!(
+                "lock guard failure incorrectly permitted unguarded execution: {error}"
+            ));
         }
         LockOutcome::Busy { detail, epilogue } => {
             return Err(format!(
                 "lock guard failure was misreported as contention: detail={detail:?} epilogue={epilogue:?}"
-            ))
+            ));
         }
         LockOutcome::Acquired(_) => {
-            return Err("lock guard failure incorrectly acquired the invocation lock".into())
+            return Err("lock guard failure incorrectly acquired the invocation lock".into());
         }
     }
     std::fs::remove_dir(&guard_path).map_err(|e| format!("lock guard failure teardown: {e}"))?;
@@ -2013,10 +2138,10 @@ pub fn self_test() -> Result<String, String> {
         LockOutcome::Busy { detail, epilogue } => {
             return Err(format!(
                 "lock: a SEQUENTIAL re-claim must succeed, got refusal: detail={detail:?} epilogue={epilogue:?}"
-            ))
+            ));
         }
         LockOutcome::SafetyRefusal(e) => {
-            return Err(format!("lock: sequential safety guard refused: {e}"))
+            return Err(format!("lock: sequential safety guard refused: {e}"));
         }
         LockOutcome::Unavailable(e) => return Err(format!("lock: sandbox unusable: {e}")),
     }
@@ -2031,14 +2156,18 @@ pub fn self_test() -> Result<String, String> {
     std::fs::write(reg.join("4194302.run"), "pid=4194302\n").map_err(|e| format!("{e}"))?;
     let c = census_peers(&reg, std::process::id() as i32, &mut prev);
     if c.live != 0 || c.stale_reaped != 1 || reg.join("4194302.run").exists() {
-        return Err(format!("registry: a dead owner's record must be reaped, got {c:?}"));
+        return Err(format!(
+            "registry: a dead owner's record must be reaped, got {c:?}"
+        ));
     }
     // A LIVE record: registered by this process, then observed from a census that
     // does NOT exclude us, so the liveness path is exercised for real.
     let held = register_run(&reg, "self-test", &sandbox)
         .map_err(|error| format!("registry: registering a free slot must succeed: {error}"))?;
     let lock_error = match register_run(&reg, "self-test", &sandbox) {
-        Ok(_) => return Err("registry: a second registration for the held record succeeded".into()),
+        Ok(_) => {
+            return Err("registry: a second registration for the held record succeeded".into());
+        }
         Err(error) => error,
     };
     if !lock_error.contains("cannot lock live-run record") {
@@ -2070,7 +2199,12 @@ pub fn self_test() -> Result<String, String> {
         }
         Err(error) => error,
     };
-    if race_census != Some(PeerCensus { live: 0, cpu_active: 0, stale_reaped: 1 })
+    if race_census
+        != Some(PeerCensus {
+            live: 0,
+            cpu_active: 0,
+            stale_reaped: 1,
+        })
         || !race_error.contains("no longer published")
     {
         return Err(format!(
@@ -2080,13 +2214,17 @@ pub fn self_test() -> Result<String, String> {
     }
     let c = census_peers(&reg, -1, &mut prev);
     if c.live != 1 || c.stale_reaped != 0 {
-        return Err(format!("registry: a live holder must be counted live, got {c:?}"));
+        return Err(format!(
+            "registry: a live holder must be counted live, got {c:?}"
+        ));
     }
     // First sighting has no previous sample, so it can never be "active" yet:
     // activity requires an OBSERVED CPU delta, which is what stops a parked
     // fixture from counting like a 22-core validate.
     if c.cpu_active != 0 {
-        return Err(format!("registry: a first sighting cannot be CPU-active, got {c:?}"));
+        return Err(format!(
+            "registry: a first sighting cannot be CPU-active, got {c:?}"
+        ));
     }
     // Now burn measurable CPU and re-census: the same peer must flip to active.
     let mut spin = 0u64;
@@ -2097,13 +2235,17 @@ pub fn self_test() -> Result<String, String> {
     std::hint::black_box(spin);
     let c2 = census_peers(&reg, -1, &mut prev);
     if c2.live != 1 || c2.cpu_active != 1 {
-        return Err(format!("registry: a CPU-burning peer must read active, got {c2:?}"));
+        return Err(format!(
+            "registry: a CPU-burning peer must read active, got {c2:?}"
+        ));
     }
     drop(held);
     // And once it is gone the count returns to zero: the guard is not sticky.
     let c3 = census_peers(&reg, -1, &mut prev);
     if c3.live != 0 {
-        return Err(format!("registry: a finished peer must stop counting, got {c3:?}"));
+        return Err(format!(
+            "registry: a finished peer must stop counting, got {c3:?}"
+        ));
     }
 
     // A write failure is not a missing peer or a zero-peer observation. Inject
@@ -2115,7 +2257,12 @@ pub fn self_test() -> Result<String, String> {
         "self-test",
         &sandbox,
         |_| {},
-        |_file, _contents| Err(io::Error::new(io::ErrorKind::WriteZero, "planted write refusal")),
+        |_file, _contents| {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "planted write refusal",
+            ))
+        },
     ) {
         Ok(_) => return Err("registry: a failed record write registered successfully".into()),
         Err(error) => error,
@@ -2125,7 +2272,10 @@ pub fn self_test() -> Result<String, String> {
             "registry: a failed record write named the wrong registration stage: {write_error}"
         ));
     }
-    if write_failure_reg.join(format!("{}.run", std::process::id())).exists() {
+    if write_failure_reg
+        .join(format!("{}.run", std::process::id()))
+        .exists()
+    {
         return Err("registry: a failed record write left a partial record behind".into());
     }
     let _ = std::fs::remove_dir_all(&sandbox);
