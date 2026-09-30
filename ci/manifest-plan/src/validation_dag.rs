@@ -260,14 +260,19 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
     "build.workspace",
-    "build.runtime_release",
     "build.e2e_artifact",
     "build.manifest_guests",
-    "build.liteinst_runtime_release",
     "compatprep.hermit_release",
 ];
 // Explicit execution destinations; hosted variants retain their original host commands.
 const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
+    // Consumers of the one validate-profile build. They ran on the host, against
+    // a second, host-built copy of the same producers, until 2026-09-30.
+    "check.dbt_runtime_abi",
+    "check.backend_parity_suites",
+    "lint.clippy",
+    "doc.doctests",
+    "doc.rustdoc",
     "test.regular_crates",
     "test.hermit_unit",
     "test.detcore_unit",
@@ -357,17 +362,26 @@ struct Profile {
 // gate.manifest: 272/273, 259/260, 15/16, 145/146 and 250/250 before. The
 // same five profiles then gained selftest.scorecard_commands (its quick/super
 // variant for quick and super): 277/278, 264/265, 20/21, 150/151 and 255/255
-// before.
+// before. The one-build change of 2026-09-30 then removed Hermit producers
+// only, no test, check or E2E node: full and portable lost the host
+// build.workspace, build.e2e_artifact, build.runtime_release and
+// build.liteinst_runtime_release and the pinned-root build.runtime_release and
+// build.liteinst_runtime_release, and both gained build.host_hermit_link:
+// 278/279 and 265/266 before. privileged lost the host
+// privileged-only-build.privileged_tests, whose pinned-root twin its consumers
+// use: 12/20 before. hosted-portable lost
+// build.runtime_release and build.liteinst_runtime_release_on_host, and
+// check.dbt_runtime_abi became check.dbt_runtime_abi_on_host: 256/256 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 278,
-        selected_steps: 279,
+        direct_steps: 273,
+        selected_steps: 274,
     },
     Profile {
         label: "portable",
-        direct_steps: 265,
-        selected_steps: 266,
+        direct_steps: 260,
+        selected_steps: 261,
     },
     Profile {
         label: "quick",
@@ -381,13 +395,13 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: "privileged",
-        direct_steps: 12,
-        selected_steps: 20,
+        direct_steps: 11,
+        selected_steps: 19,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 256,
-        selected_steps: 256,
+        direct_steps: 254,
+        selected_steps: 254,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -670,6 +684,128 @@ fn runs_in_pinned_root(step: &Step) -> bool {
             || matches!(step.group.as_str(), "portablecompat" | "portablecompatprep"))
 }
 
+/// The host-side name of the one Hermit binary that build.e2e_artifact publishes
+/// inside the pinned root at target/ci/hermit.
+pub(crate) const HOST_HERMIT_LINK_TAG: &str = "build.host_hermit_link";
+
+/// Route the local host consumers of the Hermit producers to the pinned-root
+/// build.
+///
+/// The strict compatibility rows exercise host-installed programs that the
+/// pinned image does not carry, so they, and the fixtures they read, still run
+/// on the host. They reach the one Hermit through build.host_hermit_link, which
+/// links the host's target/ci/hermit to the pinned root's published binary; that
+/// binary runs on the host because its loader and libraries are the host nix
+/// store paths the image was built from. No local host step may depend on the
+/// workspace build itself.
+fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), String> {
+    for step in &mut cfg.steps {
+        if is_hosted_variant(step)
+            || is_pinned_root_producer(step)
+            || step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
+            || step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+            || !step
+                .labels
+                .iter()
+                .any(|label| label != HOSTED_PORTABLE_LABEL)
+        {
+            continue;
+        }
+        let tag = step.tag();
+        for dependency in &mut step.deps {
+            if dependency == "build.workspace" {
+                return Err(format!(
+                    "local host step {tag} depends on build.workspace; only the pinned root builds Hermit"
+                ));
+            }
+            if dependency == "build.e2e_artifact" {
+                *dependency = if tag == HOST_HERMIT_LINK_TAG {
+                    pinned_root_twin_tag("build.e2e_artifact")
+                } else {
+                    HOST_HERMIT_LINK_TAG.into()
+                };
+            }
+        }
+        step.deps.sort();
+        step.deps.dedup();
+    }
+    Ok(())
+}
+
+/// A pinned-root producer that compiles or publishes Hermit itself, as opposed
+/// to the host tooling producers (rust scripts, the manifest plan, the manifest
+/// guests) whose host and pinned-root copies test-harness validate requires.
+fn builds_hermit(step: &Step) -> bool {
+    matches!(
+        step.tag().as_str(),
+        "build.workspace" | "build.e2e_artifact"
+    ) || step.job == "privileged_tests"
+}
+
+/// Retire host copies of the Hermit producers that no local host step consumes.
+///
+/// Every producer in [`PINNED_ROOT_PRODUCER_STEPS`] gains an `_in_pinned_root`
+/// twin, and the local profiles consume the twins. A host copy of a Hermit
+/// producer survives in a local profile only while some local host step still
+/// depends on it. Until 2026-09-30 the host originals of build.workspace,
+/// build.runtime_release, build.e2e_artifact and build.liteinst_runtime_release
+/// kept their local labels and a full validation compiled Hermit on the host as
+/// well as in the pinned root. An unconsumed copy keeps only its hosted-portable
+/// label, or is removed when it has none. Host tooling producers are left as
+/// they are.
+fn retire_unconsumed_host_producers(cfg: &mut DagConfig) {
+    loop {
+        let before = (
+            cfg.steps.len(),
+            cfg.steps.iter().map(|s| s.labels.len()).sum::<usize>(),
+        );
+        let tags = cfg
+            .steps
+            .iter()
+            .filter(|step| {
+                is_pinned_root_producer(step)
+                    && builds_hermit(step)
+                    && !is_hosted_variant(step)
+                    && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
+            })
+            .map(Step::tag)
+            .collect::<Vec<_>>();
+        for tag in tags {
+            let local_consumer = cfg.steps.iter().any(|step| {
+                step.tag() != tag
+                    && step
+                        .labels
+                        .iter()
+                        .any(|label| label != HOSTED_PORTABLE_LABEL)
+                    && step.deps.iter().any(|dependency| dependency == &tag)
+            });
+            let any_consumer = cfg
+                .steps
+                .iter()
+                .any(|step| step.deps.iter().any(|dependency| dependency == &tag));
+            if local_consumer {
+                continue;
+            }
+            let step = cfg
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .expect("tag was collected from these steps");
+            step.labels.retain(|label| label == HOSTED_PORTABLE_LABEL);
+            if step.labels.is_empty() && !any_consumer {
+                cfg.steps.retain(|step| step.tag() != tag);
+            }
+        }
+        let after = (
+            cfg.steps.len(),
+            cfg.steps.iter().map(|s| s.labels.len()).sum::<usize>(),
+        );
+        if after == before {
+            break;
+        }
+    }
+}
+
 // Dagrun appends admitted argv after the complete wrapper command. Re-quote
 // each resulting argument before appending it to the original shell payload;
 // preserve literal bytes and the original command's argument placement.
@@ -835,10 +971,15 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
     // 16 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301).
-    if split.len() != 15 {
+    // https://github.com/rrnewton/hermit/issues/3301); 15 until the one-build
+    // change of 2026-09-30 moved the host consumers of the retired host Hermit
+    // build into the pinned root: check.dbt_runtime_abi,
+    // check.backend_parity_suites, lint.clippy, doc.doctests and doc.rustdoc,
+    // which were already in this split's dependency closure and are now its
+    // roots.
+    if split.len() != 20 {
         return Err(format!(
-            "hosted test split has {} roots, expected 15",
+            "hosted test split has {} roots, expected 20",
             split.len()
         ));
     }
@@ -919,6 +1060,21 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     hosted_workspace.cmd = hosted_workspace.cmd.replace(
         local_prepare,
         "./ci/nextest-binaries.rs prepare hosted-portable",
+    );
+    // The publisher verifies the binary it publishes against the preparation
+    // record of the profile its workspace producer prepared.
+    let hosted_publisher = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.e2e_artifact_on_host")
+        .ok_or("hosted E2E publisher is absent")?;
+    let local_assert = "./ci/nextest-binaries.rs assert full";
+    if hosted_publisher.cmd.matches(local_assert).count() != 1 {
+        return Err("hosted E2E publisher lost the exact prepared-record assertion".into());
+    }
+    hosted_publisher.cmd = hosted_publisher.cmd.replace(
+        local_assert,
+        "./ci/nextest-binaries.rs assert hosted-portable",
     );
     Ok(())
 }
@@ -1018,7 +1174,7 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             .filter(|dependency| producer_tags.contains(*dependency))
             .map(|dependency| pinned_root_twin_tag(dependency))
             .collect();
-        if producer.tag() == "build.runtime_release" {
+        if producer.tag() == "build.e2e_artifact" {
             // This host-only node is a no-op in the default Cargo mode. In the
             // explicit Buck mode it prepares one content-addressed binary
             // before the network-disabled pinned root installs those bytes.
@@ -1062,6 +1218,8 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     }
     cfg.steps.push(pinned_root_fetch()?);
     cfg.steps.extend(twins);
+    route_host_consumers_to_pinned_build(cfg)?;
+    retire_unconsumed_host_producers(cfg);
     Ok(())
 }
 
@@ -1329,7 +1487,10 @@ fn refresh_generated_partitions(
         (GeneratedPartition::PortableFocusedCompat, 190usize),
         (GeneratedPartition::StrictCompat, 194usize),
         (GeneratedPartition::SabreCompat, 213usize),
-        (GeneratedPartition::E9patchCompat, 174usize),
+        // 175 since the one-build change of 2026-09-30 added
+        // e9patchcompatprep.release_resources, which stages the release
+        // resources the retired host build.runtime_release used to provide.
+        (GeneratedPartition::E9patchCompat, 175usize),
         (GeneratedPartition::RrCompat, 140usize),
         (GeneratedPartition::SuperCompat, 5usize),
         (GeneratedPartition::SuperStress, 102usize),
@@ -2029,9 +2190,16 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // system-utils nodes; +10 for the five selftest.* nodes and their
     // quick/super variants; +2 for selftest.scorecard_commands and its
     // quick/super variant.
-    if cfg.steps.len() != 1620 {
+    // 1620 until the one-build change of 2026-09-30 removed eight Hermit
+    // producers -- build.workspace, build.e2e_artifact, build.runtime_release
+    // and build.liteinst_runtime_release on the host, the pinned-root and
+    // hosted copies of the last two, and the unconsumed host copy of
+    // privileged-only-build.privileged_tests -- and added
+    // build.host_hermit_link, the hosted check.dbt_runtime_abi_on_host and the
+    // e9patch lane's e9patchcompatprep.release_resources.
+    if cfg.steps.len() != 1615 {
         return Err(format!(
-            "superset has {} steps, expected 1620",
+            "superset has {} steps, expected 1615",
             cfg.steps.len()
         ));
     }
@@ -2054,7 +2222,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))
     };
-    for tag in ["build.workspace", "build.runtime_release"] {
+    for tag in ["build.workspace_in_pinned_root", "build.workspace_on_host"] {
         let producer = step(tag)?;
         if producer.hint.preferred_inner_jobs != Some(32)
             || producer.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
@@ -3568,12 +3736,15 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 254 since the one-build change of 2026-09-30 retired the hosted
+        // copies of build.runtime_release and build.liteinst_runtime_release
+        // (check.dbt_runtime_abi became check.dbt_runtime_abi_on_host);
         // 256 since selftest.scorecard_commands split from selftest.scorecard;
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 256);
+        assert_eq!(selected.steps.len(), 254);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3622,16 +3793,20 @@ sys.exit(37)
         new_variants.extend(shared_tests.map(|job| format!("test.{job}_on_host")));
         new_variants.extend([
             "build.e2e_artifact_on_host".into(),
-            "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
             "check.backend_parity_suites_on_host".into(),
+            "check.dbt_runtime_abi_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
         // 212 since test.dbt_parity_on_host was retired with its pinned twin
-        // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
+        // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); still
+        // 212 after the one-build change of 2026-09-30 retired
+        // build.liteinst_runtime_release_on_host and moved check.dbt_runtime_abi
+        // into the pinned root, which gave it the hosted twin
+        // check.dbt_runtime_abi_on_host.
         assert_eq!(new_variants.len(), 212);
         let mut expected = legacy_variants
             .map(str::to_string)
@@ -3730,12 +3905,13 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 255 = the 256 hosted-portable direct steps since the five
+            // 253 = the 254 hosted-portable direct steps since the one-build
+            // change of 2026-09-30 (256 before it, since the five
             // selftest.<name> nodes left gate.manifest and
-            // selftest.scorecard_commands split from selftest.scorecard
-            // (https://github.com/rrnewton/hermit/issues/3381), minus the one
+            // selftest.scorecard_commands split from selftest.scorecard,
+            // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 255 direct steps"),
+            error.contains("hosted-portable label has 253 direct steps"),
             "{error}"
         );
     }
@@ -4111,11 +4287,11 @@ sys.exit(37)
         // critical path, which is the defect this layout removed.
         refused(
             &|cfg| {
-                let index = step_mut(cfg, "build.workspace");
+                let index = step_mut(cfg, "build.workspace_in_pinned_root");
                 cfg.steps[index].deps.push("selftest.scorecard".into());
             },
             &[
-                "build.workspace depends on tool self-test selftest.scorecard",
+                "build.workspace_in_pinned_root depends on tool self-test selftest.scorecard",
                 "critical path",
             ],
         );

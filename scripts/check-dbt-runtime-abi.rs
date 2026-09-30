@@ -46,7 +46,7 @@
 //!   * the client declares ZERO callbacks    -> rc=2, because a scope that
 //!     selected nothing cannot certify anything. This one is not theoretical:
 //!     `target/install_pkg/rsrcs/libdetcore_dbt.so` is a SYMLINK to
-//!     `../../release/libdetcore_dbt.so`, a plain `cargo build --workspace
+//!     `../../<profile>/libdetcore_dbt.so`, a plain `cargo build --workspace
 //!     --bins` leaves it dangling, and a dangling symlink reads as a library
 //!     that exports nothing.
 //!
@@ -69,7 +69,10 @@ use std::process::Command;
 
 const PREFIX: &str = "reverie_dbt_runtime_";
 const DEFAULT_CLIENT: &str = "target/install_pkg/rsrcs/libreverie_dbt_client.so";
-const DEFAULT_RUNTIME: &str = "target/release/libdetcore_dbt.so";
+/// The packaged runtime, which is the file Hermit loads. It is a symlink into
+/// the release-derived Cargo profile that staged the package (`validate` for a
+/// validation, `release` for a plain release build).
+const DEFAULT_RUNTIME: &str = "target/install_pkg/rsrcs/libdetcore_dbt.so";
 
 fn refuse(title: &str, body: &str) -> ! {
     eprintln!("======================================================================");
@@ -85,7 +88,7 @@ fn refuse(title: &str, body: &str) -> ! {
 
 /// Resolve through symlinks and require a real, readable file.
 ///
-/// `install_pkg/rsrcs/libdetcore_dbt.so` is a symlink into `target/release`.
+/// `install_pkg/rsrcs/libdetcore_dbt.so` is a symlink into `target/<profile>`.
 /// `Path::exists` follows links and so already returns false for a dangling
 /// one, but the message has to say WHICH failure it was or the reader spends
 /// the next ten minutes discovering the link.
@@ -99,9 +102,9 @@ fn require_artifact(path: &Path, what: &str) {
                 .map(|t| t.display().to_string())
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             format!(
-                "{} is a DANGLING SYMLINK -> {target}\nThe release cdylib is produced only by the \
-                 runtime_release build:\n  cargo build --release --locked -p hermit --features \
-                 third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install",
+                "{} is a DANGLING SYMLINK -> {target}\nThe cdylib is produced by a release-derived \
+                 build of the packaged backends, for example the validation build:\n  cargo build \
+                 --profile validate --locked --workspace --all-targets --features third-party-backends",
                 path.display()
             )
         }

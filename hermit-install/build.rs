@@ -382,24 +382,27 @@ fn main() {
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.lock");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
 
-    let profile = env::var("PROFILE");
-    if profile.as_deref() != Ok("release")
+    // Cargo sets PROFILE to "release" for `release` and for every custom
+    // profile that inherits from it, such as the validation profile
+    // `validate`; it is "debug" otherwise. Staging follows every
+    // release-derived profile.
+    if env::var("PROFILE").as_deref() != Ok("release")
         || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
     {
         return;
     }
-    let profile = profile.expect("Cargo did not set PROFILE");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let profile_dir = out_dir
-        .ancestors()
-        .find(|ancestor| {
-            ancestor.file_name().and_then(|name| name.to_str()) == Some(profile.as_str())
-        })
-        .expect("Cargo OUT_DIR does not have the active profile ancestor")
-        .to_path_buf();
+    let profile_dir = profile_dir_of(&out_dir);
+    // The artifact directory's own name (`release`, `validate`, ...): the
+    // packaged symlinks below point at the libraries and binary this same
+    // Cargo invocation places there.
+    let profile_dir_name = profile_dir
+        .file_name()
+        .expect("Cargo profile directory has no name")
+        .to_owned();
     let target_dir = profile_dir
         .parent()
         .expect("Cargo profile directory has no target parent");
@@ -419,7 +422,7 @@ fn main() {
     for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
         replace_symlink(
             &resources.join(library),
-            &Path::new("../../release").join(library),
+            &Path::new("../..").join(&profile_dir_name).join(library),
         )
         .unwrap_or_else(|error| panic!("failed to link packaged {library}: {error}"));
     }
@@ -440,13 +443,38 @@ fn main() {
     build_e9patch(reverie_root, &build_root, &resources);
     copy_licenses(repository, reverie_root, &install);
 
-    replace_symlink(&install.join("hermit"), Path::new("../release/hermit"))
-        .unwrap_or_else(|error| panic!("failed to link install_pkg/hermit: {error}"));
+    replace_symlink(
+        &install.join("hermit"),
+        &Path::new("..").join(&profile_dir_name).join("hermit"),
+    )
+    .unwrap_or_else(|error| panic!("failed to link install_pkg/hermit: {error}"));
     fs::write(
         install.join("README.txt"),
         "Hermit release staging package. Copy with symlink dereferencing (for example, cp -aL) to create a standalone installation.\n",
     )
     .expect("failed to write install package README");
+}
+
+/// The Cargo artifact directory of the active profile: `OUT_DIR` is
+/// `<target>[/<triple>]/<profile-dir>/build/<package>-<hash>/out`, and the
+/// profile directory's name is the profile's own name except that `dev` uses
+/// `debug`. Derived structurally, because a custom profile's directory is
+/// named after the profile while `PROFILE` only says `release` or `debug`.
+fn profile_dir_of(out_dir: &Path) -> PathBuf {
+    let build = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("Cargo OUT_DIR is not <profile>/build/<package>/out");
+    assert_eq!(
+        build.file_name().and_then(|name| name.to_str()),
+        Some("build"),
+        "Cargo OUT_DIR {} is not <profile>/build/<package>/out",
+        out_dir.display()
+    );
+    build
+        .parent()
+        .expect("Cargo build directory has no profile parent")
+        .to_path_buf()
 }
 
 include!("../hermit-cli/reverie_pin.rs");

@@ -38,7 +38,10 @@ independent source and refuses any command, dependency, or cap drift in the
 committed artifact. `--write` updates this same file; there is no secondary
 runnable DAG.
 
-The local privileged selection contains 20 nodes with a 4620-second critical
+The local privileged selection contains 19 nodes (20 until the one-build change
+of 2026-09-30 retired the unconsumed host copy of
+`privileged-only-build.privileged_tests`, which compiled Hermit on the host)
+with a 4620-second critical
 path (4500 until setup.manifest_plan's wall cap went from 180 to 300 seconds in
 https://github.com/rrnewton/hermit/issues/3381). The separately labelled hosted privileged smoke preserves its historical
 12-node population and has a 2100-second critical path, so the manual workflow
@@ -180,21 +183,42 @@ The current relationships are:
 
 Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
+### One build
+
+Since 2026-09-30 a full or portable validation compiles Hermit once, in the
+pinned root, in the `validate` Cargo profile (`Cargo.toml`: release
+optimisation with debug assertions and overflow checks kept on).
+`build.workspace_in_pinned_root` builds every workspace target, the DBT, SaBRe,
+e9patch and LiteInst resources (staged into `target/install_pkg` by
+`hermit-install`'s build script) and every prepared nextest selection in that
+profile; `build.e2e_artifact_in_pinned_root` publishes the one binary at
+`target/ci/hermit` and as the E2E bundle. Consumers name `target/ci/hermit`
+or the bundle, never a per-profile path. The host keeps only tooling builds
+(`build.rust_scripts`, `setup.manifest_plan`, `build.manifest_guests`) for
+host-side checks; the strict
+compatibility rows, which run host-installed programs the image does not
+carry, reach the pinned-root binary through `build.host_hermit_link`.
+`lint.clippy`, `doc.rustdoc` and `doc.doctests` stay in the dev profile: in the
+validate profile they rebuild units whose build scripts, `hermit-install`'s
+among them, rewrite `target/install_pkg` and `target/validate` under running
+tests.
+
 ### Manifest bucket fan-out
 
 The centralized manifests use an explicit build barrier before execution:
 
 1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
    and CI correspondence.
-2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
-   hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
-   tree, then atomically publishes a content-addressed bundle. Every later
-   shared-target Cargo writer waits on this barrier.
+2. `build.e2e_artifact` waits for the one Cargo producer, installs its
+   validate-profile Hermit at `target/ci/hermit`, verifies and hash-binds it
+   plus the dereferenced `install_pkg` resource tree, then atomically
+   publishes a content-addressed bundle. Every later shared-target Cargo
+   writer waits on this barrier.
 3. `build.manifest_guests` prepares every `ci=true` program once. One
    `e2e.manifest_<bucket>` node per YAML bucket declares both producers and runs
    through `run-with-hermit-e2e-artifact.sh`, which re-verifies identity before
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo
-   tests may then relink `target/debug/hermit` or restage `target/install_pkg`
+   tests may then relink `target/validate/hermit` or restage `target/install_pkg`
    without invalidating a running bucket.
    Ordinary validation binds the artifact pointer to its own checkout's
    `target/ci/hermit-e2e-artifact.path`; an inherited

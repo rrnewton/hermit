@@ -57,6 +57,18 @@ fn cargo_build_profile_and_target(compiled_hermit: &Path) -> (OsString, PathBuf)
     (cargo_profile, target_dir)
 }
 
+/// The profile of the separate `liteinst-runtime-build` workspace that matches a
+/// Hermit profile. That workspace defines only Cargo's built-in profiles, and
+/// `hermit-install` builds the runtime in `release` for every release-derived
+/// Hermit profile (`release`, `validate`), so only `dev` maps to itself.
+fn liteinst_runtime_profile(hermit_profile: OsString) -> OsString {
+    if hermit_profile == OsStr::new("dev") {
+        hermit_profile
+    } else {
+        OsString::from("release")
+    }
+}
+
 fn stage_existing_runtime(source: &Path, destination: &Path) -> bool {
     if !staged_runtime_matches_current_pin(source) {
         return false;
@@ -98,6 +110,7 @@ fn stage_existing_runtime(source: &Path, destination: &Path) -> bool {
 pub(super) fn liteinst_stage_command(runtime: &Path) -> Command {
     let compiled_hermit = PathBuf::from(env!("CARGO_BIN_EXE_hermit"));
     let (cargo_profile, target_dir) = cargo_build_profile_and_target(&compiled_hermit);
+    let cargo_profile = liteinst_runtime_profile(cargo_profile);
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -115,17 +128,27 @@ pub(super) fn liteinst_stage_command(runtime: &Path) -> Command {
     command
 }
 
+/// Where a release-derived build of this test's own Cargo profile staged the
+/// LiteInst runtime: `hermit-install`'s build script writes it beside the
+/// profile's Hermit (`target/<profile>/libreverie_liteinst.so`) for `release`
+/// and for every profile that inherits it, such as `validate`.
+fn profile_staged_runtime(compiled_hermit: &Path) -> PathBuf {
+    compiled_hermit
+        .parent()
+        .expect("compiled Hermit should have a Cargo profile directory")
+        .join("libreverie_liteinst.so")
+}
+
 pub(super) fn ensure_liteinst_runtime() {
     LITEINST_RUNTIME.get_or_init(|| {
         // Continue to stage the runtime beside the selected Hermit.
         let compiled_hermit = PathBuf::from(env!("CARGO_BIN_EXE_hermit"));
-        let (_, target_dir) = cargo_build_profile_and_target(&compiled_hermit);
         let runtime = liteinst_runtime_library();
         if staged_runtime_matches_current_pin(&runtime) {
             return;
         }
-        let release_runtime = target_dir.join("release/libreverie_liteinst.so");
-        if stage_existing_runtime(&release_runtime, &runtime) {
+        let profile_runtime = profile_staged_runtime(&compiled_hermit);
+        if stage_existing_runtime(&profile_runtime, &runtime) {
             return;
         }
         let output = liteinst_stage_command(&runtime)
@@ -165,9 +188,24 @@ mod tests {
             cargo_build_profile_and_target(Path::new("/checkout/target/release/hermit"));
         assert_eq!(profile, OsStr::new("release"));
         assert_eq!(target, Path::new("/checkout/target"));
+        let (profile, target) =
+            cargo_build_profile_and_target(Path::new("/checkout/target/validate/hermit"));
+        assert_eq!(profile, OsStr::new("validate"));
+        assert_eq!(target, Path::new("/checkout/target"));
+        assert_eq!(liteinst_runtime_profile(profile), OsStr::new("release"));
+        assert_eq!(
+            liteinst_runtime_profile(OsString::from("dev")),
+            OsStr::new("dev")
+        );
+        assert_eq!(
+            profile_staged_runtime(Path::new("/checkout/target/validate/hermit")),
+            Path::new("/checkout/target/validate/libreverie_liteinst.so")
+        );
 
         let fixture = tempfile::tempdir().unwrap();
-        let source = fixture.path().join("target/release/libreverie_liteinst.so");
+        let source = fixture
+            .path()
+            .join("target/validate/libreverie_liteinst.so");
         let destination = fixture.path().join("target/ci/libreverie_liteinst.so");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, b"runtime-bytes\n").unwrap();

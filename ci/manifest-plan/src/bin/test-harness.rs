@@ -4528,6 +4528,9 @@ sys.exit(1 if failed else 0)
             serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
         let expected_aliases = [
             "check.backend_parity_suites",
+            // A hosted twin since the one-build change of 2026-09-30 moved
+            // the local check into the pinned root.
+            "check.dbt_runtime_abi",
             "doc.doctests",
             "doc.rustdoc",
             "lint.clippy",

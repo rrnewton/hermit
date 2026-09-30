@@ -1208,7 +1208,7 @@ fn self_test() {
     check("dbt-only ⇒ selective", dbt.decision == Decision::Selective);
     check(
         "dbt-only runs the DBT runtime ABI check",
-        dbt.nodes.contains("check.dbt_runtime_abi"),
+        dbt.nodes.contains("check.dbt_runtime_abi_on_host"),
     );
     check(
         "dbt-only runs c-programs DBT cells",
@@ -1219,12 +1219,12 @@ fn self_test() {
         dbt.nodes.contains("e2e.manifest_system_utils_on_host"),
     );
     check(
-        "dbt-only pulls build.runtime_release",
-        dbt.nodes.contains("build.runtime_release"),
+        "dbt-only pulls the E2E publisher (the one validate-profile build since 2026-09-30)",
+        dbt.nodes.contains("build.e2e_artifact_on_host"),
     );
     check(
         "dbt-only pulls build.workspace (dep)",
-        dbt.nodes.contains("build.workspace"),
+        dbt.nodes.contains("build.workspace_on_host"),
     );
     check(
         "dbt-only skips strict compat cells",
@@ -1336,7 +1336,7 @@ fn self_test() {
     let rs_lint = select(&fp, &dag, &["hermit-verify/src/main.rs".into()]);
     check(
         "rs change pulls clippy",
-        rs_lint.nodes.contains("lint.clippy"),
+        rs_lint.nodes.contains("lint.clippy_on_host"),
     );
 
     // --- shard + e2e cell derivation (footprint → shard-selection layer) ---

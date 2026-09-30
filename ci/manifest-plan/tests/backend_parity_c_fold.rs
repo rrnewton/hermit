@@ -643,12 +643,35 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
         .iter()
         .find(|step| tag(step) == ABI)
         .unwrap_or_else(|| panic!("{ABI} is missing from ci/dag/validate.json"));
-    let mut abi_labels = labels(abi);
+    // Since the one-build change of 2026-09-30 the local check runs in the
+    // pinned root, so hosted-portable runs its own host twin, which the hosted
+    // E2E twins must still not depend on (see above).
+    let hosted_abi = format!("{ABI}_on_host");
+    let hosted = steps
+        .iter()
+        .find(|step| tag(step) == hosted_abi)
+        .unwrap_or_else(|| panic!("{hosted_abi} is missing from ci/dag/validate.json"));
+    assert_eq!(
+        labels(hosted),
+        BTreeSet::from([HOSTED_PORTABLE.to_string()]),
+        "{hosted_abi} left the hosted-portable profile; revisit the _on_host twins"
+    );
+    let abi_labels = labels(abi);
     assert!(
-        abi_labels.remove(HOSTED_PORTABLE),
-        "{ABI} left the hosted-portable profile; revisit the _on_host twins"
+        !abi_labels.contains(HOSTED_PORTABLE),
+        "{ABI} is selected by hosted-portable besides its host twin {hosted_abi}"
     );
     assert!(!abi_labels.is_empty(), "{ABI} is in no dagrun profile");
+    assert!(
+        !steps.iter().any(|step| {
+            step["deps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|dep| dep.as_str() == Some(hosted_abi.as_str()))
+        }),
+        "a node depends on {hosted_abi}; the hosted E2E twins must not"
+    );
     let dbt = dbt_plan_buckets();
     assert!(!dbt.is_empty(), "the committed plan selects no DBT cell");
     let mut needs = BTreeSet::new();

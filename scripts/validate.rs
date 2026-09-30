@@ -374,10 +374,10 @@ fn prebuilt_cpuid_command_bracket(cpuid: &Step) -> Result<(), String> {
 }
 
 fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
-    for required in [
-        "build.e2e_artifact_in_pinned_root",
-        "build.liteinst_runtime_release_in_pinned_root",
-    ] {
+    // build.liteinst_runtime_release_in_pinned_root was a second barrier until
+    // 2026-09-30; the one validate-profile build now stages the LiteInst runtime
+    // through hermit-install before build.e2e_artifact publishes.
+    for required in ["build.e2e_artifact_in_pinned_root"] {
         if !build.deps.iter().any(|dependency| dependency == required) {
             return Err(format!(
                 "full-plan bracket: privileged build can start before required build barrier {required}"
@@ -386,6 +386,14 @@ fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The exact Cargo-mode payload branches of the E2E publishers: prove, without
+/// compiling, that target/validate/hermit is the runtime file the node's
+/// preparation record hashed, drop a Buck runtime closure, take that
+/// validate-profile binary.
+const CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
+const HOSTED_CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert hosted-portable && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
+const BUCK_PAYLOAD_BRANCH: &str = "buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;;";
 
 fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     let step = |tag: &str| {
@@ -407,41 +415,43 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             "release-artifact bracket: host Buck producer lost its closed mode branch".into(),
         );
     }
-    for tag in [
+    // One Hermit producer per filesystem root: the validate-profile workspace
+    // build. The release runtime and LiteInst runtime builds were retired on
+    // 2026-09-30, and nothing may build Hermit in another profile for a
+    // consumer of this plan.
+    for retired in [
         "build.runtime_release",
         "build.runtime_release_in_pinned_root",
+        "build.liteinst_runtime_release",
+        "build.liteinst_runtime_release_in_pinned_root",
+        "build.workspace",
+        "build.e2e_artifact",
     ] {
-        let runtime = step(tag)?;
-        let source = guarded_command_source(&runtime.tag(), &runtime.cmd)?;
-        if !runtime
-            .deps
-            .iter()
-            .any(|dep| dep == "build.buck_release_artifact")
-            || !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
-            || !source.contains("build-buck-release.rs --validate-dag-install")
-            || !source.contains("target/ci/hermit-strict")
-            || !source.contains("install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so")
-            || !source.contains("sabre_before=$(sha256sum \"$sabre_source\"")
-            || source
-                .matches("cargo clean --release -p reverie-dbt -p detcore-sabre")
-                .count()
-                != 2
-            || !source.contains("rm -rf target/install_pkg/rsrcs/hermit-runtime")
-        {
+        if cfg.steps.iter().any(|step| step.tag() == retired) {
             return Err(format!(
-                "release-artifact bracket: {tag} can bypass the selected artifact"
+                "release-artifact bracket: retired second Hermit producer {retired} is back"
             ));
         }
-        if tag.ends_with("_in_pinned_root")
-            && [RELEASE_BUILD_MODE_ENV, BUCK_DOTSLASH_ENV]
-                .iter()
-                .any(|name| runtime.cmd.matches(&format!("--env {name}")).count() != 1)
+    }
+    for tag in ["build.workspace_in_pinned_root", "build.workspace_on_host"] {
+        let Some(producer) = cfg.steps.iter().find(|step| step.tag() == tag) else {
+            if tag == "build.workspace_on_host" {
+                continue;
+            }
+            return Err(format!("release-artifact bracket: missing {tag}"));
+        };
+        let source = guarded_command_source(&producer.tag(), &producer.cmd)?;
+        if !source.contains("cargo build --locked --profile validate --workspace --all-targets --features third-party-backends")
+            || !source.contains("cargo build --locked --profile validate -p hermit --features third-party-backends --bin hermit")
+            || !source.contains("cargo clean --profile validate -p reverie-dbt -p detcore-sabre")
+            || source.contains("--release")
         {
-            return Err("release-artifact bracket: pinned mode transport drifted".into());
+            return Err(format!(
+                "release-artifact bracket: {tag} is not the one validate-profile Hermit build"
+            ));
         }
     }
     for tag in [
-        "build.e2e_artifact",
         "build.e2e_artifact_on_host",
         "build.e2e_artifact_in_pinned_root",
     ] {
@@ -452,18 +462,38 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             return Err(format!("release-artifact bracket: missing {tag}"));
         };
         let source = guarded_command_source(&publisher.tag(), &publisher.cmd)?;
-        if !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
-            || !source.contains("cargo) hermit_payload=target/debug/hermit ;;")
-            || !source.contains("buck) hermit_payload=target/ci/hermit-strict ;;")
+        if !publisher
+            .deps
+            .iter()
+            .any(|dep| dep == "build.buck_release_artifact")
+            || !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
+            || !source.contains(if tag.ends_with("_on_host") {
+                HOSTED_CARGO_PAYLOAD_BRANCH
+            } else {
+                CARGO_PAYLOAD_BRANCH
+            })
+            || source.contains("cargo build")
+            || !source.contains(BUCK_PAYLOAD_BRANCH)
             || !source.contains("*) echo \"unknown Hermit release build mode:")
+            || !source.contains("install -m 755 \"$hermit_payload\" target/ci/hermit && ")
+            || !source.contains("install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so")
+            || !source.contains("sabre_before=$(sha256sum \"$sabre_source\"")
             || !source.contains(
-                "publish-hermit-e2e-artifact.sh \"$hermit_payload\" target/ci/hermit-e2e-artifacts",
+                "publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts",
             )
             || source.contains("target/release/hermit")
+            || source.contains("target/debug/hermit")
         {
             return Err(format!(
                 "release-artifact bracket: {tag} publishes the wrong binary"
             ));
+        }
+        if tag.ends_with("_in_pinned_root")
+            && [RELEASE_BUILD_MODE_ENV, BUCK_DOTSLASH_ENV]
+                .iter()
+                .any(|name| publisher.cmd.matches(&format!("--env {name}")).count() != 1)
+        {
+            return Err("release-artifact bracket: pinned mode transport drifted".into());
         }
     }
     let mut direct_consumers = 0;
@@ -480,7 +510,10 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
         };
         direct_consumers += 1;
         let source = guarded_command_source(&consumer.tag(), &consumer.cmd)?;
-        if !source.contains("target/ci/hermit-strict") || source.contains("target/release/hermit") {
+        if !source.contains("_TEST_BINARY=$PWD/target/ci/hermit ")
+            || source.contains("hermit-strict")
+            || source.contains("target/release/hermit")
+        {
             return Err(format!(
                 "release-artifact bracket: {tag} bypasses the staged artifact"
             ));
@@ -501,13 +534,14 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
         .filter(|step| step.labels.iter().any(|label| label == "full"))
     {
         let source = guarded_command_source(&selected.tag(), &selected.cmd)?;
-        if !matches!(
-            selected.tag().as_str(),
-            "build.runtime_release" | "build.runtime_release_in_pinned_root"
-        ) && source.contains("target/release/hermit")
+        if source.contains("target/release/hermit")
+            || source.contains("target/debug/hermit ")
+            || source.contains("target/debug/hermit;")
+            || source.contains("target/debug/hermit\"")
+            || source.contains("target/debug/hermit'")
         {
             return Err(format!(
-                "release-artifact bracket: full consumer {} names mutable target/release/hermit",
+                "release-artifact bracket: full consumer {} names a mutable per-profile Hermit instead of target/ci/hermit",
                 selected.tag()
             ));
         }
@@ -533,44 +567,66 @@ mod artifact_plan_tests {
             .find(|step| step.tag() == "privileged-build.privileged_tests")
             .unwrap();
         privileged_artifact_barriers(build).unwrap();
-        for required in [
-            "build.e2e_artifact_in_pinned_root",
-            "build.liteinst_runtime_release_in_pinned_root",
-        ] {
-            let mut missing = build.clone();
-            missing.deps.retain(|dependency| dependency != required);
-            missing
-                .deps
-                .push(required.strip_suffix("_in_pinned_root").unwrap().into());
-            let error = privileged_artifact_barriers(&missing).unwrap_err();
-            assert!(error.contains(required), "{error}");
-        }
+        let mut missing = build.clone();
+        missing
+            .deps
+            .retain(|dependency| dependency != "build.e2e_artifact_in_pinned_root");
+        missing.deps.push("build.e2e_artifact".into());
+        let error = privileged_artifact_barriers(&missing).unwrap_err();
+        assert!(
+            error.contains("build.e2e_artifact_in_pinned_root"),
+            "{error}"
+        );
         for (tag, from, to) in [
             (
-                "build.e2e_artifact",
-                "cargo) hermit_payload=target/debug/hermit",
-                "cargo) hermit_payload=target/ci/hermit-strict",
+                "build.e2e_artifact_in_pinned_root",
+                "hermit_payload=target/validate/hermit",
+                "hermit_payload=target/release/hermit",
             ),
             (
-                "build.e2e_artifact",
-                "buck) hermit_payload=target/ci/hermit-strict",
+                "build.e2e_artifact_in_pinned_root",
+                "buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict",
                 "buck) hermit_payload=target/debug/hermit",
             ),
             (
-                "test.sabre_examples",
-                "target/ci/hermit-strict",
-                "target/release/hermit",
-            ),
-            (
-                "build.runtime_release",
+                "build.e2e_artifact_in_pinned_root",
                 "target/ci/libdetcore_sabre.so",
                 "target/ci/libdetcore_sabre-decoy.so",
             ),
-            ("build.runtime_release", "sabre_before", "sabre_decoy"),
             (
-                "build.runtime_release",
+                "build.e2e_artifact_in_pinned_root",
+                "sabre_before",
+                "sabre_decoy",
+            ),
+            (
+                "build.e2e_artifact_in_pinned_root",
                 "rm -rf target/install_pkg/rsrcs/hermit-runtime",
                 "true",
+            ),
+            (
+                "build.e2e_artifact_in_pinned_root",
+                "publish-hermit-e2e-artifact.sh target/ci/hermit ",
+                "publish-hermit-e2e-artifact.sh target/validate/hermit ",
+            ),
+            (
+                "build.workspace_in_pinned_root",
+                "cargo build --locked --profile validate --workspace",
+                "cargo build --locked --workspace",
+            ),
+            (
+                "test.sabre_examples",
+                "HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit ",
+                "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit ",
+            ),
+            (
+                "test.cli",
+                "HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ",
+                "HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ",
+            ),
+            (
+                "compat.echo",
+                "$PWD/target/ci/hermit run",
+                "$PWD/target/release/hermit run",
             ),
         ] {
             let mut changed = cfg.clone();
@@ -579,6 +635,7 @@ mod artifact_plan_tests {
                 .iter_mut()
                 .find(|step| step.tag() == tag)
                 .unwrap();
+            assert!(step.cmd.contains(from), "{tag} lost {from}");
             step.cmd = step.cmd.replacen(from, to, 1);
             let error = release_artifact_plan_bracket(&changed).unwrap_err();
             assert!(error.contains(tag), "{error}");
@@ -587,11 +644,29 @@ mod artifact_plan_tests {
         missing_edge
             .steps
             .iter_mut()
-            .find(|step| step.tag() == "build.runtime_release_in_pinned_root")
+            .find(|step| step.tag() == "build.e2e_artifact_in_pinned_root")
             .unwrap()
             .deps
             .retain(|dep| dep != "build.buck_release_artifact");
         assert!(release_artifact_plan_bracket(&missing_edge).is_err());
+        for retired in [
+            "build.runtime_release",
+            "build.liteinst_runtime_release_in_pinned_root",
+        ] {
+            let mut revived = cfg.clone();
+            let mut clone = revived
+                .steps
+                .iter()
+                .find(|step| step.tag() == "build.e2e_artifact_in_pinned_root")
+                .unwrap()
+                .clone();
+            let (group, job) = retired.split_once('.').unwrap();
+            clone.group = group.into();
+            clone.job = job.into();
+            revived.steps.push(clone);
+            let error = release_artifact_plan_bracket(&revived).unwrap_err();
+            assert!(error.contains(retired), "{error}");
+        }
     }
 }
 
@@ -828,9 +903,13 @@ fn e2e_payload_identity(release_builder: &str) -> serde_json::Value {
             "overflow_checks": false,
         })
     } else {
+        // Since 2026-09-30 the one Cargo build of a validation is the
+        // `validate` profile (Cargo.toml): release optimisation with debug
+        // assertions and overflow checks kept on. It was the dev profile's
+        // target/debug/hermit before.
         serde_json::json!({
-            "path": "target/debug/hermit",
-            "profile": "debug",
+            "path": "target/validate/hermit",
+            "profile": "validate",
             "debug_assertions": true,
             "overflow_checks": true,
         })
@@ -858,19 +937,26 @@ mod e2e_payload_identity_tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|step| step["group"] == "build" && step["job"] == "e2e_artifact")
+            .filter(|step| step["group"] == "build" && step["job"] == "e2e_artifact_in_pinned_root")
             .collect();
-        assert_eq!(nodes.len(), 1, "exactly one build.e2e_artifact node");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "exactly one build.e2e_artifact_in_pinned_root node"
+        );
         let cmd = nodes[0]["cmd"].as_str().unwrap();
         for builder in [RELEASE_BUILDER_CARGO, RELEASE_BUILDER_BUCK] {
             let path = e2e_payload_identity(builder)["path"]
                 .as_str()
                 .unwrap()
                 .to_string();
-            let arm = format!("{builder}) hermit_payload={path} ;;");
+            let arm_start = cmd
+                .find(&format!("{builder}) "))
+                .unwrap_or_else(|| panic!("build.e2e_artifact has no {builder} arm: {cmd}"));
+            let arm = &cmd[arm_start..arm_start + cmd[arm_start..].find(";;").unwrap() + 2];
             assert!(
-                cmd.contains(&arm),
-                "build.e2e_artifact must publish {path} for {builder}: {cmd}"
+                arm.ends_with(&format!(" hermit_payload={path} ;;")),
+                "build.e2e_artifact must publish {path} for {builder}: {arm}"
             );
         }
     }
@@ -915,34 +1001,54 @@ mod e2e_payload_identity_tests {
     }
 
     #[test]
-    fn cargo_identity_is_the_unmodified_dev_profile() {
+    fn cargo_identity_is_the_validate_profile() {
         let cargo = e2e_payload_identity(RELEASE_BUILDER_CARGO);
-        assert_eq!(cargo["profile"], "debug");
+        assert_eq!(cargo["profile"], "validate");
+        assert_eq!(cargo["path"], "target/validate/hermit");
         assert_eq!(cargo["debug_assertions"], true);
         assert_eq!(cargo["overflow_checks"], true);
-        // Cargo's dev profile enables both classes unless something overrides
-        // them. Refuse every place that could.
+        // The validate profile inherits release and turns both classes back
+        // on. Require exactly that stanza, and refuse every other place that
+        // could set either class.
         let root = test_source_root();
         let manifest = read(&root, "Cargo.toml");
+        let mut section = String::new();
+        let mut validate_settings = Vec::new();
         for line in manifest.lines().map(str::trim) {
-            assert!(
-                !(line.starts_with("[profile.dev]")
-                    || line.starts_with("[profile.dev.package.\"*\"]")),
-                "Cargo.toml overrides the whole dev profile: {line}"
-            );
+            if line.starts_with('[') {
+                section = line.to_string();
+                assert!(
+                    !(line.starts_with("[profile.dev]")
+                        || line.starts_with("[profile.dev.package.\"*\"]")
+                        || line.starts_with("[profile.release]")
+                        || line.starts_with("[profile.validate.package.\"*\"]")),
+                    "Cargo.toml overrides a whole profile the validate profile depends on: {line}"
+                );
+                continue;
+            }
             // Anywhere on the line, not only as a leading key: a dotted
-            // `profile.dev.debug-assertions` key or an inline package table
-            // sets the class just as well.
-            let setting = line.split('#').next().unwrap_or_default();
-            assert!(
-                !(setting.contains("debug-assertions") || setting.contains("overflow-checks")),
-                "Cargo.toml sets a check class: {line}"
-            );
+            // `profile.validate.debug-assertions` key or an inline package
+            // table sets the class just as well.
+            let setting = line.split('#').next().unwrap_or_default().trim();
+            if setting.contains("debug-assertions") || setting.contains("overflow-checks") {
+                assert_eq!(
+                    section, "[profile.validate]",
+                    "Cargo.toml sets a check class outside [profile.validate]: {line}"
+                );
+                validate_settings.push(setting.replace(' ', ""));
+            }
         }
+        validate_settings.sort();
+        assert_eq!(
+            validate_settings,
+            ["debug-assertions=true", "overflow-checks=true"],
+            "[profile.validate] must keep both check classes on"
+        );
+        assert!(manifest.contains("[profile.validate]\ninherits = \"release\"\n"));
         for config in [".cargo/config.toml", ".cargo/config"] {
             assert!(
                 !root.join(config).exists(),
-                "{config} could override the dev profile or RUSTFLAGS"
+                "{config} could override the validate profile or RUSTFLAGS"
             );
         }
         let dag = read(&root, "ci/dag/validate.json");
@@ -4351,30 +4457,36 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .find(|s| s.tag() == "build.workspace")
+            .find(|s| s.tag() == "build.workspace_in_pinned_root")
             .ok_or("full-plan bracket: workspace fat build disappeared")?;
         if !workspace_build
             .cmd
-            .contains("cargo build --workspace --all-targets")
-            || !workspace_build.cmd.contains("cargo build -p hermit")
+            .contains("cargo build --locked --profile validate --workspace --all-targets")
+            || !workspace_build
+                .cmd
+                .contains("cargo build --locked --profile validate -p hermit")
             || !workspace_build.cmd.contains("--bin hermit")
         {
             return Err(
-                "full-plan bracket: fat build does not finish the debug Hermit producer".into(),
+                "full-plan bracket: fat build does not finish the validate-profile Hermit producer"
+                    .into(),
             );
         }
         let artifact = full
             .cfg
             .steps
             .iter()
-            .find(|s| s.tag() == "build.e2e_artifact")
+            .find(|s| s.tag() == "build.e2e_artifact_in_pinned_root")
             .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
         if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
-            || !artifact.cmd.contains("target/ci/hermit-strict")
-            || !artifact.cmd.ends_with(" target/install_pkg")
-            || !["build.workspace", "build.runtime_release"]
-                .iter()
-                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
+            || !artifact.cmd.contains("target/ci/hermit ")
+            || !artifact.cmd.contains(" target/install_pkg")
+            || ![
+                "build.workspace_in_pinned_root",
+                "build.buck_release_artifact",
+            ]
+            .iter()
+            .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
         {
             return Err(
                 "full-plan bracket: E2E publisher is not a complete binary+resource barrier".into(),
@@ -9096,13 +9208,16 @@ fn slot_name(root: &Path, parent: Option<&Path>) -> String {
 /// Classify the build-cache state BEFORE anything is built. Warm vs cold target/
 /// dominates wall time, so the estimate and the ledger both record it.
 fn cache_state(root: &Path) -> &'static str {
-    let debug = root.join("target/debug/hermit").exists();
-    let release = root.join("target/release/hermit").exists();
-    match (debug, release) {
-        (true, true) => "warm",
-        (true, false) | (false, true) => "partial",
-        (false, false) => "cold",
-    }
+    // One Cargo profile builds a validation (the `validate` profile, in the
+    // pinned root whose target is ignored/hermetic/split/target), so a target
+    // is warm or cold. Before 2026-09-30 a validation built target/debug and
+    // target/release separately and one of the two could be present alone
+    // ("partial").
+    let pinned = root
+        .join("ignored/hermetic/split/target/validate/hermit")
+        .exists();
+    let host = root.join("target/validate/hermit").exists();
+    if pinned || host { "warm" } else { "cold" }
 }
 
 // --------------------------------------------------------------------------- rebase freshness
@@ -10931,11 +11046,30 @@ fn generated_focused_compat_partition(
 
     let mut steps = Vec::new();
     if mode == CompatMode::E9patch {
+        // The e9patch cells run the host release Hermit built by
+        // compatprep.hermit_release, which resolves its packaged resources
+        // (the e9patch and e9tool binaries among them) through the host's
+        // target/install_pkg. The retired host build.runtime_release staged that
+        // tree as a side effect until 2026-09-30; this lane-local node stages it
+        // for the same release profile, so the lane keeps its own host release
+        // build and does not pull in the validation's pinned-root build.
+        let mut install = step_with_caps(
+            &format!("{namespace}prep"),
+            "release_resources",
+            "Stage the release backend resources for the host e9patch cells",
+            "./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool".into(),
+            vec!["compatprep.hermit_release".into()],
+            1200,
+            7200,
+            9 * 1024 * 1024 * 1024,
+        );
+        install.labels = vec![label.into()];
         let mut nss = nsswitch_fixture_node(&nsswitch);
         nss.group = format!("{namespace}prep");
         nss.labels = vec![label.into()];
-        nss.deps = vec!["build.runtime_release".into()];
+        nss.deps = vec![install.tag()];
         prep.deps.push(nss.tag());
+        steps.push(install);
         steps.push(nss);
     }
     steps.push(prep);
@@ -10967,7 +11101,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     // discarded before the committed DAG is written; authoritative definitions
     // live in hermit-manifest-plan's private static source.
     let anchor_tags = [
-        "build.runtime_release",
+        "build.e2e_artifact",
         "compatprep.hermit_release",
         "gate.manifest",
         "setup.nextest",
@@ -11013,7 +11147,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     };
     let mut portable_prep = prepare_fixtures_node("compatprep.fixtures", &portable_fixtures);
     portable_prep.deps = [
-        "build.runtime_release",
+        "build.e2e_artifact",
         "doc.doctests",
         "doc.rustdoc",
         "lint.clippy",
@@ -11035,7 +11169,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     let mut portable = validate_plan::compat_nodes(
         root,
         CompatMode::PortableStrict,
-        &root.join("target/ci/hermit-strict").to_string_lossy(),
+        &root.join("target/ci/hermit").to_string_lossy(),
         "",
         &portable_paths,
         Some("compatprep.fixtures"),
@@ -25940,6 +26074,10 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany all 189 cases: {stdout}"
                 );
             } else {
+                // 254 since the one-build change of 2026-09-30 retired the
+                // hosted build.runtime_release and
+                // build.liteinst_runtime_release_on_host and gave
+                // check.dbt_runtime_abi its hosted twin; 256 before it.
                 // 255 until 87534ff72 added the hosted-portable leaf
                 // selftest.scorecard_commands, assigned to the checks job in
                 // ci/portable-shards.json. 252 until backend-parity-c was
@@ -25953,7 +26091,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "256 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "254 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -26045,8 +26183,10 @@ mod committed_selection_preservation_tests {
         );
 
         // The exact assigned set is unchanged, but moving the Buck producer to
-        // the later completed-build job would let its release consumer start
-        // first. The dependency-order guard must name the hidden predecessor.
+        // a later test job would let its consumer, the completed-build job's
+        // E2E publisher, start first. The dependency-order guard must name the
+        // hidden predecessor. (Its consumer was the release job's
+        // build.runtime_release until the one-build change of 2026-09-30.)
         let mut late_buck = shards.clone();
         let release = late_buck["build_dbt_nodes"].as_array_mut().unwrap();
         let index = release
@@ -26054,7 +26194,7 @@ mod committed_selection_preservation_tests {
             .position(|node| node == "build.buck_release_artifact")
             .unwrap();
         let buck = release.remove(index);
-        late_buck["build_aux_nodes"]
+        late_buck["debug_shards"][0]["nodes"]
             .as_array_mut()
             .unwrap()
             .push(buck);
@@ -26062,7 +26202,7 @@ mod committed_selection_preservation_tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stderr}");
         assert!(
-            stderr.contains("release build job drops constructed predecessor"),
+            stderr.contains("completed build job drops constructed predecessor"),
             "{stderr}"
         );
         assert!(stderr.contains("build.buck_release_artifact"), "{stderr}");
@@ -26526,11 +26666,12 @@ mod fused_privileged_build_tests {
         let workspace = committed
             .steps
             .iter()
-            .find(|step| step.tag() == "build.workspace")
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
-        assert!(workspace.cmd.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
+        let workspace_payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
+        assert!(workspace_payload.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
         let preparation =
-            &workspace.cmd[workspace.cmd.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
+            &workspace_payload[workspace_payload.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
         let mut consumer = committed
             .steps
             .iter()
@@ -27502,14 +27643,16 @@ mod prepared_command_tests {
         let root = test_source_root();
         let cfg = validate_plan::validation_config(&root).unwrap();
         let find = |tag: &str| cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
-        let host = find("build.workspace");
+        // One workspace producer since the one-build change of 2026-09-30: the
+        // host copy of build.workspace was retired, so the pinned-root producer
+        // is the one the barrier's selections come from.
         let pinned = find("build.workspace_in_pinned_root");
+        let host = pinned;
         let barrier = find("privileged-build.privileged_tests");
         let cpuid = find("privileged-cpuid.faulting");
         let barrier_payload = guarded_command_source(&barrier.tag(), &barrier.cmd).unwrap();
         let cpuid_payload = guarded_command_source(&cpuid.tag(), &cpuid.cmd).unwrap();
-        // Both current workspace producers retain the exact preparation suffix.
-        prepared_nextest_commands_bracket(host, barrier).unwrap();
+        // The workspace producer retains the exact preparation suffix.
         prepared_nextest_commands_bracket(pinned, barrier).unwrap();
         prebuilt_cpuid_command_bracket(cpuid).unwrap();
         assert!(barrier.cmd.contains("cargo "));
@@ -27533,7 +27676,7 @@ mod prepared_command_tests {
                 .unwrap();
         assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
 
-        for workspace in [host, pinned] {
+        for workspace in [pinned] {
             let payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
             let mut changed = workspace.clone();
             changed.cmd = bracket_command_with_payload(
@@ -28143,7 +28286,7 @@ mod scorecard_cutover_tests {
             let release = builder == RELEASE_BUILDER_BUCK;
             assert_eq!(
                 retained["e2e_payload"]["profile"],
-                if release { "release" } else { "debug" }
+                if release { "release" } else { "validate" }
             );
             assert_eq!(retained["e2e_payload"]["debug_assertions"], !release);
             assert_eq!(retained["e2e_payload"]["overflow_checks"], !release);

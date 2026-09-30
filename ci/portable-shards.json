@@ -47,12 +47,10 @@
     "build.manifest_guests"
   ],
   "build_dbt_nodes": [
-    "build.buck_release_artifact",
-    "build.runtime_release"
+    "build.buck_release_artifact"
   ],
   "build_aux_nodes": [
-    "build.e2e_artifact",
-    "build.liteinst_runtime_release"
+    "build.e2e_artifact"
   ],
   "e2e_nodes": [
     "e2e.manifest_applications_on_host",

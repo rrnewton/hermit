@@ -58,3 +58,26 @@ repository = "https://github.com/facebookexperimental/hermit"
 # detcore/src/digest.rs.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# The one profile a validation builds. It inherits release optimisation, so the
+# end-to-end and compatibility cells run an optimised Hermit, and keeps
+# debug-assertions and overflow-checks ON so detcore's debug_assert invariants,
+# the run-queue duplicate check and the determinism-log hash lines that
+# --verify compares stay compiled in. Every consumer of a validation -- the
+# nextest suites, the E2E manifests and the strict compatibility cells -- uses
+# this profile's one Hermit binary, published at target/ci/hermit by
+# build.e2e_artifact. clippy, rustdoc and the doctests stay in the dev profile:
+# under this profile they rebuild units whose build scripts (hermit-install's
+# among them) rewrite target/install_pkg and target/validate under running
+# tests.
+[profile.validate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
+# The Rust guest programs keep the unoptimised code generation they had when the
+# prepared tests were built in the dev profile, so an optimiser cannot change
+# the programs whose behaviour the hermit_modes and record/replay tests observe.
+# Their dependencies share the validate build above.
+[profile.validate.package.hermetic_infra_hermit_tests]
+opt-level = 0

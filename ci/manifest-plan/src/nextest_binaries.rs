@@ -940,12 +940,25 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
 }
 
+/// The Cargo width of a preparation build: the width the scheduler admitted
+/// for the preparing node (dagrun delivers it through `CARGO_BUILD_JOBS`, the
+/// workspace producers' jobs_env), else 8. Since the one-build change of
+/// 2026-09-30 every selection compiles in the optimised `validate` profile,
+/// where one large crate's code generation can use up to its 16 codegen units;
+/// a fixed width of 8 made each such compile wait on half of them.
+fn preparation_build_jobs() -> String {
+    std::env::var("CARGO_BUILD_JOBS")
+        .ok()
+        .filter(|jobs| jobs.parse::<u32>().is_ok_and(|jobs| jobs > 0))
+        .unwrap_or_else(|| "8".into())
+}
+
 fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), PreparationError> {
     let output = fs::File::create(destination).map_err(|e| e.to_string())?;
     let status = Command::new(root.join("ci/run-with-reverie-dbt-budget.sh"))
         .arg("cargo")
         .args(args)
-        .env("CARGO_BUILD_JOBS", "8")
+        .env("CARGO_BUILD_JOBS", preparation_build_jobs())
         .current_dir(root)
         .stdout(output)
         .status()
@@ -1234,9 +1247,24 @@ fn verify_record_workloads(
     record_workloads::prepared_envelope(&paths).map(Some)
 }
 
+/// The Cargo profile that compiles a graph profile's prepared test executables.
+///
+/// The full and portable validations, and the hosted-portable twins of their
+/// nodes, build every test executable in the `validate` profile (Cargo.toml),
+/// the same profile as their one Hermit binary, so the executables share its
+/// compilation. The focused graph profiles keep their own builds in Cargo's
+/// default test profile.
+pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
+    match graph_profile {
+        "full" | "hosted-portable" => Some("validate"),
+        _ => None,
+    }
+}
+
 pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let selections = profile_selections(&root, profile)?;
+    let cargo_profile = cargo_profile_for(profile);
     let artifacts = LockedArtifacts::open(&root, true)?;
     let generation = artifacts.root.join(format!(
         "generation-{}-{}",
@@ -1278,6 +1306,9 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             "--list-type".into(),
             "binaries-only".into(),
         ];
+        if let Some(cargo_profile) = cargo_profile {
+            args.extend(["--cargo-profile".into(), cargo_profile.into()]);
+        }
         args.extend(selection.iter().cloned());
         cargo_output(&root, &args, &generation.join(format!("{key}.json")))?;
     }
@@ -1285,19 +1316,20 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let needs_record_workloads = has_test_selection(selections.values(), "record_replay");
     let guest_path = generation.join("guests.jsonl");
     if needs_guests || needs_record_workloads {
-        cargo_output(
-            &root,
-            &[
-                "build",
-                "--locked",
+        let mut args = ["build", "--locked"].map(String::from).to_vec();
+        if let Some(cargo_profile) = cargo_profile {
+            args.extend(["--profile".into(), cargo_profile.into()]);
+        }
+        args.extend(
+            [
                 "-p",
                 "hermetic_infra_hermit_tests",
                 "--bins",
                 "--message-format=json",
             ]
             .map(String::from),
-            &guest_path,
-        )?;
+        );
+        cargo_output(&root, &args, &guest_path)?;
     }
     let cpu_wrapper_path = generation.join("cpu-wrapper.jsonl");
     prepare_cpu_wrapper(&root, &cpu_wrapper_path)?;

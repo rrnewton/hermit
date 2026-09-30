@@ -55,8 +55,9 @@ if [[ $build_job_context == launcher ]]; then
     #
     # The K=8 above is the FLOOR for a step that declares nothing. The comment at the
     # top of this file already says the collapsed fat-build nodes "declare their
-    # independently measured higher width in the DAG manifest" -- build.workspace and
-    # build.runtime_release both declare preferred_inner_jobs=32. That declaration has
+    # independently measured higher width in the DAG manifest" -- build.workspace
+    # declares preferred_inner_jobs=32 (as build.runtime_release did until the
+    # one-build change of 2026-09-30 merged it away). That declaration had
     # never reached Cargo: every portable jobs_flag in ci/dag/validate.json is the empty string,
     # so the runner had no way to hand a step its width, and this line's ambient 8 was
     # the only value Cargo ever saw. Measured on the 2026-08-24 clean full run.

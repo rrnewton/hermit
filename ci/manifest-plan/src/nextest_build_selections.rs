@@ -590,11 +590,10 @@ mod tests {
     fn prepared_metadata_requires_the_consumers_filesystem_root() {
         let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         assert_preparation_dependencies(&graph).unwrap();
-        let host = graph
-            .steps
-            .iter()
-            .find(|step| step.tag() == "build.workspace")
-            .unwrap();
+        // The local profiles have no host workspace producer since the
+        // one-build change of 2026-09-30; the hosted variant is the host-root
+        // producer, and its command differs from the pinned payload only in
+        // the graph profile it prepares.
         let hosted = graph
             .steps
             .iter()
@@ -605,9 +604,16 @@ mod tests {
             .iter()
             .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
-        assert_eq!(execution_command(image).unwrap(), host.cmd);
+        let payload = execution_command(image).unwrap();
+        assert_eq!(
+            payload,
+            hosted.cmd.replace(
+                "./ci/nextest-binaries.rs prepare hosted-portable",
+                "./ci/nextest-binaries.rs prepare full"
+            )
+        );
         for (consumer, producer, wrong_command) in [
-            ("test.regular_crates", image.tag(), host.cmd.clone()),
+            ("test.regular_crates", image.tag(), payload.clone()),
             (
                 "test.regular_crates_on_host",
                 hosted.tag(),
