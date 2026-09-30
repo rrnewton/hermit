@@ -814,11 +814,12 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    // 213 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301).
-    if split.len() != 212 {
+    // 212 until check.backend_parity_suites was retired with
+    // tests/backend-parity; 213 until test.dbt_parity was retired (both in
+    // slice S13 of https://github.com/rrnewton/hermit/issues/3301).
+    if split.len() != 211 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 212",
+            "hosted test dependency closure has {} nodes, expected 211",
             split.len()
         ));
     }
