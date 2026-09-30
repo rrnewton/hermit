@@ -3,13 +3,16 @@
 //!
 //! A self-test with trigger paths ([`crate::validation_dag::ToolSelfTest`]'s
 //! `run_when_changed`) runs when any path changed since the merge base with
-//! `origin/main`, committed or not, lies under one of them ([`is_under`]). A self-test that
-//! does not run prints one line containing [`NOT_RUN_MARKER`], so the node log
-//! and the scheduler's one-line node summary both say it was not run.
+//! `origin/main`, committed or not, lies under one of them ([`is_under`]). When
+//! HEAD is already contained in `origin/main`, so that the merge base is HEAD
+//! itself, the change set is HEAD's own top commit instead: every path changed
+//! since HEAD's first parent, committed or not ([`change_set`]). A self-test
+//! that does not run prints one line containing [`NOT_RUN_MARKER`], so the node
+//! log and the scheduler's one-line node summary both say it was not run.
 //!
-//! Selection errs toward running. Main always runs, and so does any change set
-//! this module cannot resolve: a shallow clone, a missing `origin/main`, an
-//! empty change set, or any git failure.
+//! Selection errs toward running. So does any change set this module cannot
+//! resolve: a shallow clone, a missing `origin/main`, a HEAD with no parent,
+//! an empty change set, or any git failure.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -42,8 +45,8 @@ pub fn not_run_line(name: &str, base: &str, changed: &[String], triggers: &[&str
         shown.push_str(&format!(", and {} more", changed.len() - SHOWN));
     }
     format!(
-        "self-test {name}{NOT_RUN_MARKER}none of the {} path(s) changed since merge base {base} \
-         ({shown}) is under {}; main runs it, and {SELECTION_ENV}=all runs it here",
+        "self-test {name}{NOT_RUN_MARKER}none of the {} path(s) changed since {base} \
+         ({shown}) is under {}; {SELECTION_ENV}=all runs it here",
         changed.len(),
         triggers.join(" or ")
     )
@@ -85,7 +88,7 @@ pub fn decide(
     };
     if changed.is_empty() {
         return Decision::Run(format!(
-            "no path changed since merge base {base}, so there is nothing to select on"
+            "no path changed since {base}, so there is nothing to select on"
         ));
     }
     if let Some((path, trigger)) = changed.iter().find_map(|path| {
@@ -99,9 +102,19 @@ pub fn decide(
     Decision::Skip { base, changed }
 }
 
-/// The merge base with `origin/main` and every path changed since it,
-/// committed or not. `Err` names why the change set could not be resolved;
-/// the caller then runs the self-test.
+/// The base commit and every path changed since it, committed or not. `Err`
+/// names why the change set could not be resolved; the caller then runs the
+/// self-test.
+///
+/// The base is the merge base with `origin/main`. When that is HEAD itself,
+/// because HEAD is already contained in `origin/main` (a validation of main
+/// after a landing), the base is HEAD's first parent, so the change set is the
+/// top commit plus anything uncommitted. That is enough: HEAD equals the merge
+/// base only after a landing, and every landing needs an exact-head validation
+/// before its push, when HEAD is still ahead of `origin/main` and the change
+/// set covers every commit in the range being pushed. A push of several commits
+/// is therefore selected on all of them before it lands. A HEAD with no parent
+/// cannot be selected on and runs.
 pub fn change_set(root: &Path) -> Result<(String, Vec<String>), String> {
     let git = |args: &[&str]| -> Result<Vec<u8>, String> {
         let output = git_command()
@@ -120,27 +133,37 @@ pub fn change_set(root: &Path) -> Result<(String, Vec<String>), String> {
         Ok(output.stdout)
     };
     let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).trim().to_string();
-    let mains = text(git(&[
-        "for-each-ref",
-        "--contains",
-        "HEAD",
-        "--format=%(refname)",
-        "refs/heads/main",
-        "refs/remotes/*/main",
-    ])?);
-    if !mains.is_empty() {
-        return Err(format!(
-            "HEAD is on main ({}), and main runs every self-test",
-            mains.split_whitespace().collect::<Vec<_>>().join(", ")
-        ));
-    }
+    let is_commit = |text: &str| text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit());
     if text(git(&["rev-parse", "--is-shallow-repository"])?) != "false" {
         return Err("this clone is shallow, so its merge base cannot be trusted".into());
     }
-    let base = text(git(&["merge-base", "HEAD", "refs/remotes/origin/main"])?);
-    if base.len() != 40 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("git merge-base printed {base:?}, not a commit"));
+    let merge_base = text(git(&["merge-base", "HEAD", "refs/remotes/origin/main"])?);
+    if !is_commit(&merge_base) {
+        return Err(format!(
+            "git merge-base printed {merge_base:?}, not a commit"
+        ));
     }
+    let head = text(git(&["rev-parse", "--verify", "HEAD^{commit}"])?);
+    let base = if merge_base == head {
+        let parents = text(git(&["rev-list", "--parents", "-n", "1", "HEAD"])?);
+        let parent = parents.split_whitespace().nth(1).map(str::to_string);
+        match parent {
+            Some(parent) if is_commit(&parent) => parent,
+            Some(parent) => {
+                return Err(format!(
+                    "git rev-list printed parent {parent:?}, not a commit"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "HEAD {head} is contained in origin/main and has no parent, \
+                     so it has no top commit to select on"
+                ));
+            }
+        }
+    } else {
+        merge_base
+    };
     let mut changed = BTreeSet::new();
     for listing in [
         // A rename lists both its old and its new path. A submodule counts
@@ -243,18 +266,7 @@ mod tests {
     #[test]
     fn every_trigger_names_a_tracked_path() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let output = git_command()
-            .arg("-C")
-            .arg(&root)
-            .args(["ls-files", "-z"])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git ls-files: {output:?}");
-        let tracked = output
-            .stdout
-            .split(|&b| b == 0)
-            .map(|path| String::from_utf8_lossy(path).into_owned())
-            .collect::<Vec<_>>();
+        let tracked = tracked_paths(&root);
         let mut checked = 0;
         for tool in crate::validation_dag::TOOL_SELF_TESTS {
             for trigger in tool.run_when_changed.unwrap_or_default() {
@@ -267,6 +279,157 @@ mod tests {
             }
         }
         assert!(checked > 0, "no self-test has a trigger to check");
+    }
+
+    fn tracked_paths(root: &Path) -> Vec<String> {
+        let output = git_command()
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "-z"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git ls-files: {output:?}");
+        output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect()
+    }
+
+    /// `dir/../x` -> `x`, over `/`-separated repository paths.
+    fn normalize(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                part => parts.push(part),
+            }
+        }
+        parts.join("/")
+    }
+
+    /// Every way `inputs` and `non_inputs` can drift from the tracked tree:
+    /// an unclassified or doubly classified file under `roots`, a stale
+    /// non-input, and an input's `#[path]` module that no input covers.
+    fn scorecard_input_violations(
+        root: &Path,
+        tracked: &[String],
+        inputs: &[&str],
+        roots: &[&str],
+        non_inputs: &[(&str, &str)],
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let is_input = |path: &str| inputs.iter().any(|input| is_under(path, input));
+        let is_non_input = |path: &str| non_inputs.iter().any(|(entry, _)| is_under(path, entry));
+        for (entry, reason) in non_inputs {
+            if reason.trim().is_empty() {
+                violations.push(format!("non-input {entry} has no reason"));
+            }
+            if !roots.iter().any(|dir| is_under(entry, dir)) {
+                violations.push(format!("non-input {entry} is under no input root"));
+            }
+            if !tracked.iter().any(|path| is_under(path, entry)) {
+                violations.push(format!("non-input {entry} names no tracked path"));
+            }
+        }
+        for path in tracked {
+            if !roots.iter().any(|dir| is_under(path, dir)) {
+                continue;
+            }
+            match (is_input(path), is_non_input(path)) {
+                (true, true) => violations.push(format!("{path} is both an input and a non-input")),
+                (false, false) => {
+                    violations.push(format!("{path} is neither an input nor a non-input"))
+                }
+                _ => {}
+            }
+        }
+        for path in tracked
+            .iter()
+            .filter(|path| path.ends_with(".rs") && is_input(path))
+        {
+            let source = std::fs::read_to_string(root.join(path)).unwrap();
+            let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+            for line in source.lines() {
+                let Some(rest) = line.trim_start().strip_prefix("#[path") else {
+                    continue;
+                };
+                let target = rest.split('"').nth(1).unwrap_or_default();
+                let target = normalize(&format!("{dir}/{target}"));
+                if !tracked.contains(&target) {
+                    violations.push(format!("{path} includes {target}, which is not tracked"));
+                } else if !is_input(&target) {
+                    violations.push(format!("{path} includes {target}, which no input covers"));
+                }
+            }
+        }
+        violations
+    }
+
+    /// The scorecard's triggers cover everything its builds and runs read: a
+    /// file under an input root must be classified, and a `#[path]` module an
+    /// input includes from anywhere in the tree must be an input. Planted
+    /// drifts show each check refuses.
+    #[test]
+    fn scorecard_inputs_cover_every_file_and_path_module() {
+        use crate::validation_dag::SCORECARD_INPUT_ROOTS;
+        use crate::validation_dag::SCORECARD_INPUTS;
+        use crate::validation_dag::SCORECARD_NON_INPUTS;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let tracked = tracked_paths(&root);
+        let check = |inputs: &[&str], non_inputs: &[(&str, &str)]| {
+            scorecard_input_violations(&root, &tracked, inputs, SCORECARD_INPUT_ROOTS, non_inputs)
+        };
+        assert_eq!(
+            check(SCORECARD_INPUTS, SCORECARD_NON_INPUTS),
+            Vec::<String>::new()
+        );
+
+        let without = |dropped: &str| -> Vec<&str> {
+            let kept: Vec<&str> = SCORECARD_INPUTS
+                .iter()
+                .copied()
+                .filter(|input| *input != dropped)
+                .collect();
+            assert_eq!(
+                kept.len() + 1,
+                SCORECARD_INPUTS.len(),
+                "{dropped} is not an input"
+            );
+            kept
+        };
+        assert_eq!(
+            check(
+                &without("ci/record-replay-workloads.rs"),
+                SCORECARD_NON_INPUTS
+            ),
+            [
+                "ci/manifest-plan/src/nextest_binaries.rs includes ci/record-replay-workloads.rs, \
+              which no input covers"
+            ]
+        );
+        assert_eq!(
+            check(
+                &without("ci/manifest-plan/src/timeouts.rs"),
+                SCORECARD_NON_INPUTS
+            ),
+            ["ci/manifest-plan/src/timeouts.rs is neither an input nor a non-input"]
+        );
+        let mut doubled = SCORECARD_NON_INPUTS.to_vec();
+        doubled.push(("ci/compat-envelope/cells.json", "planted"));
+        doubled.push(("ci/compat-envelope/gone.json", ""));
+        assert_eq!(
+            check(SCORECARD_INPUTS, &doubled),
+            [
+                "non-input ci/compat-envelope/gone.json has no reason",
+                "non-input ci/compat-envelope/gone.json names no tracked path",
+                "ci/compat-envelope/cells.json is both an input and a non-input",
+            ]
+        );
     }
 
     /// A scratch repository for `change_set`, removed on drop.
@@ -319,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn change_set_reads_the_branch_diff_and_untracked_paths_and_runs_main() {
+    fn change_set_reads_the_branch_diff_and_untracked_paths() {
         let repo = Scratch::new("branch");
         repo.git(&["init", "-q", "-b", "main"]);
         let base = repo.commit("README.md");
@@ -345,22 +508,14 @@ mod tests {
             Decision::Skip { base: skipped, .. } if skipped == base
         ));
 
-        // A commit already contained in main runs, through the local branch
-        // or through any remote's main.
-        repo.git(&["switch", "-q", "main"]);
-        let on_main = change_set(&repo.0).unwrap_err();
-        assert!(
-            on_main.contains("HEAD is on main (refs/heads/main"),
-            "{on_main}"
-        );
-        repo.git(&["switch", "-q", "topic"]);
+        // A local main or another remote's main containing HEAD does not
+        // change the base: only origin/main does.
         let topic = repo.git(&["rev-parse", "HEAD"]);
-        repo.git(&["branch", "-q", "-D", "main"]);
+        repo.git(&["update-ref", "refs/heads/main", &topic]);
         repo.git(&["update-ref", "refs/remotes/upstream/main", &topic]);
-        let remote_main = change_set(&repo.0).unwrap_err();
-        assert!(
-            remote_main.contains("HEAD is on main (refs/remotes/upstream/main)"),
-            "{remote_main}"
+        assert_eq!(
+            change_set(&repo.0),
+            Ok((base.clone(), vec!["docs/one.md".to_string()]))
         );
         repo.git(&["update-ref", "-d", "refs/remotes/upstream/main"]);
 
@@ -368,6 +523,83 @@ mod tests {
         repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
         let no_base = change_set(&repo.0).unwrap_err();
         assert!(no_base.contains("git merge-base"), "{no_base}");
+    }
+
+    /// On a HEAD already contained in origin/main, the change set is the top
+    /// commit (every path changed since HEAD's first parent, committed or
+    /// not), and each case that cannot be selected on runs.
+    #[test]
+    fn change_set_on_main_selects_on_the_top_commit() {
+        let repo = Scratch::new("main");
+        repo.git(&["init", "-q", "-b", "main"]);
+        let root = repo.commit("README.md");
+        repo.git(&["update-ref", "refs/remotes/origin/main", &root]);
+        // A root commit has no top-commit diff to select on, so it runs.
+        let rooted = change_set(&repo.0).unwrap_err();
+        assert!(rooted.contains("has no parent"), "{rooted}");
+        assert!(matches!(
+            decide(None, change_set(&repo.0), TRIGGERS),
+            Decision::Run(reason) if reason == rooted
+        ));
+
+        // The top commit touches a trigger: it runs, and the branch below it
+        // (already on main) does not count.
+        repo.commit("docs/one.md");
+        let touching_parent = repo.git(&["rev-parse", "HEAD"]);
+        let touching = repo.commit("ci/compat-envelope/scorecard.rs");
+        repo.git(&["update-ref", "refs/remotes/origin/main", &touching]);
+        assert_eq!(
+            change_set(&repo.0),
+            Ok((
+                touching_parent.clone(),
+                vec!["ci/compat-envelope/scorecard.rs".to_string()]
+            ))
+        );
+        assert!(matches!(
+            decide(None, change_set(&repo.0), TRIGGERS),
+            Decision::Run(reason) if reason.contains("ci/compat-envelope/scorecard.rs")
+        ));
+
+        // The top commit touches no trigger, though an earlier commit on main
+        // did: it skips and names the parent it compared against. A HEAD
+        // behind origin/main is selected the same way.
+        let quiet = repo.commit("docs/two.md");
+        let later = repo.commit("docs/three.md");
+        repo.git(&["update-ref", "refs/remotes/origin/main", &later]);
+        repo.git(&["checkout", "-q", "--detach", &quiet]);
+        assert_eq!(
+            decide(None, change_set(&repo.0), TRIGGERS),
+            Decision::Skip {
+                base: touching,
+                changed: vec!["docs/two.md".to_string()],
+            }
+        );
+        // An uncommitted or untracked trigger path on top of it still runs.
+        std::fs::write(repo.0.join("ci/compat-envelope/scorecard.rs"), "edited").unwrap();
+        assert!(matches!(
+            decide(None, change_set(&repo.0), TRIGGERS),
+            Decision::Run(reason) if reason.contains("ci/compat-envelope/scorecard.rs")
+        ));
+        repo.git(&["checkout", "-q", "--", "ci/compat-envelope/scorecard.rs"]);
+
+        // An empty top commit leaves nothing to select on, so it runs.
+        repo.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["update-ref", "refs/remotes/origin/main", &empty]);
+        assert_eq!(change_set(&repo.0), Ok((quiet, Vec::new())));
+        assert!(matches!(
+            decide(None, change_set(&repo.0), TRIGGERS),
+            Decision::Run(reason) if reason.contains("nothing to select on")
+        ));
+
+        // A git failure runs: here, a directory that does not exist.
+        let missing = repo.0.join("missing");
+        let failed = change_set(&missing).unwrap_err();
+        assert!(failed.starts_with("git "), "{failed}");
+        assert!(matches!(
+            decide(None, change_set(&missing), TRIGGERS),
+            Decision::Run(reason) if reason == failed
+        ));
     }
 
     #[test]

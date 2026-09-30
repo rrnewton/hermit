@@ -81,44 +81,230 @@ pub struct ToolSelfTest {
     pub program: &'static str,
     pub args: &'static [&'static str],
     /// `None` runs the self-test in every validation. `Some(triggers)` runs
-    /// it on main and whenever a path changed since the merge base with
-    /// `origin/main` is under one of the triggers (a trigger ending in `/` is
-    /// a directory; any other trigger is one tracked path, a file or a
-    /// submodule); otherwise the node prints a NOT RUN line
-    /// (`self_test_selection`) and passes.
+    /// it whenever a path changed since the merge base with `origin/main` is
+    /// under one of the triggers (a trigger ending in `/` is a directory; any
+    /// other trigger is one tracked path, a file or a submodule); on a HEAD
+    /// already contained in `origin/main`, the change set is HEAD's top commit.
+    /// Otherwise the node prints a NOT RUN line (`self_test_selection`) and
+    /// passes.
     pub run_when_changed: Option<&'static [&'static str]>,
     /// `test-harness selftest` passes the `hermit-manifest-plan` binary that
     /// its own build wrote beside it through `HERMIT_MANIFEST_PLAN_BIN`, so the
     /// program runs that binary instead of building one with Cargo inside the
     /// node's CPU cap. Only the scorecard reads it.
     pub manifest_plan_helper: bool,
+    /// `true` runs the program's libtest threads at the node's admitted width:
+    /// [`ToolSelfTest::test_threads`] sets `RUST_TEST_THREADS` from
+    /// `CARGO_BUILD_JOBS`, which the DAG sets to the node's
+    /// `preferred_inner_jobs`. Otherwise libtest starts one thread per host
+    /// CPU, far past the width the scheduler admitted.
+    pub test_threads_from_jobs: bool,
     /// `true` also runs the self-test in the quick and super lanes, as
     /// `quick-super-selftest.<name>` (`materialize_quick_super_budgets`).
     /// `false` keeps it to the full, portable and hosted-portable lanes.
     pub quick_super: bool,
 }
 
+impl ToolSelfTest {
+    /// The `RUST_TEST_THREADS` to give the program, from the caller's
+    /// `RUST_TEST_THREADS` and `CARGO_BUILD_JOBS`: `None` leaves the
+    /// environment alone (the tool does not opt in, or the caller already
+    /// chose), a malformed width is an error, and a run outside the DAG with no
+    /// width gets one thread.
+    pub fn test_threads(
+        &self,
+        rust_test_threads: Option<&str>,
+        cargo_build_jobs: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        if !self.test_threads_from_jobs || rust_test_threads.is_some() {
+            return Ok(None);
+        }
+        let Some(jobs) = cargo_build_jobs else {
+            return Ok(Some("1".to_string()));
+        };
+        match jobs.parse::<usize>() {
+            Ok(jobs) if jobs > 0 => Ok(Some(jobs.to_string())),
+            _ => Err(format!(
+                "self-test {} sizes its test threads from CARGO_BUILD_JOBS, \
+                 which is {jobs:?}, not a positive integer",
+                self.name
+            )),
+        }
+    }
+}
+
 /// The paths whose change selects the scorecard's commands tier and its
 /// unit tests; see `scorecard_commands` and `scorecard_tests` in
-/// [`TOOL_SELF_TESTS`]. Every entry must name a tracked path
-/// (`self_test_selection`'s tests check it).
+/// [`TOOL_SELF_TESTS`]. Every entry must name a tracked path, every tracked
+/// file under [`SCORECARD_INPUT_ROOTS`] must be under an entry here or in
+/// [`SCORECARD_NON_INPUTS`], and every `#[path]` module an input includes
+/// must be under an entry here (`self_test_selection`'s tests check all
+/// three).
+///
+/// Derived 2026-09-30 from the dep-info of the scorecard's release and test
+/// builds, of `hermit-manifest-plan` and of `test-harness`, plus a traced run
+/// of both nodes, every file their processes opened: the build inputs are the
+/// scorecard, the rust-script prelude it includes, the manifest-plan library
+/// and helper with the files their `#[path]` modules include, detcore-model
+/// and agent-utils (path dependencies), and the Cargo manifests and lock; the
+/// run reads the data files named below and the git history of HEAD.
 pub const SCORECARD_INPUTS: &[&str] = &[
-    "ci/compat-envelope/",
-    "ci/manifest-plan/",
-    "detcore-model/",
+    // The scorecard, its cell list and its series-snapshot fixture.
+    "ci/compat-envelope/scorecard.rs",
+    "ci/compat-envelope/cells.json",
+    "ci/compat-envelope/testdata/series-snapshot/series/",
+    "ci/compat-envelope/testdata/series-snapshot/alternate-series/",
+    "scripts/lib/rust_script_prelude.rs",
+    "SCORECARD.md",
+    // The manifest-plan library the scorecard links, the helper it runs and
+    // the test-harness that runs both nodes. One path each, so a new module
+    // must be classified here or in SCORECARD_NON_INPUTS.
+    "ci/manifest-plan/Cargo.toml",
+    "ci/manifest-plan/src/backend_parity.rs",
+    "ci/manifest-plan/src/backend_parity_policy.rs",
+    "ci/manifest-plan/src/bin/test-harness.rs",
+    "ci/manifest-plan/src/ci_selection.rs",
+    "ci/manifest-plan/src/cli_help.rs",
+    "ci/manifest-plan/src/cpu_evidence.rs",
+    "ci/manifest-plan/src/environmental_block.rs",
+    "ci/manifest-plan/src/git_environment.rs",
+    "ci/manifest-plan/src/host_capability.rs",
+    "ci/manifest-plan/src/ledger.rs",
+    "ci/manifest-plan/src/ledger/admission.rs",
+    "ci/manifest-plan/src/ledger/cell_verdict.rs",
+    "ci/manifest-plan/src/ledger/schema10.rs",
+    "ci/manifest-plan/src/lib.rs",
+    "ci/manifest-plan/src/main.rs",
+    "ci/manifest-plan/src/manifest_metadata.rs",
+    "ci/manifest-plan/src/manifest_value.rs",
+    "ci/manifest-plan/src/nextest_binaries.rs",
+    "ci/manifest-plan/src/nextest_build_selections.rs",
+    "ci/manifest-plan/src/nextest_cohort.rs",
+    "ci/manifest-plan/src/nextest_cpu.rs",
+    "ci/manifest-plan/src/parity.rs",
+    "ci/manifest-plan/src/retired_ids.rs",
+    "ci/manifest-plan/src/runner.rs",
+    "ci/manifest-plan/src/self_test_selection.rs",
+    "ci/manifest-plan/src/service_result.rs",
+    "ci/manifest-plan/src/stress_series.rs",
+    "ci/manifest-plan/src/timeouts.rs",
+    "ci/manifest-plan/src/validation_dag.rs",
+    "ci/manifest-plan/src/validation_dag_static.rs",
+    // The library's `#[path]` modules outside its own directory.
+    "hermit-cli/src/canonical_verdict.rs",
+    "hermit-cli/src/logdiff_report.rs",
+    "hermit-cli/tests/common/proc_locks_lease.rs",
+    "ci/cargo-guest-binaries.rs",
+    "ci/record-replay-workloads.rs",
+    // Path dependencies: detcore-model, and agent-utils, a gitlink that
+    // `git diff` lists without a trailing slash, with .gitmodules, which says
+    // where it comes from.
+    "detcore-model/Cargo.toml",
+    "detcore-model/src/",
     "agent-utils",
     ".gitmodules",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
-    "scripts/lib/rust_script_prelude.rs",
-    "ci/rust-script-bin/",
+    // The prepared rust-script launchers, the script that prepares them and
+    // the one that pins the ledger corpus.
+    "ci/rust-script-bin/rust-script",
+    "ci/rust-script-bin/run-test-harness",
     "ci/prepare-rust-scripts.sh",
     "ci/prepare-scorecard-self-test-corpus.sh",
+    // Data the helper and the scorecard's checks read: the E2E manifests and
+    // their inventory, the expected plan and the two baselines.
+    "tests/e2e/manifests/",
     "ci/expected-e2e-plan.json",
     "ci/ci-reason-baseline.json",
     "ci/matrix-symmetry-baseline.json",
+];
+
+/// The directories that hold the scorecard's inputs. Every tracked file under
+/// one of them is either under an entry of [`SCORECARD_INPUTS`] or in
+/// [`SCORECARD_NON_INPUTS`], never both.
+pub const SCORECARD_INPUT_ROOTS: &[&str] = &[
+    "ci/compat-envelope/",
+    "ci/manifest-plan/",
+    "detcore-model/",
+    "ci/rust-script-bin/",
     "tests/e2e/manifests/",
+];
+
+/// Tracked paths under [`SCORECARD_INPUT_ROOTS`] that neither node reads,
+/// each with the reason. A trailing `/` names a directory. None of them is in
+/// the dep-info of the scorecard's builds, of `hermit-manifest-plan` or of
+/// `test-harness`, and the traced run opened none of them.
+pub const SCORECARD_NON_INPUTS: &[(&str, &str)] = &[
+    (
+        "ci/compat-envelope/README.md",
+        "documentation; nothing reads it",
+    ),
+    (
+        "ci/compat-envelope/parity-cells.json",
+        "written and checked by generate-parity-cells, read otherwise only by parity.rs's unit tests; the scorecard runs neither",
+    ),
+    (
+        "ci/compat-envelope/pressure-test.rs",
+        "a separate rust-script with its own node, selftest.pressure_test",
+    ),
+    (
+        "ci/compat-envelope/testdata/bpfjailer-pytest-denial.log",
+        "included only by pressure-test.rs",
+    ),
+    (
+        "ci/compat-envelope/testdata/series-snapshot/README.md",
+        "documentation for the fixture; nothing reads it",
+    ),
+    (
+        "ci/manifest-plan/failure-class-schema.json",
+        "included only by runner.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "ci/manifest-plan/validation-service-result-schema.json",
+        "included only by service_result.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "ci/manifest-plan/src/bin/generate-parity-cells.rs",
+        "a separate binary; neither node builds or runs it",
+    ),
+    (
+        "ci/manifest-plan/src/bin/generate-test-footprints.rs",
+        "a separate binary; neither node builds or runs it",
+    ),
+    (
+        "ci/manifest-plan/src/bin/generate-validation-dag.rs",
+        "a separate binary; neither node builds or runs it",
+    ),
+    (
+        "ci/manifest-plan/src/bin/manifest-metadata.rs",
+        "a separate binary; neither node builds or runs it",
+    ),
+    (
+        "ci/manifest-plan/src/bin/nextest-cpu-wrapper.rs",
+        "a separate binary; neither node builds or runs it",
+    ),
+    (
+        "ci/manifest-plan/src/bin/strict-green-authority.rs",
+        "a separate binary; neither node builds or runs it",
+    ),
+    (
+        "ci/manifest-plan/src/ledger/schema10/tests.rs",
+        "schema10.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "ci/manifest-plan/tests/",
+        "the crate's integration tests, which neither node builds",
+    ),
+    ("detcore-model/BUCK", "a Buck build file; Cargo ignores it"),
+    (
+        "ci/rust-script-bin/test-log-isolation.sh",
+        "run only by scripts/check-script-sigpipe.sh",
+    ),
+    (
+        "ci/rust-script-bin/test-ownership.sh",
+        "run only by scripts/check-script-sigpipe.sh",
+    ),
 ];
 
 /// `selftest.scorecard_tests` runs the scorecard's unit tests exactly as
@@ -146,26 +332,28 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test-and-check"],
         run_when_changed: None,
         manifest_plan_helper: true,
+        test_threads_from_jobs: false,
         quick_super: true,
     },
     // The scorecard's commands tier runs its commands against a scratch
     // clone, ledger and reverie repository, and costs minutes; the regression
-    // tier above runs in seconds. It runs when one of its known inputs
-    // changes, and always on main, which also catches a change elsewhere that
-    // it reads: the scorecard's own directory; the manifest-plan crate it
-    // builds and runs, with that crate's path dependencies (detcore-model/,
-    // and agent-utils, a gitlink that `git diff` lists without a trailing
-    // slash, and .gitmodules, which says where it comes from) and Cargo.lock;
-    // the rust-script prelude it includes and the
-    // prepared rust-script launchers; the script that pins its ledger corpus;
-    // and the E2E manifests its cells and its `system-utils/record-getpid`
-    // command fixture come from.
+    // tier above runs in seconds. It runs when one of its inputs changes
+    // (SCORECARD_INPUTS: the scorecard and its data, the manifest-plan code it
+    // builds and runs with that code's `#[path]` modules and path
+    // dependencies, the Cargo manifests and lock, the prepared rust-script
+    // launchers, the script that pins its ledger corpus, and the E2E
+    // manifests its cells and its `system-utils/record-getpid` command
+    // fixture come from). The one input the list cannot name is the history
+    // it reads through `HEAD^`; an exact-head validation before each landing
+    // selects on every commit being pushed, so that history is the one
+    // validated.
     ToolSelfTest {
         name: "scorecard_commands",
         program: "ci/compat-envelope/scorecard.rs",
         args: &["self-test-commands"],
         run_when_changed: Some(SCORECARD_INPUTS),
         manifest_plan_helper: false,
+        test_threads_from_jobs: false,
         quick_super: true,
     },
     // The scorecard's own `#[cfg(test)]` unit tests, which
@@ -174,14 +362,16 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
     // runs in. They took 211.96 s of that node's wall, most of it building
     // scratch ledger and source repositories
     // (https://github.com/rrnewton/hermit/issues/3381), and read the same
-    // inputs as the commands tier, so they share its triggers. Like
-    // check.lint_checks, they stay out of the quick and super lanes.
+    // inputs as the commands tier, so they share its triggers. Their tests
+    // run in parallel at the node's admitted width (test_threads_from_jobs).
+    // Like check.lint_checks, they stay out of the quick and super lanes.
     ToolSelfTest {
         name: "scorecard_tests",
         program: SCORECARD_TESTS_PROGRAM,
         args: SCORECARD_TESTS_ARGS,
         run_when_changed: Some(SCORECARD_INPUTS),
         manifest_plan_helper: false,
+        test_threads_from_jobs: true,
         quick_super: false,
     },
     ToolSelfTest {
@@ -190,6 +380,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
+        test_threads_from_jobs: false,
         quick_super: true,
     },
     // The removed shell front door accumulated plan/scheduler/receipt guards
@@ -201,6 +392,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["--self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
+        test_threads_from_jobs: false,
         quick_super: true,
     },
     ToolSelfTest {
@@ -209,6 +401,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
+        test_threads_from_jobs: false,
         quick_super: true,
     },
     // The DBT budget wrapper gates roughly twenty portable nodes and fails
@@ -221,6 +414,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &[],
         run_when_changed: None,
         manifest_plan_helper: false,
+        test_threads_from_jobs: false,
         quick_super: true,
     },
 ];
@@ -4146,6 +4340,39 @@ sys.exit(37)
         );
     }
 
+    /// The scorecard's unit tests run at the width the DAG admitted, never at
+    /// libtest's one thread per host CPU; a caller's own RUST_TEST_THREADS wins,
+    /// and a malformed width refuses.
+    #[test]
+    fn scorecard_tests_run_at_the_admitted_width() {
+        let find = |name: &str| {
+            TOOL_SELF_TESTS
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap()
+        };
+        let tests = find("scorecard_tests");
+        assert_eq!(
+            tests.test_threads(None, Some("2")),
+            Ok(Some("2".to_string()))
+        );
+        assert_eq!(tests.test_threads(None, None), Ok(Some("1".to_string())));
+        assert_eq!(tests.test_threads(Some("5"), Some("2")), Ok(None));
+        for bad in ["0", "", "two", "-1"] {
+            assert_eq!(
+                tests.test_threads(None, Some(bad)),
+                Err(format!(
+                    "self-test scorecard_tests sizes its test threads from CARGO_BUILD_JOBS, \
+                     which is {bad:?}, not a positive integer"
+                ))
+            );
+        }
+        assert_eq!(
+            find("scorecard_commands").test_threads(None, Some("2")),
+            Ok(None)
+        );
+    }
+
     /// check.lint_checks no longer runs the scorecard's unit tests:
     /// scripts/run-script-tests.sh skips ci/compat-envelope/scorecard.rs when
     /// the committed DAG has the node it names, in every lane check.lint_checks
@@ -4173,6 +4400,14 @@ sys.exit(37)
         );
         assert_eq!(tool.run_when_changed, Some(SCORECARD_INPUTS));
         assert!(!tool.manifest_plan_helper);
+        assert_eq!(
+            TOOL_SELF_TESTS
+                .iter()
+                .filter(|tool| tool.test_threads_from_jobs)
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["scorecard_tests"]
+        );
         let script = include_str!("../../../scripts/run-script-tests.sh");
         for line in [
             "SCORECARD_SOURCE=ci/compat-envelope/scorecard.rs",

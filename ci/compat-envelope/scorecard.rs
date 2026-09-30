@@ -5560,8 +5560,83 @@ fn record_ledger_identity_verified_in_command(key: VerifiedLedgerKey) {
     });
 }
 
+/// A ledger root and parent publication-lock descriptor bound to one unit-test
+/// thread. While one is bound, `ledger_root` and `acquire_history_write_lock`
+/// on that thread use it instead of DEV_HERMIT_TEST_LEDGER_ROOT and
+/// DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD.
+///
+/// libtest runs the unit tests on several threads of one process, where
+/// setting those variables would steer every other running test, so each test
+/// passes its fixture ledger here and reaches only its own thread. Only test
+/// builds have the binding: commands and the self-test read the variables
+/// their publisher set, and child processes receive a ledger only through the
+/// environment.
+#[cfg(test)]
+#[derive(Clone)]
+struct LedgerBinding {
+    root: PathBuf,
+    publish_lock_fd: i32,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEDGER_BINDING: std::cell::RefCell<Option<LedgerBinding>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Binds a fixture ledger and its publication-lock descriptor to the current
+/// thread until dropped, then restores the binding it replaced (also while a
+/// panic unwinds).
+#[cfg(test)]
+struct ThreadLedgerBinding {
+    previous: Option<LedgerBinding>,
+}
+
+#[cfg(test)]
+impl ThreadLedgerBinding {
+    fn bind(root: &Path, publish_lock_fd: i32) -> Self {
+        let binding = LedgerBinding {
+            root: root.to_path_buf(),
+            publish_lock_fd,
+        };
+        let previous = LEDGER_BINDING.with(|bound| bound.borrow_mut().replace(binding));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ThreadLedgerBinding {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        LEDGER_BINDING.with(|bound| *bound.borrow_mut() = previous);
+    }
+}
+
+/// The explicit ledger root: this thread's binding in a unit test, otherwise
+/// DEV_HERMIT_TEST_LEDGER_ROOT.
+fn explicit_ledger_root() -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(binding) = LEDGER_BINDING.with(|bound| bound.borrow().clone()) {
+        return Some(binding.root.into_os_string());
+    }
+    env::var_os("DEV_HERMIT_TEST_LEDGER_ROOT")
+}
+
+/// The inherited publication-lock descriptor: this thread's binding in a unit
+/// test, otherwise DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD.
+fn publication_lock_descriptor() -> Result<i32, String> {
+    #[cfg(test)]
+    if let Some(binding) = LEDGER_BINDING.with(|bound| bound.borrow().clone()) {
+        return Ok(binding.publish_lock_fd);
+    }
+    env::var("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD")
+        .map_err(|_| "history writes must run through the parent ledger publisher")?
+        .parse()
+        .map_err(|_| "invalid inherited ledger publication lock descriptor".into())
+}
+
 fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
-    let explicit = env::var_os("DEV_HERMIT_TEST_LEDGER_ROOT");
+    let explicit = explicit_ledger_root();
     if writing && explicit.is_none() {
         return Err("history writes require the parent ledger publisher; run ci-hub/series/mirror.py with this checkout and retained results (DEV_HERMIT_TEST_LEDGER_ROOT is unset)".into());
     }
@@ -5847,10 +5922,7 @@ fn read_history_files(root: &Path) -> Result<GeneratedFiles, String> {
 
 fn acquire_history_write_lock(root: &Path) -> Result<File, String> {
     let ledger = ledger_root(root, true)?;
-    let fd: i32 = env::var("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD")
-        .map_err(|_| "history writes must run through the parent ledger publisher")?
-        .parse()
-        .map_err(|_| "invalid inherited ledger publication lock descriptor")?;
+    let fd = publication_lock_descriptor()?;
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if duplicate < 0 {
         return Err("parent ledger publication lock is not open".into());
@@ -14680,25 +14752,10 @@ fn recorded_shell_quote(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
-static HISTORY_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Serialize tests that share process-wide fixture state.
-///
-/// The lock guards no data: it only orders tests that change the environment
-/// (HistoryFixtureEnvironment) or the working directory (RestoreCwd), and both
-/// guards restore that state in `Drop`, including while a panic unwinds. A
-/// poisoned lock therefore means only that an earlier test failed, and that
-/// test already reports its own failure. Recovering the guard lets every later
-/// test report its own verdict instead of a PoisonError; run 36485831200 turned
-/// one missing-corpus failure into 15 failures this way.
-#[cfg(test)]
-fn history_fixture_lock() -> std::sync::MutexGuard<'static, ()> {
-    HISTORY_FIXTURE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
+/// Points DEV_HERMIT_TEST_LEDGER_ROOT and DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD
+/// at a fixture ledger for the single-threaded self-test and the child
+/// commands it runs, and restores them in `Drop`. Unit tests bind their
+/// fixture ledger to their own thread instead (`ThreadLedgerBinding`).
 struct HistoryFixtureEnvironment {
     previous: [Option<std::ffi::OsString>; 2],
 }
@@ -26855,7 +26912,6 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn self_test_corpus_retains_the_complete_archived_input() {
-        let _fixture_lock = history_fixture_lock();
         // No fixture_git call precedes the ledger reads, so forget the
         // inherited location here rather than depend on another test.
         forget_inherited_repository_location();
@@ -26890,7 +26946,6 @@ mod catalogue_ledger_tests {
     fn self_test_corpus_requires_exact_committed_objects_and_identity() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -26955,7 +27010,7 @@ mod catalogue_ledger_tests {
         corpus.ledger_commit = &ledger_commit;
         corpus.identity_blob = &identity_blob;
         let lock = File::open(ledger.join(".git/HEAD")).unwrap();
-        let _environment = HistoryFixtureEnvironment::set(ledger, lock.as_raw_fd());
+        let _environment = ThreadLedgerBinding::bind(ledger, lock.as_raw_fd());
         assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
 
         // The test reads the fixed committed objects, never the current files
@@ -27223,7 +27278,6 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn exact_archive_and_parent_lock_are_required_before_history_changes() {
-        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -27270,7 +27324,7 @@ mod catalogue_ledger_tests {
             .create_new(true)
             .open(ledger.join(".git/ci-hub-series-publication.lock"))
             .unwrap();
-        let _environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+        let _environment = ThreadLedgerBinding::bind(&ledger, lock.as_raw_fd());
         git(
             &ledger,
             &[
@@ -27318,7 +27372,7 @@ mod catalogue_ledger_tests {
         FileExt::lock_exclusive(&lock).unwrap();
         let foreign = File::open(ledger.join(".git/ci-hub-series-publication.lock")).unwrap();
         {
-            let _wrong = HistoryFixtureEnvironment::set(&ledger, foreign.as_raw_fd());
+            let _wrong = ThreadLedgerBinding::bind(&ledger, foreign.as_raw_fd());
             assert!(
                 acquire_history_write_lock(&source).is_err(),
                 "a separate descriptor cannot borrow another publisher's lock"
@@ -27738,7 +27792,7 @@ mod post_verdict_transaction_tests {
     }
 
     struct Fixture {
-        _environment: HistoryFixtureEnvironment,
+        _environment: ThreadLedgerBinding,
         _lock: File,
         _directory: tempfile::TempDir,
         root: PathBuf,
@@ -27820,7 +27874,7 @@ mod post_verdict_transaction_tests {
                 .open(ledger.join(".git/ci-hub-series-publication.lock"))
                 .unwrap();
             FileExt::lock_exclusive(&lock).unwrap();
-            let environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+            let environment = ThreadLedgerBinding::bind(&ledger, lock.as_raw_fd());
             let snapshot = directory.path().join("snapshot.json");
             let value =
                 scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
@@ -27921,7 +27975,6 @@ mod post_verdict_transaction_tests {
     }
 
     fn catalogue_retirement_fixture(include_parity: bool) {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         if include_parity {
             let measured = fixture.options.results_head.as_deref().unwrap();
@@ -28153,7 +28206,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn import_retires_bound_ordinary_comparison_without_losing_provenance() {
-        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let row = result_row(&fixture.options.expected_head);
         fs::write(
@@ -28312,7 +28364,6 @@ mod post_verdict_transaction_tests {
             );
             return;
         }
-        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let mut tracked = fixture.cells();
         let heads = [
@@ -28388,7 +28439,8 @@ mod post_verdict_transaction_tests {
         assert!(bind_retained_attempts(&fixture.root, &inputs[..1]).is_err());
         assert!(read_history_files(&fixture.root).unwrap() == before);
         // Relative CLI operands select the same held original lines and full
-        // file hashes. Fixture commands share this lock; restore cwd on panic.
+        // file hashes. This child process runs only this test; restore cwd on
+        // panic.
         struct RestoreCwd(PathBuf);
         impl Drop for RestoreCwd {
             fn drop(&mut self) {
@@ -28451,7 +28503,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn identical_current_rows_retain_one_binding_and_one_comparison() {
-        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let row = result_row(&fixture.options.expected_head);
         let raw = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
@@ -28503,7 +28554,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn retained_bindings_and_current_retry_events_reconcile_together() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let retained = fixture.cells();
@@ -28606,7 +28656,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn attempt_bindings_survive_normal_projection_and_current_ingestion() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let first = comparison_attempt_bindings(&fixture.cells())
@@ -28674,7 +28723,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn selected_custom_attempts_publish_without_becoming_comparable_cells() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let comparable = serde_json::to_value(fixture.cells().cells).unwrap();
@@ -29050,7 +29098,6 @@ mod post_verdict_transaction_tests {
     /// only the audit projected from the raw row publishes.
     #[test]
     fn declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let reason = DECLARED_EXIT_REASON;
@@ -29292,7 +29339,6 @@ mod post_verdict_transaction_tests {
     /// event projected from that row is accepted.
     #[test]
     fn observe_results_reconciles_declared_guest_exits_with_committed_series() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let head = fixture.options.expected_head.clone();
         let (id, row) = declared_exit_row(&head);
@@ -29383,7 +29429,6 @@ mod post_verdict_transaction_tests {
     /// contradiction and aborts the fold rather than being kept as red.
     #[test]
     fn a_retained_failed_match_refuses_what_the_runner_cannot_write() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -29509,7 +29554,6 @@ mod post_verdict_transaction_tests {
     /// admits the sibling.
     #[test]
     fn a_matched_attempt_the_runner_failed_is_retained_red_beside_a_valid_sibling() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -29693,7 +29737,6 @@ mod post_verdict_transaction_tests {
     /// the interim `crash-error`.
     #[test]
     fn a_failed_stdout_expectation_is_retained_red_beside_a_valid_sibling() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -29922,7 +29965,6 @@ mod post_verdict_transaction_tests {
     /// runner could not have failed that way.
     #[test]
     fn an_expected_output_failure_the_runner_could_not_have_found_is_not_published() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -30096,7 +30138,6 @@ mod post_verdict_transaction_tests {
     /// cannot launder a malformed row.
     #[test]
     fn a_stdout_expectation_failure_the_evidence_contradicts_is_refused() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -30275,7 +30316,6 @@ mod post_verdict_transaction_tests {
     /// readers refuse it rather than retaining it.
     #[test]
     fn a_matched_attempt_counts_only_if_the_runner_passed_it() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, mut declared) = declared_exit_row(&measured);
@@ -30670,7 +30710,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn invalid_snapshot_refuses_before_history_work_but_after_publication_authority() {
-        let _fixture_lock = history_fixture_lock();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let ledger = directory.path().join("ledger");
@@ -30693,7 +30732,7 @@ mod post_verdict_transaction_tests {
             .create_new(true)
             .open(ledger.join(".git/ci-hub-series-publication.lock"))
             .unwrap();
-        let _environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+        let _environment = ThreadLedgerBinding::bind(&ledger, lock.as_raw_fd());
         let snapshot = directory.path().join("snapshot.fifo");
         let fifo_name = std::ffi::CString::new(snapshot.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: fifo_name is a live NUL-terminated path with no interior NUL.
@@ -30735,7 +30774,6 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn two_head_writeback_preserves_attribution_and_refuses_unbound_or_moving_inputs() {
-        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let invoker = fixture.options.expected_head.clone();

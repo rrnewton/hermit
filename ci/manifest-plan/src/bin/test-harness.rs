@@ -819,6 +819,19 @@ fn run_tool_self_test(values: &[String]) -> ExitCode {
             });
         envs.push((MANIFEST_PLAN_BIN_ENV, helper));
     }
+    let threads = tool
+        .test_threads(
+            std::env::var("RUST_TEST_THREADS").ok().as_deref(),
+            std::env::var("CARGO_BUILD_JOBS").ok().as_deref(),
+        )
+        .unwrap_or_else(|error| fail(error));
+    if let Some(threads) = threads {
+        println!(
+            "test-harness: self-test {} runs RUST_TEST_THREADS={threads}",
+            tool.name
+        );
+        envs.push(("RUST_TEST_THREADS", PathBuf::from(threads)));
+    }
     run_audit_with_env(&root, &root.join(tool.program), tool.args, &envs);
     println!(
         "test-harness: self-test {} passed: {}; elapsed={:.3}s",
