@@ -74,6 +74,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::canonical_verdict::Verdict;
 use crate::ci_selection::CiSelection;
 use crate::logdiff_report::LogDiffReport;
 use crate::logdiff_report::LogDiffVerdict;
@@ -1572,15 +1573,19 @@ pub struct PostPassConfig {
     pub jobs: usize,
     /// `(test, backend)` verify cells whose result rows the caller refused
     /// to hand over, with its typed reason. Such a cell has no row a
-    /// comparison can trust, so an operand here takes the verdict and class
-    /// the harness gives the same condition ([`ParityRejection::typed`]) and
-    /// the caller's reason, and is never compared. Empty for the harness,
-    /// which hands over every row of its process.
+    /// comparison can trust, so an operand here is never compared, and takes
+    /// the verdict and class the harness gives the same condition
+    /// ([`ParityRejection::typed`]) and the caller's reason unless
+    /// [`PostPassConfig::nondeterministic`] also names it, which is checked
+    /// first. Empty for the harness, which hands over every row of its
+    /// process.
     pub rejected: BTreeMap<(String, String), ParityRejection>,
     /// `(test, backend)` verify cells the caller saw diverge between their
     /// two runs outside the rows it handed over, such as in a later pressure
-    /// repetition, with where. Such an operand is `nondeterministic` like one
-    /// whose own history records a determinism failure. Empty for the harness.
+    /// repetition or in a refused row that is still the cell's own, with
+    /// where. Such an operand is `nondeterministic` like one whose own
+    /// history records a mismatch ([`records_mismatch`]). Empty for the
+    /// harness.
     pub nondeterministic: BTreeMap<(String, String), String>,
 }
 
@@ -1902,7 +1907,9 @@ impl PostPassReport {
     /// group with its nonzero [`UnavailableClass`] counts, the same counts
     /// the scorecard prints; the mean clean credit over the cells measured
     /// with equal inputs, and apart from it the mean credit over the cells
-    /// measured with unequal inputs. Neither mean counts an unmeasured cell.
+    /// measured with unequal inputs. Neither mean counts an unmeasured cell,
+    /// and neither prints as full credit unless every credit it averages is
+    /// full (`mean_credit_text`).
     pub fn summary_line(&self) -> String {
         let count = |verdict| {
             self.records
@@ -1940,8 +1947,8 @@ impl PostPassReport {
                 format!("none measured with {inputs} inputs")
             } else {
                 format!(
-                    "mean credit {:.4} over {} measured with {inputs} inputs",
-                    credits.iter().sum::<f64>() / credits.len() as f64,
+                    "mean credit {} over {} measured with {inputs} inputs",
+                    mean_credit_text(&credits),
                     credits.len()
                 )
             }
@@ -1981,6 +1988,22 @@ impl PostPassReport {
             group(UnavailableGroup::Unmeasured, "unmeasured"),
             self.log_diff_runs,
         )
+    }
+}
+
+/// The mean of `credits` (not empty) to four decimals, never reading as full
+/// credit unless every credit is full: a mean below 1 that would print
+/// `1.0000` prints `0.9999`, as [`credit`] keeps a partial match below 1.
+/// Whether the mean is below 1 is decided from the credits, not from their
+/// floating-point mean, which can round up to exactly 1: the largest credit
+/// below 1 plus one full credit sums to exactly 2.
+fn mean_credit_text(credits: &[f64]) -> String {
+    let mean = credits.iter().sum::<f64>() / credits.len() as f64;
+    let text = format!("{mean:.4}");
+    if text == "1.0000" && credits.iter().any(|credit| *credit < 1.0) {
+        "0.9999".to_string()
+    } else {
+        text
     }
 }
 
@@ -2674,6 +2697,25 @@ fn no_golden_consequence(operand: ParityOperand) -> &'static str {
     }
 }
 
+/// Whether `row`, a result row of a verify cell, records that the cell's two
+/// runs diverged: its typed result is `determinism-failure`, or one of its
+/// attempts retains a current verification report whose verdict is
+/// `diverged`, the evidence from which the runner types a verify row
+/// `determinism-failure`. The runner consults its terminal evidence first: a
+/// row whose terminal error kind is not product-attributed gets no product
+/// result, and one with a timed-out attempt is a `timeout`, and either can
+/// still retain an attempt whose runs diverged. Such a side has no
+/// deterministic log whatever its typed result: decision 1 of
+/// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5895129378>
+/// reads "Any mismatch in an operand's attempt history means no golden".
+pub fn records_mismatch(row: &CellResult) -> bool {
+    row.result == Some(ObservedResult::DeterminismFailure)
+        || row
+            .attempts
+            .iter()
+            .any(|attempt| crate::runner::verification_verdict(attempt) == Some(Verdict::Diverged))
+}
+
 /// The row of one verify cell whose single retained first-run log is to be
 /// compared, or the typed cause that it has none, decided from the typed
 /// result fields ([`CellResult::result`], [`CellResult::outcome`] and
@@ -2681,8 +2723,10 @@ fn no_golden_consequence(operand: ParityOperand) -> &'static str {
 /// `operand`.
 ///
 /// In order:
-/// - any attempt of `history` whose result is `determinism-failure`, or a
-///   mismatch the caller saw outside `history` (`nondeterministic`), is
+/// - any attempt of `history` that records a mismatch ([`records_mismatch`]:
+///   its result is `determinism-failure`, or one of its attempts retains a
+///   `diverged` verification report whatever its typed result), or a mismatch
+///   the caller saw outside `history` (`nondeterministic`), is
 ///   [`UnavailableClass::DeterminismMismatch`] with verdict `nondeterministic`,
 ///   even when a later attempt passed: such a cell has no deterministic log;
 /// - a row the caller rejected (`rejected`) takes the verdict and class the
@@ -2718,17 +2762,32 @@ fn evaluate_history(
     if let Some(row) = history
         .into_iter()
         .flatten()
-        .find(|row| row.result == Some(ObservedResult::DeterminismFailure))
+        .find(|row| records_mismatch(row))
     {
+        let detail = row.reason.as_deref().unwrap_or("no reason recorded");
+        let reason = if row.result == Some(ObservedResult::DeterminismFailure) {
+            format!(
+                "the {role} verify cell of {test} failed determinism on attempt {} (its two \
+                 runs diverged), so {consequence}: {detail}",
+                row.attempt
+            )
+        } else {
+            let result = row.result.map_or_else(
+                || "no typed result".to_string(),
+                |result| format!("result {}", result.as_str()),
+            );
+            format!(
+                "the {role} verify cell of {test} retained a diverged verification report on \
+                 attempt {} (its two runs diverged) although it ended with {result} ({}), so \
+                 {consequence}: {detail}",
+                row.attempt,
+                row.error_kind.as_deref().unwrap_or("no error kind")
+            )
+        };
         return Err(unusable(
             ParityVerdict::Nondeterministic,
             UnavailableClass::DeterminismMismatch,
-            format!(
-                "the {role} verify cell of {test} failed determinism on attempt {} (its two \
-                 runs diverged), so {consequence}: {}",
-                row.attempt,
-                row.reason.as_deref().unwrap_or("no reason recorded")
-            ),
+            reason,
         ));
     }
     if let Some(why) = nondeterministic {
@@ -5723,6 +5782,163 @@ mod tests {
         );
     }
 
+    /// The two credit invariants no earlier check covers, each refused with
+    /// its own message (review A, Low 8, at
+    /// https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090).
+    /// Every case passes every earlier check, so the message is the one the
+    /// label names. "A divergence cannot be full credit" is the only guard
+    /// against a diverged record whose lengths are equal and whose prefix
+    /// covers both, the one input for which [`credit`] returns 1.0.
+    #[test]
+    fn a_parity_record_breaking_a_credit_invariant_is_refused_by_that_invariant() {
+        let current = LOG_DIFF_REPORT_SCHEMA;
+        let full = report(current, LogDiffVerdict::Matched, 3, 3, Some(3));
+        let matched = record_for(&full);
+        let unequal_match = record_on(ParityBackend::Kvm, &full, false);
+        let diverged = record_for(&report(current, LogDiffVerdict::Diverged, 4, 4, Some(2)));
+        assert_eq!(
+            (matched.credit, matched.unequalized_credit),
+            (Some(1.0), None)
+        );
+        assert_eq!(
+            (unequal_match.credit, unequal_match.unequalized_credit),
+            (None, Some(1.0))
+        );
+        assert!(diverged.first_divergent_record.is_some() && diverged.first_difference.is_some());
+        let at = "parity record fixture/parity@kvm";
+        let exclusive = format!("{at}: credit and unequalized_credit are exclusive");
+        let full_divergence = format!("{at}: a divergence cannot be full credit");
+        let cases: Vec<(&str, ParityRecord, String)> = vec![
+            (
+                "clean credit with unequalized credit beside it",
+                ParityRecord {
+                    unequalized_credit: Some(1.0),
+                    ..matched.clone()
+                },
+                exclusive.clone(),
+            ),
+            (
+                "unequalized credit with clean credit beside it",
+                ParityRecord {
+                    credit: Some(1.0),
+                    ..unequal_match.clone()
+                },
+                exclusive,
+            ),
+            (
+                "a divergence over equal lengths whose prefix covers both",
+                ParityRecord {
+                    verdict: ParityVerdict::Diverged,
+                    ..matched.clone()
+                },
+                full_divergence.clone(),
+            ),
+            (
+                "the same divergence with its position located",
+                ParityRecord {
+                    verdict: ParityVerdict::Diverged,
+                    first_divergent_record: diverged.first_divergent_record,
+                    first_difference: diverged.first_difference.clone(),
+                    ..matched.clone()
+                },
+                full_divergence.clone(),
+            ),
+            (
+                "the same divergence measured with unequal inputs",
+                ParityRecord {
+                    verdict: ParityVerdict::Diverged,
+                    ..unequal_match.clone()
+                },
+                full_divergence,
+            ),
+            (
+                "a match that measured nothing",
+                ParityRecord {
+                    credit: None,
+                    matched_prefix: None,
+                    ..matched.clone()
+                },
+                format!("{at}: a match must be full credit, got None"),
+            ),
+            (
+                "a match whose prefix is empty",
+                ParityRecord {
+                    credit: Some(0.0),
+                    matched_prefix: Some(0),
+                    ..matched.clone()
+                },
+                format!("{at}: a match must be full credit, got Some(0.0)"),
+            ),
+        ];
+        for (label, record, expected) in cases {
+            assert_eq!(record.validate().unwrap_err(), expected, "{label}");
+        }
+        for record in [&matched, &unequal_match, &diverged] {
+            record.validate().unwrap();
+        }
+    }
+
+    /// A mean credit below 1 never prints as full credit (review A, Low 3, at
+    /// https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090):
+    /// one divergence at the last of 100,001 messages is credit
+    /// 100000/100001, which four decimals alone round to `1.0000`.
+    #[test]
+    fn a_mean_credit_below_one_never_prints_as_full_credit() {
+        let current = LOG_DIFF_REPORT_SCHEMA;
+        let late = report(
+            current,
+            LogDiffVerdict::Diverged,
+            100_000,
+            100_001,
+            Some(100_000),
+        );
+        let nearly_full = record_for(&late);
+        assert_eq!(nearly_full.verdict, ParityVerdict::Diverged);
+        assert_eq!(nearly_full.credit, Some(100_000.0 / 100_001.0));
+        assert_eq!(format!("{:.4}", 100_000.0_f64 / 100_001.0), "1.0000");
+        let full = record_for(&report(current, LogDiffVerdict::Matched, 3, 3, Some(3)));
+        let unequal = record_on(ParityBackend::Kvm, &late, false);
+        assert_eq!(unequal.unequalized_credit, nearly_full.credit);
+        let summary = |records: Vec<ParityRecord>| {
+            PostPassReport {
+                path: PathBuf::from("parity.jsonl"),
+                records,
+                log_diff_runs: 0,
+            }
+            .summary_line()
+        };
+        for (records, expected) in [
+            (
+                vec![nearly_full.clone()],
+                "; mean credit 0.9999 over 1 measured with equal inputs; none measured with \
+                 unequal inputs;",
+            ),
+            (
+                vec![nearly_full.clone(), full.clone()],
+                "; mean credit 0.9999 over 2 measured with equal inputs;",
+            ),
+            (
+                vec![full.clone(), full],
+                "; mean credit 1.0000 over 2 measured with equal inputs;",
+            ),
+            (
+                vec![unequal],
+                "; none measured with equal inputs; mean credit 0.9999 over 1 measured with \
+                 unequal inputs;",
+            ),
+        ] {
+            let line = summary(records);
+            assert!(line.contains(expected), "{expected:?} not in {line}");
+        }
+        // The floating-point mean itself can be exactly 1 over credits that
+        // are not all full, so the text is decided from the credits.
+        assert_eq!((BELOW_ONE + 1.0) / 2.0, 1.0);
+        assert_eq!(mean_credit_text(&[BELOW_ONE, 1.0]), "0.9999");
+        assert_eq!(mean_credit_text(&[1.0, 1.0]), "1.0000");
+        assert_eq!(mean_credit_text(&[0.5, 1.0]), "0.7500");
+        assert_eq!(mean_credit_text(&[0.0]), "0.0000");
+    }
+
     /// The first divergences S0 measured on c-programs/add-key-enosys
     /// (https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696):
     /// kvm and liteinst at compared message 14, sabre at 3, of 115 ptrace
@@ -6907,6 +7123,148 @@ mod tests {
              no-result-row 1)",
             "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
             "2 log-diff comparison(s), 0 guest runs",
+        ] {
+            assert!(summary.contains(part), "{part:?} not in {summary}");
+        }
+    }
+
+    /// A current verification report whose verdict is `diverged`, as a verify
+    /// attempt retains it: the runner's own located-divergence fixture
+    /// (`framework_terminal_refusal_cannot_revive_incidental_divergence`).
+    const DIVERGED_REPORT: &str = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","compared_outputs":{"left":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0},"right":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0}},"no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
+
+    /// One attempt of a verify row as the runner records it, retaining
+    /// `report` when given.
+    fn verify_attempt(
+        index: &str,
+        outcome: &str,
+        timed_out: bool,
+        report: Option<&str>,
+    ) -> crate::runner::AttemptResult {
+        serde_json::from_value(serde_json::json!({
+            "index": index,
+            "outcome": outcome,
+            "timed_out": timed_out,
+            "argv": ["/fake/hermit", "run", "--", "/bin/guest", "arg"],
+            "guest_argv": ["/bin/guest", "arg"],
+            "env": {},
+            "cwd": "/",
+            "shell_command": "fixture",
+            "verification_report": report,
+        }))
+        .unwrap()
+    }
+
+    /// A located divergence decides the side whatever result the runner typed
+    /// its row with (review A, Low 4a, at
+    /// https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090).
+    /// The runner gives a row whose terminal error kind is not
+    /// product-attributed no result, and a row with a timed-out attempt the
+    /// result `timeout`, before it looks for a divergence; either row can
+    /// retain an attempt whose two runs diverged, and a later attempt can
+    /// pass. Decision 1 of
+    /// https://github.com/rrnewton/hermit/issues/3301#issuecomment-5895129378
+    /// reads "Any mismatch in an operand's attempt history means no golden",
+    /// so neither side is compared: the mismatched reference writes no golden,
+    /// and neither passing attempt's log is read.
+    #[test]
+    fn a_diverged_report_under_any_typed_result_leaves_its_side_without_a_log() {
+        let fixture = Fixture::new("diverged-report");
+        let diverged = verify_attempt("1", "FAIL", false, Some(DIVERGED_REPORT));
+        assert_eq!(
+            crate::runner::verification_verdict(&diverged),
+            Some(Verdict::Diverged),
+            "the fixture must retain a current diverged report"
+        );
+        // Its comparison diverged, then publishing the result failed.
+        let mut untyped_reference =
+            fixture.row("fx/untyped-reference", "ptrace", 1, "FAIL", Some(REFERENCE));
+        untyped_reference.error_kind = Some("result-publication".into());
+        untyped_reference.attempts = vec![diverged.clone()];
+        assert_eq!(untyped_reference.result, None);
+        // Its comparison diverged, then a second attempt timed out.
+        let mut timeout_candidate = typed(
+            fixture.row("fx/timeout-candidate", "kvm", 1, "FAIL", Some(REFERENCE)),
+            ObservedResult::Timeout,
+            Some("wall-timeout"),
+        );
+        timeout_candidate.attempts = vec![diverged, verify_attempt("2", "FAIL", true, None)];
+        let rows = vec![
+            untyped_reference,
+            fixture.row("fx/untyped-reference", "ptrace", 2, "PASS", Some(REFERENCE)),
+            fixture.row("fx/untyped-reference", "kvm", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/timeout-candidate", "ptrace", 1, "PASS", Some(REFERENCE)),
+            timeout_candidate,
+            fixture.row("fx/timeout-candidate", "kvm", 2, "PASS", Some(REFERENCE)),
+        ];
+        assert!(
+            rows.iter()
+                .all(|row| row.result != Some(ObservedResult::DeterminismFailure))
+        );
+        let scope = BTreeSet::from([
+            parity_cell("fx/untyped-reference", ParityBackend::Kvm),
+            parity_cell("fx/timeout-candidate", ParityBackend::Kvm),
+        ]);
+        let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
+        assert_eq!(report.log_diff_runs, 0, "neither cell is compared");
+        assert_eq!(fixture.log_diff_calls(), 0);
+        let written = read_records(&report.path);
+        assert_eq!(written.len(), 2);
+        let by_test = |test: &str| {
+            written
+                .iter()
+                .find(|record| record.test_id == test && record.backend == ParityBackend::Kvm)
+                .unwrap()
+        };
+        for (test, operand, reason) in [
+            (
+                "fx/untyped-reference",
+                ParityOperand::Reference,
+                "the ptrace reference verify cell of fx/untyped-reference retained a diverged \
+                 verification report on attempt 1 (its two runs diverged) although it ended with \
+                 no typed result (result-publication), so there is no deterministic golden log \
+                 to compare against: fixture FAIL",
+            ),
+            (
+                "fx/timeout-candidate",
+                ParityOperand::Candidate,
+                "the kvm candidate verify cell of fx/timeout-candidate retained a diverged \
+                 verification report on attempt 1 (its two runs diverged) although it ended with \
+                 result timeout (wall-timeout), so it has no deterministic log to compare: \
+                 fixture FAIL",
+            ),
+        ] {
+            let record = by_test(test);
+            record.validate().unwrap();
+            assert_eq!(
+                record.verdict,
+                ParityVerdict::Nondeterministic,
+                "{record:?}"
+            );
+            assert_eq!(
+                record.unavailable_class,
+                Some(UnavailableClass::DeterminismMismatch),
+                "{record:?}"
+            );
+            assert_eq!(record.operand, Some(operand), "{record:?}");
+            assert_eq!(record.reason.as_deref(), Some(reason), "{record:?}");
+            assert_eq!(record.measured_credit(), None, "{record:?}");
+            assert_eq!(record.candidate_log, None, "{record:?}");
+        }
+        // The mismatched reference wrote no golden; the candidate's own
+        // reference passed, so its record still names that golden.
+        let (golden, sidecar) = golden_paths(&fixture.artifacts(), "fx/untyped-reference").unwrap();
+        assert!(!golden.exists() && !sidecar.exists());
+        assert_eq!(by_test("fx/untyped-reference").reference_log, None);
+        let (golden, _) = golden_paths(&fixture.artifacts(), "fx/timeout-candidate").unwrap();
+        assert_eq!(
+            by_test("fx/timeout-candidate").reference_log.as_deref(),
+            Some(path_text(&golden).as_str())
+        );
+        let summary = report.summary_line();
+        for part in [
+            "matched 0, diverged 0, nondeterministic 2,",
+            "measured 0; no golden 2 (determinism-mismatch 2);",
         ] {
             assert!(summary.contains(part), "{part:?} not in {summary}");
         }
