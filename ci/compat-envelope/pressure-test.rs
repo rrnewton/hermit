@@ -7187,11 +7187,18 @@ fn summarize(
     // the same way ([`parity_rejection`]): a missing or invalid row, verify
     // logs or a golden that were not retained, or a cell that only the
     // retained harness summary proves host-inapplicable. A harness or
-    // evidence defect is therefore unmeasured, in the floor as 0, and never
-    // an outcome that left no golden. A later repetition whose accepted row
-    // recorded a verify mismatch is handed over as where it did: that side's
-    // two runs diverged, so it has no deterministic log and its parity cells
-    // are nondeterministic.
+    // evidence defect alone is therefore unmeasured, in the floor as 0, and
+    // never an outcome that left no golden. Every other row that is the
+    // cell's own (valid: its identity, harness exit and terminal attempt
+    // match) and records a verify mismatch ([`parity::records_mismatch`]) is
+    // handed over as where it did, with what the summary refused about it if
+    // anything: a row of a later repetition, or of a first repetition refused
+    // for other evidence. That side's two runs diverged, so it has no
+    // deterministic log and its parity cells are nondeterministic, as the
+    // harness's post-pass finds from the same rows. Decision 1 of
+    // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5895129378>
+    // reads "Any mismatch in an operand's attempt history means no golden".
+    // Rows that are not the cell's are no evidence either way.
     let mut parity_rows: Vec<CellResult> = Vec::new();
     let mut parity_rejected: BTreeMap<(String, String), parity::ParityRejection> = BTreeMap::new();
     let mut parity_nondeterministic: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -7573,55 +7580,71 @@ fn summarize(
             if !evidence_errors.is_empty() {
                 result = "infrastructure-error";
             }
-            if cell.mode == parity::PARITY_MODE && repetition.is_none_or(|number| number == 1) {
-                if row_valid && evidence_errors.is_empty() {
+            if cell.mode == parity::PARITY_MODE {
+                let first = repetition.is_none_or(|number| number == 1);
+                if first && row_valid && evidence_errors.is_empty() {
                     parity_rows.extend(result_rows_for_history.iter().cloned());
                 } else {
-                    let why = if evidence_errors.is_empty() {
-                        format!("result {result} with no valid result row")
+                    if first {
+                        let why = if evidence_errors.is_empty() {
+                            format!("result {result} with no valid result row")
+                        } else {
+                            evidence_errors.join("; ")
+                        };
+                        let reason = format!("result row rejected by the series summary: {why}");
+                        let evidence = RefusedParityEvidence {
+                            // Exactly the samples' prerequisite failure below.
+                            host_inapplicable: retained_prerequisite
+                                && !row_valid
+                                && initial_evidence_valid
+                                && sample_evidence_errors.is_empty()
+                                && result_rows_for_history.is_empty()
+                                && !proven_timeout
+                                && !proven_oom,
+                            no_row: result_rows_for_history.is_empty()
+                                && matches!(result_file_size, None | Some(0)),
+                            row_valid,
+                            other_error: evidence_errors.len() > log_errors + golden_errors,
+                            log_error: log_errors > 0,
+                            golden_error: golden_errors > 0,
+                        };
+                        parity_rejected.insert(
+                            (cell.test.clone(), cell.backend.clone()),
+                            parity_rejection(reason, evidence),
+                        );
+                    }
+                    // Any other row that is the cell's own: of a later
+                    // repetition, or of a first repetition refused for other
+                    // evidence. The first attempt of the earliest such
+                    // repetition that recorded a verify mismatch, if any,
+                    // with what the summary refused about it. Rows that are
+                    // not the cell's are no evidence either way.
+                    let own_rows: &[CellResult] = if row_valid {
+                        &result_rows_for_history
                     } else {
-                        evidence_errors.join("; ")
+                        &[]
                     };
-                    let reason = format!("result row rejected by the series summary: {why}");
-                    let evidence = RefusedParityEvidence {
-                        // Exactly the samples' prerequisite failure below.
-                        host_inapplicable: retained_prerequisite
-                            && !row_valid
-                            && initial_evidence_valid
-                            && sample_evidence_errors.is_empty()
-                            && result_rows_for_history.is_empty()
-                            && !proven_timeout
-                            && !proven_oom,
-                        no_row: result_rows_for_history.is_empty()
-                            && matches!(result_file_size, None | Some(0)),
-                        row_valid,
-                        other_error: evidence_errors.len() > log_errors + golden_errors,
-                        log_error: log_errors > 0,
-                        golden_error: golden_errors > 0,
-                    };
-                    parity_rejected.insert(
-                        (cell.test.clone(), cell.backend.clone()),
-                        parity_rejection(reason, evidence),
-                    );
-                }
-            } else if cell.mode == parity::PARITY_MODE && row_valid && evidence_errors.is_empty() {
-                // A later repetition this summary accepted: the first attempt
-                // of the earliest such repetition that recorded a verify
-                // mismatch, if any. A refused row is not evidence either way.
-                if let (Some(number), Some(row)) = (
-                    repetition,
-                    result_rows_for_history
-                        .iter()
-                        .find(|row| row.result == Some(ObservedResult::DeterminismFailure)),
-                ) {
-                    parity_nondeterministic
-                        .entry((cell.test.clone(), cell.backend.clone()))
-                        .or_insert_with(|| {
-                            format!(
-                                "repetition {number} attempt {} recorded a verify mismatch",
-                                row.attempt
-                            )
-                        });
+                    if let Some(row) = own_rows.iter().find(|row| parity::records_mismatch(row)) {
+                        parity_nondeterministic
+                            .entry((cell.test.clone(), cell.backend.clone()))
+                            .or_insert_with(|| {
+                                let place = match repetition {
+                                    Some(number) => {
+                                        format!("repetition {number} attempt {}", row.attempt)
+                                    }
+                                    None => format!("attempt {}", row.attempt),
+                                };
+                                if evidence_errors.is_empty() {
+                                    format!("{place} recorded a verify mismatch")
+                                } else {
+                                    format!(
+                                        "{place} recorded a verify mismatch in a result row the \
+                                         series summary rejected: {}",
+                                        evidence_errors.join("; ")
+                                    )
+                                }
+                            });
+                    }
                 }
             }
             let retained_attempts = retained_attempt_count(
@@ -8202,6 +8225,10 @@ struct RefusedParityEvidence {
 ///   cannot support: an invalid row, like a history the harness refuses;
 /// - a valid row whose verify logs were not retained as required;
 /// - a valid ptrace row whose normalized golden was not written.
+///
+/// A valid row that also recorded a verify mismatch is handed over as
+/// nondeterministic besides ([`parity::PostPassConfig::nondeterministic`]),
+/// which the post-pass checks first: the defect does not hide the mismatch.
 fn parity_rejection(reason: String, evidence: RefusedParityEvidence) -> parity::ParityRejection {
     if evidence.host_inapplicable {
         parity::ParityRejection::HostInapplicable(reason)
@@ -8236,10 +8263,14 @@ thread_local! {
 /// scope was known), so the parity append reports the failure instead of an
 /// empty report. `rejected` holds the verify cells whose first repetition the
 /// summary refused, with the typed reason ([`parity_rejection`]); their
-/// parity cells take the class the harness gives the same condition and are
-/// never compared. `nondeterministic` holds the verify cells a later
-/// repetition of which the summary accepted recorded a verify mismatch, with
-/// where; their parity cells are nondeterministic.
+/// parity cells are never compared, and take the class the harness gives the
+/// same condition unless `nondeterministic` also names them.
+/// `nondeterministic` holds the verify cells a row of which is the cell's own
+/// and recorded a verify mismatch ([`parity::records_mismatch`]) outside the
+/// accepted first repetition the post-pass reads itself: in a later
+/// repetition, or in a first repetition the summary refused for other
+/// evidence. Each names where, and what the summary refused about that row
+/// if anything; their parity cells are nondeterministic.
 fn report_parity(
     root: &Path,
     results: &Path,
@@ -17418,13 +17449,16 @@ mod pressure_sample_tests {
     /// ran diverged is nondeterministic with null credit and no golden, before
     /// its candidate, which the series did not run, is looked for: whether the
     /// first repetition's own row records the mismatch or, when the summary
-    /// refused that row, a later repetition's accepted row does. A selected
-    /// cell with neither side in the series is dropped with a warning. A
-    /// post-pass that measures nothing, because its scope is empty or cannot
-    /// be resolved, leaves no records of an earlier summary behind. A verify
-    /// cell every repetition of which the summary refused makes its parity
-    /// cells unmeasured, in the floor as 0, with the class the harness gives
-    /// the first repetition's condition and the summary's reason for it.
+    /// refused that row, a later repetition's row does, even one whose
+    /// evidence the summary refused. A first repetition refused for other
+    /// evidence whose row is the cell's own and recorded the mismatch counts
+    /// the same way. A selected cell with neither side in the series is
+    /// dropped with a warning. A post-pass that measures nothing, because its
+    /// scope is empty or cannot be resolved, leaves no records of an earlier
+    /// summary behind. A verify cell no row of which is the cell's own makes
+    /// its parity cells unmeasured, in the floor as 0, with the class the
+    /// harness gives the first repetition's condition and the summary's
+    /// reason for it.
     #[test]
     fn series_parity_post_pass_reports_missing_operands_and_leaves_the_summary_unchanged() {
         let root = checkout_root();
@@ -17678,12 +17712,12 @@ mod pressure_sample_tests {
             .is_empty()
         );
 
-        // A first repetition the summary refused is never read. Rows that
-        // contradict their harness exit are an invalid row, like a history
-        // the harness refuses: the cell is unmeasured with the summary's
-        // reason, in the floor as 0. A refused reference does not take its
-        // test's cells out of the floor, and no repetition the summary
-        // accepted recorded a mismatch either.
+        // A first repetition the summary refused is never compared. Rows that
+        // contradict their harness exit are not the cell's own: an invalid
+        // row, like a history the harness refuses, and no evidence of a
+        // mismatch either way, although every one of them recorded one. The
+        // cell is unmeasured with the summary's reason, in the floor as 0. A
+        // refused reference does not take its test's cells out of the floor.
         metadata.parity_select = vec![failed_cell.to_string()];
         write_metadata(&metadata);
         let harness_statuses: Vec<PathBuf> = (1..=PROMOTION_REPETITIONS)
@@ -17770,7 +17804,82 @@ mod pressure_sample_tests {
             "{diverged:?}"
         );
         diverged.validate().unwrap();
+
+        // A later repetition whose row is the cell's own but whose evidence
+        // the summary refused still recorded the mismatch. Decision 1 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5895129378>
+        // reads "Any mismatch in an operand's attempt history means no
+        // golden", so the cell is nondeterministic, and the reason names what
+        // the summary refused (review A Low 4 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+        let run2_logs: Vec<PathBuf> = (1..=PROMOTION_REPETITIONS)
+            .map(|repetition| {
+                results
+                    .join("runs")
+                    .join(cell_evidence_run_id(
+                        &selected.id,
+                        Some(repetition),
+                        metadata.run_id_prefix.as_deref(),
+                    ))
+                    .join("attempt-1/verify-logs/verify-1/run2_log_fixture.log")
+            })
+            .collect();
+        for run2_log in &run2_logs[1..] {
+            fs::remove_file(run2_log).unwrap();
+        }
+        let refused_mismatch = |repetition: usize| {
+            let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+            assert!(error.contains("produced no trustworthy result"), "{error}");
+            let records = read_parity_records(&parity_path);
+            assert_eq!(records.len(), 1, "{records:?}");
+            let record = parity_record(&records, &failed_cell);
+            assert_eq!(
+                (record.verdict, record.unavailable_class, record.operand),
+                (
+                    parity::ParityVerdict::Nondeterministic,
+                    Some(parity::UnavailableClass::DeterminismMismatch),
+                    Some(parity::ParityOperand::Reference)
+                ),
+                "{record:?}"
+            );
+            let reason = record.reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.starts_with(&format!(
+                    "the ptrace reference verify cell of {} failed determinism: repetition \
+                     {repetition} attempt 1 recorded a verify mismatch in a result row the series \
+                     summary rejected: ",
+                    failed_cell.test_id
+                )),
+                "{record:?}"
+            );
+            assert!(
+                reason.contains(
+                    "must contain exactly one nonempty run1 capture and one nonempty run2 capture"
+                ),
+                "{record:?}"
+            );
+            assert!(
+                reason.ends_with(", so there is no deterministic golden log to compare against"),
+                "{record:?}"
+            );
+            assert_eq!(
+                (&record.reference_log, &record.candidate_log),
+                (&None, &None)
+            );
+            record.validate().unwrap();
+        };
+        refused_mismatch(2);
+        // The same when the first repetition's row is the cell's own but the
+        // summary refused its evidence: its mismatch is the earliest, and the
+        // harness's post-pass, which reads every attempt of the cell, finds
+        // such a mismatch before it looks for a log. Only rows that are not
+        // the cell's, as in the first refusal above, are no evidence.
         fs::write(&harness_statuses[0], "1\n").unwrap();
+        fs::remove_file(&run2_logs[0]).unwrap();
+        refused_mismatch(1);
+        for run2_log in &run2_logs {
+            fs::write(run2_log, "INFO second\n").unwrap();
+        }
         cleanup.remove().unwrap();
     }
 
