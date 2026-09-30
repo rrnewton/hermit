@@ -189,9 +189,17 @@ fn step(
                 (libc::RLIMIT_FSIZE, MAX_INPUT as u64),
                 (libc::RLIMIT_AS, 512 * 1024 * 1024),
             ] {
+                let mut inherited = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(resource, &mut inherited) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // A configured cap must never lift a stricter inherited limit.
                 let value = libc::rlimit {
-                    rlim_cur: limit,
-                    rlim_max: limit,
+                    rlim_cur: inherited.rlim_cur.min(limit),
+                    rlim_max: inherited.rlim_max.min(limit),
                 };
                 if libc::setrlimit(resource, &value) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -684,5 +692,983 @@ mod compiler_supervision_tests {
         assert_eq!(receipt["supervision"]["owned_group_kill_before_reap"], true);
         assert_eq!(receipt["supervision"]["cleanup_complete"], true);
         assert_eq!(receipt["supervision"]["final_group_absent"], true);
+    }
+
+    // The regression parent never changes its own limits. A fresh custodian
+    // owns the isolated copy invoking the real step and any observer adopted
+    // after that copy dies. Maintained step/supervision receipts and the exact
+    // kernel wait set remain separate; proc numbers alone grant no authority.
+    fn actual_limits() -> [[libc::rlim_t; 2]; 3] {
+        [libc::RLIMIT_FSIZE, libc::RLIMIT_AS, libc::RLIMIT_CORE].map(|resource| {
+            let mut value = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::getrlimit(resource, &mut value) }, 0);
+            assert!(value.rlim_cur <= value.rlim_max);
+            [value.rlim_cur, value.rlim_max]
+        })
+    }
+
+    #[test]
+    fn actual_package_step_limit_observer() {
+        // This is also an independently counted, always-active observation
+        // case in the full suite, not an ignored or environment-gated test.
+        let observed_limits = actual_limits();
+        let args = std::env::args().collect::<Vec<_>>();
+        let isolated = args.windows(2).any(|pair| {
+            pair == [
+                "--exact",
+                "compiler_supervision_tests::actual_package_step_limit_observer",
+            ]
+        });
+        if isolated {
+            // Capture the real entry limits before lowering only this leaf's
+            // output allowance. Do not mutate limits of the shared full suite.
+            limit_observer_output_cap().unwrap();
+        }
+        limit_observer_barrier().unwrap();
+        println!(
+            "\nPACKAGE-LIMIT-OBSERVATION {}",
+            json!({
+                "pid":std::process::id(),
+                "parent":unsafe { libc::getppid() },
+                "limits":observed_limits,
+                "limits_phase":"entry_before_output_cap",
+                "isolated_output_cap":if isolated { json!(4096) } else { Value::Null }
+            })
+        );
+    }
+
+    fn retain_limit_parent_record(record: &Value) {
+        // Write through the real pipe rather than libtest's successful-test
+        // print capture. The qualification runner retains and charges every
+        // byte, including each complete original owner's supervision receipt.
+        let mut output = std::io::stdout().lock();
+        output.write_all(b"\nPACKAGE-LIMIT-PARENT ").unwrap();
+        serde_json::to_writer(&mut output, record).unwrap();
+        output.write_all(b"\n").unwrap();
+        output.flush().unwrap();
+    }
+
+    fn limit_observer_output_cap() -> Result<()> {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        ensure!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limits) } == 0);
+        // Any libtest prefix already written must also fit the same ceiling.
+        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+            ensure!(unsafe { libc::fstat(fd, &mut status) } == 0);
+            if status.st_mode & libc::S_IFMT == libc::S_IFREG {
+                ensure!(
+                    (0..=4096).contains(&status.st_size),
+                    "observer prefix exceeds output cap"
+                );
+            }
+        }
+        limits.rlim_cur = limits.rlim_cur.min(4096);
+        ensure!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limits) } == 0);
+        Ok(())
+    }
+
+    fn emit_limit_custodian_receipt(path: &Path, value: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        if bytes.len() > 2048 {
+            // Preserve the complete failed outcome in the bounded action's
+            // captured stream, rather than publishing a truncated JSON file.
+            eprintln!("oversized custodian receipt: {value}");
+            anyhow::bail!("custodian receipt exceeds2048 bytes");
+        }
+        let mut file = File::options().write(true).create_new(true).open(path)?;
+        file.write_all(&bytes)?;
+        Ok(())
+    }
+
+    // Only the fresh, exact-selector custodian may use the child-set routines
+    // below. They must never sweep children of the shared libtest process.
+    fn limit_clock_ns() -> Result<u64> {
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        ensure!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } == 0,
+            "read fixture monotonic clock"
+        );
+        ensure!(value.tv_sec >= 0 && (0..1_000_000_000).contains(&value.tv_nsec));
+        (value.tv_sec as u64)
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(value.tv_nsec as u64))
+            .context("fixture clock overflow")
+    }
+
+    fn limit_deadline(reserve_seconds: u64) -> Result<Instant> {
+        let end = std::env::var("HERMIT_PACKAGE_LIMIT_DEADLINE")?.parse::<u64>()?;
+        let observed = Instant::now();
+        let now = limit_clock_ns()?;
+        let remaining = end
+            .checked_sub(reserve_seconds * 1_000_000_000)
+            .and_then(|end| end.checked_sub(now))
+            .context("original fixture deadline exhausted")?;
+        // Snapshot Instant before CLOCK_MONOTONIC: a descheduling gap makes
+        // this translation conservative, never a refreshed nested budget.
+        Ok(observed + Duration::from_nanos(remaining))
+    }
+
+    fn limit_poll(fd: libc::c_int, deadline: Instant) -> Result<()> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("original fixture poll deadline")?;
+        let timeout = i32::try_from(remaining.as_millis().max(1))?;
+        let mut item = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut item, 1, timeout) };
+        ensure!(
+            result >= 0,
+            "fixture poll: {}",
+            std::io::Error::last_os_error()
+        );
+        ensure!(
+            result == 1 && Instant::now() < deadline,
+            "fixture poll deadline"
+        );
+        ensure!(
+            item.revents & (libc::POLLERR | libc::POLLNVAL) == 0,
+            "fixture poll error"
+        );
+        ensure!(
+            item.revents & (libc::POLLIN | libc::POLLHUP) != 0,
+            "fixture poll without readiness"
+        );
+        Ok(())
+    }
+
+    fn limit_pidfd(pid: u32) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        ensure!(
+            fd >= 0,
+            "open original child pidfd: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+    }
+
+    fn limit_kill(fd: &std::os::fd::OwnedFd) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        ensure!(
+            result == 0,
+            "signal original pidfd: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    fn limit_childless() -> Result<bool> {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_ALL,
+                0,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(false); // Includes a live child with si_pid == 0.
+        }
+        let error = std::io::Error::last_os_error();
+        ensure!(
+            error.raw_os_error() == Some(libc::ECHILD),
+            "child-set observation: {error}"
+        );
+        Ok(true)
+    }
+
+    fn limit_retire_child(pid: u32, deadline: Instant) -> Result<Value> {
+        use std::os::fd::AsRawFd;
+        // The caller just authenticated this unreaped child with P_PID. This
+        // fresh process has one exclusive waiter; its PID cannot be recycled
+        // between that observation and opening the generation-bound pidfd.
+        let fd = limit_pidfd(pid)?;
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let peek = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        ensure!(
+            peek == 0,
+            "pidfd wait ownership: {}",
+            std::io::Error::last_os_error()
+        );
+        let signal_sent = unsafe { info.si_pid() } == 0;
+        if signal_sent {
+            limit_kill(&fd)?;
+            limit_poll(fd.as_raw_fd(), deadline)?;
+        }
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        ensure!(
+            observed == 0 && unsafe { info.si_pid() } == pid as i32,
+            "original pidfd did not become terminal"
+        );
+        let code = info.si_code;
+        let status = unsafe { info.si_status() };
+        let reaped = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        };
+        ensure!(
+            reaped == 0
+                && unsafe { info.si_pid() } == pid as i32
+                && info.si_code == code
+                && unsafe { info.si_status() } == status,
+            "exact terminal pidfd reap changed"
+        );
+        let again = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        ensure!(
+            again == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+            "reaped original pidfd must return ECHILD"
+        );
+        Ok(
+            json!({"pid":pid,"signal_sent":signal_sent,"waitid_code":code,
+            "waitid_status":status,"reaped":true,"after_reap_echild":true}),
+        )
+    }
+
+    struct LimitCustody {
+        deadline: Instant,
+        settled: bool,
+    }
+
+    impl LimitCustody {
+        fn new(deadline: Instant) -> Result<Self> {
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            ensure!(unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } == 0);
+            ensure!(
+                action.sa_sigaction == libc::SIG_DFL && action.sa_flags & libc::SA_NOCLDWAIT == 0,
+                "fresh custodian requires default SIGCHLD without automatic reap"
+            );
+            ensure!(limit_childless()?, "fresh custodian already owns a child");
+            process_group::own_descendants()?;
+            let mut subreaper = 0;
+            ensure!(
+                unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut subreaper, 0, 0, 0) } == 0
+                    && subreaper == 1,
+                "custodian subreaper was not installed"
+            );
+            Ok(Self {
+                deadline,
+                settled: false,
+            })
+        }
+
+        fn settle(&mut self) -> Value {
+            let mut retired = Vec::new();
+            let mut errors = Vec::new();
+            // The fixed fresh role can create only its isolated supervisor,
+            // which can create only one observer. The second ancestry wave
+            // covers adoption after retiring an intermediate in the first.
+            for _ in 0..2 {
+                let found = (|| -> Result<Vec<u32>> {
+                    ensure!(Instant::now() < self.deadline, "custody deadline");
+                    let mut children = Vec::new();
+                    for entry in fs::read_dir("/proc")? {
+                        ensure!(Instant::now() < self.deadline, "custody census deadline");
+                        let entry = entry?;
+                        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                            continue;
+                        };
+                        if pid == 0 {
+                            continue;
+                        }
+                        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                        let result = unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                pid,
+                                &mut info,
+                                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                            )
+                        };
+                        if result == -1 {
+                            let error = std::io::Error::last_os_error();
+                            ensure!(
+                                error.raw_os_error() == Some(libc::ECHILD),
+                                "candidate child authentication: {error}"
+                            );
+                            continue;
+                        }
+                        ensure!(
+                            result == 0
+                                && (unsafe { info.si_pid() } == 0
+                                    || unsafe { info.si_pid() } == pid as i32),
+                            "invalid child observation"
+                        );
+                        children.push(pid);
+                        ensure!(
+                            children.len() <= 2,
+                            "fresh fixture child population exceeded"
+                        );
+                    }
+                    Ok(children)
+                })();
+                match found {
+                    Ok(children) => {
+                        for pid in children {
+                            match limit_retire_child(pid, self.deadline) {
+                                Ok(receipt) => retired.push(receipt),
+                                Err(error) => errors
+                                    .push(format!("retire authenticated child {pid}: {error:#}")),
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(format!("discover owned children: {error:#}"));
+                        break;
+                    }
+                }
+                match limit_childless() {
+                    Ok(true) => {
+                        self.settled = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        errors.push(format!("final wait-set observation: {error:#}"));
+                        break;
+                    }
+                }
+            }
+            if !self.settled {
+                errors.push("actual child set is not empty".to_owned());
+            }
+            let within = Instant::now() < self.deadline;
+            if !within {
+                errors.push("original custody deadline exhausted".to_owned());
+            }
+            let complete = self.settled && within && errors.is_empty();
+            json!({"initial_childless":true,"sigchld_default":true,"subreaper":true,
+                "retired":retired,"final_echild":self.settled,"within_original_deadline":within,
+                "cleanup_errors":errors,"cleanup_complete":complete})
+        }
+    }
+
+    impl Drop for LimitCustody {
+        fn drop(&mut self) {
+            if !self.settled {
+                let receipt = self.settle();
+                eprintln!("limit custodian unwound: {receipt}, successful_receipt=false");
+            }
+        }
+    }
+
+    fn limit_observer_barrier() -> Result<()> {
+        // Only the deliberate death fixture installs this file in the actual
+        // observer's cwd. Normal observations always execute the old body.
+        let path = Path::new("limit-custody-control.json");
+        match fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            other => {
+                other?;
+            }
+        }
+        let control: Value = serde_json::from_slice(&read_regular(path, 4096)?)?;
+        ensure!(control["schema"] == 1);
+        let fd = i32::try_from(control["fd"].as_u64().context("control fd")?)?;
+        ensure!(fd > 2);
+        let mut peer = unsafe { std::mem::zeroed::<libc::ucred>() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        ensure!(
+            unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&mut peer as *mut libc::ucred).cast(),
+                    &mut length,
+                )
+            } == 0
+        );
+        ensure!(
+            length as usize == std::mem::size_of::<libc::ucred>()
+                && control["custodian"] == peer.pid
+                && peer.uid == unsafe { libc::geteuid() },
+            "control socket peer mismatch"
+        );
+        let end = control["deadline_ns"]
+            .as_u64()
+            .context("control deadline")?;
+        let observed = Instant::now();
+        let remaining = end
+            .checked_sub(limit_clock_ns()?)
+            .context("observer deadline")?;
+        // This byte deliberately conveys no PID or pidfd. The real observer
+        // is now alive, before publishing its identity/limits, and waits.
+        ensure!(unsafe { libc::write(fd, [0x52u8].as_ptr().cast(), 1) } == 1);
+        limit_poll(fd, observed + Duration::from_nanos(remaining))?;
+        anyhow::bail!("stalled observer released unexpectedly")
+    }
+
+    #[test]
+    fn actual_package_step_applies_configured_caps() {
+        let parent_before = actual_limits();
+        let caps = [MAX_INPUT as libc::rlim_t, 512 * 1024 * 1024, 0];
+        let expected: [[libc::rlim_t; 2]; 3] =
+            std::array::from_fn(|index| parent_before[index].map(|value| value.min(caps[index])));
+        // The focused normal-parent qualification requires this precondition.
+        // Under the full suite's stricter soft limit the same test still checks
+        // the exact minima, without raising any original-parent limit.
+        let incoming_above_configured_caps = (0..2).all(|index| {
+            parent_before[index]
+                .iter()
+                .all(|value| *value > caps[index])
+        });
+        let root = std::env::var_os("HERMIT_TEST_ACTION_RESULTS")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!(
+            "package-limit-control-{}-ordinary",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        let result = step(
+            &path,
+            "observed",
+            &[
+                std::env::current_exe().unwrap().into_os_string(),
+                "--exact".into(),
+                "compiler_supervision_tests::actual_package_step_limit_observer".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ],
+            Instant::now() + Duration::from_secs(30),
+            None,
+        );
+        let parent_after = actual_limits();
+        let receipt = fs::read(path.join("observed.json"))
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(anyhow::Error::from));
+        retain_limit_parent_record(&json!({
+            "schema":1,"case":"ordinary","directory":path,
+            "parent_pid":std::process::id(),
+            "parent_limits_before":parent_before,"parent_limits_after":parent_after,
+            "expected":expected,"incoming_above_configured_caps":incoming_above_configured_caps,
+            "step_receipt":receipt.as_ref().ok(),
+            "step_error":result.as_ref().err().map(|error| format!("{error:#}")),
+            "receipt_error":receipt.as_ref().err().map(|error| format!("{error:#}"))
+        }));
+        // The actual step has completed its original-child cleanup before any
+        // success assertion. Retain its error before a failed assertion exits.
+        result.unwrap();
+        assert_eq!(parent_after, parent_before, "parent limits changed");
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt["returncode"], 0);
+        assert_eq!(receipt["passed"], true);
+        let owner = &receipt["supervision"];
+        assert_eq!(owner["pid"], receipt["pid"]);
+        assert_eq!(owner["raw_status"], 0);
+        assert_eq!(owner["passed"], true);
+        assert_eq!(owner["timed_out"], false);
+        assert_eq!(owner["log_overflow"], false);
+        assert_eq!(owner["primary_error"], Value::Null);
+        assert_eq!(owner["terminal_bounds_error"], Value::Null);
+        assert_eq!(owner["terminal_observed_without_reap"], true);
+        assert_eq!(owner["natural_terminal_group"], true);
+        assert_eq!(owner["owned_group_kill_before_reap"], true);
+        assert_eq!(owner["unreaped_child_retained_until_receipt"], false);
+        assert_eq!(owner["cleanup_complete"], true);
+        assert_eq!(owner["cleanup_errors"], json!([]));
+        assert_eq!(owner["final_group_absent"], true);
+        let output = fs::read_to_string(path.join("observed.stdout")).unwrap();
+        let records = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("PACKAGE-LIMIT-OBSERVATION "))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "one genuine child's observation");
+        let observed: Value = serde_json::from_str(records[0]).unwrap();
+        assert_eq!(observed["pid"], receipt["pid"]);
+        assert_eq!(observed["parent"], std::process::id());
+        assert_eq!(observed["limits"], json!(expected));
+    }
+
+    fn inherited_limit_outer(case: &str, selector: &str, output_cap: libc::rlim_t) {
+        let parent_before = actual_limits();
+        assert!(std::env::var_os("HERMIT_PACKAGE_LIMIT_ROLE").is_none());
+        assert!(std::env::var_os("HERMIT_PACKAGE_LIMIT_WORK").is_none());
+        assert!(std::env::var_os("HERMIT_PACKAGE_LIMIT_DEADLINE").is_none());
+        let root = std::env::var_os("HERMIT_TEST_ACTION_RESULTS")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!(
+            "package-limit-control-{}-{case}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(path.join("step")).unwrap();
+        let stdout = path.join("custodian.stdout");
+        let stderr = path.join("custodian.stderr");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", selector, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("HERMIT_PACKAGE_LIMIT_ROLE", format!("custodian-{case}"))
+            .env("HERMIT_PACKAGE_LIMIT_WORK", &path)
+            .stdin(Stdio::null())
+            .stdout(
+                File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stdout)
+                    .unwrap(),
+            )
+            .stderr(
+                File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stderr)
+                    .unwrap(),
+            );
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut action = std::mem::zeroed::<libc::sigaction>();
+                action.sa_sigaction = libc::SIG_DFL;
+                if libc::sigemptyset(&mut action.sa_mask) != 0
+                    || libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_FSIZE, &mut limits) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limits.rlim_cur = limits.rlim_cur.min(output_cap);
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limits) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        process_group::own_descendants().unwrap();
+        // One origin for all nested budgets. Inner stages reserve cleanup time;
+        // they never install another fresh30-second deadline.
+        let end = limit_clock_ns()
+            .unwrap()
+            .checked_add(30_000_000_000)
+            .unwrap();
+        command.env("HERMIT_PACKAGE_LIMIT_DEADLINE", end.to_string());
+        let started = Instant::now();
+        let owner = OwnedChild {
+            child: command.spawn().unwrap(),
+            cleanup_attempted: false,
+            reaped: false,
+        };
+        let original = owner.child.id();
+        let receipt = supervise(
+            owner,
+            started,
+            &stdout,
+            &stderr,
+            Limits {
+                wall: Duration::from_secs(30),
+                logs: 2 * MAX_INPUT as u64,
+                cleanup: Duration::from_secs(2),
+            },
+        );
+        emit_limit_custodian_receipt(&path.join("custodian.json"), &receipt).unwrap();
+        // The outer original child is retired before any result comparison.
+        assert_eq!(actual_limits(), parent_before, "parent limits changed");
+        assert_eq!(receipt["pid"], original);
+        assert_eq!(receipt["raw_status"], if case == "death" { 101 } else { 0 });
+        assert_eq!(receipt["passed"], case != "death");
+        assert_eq!(receipt["signal"], Value::Null);
+        assert_eq!(receipt["timed_out"], false);
+        assert_eq!(receipt["log_overflow"], false);
+        assert_eq!(receipt["primary_error"], Value::Null);
+        assert_eq!(receipt["terminal_bounds_error"], Value::Null);
+        assert_eq!(receipt["terminal_observed_without_reap"], true);
+        assert_eq!(receipt["natural_terminal_group"], true);
+        assert_eq!(receipt["owned_group_kill_before_reap"], true);
+        assert_eq!(receipt["unreaped_child_retained_until_receipt"], false);
+        assert_eq!(receipt["cleanup_complete"], true);
+        assert_eq!(receipt["cleanup_errors"], json!([]));
+        assert_eq!(receipt["final_group_absent"], true);
+        let output = fs::read_to_string(&stdout).unwrap();
+        let rows = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("PACKAGE-LIMIT-CUSTODY "))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "one fresh custodian's actual cleanup record");
+        let row: Value = serde_json::from_str(rows[0]).unwrap();
+        assert_eq!(row["custodian"], original);
+        assert_eq!(row["case"], case);
+        assert_eq!(row["parent_limits_before"], row["parent_limits_after"]);
+        let custody = &row["custody"];
+        assert_eq!(custody["initial_childless"], true);
+        assert_eq!(custody["sigchld_default"], true);
+        assert_eq!(custody["subreaper"], true);
+        assert_eq!(custody["final_echild"], true);
+        assert_eq!(custody["within_original_deadline"], true);
+        assert_eq!(custody["cleanup_complete"], true);
+        assert_eq!(custody["cleanup_errors"], json!([]));
+        if case == "death" {
+            // A failed real stage remains failed. This control succeeds only
+            // by proving that precise failure followed authentic retirement.
+            assert_eq!(row["injection"]["ready_byte"], 0x52);
+            assert_eq!(row["injection"]["signaled_pid"], row["supervisor"]["pid"]);
+            assert_eq!(row["injection"]["observer_identity_published"], false);
+            assert_eq!(row["supervisor"]["passed"], false);
+            assert_eq!(row["supervisor"]["raw_status"], Value::Null);
+            assert_eq!(row["supervisor"]["signal"], libc::SIGKILL);
+            assert_eq!(row["supervisor"]["timed_out"], false);
+            assert_eq!(row["supervisor"]["cleanup_complete"], true);
+            assert_eq!(row["supervisor"]["cleanup_errors"], json!([]));
+            let retired = custody["retired"].as_array().unwrap();
+            assert_eq!(retired.len(), 1, "the actual adopted observer");
+            assert_ne!(retired[0]["pid"], row["supervisor"]["pid"]);
+            assert_eq!(retired[0]["signal_sent"], true);
+            assert_eq!(retired[0]["waitid_code"], libc::CLD_KILLED);
+            assert_eq!(retired[0]["waitid_status"], libc::SIGKILL);
+            assert_eq!(retired[0]["reaped"], true);
+            assert_eq!(retired[0]["after_reap_echild"], true);
+            let observer_output = fs::read_to_string(path.join("step/observed.stdout")).unwrap();
+            assert!(!observer_output.contains("PACKAGE-LIMIT-OBSERVATION "));
+            assert!(
+                !path.join("step/observed.json").exists(),
+                "killed supervisor cannot manufacture a completed step receipt"
+            );
+        } else {
+            assert_eq!(row["injection"], Value::Null);
+            assert_eq!(
+                custody["retired"],
+                json!([]),
+                "normal completion cannot depend on orphan cleanup"
+            );
+        }
+    }
+
+    fn inherited_limit_case(
+        case: &str,
+        selector: &str,
+        file: [libc::rlim_t; 2],
+        memory: [libc::rlim_t; 2],
+    ) {
+        let role = std::env::var_os("HERMIT_PACKAGE_LIMIT_ROLE");
+        if role.is_none() {
+            inherited_limit_outer(case, selector, file[0]);
+            return;
+        }
+        if role == Some(OsString::from(case)) {
+            let work = PathBuf::from(std::env::var_os("HERMIT_PACKAGE_LIMIT_WORK").unwrap());
+            emit(
+                &work.join("inherited.json"),
+                &json!({"pid":std::process::id(),"limits":actual_limits()}),
+            )
+            .unwrap();
+            // No comparison with expected caps here: for the soft regression
+            // both old and fixed executions must be able to exit0. The original
+            // parent checks the observer's values only after genuine cleanup.
+            step(
+                &work,
+                "observed",
+                &[
+                    std::env::current_exe().unwrap().into_os_string(),
+                    "--exact".into(),
+                    "compiler_supervision_tests::actual_package_step_limit_observer".into(),
+                    "--nocapture".into(),
+                    "--test-threads=1".into(),
+                ],
+                limit_deadline(10).unwrap(),
+                None,
+            )
+            .unwrap();
+            return;
+        }
+
+        assert_eq!(role, Some(OsString::from(format!("custodian-{case}"))));
+        let mut custody = LimitCustody::new(limit_deadline(2).unwrap()).unwrap();
+        let supervisor_deadline = limit_deadline(6).unwrap();
+        let observer_deadline = limit_deadline(10).unwrap();
+        let parent_before = actual_limits();
+        for (inherited, wanted) in parent_before.iter().zip([file, memory, [0, 0]]) {
+            assert!(inherited[0] >= wanted[0] && inherited[1] >= wanted[1]);
+        }
+        let path = PathBuf::from(std::env::var_os("HERMIT_PACKAGE_LIMIT_WORK").unwrap());
+        let work = path.join("step");
+        let stdout = path.join("stdout");
+        let stderr = path.join("stderr");
+        use std::os::fd::AsRawFd;
+        let control = if case == "death" {
+            let pair = std::os::unix::net::UnixStream::pair().unwrap();
+            let end = std::env::var("HERMIT_PACKAGE_LIMIT_DEADLINE")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            emit(
+                &work.join("limit-custody-control.json"),
+                &json!({
+                    "schema":1,"fd":pair.1.as_raw_fd(),"custodian":std::process::id(),
+                    "deadline_ns":end.checked_sub(10_000_000_000).unwrap()
+                }),
+            )
+            .unwrap();
+            Some(pair)
+        } else {
+            None
+        };
+        let control_fd = control.as_ref().map(|pair| pair.1.as_raw_fd());
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", selector, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("HERMIT_PACKAGE_LIMIT_ROLE", case)
+            .env("HERMIT_PACKAGE_LIMIT_WORK", &work)
+            .env(
+                "HERMIT_PACKAGE_LIMIT_DEADLINE",
+                std::env::var_os("HERMIT_PACKAGE_LIMIT_DEADLINE").unwrap(),
+            )
+            .current_dir(&work)
+            .stdin(Stdio::null())
+            .stdout(
+                File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stdout)
+                    .unwrap(),
+            )
+            .stderr(
+                File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stderr)
+                    .unwrap(),
+            );
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(fd) = control_fd {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for (resource, [soft, hard]) in [
+                    (libc::RLIMIT_FSIZE, file),
+                    (libc::RLIMIT_AS, memory),
+                    (libc::RLIMIT_CORE, [0, 0]),
+                ] {
+                    let mut inherited = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(resource, &mut inherited) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // The fixture may only lower the original child's limits.
+                    if soft > inherited.rlim_cur || hard > inherited.rlim_max {
+                        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                    }
+                    let value = libc::rlimit {
+                        rlim_cur: soft,
+                        rlim_max: hard,
+                    };
+                    if libc::setrlimit(resource, &value) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        process_group::own_descendants().unwrap();
+        let started = Instant::now();
+        let owner = OwnedChild {
+            child: command.spawn().unwrap(),
+            cleanup_attempted: false,
+            reaped: false,
+        };
+        let original = owner.child.id();
+        let mut control = control.map(|(reader, writer)| {
+            drop(writer);
+            reader
+        });
+        let injection = (|| -> Result<Value> {
+            let Some(socket) = control.as_mut() else {
+                return Ok(Value::Null);
+            };
+            ensure!(
+                !process_group::exited_without_reap(&owner.child)?,
+                "original supervisor exited before injection setup"
+            );
+            let original_fd = limit_pidfd(original)?;
+            limit_poll(socket.as_raw_fd(), observer_deadline)?;
+            let mut byte = [0u8];
+            std::io::Read::read_exact(socket, &mut byte)?;
+            ensure!(byte == [0x52], "actual observer readiness byte");
+            ensure!(
+                !process_group::exited_without_reap(&owner.child)?,
+                "original supervisor exited before the causal kill"
+            );
+            limit_kill(&original_fd)?;
+            Ok(json!({"ready_byte":byte[0],"signaled_pid":original,
+                "observer_identity_published":false}))
+        })();
+        let receipt = supervise(
+            owner,
+            started,
+            &stdout,
+            &stderr,
+            Limits {
+                wall: supervisor_deadline.saturating_duration_since(started),
+                logs: 2 * MAX_INPUT as u64,
+                cleanup: Duration::from_secs(2),
+            },
+        );
+        // Keep the socket peer alive while retiring the observer, so EOF cannot
+        // masquerade as the required killed-child result.
+        let custody_receipt = custody.settle();
+        emit(&path.join("result.json"), &receipt).unwrap();
+        {
+            let mut output = std::io::stdout().lock();
+            output.write_all(b"\nPACKAGE-LIMIT-CUSTODY ").unwrap();
+            serde_json::to_writer(
+                &mut output,
+                &json!({
+                    "custodian":std::process::id(),"case":case,
+                    "parent_limits_before":parent_before,"parent_limits_after":actual_limits(),
+                    "supervisor":receipt,"custody":custody_receipt,
+                    "injection":injection.as_ref().ok(),
+                    "injection_error":injection.as_ref().err().map(|error| format!("{error:#}"))
+                }),
+            )
+            .unwrap();
+            output.write_all(b"\n").unwrap();
+            output.flush().unwrap();
+        }
+        injection.unwrap();
+        assert_eq!(custody_receipt["cleanup_complete"], true);
+        assert_eq!(custody_receipt["cleanup_errors"], json!([]));
+        assert_eq!(custody_receipt["final_echild"], true);
+        // Every assertion below follows the original parent's actual cleanup.
+        assert_eq!(actual_limits(), parent_before, "parent limits changed");
+        assert_eq!(receipt["pid"], original);
+        assert_eq!(receipt["raw_status"], 0);
+        assert_eq!(receipt["passed"], true);
+        assert_eq!(receipt["timed_out"], false);
+        assert_eq!(receipt["log_overflow"], false);
+        assert_eq!(receipt["primary_error"], Value::Null);
+        assert_eq!(receipt["terminal_bounds_error"], Value::Null);
+        assert_eq!(receipt["terminal_observed_without_reap"], true);
+        assert_eq!(receipt["natural_terminal_group"], true);
+        assert_eq!(receipt["owned_group_kill_before_reap"], true);
+        assert_eq!(receipt["unreaped_child_retained_until_receipt"], false);
+        assert_eq!(receipt["cleanup_complete"], true);
+        assert_eq!(receipt["cleanup_errors"], json!([]));
+        assert_eq!(receipt["final_group_absent"], true);
+        let inherited: Value =
+            serde_json::from_slice(&fs::read(work.join("inherited.json")).unwrap()).unwrap();
+        assert_eq!(inherited["pid"], original);
+        assert_eq!(inherited["limits"], json!([file, memory, [0, 0]]));
+        let step_receipt: Value =
+            serde_json::from_slice(&fs::read(work.join("observed.json")).unwrap()).unwrap();
+        assert_eq!(step_receipt["returncode"], 0);
+        assert_eq!(step_receipt["passed"], true);
+        let step_owner = &step_receipt["supervision"];
+        assert_eq!(step_owner["terminal_observed_without_reap"], true);
+        assert_eq!(step_owner["natural_terminal_group"], true);
+        assert_eq!(step_owner["owned_group_kill_before_reap"], true);
+        assert_eq!(step_owner["unreaped_child_retained_until_receipt"], false);
+        assert_eq!(step_owner["cleanup_complete"], true);
+        assert_eq!(step_owner["cleanup_errors"], json!([]));
+        assert_eq!(step_owner["final_group_absent"], true);
+        let output = fs::read_to_string(work.join("observed.stdout")).unwrap();
+        let records = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("PACKAGE-LIMIT-OBSERVATION "))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "one genuine child's observation");
+        let observed: Value = serde_json::from_str(records[0]).unwrap();
+        assert_eq!(observed["pid"], step_receipt["pid"]);
+        assert_eq!(observed["parent"], original);
+        assert_eq!(observed["limits"], json!([file, memory, [0, 0]]));
+    }
+
+    #[test]
+    fn actual_package_step_respects_lower_hard_limits() {
+        inherited_limit_case(
+            "hard",
+            "compiler_supervision_tests::actual_package_step_respects_lower_hard_limits",
+            [32768, 32768],
+            [256 * 1024 * 1024, 256 * 1024 * 1024],
+        );
+    }
+
+    #[test]
+    fn actual_package_step_preserves_lower_soft_limits() {
+        inherited_limit_case(
+            "soft",
+            "compiler_supervision_tests::actual_package_step_preserves_lower_soft_limits",
+            [8192, MAX_INPUT as libc::rlim_t],
+            [256 * 1024 * 1024, 512 * 1024 * 1024],
+        );
+    }
+
+    #[test]
+    fn actual_package_step_nested_supervisor_death_retires_observer() {
+        inherited_limit_case(
+            "death",
+            "compiler_supervision_tests::actual_package_step_nested_supervisor_death_retires_observer",
+            [8192, MAX_INPUT as libc::rlim_t],
+            [256 * 1024 * 1024, 512 * 1024 * 1024],
+        );
     }
 }

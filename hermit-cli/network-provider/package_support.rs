@@ -1436,7 +1436,9 @@ mod tests {
         }
     }
 
-    fn btf() -> (Vec<u8>, BTreeMap<String, (Vec<usize>, usize, usize)>) {
+    type BtfTestFixture = (Vec<u8>, BTreeMap<String, (Vec<usize>, usize, usize)>);
+
+    fn btf() -> BtfTestFixture {
         let mut types = Vec::new();
         for word in [
             0u32,
