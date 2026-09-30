@@ -549,10 +549,14 @@ fn kernel_activity_commands_are_deterministic_under_strict_verify() {
             args: &["--noheadings", "--output", "IRQ,TOTAL,NAME"],
             stdin: None,
         },
+        // Only CPU 0's row. Hermit zeroes every /proc/softirqs counter, and the all-CPU form
+        // printed 632 zero rows on a 316-CPU host, one traced write per field; validate killed
+        // this test at its 22 CPU-s cap (https://github.com/rrnewton/hermit/issues/3395). `-P 0`
+        // still reads and hashes the whole file (every CPU column) and keeps the 1 s resample.
         StrictCommandCase {
             name: "mpstat softirqs",
             candidates: &["/usr/bin/mpstat"],
-            args: &["-I", "SCPU", "1", "1"],
+            args: &["-I", "SCPU", "-P", "0", "1", "1"],
             stdin: None,
         },
         StrictCommandCase {
