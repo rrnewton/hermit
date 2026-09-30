@@ -67,12 +67,18 @@ fn apply_innermost_timeout_runner(argv: &mut Vec<String>, root: &str) -> bool {
             true
         }
     });
-    let split = argv.iter().position(|argument| argument == "--").unwrap_or(argv.len());
+    let split = argv
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(argv.len());
     if let Some(jobs) = jobs {
         argv.splice(split..split, ["-j".to_string(), jobs]);
     }
     if no_capture {
-        let split = argv.iter().position(|argument| argument == "--").unwrap_or(argv.len());
+        let split = argv
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(argv.len());
         argv.insert(split, "--no-capture".to_string());
     }
     true
@@ -100,22 +106,36 @@ fn load_gates(root: &Path) -> Result<Vec<SuperGate>, String> {
             .ok_or_else(|| format!("{} row {index}: missing string `job`", file.display()))?;
         let label = string("label")
             .ok_or_else(|| format!("{} row {index}: missing string `label`", file.display()))?;
-        let timeout = row.get("timeout").and_then(|value| value.as_i64()).unwrap_or(0);
+        let timeout = row
+            .get("timeout")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
         let raw = row
             .get("argv")
             .and_then(|value| value.as_array())
-            .ok_or_else(|| format!("{} row {index} ({label}): missing array `argv`", file.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "{} row {index} ({label}): missing array `argv`",
+                    file.display()
+                )
+            })?;
         let mut argv = Vec::with_capacity(raw.len());
         for argument in raw {
             let argument = argument.as_str().ok_or_else(|| {
-                format!("{} row {index} ({label}): non-string argv element", file.display())
+                format!(
+                    "{} row {index} ({label}): non-string argv element",
+                    file.display()
+                )
             })?;
             argv.push(argument.replace("{{ROOT_DIR}}", &root));
         }
         apply_innermost_timeout_runner(&mut argv, &root);
         let synthetic = string("synthetic");
         if synthetic.is_none() && argv.is_empty() {
-            return Err(format!("{} row {index} ({label}): empty argv", file.display()));
+            return Err(format!(
+                "{} row {index} ({label}): empty argv",
+                file.display()
+            ));
         }
         gates.push(SuperGate {
             job,
@@ -194,7 +214,8 @@ impl StressProbe {
             ),
             StressProbe::PtraceRecordReplay => {
                 let dir = shell_quote(
-                    &tmp.join(format!("super-record-{iteration}")).to_string_lossy(),
+                    &tmp.join(format!("super-record-{iteration}"))
+                        .to_string_lossy(),
                 );
                 // The bash removed the data dir before AND after, preserving the
                 // record phase's exit status across the second removal.
@@ -327,7 +348,12 @@ pub fn stress_rates(outcomes: &[StepOutcome], reps: i64) -> Vec<ProbeRate> {
                 passed += 1;
             }
         }
-        rates.push(ProbeRate { probe: *probe, passed, ran, planned: reps as usize });
+        rates.push(ProbeRate {
+            probe: *probe,
+            passed,
+            ran,
+            planned: reps as usize,
+        });
     }
     rates
 }
@@ -345,7 +371,9 @@ pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usiz
     for r in rates {
         let slug = r.probe.slug();
         if r.ran == 0 {
-            println!("  SKIP {slug:<24} backend unavailable (availability node failed; 0/{reps} ran)");
+            println!(
+                "  SKIP {slug:<24} backend unavailable (availability node failed; 0/{reps} ran)"
+            );
             continue;
         }
         let pct = 100 * r.passed / r.planned.max(1);
@@ -359,7 +387,10 @@ pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usiz
                 r.passed, r.planned
             );
         } else {
-            println!("  ⚠️  {slug:<24} {}/{} ({pct}%) FLAKY/FAILING", r.passed, r.planned);
+            println!(
+                "  ⚠️  {slug:<24} {}/{} ({pct}%) FLAKY/FAILING",
+                r.passed, r.planned
+            );
             blocking += 1;
         }
     }
@@ -465,8 +496,14 @@ pub fn self_test(root: &Path) -> Result<String, String> {
     for (description, body) in [
         ("no rows array", r#"{"rows": {}}"#),
         ("empty rows", r#"{"rows": []}"#),
-        ("row without argv", r#"{"rows":[{"job":"j","label":"l","timeout":0}]}"#),
-        ("non-string argv", r#"{"rows":[{"job":"j","label":"l","argv":[7]}]}"#),
+        (
+            "row without argv",
+            r#"{"rows":[{"job":"j","label":"l","timeout":0}]}"#,
+        ),
+        (
+            "non-string argv",
+            r#"{"rows":[{"job":"j","label":"l","argv":[7]}]}"#,
+        ),
     ] {
         std::fs::write(&bad_file, body)
             .map_err(|error| format!("cannot write super negative fixture: {error}"))?;
@@ -506,7 +543,9 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         .ok_or_else(|| "super stress verdict: KVM control is absent".to_string())?;
     kvm.passed -= 1;
     if stress_verdict(&kvm_miss, reps, 1, 1) != 0 {
-        return Err("super stress verdict: the first KVM measurement must remain nonblocking".into());
+        return Err(
+            "super stress verdict: the first KVM measurement must remain nonblocking".into(),
+        );
     }
 
     Ok(format!(

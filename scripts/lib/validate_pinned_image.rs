@@ -183,7 +183,8 @@ mod tests {
             let here = dir.path().join("ci/hermetic");
             std::fs::create_dir_all(&here).unwrap();
             for name in ["run-in-pinned-root.sh", "image.digest"] {
-                crate::exec_safe_fs::copy(root().join("ci/hermetic").join(name), here.join(name)).unwrap();
+                crate::exec_safe_fs::copy(root().join("ci/hermetic").join(name), here.join(name))
+                    .unwrap();
             }
             let bin = dir.path().join("bin");
             std::fs::create_dir(&bin).unwrap();

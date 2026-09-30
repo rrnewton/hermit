@@ -203,7 +203,11 @@ fn outer_scope_limit_readback_matches(scope: &Path, expected_memory_max: i64) ->
     eprintln!(
         "[safe-ci]{} outer cgroup audit at {}: memory.max={} ({}), memory.swap.max={} ({}), \
          memory.oom.group={} ({})",
-        if EXPECTED_REFUSAL.load(Ordering::Relaxed) { " expected-refusal:" } else { "" },
+        if EXPECTED_REFUSAL.load(Ordering::Relaxed) {
+            " expected-refusal:"
+        } else {
+            ""
+        },
         scope.display(),
         memory_max.as_deref().unwrap_or("UNREADABLE"),
         if memory_ok { "bound" } else { "MISMATCH" },
@@ -294,7 +298,11 @@ fn parse_cpu_list(text: &str) -> Option<BTreeSet<u32>> {
 }
 
 /// Why an observed CPU list does not honour the requested allowed set.
-fn cpu_list_within(name: &str, observed: Option<&str>, requested: &BTreeSet<u32>) -> Result<(), String> {
+fn cpu_list_within(
+    name: &str,
+    observed: Option<&str>,
+    requested: &BTreeSet<u32>,
+) -> Result<(), String> {
     let Some(text) = observed else {
         return Err(format!("{name} is unreadable"));
     };
@@ -341,7 +349,11 @@ fn format_cpu_list(cpus: &BTreeSet<u32>) -> String {
         while iter.peek() == Some(&(high + 1)) {
             high = iter.next().unwrap_or(high);
         }
-        parts.push(if low == high { low.to_string() } else { format!("{low}-{high}") });
+        parts.push(if low == high {
+            low.to_string()
+        } else {
+            format!("{low}-{high}")
+        });
     }
     parts.join(",")
 }
@@ -353,24 +365,38 @@ fn format_cpu_list(cpus: &BTreeSet<u32>) -> String {
 /// instead of passing without testing it.
 #[allow(dead_code)] // Only validate.rs's nested scope self-test uses it.
 pub fn self_test_placement_request() -> Result<(String, String), String> {
-    let current = process_cpus_allowed_list().ok_or("this process's Cpus_allowed_list is unreadable")?;
-    let mut cpus =
-        parse_cpu_list(&current).ok_or_else(|| format!("Cpus_allowed_list={current:?} does not parse"))?;
+    let current =
+        process_cpus_allowed_list().ok_or("this process's Cpus_allowed_list is unreadable")?;
+    let mut cpus = parse_cpu_list(&current)
+        .ok_or_else(|| format!("Cpus_allowed_list={current:?} does not parse"))?;
     let Some(excluded) = cpus.pop_first() else {
         return Err("this process has no CPUs".into());
     };
     if cpus.is_empty() {
-        return Err(format!("this process may use only CPU {excluded}; nothing would remain"));
+        return Err(format!(
+            "this process may use only CPU {excluded}; nothing would remain"
+        ));
     }
     let allowed = format_cpu_list(&cpus);
     let output = Command::new("timeout")
-        .args(["20", "systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect"])
+        .args([
+            "20",
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+        ])
         .arg(format!("--property=AllowedCPUs={allowed}"))
         .args(["--", "grep", "Cpus_allowed_list", "/proc/self/status"])
         .output()
         .map_err(|error| format!("systemd-run could not be run: {error}"))?;
     let observed = String::from_utf8_lossy(&output.stdout);
-    let observed = observed.trim().strip_prefix("Cpus_allowed_list:").map(str::trim);
+    let observed = observed
+        .trim()
+        .strip_prefix("Cpus_allowed_list:")
+        .map(str::trim);
     if !output.status.success() {
         return Err(format!(
             "a probe unit with AllowedCPUs={allowed} exited {}: {}",
@@ -378,8 +404,9 @@ pub fn self_test_placement_request() -> Result<(String, String), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    cpu_list_within("the probe unit's Cpus_allowed_list", observed, &cpus)
-        .map_err(|reason| format!("the user manager does not enforce AllowedCPUs= here: {reason}"))?;
+    cpu_list_within("the probe unit's Cpus_allowed_list", observed, &cpus).map_err(|reason| {
+        format!("the user manager does not enforce AllowedCPUs= here: {reason}")
+    })?;
     Ok((allowed, excluded.to_string()))
 }
 
@@ -434,7 +461,10 @@ pub fn cpu_placement_summary_line(observation: Option<&CpuPlacementObservation>)
          informational, not part of the verdict",
         observation.status,
         observation.source.as_deref().unwrap_or("not set"),
-        observation.cpus_allowed_list.as_deref().unwrap_or("UNREADABLE"),
+        observation
+            .cpus_allowed_list
+            .as_deref()
+            .unwrap_or("UNREADABLE"),
         observation.detail,
     )
 }
@@ -448,7 +478,9 @@ pub fn cpu_placement_observation() -> Option<&'static CpuPlacementObservation> {
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Apply (scope owner) or observe (inherited) the launcher's CPU placement.
@@ -463,8 +495,11 @@ fn establish_cpu_placement(
     let requested_text = std::env::var(CPU_PLACEMENT_ALLOWED_ENV).ok();
     let scope = proof.and_then(promised_scope_ancestor);
     let scope_unit = proof.and_then(|proof| proof.unit.clone());
-    let read_scope_effective =
-        || scope.as_deref().and_then(|scope| read_trim(scope, "cpuset.cpus.effective"));
+    let read_scope_effective = || {
+        scope
+            .as_deref()
+            .and_then(|scope| read_trim(scope, "cpuset.cpus.effective"))
+    };
     let observation = |status, detail: String| CpuPlacementObservation {
         status,
         source: source.clone(),
@@ -478,7 +513,9 @@ fn establish_cpu_placement(
     let Some(requested_text) = requested_text.as_deref() else {
         return observation(
             "not-requested",
-            format!("{CPU_PLACEMENT_ALLOWED_ENV} is not set; this run was not launched with a CPU placement"),
+            format!(
+                "{CPU_PLACEMENT_ALLOWED_ENV} is not set; this run was not launched with a CPU placement"
+            ),
         );
     };
     let Some(requested) = parse_cpu_list(requested_text) else {
@@ -486,7 +523,10 @@ fn establish_cpu_placement(
             "not-applied",
             format!("{CPU_PLACEMENT_ALLOWED_ENV}={requested_text:?} does not parse as a CPU list"),
         );
-        eprintln!("{label}: WARNING: CPU placement NOT APPLIED: {}.", result.detail);
+        eprintln!(
+            "{label}: WARNING: CPU placement NOT APPLIED: {}.",
+            result.detail
+        );
         return result;
     };
     if requested.is_empty() {
@@ -518,7 +558,10 @@ fn establish_cpu_placement(
             "not-applied",
             "no promised scope unit to apply AllowedCPUs to".into(),
         );
-        eprintln!("{label}: WARNING: CPU placement NOT APPLIED: {}.", result.detail);
+        eprintln!(
+            "{label}: WARNING: CPU placement NOT APPLIED: {}.",
+            result.detail
+        );
         return result;
     };
     let property = format!("AllowedCPUs={}", requested_text.trim());
@@ -549,7 +592,9 @@ fn establish_cpu_placement(
                 Ok(()) => {
                     break observation(
                         "applied",
-                        format!("{property} set on {unit}; https://github.com/rrnewton/hermit/issues/3265"),
+                        format!(
+                            "{property} set on {unit}; https://github.com/rrnewton/hermit/issues/3265"
+                        ),
                     );
                 }
                 Err(reason) if Instant::now() >= deadline => {
@@ -568,7 +613,10 @@ fn establish_cpu_placement(
              scope cpuset.cpus.effective={}, Cpus_allowed_list={}.",
             result.source.as_deref().unwrap_or("unknown"),
             result.excluded_cpus.as_deref().unwrap_or("unknown"),
-            result.scope_cpuset_effective.as_deref().unwrap_or("UNREADABLE"),
+            result
+                .scope_cpuset_effective
+                .as_deref()
+                .unwrap_or("UNREADABLE"),
             result.cpus_allowed_list.as_deref().unwrap_or("UNREADABLE"),
         );
     } else {
@@ -887,7 +935,10 @@ fn cpu_placement_self_test() -> Result<(), String> {
         ("0 1", None),
     ] {
         if parse_cpu_list(text) != expected {
-            return Err(format!("CPU list {text:?} parsed as {:?}, expected {expected:?}", parse_cpu_list(text)));
+            return Err(format!(
+                "CPU list {text:?} parsed as {:?}, expected {expected:?}",
+                parse_cpu_list(text)
+            ));
         }
     }
     for (cpus, expected) in [
@@ -898,7 +949,9 @@ fn cpu_placement_self_test() -> Result<(), String> {
     ] {
         let text = format_cpu_list(&cpus);
         if text != expected || parse_cpu_list(&text) != Some(cpus.clone()) {
-            return Err(format!("CPU set {cpus:?} formatted as {text:?}, expected {expected:?}"));
+            return Err(format!(
+                "CPU set {cpus:?} formatted as {text:?}, expected {expected:?}"
+            ));
         }
     }
     let placed = |status, excluded: Option<&str>| CpuPlacementObservation {
@@ -940,7 +993,9 @@ fn cpu_placement_self_test() -> Result<(), String> {
     ] {
         let line = cpu_placement_summary_line(observation.as_ref());
         if line != expected {
-            return Err(format!("placement summary line {line:?}, expected {expected:?}"));
+            return Err(format!(
+                "placement summary line {line:?}, expected {expected:?}"
+            ));
         }
     }
     let requested = set(&[1, 2, 3, 5]);
@@ -948,11 +1003,21 @@ fn cpu_placement_self_test() -> Result<(), String> {
         return Err(format!("an exact placement was refused: {reason}"));
     }
     if let Err(reason) = cpu_placement_verdict(&requested, Some("1-3,5"), Some("2")) {
-        return Err(format!("a narrower affinity inside the allowed set was refused: {reason}"));
+        return Err(format!(
+            "a narrower affinity inside the allowed set was refused: {reason}"
+        ));
     }
     for (effective, affinity, why) in [
-        (Some("0-5"), Some("1-3,5"), "a scope cpuset still containing CPU 0"),
-        (Some("1-3,5"), Some("0-5"), "an affinity still containing CPU 0"),
+        (
+            Some("0-5"),
+            Some("1-3,5"),
+            "a scope cpuset still containing CPU 0",
+        ),
+        (
+            Some("1-3,5"),
+            Some("0-5"),
+            "an affinity still containing CPU 0",
+        ),
         (None, Some("1-3,5"), "an unreadable scope cpuset"),
         (Some("1-3,5"), None, "an unreadable affinity"),
         (Some(""), Some("1-3,5"), "an empty scope cpuset"),

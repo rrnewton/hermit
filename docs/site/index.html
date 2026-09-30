@@ -46,8 +46,8 @@
     <section class="score-strip" aria-label="Current compatibility highlights">
       <div><strong>191/191</strong><span>ptrace strict L2 corpus</span></div>
       <div><strong>70/89</strong><span>DBT-native Reverie tests</span></div>
-      <div><strong>22/23</strong><span>DBT at ptrace parity</span></div>
-      <div><strong>22/23</strong><span>KVM at ptrace parity</span></div>
+      <div><strong>3</strong><span>backends compared with ptrace (KVM, SaBRe, LiteInst); DBT not compared: inputs cannot be equalized</span></div>
+      <div><strong>0&ndash;1</strong><span>parity credit, from the first divergence</span></div>
     </section>
 
     <section id="tools" class="section tools">
@@ -120,7 +120,7 @@
             <tr>
               <th scope="col">Backend</th>
               <th scope="col">Backend-local / compatibility</th>
-              <th scope="col">Ptrace-parity contracts</th>
+              <th scope="col">Ptrace parity</th>
               <th scope="col">Proven maturity</th>
             </tr>
           </thead>
@@ -128,37 +128,37 @@
             <tr>
               <th scope="row">ptrace <span class="tag reference">reference</span></th>
               <td><strong>191/191</strong> strict L2; <strong>139</strong> record/replay</td>
-              <td><strong>23/23</strong> contracts</td>
+              <td>reference</td>
               <td><strong>B2.1</strong></td>
             </tr>
             <tr>
               <th scope="row">DBT</th>
               <td><strong>70/89</strong> Reverie-native tests</td>
-              <td><strong>22/23</strong> contracts</td>
+              <td>not compared: dbt refuses --bind/--mount, so inputs cannot be equalized</td>
               <td><strong>B2</strong></td>
             </tr>
             <tr>
               <th scope="row">KVM</th>
               <td><span class="todo">TODO: publish native-suite denominator</span></td>
-              <td><strong>22/23</strong> contracts</td>
+              <td><span class="todo">no parity rows published yet</span></td>
               <td><strong>B2</strong></td>
             </tr>
             <tr>
               <th scope="row">SaBRe</th>
               <td><strong>198/198</strong> compatibility rows</td>
-              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
+              <td><span class="todo">no parity rows published yet</span></td>
               <td><strong>B2</strong></td>
             </tr>
             <tr>
               <th scope="row">LiteInst</th>
               <td><span class="todo">TODO: publish native-suite denominator</span></td>
-              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
+              <td><span class="todo">no parity rows published yet</span></td>
               <td><span class="todo">TODO: not assigned in current snapshot</span></td>
             </tr>
             <tr>
               <th scope="row">e9patch</th>
               <td><strong>155</strong> classified rows; <span class="todo">pass count TODO</span></td>
-              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
+              <td><span class="todo">not in the parity matrix</span></td>
               <td><span class="todo">TODO: not assigned in current snapshot</span></td>
             </tr>
           </tbody>
@@ -173,7 +173,8 @@
       <div class="evidence-links">
         <span>Sources:</span>
         <a href="https://github.com/rrnewton/hermit/blob/main/scripts/validate.rs">compatibility ratchets</a>
-        <a href="https://github.com/rrnewton/hermit/tree/main/tests/backend-parity">parity matrix</a>
+        <a href="https://github.com/rrnewton/hermit/tree/main/tests/backend-parity">backend maturity contracts</a>
+        <a href="https://github.com/rrnewton/hermit/issues/3301">parity measured after determinism</a>
         <a href="https://github.com/rrnewton/hermit/issues/1087">maturity definitions and evidence snapshot</a>
       </div>
 
