@@ -467,7 +467,7 @@ jobs:
     runs-on: ubuntu-latest
     # The selected debug DAG's critical path is setup.nextest (600s) then
     # build.workspace (1200s): 1800s of node timeouts. The 35-minute job
-    # covers that path plus exactly the 300s of setup and artifact overhead
+    # covers that path plus at least the 300s of setup and artifact overhead
     # that test-harness requires; it audits this bound against the selected
     # DAG nodes, so raising a node timeout on the path fails that audit.
     timeout-minutes: 35
