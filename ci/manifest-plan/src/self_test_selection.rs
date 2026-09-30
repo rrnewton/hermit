@@ -885,6 +885,39 @@ mod tests {
             let scanned = scanned(&root.join(path));
             let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
             let stem = path.strip_suffix(".rs").unwrap_or(path);
+            // Its file is `x.rs` or `x/mod.rs` beside a crate root or
+            // `mod.rs`, and under `<stem>/` otherwise, below the directories
+            // of the inline modules around it.
+            let candidates = |within: &str, name: &str| -> Vec<String> {
+                [dir, stem]
+                    .iter()
+                    .flat_map(|base| {
+                        [
+                            format!("{base}/{within}/{name}.rs"),
+                            format!("{base}/{within}/{name}/mod.rs"),
+                        ]
+                    })
+                    .map(|candidate| normalize(&candidate))
+                    .filter(|candidate| tracked.contains(candidate))
+                    .collect()
+            };
+            // A file some reference requires to be an input is checked by
+            // that reference, whichever order the source names it in: a
+            // file seen first through an include or a test-only module
+            // would otherwise pass as a non-input.
+            let strict: BTreeSet<String> = scanned
+                .references
+                .iter()
+                .flat_map(|reference| match reference {
+                    Reference::Module(target) => vec![normalize(&format!("{dir}/{target}"))],
+                    Reference::Plain {
+                        name,
+                        within,
+                        test_only: false,
+                    } => candidates(within, name),
+                    _ => Vec::new(),
+                })
+                .collect();
             let mut seen = BTreeSet::new();
             for reference in &scanned.references {
                 let (target, module) = match reference {
@@ -901,43 +934,34 @@ mod tests {
                         within,
                         test_only,
                     } => {
-                        // Its file is `x.rs` or `x/mod.rs` beside a crate
-                        // root or `mod.rs`, and under `<stem>/` otherwise,
-                        // below the directories of the inline modules
-                        // around it. A tracked candidate must be an input,
-                        // or, for a test-only module (a `#[cfg(test)] mod
-                        // tests;`), an input or a non-input; with none
-                        // tracked, a `#[path]` names the file or nothing
-                        // builds.
-                        for base in [dir, stem] {
-                            for candidate in [
-                                format!("{base}/{within}/{name}.rs"),
-                                format!("{base}/{within}/{name}/mod.rs"),
-                            ] {
-                                let candidate = normalize(&candidate);
-                                if !tracked.contains(&candidate) || !seen.insert(candidate.clone())
-                                {
-                                    continue;
-                                }
-                                if !test_only && !is_input(&candidate) {
-                                    reference_violations.push(format!(
-                                        "{path} declares mod {name}, whose file {candidate} \
-                                         no input covers"
-                                    ));
-                                } else if !is_input(&candidate) && !is_non_input(&candidate) {
-                                    reference_violations.push(format!(
-                                        "{path} declares mod {name}, whose file {candidate} \
-                                         is neither an input nor a non-input"
-                                    ));
-                                }
-                                included.insert(candidate);
+                        // A tracked candidate must be an input, or, for a
+                        // test-only module (a `#[cfg(test)] mod tests;`),
+                        // an input or a non-input; with none tracked, a
+                        // `#[path]` names the file or nothing builds.
+                        for candidate in candidates(within, name) {
+                            if (*test_only && strict.contains(&candidate))
+                                || !seen.insert(candidate.clone())
+                            {
+                                continue;
                             }
+                            if !test_only && !is_input(&candidate) {
+                                reference_violations.push(format!(
+                                    "{path} declares mod {name}, whose file {candidate} \
+                                     no input covers"
+                                ));
+                            } else if !is_input(&candidate) && !is_non_input(&candidate) {
+                                reference_violations.push(format!(
+                                    "{path} declares mod {name}, whose file {candidate} \
+                                     is neither an input nor a non-input"
+                                ));
+                            }
+                            included.insert(candidate);
                         }
                         continue;
                     }
                 };
                 let target = normalize(&format!("{dir}/{target}"));
-                if !seen.insert(target.clone()) {
+                if (!module && strict.contains(&target)) || !seen.insert(target.clone()) {
                     continue;
                 }
                 if !tracked.contains(&target) {
@@ -1162,13 +1186,17 @@ mod tests {
                 "//! ```cargo\n//! [dependencies]\n//! dep = { path = \"../dep\" }\n//! ```\n\
                  mod inner { mod x; }\n\
                  #[cfg(test)]\nmod tests;\n\
+                 const _H: &str = include_str!(\"helper.rs\");\n\
                  mod helper;\n\
+                 #[cfg(test)]\nmod twice;\n\
+                 #[path = \"twice.rs\"]\nmod again;\n\
                  use std::include_str as grab;\n",
             ),
             ("s/inner/x.rs", ""),
             ("s/x.rs", ""),
             ("s/tests.rs", ""),
             ("s/helper.rs", ""),
+            ("s/twice.rs", ""),
             ("dep/Cargo.toml", ""),
         ];
         for (path, contents) in files {
@@ -1177,13 +1205,20 @@ mod tests {
             std::fs::write(path, contents).unwrap();
         }
         let tracked: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
-        let non_inputs = [("s/tests.rs", "test-only"), ("s/helper.rs", "planted")];
+        // An earlier include of helper.rs and an earlier test-only module
+        // of twice.rs must not let their strict references pass.
+        let non_inputs = [
+            ("s/tests.rs", "test-only"),
+            ("s/helper.rs", "planted"),
+            ("s/twice.rs", "planted"),
+        ];
         assert_eq!(
             scorecard_input_violations(&scratch.0, &tracked, &["s/main.rs"], &["r/"], &non_inputs),
             [
                 "s/main.rs declares mod x, whose file s/inner/x.rs no input covers",
                 "s/main.rs declares mod helper, whose file s/helper.rs no input covers",
-                "s/main.rs:9: unresolved: include_str renamed; the scan cannot classify its file",
+                "s/main.rs includes s/twice.rs, which no input covers",
+                "s/main.rs:14: unresolved: include_str renamed; the scan cannot classify its file",
                 "s/main.rs gives Cargo the path dep, which no input or input root covers",
             ]
         );
@@ -1191,11 +1226,17 @@ mod tests {
             scorecard_input_violations(
                 &scratch.0,
                 &tracked,
-                &["s/main.rs", "s/inner/x.rs", "s/helper.rs", "dep/"],
+                &[
+                    "s/main.rs",
+                    "s/inner/x.rs",
+                    "s/helper.rs",
+                    "s/twice.rs",
+                    "dep/"
+                ],
                 &["r/"],
                 &non_inputs[..1],
             ),
-            ["s/main.rs:9: unresolved: include_str renamed; the scan cannot classify its file"]
+            ["s/main.rs:14: unresolved: include_str renamed; the scan cannot classify its file"]
         );
     }
 
