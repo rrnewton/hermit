@@ -8,9 +8,10 @@
 # corpus in the existing public ledger (SELF_TEST_CORPUS). The test refuses
 # missing data and never fetches, so every hosted job that runs the self-test
 # must prepare these objects first and export DEV_HERMIT_TEST_LEDGER_ROOT.
-# Hosted, `selftest.scorecard_commands` and `check.lint_checks` (via
-# scripts/run-script-tests.sh) both read it in the checks job; the regression
-# tier in `selftest.scorecard` reads no ledger. Run 36485831200
+# Hosted, `selftest.scorecard_commands` and `selftest.scorecard_tests` (the
+# scorecard's rust-script unit tests, which `check.lint_checks` ran through
+# scripts/run-script-tests.sh until 2026-09-29) both read it in the checks
+# job; the regression tier in `selftest.scorecard` reads no ledger. Run 36485831200
 # prepared the corpus only in the preflight job, whose gate.manifest ran the
 # self-test until 2026-09-29, so the checks job failed the corpus test there.
 #

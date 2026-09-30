@@ -92,11 +92,16 @@ pub struct ToolSelfTest {
     /// program runs that binary instead of building one with Cargo inside the
     /// node's CPU cap. Only the scorecard reads it.
     pub manifest_plan_helper: bool,
+    /// `true` also runs the self-test in the quick and super lanes, as
+    /// `quick-super-selftest.<name>` (`materialize_quick_super_budgets`).
+    /// `false` keeps it to the full, portable and hosted-portable lanes.
+    pub quick_super: bool,
 }
 
-/// The paths whose change selects the scorecard's commands tier; see
-/// `scorecard_commands` in [`TOOL_SELF_TESTS`]. Every entry must name a tracked
-/// path (`self_test_selection`'s tests check it).
+/// The paths whose change selects the scorecard's commands tier and its
+/// unit tests; see `scorecard_commands` and `scorecard_tests` in
+/// [`TOOL_SELF_TESTS`]. Every entry must name a tracked path
+/// (`self_test_selection`'s tests check it).
 pub const SCORECARD_INPUTS: &[&str] = &[
     "ci/compat-envelope/",
     "ci/manifest-plan/",
@@ -111,7 +116,22 @@ pub const SCORECARD_INPUTS: &[&str] = &[
     "ci/prepare-rust-scripts.sh",
     "ci/prepare-scorecard-self-test-corpus.sh",
     "ci/expected-e2e-plan.json",
+    "ci/ci-reason-baseline.json",
+    "ci/matrix-symmetry-baseline.json",
     "tests/e2e/manifests/",
+];
+
+/// `selftest.scorecard_tests` runs the scorecard's unit tests exactly as
+/// scripts/run-script-tests.sh runs every other rust-script's: through the
+/// retained-log launcher, with the `rust-script` that the node's PATH resolves
+/// (the prepared shim under ci/rust-script-bin in the validation DAG).
+const SCORECARD_TESTS_PROGRAM: &str = "ci/rust-script-bin/run-test-harness";
+const SCORECARD_TESTS_ARGS: &[&str] = &[
+    "ci/compat-envelope/scorecard.rs",
+    "--",
+    "rust-script",
+    "--test",
+    "ci/compat-envelope/scorecard.rs",
 ];
 
 /// The tool self-tests the validation DAG runs as `selftest.<name>` leaf nodes.
@@ -126,6 +146,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test-and-check"],
         run_when_changed: None,
         manifest_plan_helper: true,
+        quick_super: true,
     },
     // The scorecard's commands tier runs its commands against a scratch
     // clone, ledger and reverie repository, and costs minutes; the regression
@@ -145,6 +166,23 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test-commands"],
         run_when_changed: Some(SCORECARD_INPUTS),
         manifest_plan_helper: false,
+        quick_super: true,
+    },
+    // The scorecard's own `#[cfg(test)]` unit tests, which
+    // scripts/run-script-tests.sh (check.lint_checks) ran until 2026-09-29 and
+    // now excludes while this entry's node exists in every lane that node
+    // runs in. They took 211.96 s of that node's wall, most of it building
+    // scratch ledger and source repositories
+    // (https://github.com/rrnewton/hermit/issues/3381), and read the same
+    // inputs as the commands tier, so they share its triggers. Like
+    // check.lint_checks, they stay out of the quick and super lanes.
+    ToolSelfTest {
+        name: "scorecard_tests",
+        program: SCORECARD_TESTS_PROGRAM,
+        args: SCORECARD_TESTS_ARGS,
+        run_when_changed: Some(SCORECARD_INPUTS),
+        manifest_plan_helper: false,
+        quick_super: false,
     },
     ToolSelfTest {
         name: "pressure_test",
@@ -152,6 +190,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
+        quick_super: true,
     },
     // The removed shell front door accumulated plan/scheduler/receipt guards
     // that now belong to the Rust validate driver. Exercise those brackets
@@ -162,6 +201,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["--self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
+        quick_super: true,
     },
     ToolSelfTest {
         name: "manifest_cli",
@@ -169,6 +209,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &["self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
+        quick_super: true,
     },
     // The DBT budget wrapper gates roughly twenty portable nodes and fails
     // CLOSED on a pin it is not calibrated for. Nothing else notices: a
@@ -180,6 +221,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         args: &[],
         run_when_changed: None,
         manifest_plan_helper: false,
+        quick_super: true,
     },
 ];
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
@@ -357,17 +399,20 @@ struct Profile {
 // gate.manifest: 272/273, 259/260, 15/16, 145/146 and 250/250 before. The
 // same five profiles then gained selftest.scorecard_commands (its quick/super
 // variant for quick and super): 277/278, 264/265, 20/21, 150/151 and 255/255
-// before.
+// before. Full, portable and hosted-portable then gained
+// selftest.scorecard_tests, the scorecard's unit tests moved out of
+// check.lint_checks: 278/279, 265/266 and 256/256 before. It has no quick/super
+// variant (`ToolSelfTest.quick_super`), so quick and super are unchanged.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 278,
-        selected_steps: 279,
+        direct_steps: 279,
+        selected_steps: 280,
     },
     Profile {
         label: "portable",
-        direct_steps: 265,
-        selected_steps: 266,
+        direct_steps: 266,
+        selected_steps: 267,
     },
     Profile {
         label: "quick",
@@ -386,8 +431,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 256,
-        selected_steps: 256,
+        direct_steps: 257,
+        selected_steps: 257,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1068,9 +1113,11 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
 // These six shared ancestors need separate immutable IDs because quick/super
 // use the measured 1200-second Rust-script CPU budget, while the other profiles
 // keep the established 7200-second cold-build budget. This is generation, not
-// a runtime rewrite of the selected graph. Each `selftest.<name>` node also
-// gets a variant (`is_quick_super_variant`): it depends on gate.manifest, so
-// without one a quick/super selection would pull the ordinary producers too.
+// a runtime rewrite of the selected graph. Each `selftest.<name>` node whose
+// tool sets `quick_super` also gets a variant (`is_quick_super_variant`): it
+// depends on gate.manifest, so without one a quick/super selection would pull
+// the ordinary producers too. A tool without `quick_super` has no quick or
+// super label and so no variant.
 const QUICK_SUPER_VARIANTS: &[&str] = &[
     "build.rust_scripts",
     "build.rust_scripts_in_pinned_root",
@@ -1088,7 +1135,11 @@ fn is_quick_super_variant(tag: &str) -> bool {
     QUICK_SUPER_VARIANTS.contains(&tag)
         || tag
             .strip_prefix(TOOL_SELF_TEST_GROUP_PREFIX)
-            .is_some_and(|name| TOOL_SELF_TESTS.iter().any(|tool| tool.name == name))
+            .is_some_and(|name| {
+                TOOL_SELF_TESTS
+                    .iter()
+                    .any(|tool| tool.name == name && tool.quick_super)
+            })
 }
 
 fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
@@ -1877,8 +1928,9 @@ fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
 }
 
 /// Every tool self-test runs as one leaf node in each profile that runs the
-/// ordinary or quick/super manifest gate, after that gate, with its exact
-/// command. Nothing may depend on these nodes: they test repository tooling,
+/// ordinary manifest gate, after that gate, with its exact command, and, when
+/// its tool sets `quick_super`, as one more in the quick/super profiles after
+/// the quick/super gate. A tool without `quick_super` has no such node. Nothing may depend on these nodes: they test repository tooling,
 /// and a product node waiting on them would put them back on its critical path.
 fn assert_tool_self_test_nodes(cfg: &DagConfig) -> Result<(), String> {
     let mut expected = BTreeSet::new();
@@ -1887,18 +1939,19 @@ fn assert_tool_self_test_nodes(cfg: &DagConfig) -> Result<(), String> {
             "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest {}",
             tool.name
         );
-        for (tag, labels, gate) in [
-            (
-                format!("{TOOL_SELF_TEST_GROUP_PREFIX}{}", tool.name),
-                &["full", HOSTED_PORTABLE_LABEL, "portable"][..],
-                "gate.manifest",
-            ),
+        let ordinary = (
+            format!("{TOOL_SELF_TEST_GROUP_PREFIX}{}", tool.name),
+            &["full", HOSTED_PORTABLE_LABEL, "portable"][..],
+            "gate.manifest",
+        );
+        let quick_super = tool.quick_super.then(|| {
             (
                 quick_super_variant(&format!("{TOOL_SELF_TEST_GROUP_PREFIX}{}", tool.name)),
                 &["quick", "super"][..],
                 "quick-super-gate.manifest",
-            ),
-        ] {
+            )
+        });
+        for (tag, labels, gate) in std::iter::once(ordinary).chain(quick_super) {
             let step = cfg
                 .steps
                 .iter()
@@ -2028,10 +2081,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // since check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes; +10 for the five selftest.* nodes and their
     // quick/super variants; +2 for selftest.scorecard_commands and its
+    // quick/super variant; +1 for selftest.scorecard_tests, which has no
     // quick/super variant.
-    if cfg.steps.len() != 1620 {
+    if cfg.steps.len() != 1621 {
         return Err(format!(
-            "superset has {} steps, expected 1620",
+            "superset has {} steps, expected 1621",
             cfg.steps.len()
         ));
     }
@@ -3568,12 +3622,13 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 256 since selftest.scorecard_commands split from selftest.scorecard;
-        // 255 since the five selftest.<name> nodes left gate.manifest
+        // 257 since selftest.scorecard_tests took the scorecard's unit tests
+        // out of check.lint_checks; 256 since selftest.scorecard_commands
+        // split from selftest.scorecard; 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 256);
+        assert_eq!(selected.steps.len(), 257);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3730,12 +3785,14 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 255 = the 256 hosted-portable direct steps since the five
-            // selftest.<name> nodes left gate.manifest and
-            // selftest.scorecard_commands split from selftest.scorecard
+            // 256 = the 257 hosted-portable direct steps since the five
+            // selftest.<name> nodes left gate.manifest,
+            // selftest.scorecard_commands split from selftest.scorecard and
+            // selftest.scorecard_tests took the scorecard's unit tests out of
+            // check.lint_checks
             // (https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 255 direct steps"),
+            error.contains("hosted-portable label has 256 direct steps"),
             "{error}"
         );
     }
@@ -4086,6 +4143,103 @@ sys.exit(37)
                 .map(|tool| tool.name)
                 .collect::<Vec<_>>(),
             ["scorecard"]
+        );
+    }
+
+    /// check.lint_checks no longer runs the scorecard's unit tests:
+    /// scripts/run-script-tests.sh skips ci/compat-envelope/scorecard.rs when
+    /// the committed DAG has the node it names, in every lane check.lint_checks
+    /// runs in, running the command it names. That script reads only the DAG,
+    /// so this pins the rest: the node's self-test runs
+    /// `rust-script --test` on the scorecard through the same launcher the
+    /// script uses, on the commands tier's triggers, and the script names this
+    /// node and command.
+    #[test]
+    fn scorecard_tests_node_runs_the_unit_tests_run_script_tests_skips() {
+        let tool = TOOL_SELF_TESTS
+            .iter()
+            .find(|tool| tool.name == "scorecard_tests")
+            .unwrap();
+        assert_eq!(tool.program, "ci/rust-script-bin/run-test-harness");
+        assert_eq!(
+            tool.args,
+            [
+                "ci/compat-envelope/scorecard.rs",
+                "--",
+                "rust-script",
+                "--test",
+                "ci/compat-envelope/scorecard.rs",
+            ]
+        );
+        assert_eq!(tool.run_when_changed, Some(SCORECARD_INPUTS));
+        assert!(!tool.manifest_plan_helper);
+        let script = include_str!("../../../scripts/run-script-tests.sh");
+        for line in [
+            "SCORECARD_SOURCE=ci/compat-envelope/scorecard.rs",
+            "SCORECARD_NODE=selftest.scorecard_tests",
+            "SCORECARD_NODE_COMMAND='target/debug/test-harness selftest scorecard_tests'",
+            "LINT_NODE=check.lint_checks",
+        ] {
+            assert_eq!(
+                script.lines().filter(|text| *text == line).count(),
+                1,
+                "scripts/run-script-tests.sh must define `{line}` once"
+            );
+        }
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let labels = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .labels
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(
+            labels("check.lint_checks").is_subset(&labels("selftest.scorecard_tests")),
+            "selftest.scorecard_tests must run in every lane check.lint_checks runs in"
+        );
+    }
+
+    /// selftest.scorecard_tests runs only where check.lint_checks ran it:
+    /// no quick or super label and no quick-super variant, and the guard
+    /// refuses a planted variant.
+    #[test]
+    fn scorecard_tests_stays_out_of_the_quick_and_super_lanes() {
+        let tool = TOOL_SELF_TESTS
+            .iter()
+            .find(|tool| tool.name == "scorecard_tests")
+            .unwrap();
+        assert!(!tool.quick_super);
+        assert!(!is_quick_super_variant("selftest.scorecard_tests"));
+        assert!(is_quick_super_variant("selftest.scorecard_commands"));
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert!(
+            committed
+                .steps
+                .iter()
+                .all(|step| step.tag() != "quick-super-selftest.scorecard_tests")
+        );
+        let node = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "selftest.scorecard_tests")
+            .unwrap();
+        assert_eq!(node.labels, ["full", HOSTED_PORTABLE_LABEL, "portable"]);
+        let mut planted = committed.clone();
+        let mut variant = node.clone();
+        variant.group = quick_super_variant(TOOL_SELF_TEST_GROUP);
+        variant.labels = vec!["quick".into(), "super".into()];
+        variant.deps = vec!["pre.reverie_pin".into(), "quick-super-gate.manifest".into()];
+        planted.steps.push(variant);
+        let error = assert_tool_self_test_nodes(&planted).unwrap_err();
+        assert!(
+            error.contains("quick-super-selftest.scorecard_tests")
+                && error.contains("differ from TOOL_SELF_TESTS"),
+            "{error}"
         );
     }
 

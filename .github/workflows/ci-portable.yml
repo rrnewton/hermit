@@ -349,7 +349,8 @@ jobs:
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
     # check.lint_checks alone has a committed 2400s bound: its historical
-    # loaded run reached 8m54s, and it now owns every lint-checks script test.
+    # loaded run reached 8m54s, and it owns every lint-checks script test
+    # except the scorecard's unit tests, which selftest.scorecard_tests runs.
     # Run 35354614446 proved the old 10-minute outer job bound contradictory:
     # it canceled the healthy node after 390s of visible progress. Preserve the
     # inner 40-minute hang detector plus ten minutes for setup and artifacts.
@@ -401,9 +402,10 @@ jobs:
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           ./ci/prepare-rust-scripts.sh --check
-      # selftest.scorecard_commands and check.lint_checks (which runs every
-      # rust-script test suite) both read the pinned ledger corpus and never
-      # fetch, so this job prepares it. Run 36485831200 omitted it here: the corpus test failed
+      # selftest.scorecard_commands and selftest.scorecard_tests (the
+      # scorecard's rust-script unit tests, which check.lint_checks no longer
+      # runs) both read the pinned ledger corpus and never fetch, so this job
+      # prepares it. Run 36485831200 omitted it here: the corpus test failed
       # and 14 unrelated scorecard tests failed behind it on the poisoned
       # fixture lock.
       - name: Prepare pinned scorecard self-test corpus

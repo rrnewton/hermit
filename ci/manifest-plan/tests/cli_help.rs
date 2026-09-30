@@ -391,8 +391,8 @@ fn test_harness_refuses_the_removed_parity_reference_flag() {
 /// cannot turn into a vacuous pass.
 #[test]
 fn test_harness_selftest_refuses_anything_but_one_known_name() {
-    const NAMES: &str =
-        "scorecard, scorecard_commands, pressure_test, validate_rs, manifest_cli, dbt_budget";
+    const NAMES: &str = "scorecard, scorecard_commands, scorecard_tests, pressure_test, \
+                         validate_rs, manifest_cli, dbt_budget";
     let harness = env!("CARGO_BIN_EXE_test-harness");
     let directory = non_repository_dir("selftest-refusals");
     for (arguments, refusal) in [

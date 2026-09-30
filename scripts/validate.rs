@@ -25940,6 +25940,10 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany all 189 cases: {stdout}"
                 );
             } else {
+                // 256 until the scorecard's unit tests moved out of
+                // check.lint_checks into the hosted-portable leaf
+                // selftest.scorecard_tests, also assigned to the checks job
+                // (https://github.com/rrnewton/hermit/issues/3381).
                 // 255 until 87534ff72 added the hosted-portable leaf
                 // selftest.scorecard_commands, assigned to the checks job in
                 // ci/portable-shards.json. 252 until backend-parity-c was
@@ -25953,7 +25957,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "256 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "257 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );

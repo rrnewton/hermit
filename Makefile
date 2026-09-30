@@ -190,6 +190,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
+	./scripts/run-script-tests.sh --self-test
 	./scripts/run-script-tests.sh
 	./scripts/bisect-probe.rs --self-test
 	./ci/lint-checks-node.sh --self-test

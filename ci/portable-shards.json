@@ -35,6 +35,7 @@
     "lint.rustfmt",
     "selftest.scorecard",
     "selftest.scorecard_commands",
+    "selftest.scorecard_tests",
     "selftest.pressure_test",
     "selftest.validate_rs",
     "selftest.manifest_cli",
