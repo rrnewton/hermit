@@ -79,7 +79,7 @@ pub struct BisectOpts {
 }
 
 impl BisectOpts {
-    pub fn main(&self, _global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
         if good == bad {
@@ -111,6 +111,9 @@ impl BisectOpts {
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
+            // Replays run on the globally selected backend
+            // (`hermit --backend <BACKEND> bisect ...`).
+            backend: global.backend,
         };
 
         analyzer.bisect_schedule_pair(good, bad)

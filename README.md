@@ -107,8 +107,9 @@ default and skip the rest of this section. See [Architecture](#architecture)
 for how a backend fits into the whole system.
 
 Hermit accepts `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` as a global
-option before the subcommand. Backend scope is command-specific: LiteInst and
-e9patch support only `run`, while SaBRe supports `run` and `strace`; unsupported
+option before the subcommand. Backend scope is command-specific: every backend
+works with `run` and with `analyze` and `bisect`, which launch `run` trials;
+e9patch also supports `record`, and SaBRe also supports `strace`; unsupported
 combinations fail closed. Omitting the option selects `ptrace`, preserving the
 existing behavior:
 

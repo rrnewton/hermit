@@ -3108,6 +3108,13 @@ impl RunOpts {
         self.backend.unwrap_or_default()
     }
 
+    /// Apply the global backend selection for a `RunOpts` built outside
+    /// [`RunOpts::main`], such as `hermit analyze`'s trial options, so that
+    /// validation and reproducers see the backend the run will use.
+    pub(crate) fn set_backend(&mut self, backend: Option<Backend>) {
+        self.backend = backend;
+    }
+
     /// The global `--backend` option that selected this run's backend, rendered
     /// for the position before the subcommand (`hermit{this} run ...`). Empty
     /// when no backend was requested explicitly.

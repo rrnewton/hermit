@@ -465,8 +465,17 @@ enum Subcommand {
 
 impl Subcommand {
     fn validate_backend_scope(&self, backend: Option<hermit::Backend>) -> Result<(), Error> {
+        // `analyze` and `bisect` launch ordinary `run` trials (chaos plus
+        // preemption recording and replay) on the selected backend. Until `run`
+        // lost its own `--backend`, `--backend=X` in their run arguments reached
+        // every backend this way; the global option is now the spelling for it,
+        // so they are in scope wherever `run` is.
+        let runs_guest = matches!(
+            self,
+            Subcommand::Run(_) | Subcommand::Analyze(_) | Subcommand::Bisect(_)
+        );
         if backend == Some(hermit::Backend::Sabre)
-            && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
+            && !(runs_guest || matches!(self, Subcommand::Strace(_)))
         {
             // The predicate admits Strace AND Run, and `run` genuinely works --
             // measured 2026-08-06 on a 4-thread guest: `hermit --backend sabre run`
@@ -475,37 +484,39 @@ impl Subcommand {
             // and hid real backend maturity. Message and predicate are now derived
             // from the same list; if the predicate changes, this text must too.
             anyhow::bail!(
-                "the SaBRe backend is available only through `hermit --backend sabre run` \
-                 and `hermit --backend sabre strace`"
+                "the SaBRe backend is available only through `hermit --backend sabre run`, \
+                 `hermit --backend sabre analyze` and `hermit --backend sabre strace`"
             );
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-696): Review the expanded e9patch CLI scope.
-        let starts_e9patch_guest = matches!(self, Subcommand::Run(_))
-            || matches!(self, Subcommand::Record(record) if record.starts_recording());
+        let starts_e9patch_guest =
+            runs_guest || matches!(self, Subcommand::Record(record) if record.starts_recording());
         if backend == Some(hermit::Backend::E9patch) && !starts_e9patch_guest {
             anyhow::bail!(
                 "the e9patch preprocessor is available only through `hermit --backend e9patch \
-                 run` and `hermit --backend e9patch record`; other subcommands do not \
-                 preprocess their guest"
+                 run`, `hermit --backend e9patch analyze` and `hermit --backend e9patch \
+                 record`; other subcommands do not preprocess their guest"
             );
         }
-        if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
+        if backend == Some(hermit::Backend::Liteinst) && !runs_guest {
             anyhow::bail!(
                 "the LiteInst preload backend is available only through `hermit --backend \
-                 liteinst run`; other subcommands do not use the preload runtime"
+                 liteinst run` and `hermit --backend liteinst analyze`; other subcommands do \
+                 not use the preload runtime"
             );
         }
-        if backend == Some(hermit::Backend::Kvm) && !matches!(self, Subcommand::Run(_)) {
+        if backend == Some(hermit::Backend::Kvm) && !runs_guest {
             anyhow::bail!(
-                "the KVM backend is available only through `hermit --backend kvm run`; record \
-                 and replay require the ptrace runtime's sequentialized scheduler"
+                "the KVM backend is available only through `hermit --backend kvm run` and \
+                 `hermit --backend kvm analyze`; record and replay require the ptrace \
+                 runtime's sequentialized scheduler"
             );
         }
-        if backend == Some(hermit::Backend::Dbt) && !matches!(self, Subcommand::Run(_)) {
+        if backend == Some(hermit::Backend::Dbt) && !runs_guest {
             anyhow::bail!(
-                "the DBT backend is available only through `hermit --backend dbt run`; record \
-                 and replay use the ptrace runtime"
+                "the DBT backend is available only through `hermit --backend dbt run` and \
+                 `hermit --backend dbt analyze`; record and replay use the ptrace runtime"
             );
         }
         Ok(())
@@ -1550,6 +1561,44 @@ mod tests {
             .expect("global-position --backend should parse");
         assert_eq!(args.global.backend, Some(Backend::Kvm));
         assert!(matches!(args.command, Subcommand::Run(_)));
+    }
+
+    /// `analyze` and `bisect` run ordinary `run` trials, and the global option is
+    /// the only way to pick their backend, so every backend `run` accepts is in
+    /// scope for them. A management subcommand stays out of scope.
+    #[test]
+    fn analyze_and_bisect_accept_every_run_backend() {
+        for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+            for argv in [
+                vec!["hermit", "--backend", backend, "analyze", "--", "/bin/true"],
+                vec![
+                    "hermit",
+                    "--backend",
+                    backend,
+                    "bisect",
+                    "--good=g.json",
+                    "--bad=b.json",
+                    "--",
+                    "/bin/true",
+                ],
+            ] {
+                let args = Args::try_parse_from(&argv)
+                    .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+                args.command
+                    .validate_backend_scope(args.global.backend)
+                    .unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
+            }
+            if backend != "ptrace" {
+                let args = Args::try_parse_from(["hermit", "--backend", backend, "record", "list"])
+                    .unwrap();
+                assert!(
+                    args.command
+                        .validate_backend_scope(args.global.backend)
+                        .is_err(),
+                    "--backend {backend} record list must stay out of scope"
+                );
+            }
+        }
     }
 
     fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {
