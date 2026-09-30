@@ -462,7 +462,7 @@ fn hermit_command(
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} run --base-env=minimal --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
             )
         }
         "replay" => format!(
@@ -473,7 +473,7 @@ fn hermit_command(
                 fail("internal error: chaos command construction requires a declared seed")
             });
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} run --base-env=minimal --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
             )
         }
         "custom" => {
@@ -486,7 +486,7 @@ fn hermit_command(
                 .join(" ");
             let sep = if margs.is_empty() { "" } else { " " };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} run{sep}{margs} -- {guest}"
             )
         }
         other => fail(format!("unsupported mode `{other}`")),
@@ -1077,7 +1077,7 @@ modes:
         &[],
         "guest",
     );
-    assert!(custom.contains("run --backend ptrace --base-env=minimal -- guest"));
+    assert!(custom.contains("--backend ptrace run --base-env=minimal -- guest"));
     assert!(!custom.contains("--strict"));
     assert!(!custom.contains("--no-virtualize-cpuid"));
 

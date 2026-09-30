@@ -18,7 +18,7 @@ HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
 ```
 
 The mode runs the 155 semantic installed-program probes in the compatibility
-matrix. Every available probe uses `hermit run --backend e9patch --strict
+matrix. Every available probe uses `hermit --backend e9patch run --strict
 --verify`, so a pass establishes Stripped two-run equality, not L2. Stripped
 verification compares status, stdout, and stderr after removing selected
 numeric, address, path, and time fields. A program that fails or lacks a backend

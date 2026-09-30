@@ -87,8 +87,8 @@ pub(super) fn run() {
         let report_path = directory.join("verification.json");
         let args = [
             "--log=info",
-            "run",
             "--backend=kvm",
+            "run",
             "--base-env=minimal",
             "--tmp=/tmp",
             "--strict",
@@ -154,8 +154,8 @@ pub(super) fn run() {
         let directory = root.join(name);
         let mut args = vec![
             "--log=info",
-            "run",
             "--backend=kvm",
+            "run",
             "--base-env=minimal",
             "--tmp=/tmp",
             "--epoch=2026-01-01T00:00:00.123456789+00:00",

@@ -52,8 +52,8 @@ fn incoming_cpu_is_the_virtual_cpu_under_strict_verify() {
             .args([
                 "--log",
                 "DEBUG",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

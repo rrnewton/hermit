@@ -63,8 +63,8 @@ fn kernel_keyring_is_deterministically_unavailable() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",
@@ -135,8 +135,8 @@ fn kernel_keyring_passes_through_with_compatibility_opt_out() {
         .arg(hermit_test::hermit_binary())
         .args([
             "--log=off",
-            "run",
             "--backend=ptrace",
+            "run",
             "--base-env=minimal",
             "--allow-unsupported-syscalls",
             "--",

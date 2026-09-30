@@ -43,7 +43,7 @@ fn run_guest(backend: &str, binary: &Path, verify: bool) -> Output {
     command
         .args(["--kill-after", "10s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--strict"]);
+        .args(["--backend", backend, "run", "--strict"]);
     if verify {
         command.arg("--verify");
     }
@@ -136,7 +136,7 @@ fn kvm_mountinfo_uses_its_synthetic_namespace_identity() {
         command
             .args(["--kill-after", "10s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["run", "--backend", "kvm", "--strict", "--tmp=/tmp", "--"])
+            .args(["--backend", "kvm", "run", "--strict", "--tmp=/tmp", "--"])
             .arg(&guest);
         let output = command.output().expect("run KVM mountinfo guest");
         assert!(

@@ -97,8 +97,8 @@ fn matrix_configurations() -> Vec<Configuration> {
                     for virtualize_cpuid in [true, false] {
                         for verify in [false, true] {
                             let mut args = vec![
-                                "run",
                                 "--backend=ptrace",
+                                "run",
                                 "--base-env=minimal",
                                 "--max-timeslice=disabled",
                             ];

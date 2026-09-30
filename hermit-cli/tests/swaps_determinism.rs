@@ -54,9 +54,9 @@ fn assert_l2(case: &ProgramCase) {
         .args([
             "--log",
             "DEBUG",
-            "run",
             "--backend",
             "ptrace",
+            "run",
             "--strict",
             "--verify",
             "--verify-logs",

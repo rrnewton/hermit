@@ -247,7 +247,7 @@ fn run_bounded_for_backend_with_limits(
     } else {
         command.arg("--log=info");
     }
-    command.args(["run", "--backend", backend, "--strict"]);
+    command.args(["--backend", backend, "run", "--strict"]);
     if let Some(report) = verify_report {
         let report_parent = report
             .parent()

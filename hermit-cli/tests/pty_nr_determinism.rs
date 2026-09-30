@@ -77,8 +77,8 @@ fn pty_nr_consumers_verify() {
         .arg(hermit_test::hermit_binary())
         .args([
             "--log=off",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
@@ -123,8 +123,8 @@ fn pty_nr_consumers_verify() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

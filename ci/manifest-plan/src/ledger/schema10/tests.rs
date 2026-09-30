@@ -57,9 +57,9 @@ fn attempt(backend: &str, index: &str, report: &VerificationReport) -> ParityAtt
         observation_sha256: None,
         argv: vec![
             "/synthetic/fixture/hermit".into(),
-            "run".into(),
             "--backend".into(),
             backend.into(),
+            "run".into(),
             "--strict".into(),
             "--verify".into(),
             "--verify-strict".into(),

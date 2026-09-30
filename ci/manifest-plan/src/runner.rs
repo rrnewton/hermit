@@ -2943,10 +2943,10 @@ pub fn build_spec(
                 context.hermit_bin.to_string_lossy().into_owned(),
                 "--log".into(),
                 "info".into(),
-                "run".into(),
-                "--base-env=minimal".into(),
                 "--backend".into(),
                 backend.into(),
+                "run".into(),
+                "--base-env=minimal".into(),
                 "--strict".into(),
             ];
             if context.run_verify_strict {
@@ -3039,10 +3039,10 @@ pub fn build_spec(
                 context.hermit_bin.to_string_lossy().into_owned(),
                 "--log".into(),
                 "info".into(),
-                "run".into(),
-                "--base-env=minimal".into(),
                 "--backend".into(),
                 backend.into(),
+                "run".into(),
+                "--base-env=minimal".into(),
                 "--strict".into(),
             ];
             if context.run_verify_strict {
@@ -3074,9 +3074,9 @@ pub fn build_spec(
                 context.hermit_bin.to_string_lossy().into_owned(),
                 "--log".into(),
                 "info".into(),
-                "run".into(),
                 "--backend".into(),
                 backend.into(),
+                "run".into(),
             ];
             argv.extend(cell.test.modes["custom"].args.clone());
             if isolated {

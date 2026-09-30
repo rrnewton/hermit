@@ -134,7 +134,7 @@ fn hermit_run_backend_timeout(
         .args(["--kill-after", "10s", timeout])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .arg(format!("--log={log}"))
-        .args(["run", &format!("--backend={backend}"), "--base-env=minimal"])
+        .args([&format!("--backend={backend}"), "run", "--base-env=minimal"])
         .args(extra)
         .arg("--")
         .arg(guest())

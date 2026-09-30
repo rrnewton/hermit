@@ -35,7 +35,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
     command
         .args(["--kill-after", "10s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "DEBUG", "run", "--backend=ptrace", "--strict"]);
+        .args(["--log", "DEBUG", "--backend=ptrace", "run", "--strict"]);
     if verify {
         command.arg("--verify");
     }
@@ -150,8 +150,9 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         let output = Command::new("timeout")
             .args(["--kill-after", "10s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["--log", "DEBUG", "run"])
+            .args(["--log", "DEBUG"])
             .arg(format!("--backend={backend}"))
+            .arg("run")
             .args(["--strict", "--verify", "--"])
             .arg(&guest)
             .output()

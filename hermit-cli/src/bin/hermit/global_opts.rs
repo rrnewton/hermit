@@ -94,9 +94,8 @@ pub struct GlobalOpts {
     #[clap(skip)]
     pub(crate) run_evidence_write_error: Option<WriteErrorLatch>,
 
-    /// Select the process instrumentation backend. This is the preferred, global
-    /// position (e.g. `hermit --backend ptrace run ...`); for backwards
-    /// compatibility `run` also accepts `--backend` after the subcommand.
+    /// Select the process instrumentation backend. This is a global option and
+    /// must come before the subcommand, e.g. `hermit --backend ptrace run ...`.
     #[clap(long, value_enum, value_name = "BACKEND")]
     pub backend: Option<Backend>,
 }
@@ -201,12 +200,12 @@ impl GlobalOpts {
         self.init_tracing_for_backend(self.backend.unwrap_or_default())
     }
 
-    /// Initialize tracing with the backend selected by the owning subcommand.
+    /// Initialize tracing with the backend that will actually execute the guest.
     ///
-    /// `run --backend ...` remains a supported compatibility spelling, so the
-    /// backend is not necessarily present in the global option. Callers that
-    /// own a subcommand selection must pass it here rather than silently using
-    /// the global default when deciding whether a Linux PID slot is needed.
+    /// This can differ from the global `--backend` selection: e9patch is
+    /// preprocessing that runs on the ptrace runtime. `run` passes its runtime
+    /// backend here rather than the raw global value when deciding whether a
+    /// Linux PID slot is needed.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
     pub fn init_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {

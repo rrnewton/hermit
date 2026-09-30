@@ -59,8 +59,8 @@ fn privileged_observation_is_refused_deterministically() {
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

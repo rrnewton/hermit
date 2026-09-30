@@ -53,7 +53,7 @@ fn selector_guest() -> &'static Path {
 
 fn run_selector_guest(backend: &str, guest_args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args(["run", &format!("--backend={backend}"), "--strict"]);
+    command.args([&format!("--backend={backend}"), "run", "--strict"]);
     if backend == "kvm" {
         command.arg("--max-timeslice=disabled");
     }

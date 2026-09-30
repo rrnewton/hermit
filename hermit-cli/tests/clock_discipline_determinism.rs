@@ -120,8 +120,8 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=trace",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--panic-on-unsupported-syscalls",
                 "--base-env=minimal",
@@ -155,8 +155,8 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=debug",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

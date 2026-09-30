@@ -30,7 +30,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
     command
         .args(["--kill-after", "10s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "DEBUG", "run", "--backend=ptrace", "--strict"]);
+        .args(["--log", "DEBUG", "--backend=ptrace", "run", "--strict"]);
     if verify {
         command.arg("--verify");
     }

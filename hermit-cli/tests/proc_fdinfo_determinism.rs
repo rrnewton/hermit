@@ -44,8 +44,8 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
             .args([
                 "--log",
                 "DEBUG",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--base-env=minimal",

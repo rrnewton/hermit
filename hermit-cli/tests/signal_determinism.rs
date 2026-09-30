@@ -187,10 +187,10 @@ fn run_signal_scenario_on_backend(
 
     for iteration in 0..runs {
         let mut command = Command::new(hermit_test::hermit_binary());
-        command.arg("run");
         if let Some(backend) = backend {
             command.arg(format!("--backend={backend}"));
         }
+        command.arg("run");
         command.args([
             "--base-env=minimal",
             "--no-virtualize-cpuid",

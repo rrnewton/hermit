@@ -291,12 +291,12 @@ fn example_command_with_execution_root(
     if let Some(path) = diagnostic_log {
         command.arg("--log-file").arg(path);
     }
-    command.arg("run");
     if let Some(loader) = backend {
         command
             .env("HERMIT_SABRE_BINARY", loader)
             .args(["--backend", "sabre"]);
     }
+    command.arg("run");
     command.args([
         "--strict",
         "--no-virtualize-cpuid",

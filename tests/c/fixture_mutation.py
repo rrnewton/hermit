@@ -499,9 +499,10 @@ def _hermit_command(
     # --log=info is what makes TIER-3 possible at all: without it hermit emits
     # no INFO log, so "compare the unstripped INFO log" would be comparing two
     # empty strings — a vacuous pass wearing the name of the strictest tier.
-    command = [str(hermit), "--log=info", "run"]
+    command = [str(hermit), "--log=info"]
     if backend != GOLDEN_BACKEND:
         command.extend(["--backend", backend])
+    command.append("run")
     command.extend(
         [
             "--strict",
@@ -541,9 +542,9 @@ def backend_available(hermit: Path, backend: str) -> tuple[bool, str]:
         return True, ""
     command = [
         str(hermit),
-        "run",
         "--backend",
         backend,
+        "run",
         "--base-env=minimal",
         "--",
         "/bin/true",

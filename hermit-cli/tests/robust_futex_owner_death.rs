@@ -205,8 +205,8 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
         .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--tmp=/tmp",
             "--verify",
@@ -256,8 +256,8 @@ fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
         .arg(hermit_test::hermit_binary())
         .args([
             "--log=debug",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--tmp=/tmp",
             "--base-env=minimal",
@@ -337,8 +337,8 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--tmp=/tmp",
                 "--verify",
@@ -369,8 +369,8 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=debug",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--tmp=/tmp",
                 "--base-env=minimal",

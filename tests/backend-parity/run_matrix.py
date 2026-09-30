@@ -759,7 +759,7 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
 
 def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
     if backend == "dbt":
-        smoke_command = [str(hermit), "run", "--backend", "dbt"]
+        smoke_command = [str(hermit), "--backend", "dbt", "run"]
         if strict:
             smoke_command.append("--strict")
         if workdir := hermetic_test_workdir():
@@ -795,9 +795,10 @@ def hermit_command(
     verify: bool = False,
     verify_json: Path | None = None,
 ) -> list[str]:
-    command = [str(hermit), "run"]
+    command = [str(hermit)]
     if backend != "ptrace":
         command.extend(["--backend", backend])
+    command.append("run")
     if strict:
         command.append("--strict")
     if verify:

@@ -178,8 +178,8 @@ fn pinned_root_arguments_are_exact_and_fail_closed() {
     assert_eq!(
         hermit_test::guest_args_for(
             [
-                "run",
                 "--backend=dbt",
+                "run",
                 "--base-env=minimal",
                 "--",
                 "/bin/true",
@@ -188,8 +188,8 @@ fn pinned_root_arguments_are_exact_and_fail_closed() {
         )
         .unwrap(),
         [
-            "run",
             "--backend=dbt",
+            "run",
             "--base-env=minimal",
             "--workdir=/test",
             "--",

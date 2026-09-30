@@ -364,8 +364,8 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
     if has_authoritative_complete_single_run_log_file(backend) {
         cmd.arg("--log-file").arg(&log_file);
     }
-    cmd.arg("run")
-        .arg(format!("--backend={backend}"))
+    cmd.arg(format!("--backend={backend}"))
+        .arg("run")
         .arg("--strict");
     if let Some(epoch) = &cfg.epoch {
         cmd.arg(format!("--epoch={epoch}"));

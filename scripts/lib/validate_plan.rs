@@ -144,16 +144,16 @@ impl CompatMode {
             ],
             CompatMode::Sabre => {
                 vec![
-                    s("run"),
                     s("--backend"),
                     s("sabre"),
+                    s("run"),
                     s("--strict"),
                     s("--verify"),
                     s("--"),
                 ]
             }
             CompatMode::E9patch => {
-                let mut v = vec![s("run"), s("--backend"), s("e9patch")];
+                let mut v = vec![s("--backend"), s("e9patch"), s("run")];
                 // These rows query owner names the host may delegate to an async
                 // identity daemon; pin just them to the files-only NSS fixture
                 // (validate.sh:2981).

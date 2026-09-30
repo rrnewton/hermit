@@ -83,9 +83,9 @@ pub(super) fn run() {
                 fs::create_dir_all(&config).unwrap();
                 let args = [
                     "--log=info",
+                    "--backend=kvm",
                     "run",
                     "--base-env=minimal",
-                    "--backend=kvm",
                     "--strict",
                     "--verify-strict",
                     "--verify",

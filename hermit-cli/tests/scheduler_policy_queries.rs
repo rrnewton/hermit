@@ -49,8 +49,8 @@ fn scheduler_policy_queries_are_deterministic() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=trace",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
@@ -77,8 +77,8 @@ fn scheduler_policy_queries_are_deterministic() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=info",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--verify",
             "--panic-on-unsupported-syscalls",

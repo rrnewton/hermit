@@ -60,8 +60,8 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--verify",
                 "--base-env=minimal",
                 "--",
@@ -88,8 +88,8 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=off",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--allow-unsupported-syscalls",
                 "--base-env=minimal",
                 "--",

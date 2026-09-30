@@ -58,10 +58,11 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
     command
         .args(["--kill-after", "10s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=info", "run"]);
+        .arg("--log=info");
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
     }
+    command.arg("run");
     let output = command
         .args([
             "--strict",
