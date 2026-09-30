@@ -269,25 +269,6 @@ pub struct SeriesPressureAttempt {
     pub signal: Option<i32>,
     pub timed_out: bool,
     pub comparison: Option<SeriesPressureComparison>,
-    /// The exact nonzero guest disposition the cell's manifest declares
-    /// through `modes.verify.expected_guest_exit`, if any. Absent for every
-    /// undeclared cell, which keeps its exact serialized form and the
-    /// success-only matched rule.
-    ///
-    /// This field is a consistency check, not an authority. The authority is
-    /// the manifest (`hermit-manifest-plan --format matrix-json` at the row's
-    /// tree): a row must not be trusted to declare its own exit.
-    /// [`Self::validate_for_mode`]
-    /// only checks that the attempt's disposition agrees with whatever value
-    /// the field holds; it cannot tell a manifest-derived value from one a
-    /// producer invented. The field is not covered by `evidence_sha256` and
-    /// the runner's `CellResult` does not record it. Every producer must
-    /// therefore copy it from the manifest declaration for this exact
-    /// (test, mode, backend), never from the observed guest disposition, and
-    /// every consumer that relies on it for qualification must re-derive it
-    /// from the manifest rather than trust the row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_exit: Option<SeriesExpectedExit>,
 }
 
 /// The one nonzero guest disposition a verify cell declares, without the
@@ -298,8 +279,13 @@ pub struct SeriesPressureAttempt {
 /// declaration replaces the success requirement only by exact equality: a
 /// different code, a different signal, or a success still contradicts a
 /// matched report.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// This value is never serialized into a pressure attempt. A caller passes it
+/// to [`SeriesPressureAttempt::validate_for_mode`]: pressure-test takes it
+/// from the manifest matrix at the run's tree, and a stored row takes it from
+/// its own `series.declared_guest_exit` (see
+/// [`SeriesRow::validate_for_read`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeriesExpectedExit {
     Code(i32),
     Signal(i32),
@@ -382,7 +368,18 @@ impl SeriesPressureAttempt {
     /// Validate one retained invocation without changing its framework outcome.
     /// Callers that have original report bytes must additionally validate their
     /// digest and report semantics before constructing these compact facts.
-    pub fn validate_for_mode(&self, mode: &str) -> Result<(), String> {
+    ///
+    /// `expected_exit` is the cell's declared nonzero guest disposition, or
+    /// None. A matched comparison then qualifies only with exactly that
+    /// disposition; without one it keeps the success-only rule. This function
+    /// cannot tell a manifest declaration from an invented one, so callers
+    /// must derive `expected_exit` from the declaration, never from the
+    /// observed disposition.
+    pub fn validate_for_mode(
+        &self,
+        mode: &str,
+        expected_exit: Option<SeriesExpectedExit>,
+    ) -> Result<(), String> {
         let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
         if !matches!(self.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
             return Err("pressure_evidence has an unsupported inner outcome".into());
@@ -397,7 +394,7 @@ impl SeriesPressureAttempt {
         {
             return Err("pressure_evidence has an invalid process disposition".into());
         }
-        if let Some(expected) = self.expected_exit {
+        if let Some(expected) = expected_exit {
             if mode != "verify" {
                 return Err(
                     "pressure_evidence expected_exit is supported only by verify mode".into(),
@@ -459,7 +456,7 @@ impl SeriesPressureAttempt {
         let valid = match comparison.verdict {
             Verdict::Matched => {
                 completed_pass
-                    && match self.expected_exit {
+                    && match expected_exit {
                         // A declared cell matches only with exactly its
                         // declared disposition; success does not qualify.
                         Some(expected) => expected.is_exactly(self.status, self.signal),
@@ -527,8 +524,7 @@ impl SeriesPressureAttempt {
         if !valid
             && comparison.verdict == Verdict::Matched
             && completed_pass
-            && self
-                .expected_exit
+            && expected_exit
                 .is_some_and(|expected| expected.is_shell_encoded_signal(self.status, self.signal))
         {
             // Deliberately stricter than the runner. The runner's
@@ -671,7 +667,11 @@ impl SeriesRow {
                 self.schema.as_str()
             ));
         }
-        self.validate_common()?;
+        // A new row keeps the success-only matched rule even when it declares
+        // a guest exit. Readers built before `validate_for_read` honoured the
+        // declaration refuse such a row, and one refused row fails a whole
+        // ledger read, so writing it waits until every reader accepts it.
+        self.validate_common(None)?;
         self.validate_host_facts()?;
         self.validate_classification()?;
         self.require_current_no_verdict_evidence()
@@ -682,8 +682,13 @@ impl SeriesRow {
     /// Retained v1/v2 rows remain readable. Every v2/v3 row must carry the
     /// complete host facts that its schema promises, and every v3 row must
     /// carry the exact result classification.
+    ///
+    /// A matched pressure attempt may end with the guest exit the row itself
+    /// records in `series.declared_guest_exit`, and only with exactly that
+    /// exit. The reader trusts that recorded declaration: it cannot re-derive
+    /// it from the manifest at the row's tree.
     pub fn validate_for_read(&self) -> Result<(), String> {
-        self.validate_common()?;
+        self.validate_common(self.declared_pressure_exit())?;
         if matches!(self.schema, SeriesSchema::V2 | SeriesSchema::V3) {
             self.validate_host_facts()?;
         }
@@ -697,8 +702,11 @@ impl SeriesRow {
     ///
     /// Retained v1 rows still parse and can be reported, but they cannot safely
     /// compare runs across the same machine name after a kernel change.
+    ///
+    /// Declared guest exits are honoured exactly as in
+    /// [`Self::validate_for_read`].
     pub fn validate_for_projection(&self) -> Result<(), String> {
-        self.validate_common()?;
+        self.validate_common(self.declared_pressure_exit())?;
         if self.schema == SeriesSchema::V1 {
             return Err(format!(
                 "{} does not record machine_shortname, kernel_version, and host_capabilities",
@@ -717,7 +725,26 @@ impl SeriesRow {
         Ok(())
     }
 
-    fn validate_common(&self) -> Result<(), String> {
+    /// The guest exit a matched pressure attempt may end with, taken from the
+    /// row's own `series.declared_guest_exit`.
+    ///
+    /// A declaration that its own validator refuses grants nothing, so the
+    /// attempt keeps the success-only rule and `validate_declared_guest_exit`
+    /// still refuses the row. Every other binding between the declaration and
+    /// the pressure evidence is checked there too.
+    fn declared_pressure_exit(&self) -> Option<SeriesExpectedExit> {
+        let declared = self.series.declared_guest_exit.as_ref()?;
+        let expected = ExpectedGuestExit {
+            code: declared.code,
+            signal: declared.signal,
+            reason: declared.reason.clone(),
+        };
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        validate_expected_guest_exit("declared_guest_exit", mode, Some(&expected)).ok()?;
+        SeriesExpectedExit::from_declared(&expected).ok()
+    }
+
+    fn validate_common(&self, pressure_exit: Option<SeriesExpectedExit>) -> Result<(), String> {
         for (name, value) in [
             ("event_id", self.event_id.as_str()),
             ("emitted_at", self.emitted_at.as_str()),
@@ -830,7 +857,7 @@ impl SeriesRow {
             self.validate_no_verdict_evidence(evidence)?;
         }
         if let Some(evidence) = &self.series.pressure_evidence {
-            self.validate_pressure_evidence(evidence)?;
+            self.validate_pressure_evidence(evidence, pressure_exit)?;
         }
         if let Some(declared) = &self.series.declared_guest_exit {
             self.validate_declared_guest_exit(declared)?;
@@ -952,7 +979,11 @@ impl SeriesRow {
         Ok(())
     }
 
-    fn validate_pressure_evidence(&self, evidence: &SeriesPressureEvidence) -> Result<(), String> {
+    fn validate_pressure_evidence(
+        &self,
+        evidence: &SeriesPressureEvidence,
+        expected_exit: Option<SeriesExpectedExit>,
+    ) -> Result<(), String> {
         if self.schema != SeriesSchema::V3 || self.producer != SeriesProducer::PressureTest {
             return Err("pressure_evidence requires a pressure-test stress-series/v3 row".into());
         }
@@ -987,7 +1018,7 @@ impl SeriesRow {
             if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
                 return Err("pressure_evidence attempt indices must be nonempty and unique".into());
             }
-            attempt.validate_for_mode(mode)?;
+            attempt.validate_for_mode(mode, expected_exit)?;
         }
         if let Some(other) = &self.series.no_verdict_evidence {
             for disposition in &other.attempts {
@@ -2616,7 +2647,6 @@ mod tests {
                     report_sha256: "c".repeat(64),
                     no_result_kind: None,
                 }),
-                expected_exit: None,
             }],
         });
         value
@@ -2660,47 +2690,71 @@ mod tests {
         custom.validate_for_write().unwrap();
     }
 
-    fn pressure_row_with_exit(
+    const MATCHED_CONTRADICTION: &str =
+        "pressure_evidence matched report contradicts its inner process disposition";
+
+    /// The pressure fixture's one matched inner attempt, ending with `status`
+    /// or `signal`.
+    fn matched_attempt(status: Option<i32>, signal: Option<i32>) -> SeriesPressureAttempt {
+        let mut attempt = pressure_row()
+            .series
+            .pressure_evidence
+            .unwrap()
+            .attempts
+            .remove(0);
+        attempt.status = status;
+        attempt.signal = signal;
+        attempt
+    }
+
+    /// A pressure row whose one matched inner attempt ends with `status` or
+    /// `signal`, recording `declared` as its `series.declared_guest_exit`.
+    /// The declaration's own attempt always shows the declared exit, so only
+    /// the pressure rule can refuse the row.
+    fn declared_pressure_row(
+        declared: Option<SeriesExpectedExit>,
         status: Option<i32>,
         signal: Option<i32>,
-        expected_exit: Option<SeriesExpectedExit>,
     ) -> SeriesRow {
         let mut value = pressure_row();
-        let inner = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
-        inner.status = status;
-        inner.signal = signal;
-        inner.expected_exit = expected_exit;
+        value.series.pressure_evidence.as_mut().unwrap().attempts[0] =
+            matched_attempt(status, signal);
+        if let Some(declared) = declared {
+            let (code, signal) = match declared {
+                SeriesExpectedExit::Code(code) => (Some(code), None),
+                SeriesExpectedExit::Signal(signal) => (None, Some(signal)),
+            };
+            value.series.declared_guest_exit = declared_exit_row(code, signal, code, signal)
+                .series
+                .declared_guest_exit;
+        }
         value
     }
 
-    fn assert_matched_contradiction(value: SeriesRow) {
-        let error = value
-            .validate_for_write()
-            .expect_err("a matched report with the wrong disposition must refuse");
-        assert_eq!(
-            error, "pressure_evidence matched report contradicts its inner process disposition",
-            "{:?}",
-            value.series.pressure_evidence
-        );
+    /// The read and projection verdicts, the two paths that honour the row's
+    /// own declared guest exit.
+    fn read_and_projection(value: &SeriesRow) -> [Result<(), String>; 2] {
+        [value.validate_for_read(), value.validate_for_projection()]
     }
 
     #[test]
-    fn pressure_history_matches_a_declared_expected_exit_only_exactly() {
+    fn a_declared_exit_qualifies_on_read_and_projection_only_exactly() {
         use SeriesExpectedExit::Code;
         use SeriesExpectedExit::Signal;
         // The declared code and the declared signal each qualify.
-        pressure_row_with_exit(Some(3), None, Some(Code(3)))
-            .validate_for_write()
-            .unwrap();
-        pressure_row_with_exit(Some(7), None, Some(Code(7)))
-            .validate_for_write()
-            .unwrap();
-        pressure_row_with_exit(None, Some(11), Some(Signal(11)))
-            .validate_for_write()
-            .unwrap();
+        for (status, signal, declared) in [
+            (Some(3), None, Code(3)),
+            (Some(7), None, Code(7)),
+            (None, Some(11), Signal(11)),
+        ] {
+            let value = declared_pressure_row(Some(declared), status, signal);
+            for verdict in read_and_projection(&value) {
+                verdict.unwrap_or_else(|error| panic!("{declared:?}: {error}"));
+            }
+        }
         // A different code, a success, or the other kind of disposition does
         // not; Hermit exiting with the bare signo is not the declared signal.
-        for (status, signal, expected) in [
+        for (status, signal, declared) in [
             (Some(4), None, Code(3)),
             (Some(0), None, Code(3)),
             (None, Some(3), Code(3)),
@@ -2708,29 +2762,83 @@ mod tests {
             (None, Some(9), Signal(11)),
             (Some(11), None, Signal(11)),
         ] {
-            assert_matched_contradiction(pressure_row_with_exit(status, signal, Some(expected)));
+            let value = declared_pressure_row(Some(declared), status, signal);
+            for verdict in read_and_projection(&value) {
+                assert_eq!(
+                    verdict.unwrap_err(),
+                    MATCHED_CONTRADICTION,
+                    "{status:?}/{signal:?} for {declared:?}"
+                );
+            }
         }
         // Hermit's 128 + signo status for a declared signal is still refused,
         // with its own named message: the runner accepts that form, and the
         // refusal must say that pressure deliberately does not.
-        for (status, expected) in [(139, Signal(11)), (137, Signal(9)), (129, Signal(1))] {
-            let error = pressure_row_with_exit(Some(status), None, Some(expected))
-                .validate_for_write()
-                .expect_err("128 + signo must not satisfy a declared signal");
-            assert_eq!(
-                error, SHELL_ENCODED_SIGNAL_REFUSAL,
-                "{status} for {expected:?}"
-            );
+        for (status, declared) in [(139, Signal(11)), (137, Signal(9)), (129, Signal(1))] {
+            let value = declared_pressure_row(Some(declared), Some(status), None);
+            for verdict in read_and_projection(&value) {
+                assert_eq!(
+                    verdict.unwrap_err(),
+                    SHELL_ENCODED_SIGNAL_REFUSAL,
+                    "{status} for {declared:?}"
+                );
+            }
         }
         // Only the exact 128 + declared signo gets the named refusal; a
         // neighbouring status, or 128 + signo on a declared code, keeps the
         // ordinary contradiction.
-        for (status, expected) in [(138, Signal(11)), (140, Signal(11)), (139, Code(3))] {
-            assert_matched_contradiction(pressure_row_with_exit(
-                Some(status),
-                None,
-                Some(expected),
-            ));
+        for (status, declared) in [(138, Signal(11)), (140, Signal(11)), (139, Code(3))] {
+            let value = declared_pressure_row(Some(declared), Some(status), None);
+            for verdict in read_and_projection(&value) {
+                assert_eq!(
+                    verdict.unwrap_err(),
+                    MATCHED_CONTRADICTION,
+                    "{status} for {declared:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_refuses_a_declared_exit_that_read_accepts() {
+        use SeriesExpectedExit::Code;
+        use SeriesExpectedExit::Signal;
+        // A reader built before read honoured the declaration refuses a
+        // matched attempt with a nonzero exit, and one refused row fails a
+        // whole ledger read. Until every reader accepts such a row, writing
+        // keeps the success-only rule even where read accepts the declaration.
+        for (status, signal, declared) in [(Some(3), None, Code(3)), (None, Some(11), Signal(11))] {
+            let value = declared_pressure_row(Some(declared), status, signal);
+            for verdict in read_and_projection(&value) {
+                verdict.unwrap_or_else(|error| panic!("{declared:?}: {error}"));
+            }
+            assert_eq!(
+                value.validate_for_write().unwrap_err(),
+                MATCHED_CONTRADICTION,
+                "{declared:?}"
+            );
+            // The declaration adds no field to the pressure attempt, so an
+            // older reader decodes the row unchanged.
+            let raw = serde_json::to_value(&value).unwrap();
+            let mut keys: Vec<&str> = raw["series"]["pressure_evidence"]["attempts"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "comparison",
+                    "error_kind",
+                    "index",
+                    "outcome",
+                    "signal",
+                    "status",
+                    "timed_out"
+                ]
+            );
         }
     }
 
@@ -2741,27 +2849,22 @@ mod tests {
         // ordinary contradiction even when Hermit exited with 128 + the
         // declared signo: the named refusal describes a completed PASS.
         for (outcome, error_kind) in [("FAIL", None), ("ERROR", Some("cli-error"))] {
-            let mut value = pressure_row_with_exit(Some(139), None, Some(Signal(11)));
-            let inner = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+            let mut inner = matched_attempt(Some(139), None);
             inner.outcome = outcome.into();
             inner.error_kind = error_kind.map(Into::into);
             let error = inner
-                .validate_for_mode("verify")
+                .validate_for_mode("verify", Some(Signal(11)))
                 .expect_err("a non-completed matched attempt must refuse");
-            assert_eq!(
-                error, "pressure_evidence matched report contradicts its inner process disposition",
-                "{outcome}"
-            );
+            assert_eq!(error, MATCHED_CONTRADICTION, "{outcome}");
         }
         // A timed-out or error-kind PASS never reaches the comparison checks:
         // it is refused earlier as an incomplete PASS.
         for (timed_out, error_kind) in [(true, None), (false, Some("cli-error"))] {
-            let mut value = pressure_row_with_exit(Some(139), None, Some(Signal(11)));
-            let inner = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+            let mut inner = matched_attempt(Some(139), None);
             inner.timed_out = timed_out;
             inner.error_kind = error_kind.map(Into::into);
             let error = inner
-                .validate_for_mode("verify")
+                .validate_for_mode("verify", Some(Signal(11)))
                 .expect_err("an incomplete PASS must refuse");
             assert_eq!(
                 error, "pressure_evidence passing invocation lacks a completed process disposition",
@@ -2772,56 +2875,102 @@ mod tests {
 
     #[test]
     fn pressure_history_without_a_declared_exit_keeps_the_success_rule() {
-        pressure_row_with_exit(Some(0), None, None)
-            .validate_for_write()
-            .unwrap();
-        for (status, signal) in [(Some(3), None), (Some(7), None), (None, Some(11))] {
-            assert_matched_contradiction(pressure_row_with_exit(status, signal, None));
+        let success = declared_pressure_row(None, Some(0), None);
+        success.validate_for_write().unwrap();
+        for verdict in read_and_projection(&success) {
+            verdict.unwrap();
         }
-        // An undeclared row serializes exactly as it did before the field.
-        let raw = serde_json::to_value(pressure_row()).unwrap();
-        assert!(
-            raw["series"]["pressure_evidence"]["attempts"][0]
-                .get("expected_exit")
-                .is_none()
-        );
+        for (status, signal) in [(Some(3), None), (Some(7), None), (None, Some(11))] {
+            let value = declared_pressure_row(None, status, signal);
+            assert_eq!(
+                value.validate_for_write().unwrap_err(),
+                MATCHED_CONTRADICTION,
+                "{status:?}/{signal:?}"
+            );
+            for verdict in read_and_projection(&value) {
+                assert_eq!(
+                    verdict.unwrap_err(),
+                    MATCHED_CONTRADICTION,
+                    "{status:?}/{signal:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn pressure_history_refuses_a_malformed_or_misplaced_expected_exit() {
+    fn a_malformed_misplaced_or_unbound_declaration_grants_nothing() {
         use SeriesExpectedExit::Code;
         use SeriesExpectedExit::Signal;
+        // A caller's expected exit is itself validated.
         for expected in [Code(0), Code(256), Code(-1), Signal(0), Signal(65)] {
             // The observed disposition is itself valid, so only the
             // declaration can be refused.
-            let status = match expected {
-                Code(_) => (Some(3), None),
-                Signal(_) => (None, Some(11)),
+            let inner = match expected {
+                Code(_) => matched_attempt(Some(3), None),
+                Signal(_) => matched_attempt(None, Some(11)),
             };
-            let error = pressure_row_with_exit(status.0, status.1, Some(expected))
-                .validate_for_write()
+            let error = inner
+                .validate_for_mode("verify", Some(expected))
                 .unwrap_err();
             assert!(error.contains("expected_exit"), "{expected:?}: {error}");
         }
         // The manifest accepts the declaration only on verify cells.
         for mode in ["replay", "chaos", "naked", "custom"] {
-            let mut value = pressure_row_with_exit(Some(3), None, Some(Code(3)));
-            value.series.cell = format!("fixture/test/{mode}/ptrace");
-            let error = value.validate_for_write().unwrap_err();
+            let error = matched_attempt(Some(3), None)
+                .validate_for_mode(mode, Some(Code(3)))
+                .unwrap_err();
             assert_eq!(
                 error, "pressure_evidence expected_exit is supported only by verify mode",
                 "{mode}"
             );
         }
-        // Round trip in the compact JSON shape.
-        let declared = pressure_row_with_exit(None, Some(11), Some(Signal(11)));
-        let raw = serde_json::to_value(&declared).unwrap();
-        assert_eq!(
-            raw["series"]["pressure_evidence"]["attempts"][0]["expected_exit"],
-            serde_json::json!({"signal": 11})
-        );
-        let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
-        assert_eq!(decoded, declared);
+        // A row's recorded declaration that its own validator refuses, or one
+        // on a cell that cannot declare, grants nothing: the matched attempt
+        // keeps the success-only rule. A well-formed declaration grants the
+        // exact exit only together with the audit that binds it to the same
+        // evidence.
+        let exact = || declared_pressure_row(Some(Code(3)), Some(3), None);
+        for verdict in read_and_projection(&exact()) {
+            verdict.unwrap();
+        }
+        let mut cases: Vec<(&str, SeriesRow, &str)> = Vec::new();
+        let mut other = exact();
+        declared(&mut other).code = Some(0);
+        cases.push(("code 0", other, MATCHED_CONTRADICTION));
+        let mut other = exact();
+        declared(&mut other).signal = Some(11);
+        cases.push(("code and signal", other, MATCHED_CONTRADICTION));
+        let mut other = exact();
+        declared(&mut other).reason = " ".into();
+        cases.push(("blank reason", other, MATCHED_CONTRADICTION));
+        let mut other = exact();
+        other.series.cell = "fixture/test/replay/ptrace".into();
+        cases.push(("replay cell", other, MATCHED_CONTRADICTION));
+        // Chaos accepts a nonzero matched status by itself, so there the
+        // declaration's own validator refuses the row.
+        let mut other = exact();
+        other.series.cell = "fixture/test/chaos/ptrace".into();
+        cases.push(("chaos cell", other, "supported only by verify mode"));
+        let mut other = exact();
+        declared(&mut other).evidence_sha256 = "d".repeat(64);
+        cases.push((
+            "different source evidence",
+            other,
+            "declared_guest_exit and pressure_evidence name different source evidence",
+        ));
+        let mut other = exact();
+        declared(&mut other).attempts[0].status = Some(4);
+        cases.push((
+            "declaration's own attempt disagrees",
+            other,
+            "without Hermit reporting the declared exit code 3",
+        ));
+        for (label, fixture, message) in cases {
+            for verdict in read_and_projection(&fixture) {
+                let error = verdict.expect_err(&format!("{label} was accepted"));
+                assert!(error.contains(message), "{label}: {error}");
+            }
+        }
     }
 
     #[test]
@@ -3021,7 +3170,6 @@ mod tests {
                     report_sha256: "c".repeat(64),
                     no_result_kind: Some(SeriesNoVerdictKind::NotRun),
                 }),
-                expected_exit: None,
             }],
         });
         value.validate_for_write().unwrap();
@@ -3097,7 +3245,6 @@ mod tests {
                             report_sha256: disposition.verification_report_sha256.clone().unwrap(),
                             no_result_kind: Some(kind),
                         }),
-                        expected_exit: None,
                     }],
                 });
                 value.validate_for_write().unwrap();

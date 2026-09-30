@@ -6279,9 +6279,8 @@ fn retained_pressure_attempt(
         signal: attempt.signal,
         timed_out: attempt.timed_out,
         comparison,
-        expected_exit,
     };
-    retained.validate_for_mode(mode)?;
+    retained.validate_for_mode(mode, expected_exit)?;
     Ok(retained)
 }
 
@@ -15199,8 +15198,9 @@ mod pressure_sample_tests {
         use SeriesExpectedExit::Signal;
         let code3 = declared_exit_attempt((Some(3), None), (Some(3), None));
         let signal11 = declared_exit_attempt((None, Some(11)), (None, Some(11)));
-        // The declared code and the declared signal qualify, and the retained
-        // compact evidence carries the declaration.
+        // The declared code and the declared signal qualify. The retained
+        // compact evidence carries no copy of the declaration, so it validates
+        // only when the declaration is supplied again.
         assert!(qualifying_subruns(
             "verify",
             Some(Code(3)),
@@ -15211,11 +15211,11 @@ mod pressure_sample_tests {
             Some(Signal(11)),
             std::slice::from_ref(&signal11)
         ));
+        let retained = retained_pressure_attempt("verify", Some(Code(3)), &code3).unwrap();
+        retained.validate_for_mode("verify", Some(Code(3))).unwrap();
         assert_eq!(
-            retained_pressure_attempt("verify", Some(Code(3)), &code3)
-                .unwrap()
-                .expected_exit,
-            Some(Code(3))
+            retained.validate_for_mode("verify", None).unwrap_err(),
+            "pressure_evidence matched report contradicts its inner process disposition"
         );
         let row = history_row("verify", "PASS", 1, vec![code3.clone()]);
         assert!(
@@ -15334,7 +15334,10 @@ mod pressure_sample_tests {
                 Some(Verdict::Diverged),
                 "{label}"
             );
-            assert_eq!(retained.expected_exit, Some(Code(3)), "{label}");
+            // A diverged attempt's validity does not depend on the declaration.
+            retained
+                .validate_for_mode("verify", None)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
             let row = history_row("verify", "FAIL", 1, vec![diverged]);
             assert_eq!(
                 inner_pressure_history(std::slice::from_ref(&row), Some(Code(3))).unwrap(),
