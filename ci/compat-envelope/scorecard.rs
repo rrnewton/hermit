@@ -4026,7 +4026,8 @@ const MANIFEST_PLAN_DATA_FILES: [&str; 4] = [
 /// covered. It also checks that each manifest program is a file or a symlink,
 /// and whether its target is a file. A successful plan requires every program
 /// to appear in that listing, so the digest records both facts for every
-/// listed path. The helper reads no environment variable, and its output
+/// listed path. The helper reads no environment variable itself; Git's
+/// environment acts only through the listing, which is hashed. Its output
 /// does not name ROOT; ROOT must be absolute because the helper runs inside
 /// it. The helper itself is identified by its file metadata, not its bytes:
 /// hashing the 120 MB debug build would cost about as much as running it.
@@ -14976,7 +14977,7 @@ mod prepared_manifest_plan_tests {
     }
 
     #[test]
-    fn the_plan_cache_key_follows_every_helper_input_and_nothing_else() {
+    fn the_plan_cache_key_follows_each_helper_input() {
         let helper = env::current_exe().unwrap();
         let key = |root: &Path, listing: &[u8]| {
             manifest_plan_input_digest(&helper, root, listing).unwrap()
@@ -15060,6 +15061,67 @@ mod prepared_manifest_plan_tests {
             manifest_plan_input_digest(&other_helper, original.path(), PLAN_LISTING).unwrap(),
             expected,
             "another helper file"
+        );
+
+        // Each pair below differs in exactly one input, so a key that
+        // dropped that input would give both sides the same value.
+        let renamed = plan_inputs();
+        fs::write(
+            renamed.path().join("tests/e2e/sample/run.sx"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let renamed_listing = String::from_utf8(PLAN_LISTING.to_vec())
+            .unwrap()
+            .replace("run.sh", "run.sx");
+        assert_ne!(
+            key(renamed.path(), renamed_listing.as_bytes()),
+            key(renamed.path(), PLAN_LISTING),
+            "a listed path renamed to a file of the same status"
+        );
+        let renamed_manifest = plan_inputs();
+        fs::rename(
+            renamed_manifest
+                .path()
+                .join("tests/e2e/manifests/sample.yaml"),
+            renamed_manifest
+                .path()
+                .join("tests/e2e/manifests/sampla.yaml"),
+        )
+        .unwrap();
+        // Neither name is listed, so the listed paths' status is the same.
+        let unlisted = String::from_utf8(PLAN_LISTING.to_vec())
+            .unwrap()
+            .replace("tests/e2e/manifests/sample.yaml\n", "");
+        assert_ne!(
+            key(renamed_manifest.path(), unlisted.as_bytes()),
+            key(original.path(), unlisted.as_bytes()),
+            "a manifest renamed with identical bytes"
+        );
+        let removed = plan_inputs();
+        fs::remove_file(removed.path().join("tests/e2e/sample/run.sh")).unwrap();
+        let dangling = plan_inputs();
+        let program = dangling.path().join("tests/e2e/sample/run.sh");
+        fs::remove_file(&program).unwrap();
+        std::os::unix::fs::symlink("missing.sh", program).unwrap();
+        assert_ne!(
+            key(dangling.path(), PLAN_LISTING),
+            key(removed.path(), PLAN_LISTING),
+            "a dangling symlink against a missing program"
+        );
+        let rebuilt = original.path().join("helper");
+        fs::write(&rebuilt, "helper\n").unwrap();
+        let before = manifest_plan_input_digest(&rebuilt, original.path(), PLAN_LISTING).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&rebuilt)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(
+            manifest_plan_input_digest(&rebuilt, original.path(), PLAN_LISTING).unwrap(),
+            before,
+            "the same helper path with a new modification time"
         );
         assert_eq!(
             key(original.path(), &[0xff, b'\n']),
@@ -18450,9 +18512,10 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         // Only the first clone observation below runs the helper through
         // `cargo run`; require_shared_clone_helper then checks that Cargo used the
         // shared target and left the helper's bytes unchanged. Every later child
-        // runs that same Cargo-built file directly, which skips Cargo's
+        // is given that same Cargo-built file directly, which skips Cargo's
         // fingerprint check (0.11 s per child, measured 2026-09-30), and the tier
-        // re-checks the bytes at its end.
+        // re-checks the bytes at its end. Most of those children find their plan
+        // in the shared cache below and never run the helper.
         let prepared_command_helper = std::path::absolute(&command_helper)
             .map_err(|error| format!("cannot make the manifest helper path absolute: {error}"))?;
         let child_helper_via_cargo = std::cell::Cell::new(true);
@@ -21865,6 +21928,27 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             .count();
         if cached_plans == 0 {
             return Err("no child command stored a manifest plan in the shared cache".into());
+        }
+        // The restored fixture tree must still find its plan in the cache, and
+        // that plan must be exactly what the helper prints for it now.
+        let restored_key = manifest_plan_cache_key(&prepared_command_helper, &result_command_root)?
+            .ok_or("the restored fixture tree has no manifest plan cache key")?;
+        let cached_plan = fs::read(child_plan_cache.path().join(&restored_key)).map_err(|e| {
+            format!("no cached manifest plan for the restored fixture tree ({restored_key}): {e}")
+        })?;
+        let fresh_plan = Command::new(&prepared_command_helper)
+            .arg("--root")
+            .arg(&result_command_root)
+            .args(["--format", "matrix-json"])
+            .current_dir(&result_command_root)
+            .output()
+            .map_err(|e| format!("cannot run hermit-manifest-plan: {e}"))?;
+        if !fresh_plan.status.success() || fresh_plan.stdout != cached_plan {
+            return Err(format!(
+                "the cached manifest plan for the restored fixture tree differs from a fresh run \
+                 (helper status {})",
+                fresh_plan.status
+            ));
         }
         Some(CommandsFixture {
             _history_environment,
