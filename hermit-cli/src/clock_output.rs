@@ -828,7 +828,14 @@ mod tests {
         }
     }
 
+    /// The message of any other replay failure, which hermit must still report
+    /// as an internal failure.
     fn tool_message(error: Error) -> String {
+        assert_eq!(
+            crate::error::classify_ptrace_primary(&error),
+            crate::error::FailureKind::Error,
+            "only the refusal is a policy refusal"
+        );
         let Error::Tool(error) = error else {
             panic!("expected a Tool error, got {error:?}");
         };
@@ -836,8 +843,13 @@ mod tests {
     }
 
     /// The message of a refusal before any guest write, which must be an
-    /// `UnreplayableClockOutput`.
+    /// `UnreplayableClockOutput` that hermit reports as a policy refusal.
     fn refusal_message(error: Error) -> String {
+        assert_eq!(
+            crate::error::classify_ptrace_primary(&error),
+            crate::error::FailureKind::PolicyRefusal,
+            "the refusal must exit as a policy refusal, not as an internal failure"
+        );
         let Error::Tool(error) = error else {
             panic!("expected a Tool error, got {error:?}");
         };
