@@ -136,11 +136,18 @@ impl ToolSelfTest {
 /// unit tests; see `scorecard_commands` and `scorecard_tests` in
 /// [`TOOL_SELF_TESTS`]. Every entry must name a tracked path, every tracked
 /// file under [`SCORECARD_INPUT_ROOTS`] must be under an entry here or in
-/// [`SCORECARD_NON_INPUTS`], every `#[path]` module an input's source declares
-/// must be under an entry here, and every file an input's source includes
-/// (`include_str!`, `include_bytes!`, `include!`), like every tracked default
-/// file of a plain `mod x;` it declares, must be under an entry here or in
-/// [`SCORECARD_NON_INPUTS`] (`self_test_selection`'s tests check all four).
+/// [`SCORECARD_NON_INPUTS`], every `#[path]` module an input's source
+/// declares, like every tracked default file of a plain `mod x;` it declares
+/// (inside inline modules too) that is not `#[cfg(test)]`, must be under an
+/// entry here, every file an input's source includes (`include_str!`,
+/// `include_bytes!`, `include!`), like a `#[cfg(test)]` module's file, must be
+/// under an entry here or in [`SCORECARD_NON_INPUTS`], and every Cargo `path`
+/// in an input manifest (a `Cargo.toml`, or a rust-script's `//!` cargo
+/// block) must be under an entry here or a root. A form that names a file the
+/// scan does not resolve is refused with its file and line: a non-literal
+/// `#[path]` or include, a `#[path]` inside an inline module, a macro-made
+/// `mod $name;`, a renamed include macro, or `#[debugger_visualizer]`; no
+/// file uses one today. `self_test_selection`'s tests check all of these.
 ///
 /// Derived 2026-09-30 from the dep-info of the scorecard's release and test
 /// builds, of `hermit-manifest-plan`, of `test-harness` and of the release
@@ -170,9 +177,11 @@ impl ToolSelfTest {
 /// quick-super-selftest.scorecard_commands selects on this same list.
 ///
 /// A non-input outside [`SCORECARD_INPUT_ROOTS`] must be exactly a file that
-/// an input includes or declares as a plain module. Its reason says the include is test-only; nothing
-/// checks that claim, so a later non-test include of the same file would
-/// pass the scan.
+/// an input includes or declares as a `#[cfg(test)]` module. Its reason says
+/// the include is test-only; nothing checks that claim for an include, so a
+/// later non-test include of the same file would pass the scan. A non-input
+/// is not scanned itself, so what a test-only module includes is not
+/// followed.
 ///
 /// `tests/` is selected through a stand-in (accepted by the coordinator
 /// 2026-09-30): the helper refuses a `tests/` tree whose files differ from

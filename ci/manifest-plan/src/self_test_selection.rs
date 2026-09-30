@@ -291,23 +291,34 @@ mod tests {
 
     /// What a Rust source names by path: `#[path = "..."]` module files, with
     /// any spacing, inside `cfg_attr` and as raw identifiers; bodyless
-    /// `mod x;` declarations; and the files `include_str!`, `include_bytes!`
-    /// and `include!` read, with any of the three delimiters. Comments, string
-    /// literals and character literals are skipped, so text that only
-    /// mentions these forms names nothing. A `#[path]` or include whose value
-    /// is not a string literal is `Err`, because its file cannot be read off
-    /// the source.
+    /// `mod x;` declarations, inside inline modules too; and the files
+    /// `include_str!`, `include_bytes!` and `include!` read, with any of the
+    /// three delimiters. Comments, string literals and character literals are
+    /// skipped, so text that only mentions these forms names nothing. A form
+    /// whose file this scan does not resolve is `Unresolved`, with its line.
     #[derive(Debug, PartialEq)]
     enum Reference {
-        /// A `#[path]` module's file, or the attribute when its value is not
-        /// a string literal.
-        Module(Result<String, String>),
-        /// A bodyless `mod x;`, whose file is found by its name unless a
-        /// `#[path]` attribute names it.
-        Plain(String),
-        /// An included file, or the macro when its argument is not a string
-        /// literal.
-        Include(Result<String, String>),
+        /// A `#[path]` module's file.
+        Module(String),
+        /// A bodyless `mod name;` inside the inline modules `within`
+        /// (`a/b` for `mod a { mod b { mod name; } }`), whose file is found
+        /// by its name unless a `#[path]` attribute names it. `test_only`
+        /// when it, or an inline module around it, carries `#[cfg(test)]`.
+        Plain {
+            name: String,
+            within: String,
+            test_only: bool,
+        },
+        /// An included file.
+        Include(String),
+        /// A form that names a file this scan does not resolve, at `line`: a
+        /// `#[path]` or include whose value is not a string literal, a
+        /// `#[path]` inside an inline module, a bodyless module inside an
+        /// inline module that has a `#[path]`, a macro-generated
+        /// `mod $name;`, a renamed include macro, or
+        /// `#[debugger_visualizer]`. No file in the tree uses one today; each
+        /// is refused rather than resolved.
+        Unresolved { form: String, line: usize },
     }
 
     #[derive(Debug, PartialEq)]
@@ -317,12 +328,17 @@ mod tests {
         Str(String),
     }
 
-    fn rust_tokens(source: &str) -> Vec<Token> {
+    /// The tokens of `source`, each with its 1-based line.
+    fn rust_tokens(source: &str) -> (Vec<Token>, Vec<usize>) {
         let chars: Vec<char> = source.chars().collect();
         let at = |i: usize| chars.get(i).copied().unwrap_or('\0');
+        // The line of `counted`, advanced to each token's start.
+        let (mut line, mut counted) = (1, 0);
         let mut tokens = Vec::new();
+        let mut lines = Vec::new();
         let mut i = 0;
         while i < chars.len() {
+            let begin = i;
             let c = chars[i];
             if c.is_whitespace() {
                 i += 1;
@@ -413,17 +429,118 @@ mod tests {
                 tokens.push(Token::Punct(c));
                 i += 1;
             }
+            // Each pass reads at most one token, which starts at `begin`.
+            if lines.len() < tokens.len() {
+                line += chars[counted..begin].iter().filter(|&&c| c == '\n').count();
+                counted = begin;
+                lines.push(line);
+            }
         }
-        tokens
+        (tokens, lines)
     }
 
     fn rust_references(source: &str) -> Vec<Reference> {
-        let tokens = rust_tokens(source);
+        let (tokens, lines) = rust_tokens(source);
+        let unresolved = |i: usize, form: String| Reference::Unresolved {
+            form,
+            line: lines[i],
+        };
         let ident =
             |i: usize, name: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n == name);
         let punct = |i: usize, c: char| tokens.get(i) == Some(&Token::Punct(c));
+        // The index just past the group that opens at `open` (`(`, `[` or
+        // `{`), or the end.
+        let group_end = |open: usize| {
+            let mut depth = 0;
+            for (j, token) in tokens.iter().enumerate().skip(open) {
+                match token {
+                    Token::Punct('(' | '[' | '{') => depth += 1,
+                    Token::Punct(')' | ']' | '}') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return j + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            tokens.len()
+        };
+        // The outer attributes of the item whose keyword is at `item`, read
+        // backwards over its visibility: each as the range of its tokens.
+        let attributes = |item: usize| {
+            let mut j = item;
+            if j > 0 && punct(j - 1, ')') {
+                let mut depth = 0;
+                let mut k = j;
+                while k > 0 {
+                    k -= 1;
+                    match &tokens[k] {
+                        Token::Punct(')') => depth += 1,
+                        Token::Punct('(') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if k > 0 && ident(k - 1, "pub") {
+                    j = k - 1;
+                }
+            } else if j > 0 && ident(j - 1, "pub") {
+                j -= 1;
+            }
+            let mut found = Vec::new();
+            while j > 0 && punct(j - 1, ']') {
+                let mut depth = 0;
+                let mut k = j;
+                while k > 0 {
+                    k -= 1;
+                    match &tokens[k] {
+                        Token::Punct(']') => depth += 1,
+                        Token::Punct('[') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if k == 0 || !punct(k - 1, '#') {
+                    break;
+                }
+                found.push(k - 1..j);
+                j = k - 1;
+            }
+            found
+        };
+        let is_cfg_test = |range: &std::ops::Range<usize>| {
+            range.len() == 7
+                && ident(range.start + 2, "cfg")
+                && punct(range.start + 3, '(')
+                && ident(range.start + 4, "test")
+                && punct(range.start + 5, ')')
+        };
+        let names_path = |range: &std::ops::Range<usize>| {
+            range.clone().any(|j| ident(j, "path") && punct(j + 1, '='))
+        };
+        // The inline modules around the current token: name, whether a
+        // `#[path]` or `#[cfg(test)]` is on it, and the index past its `}`.
+        struct Inline {
+            name: String,
+            path: bool,
+            test_only: bool,
+            end: usize,
+        }
+        let mut inline: Vec<Inline> = Vec::new();
         let mut references = Vec::new();
         for i in 0..tokens.len() {
+            while inline.last().is_some_and(|module| i >= module.end) {
+                inline.pop();
+            }
             if punct(i, '#')
                 && punct(i + 1, '[')
                 && (ident(i + 2, "path") || ident(i + 2, "cfg_attr"))
@@ -439,10 +556,19 @@ mod tests {
                             }
                         }
                         Token::Ident(name) if name == "path" && punct(j + 1, '=') => {
-                            references.push(Reference::Module(match tokens.get(j + 2) {
-                                Some(Token::Str(target)) => Ok(target.clone()),
-                                _ => Err("#[path]".to_string()),
-                            }));
+                            references.push(match (inline.last(), tokens.get(j + 2)) {
+                                (Some(module), _) => unresolved(
+                                    j,
+                                    format!("#[path] inside the inline module {}", module.name),
+                                ),
+                                (None, Some(Token::Str(target))) => {
+                                    Reference::Module(target.clone())
+                                }
+                                (None, _) => unresolved(
+                                    j,
+                                    "#[path] whose value is not a string literal".to_string(),
+                                ),
+                            });
                         }
                         _ => {}
                     }
@@ -451,10 +577,50 @@ mod tests {
             let Some(Token::Ident(name)) = tokens.get(i) else {
                 continue;
             };
-            if name == "mod" && punct(i + 2, ';') {
+            if name == "mod" && punct(i + 1, '$') {
+                references.push(unresolved(i, "a macro-generated mod $name".to_string()));
+            }
+            if name == "mod" {
                 if let Some(Token::Ident(module)) = tokens.get(i + 1) {
-                    references.push(Reference::Plain(module.clone()));
+                    let attributes = attributes(i);
+                    let test_only = attributes.iter().any(is_cfg_test)
+                        || inline.iter().any(|module| module.test_only);
+                    if punct(i + 2, ';') {
+                        if let Some(outer) = inline.iter().find(|module| module.path) {
+                            references.push(unresolved(
+                                i,
+                                format!(
+                                    "mod {module} inside the inline module {}, which has a #[path]",
+                                    outer.name
+                                ),
+                            ));
+                        } else {
+                            references.push(Reference::Plain {
+                                name: module.clone(),
+                                within: inline
+                                    .iter()
+                                    .map(|module| module.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("/"),
+                                test_only,
+                            });
+                        }
+                    } else if punct(i + 2, '{') {
+                        inline.push(Inline {
+                            name: module.clone(),
+                            path: attributes.iter().any(names_path),
+                            test_only,
+                            end: group_end(i + 2),
+                        });
+                    }
                 }
+            }
+            let include = matches!(name.as_str(), "include" | "include_str" | "include_bytes");
+            if include && ident(i + 1, "as") {
+                references.push(unresolved(i, format!("{name} renamed")));
+            }
+            if name == "debugger_visualizer" {
+                references.push(unresolved(i, "debugger_visualizer".to_string()));
             }
             let close = match tokens.get(i + 2) {
                 Some(Token::Punct('(')) => ')',
@@ -462,15 +628,11 @@ mod tests {
                 Some(Token::Punct('{')) => '}',
                 _ => continue,
             };
-            if matches!(name.as_str(), "include" | "include_str" | "include_bytes")
-                && punct(i + 1, '!')
-            {
-                references.push(Reference::Include(
-                    match (tokens.get(i + 3), punct(i + 4, close)) {
-                        (Some(Token::Str(target)), true) => Ok(target.clone()),
-                        _ => Err(format!("{name}!")),
-                    },
-                ));
+            if include && punct(i + 1, '!') {
+                references.push(match (tokens.get(i + 3), punct(i + 4, close)) {
+                    (Some(Token::Str(target)), true) => Reference::Include(target.clone()),
+                    _ => unresolved(i, format!("{name}! whose argument is not a string literal")),
+                });
             }
         }
         references
@@ -508,45 +670,202 @@ mod tests {
             mod plain;
             pub(crate) mod visible;
             mod inline { include!("inline.rs"); }
+            mod outer { pub mod middle { mod nested; } mod sibling; }
+            mod after;
+            #[cfg(test)] mod tests;
+            #[cfg(test)] #[allow(dead_code)] pub(crate) mod helpers;
+            #[cfg(test)] mod test_block { mod fixture; }
+            #[path = "dir"] mod pathed { mod lost; }
+            mod pathed_inner { #[path = "z.rs"] mod z; }
+            macro_rules! m { ($n:ident) => { mod $n; } }
+            use std::include_str as grab;
+            use std::{include_bytes as grab_bytes};
+            #![debugger_visualizer(gdb_script_file = "g.py")]
         "##;
         use Reference::*;
+        let plain = |name: &str| Plain {
+            name: name.to_string(),
+            within: String::new(),
+            test_only: false,
+        };
+        let test_only = |name: &str| Plain {
+            name: name.to_string(),
+            within: String::new(),
+            test_only: true,
+        };
+        let unresolved = |line: usize, form: &str| Unresolved {
+            form: form.to_string(),
+            line,
+        };
         assert_eq!(
             rust_references(source),
             [
-                Module(Ok("a.rs".to_string())),
-                Plain("a".to_string()),
-                Module(Ok("b.rs".to_string())),
-                Plain("b".to_string()),
-                Module(Ok("c.rs".to_string())),
-                Plain("c".to_string()),
-                Module(Ok("d.rs".to_string())),
-                Plain("d".to_string()),
-                Plain("e".to_string()),
-                Include(Ok("e.json".to_string())),
-                Include(Ok("f.bin".to_string())),
-                Include(Ok("g.rs".to_string())),
-                Include(Err("include_str!".to_string())),
-                Module(Ok("raw.rs".to_string())),
-                Plain("raw".to_string()),
-                Module(Ok("raw-cfg.rs".to_string())),
-                Plain("raw_cfg".to_string()),
-                Module(Err("#[path]".to_string())),
-                Plain("unreadable".to_string()),
-                Include(Ok("brace.json".to_string())),
-                Include(Ok("bracket.bin".to_string())),
-                Plain("plain".to_string()),
-                Plain("visible".to_string()),
-                Include(Ok("inline.rs".to_string())),
+                Module("a.rs".to_string()),
+                plain("a"),
+                Module("b.rs".to_string()),
+                plain("b"),
+                Module("c.rs".to_string()),
+                plain("c"),
+                Module("d.rs".to_string()),
+                plain("d"),
+                plain("e"),
+                Include("e.json".to_string()),
+                Include("f.bin".to_string()),
+                Include("g.rs".to_string()),
+                unresolved(21, "include_str! whose argument is not a string literal"),
+                Module("raw.rs".to_string()),
+                plain("raw"),
+                Module("raw-cfg.rs".to_string()),
+                plain("raw_cfg"),
+                unresolved(24, "#[path] whose value is not a string literal"),
+                plain("unreadable"),
+                Include("brace.json".to_string()),
+                Include("bracket.bin".to_string()),
+                plain("plain"),
+                plain("visible"),
+                Include("inline.rs".to_string()),
+                Plain {
+                    name: "nested".to_string(),
+                    within: "outer/middle".to_string(),
+                    test_only: false,
+                },
+                Plain {
+                    name: "sibling".to_string(),
+                    within: "outer".to_string(),
+                    test_only: false,
+                },
+                plain("after"),
+                test_only("tests"),
+                test_only("helpers"),
+                Plain {
+                    name: "fixture".to_string(),
+                    within: "test_block".to_string(),
+                    test_only: true,
+                },
+                Module("dir".to_string()),
+                unresolved(
+                    36,
+                    "mod lost inside the inline module pathed, which has a #[path]"
+                ),
+                unresolved(37, "#[path] inside the inline module pathed_inner"),
+                Plain {
+                    name: "z".to_string(),
+                    within: "pathed_inner".to_string(),
+                    test_only: false,
+                },
+                unresolved(38, "a macro-generated mod $name"),
+                unresolved(39, "include_str renamed"),
+                unresolved(40, "include_bytes renamed"),
+                unresolved(41, "debugger_visualizer"),
             ]
         );
     }
 
+    /// The `path = "..."` values of a Cargo manifest: the whole file for a
+    /// `Cargo.toml`, and the `//!` ```` ```cargo ```` block for a rust-script.
+    fn cargo_paths(rust_script: bool, source: &str) -> Vec<String> {
+        let mut in_block = !rust_script;
+        let mut paths = Vec::new();
+        for line in source.lines() {
+            let line = if rust_script {
+                let Some(doc) = line.trim_start().strip_prefix("//!") else {
+                    in_block = false;
+                    continue;
+                };
+                let doc = doc.trim();
+                if doc.starts_with("```") {
+                    in_block = doc == "```cargo";
+                    continue;
+                }
+                doc
+            } else {
+                line
+            };
+            if !in_block {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find("path") {
+                let before = rest[..at].chars().next_back();
+                rest = &rest[at + "path".len()..];
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                    continue;
+                }
+                let Some(value) = rest.trim_start().strip_prefix('=') else {
+                    continue;
+                };
+                if let Some(value) = value.trim_start().strip_prefix('"') {
+                    if let Some((value, _)) = value.split_once('"') {
+                        paths.push(value.to_string());
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn cargo_paths_reads_manifests_and_rust_script_blocks() {
+        let script = "//! Docs: path = \"prose.rs\"\n\
+                      //! ```cargo\n\
+                      //! [dependencies]\n\
+                      //! a = { path = \"../a\" }\n\
+                      //! b = { version = \"1\", path=\"b\" }\n\
+                      //! c = \"1\"\n\
+                      //! ```\n\
+                      //! ```text\n\
+                      //! d = { path = \"not-cargo\" }\n\
+                      //! ```\n\
+                      const X: &str = \"path = \\\"code\\\"\";\n";
+        assert_eq!(cargo_paths(true, script), ["../a", "b"]);
+        let manifest = "[lib]\npath = \"src/lib.rs\"\n\
+                        [dependencies]\n\
+                        e = { path = \"../e\", subpath = \"x\" }\n";
+        assert_eq!(cargo_paths(false, manifest), ["src/lib.rs", "../e"]);
+    }
+
+    /// A file's references and Cargo paths, read once per test process: the
+    /// coverage test checks the same tree under several planted lists.
+    struct Scanned {
+        references: Vec<Reference>,
+        cargo_paths: Vec<String>,
+    }
+
+    fn scanned(file: &Path) -> std::sync::Arc<Scanned> {
+        type Cache = std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, std::sync::Arc<Scanned>>,
+        >;
+        static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(scanned) = cache.lock().unwrap().get(file) {
+            return scanned.clone();
+        }
+        let source = std::fs::read_to_string(file).unwrap();
+        let rust = file.extension().is_some_and(|extension| extension == "rs");
+        let scanned = std::sync::Arc::new(Scanned {
+            references: if rust {
+                rust_references(&source)
+            } else {
+                Vec::new()
+            },
+            cargo_paths: cargo_paths(rust, &source),
+        });
+        cache
+            .lock()
+            .unwrap()
+            .insert(file.to_path_buf(), scanned.clone());
+        scanned
+    }
+
     /// Every way `inputs` and `non_inputs` can drift from the tracked tree:
     /// an unclassified or doubly classified file under `roots`, a stale
-    /// non-input, an input's `#[path]` module that no input covers, and a
-    /// file an input includes, or a tracked file of a plain `mod x;` it
-    /// declares, that is neither an input nor a non-input. A non-input
-    /// outside `roots` must be exactly such a file.
+    /// non-input, an input's `#[path]` module or plain `mod x;` file that no
+    /// input covers, a file an input includes, or the file of a
+    /// `#[cfg(test)]` plain module it declares, that is neither an input nor
+    /// a non-input, a form whose file the scan cannot resolve, and a Cargo
+    /// `path` in an input manifest (`Cargo.toml`, or a rust-script's
+    /// `//!` cargo block) that no input or root covers. A non-input outside
+    /// `roots` must be exactly an included file or a test-only module's.
     fn scorecard_input_violations(
         root: &Path,
         tracked: &[String],
@@ -563,45 +882,56 @@ mod tests {
             .iter()
             .filter(|path| path.ends_with(".rs") && is_input(path))
         {
-            let source = std::fs::read_to_string(root.join(path)).unwrap();
+            let scanned = scanned(&root.join(path));
             let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
             let stem = path.strip_suffix(".rs").unwrap_or(path);
             let mut seen = BTreeSet::new();
-            for reference in rust_references(&source) {
+            for reference in &scanned.references {
                 let (target, module) = match reference {
-                    Reference::Module(Ok(target)) => (target, true),
-                    Reference::Include(Ok(target)) => (target, false),
-                    Reference::Module(Err(name)) | Reference::Include(Err(name)) => {
+                    Reference::Module(target) => (target, true),
+                    Reference::Include(target) => (target, false),
+                    Reference::Unresolved { form, line } => {
                         reference_violations.push(format!(
-                            "{path} gives {name} something other than a string literal, \
-                             so its file cannot be classified"
+                            "{path}:{line}: unresolved: {form}; the scan cannot classify its file"
                         ));
                         continue;
                     }
-                    Reference::Plain(name) => {
+                    Reference::Plain {
+                        name,
+                        within,
+                        test_only,
+                    } => {
                         // Its file is `x.rs` or `x/mod.rs` beside a crate
-                        // root or `mod.rs`, and under `<stem>/` otherwise.
-                        // Every tracked candidate is classified like an
-                        // included file (a `#[cfg(test)] mod tests;` names a
-                        // non-input); with none tracked, a `#[path]` names
-                        // the file or nothing builds.
-                        for candidate in [
-                            format!("{dir}/{name}.rs"),
-                            format!("{dir}/{name}/mod.rs"),
-                            format!("{stem}/{name}.rs"),
-                            format!("{stem}/{name}/mod.rs"),
-                        ] {
-                            let candidate = normalize(&candidate);
-                            if !tracked.contains(&candidate) || !seen.insert(candidate.clone()) {
-                                continue;
+                        // root or `mod.rs`, and under `<stem>/` otherwise,
+                        // below the directories of the inline modules
+                        // around it. A tracked candidate must be an input,
+                        // or, for a test-only module (a `#[cfg(test)] mod
+                        // tests;`), an input or a non-input; with none
+                        // tracked, a `#[path]` names the file or nothing
+                        // builds.
+                        for base in [dir, stem] {
+                            for candidate in [
+                                format!("{base}/{within}/{name}.rs"),
+                                format!("{base}/{within}/{name}/mod.rs"),
+                            ] {
+                                let candidate = normalize(&candidate);
+                                if !tracked.contains(&candidate) || !seen.insert(candidate.clone())
+                                {
+                                    continue;
+                                }
+                                if !test_only && !is_input(&candidate) {
+                                    reference_violations.push(format!(
+                                        "{path} declares mod {name}, whose file {candidate} \
+                                         no input covers"
+                                    ));
+                                } else if !is_input(&candidate) && !is_non_input(&candidate) {
+                                    reference_violations.push(format!(
+                                        "{path} declares mod {name}, whose file {candidate} \
+                                         is neither an input nor a non-input"
+                                    ));
+                                }
+                                included.insert(candidate);
                             }
-                            if !is_input(&candidate) && !is_non_input(&candidate) {
-                                reference_violations.push(format!(
-                                    "{path} declares mod {name}, whose file {candidate} \
-                                     is neither an input nor a non-input"
-                                ));
-                            }
-                            included.insert(candidate);
                         }
                         continue;
                     }
@@ -622,6 +952,28 @@ mod tests {
                     ));
                 }
                 included.insert(target);
+            }
+        }
+        // A Cargo `path` names a dependency's directory, or a target's file,
+        // relative to its manifest.
+        for path in tracked.iter().filter(|path| {
+            (path.ends_with(".rs") || path.ends_with("Cargo.toml")) && is_input(path)
+        }) {
+            let scanned = scanned(&root.join(path));
+            let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+            for target in &scanned.cargo_paths {
+                let target = normalize(&format!("{dir}/{target}"));
+                let covered = if tracked.contains(&target) {
+                    is_input(&target)
+                } else {
+                    let directory = format!("{target}/");
+                    is_input(&directory) || roots.iter().any(|root| is_under(&directory, root))
+                };
+                if !covered {
+                    reference_violations.push(format!(
+                        "{path} gives Cargo the path {target}, which no input or input root covers"
+                    ));
+                }
             }
         }
         for (entry, reason) in non_inputs {
@@ -722,7 +1074,7 @@ mod tests {
             [
                 "ci/manifest-plan/src/timeouts.rs is neither an input nor a non-input",
                 "ci/manifest-plan/src/lib.rs declares mod timeouts, whose file \
-                 ci/manifest-plan/src/timeouts.rs is neither an input nor a non-input",
+                 ci/manifest-plan/src/timeouts.rs no input covers",
             ]
         );
         let without_non_input = |dropped: &str| -> Vec<(&str, &str)> {
@@ -764,7 +1116,18 @@ mod tests {
             [
                 "ci/manifest-plan/src/ledger/admission.rs is neither an input nor a non-input",
                 "ci/manifest-plan/src/ledger.rs declares mod admission, whose file \
-                 ci/manifest-plan/src/ledger/admission.rs is neither an input nor a non-input",
+                 ci/manifest-plan/src/ledger/admission.rs no input covers",
+            ]
+        );
+        // A module that is not test-only must be an input: listing it as a
+        // non-input does not satisfy the check.
+        let mut moved = SCORECARD_NON_INPUTS.to_vec();
+        moved.push(("ci/manifest-plan/src/timeouts.rs", "planted"));
+        assert_eq!(
+            check(&without("ci/manifest-plan/src/timeouts.rs"), &moved),
+            [
+                "ci/manifest-plan/src/lib.rs declares mod timeouts, whose file \
+              ci/manifest-plan/src/timeouts.rs no input covers"
             ]
         );
         let mut doubled = SCORECARD_NON_INPUTS.to_vec();
@@ -783,6 +1146,56 @@ mod tests {
                  and no input includes it",
                 "ci/compat-envelope/cells.json is both an input and a non-input",
             ]
+        );
+    }
+
+    /// On a planted tree: a plain module inside an inline module is found
+    /// under the inline module's directory, a test-only module may be a
+    /// non-input and any other must be an input, a form the scan cannot
+    /// resolve is refused, and a rust-script's Cargo path must be covered.
+    #[test]
+    fn scorecard_input_violations_follow_inline_modules_and_refuse_the_rest() {
+        let scratch = Scratch::new("input-violations");
+        let files = [
+            (
+                "s/main.rs",
+                "//! ```cargo\n//! [dependencies]\n//! dep = { path = \"../dep\" }\n//! ```\n\
+                 mod inner { mod x; }\n\
+                 #[cfg(test)]\nmod tests;\n\
+                 mod helper;\n\
+                 use std::include_str as grab;\n",
+            ),
+            ("s/inner/x.rs", ""),
+            ("s/x.rs", ""),
+            ("s/tests.rs", ""),
+            ("s/helper.rs", ""),
+            ("dep/Cargo.toml", ""),
+        ];
+        for (path, contents) in files {
+            let path = scratch.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let tracked: Vec<String> = files.iter().map(|(path, _)| path.to_string()).collect();
+        let non_inputs = [("s/tests.rs", "test-only"), ("s/helper.rs", "planted")];
+        assert_eq!(
+            scorecard_input_violations(&scratch.0, &tracked, &["s/main.rs"], &["r/"], &non_inputs),
+            [
+                "s/main.rs declares mod x, whose file s/inner/x.rs no input covers",
+                "s/main.rs declares mod helper, whose file s/helper.rs no input covers",
+                "s/main.rs:9: unresolved: include_str renamed; the scan cannot classify its file",
+                "s/main.rs gives Cargo the path dep, which no input or input root covers",
+            ]
+        );
+        assert_eq!(
+            scorecard_input_violations(
+                &scratch.0,
+                &tracked,
+                &["s/main.rs", "s/inner/x.rs", "s/helper.rs", "dep/"],
+                &["r/"],
+                &non_inputs[..1],
+            ),
+            ["s/main.rs:9: unresolved: include_str renamed; the scan cannot classify its file"]
         );
     }
 
