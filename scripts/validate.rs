@@ -26283,8 +26283,8 @@ sys.exit(2)
         assert_eq!(
             line,
             format!(
-                "parity: appended 4 row(s) from {} (diverged 1, record-missing 3): \
-                 fixture parity append accepted",
+                "parity: append-parity accepted 4 row(s) from {} (diverged 1, record-missing \
+                 3): fixture parity append accepted",
                 fixture.root.join("e2e").display()
             )
         );
@@ -26368,7 +26368,7 @@ sys.exit(2)
         let sent = |fixture: &Fixture| {
             let line = fixture.append(true).unwrap();
             assert!(
-                line.starts_with("parity: appended 4 row(s) from "),
+                line.starts_with("parity: append-parity accepted 4 row(s) from "),
                 "{line}"
             );
             let captured = fixture.captured().expect("append-parity was called");
@@ -26553,8 +26553,8 @@ sys.exit(2)
                 "parity: WARNING: the post-pass outputs were refused in 1 place(s), so each cell \
                  the expected scope owed there is a record-missing row \
                  (portable/manifest_system_utils: {} has no parity.status.json beside it, so \
-                 its records cannot be attributed); appended 4 row(s) from {} (diverged 1, \
-                 record-missing 3): fixture parity append accepted",
+                 its records cannot be attributed); append-parity accepted 4 row(s) from {} \
+                 (diverged 1, record-missing 3): fixture parity append accepted",
                 stray.join("parity.jsonl").display(),
                 e2e.display()
             )

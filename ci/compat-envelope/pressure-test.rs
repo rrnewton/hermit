@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 use std::process::Stdio;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -2818,6 +2819,7 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
         results,
         checkout,
         fresh,
+        SERIES_APPEND_CELLS_BOUND,
         parity::AppendBounds::default(),
     );
     if let Some(line) = &emission.parity {
@@ -2827,24 +2829,41 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// How long [`emit_series`] waits on `series.py append-cells` before it
+/// kills the writer with its process group. The writer bounds each of its
+/// own steps -- the shared SeriesRow checker it may compile and run several
+/// times at 300 s a run, each git call at 60 s, the spool lock at 5 s -- so
+/// one still running after half an hour is hung, not slow.
+const SERIES_APPEND_CELLS_BOUND: Duration = Duration::from_secs(30 * 60);
+
 /// What [`emit_series_to`] did.
 struct SeriesEmission {
     /// The cells' `emitted ...` line, or why they were not all appended.
     cells: Result<String, String>,
     /// The one `parity:` line of the parity append, which runs once the
-    /// cells were offered to their writer, whatever became of them. `None`
+    /// cells' writer was started, whatever became of it or of them. `None`
     /// when the emit stopped before that.
     parity: Option<String>,
 }
 
 /// [`emit_series`] into the dev-hermit checkout `parent`: the cells to
-/// `series.py append-cells`, then the series' parity rows to `series.py
-/// append-parity`, the second bounded by `bounds`.
+/// `series.py append-cells`, bounded by `cells_bound`, then the series'
+/// parity rows to `series.py append-parity`, bounded by `bounds`.
+///
+/// The cells reach their writer's stdin from an unlinked file
+/// ([`parity::unlinked_input`]), never a pipe. This script's prelude turns
+/// `SIGPIPE` into `_exit(0)`, so with a pipe a writer that exited before
+/// reading a payload larger than the pipe buffer (a usage error, a failed
+/// import) would end the whole pressure test on the spot with exit status 0
+/// and no parity append. The writer leads its own process group
+/// ([`parity::GroupChild`]), so one still running at `cells_bound` is
+/// killed with everything it started, and the emit reports that.
 fn emit_series_to(
     parent: &Path,
     results: &Path,
     checkout: &Path,
     fresh: bool,
+    cells_bound: Duration,
     bounds: parity::AppendBounds,
 ) -> SeriesEmission {
     let mut parity_line = None;
@@ -2893,7 +2912,10 @@ fn emit_series_to(
                 script.display()
             ));
         }
-        let mut child = Command::new("python3")
+        let input = parity::unlinked_input(payload.as_bytes())
+            .map_err(|e| format!("cannot stage the cell results for the series writer: {e}"))?;
+        let mut command = Command::new("python3");
+        command
             .arg(&script)
             .arg("append-cells")
             .arg("--parent")
@@ -2906,20 +2928,11 @@ fn emit_series_to(
             .arg(&run_id)
             .arg("--tree")
             .arg(&metadata.hermit_sha)
-            .stdin(Stdio::piped())
-            .spawn()
+            .stdin(Stdio::from(input));
+        let child = parity::GroupChild::spawn(&mut command)
             .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
-        let sent = child
-            .stdin
-            .take()
-            .ok_or_else(|| "series append stdin unavailable".to_string())
-            .and_then(|mut stdin| {
-                stdin
-                    .write_all(payload.as_bytes())
-                    .map_err(|e| format!("cannot send rows to the series writer: {e}"))
-            });
         let status = child
-            .wait()
+            .wait_bounded(cells_bound)
             .map_err(|e| format!("series append did not terminate readably: {e}"));
         // The series' parity rows go beside its cells whatever became of them:
         // parity is measured after determinism and never decides the emit.
@@ -2932,8 +2945,12 @@ fn emit_series_to(
             metadata.source_tree_dirty,
             bounds,
         ));
-        sent?;
-        let status = status?;
+        let Some(status) = status? else {
+            return Err(format!(
+                "the series writer did not finish within {cells_bound:?} and was killed with its \
+                 process group; some of these cell results may have been written"
+            ));
+        };
         if !status.success() {
             // A nonzero status keeps every rejected cell visible to the caller.
             // append-cells can still have retained independent valid rows, so do
@@ -2972,7 +2989,11 @@ fn emit_series_to(
 ///
 /// A pressure test has no plan that says which cells its post-pass owed, so,
 /// unlike validate, it cannot stand record-missing rows in for refused
-/// outputs; the line names the refusal instead.
+/// outputs; the line names the refusal instead. Likewise a post-pass that
+/// failed before it knew its scope leaves a status that names no cell and so
+/// yields no row; the line is then an `ERROR:` naming that state and its
+/// error, never the benign line for a series with no post-pass output at
+/// all.
 /// <https://github.com/rrnewton/hermit/issues/3301>
 fn append_series_parity(
     script: &Path,
@@ -2999,6 +3020,9 @@ fn append_series_parity(
         }
     };
     if rows.is_empty() {
+        if let Some(line) = unfinished_series_post_pass(results) {
+            return line;
+        }
         return format!(
             "parity: no parity post-pass output in {}; nothing appended",
             results.display()
@@ -3017,6 +3041,27 @@ fn append_series_parity(
         &rows,
         bounds,
     )
+}
+
+/// The `ERROR:` line for a series whose `parity.status.json` says its
+/// post-pass failed or never finished, for [`append_series_parity`] when
+/// that status yielded no row. `None` when there is no status or it is
+/// complete; a status that cannot be read is already refused by
+/// [`parity::node_ledger_sources`].
+fn unfinished_series_post_pass(results: &Path) -> Option<String> {
+    let path = results.join(parity::PARITY_STATUS_JSON);
+    let status: parity::PostPassStatus = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    let state = match status.state {
+        parity::PostPassState::Complete => return None,
+        parity::PostPassState::Running => "never finished",
+        parity::PostPassState::Failed => "failed",
+    };
+    Some(format!(
+        "parity: ERROR: the series post-pass in {} {state} and named no cell it owed ({}); \
+         no parity rows appended",
+        results.display(),
+        status.error.as_deref().unwrap_or("no error recorded")
+    ))
 }
 
 fn default_result_root(root: &Path) -> Result<PathBuf, String> {
@@ -7974,8 +8019,8 @@ fn parity_rejection(reason: String, evidence: RefusedParityEvidence) -> parity::
 
 #[cfg(test)]
 thread_local! {
-    /// Set by a self-test to panic inside [`report_parity`], outside
-    /// [`parity::post_pass`] and its own panic guard.
+    /// Set by a self-test to panic inside [`pressure_parity`] once its scope
+    /// is resolved, outside [`parity::post_pass`] and its own panic guard.
     static PANIC_IN_SERIES_PARITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -7985,7 +8030,10 @@ thread_local! {
 /// or an `out` or `err` that cannot be written is reported where it can be,
 /// and neither `summary.json` nor the exit status changes. A post-pass that
 /// refused or panicked before measuring leaves no earlier summary's records
-/// behind. `rejected` holds the verify cells whose first repetition the
+/// behind, and a failed `parity.status.json` naming its error and every cell
+/// it owed ([`parity::mark_failed`]; none when the panic came before its
+/// scope was known), so the parity append reports the failure instead of an
+/// empty report. `rejected` holds the verify cells whose first repetition the
 /// summary refused, with the typed reason ([`parity_rejection`]); their
 /// parity cells take the class the harness gives the same condition and are
 /// never compared. `nondeterministic` holds the verify cells a later
@@ -8011,12 +8059,9 @@ fn report_parity(
     config.rejected = rejected.clone();
     config.nondeterministic = nondeterministic.clone();
     let mut warnings = Vec::new();
+    let mut scope = None;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        #[cfg(test)]
-        if PANIC_IN_SERIES_PARITY.with(|armed| armed.replace(false)) {
-            panic!("planted series post-pass panic");
-        }
-        pressure_parity(root, &config, metadata, rows, &mut warnings)
+        pressure_parity(root, &config, metadata, rows, &mut warnings, &mut scope)
     }));
     for warning in &warnings {
         let _ = writeln!(err, "pressure-test: {warning}");
@@ -8032,13 +8077,17 @@ fn report_parity(
                 "pressure-test: parity post-pass failed (exit status unaffected): {error}"
             );
         }
-        Err(_) => {
-            let cleared = parity::clear_outputs(&config);
+        Err(panic) => {
+            let error = format!(
+                "the series parity post-pass panicked: {}",
+                parity::panic_text(panic.as_ref())
+            );
+            let marked = parity::mark_failed(&config, &scope.unwrap_or_default(), &error);
             let _ = writeln!(
                 err,
-                "pressure-test: parity post-pass panicked (exit status unaffected)"
+                "pressure-test: parity post-pass panicked (exit status unaffected): {error}"
             );
-            if let Err(error) = cleared {
+            if let Err(error) = marked {
                 let _ = writeln!(err, "pressure-test: {error}");
             }
         }
@@ -8051,27 +8100,39 @@ fn report_parity(
 /// committed selection or of `--parity-select` is reported when the series
 /// ran its ptrace or its candidate verify cell, and an explicit cell with
 /// neither side in the series is dropped with a warning. `None` when nothing
-/// is in scope. When nothing is measured, because the scope is empty or
-/// cannot be resolved, the previous outputs are removed first.
+/// is in scope, after the previous outputs are removed. A scope that cannot
+/// be resolved leaves a failed status naming no cell
+/// ([`parity::mark_failed`]): the cells it owed are unknown, so the parity
+/// append reports the failure itself. `resolved` receives the scope as soon
+/// as it is known, so [`report_parity`] can name every owed cell if what
+/// follows panics.
 fn pressure_parity(
     root: &Path,
     config: &parity::PostPassConfig,
     metadata: &RunMetadata,
     rows: &[CellResult],
     warnings: &mut Vec<String>,
+    resolved: &mut Option<BTreeSet<parity::ParityCellId>>,
 ) -> Result<Option<parity::PostPassReport>, String> {
     let scope = match series_parity_scope(root, metadata) {
         Ok(scope) => scope,
         Err(error) => {
-            return Err(match parity::clear_outputs(config) {
-                Ok(()) => error,
-                Err(cleared) => format!("{error}; {cleared}"),
-            });
+            return Err(
+                match parity::mark_failed(config, &BTreeSet::new(), &error) {
+                    Ok(()) => error,
+                    Err(marked) => format!("{error}; {marked}"),
+                },
+            );
         }
     };
     warnings.extend(scope.warnings);
     if scope.cells.is_empty() {
         return parity::clear_outputs(config).map(|()| None);
+    }
+    *resolved = Some(scope.cells.clone());
+    #[cfg(test)]
+    if PANIC_IN_SERIES_PARITY.with(|armed| armed.replace(false)) {
+        panic!("planted series post-pass panic");
     }
     parity::post_pass(config, &scope.cells, rows).map(Some)
 }
@@ -16942,7 +17003,11 @@ mod pressure_sample_tests {
         assert!(!status_path.exists());
 
         // A post-pass that fails is reported; the summary and the result stand,
-        // and no earlier records are left behind.
+        // and no earlier records are left behind. A scope that cannot be
+        // resolved leaves a failed status naming the error and no cell, since
+        // the cells it owed are unknown, so the parity append reports it
+        // (review A Low 6 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
         metadata.parity_select = explicit.clone();
         write_metadata(&metadata);
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
@@ -16953,7 +17018,32 @@ mod pressure_sample_tests {
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
         assert_eq!(fs::read(&summary_path).unwrap(), without);
         assert!(!parity_path.exists());
-        assert!(!status_path.exists());
+        let failed: parity::PostPassStatus =
+            serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+        assert_eq!(failed.state, parity::PostPassState::Failed, "{failed:?}");
+        assert_eq!(
+            (failed.cells, failed.scope.clone(), failed.summary.clone()),
+            (0, Some(Vec::new()), None),
+            "{failed:?}"
+        );
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error
+                    .contains("no manifest declares test \"no-such-bucket/no-such-test\"")),
+            "{failed:?}"
+        );
+        assert!(
+            parity::node_ledger_sources(
+                &results,
+                parity::PRESSURE_TEST_LEDGER_LANE,
+                parity::PRESSURE_TEST_LEDGER_NODE,
+                None,
+            )
+            .unwrap()
+            .is_empty()
+        );
 
         // A first repetition the summary refused is never read. Rows that
         // contradict their harness exit are an invalid row, like a history
@@ -17285,14 +17375,61 @@ mod pressure_sample_tests {
         assert!(golden.is_file() && sidecar.is_file());
         assert_eq!(log_diff_calls(), 1);
 
-        // A panic in the post-pass is reported and changes nothing else, and
-        // the records of the previous summary are gone.
+        // A panic in the post-pass is reported and changes nothing else: the
+        // records of the previous summary are gone, and a failed status names
+        // the panic and every cell the post-pass owed, so each is a
+        // record-missing row rather than an empty report (review A Low 6 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
         PANIC_IN_SERIES_PARITY.with(|armed| armed.set(true));
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
         assert!(!PANIC_IN_SERIES_PARITY.with(std::cell::Cell::get));
         assert_eq!(fs::read(&summary_path).unwrap(), summary);
         assert!(!parity_path.exists());
-        assert!(!status_path.exists());
+        let owed = records
+            .iter()
+            .map(|record| parity::ParityCellId {
+                test_id: record.test_id.clone(),
+                backend: record.backend,
+            })
+            .collect::<BTreeSet<_>>()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let panicked = "the series parity post-pass panicked: planted series post-pass panic";
+        let failed: parity::PostPassStatus =
+            serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+        assert_eq!(failed.state, parity::PostPassState::Failed, "{failed:?}");
+        assert_eq!(failed.error.as_deref(), Some(panicked), "{failed:?}");
+        assert_eq!(
+            (failed.cells, failed.scope.clone(), failed.summary.clone()),
+            (owed.len(), Some(owed.clone()), None),
+            "{failed:?}"
+        );
+        let owed_rows = parity::node_ledger_sources(
+            &results,
+            parity::PRESSURE_TEST_LEDGER_LANE,
+            parity::PRESSURE_TEST_LEDGER_NODE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            owed_rows
+                .iter()
+                .map(|row| row.cell.clone())
+                .collect::<Vec<_>>(),
+            owed
+        );
+        let missing_reason = format!("parity post-pass failed: {panicked}");
+        for row in &owed_rows {
+            assert_eq!(
+                (row.verdict, row.reason.as_deref()),
+                (
+                    parity::LedgerVerdict::RecordMissing,
+                    Some(missing_reason.as_str())
+                ),
+                "{row:?}"
+            );
+        }
         assert_eq!(log_diff_calls(), 1);
         PANIC_IN_SERIES_PARITY.with(|armed| armed.set(true));
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -17309,7 +17446,9 @@ mod pressure_sample_tests {
         let err = String::from_utf8(err).unwrap();
         assert!(out.is_empty());
         assert!(
-            err.contains("pressure-test: parity post-pass panicked (exit status unaffected)"),
+            err.contains(&format!(
+                "pressure-test: parity post-pass panicked (exit status unaffected): {panicked}\n"
+            )),
             "{err}"
         );
 
@@ -17973,7 +18112,7 @@ sys.exit(2)
         assert_eq!(
             fixture.append(),
             format!(
-                "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): \
+                "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
                  fixture parity append accepted",
                 fixture.path("results").display()
             )
@@ -18199,6 +18338,7 @@ print("fixture " + args[0] + " accepted")
                 &results,
                 &checkout,
                 false,
+                SERIES_APPEND_CELLS_BOUND,
                 parity::AppendBounds::default(),
             );
             let expected_cells = if cells_exit == 0 {
@@ -18217,8 +18357,8 @@ print("fixture " + args[0] + " accepted")
             assert_eq!(
                 emission.parity,
                 Some(format!(
-                    "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): \
-                     fixture append-parity accepted",
+                    "parity: append-parity accepted 2 row(s) from {} (diverged 1, \
+                     record-missing 1): fixture append-parity accepted",
                     results.display()
                 )),
                 "the parity rows go out whatever became of the cells"
@@ -18300,6 +18440,7 @@ print("fixture " + args[0] + " accepted")
             &fixture.path("results"),
             &fixture.path("checkout"),
             false,
+            SERIES_APPEND_CELLS_BOUND,
             parity::AppendBounds::default(),
         );
         let error = emission
@@ -18308,5 +18449,229 @@ print("fixture " + args[0] + " accepted")
         assert!(error.starts_with("cannot read "), "{error}");
         assert_eq!(emission.parity, None);
         assert!(recorded_calls(&parent).is_empty());
+    }
+
+    /// A series post-pass that failed before it knew its scope leaves a
+    /// failed status naming no cell, which yields no row. The line is an
+    /// `ERROR:` naming the failure, never the benign line for a series with
+    /// no post-pass output, and the writer is not called (review A Low 6 of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    #[test]
+    fn a_post_pass_that_named_no_cell_is_an_error_line() {
+        let fixture = Fixture::new("scopeless", WRITER);
+        let results = fixture.path("results");
+        fs::remove_file(results.join(parity::PARITY_JSONL)).unwrap();
+        for (state, error, line) in [
+            (
+                "failed",
+                json!("cannot derive the parity matrix: fixture"),
+                "failed and named no cell it owed (cannot derive the parity matrix: fixture)",
+            ),
+            (
+                "running",
+                JsonValue::Null,
+                "never finished and named no cell it owed (no error recorded)",
+            ),
+        ] {
+            let status = json!({
+                "schema": 2, "state": state, "run_id": RUN, "hermit_sha": TREE,
+                "hermit_bin": "/src/hermit", "hermit_bin_sha256": null,
+                "records": "/results/parity.jsonl", "cells": 0, "scope": [],
+                "summary": null, "error": error,
+            });
+            fs::write(results.join(parity::PARITY_STATUS_JSON), status.to_string()).unwrap();
+            assert_eq!(
+                fixture.append(),
+                format!(
+                    "parity: ERROR: the series post-pass in {} {line}; no parity rows appended",
+                    results.display()
+                )
+            );
+            assert!(
+                fixture.captured().is_none(),
+                "no row, so the writer is not called"
+            );
+        }
+    }
+
+    /// One verify cell of run [`RUN`] under `results`, as
+    /// [`emitting_a_series_sends_its_cells_and_then_its_parity_rows`] plants
+    /// it, carrying an environment variable `pad` bytes long.
+    fn plant_emittable_series(results: &Path, pad: usize) {
+        fs::write(
+            results.join("run.json"),
+            json!({
+                "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                "run_timeout_seconds": 60, "cells": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cell = results.join("cells/portable-aio-refusal-verify-kvm");
+        fs::create_dir_all(&cell).unwrap();
+        let row = json!({
+            "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+            "source_tree_dirty": false, "test": "c-programs/aio-refusal",
+            "category": "c-programs", "lane": "portable", "mode": "verify",
+            "backend": "kvm", "classification": "required", "outcome": "PASS",
+            "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
+            "env": {"PRESSURE_FIXTURE_PAD": "x".repeat(pad)}, "cwd": "/",
+            "shell_command": "fixture", "attempts": [], "artifact_dir": "/retained/1",
+        });
+        fs::write(cell.join("results.jsonl"), format!("{row}\n")).unwrap();
+    }
+
+    /// A dev-hermit checkout under `root` whose `series.py` reads and accepts
+    /// an append-parity and runs `cells`, Python with `args`, `parent`,
+    /// `json`, `os`, `stat`, `subprocess`, `sys` and `time` in scope, for an
+    /// append-cells.
+    fn scripted_parent(root: &Path, cells: &str) -> PathBuf {
+        let parent = root.join("parent");
+        let series = parent.join("ci-hub/series");
+        fs::create_dir_all(&series).unwrap();
+        let script = [
+            "import json, os, pathlib, stat, subprocess, sys, time",
+            "args = sys.argv[1:]",
+            "if args == ['append-parity', '--help']:",
+            "    sys.exit(0)",
+            "parent = pathlib.Path(args[args.index('--parent') + 1])",
+            "if args[0] == 'append-parity':",
+            "    sys.stdin.read()",
+            "    print('fixture append-parity accepted')",
+            "    sys.exit(0)",
+            cells,
+        ]
+        .join("\n");
+        fs::write(series.join("series.py"), script + "\n").unwrap();
+        parent
+    }
+
+    /// The parity line of an emit whose parity rows reached the writer.
+    fn accepted_parity(results: &Path) -> Option<String> {
+        Some(format!(
+            "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+             fixture append-parity accepted",
+            results.display()
+        ))
+    }
+
+    /// The cells reach append-cells from an unlinked regular file, never a
+    /// pipe (review A Minor of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    /// A writer that exits without reading a payload larger than a pipe
+    /// buffer is reported by its exit status, and the parity rows still go
+    /// out; through a pipe, the next write would have met a closed reader,
+    /// which this script's prelude turns into exit status 0 for the whole
+    /// pressure test.
+    #[test]
+    fn the_cells_reach_their_writer_from_an_unlinked_file() {
+        let fixture = Fixture::new("emit-staged", WRITER);
+        let results = fixture.path("results");
+        plant_emittable_series(&results, 0);
+        let parent = scripted_parent(
+            &fixture.root.path,
+            "st = os.fstat(0)\n\
+             rows = len(sys.stdin.read().splitlines())\n\
+             seen = dict(regular=stat.S_ISREG(st.st_mode), links=st.st_nlink, rows=rows)\n\
+             parent.joinpath('stdin.json').write_text(json.dumps(seen))",
+        );
+        let emission = emit_series_to(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+        );
+        assert_eq!(
+            emission.cells,
+            Ok(format!(
+                "emitted 1 cell result(s) from run {RUN} to {}",
+                parent.display()
+            ))
+        );
+        assert_eq!(emission.parity, accepted_parity(&results));
+        let seen: JsonValue =
+            serde_json::from_slice(&fs::read(parent.join("stdin.json")).unwrap()).unwrap();
+        assert_eq!(seen, json!({"regular": true, "links": 0, "rows": 1}));
+
+        let fixture = Fixture::new("emit-unread", WRITER);
+        let results = fixture.path("results");
+        plant_emittable_series(&results, 256 * 1024);
+        let parent = scripted_parent(&fixture.root.path, "sys.exit(3)");
+        let emission = emit_series_to(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+        );
+        assert_eq!(
+            emission.cells,
+            Err(
+                "the series writer rejected one or more cell results (exit Some(3)); valid \
+                 completed rows, if any, were retained"
+                    .to_string()
+            )
+        );
+        assert_eq!(emission.parity, accepted_parity(&results));
+    }
+
+    /// An append-cells still running at its bound is killed with everything
+    /// it started, the emit says so, and the parity rows still go out
+    /// (review A Minor of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    /// The bound leaves the writer ample time to start its child first.
+    #[test]
+    fn a_hung_cells_writer_is_killed_with_its_process_group() {
+        let fixture = Fixture::new("emit-hung", WRITER);
+        let results = fixture.path("results");
+        plant_emittable_series(&results, 0);
+        let parent = scripted_parent(
+            &fixture.root.path,
+            "sleeper = subprocess.Popen(['sleep', '60'])\n\
+             parent.joinpath('sleeper.pid').write_text(str(sleeper.pid))\n\
+             time.sleep(60)",
+        );
+        let started = Instant::now();
+        let emission = emit_series_to(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            Duration::from_secs(5),
+            parity::AppendBounds::default(),
+        );
+        assert_eq!(
+            emission.cells,
+            Err(
+                "the series writer did not finish within 5s and was killed with its process \
+                 group; some of these cell results may have been written"
+                    .to_string()
+            )
+        );
+        assert_eq!(emission.parity, accepted_parity(&results));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // The writer's child was killed with it: its process is gone or
+        // awaits only its reaper.
+        let sleeper = fs::read_to_string(parent.join("sleeper.pid")).unwrap();
+        let stat = PathBuf::from(format!("/proc/{}/stat", sleeper.trim()));
+        let killed = || {
+            fs::read_to_string(&stat).map_or(true, |text| {
+                text.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with(['Z', 'X']))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !killed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            killed(),
+            "the writer's child {} outlived it",
+            sleeper.trim()
+        );
     }
 }
