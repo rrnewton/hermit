@@ -314,7 +314,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 719 prior identities:
     // validation_dag::tests::only_the_scorecard_regression_tier_takes_the_prepared_helper;
     // cli_help: test_harness_selftest_scorecard_refuses_a_missing_helper.
-    ("test.regular_crates", 721),
+    // The chaos-timeout reason regression
+    // (runner::tests::a_chaos_timeout_leads_the_reason_and_is_not_counted_as_a_pass)
+    // retains all 721 prior identities.
+    ("test.regular_crates", 722),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -424,7 +427,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 721),
+    ("test.regular_crates_on_host", 722),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
