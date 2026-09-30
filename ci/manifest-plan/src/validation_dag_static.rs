@@ -401,7 +401,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3354) adds one more. Both
     // retain all 171 prior identities (`cargo nextest list --profile ci`
     // measured 173).
-    ("test.hermit_integration", 173),
+    // procfs_determinism::
+    // files_sharing_a_raw_inode_on_two_devices_keep_separate_identities
+    // (https://github.com/rrnewton/hermit/issues/3307) retains all 173 prior
+    // identities (`cargo nextest list --profile ci` measured 174).
+    ("test.hermit_integration", 174),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -440,7 +444,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 862),
     // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 173),
+    ("test.hermit_integration_on_host", 174),
     ("test.hermit_unit_on_host", 758),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
