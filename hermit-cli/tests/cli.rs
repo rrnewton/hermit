@@ -1574,6 +1574,39 @@ fn run_rejects_subcommand_level_backend() {
 }
 
 #[test]
+fn analyze_rejects_backend_in_its_run_arguments() {
+    // `hermit analyze` builds its trials' `run` options from --run-arg and its
+    // trailing run arguments. `run` has no `--backend`, and analyze runs its
+    // trials on ptrace, so a backend there must be refused with the working
+    // path rather than clap's unrelated `--backend-engagement-json` hint.
+    let hermit_binary = env!("CARGO_BIN_EXE_hermit");
+    for args in [
+        &["analyze", "--run-arg=--backend=kvm", "--", "/bin/true"][..],
+        &["analyze", "--", "--backend", "dbt", "/bin/true"][..],
+    ] {
+        let output = Command::new(hermit_binary)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let message = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error:\n{message}"
+        );
+        assert!(
+            message.contains("runs every trial on the default ptrace backend")
+                && message.contains("drop `--backend` from the run arguments"),
+            "{args:?}: error does not give the working path:\n{message}"
+        );
+        assert!(
+            !message.contains("backend-engagement-json"),
+            "{args:?}: error points at an unrelated flag:\n{message}"
+        );
+    }
+}
+
+#[test]
 fn run_rejects_unknown_backends_during_argument_parsing() {
     let args = ["--backend", "unknown", "run", "--", "/bin/true"];
     let output = hermit(&args);

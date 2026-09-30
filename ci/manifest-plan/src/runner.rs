@@ -8810,6 +8810,87 @@ backends_disabled:
         }
     }
 
+    /// `--backend` is a global Hermit option: `hermit run --backend X` is refused
+    /// with a usage error. Every hermit invocation the runner builds must
+    /// therefore carry the backend before the `run` subcommand, and never after.
+    #[test]
+    fn hermit_backend_is_passed_before_the_run_subcommand() {
+        for (mode, seed) in [("verify", None), ("chaos", Some(7)), ("custom", None)] {
+            let mut test = recipe(true);
+            let recipe_mode = test.modes["verify"].clone();
+            test.modes = BTreeMap::from([(mode.to_string(), recipe_mode)]);
+            let cell = SelectedCell {
+                category: "fixture".into(),
+                id: CellId {
+                    test: test.id.clone(),
+                    mode: mode.into(),
+                    backend: Some("ptrace".into()),
+                },
+                test,
+                enabled: true,
+                timeout_seconds: 15,
+                cpu_timeout_seconds: 10,
+            };
+            let context = RunContext {
+                root: PathBuf::from("/repo"),
+                hermit_bin: PathBuf::from("/repo/hermit"),
+                result_root: PathBuf::from("/repo/results"),
+                build_root: PathBuf::from("/repo/build"),
+                run_id: "fixture".into(),
+                machine_shortname: "fixture-host".into(),
+                kernel_version: "7.1.3-fixture".into(),
+                host_capabilities: fixture_host_capabilities(),
+                attempt: 1,
+                run_index: None,
+                epoch: "2026-01-01T00:00:00Z".into(),
+                source_sha: "0".repeat(40),
+                binary_build_sha: None,
+                source_dirty: false,
+                prebuilt: false,
+                keep_logs: false,
+                parity_retained: BTreeSet::new(),
+                run_verify_strict: true,
+                record_verify_strict: true,
+                timeout_multipliers: TimeoutMultipliers::default(),
+                scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+                isolated_workdir: None,
+            };
+            let spec = build_spec(
+                &context,
+                &cell,
+                PathBuf::from("/repo/results/cell"),
+                vec!["/bin/true".into()],
+                "1",
+                seed,
+                cell.timeout_seconds,
+            )
+            .unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let run = spec
+                .argv
+                .iter()
+                .position(|arg| arg == "run")
+                .unwrap_or_else(|| panic!("{mode}: no run subcommand in {:?}", spec.argv));
+            let backend = spec
+                .argv
+                .iter()
+                .position(|arg| arg == "--backend")
+                .unwrap_or_else(|| panic!("{mode}: no --backend in {:?}", spec.argv));
+            assert!(
+                backend < run,
+                "{mode}: --backend after run: {:?}",
+                spec.argv
+            );
+            assert_eq!(spec.argv[backend + 1], "ptrace", "{mode}: {:?}", spec.argv);
+            assert!(
+                !spec.argv[run..]
+                    .iter()
+                    .any(|arg| arg == "--backend" || arg.starts_with("--backend=")),
+                "{mode}: a subcommand-level --backend in {:?}",
+                spec.argv
+            );
+        }
+    }
+
     #[test]
     fn run_workdir_precedes_the_guest_separator() {
         let mut test = recipe(true);

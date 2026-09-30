@@ -386,7 +386,24 @@ impl RunData {
         for arg in &aopts.run_args {
             run_cmd.push(arg.to_string());
         }
-        RunOpts::parse_from(run_cmd.iter())
+        RunOpts::try_parse_from(run_cmd.iter()).unwrap_or_else(|error| {
+            if crate::misplaced_backend_argument(&error).is_some() {
+                // Before `run` lost its own `--backend`, a `--run-arg=--backend=X`
+                // silently ran analyze's trials on backend X, although
+                // `validate_backend_scope` refuses every non-ptrace global
+                // `--backend` for `analyze`. Say so instead of letting clap
+                // suggest an unrelated `--backend-engagement-json`.
+                clap::Error::raw(
+                    clap::error::ErrorKind::UnknownArgument,
+                    "`--backend` is not a `run` option, so it cannot be passed to `hermit \
+                     analyze` through --run-arg or the run arguments. `hermit analyze` runs \
+                     every trial on the default ptrace backend: drop `--backend` from the \
+                     run arguments.\n",
+                )
+                .exit()
+            }
+            error.exit()
+        })
     }
 
     /// Extract the (initial) RunOpts for target/run1 that are implied by all of hermit analyze's arguments.

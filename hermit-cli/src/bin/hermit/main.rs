@@ -281,21 +281,12 @@ fn redirect_misplaced_backend(error: clap::Error, argv: &[std::ffi::OsString]) -
     use clap::error::ContextValue;
     use clap::error::ErrorKind;
 
-    if error.kind() != ErrorKind::UnknownArgument {
-        return error;
-    }
-    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+    let Some(invalid) = misplaced_backend_argument(&error) else {
         return error;
     };
-    if invalid != "--backend" && !invalid.starts_with("--backend=") {
-        return error;
-    }
     let mut command = Args::command();
     let mut redirected = clap::Error::new(ErrorKind::UnknownArgument).with_cmd(&command);
-    redirected.insert(
-        ContextKind::InvalidArg,
-        ContextValue::String(invalid.clone()),
-    );
+    redirected.insert(ContextKind::InvalidArg, ContextValue::String(invalid));
     redirected.insert(
         ContextKind::Usage,
         ContextValue::StyledStr(command.render_usage()),
@@ -311,9 +302,33 @@ fn redirect_misplaced_backend(error: clap::Error, argv: &[std::ffi::OsString]) -
     redirected
 }
 
+/// The offending argument when clap refused a `--backend` it found after a
+/// subcommand (`--backend` or `--backend=VALUE`), and `None` for every other
+/// parse error, including similarly named flags such as
+/// `--backend-engagement-json`.
+pub(crate) fn misplaced_backend_argument(error: &clap::Error) -> Option<String> {
+    use clap::error::ContextKind;
+    use clap::error::ContextValue;
+    use clap::error::ErrorKind;
+
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(invalid))
+            if invalid == "--backend" || invalid.starts_with("--backend=") =>
+        {
+            Some(invalid.clone())
+        }
+        _ => None,
+    }
+}
+
 /// `argv` with its single `--backend` option moved directly after the program
 /// name, rendered as a shell command. `None` when the option cannot be moved
-/// unambiguously (it appears more than once before `--`, or has no value).
+/// unambiguously: it appears more than once before `--`, or its value is
+/// missing, empty, or itself looks like an option (`run --backend --strict`
+/// must not suggest `--backend=--strict`).
 fn globally_placed_backend(argv: &[std::ffi::OsString]) -> Option<String> {
     let args = argv
         .iter()
@@ -344,6 +359,9 @@ fn globally_placed_backend(argv: &[std::ffi::OsString]) -> Option<String> {
     } else {
         remaining.remove(index).strip_prefix("--backend=")?
     };
+    if backend.is_empty() || backend.starts_with('-') {
+        return None;
+    }
     let flag = format!("--backend={backend}");
     let words = std::iter::once(*program)
         .chain(std::iter::once(flag.as_str()))
@@ -1612,12 +1630,16 @@ mod tests {
             .as_deref(),
             Some("h --backend=dbt run -- prog --backend")
         );
-        // Two backend options, or one without a value, cannot be moved safely,
-        // so the generic global spelling is shown instead.
+        // Two backend options, or one whose value is missing, empty, or looks
+        // like an option, cannot be moved safely, so the generic global
+        // spelling is shown instead.
         for argv in [
             &["h", "--backend=kvm", "run", "--backend=dbt", "--", "p"][..],
             &["h", "run", "--backend"][..],
             &["h", "run", "--backend", "--", "p"][..],
+            &["h", "run", "--backend", "--strict", "--", "p"][..],
+            &["h", "run", "--backend=", "--", "p"][..],
+            &["h", "run", "--backend=-x", "--", "p"][..],
         ] {
             assert_eq!(globally_placed_backend(&os_args(argv)), None, "{argv:?}");
         }
