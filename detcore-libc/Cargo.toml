@@ -1,0 +1,14 @@
+[package]
+name = "detcore-libc"
+description = "The libc that Detcore uses when it is built without std for the Narf kernel target."
+version = "0.2.0"
+edition = "2024"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
+publish = false
+
+# The crate is empty on every target except target_os = "none" (see
+# src/lib.rs), so its dependency is declared for that target only and the host
+# build compiles none of it. The Reverie revision is Detcore's pin.
+[target.'cfg(target_os = "none")'.dependencies]
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "c6c047b63e82dab57943cb9215413e1c14f465cf", default-features = false }
