@@ -8260,6 +8260,98 @@ fn run_timeout_fallback_fires_when_the_unwind_does_not_finish() {
     );
 }
 
+/// A `hermit run` of `/bin/true` whose container child sleeps `stall_ms` after
+/// publishing its result (test hook), with an optional finalize-budget
+/// override.
+fn run_with_post_publication_stall(stall_ms: u64, budget_ms: Option<&str>) -> (Output, Duration) {
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/true",
+    ];
+    let mut command = hermit_command(&args);
+    command
+        .env(
+            "HERMIT_INTERNAL_STALL_AFTER_PUBLICATION_MS",
+            stall_ms.to_string(),
+        )
+        .env_remove("HERMIT_FINALIZE_BUDGET_MS")
+        .stdin(Stdio::null());
+    if let Some(budget) = budget_ms {
+        command.env("HERMIT_FINALIZE_BUDGET_MS", budget);
+    }
+    let started = std::time::Instant::now();
+    let output = command.output().expect("failed to run hermit");
+    (output, started.elapsed())
+}
+
+/// https://github.com/rrnewton/hermit/issues/3414: after the container child
+/// publishes its result, the parent waits a bounded time for it to exit. That
+/// teardown was measured at up to 1.52 s on a saturated 316-CPU host, and the
+/// old 2 s bound cancelled completed runs under a parallel Buck run. The
+/// default is now 20 s, so a 3 s post-publication stall completes normally.
+#[test]
+fn a_teardown_stall_after_publication_completes_within_the_default_budget() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (output, elapsed) = run_with_post_publication_stall(3_000, None);
+    assert!(
+        output.status.success(),
+        "a 3 s teardown stall must fit the default finalize budget (took {elapsed:?}): {}",
+        stderr(&output)
+    );
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "the stall hook did not fire: {elapsed:?}"
+    );
+}
+
+/// A child that does not exit within the finalize budget is cancelled, and the
+/// error says so and names the budget, so it cannot be mistaken for a guest
+/// killed by SIGKILL. The override bounds the wait: a 10 s stall under a
+/// 500 ms budget ends long before the stall would.
+#[test]
+fn a_child_that_outlives_the_finalize_budget_is_cancelled_with_the_budget_named() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (output, elapsed) = run_with_post_publication_stall(10_000, Some("500"));
+    let stderr = stderr(&output);
+    // EXIT-CLASS: hermit
+    assert_eq!(output.status.code(), Some(125), "{stderr}");
+    assert!(
+        stderr.contains("did not exit within the 500ms finalize budget"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("this error reports a teardown stall"),
+        "{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "cancellation waited for the stall instead of the budget: {elapsed:?}"
+    );
+
+    // Within the overridden budget, the same kind of stall completes.
+    let (output, _) = run_with_post_publication_stall(200, Some("5000"));
+    assert!(output.status.success(), "{}", self::stderr(&output));
+}
+
+#[test]
+fn a_malformed_finalize_budget_is_refused() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for budget in ["0", "soon", "-5", "+5"] {
+        let (output, _) = run_with_post_publication_stall(0, Some(budget));
+        let stderr = stderr(&output);
+        assert!(!output.status.success(), "{budget}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "HERMIT_FINALIZE_BUDGET_MS={budget} is not a positive number of milliseconds"
+            )),
+            "{budget}: {stderr}"
+        );
+    }
+}
+
 /// `--timeout` refuses a backend where it was measured not to bound the run.
 ///
 /// ⚠️ THE BACKENDS ARE NAMED INDIVIDUALLY, NOT LOOPED OVER A LIST, so adding a

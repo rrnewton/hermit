@@ -33,7 +33,72 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde::de::Error as _;
 
-const FINALIZE_BUDGET: Duration = Duration::from_secs(2);
+/// How long the parent waits for the container child to EXIT after it has
+/// published its result, and then waits again after cancelling it.
+///
+/// The run is already over at this point; only teardown remains (the child's
+/// own exit and, as PID 1 of its namespace, reaping everything left in it).
+/// Publication-to-reap latency was measured on the development host recorded
+/// in docs/TESTING_ENVIRONMENTS.md (316 CPUs), for trace-level
+/// `hermit run --record-preemptions-to` of rustbin_heap_ptrs on a debug build,
+/// every run through safehermit:
+///
+/// | concurrent runs | samples | p50 | p99 | max |
+/// |---|---|---|---|---|
+/// | 1 | 30 | 2.4 ms | 2.9 ms | 2.9 ms |
+/// | 64 | 640 | 7.6 ms | 63 ms | 64 ms |
+/// | 158 | 948 | 9.5 ms | 84 ms | 161 ms |
+/// | 316 | 1264 | 18 ms | 1105 ms | 1222 ms |
+/// | 316, repeated | 1264 | 15 ms | 94 ms | 100 ms |
+/// | 316, `--no-namespace` | 1264 | 179 ms | 747 ms | 1033 ms |
+/// | 316, plus 316 CPU + 16 IO stress workers | 948 | 15 ms | 1386 ms | 1520 ms |
+/// | 632 | 1896 | 65 ms | 1223 ms | 1409 ms |
+/// | 1264 | 2528 | 20 ms | 893 ms | 1096 ms |
+///
+/// All 10,782 runs exited, and none took longer than 1.52 s, so the former
+/// 2 s bound held in every measured condition. The tail's cause was not
+/// identified: two identical 316-run sweeps differed 12x in their maximum, and
+/// the `--no-namespace` runs were bimodal with a 10x higher median. What was
+/// NOT measured is the failure itself: a fully parallel fbsource Buck run
+/// (mostly replay and chaos-replay targets) exceeded 2 s in 49 tests, which were
+/// then reported as cancelled although they had completed
+/// (<https://github.com/rrnewton/hermit/issues/3414>). How far beyond 2 s that
+/// teardown went is unknown.
+///
+/// 20 s is therefore a margin chosen without that measurement: 13x the largest
+/// measured tail. It only costs time for a child that genuinely does not exit
+/// after publishing. The same budget then applies after the SIGKILL, because
+/// the same teardown (the child's exit and its namespace reaping) has to finish
+/// again; that post-cancel wait was never exercised in the measurements. A
+/// child that never exits is therefore reported after up to 2 x 20 s, where the
+/// old bound took 2 x 2 s. `HERMIT_FINALIZE_BUDGET_MS` overrides both waits.
+const FINALIZE_BUDGET: Duration = Duration::from_secs(20);
+const FINALIZE_BUDGET_ENV: &str = "HERMIT_FINALIZE_BUDGET_MS";
+/// Test-only: the container child sleeps this many milliseconds after
+/// publishing its result, so the parent's finalize budget can be exercised.
+/// Read in the child from the hermit process's environment, never from the
+/// guest's; an unset or unparsable value means no stall.
+const STALL_AFTER_PUBLICATION_ENV: &str = "HERMIT_INTERNAL_STALL_AFTER_PUBLICATION_MS";
+
+/// The finalize budget for this invocation, refusing a malformed override
+/// rather than silently falling back to the default.
+fn finalize_budget() -> Result<Duration, Error> {
+    let Some(raw) = std::env::var_os(FINALIZE_BUDGET_ENV) else {
+        return Ok(FINALIZE_BUDGET);
+    };
+    let millis = raw
+        .to_str()
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{FINALIZE_BUDGET_ENV}={} is not a positive number of milliseconds",
+                raw.to_string_lossy()
+            )
+        })?;
+    Ok(Duration::from_millis(millis))
+}
 const RETAINED_OWNER_REMEDY: &str = "Stop the affected run through its process supervisor, \
     confirm its entire child tree has stopped, then start a fresh Hermit process; \
     retrying in this process cannot release the retained owner.";
@@ -90,6 +155,14 @@ struct PublishedFailureExit {
 }
 impl Drop for PublishedFailureExit {
     fn drop(&mut self) {
+        // Reverie drops this only after the result is flushed and closed, so a
+        // stall here is a stall after publication.
+        if let Some(millis) = std::env::var(STALL_AFTER_PUBLICATION_ENV)
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(millis));
+        }
         if self.unresolved {
             unsafe { libc::_exit(125) }
         }
@@ -175,6 +248,7 @@ where
     F: FnMut(&mut G) -> Result<T, Error> + 'static,
     T: Serialize + DeserializeOwned + 'static,
 {
+    let finalize_budget = finalize_budget()?;
     if RETAINED.load(Ordering::Acquire) {
         anyhow::bail!(
             "a prior CLI container owner is unresolved; backing resources remain retained; {RETAINED_OWNER_REMEDY}"
@@ -226,7 +300,7 @@ where
     let (first, child_pid) = match started {
         Ok(run) => {
             let pid = run.cleanup().child_pid().as_raw();
-            (run.finalize_until(Instant::now() + FINALIZE_BUDGET), pid)
+            (run.finalize_until(Instant::now() + finalize_budget), pid)
         }
         Err(StartupOwnedFailure::BeforeClone { cause }) => return Err(Error::new(cause)),
         Err(StartupOwnedFailure::AfterClone { cause, run }) => {
@@ -244,7 +318,7 @@ where
     // failed acquisition and lingering workers preserve their original failure.
     let final_result = match first {
         OwnedFinalize::Complete(result) => OwnedFinalize::Complete(result),
-        OwnedFinalize::Pending(run) => run.cancel_until(Instant::now() + FINALIZE_BUDGET),
+        OwnedFinalize::Pending(run) => run.cancel_until(Instant::now() + finalize_budget),
         OwnedFinalize::Failed { cause, cleanup } => {
             if matches!(
                 cleanup.cleanup().observation(),
@@ -253,7 +327,7 @@ where
             ) {
                 OwnedFinalize::Failed { cause, cleanup }
             } else {
-                cleanup.retry_until(Instant::now() + FINALIZE_BUDGET)
+                cleanup.retry_until(Instant::now() + finalize_budget)
             }
         }
     };
@@ -360,6 +434,18 @@ where
                             RunError::ExitStatus(status),
                         ))
                         .expect_err("an abnormal child status remains an error")
+                    }
+                    // Name the budget: this child published its result and
+                    // then did not exit in time, so hermit killed it. Without
+                    // the budget in the message it reads as a guest SIGKILL.
+                    _ if cause == OwnedRunFailure::Cancelled && cleanup.result_eof() => {
+                        anyhow::anyhow!(
+                            "container child published its result but did not exit within \
+                             the {finalize_budget:?} finalize budget ({FINALIZE_BUDGET_ENV} \
+                             overrides it), so hermit cancelled it and discarded the published \
+                             result; this error reports a teardown stall and says nothing about \
+                             the guest's own outcome; actual child: {observation:?}"
+                        )
                     }
                     _ => anyhow::anyhow!(
                         "container result failed: {cause:?}; actual child: {observation:?}"

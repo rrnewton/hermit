@@ -424,7 +424,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_dap_skip_never_applies_to_a_binary_named_hermit_dap
     // (https://github.com/rrnewton/hermit/issues/3419) retain all 92 prior
     // selected CLI identities.
-    ("test.cli", 94),
+    // a_teardown_stall_after_publication_completes_within_the_default_budget,
+    // a_child_that_outlives_the_finalize_budget_is_cancelled_with_the_budget_named
+    // and a_malformed_finalize_budget_is_refused
+    // (https://github.com/rrnewton/hermit/issues/3414) retain all 94 prior
+    // selected CLI identities.
+    ("test.cli", 97),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -444,7 +449,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 94),
+    ("test.cli_on_host", 97),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
