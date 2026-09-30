@@ -1164,10 +1164,13 @@ mod tests {
 
     /// The DBT arm builds its own [`verify::ComparisonOptions`], so the record
     /// envelope it names is not covered by the generic verifier's tests. Pin it
-    /// to the canonical transport policy selected by Reverie's authenticated
-    /// decoder. An opaque `caller_defined` predicate here would silently
-    /// disqualify every DBT verdict from bitwise parity, while `all_records_v1`
-    /// would falsely claim that initialization records remain in the log.
+    /// to `all_records_v1`, the envelope the schema-10 ledger accepts: the DBT
+    /// log holds every authenticated record, initialization records included at
+    /// their arrival positions. An opaque `caller_defined` predicate here would
+    /// silently disqualify every DBT verdict from bitwise parity, while
+    /// `dbt_evidence_transport_v1` would leave the initialization positions
+    /// uncompared. The DBT evidence tests in `backends.rs` check behaviourally
+    /// that the log and the verdict carry that stream.
     #[test]
     fn dbt_verdict_names_a_canonical_record_envelope() {
         let source = include_str!("backends.rs");
@@ -1192,11 +1195,11 @@ mod tests {
         };
         assert_eq!(
             record_envelope_literal(),
-            "RecordEnvelope::dbt_evidence_transport_v1()",
-            "the DBT adapter compares every non-transport evidence record and compares the \
-             authenticated initialization count separately. Changing this envelope changes \
-             which records are compared, so update the adapter and its evidence together, not \
-             just this literal"
+            "RecordEnvelope::all_records_v1()",
+            "the DBT adapter compares every authenticated evidence record, initialization \
+             records included at their arrival positions, and also compares the initialization \
+             count as a typed dimension. Changing this envelope changes which records are \
+             compared, so update the adapter and its evidence together, not just this literal"
         );
         // Naming the envelope is worth nothing if the adapter applies another
         // unreported filter while materializing the already decoded records.
@@ -1219,17 +1222,17 @@ mod tests {
         // Bind the literal above to the real policy, so renaming the
         // constructor without preserving its meaning fails here too.
         assert!(
-            crate::record_envelope::RecordEnvelope::dbt_evidence_transport_v1()
+            crate::record_envelope::RecordEnvelope::all_records_v1()
                 .policy()
                 .is_canonical(),
-            "dbt_evidence_transport_v1 must remain canonical or DBT verdicts silently lose \
+            "all_records_v1 must remain canonical or DBT verdicts silently lose \
              bitwise-parity eligibility"
         );
         assert_eq!(
-            crate::record_envelope::RecordEnvelope::dbt_evidence_transport_v1()
+            crate::record_envelope::RecordEnvelope::all_records_v1()
                 .policy()
                 .as_str(),
-            "dbt_evidence_transport_v1"
+            "all_records_v1"
         );
     }
 
