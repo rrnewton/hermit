@@ -91,6 +91,29 @@ fn rows(output: &Output) -> Vec<Value> {
         .collect()
 }
 
+/// `record` with each `(from, to)` replaced, where `from` occurs exactly
+/// once, so a fixture edit can neither miss its field nor touch another.
+fn edited(record: &str, edits: &[(&str, &str)]) -> String {
+    let mut record = record.to_string();
+    for &(from, to) in edits {
+        assert_eq!(record.matches(from).count(), 1, "{from} in {record}");
+        record = record.replace(from, to);
+    }
+    record
+}
+
+/// The whole `"first_difference":{...}` member of `record`, an object with
+/// no object inside it.
+fn first_difference(record: &str) -> &str {
+    let start = record.find(r#""first_difference":{"#).unwrap();
+    let end = start + record[start..].find('}').unwrap() + 1;
+    assert!(
+        record[end..].starts_with(r#","reference_log":"#),
+        "{record}"
+    );
+    &record[start..end]
+}
+
 #[test]
 fn export_prints_one_row_per_owed_cell_and_passes_real_records_through() {
     let root = scratch("rows");
@@ -216,24 +239,89 @@ fn export_refuses_an_inconsistent_node_and_prints_no_rows() {
         "{stderr}"
     );
 
-    // A matched record with partial credit breaks a credit invariant.
+    // A record carrying clean credit beside its unequalized credit is refused
+    // by the check that keeps the two apart, which comes before any check of
+    // the verdict.
     fs::remove_dir_all(root.join("portable/manifest_system_utils")).unwrap();
-    let matched = REAL_RECORD
-        .replace(r#""verdict":"diverged""#, r#""verdict":"matched""#)
-        .replace(r#""credit":null"#, r#""credit":0.5"#);
+    let both_credits = edited(
+        REAL_RECORD,
+        &[
+            (r#""verdict":"diverged""#, r#""verdict":"matched""#),
+            (r#""credit":null"#, r#""credit":0.5"#),
+        ],
+    );
     write_node(
         &root.join("portable/manifest_c_programs"),
         None,
-        Some(&format!("{matched}\n")),
+        Some(&format!("{both_credits}\n")),
     );
     let output = export(&["--e2e-root", root.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("parity record backend-parity-c/aio-refusal@kvm"),
+        stderr.contains(
+            "parity record backend-parity-c/aio-refusal@kvm: credit and unequalized_credit are \
+             exclusive"
+        ),
         "{stderr}"
     );
+
+    // A matched record with partial credit breaks a credit invariant. It
+    // passes every earlier check: equal inputs with clean credit only, no
+    // divergence position, and a credit that agrees with its prefix (53 of
+    // 106 is 0.5).
+    let partial_match = edited(
+        REAL_RECORD,
+        &[
+            (r#""verdict":"diverged""#, r#""verdict":"matched""#),
+            (r#""inputs_equalized":false"#, r#""inputs_equalized":true"#),
+            (r#""credit":null"#, r#""credit":0.5"#),
+            (
+                r#""unequalized_credit":0.11320754716981132"#,
+                r#""unequalized_credit":null"#,
+            ),
+            (
+                r#""first_divergent_record":13"#,
+                r#""first_divergent_record":null"#,
+            ),
+            (r#""matched_prefix":12"#, r#""matched_prefix":53"#),
+            (first_difference(REAL_RECORD), r#""first_difference":null"#),
+        ],
+    );
+    write_node(
+        &root.join("portable/manifest_c_programs"),
+        None,
+        Some(&format!("{partial_match}\n")),
+    );
+    let output = export(&["--e2e-root", root.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "parity record backend-parity-c/aio-refusal@kvm: a match must be full credit, got \
+             Some(0.5)"
+        ),
+        "{stderr}"
+    );
+    // The same record at full credit is published, so the partial credit
+    // alone is what was refused.
+    let full_match = edited(
+        &partial_match,
+        &[
+            (r#""credit":0.5"#, r#""credit":1.0"#),
+            (r#""matched_prefix":53"#, r#""matched_prefix":106"#),
+        ],
+    );
+    write_node(
+        &root.join("portable/manifest_c_programs"),
+        None,
+        Some(&format!("{full_match}\n")),
+    );
+    let published = rows(&export(&["--e2e-root", root.to_str().unwrap()]));
+    assert_eq!(published.len(), 1, "{published:?}");
+    assert_eq!(published[0]["verdict"], "matched", "{published:?}");
 
     // A record written before every record carried its typed class is
     // refused, not read without one.
