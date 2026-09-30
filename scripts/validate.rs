@@ -24755,7 +24755,10 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany all 189 cases: {stdout}"
                 );
             } else {
-                // 252 until backend-parity-c was folded into c-programs, which
+                // 255 until 87534ff72 added the hosted-portable leaf
+                // selftest.scorecard_commands, assigned to the checks job in
+                // ci/portable-shards.json. 252 until backend-parity-c was
+                // folded into c-programs, which
                 // removed e2e.manifest_backend_parity_c_on_host, and 251 until
                 // slice S13 retired test.dbt_parity_on_host
                 // (https://github.com/rrnewton/hermit/issues/3301). 250 until
@@ -24765,7 +24768,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "255 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "256 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
