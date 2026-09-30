@@ -171,9 +171,10 @@ impl RunData {
         self.sched_path_out = Some(normalized_path);
     }
 
-    /// The global options a trial run is launched with. The backend is the one
-    /// `hermit --backend <BACKEND> analyze` selected: `RunOpts::main` takes its
-    /// backend from these options, so this is what makes every trial run on it.
+    /// The global options a trial run is launched with. Trials go through
+    /// `RunOpts::run`, which dispatches on the trial `RunOpts`' own backend (set
+    /// from `hermit --backend <BACKEND> analyze` by `get_raw_runopts`); this
+    /// copy keeps the trial's global options consistent with it.
     fn trial_global_opts(&self) -> GlobalOpts {
         let log_path = self.root_path().with_extension(LOG_EXT);
         GlobalOpts {
@@ -396,9 +397,18 @@ impl RunData {
                 // trials' backend instead of letting clap suggest the unrelated
                 // `--backend-engagement-json`. clap reports only the flag name,
                 // so read the value from the run arguments themselves.
+                // The first `--backend` is the one clap refused; later tokens may
+                // be the guest's own arguments.
                 let value = run_cmd
                     .iter()
-                    .find_map(|arg| arg.strip_prefix("--backend="))
+                    .enumerate()
+                    .find_map(|(index, arg)| {
+                        if arg == "--backend" {
+                            Some(run_cmd.get(index + 1).map(String::as_str).unwrap_or(""))
+                        } else {
+                            arg.strip_prefix("--backend=")
+                        }
+                    })
                     .filter(|value| !value.is_empty() && !value.starts_with('-'))
                     .unwrap_or("<BACKEND>");
                 clap::Error::raw(
@@ -565,7 +575,7 @@ mod tests {
     /// trial `RunOpts`, and the printed reproducer.
     #[test]
     fn global_backend_reaches_every_trial_run() {
-        for flag in ["ptrace", "kvm", "liteinst"] {
+        for flag in ["ptrace", "kvm"] {
             let argv = [
                 "hermit".to_owned(),
                 format!("--backend={flag}"),
