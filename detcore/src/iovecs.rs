@@ -32,6 +32,7 @@ impl UserAddressPolicy {
     pub(crate) fn validate(self, iovecs: &[ImportedIovec]) -> Result<(), Error> {
         match self {
             Self::Kvm => validate_ranges(iovecs, KVM_USER_LIMIT).map_err(Error::from),
+            #[cfg(not(target_os = "none"))]
             Self::Native => {
                 let local: Vec<_> = iovecs
                     .iter()
@@ -57,10 +58,17 @@ impl UserAddressPolicy {
                 };
                 native_import_result(result, Errno::last())
             }
+            // The host asks its own kernel for the user address limit. The
+            // Narf kernel build of Detcore has no host kernel to ask.
+            #[cfg(target_os = "none")]
+            Self::Native => Err(Error::Tool(anyhow::anyhow!(
+                "native iovec range validation needs a host kernel, which the Narf kernel build of Detcore does not have; it supports only the KVM address policy"
+            ))),
         }
     }
 }
 
+#[cfg(not(target_os = "none"))]
 fn native_import_result(result: isize, error: Errno) -> Result<(), Error> {
     match (result, error) {
         (0, _) => Ok(()),

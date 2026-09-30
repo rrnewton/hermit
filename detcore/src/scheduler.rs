@@ -16,6 +16,8 @@ mod parked_tests;
 pub(crate) mod real_timer;
 mod replayer;
 pub mod runqueue;
+#[cfg(any(test, target_os = "none"))]
+mod shared_receiver;
 pub(crate) mod signal_control;
 pub mod timed_waiters;
 
@@ -25,8 +27,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::iter::Peekable;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::AsRawFd;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::FromRawFd;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,8 +45,10 @@ use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+#[cfg(not(target_os = "none"))]
 use futures::FutureExt;
 use futures::channel::oneshot;
+#[cfg(not(target_os = "none"))]
 use futures::future::Shared;
 #[cfg(not(target_os = "none"))]
 use nix::sys::signal;
@@ -53,9 +60,6 @@ use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
-// Without std, reverie-process's look-alike of nix's type, as in detcore-model.
-#[cfg(target_os = "none")]
-use reverie::Pid;
 use reverie::Signal;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -653,7 +657,7 @@ pub struct Scheduler {
     // callback and daemon wait clones its own subscriber, unlike an Ivar.
     backend_failure: Option<BackendFailureLocation>,
     backend_failure_sender: Option<oneshot::Sender<()>>,
-    backend_failure_wake: Shared<oneshot::Receiver<()>>,
+    backend_failure_wake: BackendFailureWaiter,
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
@@ -843,7 +847,9 @@ struct ProcessWaitMetadata {
     session: DetPid,
 }
 
+#[cfg(not(target_os = "none"))]
 use pretty::Doc;
+#[cfg(not(target_os = "none"))]
 use pretty::RcDoc;
 
 use self::replayer::DesyncStats;
@@ -886,6 +892,7 @@ impl ThreadTree {
     ///   `[1 [2 [3] 4] (5 6 7)]`
     // TODO: it would also be nice to store a fixed prefix of the binary name and listing
     // that along with the thread ID.
+    #[cfg(not(target_os = "none"))]
     pub fn pretty_print(&self) -> String {
         fn walk<'a>(
             tt: &'a HashMap<DetTid, Vec<DetTid>>,
@@ -943,6 +950,52 @@ impl ThreadTree {
         let mut vec = Vec::new();
         doc.render(width, &mut vec).unwrap();
         String::from_utf8(vec).unwrap()
+    }
+
+    /// Render the tree as the host's `pretty_print` does, always on one line:
+    /// the Narf kernel build of Detcore has no `pretty` crate to wrap it. The
+    /// output is the host's whenever that fits in the host's 100 columns.
+    #[cfg(target_os = "none")]
+    pub fn pretty_print(&self) -> String {
+        self.render_flat()
+    }
+
+    /// The tree in `pretty_print`'s notation, on one line.
+    #[cfg(any(test, target_os = "none"))]
+    fn render_flat(&self) -> String {
+        fn walk(
+            tt: &HashMap<DetTid, Vec<DetTid>>,
+            tgl: &HashSet<DetTid>,
+            current: &DetTid,
+            out: &mut String,
+        ) {
+            let Some(children) = tt.get(current) else {
+                // This should be unreachable if the invariants are maintained:
+                let _ = write!(out, "<ThreadTree corrupt, missing tid: {current}>");
+                return;
+            };
+            let (open, close) = if tgl.contains(current) {
+                ("[", "]")
+            } else if children.is_empty() {
+                let _ = write!(out, "{current}");
+                return;
+            } else {
+                ("(", ")")
+            };
+            let _ = write!(out, "{open}{current}");
+            for child in children {
+                out.push(' ');
+                walk(tt, tgl, child, out);
+            }
+            out.push_str(close);
+        }
+
+        let Some(root) = self.root else {
+            return "[]".into();
+        };
+        let mut out = String::new();
+        walk(&self.tree, &self.thread_group_leaders, &root, &mut out);
+        out
     }
 
     #[allow(dead_code)]
@@ -1175,6 +1228,7 @@ impl Default for Backoff {
 
 pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
 
+#[cfg(not(target_os = "none"))]
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
     sched_loop_inner(sched, timer, false, None).await;
 }
@@ -1349,6 +1403,14 @@ struct BackendFailureLocation {
     tid: Option<reverie::Tid>,
     phase: &'static str,
 }
+
+/// A wait for the backend-failure notice that every waiter can clone.
+#[cfg(not(target_os = "none"))]
+pub(crate) type BackendFailureWaiter = Shared<oneshot::Receiver<()>>;
+/// Without std, `futures` has no `Shared`; `SharedReceiver` does its job for
+/// this one receiver.
+#[cfg(target_os = "none")]
+pub(crate) type BackendFailureWaiter = shared_receiver::SharedReceiver;
 
 /// Wait without manufacturing a normal scheduler request or response. The
 /// caller must check the terminal state again under the mutex before mutation.
@@ -1673,7 +1735,92 @@ fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
 /// Until panics are escalated properly, this encapsulates a way to exit the hermit container
 /// entirely.
 pub fn immediate_fatal_exit() {
+    #[cfg(not(target_os = "none"))]
     std::process::exit(1);
+    // The Narf kernel build of Detcore has no process to exit. Until Narf
+    // gives it a way to end the run with a status, it stops the run here.
+    #[cfg(target_os = "none")]
+    panic!("Fatal exit with status 1: the Narf kernel build of Detcore has no process to exit");
+}
+
+/// The Narf kernel build of Detcore opens no pidfds (see `open_thread_pidfd`),
+/// so its map of them is always empty.
+#[cfg(target_os = "none")]
+#[derive(Debug)]
+enum OwnedFd {}
+
+/// Open a pidfd for a host thread, for `Scheduler::register_physical_thread`.
+#[cfg(not(target_os = "none"))]
+fn open_thread_pidfd(physical_tid: i32) -> std::io::Result<OwnedFd> {
+    let raw_fd = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            physical_tid,
+            libc::O_EXCL as libc::c_uint,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a new descriptor owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) })
+}
+
+/// The Narf kernel build of Detcore has no host threads, so it has no pidfds.
+#[cfg(target_os = "none")]
+fn open_thread_pidfd(physical_tid: i32) -> std::io::Result<OwnedFd> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "the Narf kernel build of Detcore has no pidfds, so it cannot bind host thread {physical_tid}"
+        ),
+    ))
+}
+
+/// The error of a failed host signal: nix's errno on the host. The Narf kernel
+/// build of Detcore sends no host signals and names it through Reverie.
+#[cfg(not(target_os = "none"))]
+type HostErrno = nix::errno::Errno;
+#[cfg(target_os = "none")]
+type HostErrno = reverie::Errno;
+
+/// Send a signal to a host thread through its pidfd.
+#[cfg(not(target_os = "none"))]
+fn send_signal_through_pidfd(pidfd: &OwnedFd, signal: Signal) -> Result<(), HostErrno> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal as libc::c_int,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        Err(nix::errno::Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
+/// The Narf kernel build of Detcore has no pidfds.
+#[cfg(target_os = "none")]
+fn send_signal_through_pidfd(pidfd: &OwnedFd, _signal: Signal) -> Result<(), HostErrno> {
+    match *pidfd {}
+}
+
+/// Send a signal to the host thread that a scheduler identity names.
+#[cfg(not(target_os = "none"))]
+fn kill_host_thread(dettid: DetTid, signal: Signal) -> Result<(), HostErrno> {
+    let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+    signal::kill(pid, signal)
+}
+
+/// The Narf kernel build of Detcore has no host threads; `Scheduler::signal_guest`
+/// does not call this there.
+#[cfg(target_os = "none")]
+fn kill_host_thread(_dettid: DetTid, _signal: Signal) -> Result<(), HostErrno> {
+    unreachable!("the Narf kernel build of Detcore has no host threads to signal")
 }
 
 /// The result of consuming a SchedEvent during --replay-preemptions-from.  This represents some
@@ -1776,7 +1923,10 @@ impl Scheduler {
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
+            #[cfg(not(target_os = "none"))]
             backend_failure_wake: backend_failure_wake.shared(),
+            #[cfg(target_os = "none")]
+            backend_failure_wake: shared_receiver::SharedReceiver::new(backend_failure_wake),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             backend_is_kvm: cfg.backend_is_kvm,
             #[cfg(test)]
@@ -1849,18 +1999,7 @@ impl Scheduler {
                 ));
             }
         }
-        let raw_fd = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_open,
-                physical_tid,
-                libc::O_EXCL as libc::c_uint,
-            )
-        };
-        if raw_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: pidfd_open returned a new descriptor owned by this process.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+        let pidfd = open_thread_pidfd(physical_tid)?;
         self.physical_thread_pidfds
             .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
         Ok(())
@@ -2597,7 +2736,7 @@ impl Scheduler {
         self.backend_failure.is_some()
     }
 
-    pub(crate) fn backend_failure_waiter(&self) -> Shared<oneshot::Receiver<()>> {
+    pub(crate) fn backend_failure_waiter(&self) -> BackendFailureWaiter {
         self.backend_failure_wake.clone()
     }
 
@@ -3311,21 +3450,11 @@ impl Scheduler {
             dettid, signal
         );
         let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    pidfd.as_raw_fd(),
-                    signal as libc::c_int,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            if rc < 0 {
-                Err(nix::errno::Errno::last())
-            } else {
-                Ok(())
-            }
-        } else if self.backend_requires_thread_directed_process_signals {
+            send_signal_through_pidfd(pidfd, signal)
+        } else if self.backend_requires_thread_directed_process_signals || cfg!(target_os = "none")
+        {
+            // The Narf kernel build of Detcore has no host threads to signal,
+            // so without a pidfd it always ends here.
             self.terminal_deadlock.get_or_insert_with(|| {
                 format!(
                     "HERMIT_DEADLOCK: scheduler cannot deliver signal {} to dettid {} without its host thread pidfd",
@@ -3334,8 +3463,7 @@ impl Scheduler {
             });
             return;
         } else {
-            let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
-            signal::kill(pid, signal)
+            kill_host_thread(dettid, signal)
         };
         match result {
             Ok(()) => {}
@@ -3360,7 +3488,7 @@ impl Scheduler {
             // stdout and never exited. The pipeline's short-lived subshells hit
             // this window repeatedly. Found only once the 22 `run_kvm_` cli
             // tests were scheduled; nothing had ever run them.
-            Err(nix::errno::Errno::ESRCH) => {
+            Err(HostErrno::ESRCH) => {
                 info!(
                     "[dtid {}] signal {} not delivered: the thread exited before it landed. \
                      Expected race; nothing to deliver and nothing to wake.",
@@ -7712,6 +7840,30 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    /// The Narf kernel build renders the tree on one line with `render_flat`;
+    /// for a tree that fits in 100 columns that is the host's `pretty_print`.
+    #[test]
+    fn flat_render_matches_pretty_print() {
+        let mut tree: ThreadTree = Default::default();
+        assert_eq!(tree.render_flat(), "[]");
+        assert_eq!(tree.render_flat(), tree.pretty_print());
+
+        let p1 = DetPid::from_raw(100);
+        let p2 = DetPid::from_raw(200);
+        let p3 = DetPid::from_raw(300);
+        let p4 = DetPid::from_raw(400);
+        let p5 = DetPid::from_raw(500);
+        let p6 = DetPid::from_raw(600);
+        tree.add_child(p1, p1, true);
+        tree.add_child(p1, p2, false);
+        tree.add_child(p1, p3, true);
+        tree.add_child(p3, p4, false);
+        tree.add_child(p4, p5, false);
+        tree.add_child(p1, p6, true);
+        assert_eq!(tree.render_flat(), "[100 200 [300 (400 500)] [600]]");
+        assert_eq!(tree.render_flat(), tree.pretty_print());
     }
 
     #[test]
