@@ -112,6 +112,12 @@ cpp_unittest(
 )
 
 cpp_unittest(
+    name = "replay_epoch_probe",
+    srcs = ["replay_epoch_probe.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
     name = "recvmsg_scm_rights_mmap",
     srcs = ["recvmsg_scm_rights_mmap.c"],
     labels = ["autodeps2_generated"],
