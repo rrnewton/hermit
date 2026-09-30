@@ -81,12 +81,11 @@ pub struct ToolSelfTest {
     pub program: &'static str,
     pub args: &'static [&'static str],
     /// `None` runs the self-test in every validation. `Some(triggers)` runs
-    /// it whenever a path changed since the merge base with `origin/main` is
-    /// under one of the triggers (a trigger ending in `/` is a directory; any
-    /// other trigger is one tracked path, a file or a submodule); on a HEAD
-    /// already contained in `origin/main`, the change set is HEAD's top commit.
-    /// Otherwise the node prints a NOT RUN line (`self_test_selection`) and
-    /// passes.
+    /// it on main and whenever a path changed since the merge base with
+    /// `origin/main` is under one of the triggers (a trigger ending in `/` is
+    /// a directory; any other trigger is one tracked path, a file or a
+    /// submodule); otherwise the node prints a NOT RUN line
+    /// (`self_test_selection`) and passes.
     pub run_when_changed: Option<&'static [&'static str]>,
     /// `test-harness selftest` passes the `hermit-manifest-plan` binary that
     /// its own build wrote beside it through `HERMIT_MANIFEST_PLAN_BIN`, so the
@@ -137,17 +136,41 @@ impl ToolSelfTest {
 /// unit tests; see `scorecard_commands` and `scorecard_tests` in
 /// [`TOOL_SELF_TESTS`]. Every entry must name a tracked path, every tracked
 /// file under [`SCORECARD_INPUT_ROOTS`] must be under an entry here or in
-/// [`SCORECARD_NON_INPUTS`], and every `#[path]` module an input includes
-/// must be under an entry here (`self_test_selection`'s tests check all
-/// three).
+/// [`SCORECARD_NON_INPUTS`], every `#[path]` module an input's source declares
+/// must be under an entry here, and every file an input's source includes
+/// (`include_str!`, `include_bytes!`, `include!`) must be under an entry here
+/// or in [`SCORECARD_NON_INPUTS`] (`self_test_selection`'s tests check all
+/// four).
 ///
 /// Derived 2026-09-30 from the dep-info of the scorecard's release and test
-/// builds, of `hermit-manifest-plan` and of `test-harness`, plus a traced run
-/// of both nodes, every file their processes opened: the build inputs are the
-/// scorecard, the rust-script prelude it includes, the manifest-plan library
-/// and helper with the files their `#[path]` modules include, detcore-model
-/// and agent-utils (path dependencies), and the Cargo manifests and lock; the
-/// run reads the data files named below and the git history of HEAD.
+/// builds, of `hermit-manifest-plan`, of `test-harness` and of the release
+/// build of `scripts/validate.rs`, plus a traced run of both nodes. The build
+/// inputs are the scorecard, the rust-script prelude it includes, the
+/// manifest-plan library and helper with the files their `#[path]` modules
+/// include, detcore-model and agent-utils (path dependencies), and the Cargo
+/// manifests and lock; the run opens the data files named below and reads the
+/// git history of HEAD.
+///
+/// The regression tier runs the whole DAG generator,
+/// `validation_dag::generate`, which executes `scripts/validate.rs`. That
+/// script, every `scripts/lib/` module it declares through `#[path]`, and the
+/// files it includes are listed here one path each, so the module scan above
+/// follows its module tree: a new module or included file breaks the test
+/// until it is classified. The generator's run also opens the four compat
+/// corpora under `ci/compat/` and the committed `ci/dag/validate.json`,
+/// which are listed here too. A new file that the generator opens at run time
+/// is not visible to that scan; the backstop is
+/// `validation_dag::tests::full_generator_refuses_static_artifact_mutations`,
+/// run by test.regular_crates in every validation, which requires the
+/// generator's output to equal `ci/dag/validate.json`.
+///
+/// `tests/` is selected through a stand-in (accepted by the coordinator
+/// 2026-09-30): the helper refuses a `tests/` tree whose files differ from
+/// its inventory. That depends on which paths exist under `tests/`, not on
+/// their contents (the traced run listed and stat'ed them and opened none),
+/// and the inventory is `tests/e2e/manifests/inventory/test-files.json`,
+/// which gate.manifest's `test-harness validate` holds equal to the tree in
+/// every validation.
 pub const SCORECARD_INPUTS: &[&str] = &[
     // The scorecard, its cell list and its series-snapshot fixture.
     "ci/compat-envelope/scorecard.rs",
@@ -218,6 +241,31 @@ pub const SCORECARD_INPUTS: &[&str] = &[
     "ci/expected-e2e-plan.json",
     "ci/ci-reason-baseline.json",
     "ci/matrix-symmetry-baseline.json",
+    // The DAG generator the regression tier runs, its modules, the committed
+    // DAG it includes and the compat corpora it opens.
+    "scripts/validate.rs",
+    "scripts/lib/exec_safe_fs.rs",
+    "scripts/lib/safe_ci_scope.rs",
+    "scripts/lib/validate_admission.rs",
+    "scripts/lib/validate_artifacts.rs",
+    "scripts/lib/validate_cell_results.rs",
+    "scripts/lib/validate_classification.rs",
+    "scripts/lib/validate_corpus.rs",
+    "scripts/lib/validate_envelope.rs",
+    "scripts/lib/validate_evidence.rs",
+    "scripts/lib/validate_history.rs",
+    "scripts/lib/validate_nextest_fixture.rs",
+    "scripts/lib/validate_pinned_image.rs",
+    "scripts/lib/validate_plan.rs",
+    "scripts/lib/validate_receipt.rs",
+    "scripts/lib/validate_runtime.rs",
+    "scripts/lib/validate_super.rs",
+    "scripts/lib/validate_test_results.rs",
+    "ci/dag/validate.json",
+    "ci/compat/corpus-e9patch.json",
+    "ci/compat/corpus-rr.json",
+    "ci/compat/corpus-sabre.json",
+    "ci/compat/corpus-strict.json",
 ];
 
 /// The directories that hold the scorecard's inputs. Every tracked file under
@@ -231,10 +279,12 @@ pub const SCORECARD_INPUT_ROOTS: &[&str] = &[
     "tests/e2e/manifests/",
 ];
 
-/// Tracked paths under [`SCORECARD_INPUT_ROOTS`] that neither node reads,
-/// each with the reason. A trailing `/` names a directory. None of them is in
-/// the dep-info of the scorecard's builds, of `hermit-manifest-plan` or of
-/// `test-harness`, and the traced run opened none of them.
+/// Tracked paths that neither node reads, each with the reason: files under
+/// [`SCORECARD_INPUT_ROOTS`], and files elsewhere that an input's source
+/// includes only in code neither node compiles. A trailing `/` names a
+/// directory. None of them is in the dep-info of the scorecard's builds, of
+/// `hermit-manifest-plan`, of `test-harness` or of the release build of
+/// `scripts/validate.rs`, and the traced run opened none of them.
 pub const SCORECARD_NON_INPUTS: &[(&str, &str)] = &[
     (
         "ci/compat-envelope/README.md",
@@ -278,7 +328,7 @@ pub const SCORECARD_NON_INPUTS: &[(&str, &str)] = &[
     ),
     (
         "ci/manifest-plan/src/bin/manifest-metadata.rs",
-        "a separate binary; neither node builds or runs it",
+        "a separate binary, included otherwise only by manifest_metadata.rs's #[cfg(test)] module; neither node builds or runs either",
     ),
     (
         "ci/manifest-plan/src/bin/nextest-cpu-wrapper.rs",
@@ -304,6 +354,54 @@ pub const SCORECARD_NON_INPUTS: &[(&str, &str)] = &[
     (
         "ci/rust-script-bin/test-ownership.sh",
         "run only by scripts/check-script-sigpipe.sh",
+    ), // Outside the input roots, allowed only because an input includes them.
+    (
+        ".github/workflows/validation-levels.yml",
+        "included only by test-harness.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "ci/portable-shards.json",
+        "included only by test-harness.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        ".github/workflows/ci-portable.yml",
+        "included only by validation_dag.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "ci/check-shard-coverage.sh",
+        "included only by validation_dag.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "ci/hermetic/run-split-validate.sh",
+        "included only by validation_dag.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "scripts/run-script-tests.sh",
+        "included only by validation_dag.rs's #[cfg(test)] module, which neither node builds",
+    ),
+    (
+        "scripts/lib/fixtures/schema10-matched-cell.json",
+        "included only by validate_cell_results.rs's #[cfg(test)] module; the generator runs the release build of scripts/validate.rs",
+    ),
+    (
+        "scripts/lib/fixtures/schema10-matched-plan.json",
+        "included only by the #[cfg(test)] modules of validate_cell_results.rs and validate_evidence.rs; the generator runs the release build of scripts/validate.rs",
+    ),
+    (
+        "tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json",
+        "included only by validate_cell_results.rs's #[cfg(test)] module; the generator runs the release build of scripts/validate.rs",
+    ),
+    (
+        "tests/fixtures/ledger-schema10/legacy/ordinary-only-row.json",
+        "included only by validate_cell_results.rs's #[cfg(test)] module; the generator runs the release build of scripts/validate.rs",
+    ),
+    (
+        "ci/tests/nextest-preparation-cargo-fixture.py",
+        "included only by scripts/validate.rs's #[cfg(test)] module; the generator runs the release build of scripts/validate.rs",
+    ),
+    (
+        "tests/fixtures/scorecard-writeback/refusal.txt",
+        "included only by scripts/validate.rs's #[cfg(test)] module; the generator runs the release build of scripts/validate.rs",
     ),
 ];
 
