@@ -4147,7 +4147,7 @@ fn manifest_plan_input_digest(
 /// [`MANIFEST_PLAN_CACHE_ENV`] when an identical input was planned before.
 fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
     let program = prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref())?;
-    let cache = match (env::var_os(MANIFEST_PLAN_CACHE_ENV), &program) {
+    let directory = match (env::var_os(MANIFEST_PLAN_CACHE_ENV), &program) {
         (None, _) => None,
         (Some(_), None) => {
             return Err(format!(
@@ -4155,7 +4155,7 @@ fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
                  {MANIFEST_PLAN_BIN_ENV} is unset"
             ));
         }
-        (Some(directory), Some(program)) => {
+        (Some(directory), Some(_)) => {
             let directory = PathBuf::from(directory);
             if !directory.is_absolute() || !directory.is_dir() {
                 return Err(format!(
@@ -4163,23 +4163,27 @@ fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
                     directory.display()
                 ));
             }
-            manifest_plan_cache_key(program, root)?.map(|key| (directory, key))
+            Some(PlanDirectory(directory))
         }
     };
-    if let Some((directory, key)) = &cache {
-        match fs::read(directory.join(key)) {
-            Ok(stdout) => return Ok(stdout),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot read cached manifest plan {}: {error}",
-                    directory.join(key).display()
-                ));
-            }
+    match (&program, &directory) {
+        (Some(program), Some(directory)) => {
+            cached_manifest_plan(program, directory, root).map(|(plan, _)| plan)
         }
+        #[cfg(test)]
+        _ => {
+            let (program, memory) = unit_test_manifest_plan(program)?;
+            cached_manifest_plan(program, memory, root).map(|(plan, _)| plan)
+        }
+        #[cfg(not(test))]
+        _ => run_manifest_plan(program.as_deref(), root),
     }
+}
 
-    let mut command = match &program {
+/// Run `program --root ROOT --format matrix-json`, or the default binary
+/// through `cargo run` when `program` is `None`.
+fn run_manifest_plan(program: Option<&Path>, root: &Path) -> Result<Vec<u8>, String> {
+    let mut command = match program {
         Some(program) => Command::new(program),
         None => {
             let mut command = manifest_plan_cargo("run")?;
@@ -4200,21 +4204,138 @@ fn manifest_plan_matrix(root: &Path) -> Result<Vec<u8>, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    Ok(output.stdout)
+}
 
-    if let (Some((directory, key)), Some(program)) = (&cache, &program) {
-        // Keep the output only if no input changed while the helper ran.
-        if manifest_plan_cache_key(program, root)?.as_ref() == Some(key) {
-            let mut temporary = NamedTempFile::new_in(directory)
-                .map_err(|e| format!("cannot create a manifest plan cache file: {e}"))?;
-            temporary
-                .write_all(&output.stdout)
-                .map_err(|e| format!("cannot write a manifest plan cache file: {e}"))?;
-            temporary
-                .persist(directory.join(key))
-                .map_err(|e| format!("cannot store a manifest plan cache file: {}", e.error))?;
+/// Where [`cached_manifest_plan`] files each helper output under its
+/// [`manifest_plan_cache_key`].
+trait PlanStore {
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
+    fn save(&self, key: &str, plan: &[u8]) -> Result<(), String>;
+}
+
+/// The directory named by [`MANIFEST_PLAN_CACHE_ENV`].
+struct PlanDirectory(PathBuf);
+
+impl PlanStore for PlanDirectory {
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(self.0.join(key)) {
+            Ok(plan) => Ok(Some(plan)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "cannot read cached manifest plan {}: {error}",
+                self.0.join(key).display()
+            )),
         }
     }
-    Ok(output.stdout)
+
+    fn save(&self, key: &str, plan: &[u8]) -> Result<(), String> {
+        let mut temporary = NamedTempFile::new_in(&self.0)
+            .map_err(|e| format!("cannot create a manifest plan cache file: {e}"))?;
+        temporary
+            .write_all(plan)
+            .map_err(|e| format!("cannot write a manifest plan cache file: {e}"))?;
+        temporary
+            .persist(self.0.join(key))
+            .map_err(|e| format!("cannot store a manifest plan cache file: {}", e.error))?;
+        Ok(())
+    }
+}
+
+/// `program`'s plan for `root`, from `store` when an identical input was
+/// planned before, and whether the helper ran to produce it. An input that
+/// has no key is planned every time.
+fn cached_manifest_plan(
+    program: &Path,
+    store: &dyn PlanStore,
+    root: &Path,
+) -> Result<(Vec<u8>, bool), String> {
+    let key = manifest_plan_cache_key(program, root)?;
+    if let Some(key) = &key {
+        if let Some(plan) = store.load(key)? {
+            return Ok((plan, false));
+        }
+    }
+    let plan = run_manifest_plan(Some(program), root)?;
+    // Keep the output only if no input changed while the helper ran.
+    if let Some(key) = &key {
+        if manifest_plan_cache_key(program, root)?.as_ref() == Some(key) {
+            store.save(key, &plan)?;
+        }
+    }
+    Ok((plan, true))
+}
+
+/// The unit tests' plan store: this process's memory, so the first derive of
+/// every test process runs the helper and a plan never outlives the process.
+#[cfg(test)]
+struct PlanMemory(std::sync::Mutex<BTreeMap<String, Vec<u8>>>);
+
+#[cfg(test)]
+impl PlanStore for PlanMemory {
+    fn load(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.0.lock().unwrap().get(key).cloned())
+    }
+
+    fn save(&self, key: &str, plan: &[u8]) -> Result<(), String> {
+        self.0.lock().unwrap().insert(key.into(), plan.to_vec());
+        Ok(())
+    }
+}
+
+/// The helper and plan store that the unit tests' derives share. Their
+/// fixtures are clones of this checkout, so almost every derive plans the
+/// same inputs: `cargo run` for each of them cost 0.5 s, of which 0.1 s was
+/// Cargo's fingerprint check (measured 2026-09-30). The helper is the
+/// prepared one when [`MANIFEST_PLAN_BIN_ENV`] names it, and otherwise the
+/// one a single `cargo build` in this process produced.
+#[cfg(test)]
+fn unit_test_manifest_plan(
+    prepared: Option<PathBuf>,
+) -> Result<(&'static Path, &'static PlanMemory), String> {
+    static PLAN: std::sync::OnceLock<Result<(PathBuf, PlanMemory), String>> =
+        std::sync::OnceLock::new();
+    let resolved = PLAN.get_or_init(|| {
+        let program = match prepared {
+            Some(program) => program,
+            None => built_manifest_plan()?,
+        };
+        Ok((program, PlanMemory(Default::default())))
+    });
+    match resolved {
+        Ok((program, memory)) => Ok((program, memory)),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// Build the default `hermit-manifest-plan` binary and return the path that
+/// Cargo reports for it.
+#[cfg(test)]
+fn built_manifest_plan() -> Result<PathBuf, String> {
+    let output = manifest_plan_cargo("build")?
+        .arg("--message-format=json-render-diagnostics")
+        .output()
+        .map_err(|e| format!("cannot build hermit-manifest-plan: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "hermit-manifest-plan failed to build:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut built = None;
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Ok(message) = serde_json::from_slice::<JsonValue>(line) else {
+            continue;
+        };
+        if message["reason"] == "compiler-artifact"
+            && message["target"]["name"] == "hermit-manifest-plan"
+        {
+            if let Some(executable) = message["executable"].as_str() {
+                built = Some(PathBuf::from(executable));
+            }
+        }
+    }
+    built.ok_or_else(|| "cargo build named no hermit-manifest-plan executable".into())
 }
 
 fn derive(root: &Path) -> Result<Derived, String> {
@@ -15189,6 +15310,92 @@ mod prepared_manifest_plan_tests {
             manifest_plan_cache_key(&helper, Path::new("relative/root")).unwrap(),
             None
         );
+    }
+
+    /// A stub helper that prints the sample manifest it plans, in a Git
+    /// checkout of [`plan_inputs`], so that [`manifest_plan_cache_key`] can
+    /// list it.
+    fn stub_plan() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let inputs = plan_inputs();
+        let helper = inputs.path().join("stub-manifest-plan");
+        fs::write(
+            &helper,
+            "#!/bin/sh\ncat \"$2/tests/e2e/manifests/sample.yaml\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let status = fixture_git()
+            .args(["init", "--quiet"])
+            .current_dir(inputs.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        (inputs, helper)
+    }
+
+    #[test]
+    fn a_plan_store_runs_the_helper_for_every_input_it_has_not_planned() {
+        let (inputs, helper) = stub_plan();
+        let root = inputs.path();
+        let memory = PlanMemory(Default::default());
+        let plan = |store: &dyn PlanStore| cached_manifest_plan(&helper, store, root).unwrap();
+        assert_eq!(
+            plan(&memory),
+            (b"bucket: sample\n".to_vec(), true),
+            "empty store"
+        );
+        assert_eq!(
+            plan(&memory),
+            (b"bucket: sample\n".to_vec(), false),
+            "same tree"
+        );
+
+        let manifest = root.join("tests/e2e/manifests/sample.yaml");
+        fs::write(&manifest, "bucket: changed\n").unwrap();
+        assert_eq!(
+            plan(&memory),
+            (b"bucket: changed\n".to_vec(), true),
+            "changed tree"
+        );
+        fs::write(&manifest, "bucket: sample\n").unwrap();
+        assert_eq!(
+            plan(&memory),
+            (b"bucket: sample\n".to_vec(), false),
+            "tree restored"
+        );
+        fs::write(root.join("tests/e2e/sample/new.sh"), "#!/bin/sh\n").unwrap();
+        assert!(plan(&memory).1, "an untracked file in the listing");
+
+        // The directory store files the same plans under the same keys.
+        let directory = tempfile::tempdir().unwrap();
+        let store = PlanDirectory(directory.path().into());
+        assert!(plan(&store).1, "empty directory");
+        assert!(!plan(&store).1, "planned directory");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        // Outside a Git checkout the listing fails, so nothing is kept.
+        fs::remove_dir_all(root.join(".git")).unwrap();
+        let memory = PlanMemory(Default::default());
+        assert!(plan(&memory).1);
+        assert!(plan(&memory).1, "an input with no key is planned again");
+    }
+
+    #[test]
+    fn unit_tests_plan_with_one_helper_that_cargo_or_the_caller_built() {
+        let prepared = prepared_manifest_plan(env::var_os(MANIFEST_PLAN_BIN_ENV).as_deref());
+        let (program, _) = unit_test_manifest_plan(prepared.unwrap()).unwrap();
+        assert!(
+            program.is_absolute() && program.is_file(),
+            "{}",
+            program.display()
+        );
+        assert_eq!(
+            program.file_name(),
+            Some(std::ffi::OsStr::new("hermit-manifest-plan"))
+        );
+        let (again, _) = unit_test_manifest_plan(None).unwrap();
+        assert_eq!(again, program, "one helper per process");
     }
 }
 
