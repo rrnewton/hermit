@@ -1455,4 +1455,57 @@ mod tests {
             assert_eq!(target, [0; 16]);
         }
     }
+
+    #[test]
+    fn successful_replay_restores_consistent_overlapping_outputs() {
+        // A successful gettimeofday whose tz overlaps tv: Linux stores the
+        // timeval and then the timezone over part of it, so the two post-call
+        // snapshots agree where they overlap. The overlap check must accept
+        // this faithful event, and replay must restore the final bytes. tz
+        // first overlaps tv_usec, then tv_sec.
+        for tz_offset in [8, 0] {
+            let pages = Pages::new();
+            let tv_address = pages.base;
+            let tz_address = tv_address + tz_offset;
+            pages.fill(tv_address, &[0x5a; 16]);
+            let tv = Destination::new(
+                "gettimeofday",
+                "tv",
+                AddrMut::<Timeval>::from_raw(tv_address),
+            );
+            let tz = Destination::new(
+                "gettimeofday",
+                "tz",
+                AddrMut::<Timezone>::from_raw(tz_address),
+            );
+            let memory = LocalMemory::new();
+            let (tv_before, tz_before) =
+                (tv.pre_call(&memory).unwrap(), tz.pre_call(&memory).unwrap());
+            let result = gettimeofday(tv_address, tz_address);
+            assert_eq!(result, Ok(0));
+            let timeval = tv.capture(&memory, result, tv_before).unwrap();
+            let timezone = tz.capture(&memory, result, tz_before).unwrap();
+            let after = pages.bytes(tv_address, 16);
+            assert_ne!(after, vec![0x5a; 16], "Linux stored the timeval");
+            assert_eq!(timeval.bytes, after);
+            assert_eq!(
+                timezone.bytes,
+                after[tz_offset..tz_offset + 8],
+                "tz was stored last"
+            );
+
+            pages.fill(tv_address, &[0x5a; 16]);
+            let mut memory = TestMemory::new(None);
+            if let Err(error) = replay(
+                &mut memory,
+                Pid::this(),
+                result,
+                &[(tv, &timeval), (tz, &timezone)],
+            ) {
+                panic!("tz at tv + {tz_offset}: {}", tool_message(error));
+            }
+            assert_eq!(memory.writes, 24, "a successful copyout writes every byte");
+            assert_eq!(pages.bytes(tv_address, 16), after);
+        }
+    }
 }
