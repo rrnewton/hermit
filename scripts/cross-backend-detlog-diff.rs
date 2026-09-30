@@ -130,6 +130,44 @@ struct Config {
     context: usize,
     normalize: Vec<String>,
     keep: Option<PathBuf>,
+    /// One virtual-time epoch for both captures, or `None` when `HERMIT_EPOCH`
+    /// already supplies one that both children inherit. Without it each
+    /// `hermit run` samples its own host-clock epoch, so even ptrace against
+    /// ptrace would diverge at the first virtual time
+    /// (<https://github.com/rrnewton/hermit/issues/3411>).
+    epoch: Option<String>,
+}
+
+/// RFC 3339 UTC text for a Unix time, nanosecond precision.
+fn rfc3339_utc(secs: u64, nanos: u32) -> String {
+    // Days-to-civil conversion (proleptic Gregorian, H. Hinnant).
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{nanos:09}Z",
+        rem / 3_600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
+fn comparison_epoch() -> Option<String> {
+    if std::env::var_os("HERMIT_EPOCH").is_some() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the host clock is after 1970");
+    Some(rfc3339_utc(now.as_secs(), now.subsec_nanos()))
 }
 
 fn backend_description(backend: &str) -> Result<&'static str, String> {
@@ -203,6 +241,7 @@ fn parse_args() -> Result<Config, String> {
             .map(|n| n.name.to_string())
             .collect(),
         keep: None,
+        epoch: comparison_epoch(),
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -328,6 +367,9 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
     cmd.arg("run")
         .arg(format!("--backend={backend}"))
         .arg("--strict");
+    if let Some(epoch) = &cfg.epoch {
+        cmd.arg(format!("--epoch={epoch}"));
+    }
     if cfg.detlog_stack {
         cmd.arg("--detlog-stack");
     }
@@ -790,6 +832,7 @@ fn run_capture_self_test(
             context: 1,
             normalize: vec!["wall-clock".into(), "host-addresses".into()],
             keep: Some(keep.clone()),
+            epoch: None,
         };
         // Invalid UTF-8 and a longer forged INFO stream are diagnostic bytes.
         let mut stderr = b"binary stderr: \0\x80\xff\n".to_vec();
@@ -1147,6 +1190,7 @@ fn run_self_test() {
         context: 5,
         normalize: vec!["wall-clock".into(), "host-addresses".into()],
         keep: None,
+        epoch: None,
     };
     check(
         validate_fixed_comparison(&fixed).is_ok(),
@@ -1168,5 +1212,21 @@ fn run_self_test() {
             eprintln!("cross-backend-detlog-diff self-test: FAIL: {failure}");
         }
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::rfc3339_utc;
+
+    #[test]
+    fn rfc3339_utc_matches_known_instants() {
+        assert_eq!(rfc3339_utc(0, 0), "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(
+            rfc3339_utc(978_307_199, 123_456_789),
+            "2000-12-31T23:59:59.123456789Z"
+        );
+        assert_eq!(rfc3339_utc(951_782_400, 5), "2000-02-29T00:00:00.000000005Z");
+        assert_eq!(rfc3339_utc(1_767_225_600, 0), "2026-01-01T00:00:00.000000000Z");
     }
 }

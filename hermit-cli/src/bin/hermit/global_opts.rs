@@ -29,6 +29,11 @@ use super::tracing::init_stderr_tracing;
 use super::tracing::init_stderr_tracing_with_evidence;
 use super::tracing::log_max_bytes;
 
+/// The target named by controller diagnostics written to `--log-file`. It is
+/// not a tracing target: these lines are written directly, before tracing
+/// starts, so `--log`/`RUST_LOG` filtering does not apply to them.
+const CONTROLLER_TARGET: &str = "hermit::controller";
+
 /// Hermit provides a sandbox for deterministic and reproducible execution.
 /// Arbitrary programs run inside (guests) become deterministic
 /// functions of their inputs. Configuration flags control the initial
@@ -123,12 +128,35 @@ impl GlobalOpts {
 
     /// Report controller context before tracing starts, using the selected host
     /// destination without reopening its path or creating a tracing thread.
+    ///
+    /// In `--log-file` the line is written in the shape of a DEBUG tracing
+    /// event (wall-clock timestamp, level, target), because that file is a
+    /// record stream: `hermit log-diff` splits it on timestamps and refuses any
+    /// record without a level tag, so a bare line made every comparison of two
+    /// such files stop at line 0
+    /// (<https://github.com/rrnewton/hermit/issues/3410>).
+    ///
+    /// DEBUG, not INFO, on purpose. The INFO stream and the DETLOG/COMMIT
+    /// subset are the guest and Detcore evidence that comparisons count toward
+    /// "nonzero compared messages"; a harness line written into every log must
+    /// not satisfy that, or two logs holding nothing but this line would be
+    /// reported as a match. Plain stderr keeps the bare line.
     pub(crate) fn write_controller_diagnostic(
         &self,
         message: std::fmt::Arguments<'_>,
     ) -> Result<(), Error> {
         if let Some(handle) = &self.log_file_handle {
-            writeln!(&**handle, "{message}").context("cannot write to the host log file")?;
+            use tracing_subscriber::fmt::format::Writer;
+            use tracing_subscriber::fmt::time::FormatTime;
+            let mut timestamp = String::new();
+            tracing_subscriber::fmt::time::SystemTime
+                .format_time(&mut Writer::new(&mut timestamp))
+                .map_err(|_| anyhow::anyhow!("cannot format the controller diagnostic time"))?;
+            writeln!(
+                &**handle,
+                "{timestamp} DEBUG {CONTROLLER_TARGET}: {message}"
+            )
+            .context("cannot write to the host log file")?;
         } else {
             // A stopped stderr reader must not replace the command's primary
             // exit status. This shares the existing invocation-wide deadline
@@ -297,9 +325,17 @@ mod tests {
         held.write_all(b"written through the held descriptor")
             .unwrap();
 
+        let written = String::from_utf8(std::fs::read(opened_path).unwrap()).unwrap();
+        let (timestamp, rest) = written.split_once(" DEBUG ").unwrap();
+        assert!(
+            regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z$")
+                .unwrap()
+                .is_match(timestamp),
+            "{written:?}"
+        );
         assert_eq!(
-            std::fs::read(opened_path).unwrap(),
-            b"controller context\nwritten through the held descriptor"
+            rest,
+            "hermit::controller: controller context\nwritten through the held descriptor"
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),

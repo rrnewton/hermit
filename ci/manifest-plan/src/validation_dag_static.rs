@@ -323,7 +323,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_explicit_epoch_is_never_replaced_or_duplicated,
     // an_environment_epoch_is_inherited_without_reading_the_clock) and retains
     // all 723 prior identities.
-    ("test.regular_crates", 726),
+    // hermit-verify's
+    // log_diff_canonicalizes_host_addresses_only_when_the_child_offers_it
+    // (https://github.com/rrnewton/hermit/issues/3412) retains all 726 prior
+    // identities.
+    ("test.regular_crates", 727),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -410,7 +414,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_timeout_refusal_does_not_depend_on_backend_availability
     // (https://github.com/rrnewton/hermit/issues/3418) retains all 88 prior
     // selected CLI identities.
-    ("test.cli", 89),
+    // log_diff_compares_the_log_files_of_two_separate_runs,
+    // log_diff_does_not_count_the_epoch_notice_as_evidence
+    // (https://github.com/rrnewton/hermit/issues/3410) and
+    // relaxed_log_diff_canonicalizes_marked_host_addresses_on_request
+    // (https://github.com/rrnewton/hermit/issues/3412) retain all 89 prior
+    // selected CLI identities.
+    ("test.cli", 92),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -430,7 +440,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 89),
+    ("test.cli_on_host", 92),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -448,7 +458,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 726),
+    ("test.regular_crates_on_host", 727),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

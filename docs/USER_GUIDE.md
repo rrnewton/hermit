@@ -331,7 +331,12 @@ stderr exactly as the comparator receives them. The output names the active
 policy: `Deterministic` for the default DETLOG/scheduler-COMMIT subset,
 `Stripped` when `--unsafe-strip-lines` applies its lossy substitutions, or
 `Canonical` when `--canonical-info` selects the INFO stream and canonicalizes
-marked host addresses. This output is produced by the shared comparator path,
+marked host addresses. `--canonicalize-host-addresses` applies that same
+host-address canonicalization to the other comparisons, reported as
+`Deterministic with Canonical host-address normalization`: each explicitly
+marked `<hostaddr 0x...>` value becomes a per-run ordinal, so identity, order
+and aliasing are still compared while an ASLR shift between two processes is
+not a difference. This output is produced by the shared comparator path,
 after wall-clock-prefix removal, line filtering, message selection, and any
 requested substitutions.
 
