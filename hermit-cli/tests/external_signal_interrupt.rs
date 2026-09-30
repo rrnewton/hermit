@@ -28,6 +28,20 @@
 //! including a child that dies by SIGKILL or by its only thread calling `exit`,
 //! whose SIGCHLD comes from the kernel alone.
 //!
+//! A child's SIGCHLD is queued on its parent process and taken by one thread
+//! that does not block it; Linux offers it first to the thread that forked the
+//! child. The role cells give the waiter a sibling that does not block SIGCHLD
+//! and check both the waiter's result and which thread's handler ran. A
+//! runnable sibling that forks the child takes the signal, and the waiter keeps
+//! waiting to its original deadline or its wakeup. A sibling that forks the
+//! child and then parks in a wait of its own takes it there. A waiting main
+//! thread that forks the child takes it although a sibling is running.
+//!
+//! LiteInst runs a call site's first execution through a ptrace stop, where the
+//! kernel turns a restart errno into `EINTR` or a restart, and later executions
+//! through the patched site, where Hermit must do the same. The `warm` cells run
+//! the wait through the patched site.
+//!
 //! Every cell with only Hermit-internal senders, on both backends, runs under
 //! `--verify --verify-strict` and requires a matched strict report.
 //!
@@ -46,6 +60,17 @@
 //!   Hermit's deadlock detector ends the run before the signal can arrive.
 //! - External signals to blocked `wait4`/`waitid`. Those still do not observe
 //!   a host-queued signal; that is a separate defect in the same issue.
+//! - A host-timed kernel SIGCHLD that the scheduler has not made eligible yet.
+//!   The detcore unit tests cover that filter; every cell here also passes
+//!   without it.
+//! - The `spin` role in polling mode. Between probes a polling waiter blocks
+//!   every signal, so the running sibling takes the SIGCHLD that Linux gives the
+//!   waiting thread that forked the child.
+//! - LiteInst `sem thread warm`: the guest dies of SIGSEGV after its handler
+//!   runs, on every head of https://github.com/rrnewton/hermit/pull/3361
+//!   measured; on its base the wait was never interrupted. Only
+//!   `sem exit warm` is asserted.
+//! - `warm` on ptrace, which patches no call site.
 
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
@@ -104,6 +129,19 @@ const EXIT_WAKE_FLOOR_MS: u64 = 90;
 /// posts its own SIGCHLD for the exit at a host-timed moment, so a single
 /// matched pair of runs is weak evidence that the result ignores it.
 const SIGCHLD_TRIALS: usize = 3;
+/// A role cell's SIGCHLD handler ran once, on the sibling.
+const HANDLED_BY_SIBLING: &str = "HANDLER main=0 sibling=1";
+/// A role cell's SIGCHLD handler ran once, on the main thread.
+const HANDLED_BY_MAIN: &str = "HANDLER main=1 sibling=0";
+/// When the steal role's untimed wait ends: the sibling forks at 100 ms and
+/// wakes the futex 100 ms after the handler ran. Measured at 202-205 ms on
+/// 2026-09-29, on both backends and in both futex modes.
+const STEAL_WAKE_MS: u64 = 2 * SIGNAL_DELAY_MS;
+/// Upper bound on the spin role's wake. Natively the wait ends at the child's
+/// death, about 100 ms in. Under Hermit the spinning sibling keeps the run slot
+/// until its timeslice ends, and the wait ended at 450-652 ms on 2026-09-29 on
+/// both backends. A wait the SIGCHLD did not end runs to its 10 s timeout.
+const SPIN_WAKE_BOUND_MS: u64 = 1_000;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -140,6 +178,18 @@ impl GuestRun {
             .lines()
             .find_map(|line| line.strip_prefix("ELAPSED ms="))
             .and_then(|value| value.parse().ok())
+    }
+
+    /// The first guest stdout line that starts with `prefix`.
+    fn line(&self, prefix: &str) -> Option<&str> {
+        self.stdout.lines().find(|line| line.starts_with(prefix))
+    }
+
+    /// The `ms=` value of the fork role's `SIBLING` line.
+    fn sibling_ms(&self) -> Option<u64> {
+        self.line("SIBLING ")
+            .and_then(|line| line.rsplit_once(" ms="))
+            .and_then(|(_, value)| value.parse().ok())
     }
 }
 
@@ -463,6 +513,36 @@ fn assert_woken_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &s
         run.describe()
     );
     assert_verified(backend, mode, args, &run);
+}
+
+/// A role cell: the main thread's call returns `expected` within `elapsed` ms,
+/// the SIGCHLD handler ran on the thread `handler` names, and the run exits
+/// cleanly with `DONE` and a matched strict report.
+fn assert_role_cell(
+    backend: &str,
+    mode: FutexMode,
+    args: &[&str],
+    expected: &str,
+    handler: &str,
+    elapsed: std::ops::Range<u64>,
+) -> GuestRun {
+    let run = run_cell(backend, mode, args, false);
+    assert!(
+        run.status.success()
+            && run.result_line() == Some(expected)
+            && run.line("HANDLER ") == Some(handler)
+            && run.stdout.lines().any(|line| line == "DONE"),
+        "{backend} {mode:?} {args:?}: expected `{expected}` and `{handler}`\n{}",
+        run.describe()
+    );
+    let ms = run.elapsed_ms();
+    assert!(
+        ms.is_some_and(|ms| elapsed.contains(&ms)),
+        "{backend} {mode:?} {args:?}: the wait took {ms:?} ms, outside {elapsed:?}\n{}",
+        run.describe()
+    );
+    assert_verified(backend, mode, args, &run);
+    run
 }
 
 /// Fix A: a polling-mode futex wait must observe a signal that Hermit did not
@@ -883,4 +963,274 @@ fn liteinst_poll_and_epoll_are_ended_by_a_caught_sigchld_from_an_exiting_child()
 #[test]
 fn liteinst_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
     assert_child_exit_ends_readiness_waits("liteinst", ["select", "rawselect"]);
+}
+
+/// A child's SIGCHLD goes to the thread that forked it when that thread does
+/// not block it and is running (Linux's `complete_signal`). Here a sibling forks
+/// a child that dies at once and stays runnable until the handler has run, so
+/// the main thread's futex wait is not interrupted. A timed wait returns
+/// ETIMEDOUT at its original 300 ms deadline; an untimed one is ended by the
+/// sibling's FUTEX_WAKE 100 ms after the handler ran, which precise mode reports
+/// as 0 and polling mode as EAGAIN, as in
+/// `untimed_futex_wait_restarts_under_sa_restart`. The child dies by
+/// `exit_group`, by SIGKILL, and by its only thread calling `exit`. Each wait
+/// runs from a cold and from a warm call site, so LiteInst runs it both through
+/// a ptrace stop and through its patched site. Timed and untimed waits are
+/// separate tests so that each LiteInst test stays within two thirds of the
+/// per-test CPU budget.
+///
+/// Before https://github.com/rrnewton/hermit/pull/3361 was fixed Hermit also
+/// woke the main thread for the sibling's SIGCHLD in precise mode. The kernel
+/// then restarted a timed wait with a fresh timeout, ending it near 400 ms, and
+/// at LiteInst's patched site the kernel-internal errno 512 or 514 reached the
+/// guest. Polling mode already left the wait alone; its cells guard that.
+fn assert_runnable_sibling_takes_the_sigchld(backend: &str, mode: FutexMode, timed: bool) {
+    let (expected, elapsed) = match (timed, mode) {
+        (true, _) => (
+            "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
+            QUIET_TIMEOUT_MS..QUIET_TIMEOUT_MS + QUIET_OVERSHOOT_MS,
+        ),
+        (false, FutexMode::Precise) => (
+            "RESULT call=futex ret=0 errno=none handler=1",
+            STEAL_WAKE_MS..STEAL_WAKE_MS + QUIET_OVERSHOOT_MS,
+        ),
+        (false, FutexMode::Polling) => (
+            "RESULT call=futex ret=-1 errno=EAGAIN handler=1",
+            STEAL_WAKE_MS..STEAL_WAKE_MS + QUIET_OVERSHOOT_MS,
+        ),
+    };
+    for death in ["stealgrp", "stealkill", "stealthrexit"] {
+        for warm in [false, true] {
+            let mut args = vec!["futex", "thread"];
+            if timed {
+                args.push("timed");
+            }
+            if warm {
+                args.push("warm");
+            }
+            args.push(death);
+            assert_role_cell(
+                backend,
+                mode,
+                &args,
+                expected,
+                HANDLED_BY_SIBLING,
+                elapsed.clone(),
+            );
+        }
+    }
+}
+
+#[test]
+fn ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld() {
+    assert_runnable_sibling_takes_the_sigchld("ptrace", FutexMode::Precise, true);
+}
+
+#[test]
+fn ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld() {
+    assert_runnable_sibling_takes_the_sigchld("ptrace", FutexMode::Precise, false);
+}
+
+#[test]
+fn ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld() {
+    assert_runnable_sibling_takes_the_sigchld("ptrace", FutexMode::Polling, true);
+}
+
+#[test]
+fn ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld() {
+    assert_runnable_sibling_takes_the_sigchld("ptrace", FutexMode::Polling, false);
+}
+
+#[test]
+fn liteinst_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld()
+{
+    assert_runnable_sibling_takes_the_sigchld("liteinst", FutexMode::Precise, true);
+}
+
+#[test]
+fn liteinst_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld() {
+    assert_runnable_sibling_takes_the_sigchld("liteinst", FutexMode::Precise, false);
+}
+
+#[test]
+fn liteinst_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld()
+{
+    assert_runnable_sibling_takes_the_sigchld("liteinst", FutexMode::Polling, true);
+}
+
+#[test]
+fn liteinst_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld() {
+    assert_runnable_sibling_takes_the_sigchld("liteinst", FutexMode::Polling, false);
+}
+
+/// As above, but the sibling that forks the child, which dies 100 ms later,
+/// then parks in a 300 ms FUTEX_WAIT of its own. The SIGCHLD ends the sibling's
+/// wait with EINTR near 100 ms, and the main thread's timed wait runs to
+/// ETIMEDOUT at its 300 ms deadline. Before
+/// https://github.com/rrnewton/hermit/pull/3361 was fixed, a child that called
+/// `exit_group` had its SIGCHLD sent to the main thread instead, ending the
+/// main thread's wait at 100 ms and leaving the sibling's to time out.
+fn assert_parked_forker_takes_the_sigchld(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        for death in ["forkgrp", "forkkill", "forkthrexit"] {
+            let args = ["futex", "thread", "timed", death];
+            let run = assert_role_cell(
+                backend,
+                mode,
+                &args,
+                "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
+                HANDLED_BY_SIBLING,
+                QUIET_TIMEOUT_MS..QUIET_TIMEOUT_MS + QUIET_OVERSHOOT_MS,
+            );
+            let ms = run.sibling_ms();
+            assert!(
+                run.line("SIBLING ")
+                    .is_some_and(|line| line.starts_with("SIBLING ret=-1 errno=EINTR ms="))
+                    && ms.is_some_and(|ms| {
+                        (SIGNAL_DELAY_MS..SIGNAL_DELAY_MS + WAKE_SLACK_MS).contains(&ms)
+                    }),
+                "{backend} {mode:?} {args:?}: expected the sibling's wait to end with EINTR \
+                 near {SIGNAL_DELAY_MS} ms, not after {ms:?} ms\n{}",
+                run.describe()
+            );
+        }
+    }
+}
+
+#[test]
+fn ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld() {
+    assert_parked_forker_takes_the_sigchld("ptrace");
+}
+
+#[test]
+fn liteinst_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld() {
+    assert_parked_forker_takes_the_sigchld("liteinst");
+}
+
+/// The thread that forked the child takes its SIGCHLD while waiting, although
+/// a sibling that does not block SIGCHLD is running. Here the main thread forks
+/// a child that dies after 100 ms and waits, while a sibling spins in user code,
+/// with no system calls, until the handler has run and then, for an untimed
+/// wait, wakes the futex. The main thread's wait ends with EINTR, timed or not,
+/// within `SPIN_WAKE_BOUND_MS`. Before
+/// https://github.com/rrnewton/hermit/pull/3361 was fixed the spinning sibling
+/// took the SIGCHLD: an untimed wait was ended only by the sibling's wake, and a
+/// timed one ran to its 10 s timeout. Precise mode only; see the module
+/// documentation for polling mode.
+fn assert_waiting_forker_takes_the_sigchld(backend: &str) {
+    for death in ["spin", "spinkill", "spinthrexit"] {
+        for timed in [None, Some("timed")] {
+            let mut args = vec!["futex", "exit"];
+            args.extend(timed);
+            args.push(death);
+            assert_role_cell(
+                backend,
+                FutexMode::Precise,
+                &args,
+                EINTR_FUTEX,
+                HANDLED_BY_MAIN,
+                EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
+            );
+        }
+    }
+}
+
+#[test]
+fn ptrace_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
+    assert_waiting_forker_takes_the_sigchld("ptrace");
+}
+
+#[test]
+fn liteinst_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
+    assert_waiting_forker_takes_the_sigchld("liteinst");
+}
+
+/// A wait at a LiteInst call site that has already run once goes through the
+/// patched site, which the kernel's syscall-return path does not see. Hermit
+/// must then turn the handler's restart errno into what Linux returns: EINTR for
+/// a timed futex wait, a raw `select`, glibc's `sem_timedwait`, and an untimed
+/// futex wait without SA_RESTART. An untimed futex wait under SA_RESTART cannot
+/// be restarted, because the patched site resumes after the system-call
+/// instruction; it returns 0, a wakeup futex(2) permits and every caller
+/// re-checks. Each call returns near the signal, strict-verified. Before
+/// https://github.com/rrnewton/hermit/pull/3361 was fixed the kernel-internal
+/// errno 512 or 514 reached the guest, and glibc's `sem_timedwait` aborted on it.
+///
+/// The lower bound is `EXIT_WAKE_FLOOR_MS` because the `thread` sender, like the
+/// `exit` child, starts its 100 ms sleep before the wait takes its start stamp:
+/// these waits read 99-100 ms (measured 2026-09-29).
+fn assert_patched_site_waits_are_interrupted(mode: FutexMode, cells: &[(&[&str], &str)]) {
+    for &(args, expected) in cells {
+        let run = run_cell("liteinst", mode, args, false);
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(expected)
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "liteinst {mode:?} {args:?}: expected `{expected}`\n{}",
+            run.describe()
+        );
+        let elapsed = run.elapsed_ms();
+        assert!(
+            elapsed.is_some_and(|ms| {
+                (EXIT_WAKE_FLOOR_MS..SIGNAL_DELAY_MS + WAKE_SLACK_MS).contains(&ms)
+            }),
+            "liteinst {mode:?} {args:?}: the wait took {elapsed:?} ms, not the \
+             {SIGNAL_DELAY_MS} ms until the signal\n{}",
+            run.describe()
+        );
+        assert_verified("liteinst", mode, args, &run);
+    }
+}
+
+/// Futex waits at a patched call site, split from the other calls so that each
+/// test stays within two thirds of the per-test CPU budget.
+const PATCHED_SITE_FUTEX_CELLS: [(&[&str], &str); 6] = [
+    (&["futex", "thread", "warm"], EINTR_FUTEX),
+    (&["futex", "thread", "timed", "warm"], EINTR_FUTEX),
+    (
+        &["futex", "thread", "restart", "timed", "warm"],
+        EINTR_FUTEX,
+    ),
+    (
+        &["futex", "thread", "restart", "warm"],
+        "RESULT call=futex ret=0 errno=none handler=1",
+    ),
+    (&["futex", "exit", "warm"], EINTR_FUTEX),
+    (&["futex", "exit", "timed", "warm"], EINTR_FUTEX),
+];
+
+/// `sem_timedwait` and a raw `select` at a patched call site.
+const PATCHED_SITE_OTHER_CELLS: [(&[&str], &str); 3] = [
+    (
+        &["sem", "exit", "warm"],
+        "RESULT call=sem ret=-1 errno=EINTR handler=1",
+    ),
+    (
+        &["rawselect", "thread", "warm"],
+        "RESULT call=rawselect ret=-1 errno=EINTR handler=1",
+    ),
+    (
+        &["rawselect", "thread", "restart", "warm"],
+        "RESULT call=rawselect ret=-1 errno=EINTR handler=1",
+    ),
+];
+
+#[test]
+fn liteinst_precise_futex_waits_at_a_patched_call_site_are_interrupted_as_on_linux() {
+    assert_patched_site_waits_are_interrupted(FutexMode::Precise, &PATCHED_SITE_FUTEX_CELLS);
+}
+
+#[test]
+fn liteinst_polling_futex_waits_at_a_patched_call_site_are_interrupted_as_on_linux() {
+    assert_patched_site_waits_are_interrupted(FutexMode::Polling, &PATCHED_SITE_FUTEX_CELLS);
+}
+
+#[test]
+fn liteinst_precise_sem_and_select_at_a_patched_call_site_are_interrupted_as_on_linux() {
+    assert_patched_site_waits_are_interrupted(FutexMode::Precise, &PATCHED_SITE_OTHER_CELLS);
+}
+
+#[test]
+fn liteinst_polling_sem_and_select_at_a_patched_call_site_are_interrupted_as_on_linux() {
+    assert_patched_site_waits_are_interrupted(FutexMode::Polling, &PATCHED_SITE_OTHER_CELLS);
 }

@@ -8,13 +8,16 @@
 /* Guest for hermit-cli/tests/external_signal_interrupt.rs
  * (https://github.com/rrnewton/hermit/issues/3146).
  *
- * usage: external_signal_interrupt <futex|select|rawselect|poll|epoll|wait4|waitid>
- *            <external|process|thread|timer|exit> [restart] [timed]
+ * usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid>
+ *            <external|process|thread|timer|exit> [restart] [timed] [warm]
  *            [ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|
- *             chldkill|chldthrexit]
+ *             chldkill|chldthrexit|stealgrp|stealkill|stealthrexit|
+ *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit]
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
- * select system call itself.
+ * select system call itself. `sem` is glibc's sem_timedwait, a FUTEX_WAIT_BITSET
+ * with an absolute CLOCK_REALTIME deadline 10 s away (300 ms for a
+ * must-not-wake option).
  *
  * The main thread installs a SIGUSR1 and SIGALRM handler (SA_RESTART only
  * with `restart`), prints READY, and blocks in the chosen call until the
@@ -64,13 +67,52 @@
  *
  * `exit` and these six options also print the ELAPSED line.
  *
+ * The remaining options add a sibling thread that does NOT block SIGCHLD, so
+ * the kernel may deliver a child's SIGCHLD to it instead of to the waiter.
+ * Linux's complete_signal() offers a process-directed signal first to the
+ * thread it names, which for a child's SIGCHLD is the thread that forked the
+ * child, and takes it if that thread does not block the signal and is running
+ * or has no signal pending; otherwise it tries the other threads. The SIGCHLD
+ * handler is installed from the start, and a HANDLER line reports how many
+ * times it ran on the main thread and on the sibling. The child dies by
+ * exit_group (`...grp`, or `spin`), by sending itself SIGKILL (`...kill`), or
+ * by its only thread calling the exit system call (`...threxit`).
+ *   steal*:  `thread` sender. After 100 ms the sibling forks a child that dies
+ *            at once and stays runnable, calling sched_yield (which gives up
+ *            the CPU but does not block), until the handler has run. The
+ *            forking sibling takes the SIGCHLD, so
+ *            the waiter keeps waiting: a `timed` wait (300 ms) returns
+ *            ETIMEDOUT at its original deadline, and an untimed one is ended
+ *            by the sibling's FUTEX_WAKE 100 ms after the handler ran.
+ *   fork*:   `thread` sender and `timed`. The sibling forks a child that dies
+ *            after 100 ms, then parks in its own 300 ms FUTEX_WAIT. The forking
+ *            sibling takes the SIGCHLD: its wait ends with EINTR near 100 ms,
+ *            reported on a SIBLING line, and the main thread's 300 ms wait
+ *            runs to ETIMEDOUT.
+ *   spin*:   `exit` sender. The main thread forks the child, which dies after
+ *            100 ms, and starts a sibling that sleeps 50 ms, so the main thread
+ *            is already waiting, and then spins in user code, with no system
+ *            calls, until the handler has run. The forking main thread is
+ *            waiting, so it takes the SIGCHLD and its wait ends with EINTR.
+ *            For an untimed wait the sibling then wakes the futex, so a wait
+ *            that lost the signal to the sibling returns 0 instead of hanging.
+ *
+ * `warm` issues the waiting call's own system-call instruction once before the
+ * wait, so a backend that patches a call site on its first execution (LiteInst)
+ * runs the wait through the patched site: syscall(SYS_gettid) for `futex` and
+ * `rawselect`, which share glibc's syscall() instruction, and a 10 ms
+ * sem_timedwait that must time out for `sem`.
+ *
  * Output is one deterministic RESULT line after the call returns, followed
- * by DONE once every helper has been reaped. */
+ * by DONE once every helper has been reaped. A kernel-internal errno, which has
+ * no name, prints as UNNAMED(<number>). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -86,6 +128,9 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t handled = 0;
+/* Handler runs on the main thread and on any other thread. */
+static volatile sig_atomic_t handled_main = 0;
+static volatile sig_atomic_t handled_sibling = 0;
 static uint32_t futex_word = 0;
 static pthread_t main_thread;
 static int sent_signal = SIGUSR1;
@@ -94,15 +139,34 @@ static int quiet = 0;
 enum flip { FLIP_NONE, IGN2CAUGHT, CAUGHT2IGN, CHLDLATE, CHLDIGN, CHLDKILL, CHLDTHREXIT };
 static enum flip flip = FLIP_NONE;
 static int flip_timed = 0;
+/* A sibling that does not block SIGCHLD (see the usage comment). */
+enum role { ROLE_NONE, ROLE_STEAL, ROLE_FORK, ROLE_SPIN };
+static enum role role = ROLE_NONE;
+/* How the child of the `exit` sender or of a role dies. */
+enum death { DEATH_GROUP, DEATH_KILL, DEATH_THREXIT };
+static enum death death = DEATH_GROUP;
+/* The fork role's own wait on sibling_word, as the main thread reports it. */
+static uint32_t sibling_word = 0;
+static long sibling_ret = 0;
+static int sibling_err = 0;
+static long sibling_ms = -1;
+static volatile unsigned long spin_sink = 0;
 /* Write end of the pipe a readiness call waits on. */
 static int ready_write_fd = -1;
 
 #define QUIET_TIMEOUT_MS 300
 #define WAKER_POLLS 5000
+/* Bound on the steal role's sched_yield calls while it waits for the handler. */
+#define STEAL_SYSCALLS 200000L
+/* Bound on the spin role's user-code iterations while it waits for the handler. */
+#define SPIN_ITERATIONS 20000000000UL
 
 static void on_usr1(int sig) {
   (void)sig;
   handled += 1;
+  /* pthread_self() reads the thread pointer; it makes no system call. */
+  if (pthread_equal(pthread_self(), main_thread)) handled_main += 1;
+  else handled_sibling += 1;
 }
 
 static void say(const char *s) {
@@ -202,6 +266,97 @@ static void flip_sender(void) {
   }
 }
 
+static void reap(pid_t child) {
+  int st;
+  while (waitpid(child, &st, 0) < 0 && errno == EINTR) {
+  }
+}
+
+/* A child of the `exit` sender or of a role, which dies as `death` says and
+ * never returns. */
+static void die(void) {
+  if (death == DEATH_KILL) syscall(SYS_kill, syscall(SYS_getpid), SIGKILL);
+  if (death == DEATH_THREXIT) syscall(SYS_exit, 0);
+  _exit(0);
+}
+
+static long ms_between(const struct timespec *start, const struct timespec *end) {
+  return (end->tv_sec - start->tv_sec) * 1000L + (end->tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+static void add_ms(struct timespec *ts, long ms) {
+  ts->tv_sec += ms / 1000;
+  ts->tv_nsec += (ms % 1000) * 1000000L;
+  if (ts->tv_nsec >= 1000000000L) {
+    ts->tv_sec += 1;
+    ts->tv_nsec -= 1000000000L;
+  }
+}
+
+/* The errno's name, or UNNAMED(<number>) for a kernel-internal errno. */
+static const char *errno_name(int err) {
+  static char unnamed[4][32];
+  static int next = 0;
+  const char *name = strerrorname_np(err);
+  if (name != NULL) return name;
+  char *slot = unnamed[next++ % 4];
+  snprintf(slot, sizeof unnamed[0], "UNNAMED(%d)", err);
+  return slot;
+}
+
+/* The steal role, 100 ms after the sibling started. */
+static void steal_sibling(void) {
+  pid_t child = fork();
+  if (child < 0) _exit(96);
+  if (child == 0) die();
+  /* Stay runnable, giving up the CPU often, until some thread's handler ran. */
+  for (long calls = 0; handled == 0; calls++) {
+    if (calls > STEAL_SYSCALLS) {
+      say("STEAL_TIMEOUT\n");
+      _exit(93);
+    }
+    sched_yield();
+  }
+  if (!flip_timed) {
+    sleep_ms(100);
+    wake_waiter();
+  }
+  reap(child);
+}
+
+/* The fork role: fork a child that dies after 100 ms, then wait on its own word. */
+static void fork_sibling(void) {
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  pid_t child = fork();
+  if (child < 0) _exit(96);
+  if (child == 0) {
+    sleep_ms(100);
+    die();
+  }
+  struct timespec timeout = {0, QUIET_TIMEOUT_MS * 1000000L};
+  errno = 0;
+  sibling_ret = syscall(SYS_futex, &sibling_word, FUTEX_WAIT_PRIVATE, 0, &timeout, NULL, 0);
+  sibling_err = errno;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  sibling_ms = ms_between(&start, &end);
+  reap(child);
+}
+
+/* The spin role: after a 50 ms sleep, user code only, with no system calls,
+ * until some thread's handler ran. */
+static void *spin_sibling(void *arg) {
+  (void)arg;
+  /* Let the main thread park in its wait before spinning. */
+  sleep_ms(50);
+  unsigned long x = 1;
+  for (unsigned long i = 0; handled == 0 && i < SPIN_ITERATIONS; i++)
+    x = x * 6364136223846793005UL + 1442695040888963407UL;
+  spin_sink = x;
+  if (!flip_timed) wake_waiter();
+  return NULL;
+}
+
 static void *thread_sender(void *arg) {
   (void)arg;
   sigset_t block;
@@ -209,7 +364,15 @@ static void *thread_sender(void *arg) {
   sigaddset(&block, SIGUSR1);
   if (flip != FLIP_NONE) sigaddset(&block, SIGCHLD);
   pthread_sigmask(SIG_BLOCK, &block, NULL);
+  if (role == ROLE_FORK) {
+    fork_sibling();
+    return NULL;
+  }
   sleep_ms(100);
+  if (role == ROLE_STEAL) {
+    steal_sibling();
+    return NULL;
+  }
   if (flip != FLIP_NONE) {
     flip_sender();
     return NULL;
@@ -234,17 +397,43 @@ static void *thread_sender(void *arg) {
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    say("usage: external_signal_interrupt <futex|select|rawselect|poll|epoll|wait4|waitid> "
-        "<external|process|thread|timer|exit> [restart] [timed] "
-        "[ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit]\n");
+    say("usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid> "
+        "<external|process|thread|timer|exit> [restart] [timed] [warm] "
+        "[ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
+        "stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
+        "spinthrexit]\n");
     return 2;
   }
+  /* Before any handler is installed: the handler compares against it. */
+  main_thread = pthread_self();
   const char *call = argv[1];
   const char *sender = argv[2];
-  int restart = 0, timed = 0, ignored = 0, blocked = 0;
+  int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, options = 0;
+  static const struct {
+    const char *name;
+    enum role role;
+    enum death death;
+  } roles[] = {
+      {"stealgrp", ROLE_STEAL, DEATH_GROUP}, {"stealkill", ROLE_STEAL, DEATH_KILL},
+      {"stealthrexit", ROLE_STEAL, DEATH_THREXIT}, {"forkgrp", ROLE_FORK, DEATH_GROUP},
+      {"forkkill", ROLE_FORK, DEATH_KILL}, {"forkthrexit", ROLE_FORK, DEATH_THREXIT},
+      {"spin", ROLE_SPIN, DEATH_GROUP}, {"spinkill", ROLE_SPIN, DEATH_KILL},
+      {"spinthrexit", ROLE_SPIN, DEATH_THREXIT},
+  };
   for (int i = 3; i < argc; i++) {
+    int matched_role = 0;
+    for (size_t r = 0; r < sizeof roles / sizeof roles[0]; r++) {
+      if (!strcmp(argv[i], roles[r].name)) {
+        role = roles[r].role;
+        death = roles[r].death;
+        options += 1;
+        matched_role = 1;
+      }
+    }
+    if (matched_role) continue;
     if (!strcmp(argv[i], "restart")) restart = 1;
     else if (!strcmp(argv[i], "timed")) timed = 1;
+    else if (!strcmp(argv[i], "warm")) warm = 1;
     else if (!strcmp(argv[i], "ignored")) ignored = quiet = 1;
     else if (!strcmp(argv[i], "blocked")) blocked = quiet = 1;
     else if (!strcmp(argv[i], "winch")) {
@@ -258,9 +447,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "chldthrexit")) flip = CHLDTHREXIT;
     else return 2;
   }
-  if (ignored + blocked + (sent_signal == SIGWINCH) + (flip != FLIP_NONE) > 1) return 2;
+  if (ignored + blocked + (sent_signal == SIGWINCH) + (flip != FLIP_NONE) + options > 1) return 2;
   flip_timed = timed;
   int is_futex = !strcmp(call, "futex");
+  int is_sem = !strcmp(call, "sem");
   int is_wait = !strcmp(call, "wait4") || !strcmp(call, "waitid");
   int from_process = !strcmp(sender, "process");
   int from_thread = !strcmp(sender, "thread");
@@ -269,7 +459,8 @@ int main(int argc, char **argv) {
   int is_poll = !strcmp(call, "poll");
   int is_epoll = !strcmp(call, "epoll");
   int is_rawselect = !strcmp(call, "rawselect");
-  if (!is_futex && !is_wait && !is_poll && !is_epoll && !is_rawselect && strcmp(call, "select"))
+  if (!is_futex && !is_sem && !is_wait && !is_poll && !is_epoll && !is_rawselect &&
+      strcmp(call, "select"))
     return 2;
   if (!from_process && !from_thread && !from_timer && !from_exit && strcmp(sender, "external"))
     return 2;
@@ -277,14 +468,21 @@ int main(int argc, char **argv) {
   if (quiet && (is_wait || !(from_process || from_thread))) return 2;
   if (flip != FLIP_NONE && (is_wait || !from_thread || restart)) return 2;
   if (from_exit && restart) return 2;
-  int report_elapsed = quiet || flip != FLIP_NONE || from_exit;
+  if (role != ROLE_NONE && (!is_futex || restart)) return 2;
+  if ((role == ROLE_STEAL || role == ROLE_FORK) && !from_thread) return 2;
+  if (role == ROLE_FORK && !timed) return 2;
+  if (role == ROLE_SPIN && !from_exit) return 2;
+  if (warm && !is_futex && !is_rawselect && !is_sem) return 2;
+  if (is_sem && timed) return 2;
+  int report_elapsed = quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm;
 
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = on_usr1;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = restart ? SA_RESTART : 0;
-  if ((from_exit || flip == CHLDIGN) && sigaction(SIGCHLD, &sa, NULL) != 0) return 3;
+  if ((from_exit || flip == CHLDIGN || role != ROLE_NONE) && sigaction(SIGCHLD, &sa, NULL) != 0)
+    return 3;
   if (ignored) sa.sa_handler = SIG_IGN;
   struct sigaction usr1 = sa;
   if (flip == IGN2CAUGHT) usr1.sa_handler = SIG_IGN;
@@ -295,6 +493,18 @@ int main(int argc, char **argv) {
     sigemptyset(&mask);
     sigaddset(&mask, SIGUSR1);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) return 3;
+  }
+  sem_t sem;
+  if (is_sem && sem_init(&sem, 0, 0) != 0) return 3;
+  /* Warm the waiting call's site before any helper starts, so the helpers'
+   * timing is unchanged. */
+  if (warm && is_sem) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    add_ms(&deadline, 10);
+    if (sem_timedwait(&sem, &deadline) != -1 || errno != ETIMEDOUT) return 3;
+  } else if (warm) {
+    syscall(SYS_gettid);
   }
 
   int pfd[2];
@@ -310,8 +520,9 @@ int main(int argc, char **argv) {
     if (child < 0) return 3;
     if (child == 0) {
       sleep_ms(100);
-      _exit(0);
+      die();
     }
+    if (role == ROLE_SPIN && pthread_create(&thread, NULL, spin_sibling, NULL) != 0) return 3;
   }
   if (from_process) {
     child = fork();
@@ -328,7 +539,6 @@ int main(int argc, char **argv) {
     }
   }
   close(pfd[0]);
-  main_thread = pthread_self();
   if (from_thread && pthread_create(&thread, NULL, thread_sender, NULL) != 0) return 3;
 
   say("READY\n");
@@ -355,9 +565,15 @@ int main(int argc, char **argv) {
   int bounded = quiet || (flip != FLIP_NONE && timed);
   if (is_futex) {
     struct timespec timeout = {10, 0};
-    if (quiet || flip != FLIP_NONE) timeout = (struct timespec){0, QUIET_TIMEOUT_MS * 1000000L};
+    if (quiet || flip != FLIP_NONE || role == ROLE_STEAL || role == ROLE_FORK)
+      timeout = (struct timespec){0, QUIET_TIMEOUT_MS * 1000000L};
     ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0,
                   timed || quiet ? &timeout : NULL, NULL, 0);
+  } else if (is_sem) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    add_ms(&deadline, bounded ? QUIET_TIMEOUT_MS : 10000);
+    ret = sem_timedwait(&sem, &deadline);
   } else if (!strcmp(call, "select") || is_rawselect) {
     fd_set rf;
     FD_ZERO(&rf);
@@ -388,15 +604,23 @@ int main(int argc, char **argv) {
 
   char buf[160];
   snprintf(buf, sizeof buf, "RESULT call=%s ret=%ld errno=%s handler=%d\n", call,
-           ret < 0 ? -1L : ret, ret < 0 ? strerrorname_np(err) : "none", (int)handled);
+           ret < 0 ? -1L : ret, ret < 0 ? errno_name(err) : "none", (int)handled);
   say(buf);
   if (report_elapsed) {
-    long elapsed_ms = (end.tv_sec - start.tv_sec) * 1000L +
-                      (end.tv_nsec - start.tv_nsec) / 1000000L;
-    snprintf(buf, sizeof buf, "ELAPSED ms=%ld\n", elapsed_ms);
+    snprintf(buf, sizeof buf, "ELAPSED ms=%ld\n", ms_between(&start, &end));
     say(buf);
   }
-  if (from_thread) pthread_join(thread, NULL);
+  if (from_thread || role == ROLE_SPIN) pthread_join(thread, NULL);
+  if (role == ROLE_FORK) {
+    snprintf(buf, sizeof buf, "SIBLING ret=%ld errno=%s ms=%ld\n", sibling_ret < 0 ? -1L : sibling_ret,
+             sibling_ret < 0 ? errno_name(sibling_err) : "none", sibling_ms);
+    say(buf);
+  }
+  if (role != ROLE_NONE) {
+    snprintf(buf, sizeof buf, "HANDLER main=%d sibling=%d\n", (int)handled_main,
+             (int)handled_sibling);
+    say(buf);
+  }
   if (child > 0) {
     close(pfd[1]);
     int st;
