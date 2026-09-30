@@ -12,6 +12,7 @@ __asm__(
     ".global hermit_liteinst_activation_getpid\n"
     ".type hermit_liteinst_activation_getpid,@function\n"
     "hermit_liteinst_activation_getpid:\n"
+    ".cfi_startproc\n"
     "mov $39, %eax\n"
     ".global hermit_liteinst_activation_getpid_site\n"
     "hermit_liteinst_activation_getpid_site:\n"
@@ -20,6 +21,7 @@ __asm__(
     "nop\n"
     "nop\n"
     "ret\n"
+    ".cfi_endproc\n"
     ".size hermit_liteinst_activation_getpid, "
     ".-hermit_liteinst_activation_getpid\n");
 
