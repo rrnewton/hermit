@@ -674,9 +674,12 @@ impl MeasurementState {
 /// ⚠️ PARITY IS NOT DETERMINISM. `parity-failure` only ever came from the
 /// retired ptrace rerun, which compared a candidate backend with ptrace rather
 /// than the cell with itself; it says nothing about whether the cell repeats.
-/// It is read here as a non-verdict, and the ledger scorecard reports it in the
-/// parity section's labelled `legacy-rerun` history instead
-/// (<https://github.com/rrnewton/hermit/issues/3301>). For the same reason a
+/// It is read here as a non-verdict. The ledger scorecard reports the rerun's
+/// verified comparisons in the parity section's labelled `legacy-rerun`
+/// history instead, one entry per cell and backend whether an observation or
+/// a retired receipt holds the comparison, and counts there, by reason, a
+/// `parity-failure` that kept no comparison ([`legacy_rerun_history`],
+/// <https://github.com/rrnewton/hermit/issues/3301>). For the same reason a
 /// divergence position recorded beside a `parity-failure` locates nothing
 /// unless the same observation also carries a determinism or replay failure:
 /// the rerun's positions are parity positions.
@@ -6472,12 +6475,16 @@ struct LegacyRerunEntry {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct LegacyRerunSummary {
     label: &'static str,
+    /// How many cells have an entry, and their verdicts; its three forms are
+    /// stated in [`legacy_rerun_history`].
     line: String,
     matched: usize,
     diverged: usize,
     /// The newest Hermit commit among the entries.
     last_hermit_sha: Option<String>,
-    /// Older comparisons of an entry's cell that the latest one replaced.
+    /// Older comparisons of an entry's cell that the latest one replaced. A
+    /// receipt that repeats a comparison an observation still holds is the
+    /// same comparison and is not counted.
     superseded: usize,
     entries: Vec<LegacyRerunEntry>,
 }
@@ -6829,18 +6836,42 @@ fn summarize_parity(
 
 /// The retired ptrace rerun's comparisons, as labelled `legacy-rerun` history.
 ///
+/// The rerun's comparisons are read from two places: a live cell's
+/// observations, and the typed receipts that the comparison-attempt bindings
+/// keep once an observation no longer holds its comparison
+/// (`retired_backend_parity_comparisons`). A receipt belongs to the live cell
+/// whose id is the receipt's cell id, retired test ids resolved to their
+/// successors ([`resolve_cell_id`]), and that cell gives its entry the
+/// determinism column.
+///
 /// A comparison becomes history only when it is verified -- it passes the
 /// same admission [`validate_observation_identity_namespace`] applies to a
-/// stored comparison: a ptrace reference, the cell's own backend as the
-/// candidate, a result the evidence implies, a matched or diverged log
-/// verdict under the cross-backend envelope, nonzero compared records, and
-/// well-formed digests -- and its verdict is matched or diverged. Everything
-/// else is dropped and counted by reason: an unverified comparison under its
-/// admission slug, a `parity-failure` observation that kept no comparison
-/// (`no-retained-comparison`), and receipts retired with their catalogue cell
-/// (`retired-from-catalogue`). Each reason is counted twice: by piece of
-/// evidence and by distinct cell, so a count of observations is never read as
-/// a count of cells. History never enters a parity count or credit.
+/// stored comparison ([`backend_parity_admission`]): a ptrace reference, the
+/// cell's own backend as the candidate, a result the evidence implies, a
+/// matched or diverged log verdict under the cross-backend envelope, nonzero
+/// compared records, and well-formed digests -- and its verdict is matched or
+/// diverged. Everything else is dropped and counted by reason: an unverified
+/// comparison or receipt under its admission slug, a `parity-failure`
+/// observation that kept no comparison (`no-retained-comparison`), and a
+/// receipt whose cell is absent from the catalogue (`retired-from-catalogue`).
+/// Each reason is counted twice: by piece of evidence and by distinct cell, so
+/// a count of observations is never read as a count of cells.
+///
+/// Each cell and backend (`test@backend`) gets one entry, from its latest
+/// verified comparison; the order that defines "latest" is stated where the
+/// entry is chosen. The line has three forms:
+///
+/// - with entries: `legacy-rerun (retired ptrace rerun on N cell(s), last at
+///   SHA12): M matched / D diverged`, where N is the number of entries;
+/// - without entries, with dropped evidence: `legacy-rerun (retired ptrace
+///   rerun on 0 cell(s)): 0 matched / 0 diverged; K piece(s) of evidence
+///   dropped`, where K is the sum of the dropped counts;
+/// - otherwise: `legacy-rerun: no retired ptrace-rerun comparison is
+///   retained`.
+///
+/// So it says that no comparison is retained only when there is no
+/// comparison, no receipt and no `parity-failure` at all. History never
+/// enters a parity count or credit.
 fn legacy_rerun_history(
     tracked: &TrackedCells,
     current: &BTreeMap<String, &'static str>,
@@ -6858,14 +6889,11 @@ fn legacy_rerun_history(
             .or_default()
             .insert(cell.to_string());
     };
+    let history_key = |id: &CellId| format!("{}@{}", retired_ids().resolve(&id.test), id.backend);
     let mut latest: BTreeMap<String, Vec<(&RecordedBackendParityComparison, &TrackedCell)>> =
         BTreeMap::new();
     for cell in &tracked.cells {
-        let key = format!(
-            "{}@{}",
-            retired_ids().resolve(&cell.id.test),
-            cell.id.backend
-        );
+        let key = history_key(&cell.id);
         for observation in &cell.observations {
             if observation.backend_parity_comparisons.is_empty()
                 && observation.results.contains(&ObservedResult::ParityFailure)
@@ -6884,15 +6912,32 @@ fn legacy_rerun_history(
         }
     }
     if let Some(bindings) = comparison_attempt_bindings(tracked) {
+        // The live cell each resolved id names. A loaded document has one
+        // ([`resolve_retired_history`] refuses a retired id beside its
+        // successor). For a document that has both, the cell already under
+        // the resolved id wins, then the greater id, whatever their order in
+        // cells.json.
+        let mut live: BTreeMap<CellId, &TrackedCell> = BTreeMap::new();
+        for cell in &tracked.cells {
+            let resolved = resolve_cell_id(&cell.id);
+            let held = live.entry(resolved.clone()).or_insert(cell);
+            if (cell.id == resolved, &cell.id) > (held.id == resolved, &held.id) {
+                *held = cell;
+            }
+        }
         for retired in &bindings.retired_backend_parity_comparisons {
-            count_drop(
-                "retired-from-catalogue",
-                &format!(
-                    "{}@{}",
-                    retired_ids().resolve(&retired.cell.test),
-                    retired.cell.backend
-                ),
-            );
+            let Some(&cell) = live.get(&resolve_cell_id(&retired.cell)) else {
+                count_drop("retired-from-catalogue", &history_key(&retired.cell));
+                continue;
+            };
+            let key = history_key(&cell.id);
+            match backend_parity_admission(&retired.comparison, &cell.id.backend) {
+                Ok(()) => latest
+                    .entry(key)
+                    .or_default()
+                    .push((&retired.comparison, cell)),
+                Err((slug, _)) => count_drop(slug, &key),
+            }
         }
     }
     let dropped_cells = dropped_cells
@@ -6901,15 +6946,27 @@ fn legacy_rerun_history(
         .collect::<BTreeMap<_, _>>();
     let mut superseded = 0usize;
     let mut entries = Vec::new();
-    for (key, candidates) in latest {
+    for (key, mut candidates) in latest {
+        // Binding validation admits a receipt identical to a comparison a live
+        // observation still holds: one comparison, counted once.
+        candidates
+            .sort_by(|(a, a_cell), (b, b_cell)| a.cmp(b).then_with(|| a_cell.id.cmp(&b_cell.id)));
+        candidates.dedup_by(|(a, a_cell), (b, b_cell)| a == b && a_cell.id == b_cell.id);
         superseded += candidates.len() - 1;
+        // "Latest" is the newest Hermit commit the comparison itself recorded:
+        // the greatest (`hermit_commits`, `hermit_first_parent`). No recorded
+        // field orders two comparisons made at one commit in time, so between
+        // those a parity failure outranks a match -- a lucky match never hides
+        // a measured mismatch -- and then the comparison's own field order
+        // decides (`hermit_sha`, `run_id`, `evidence_sha256`, and on through
+        // the struct), and for one comparison held by two cells, the greater
+        // cell id. The choice depends only on what the comparisons recorded,
+        // never on the order of cells, observations or receipts in cells.json.
         let (comparison, cell) = candidates
             .into_iter()
             .max_by(|(a, _), (b, _)| {
                 (a.hermit_commits, a.hermit_first_parent)
                     .cmp(&(b.hermit_commits, b.hermit_first_parent))
-                    // At one depth a divergence outranks a match, so a lucky
-                    // match never hides a measured mismatch.
                     .then_with(|| {
                         (a.result == ObservedResult::ParityFailure)
                             .cmp(&(b.result == ObservedResult::ParityFailure))
@@ -6951,10 +7008,15 @@ fn legacy_rerun_history(
         .iter()
         .max_by_key(|entry| (entry.depth.commits, entry.depth.first_parent))
         .map(|entry| entry.hermit_sha.clone());
+    let dropped_evidence = dropped.values().sum::<usize>();
     let line = match &last_hermit_sha {
         Some(sha) => format!(
-            "{LEGACY_RERUN_LABEL} (retired ptrace rerun, last at {}): {matched} matched / {diverged} diverged",
+            "{LEGACY_RERUN_LABEL} (retired ptrace rerun on {} cell(s), last at {}): {matched} matched / {diverged} diverged",
+            entries.len(),
             &sha[..sha.len().min(12)]
+        ),
+        None if dropped_evidence > 0 => format!(
+            "{LEGACY_RERUN_LABEL} (retired ptrace rerun on 0 cell(s)): 0 matched / 0 diverged; {dropped_evidence} piece(s) of evidence dropped"
         ),
         None => format!("{LEGACY_RERUN_LABEL}: no retired ptrace-rerun comparison is retained"),
     };
@@ -17879,6 +17941,326 @@ fn series_snapshot_worktree_brackets(source_row: &SeriesRow) -> Result<(), Strin
     Ok(())
 }
 
+/// The retired ptrace rerun's typed receipts reach the `legacy-rerun` history
+/// ([`legacy_rerun_history`]; review B of
+/// <https://github.com/rrnewton/hermit/issues/3301>,
+/// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5912040475>).
+/// Every receipt used to be counted as `retired-from-catalogue`, and the line
+/// said that no comparison was retained while the ledger held 1,384 receipts
+/// of live cells. Here a receipt of a live cell, recorded under the cell's
+/// retired id or its own, becomes that cell's entry; only a receipt whose
+/// cell is absent from the catalogue is `retired-from-catalogue`; and a
+/// receipt that fails admission is counted under its reason. In memory: no
+/// subprocess and no command, and no file read beyond the checked-in
+/// retired-id map that every history join reads ([`retired_ids`]).
+fn legacy_rerun_receipt_brackets() -> Result<(), String> {
+    // The receipt review B names: `c-programs/aio-refusal@kvm`, 107 compared
+    // records, first divergent record 13, at Hermit 5ee668223a15.
+    const NEWEST: &str = "5ee668223a15e4a853ca4e28f26fe31e5542d43e";
+    const NEWEST_RUN: &str =
+        "validate-buck-validate-cargo-5ee668223a15-1790586574232510178-2945118-43b1052e";
+    const OLDER: &str = "83928eb75c9aae899bdf6d80046688534562b761";
+    const OLDER_RUN: &str = "validate-main-full-20260922-v4";
+    let id = |category: &str, test: &str, backend: &str| CellId {
+        lane: "portable".into(),
+        category: category.into(),
+        test: test.into(),
+        mode: "verify".into(),
+        backend: backend.into(),
+    };
+    let digest = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+    // A verified divergence: a ptrace reference, the cell's backend as the
+    // candidate, a diverged log under the cross-backend envelope, and equal
+    // exits and output, so the parity failure is the log's alone.
+    let diverged = |backend: &str, run: (&str, u64, u64, &str), records: u64, first: u64| {
+        let (sha, commits, first_parent, run_id) = run;
+        RecordedBackendParityComparison {
+            hermit_sha: sha.into(),
+            hermit_commits: commits,
+            hermit_first_parent: first_parent,
+            run_id: run_id.into(),
+            evidence_sha256: digest(&format!("evidence {backend} {run_id} {records}")),
+            reference_backend: "ptrace".into(),
+            candidate_backend: backend.into(),
+            result: ObservedResult::ParityFailure,
+            log_verdict: LogDiffVerdict::Diverged,
+            record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
+            compared_records: records,
+            reference_info_messages: records,
+            candidate_info_messages: records,
+            reference_exit_code: Some(0),
+            reference_signal: None,
+            candidate_exit_code: Some(0),
+            candidate_signal: None,
+            reference_stdout_sha256: digest("stdout"),
+            candidate_stdout_sha256: digest("stdout"),
+            reference_stderr_sha256: digest("stderr"),
+            candidate_stderr_sha256: digest("stderr"),
+            first_divergent_record: Some(first),
+            first_divergent_syscall: Some(2),
+            first_divergent_scheduler_turn: Some(1),
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+        }
+    };
+    let receipt = |cell: CellId,
+                   comparison: RecordedBackendParityComparison|
+     -> Result<RetiredBackendParityComparison, String> {
+        Ok(RetiredBackendParityComparison {
+            cell,
+            provenance: ObservationProvenance::Validate,
+            detcore_tree: "4925a3dc52caaeea64fd7b430ec5116e410f0bbb".into(),
+            typed_comparison_sha256: typed_comparison_digest(&comparison)?,
+            comparison,
+        })
+    };
+    let pass = || -> Result<Observation, String> {
+        serde_json::from_value(serde_json::json!({
+            "provenance": "validate",
+            "hermit_shas": [NEWEST],
+            "results": ["pass"],
+            "invocations": [],
+        }))
+        .map_err(|error| format!("cannot build a legacy-rerun fixture observation: {error}"))
+    };
+    let live = |test: &str, backend: &str, observations: Vec<Observation>| TrackedCell {
+        id: id("c-programs", test, backend),
+        status: CellStatus::Green,
+        ci_disabled_reason: None,
+        green_removal_reason: None,
+        not_applicable_reason: None,
+        last_tested: None,
+        observations,
+        measurement: MeasurementState::NeverMeasured,
+    };
+    let summarize = |cells: Vec<TrackedCell>, receipts: Vec<RetiredBackendParityComparison>| {
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: Some(ObservationProjection {
+                source: "series".into(),
+                source_repository: Some(TEST_LEDGER_REPOSITORY.into()),
+                source_commit: None,
+                source_tree: None,
+                refreshed_at: "2026-09-30T00:00:00Z".into(),
+                rows_read: 0,
+                pre_series_corpus: false,
+                comparison_attempt_bindings_v1: Some(ComparisonAttemptBindings {
+                    schema: 1,
+                    authority: ATTEMPT_BINDING_AUTHORITY.into(),
+                    bindings: Vec::new(),
+                    retired_canonical_comparisons: Vec::new(),
+                    retired_backend_parity_comparisons: receipts,
+                }),
+            }),
+            cells,
+        };
+        refresh_measurement(&mut tracked);
+        parity_summary_without_store(&tracked)
+    };
+
+    let newest = diverged("kvm", (NEWEST, 3222, 3147, NEWEST_RUN), 107, 13);
+    // Recorded under the retired backend-parity-c id, whose successor is the
+    // live `c-programs/aio-refusal`: the cell is not absent.
+    let newest_receipt = receipt(
+        id("backend-parity-c", "backend-parity-c/aio-refusal", "kvm"),
+        newest.clone(),
+    )?;
+    // An older receipt of the same cell under its live id, with its own
+    // counts, listed last: "latest" is the recorded commit, never file order.
+    let older_receipt = receipt(
+        id("c-programs", "c-programs/aio-refusal", "kvm"),
+        diverged("kvm", (OLDER, 3109, 3034, OLDER_RUN), 100, 9),
+    )?;
+    // A receipt whose cell is absent from the catalogue.
+    let absent_receipt = receipt(
+        id("c-programs", "c-programs/legacy-absent", "kvm"),
+        diverged("kvm", (NEWEST, 3222, 3147, NEWEST_RUN), 40, 5),
+    )?;
+    // A receipt of a live cell that fails admission: its reference is not
+    // ptrace.
+    let mut not_ptrace = diverged("liteinst", (NEWEST, 3222, 3147, NEWEST_RUN), 60, 7);
+    not_ptrace.reference_backend = "kvm".into();
+    let refused_receipt = receipt(
+        id("c-programs", "c-programs/legacy-refused", "liteinst"),
+        not_ptrace,
+    )?;
+    let receipts = vec![
+        newest_receipt,
+        absent_receipt.clone(),
+        refused_receipt.clone(),
+        older_receipt,
+    ];
+    let cells = || -> Result<Vec<TrackedCell>, String> {
+        Ok(vec![
+            live("c-programs/aio-refusal", "kvm", vec![pass()?]),
+            live("c-programs/legacy-refused", "liteinst", vec![pass()?]),
+        ])
+    };
+
+    let summary = summarize(cells()?, receipts.clone());
+    let legacy = &summary.legacy_rerun;
+    // (a) The live cell's latest receipt is its entry, beside the cell's own
+    // determinism measurement.
+    let [entry] = legacy.entries.as_slice() else {
+        return Err(format!(
+            "retired receipts of one live cell did not yield exactly one legacy-rerun entry: {:?}",
+            legacy.entries
+        ));
+    };
+    if entry.cell != "c-programs/aio-refusal@kvm"
+        || entry.verdict != "diverged"
+        || entry.compared_records != 107
+        || entry.first_divergent_record != Some(13)
+        || entry.hermit_sha != NEWEST
+        || entry.run_id != NEWEST_RUN
+        || entry.determinism != "measured-and-passed"
+        || entry.current_parity_verdict.is_some()
+    {
+        return Err(format!(
+            "a live cell's latest retired receipt did not become its legacy-rerun entry: {entry:?}"
+        ));
+    }
+    // (b) The line counts the entry, and never says that none is retained.
+    if legacy.line
+        != "legacy-rerun (retired ptrace rerun on 1 cell(s), last at 5ee668223a15): 0 matched / 1 diverged"
+        || legacy
+            .line
+            .contains("no retired ptrace-rerun comparison is retained")
+        || (legacy.matched, legacy.diverged, legacy.superseded) != (0, 1, 1)
+        || legacy.last_hermit_sha.as_deref() != Some(NEWEST)
+    {
+        return Err(format!(
+            "the legacy-rerun line did not count the retained receipt: {legacy:?}"
+        ));
+    }
+    // (c) and (d): only the absent cell's receipt is `retired-from-catalogue`,
+    // and the refused receipt is counted under its admission reason.
+    let dropped = BTreeMap::from([
+        ("reference-not-ptrace".to_string(), 1),
+        ("retired-from-catalogue".to_string(), 1),
+    ]);
+    if summary.legacy_dropped != dropped || summary.legacy_dropped_cells != dropped {
+        return Err(format!(
+            "retired receipts were dropped under the wrong reasons: {:?} by evidence, {:?} by cell",
+            summary.legacy_dropped, summary.legacy_dropped_cells
+        ));
+    }
+    let markdown = render_parity_section(&summary);
+    for needle in [
+        "`legacy-rerun (retired ptrace rerun on 1 cell(s), last at 5ee668223a15): 0 matched / 1 diverged`",
+        "\n1 older comparison(s) of the same cells were superseded by a later one.\n",
+        "\nRetired rerun evidence not kept as history, by reason: `reference-not-ptrace` 1 on 1 cell(s); `retired-from-catalogue` 1 on 1 cell(s).\n",
+        "| `c-programs/aio-refusal@kvm` | legacy-rerun | diverged | 107 | 13 | `5ee668223a15` | `measured-and-passed` | — |\n",
+    ] {
+        if !markdown.contains(needle) {
+            return Err(format!(
+                "the parity section did not render the retained receipt: missing {needle:?} in:\n{markdown}"
+            ));
+        }
+    }
+
+    // The same receipts in the opposite order give the same history.
+    let mut reversed = receipts.clone();
+    reversed.reverse();
+    let reordered = summarize(cells()?, reversed);
+    if reordered.legacy_rerun != summary.legacy_rerun
+        || reordered.legacy_dropped != summary.legacy_dropped
+        || reordered.legacy_dropped_cells != summary.legacy_dropped_cells
+    {
+        return Err(format!(
+            "the legacy-rerun history depends on the order of the receipts: {:?}",
+            reordered.legacy_rerun
+        ));
+    }
+
+    // A cell still under the retired id beside its successor, a document the
+    // loader refuses ([`resolve_retired_history`]): the receipts pair with
+    // the successor, whichever of the two comes first in the cells.
+    let twin = || -> Result<TrackedCell, String> {
+        let mut failed = pass()?;
+        failed.results = BTreeSet::from([ObservedResult::DeterminismFailure]);
+        Ok(TrackedCell {
+            id: id("backend-parity-c", "backend-parity-c/aio-refusal", "kvm"),
+            ..live("c-programs/aio-refusal", "kvm", vec![failed])
+        })
+    };
+    for twin_first in [false, true] {
+        let mut twinned = cells()?;
+        twinned.push(twin()?);
+        if twin_first {
+            twinned.reverse();
+        }
+        let paired = summarize(twinned, receipts.clone());
+        if paired.legacy_rerun != summary.legacy_rerun
+            || paired.legacy_dropped != summary.legacy_dropped
+            || paired.legacy_dropped_cells != summary.legacy_dropped_cells
+        {
+            return Err(format!(
+                "receipts paired with a retired-id twin instead of its successor (twin first: {twin_first}): {:?}",
+                paired.legacy_rerun
+            ));
+        }
+    }
+
+    // A receipt identical to a comparison an observation still holds is one
+    // comparison: nothing more is superseded or dropped.
+    let mut held = pass()?;
+    held.results = BTreeSet::from([ObservedResult::ParityFailure]);
+    held.backend_parity_comparisons = BTreeSet::from([newest]);
+    let with_copy = summarize(
+        vec![
+            live("c-programs/aio-refusal", "kvm", vec![pass()?, held]),
+            live("c-programs/legacy-refused", "liteinst", vec![pass()?]),
+        ],
+        receipts,
+    );
+    if with_copy.legacy_rerun != summary.legacy_rerun
+        || with_copy.legacy_dropped != summary.legacy_dropped
+        || with_copy.legacy_dropped_cells != summary.legacy_dropped_cells
+    {
+        return Err(format!(
+            "a receipt identical to an observation's comparison was counted twice: {:?}",
+            with_copy.legacy_rerun
+        ));
+    }
+
+    // Dropped receipts alone: no entry, and the line counts what was dropped
+    // instead of saying that nothing is retained.
+    let only_dropped = summarize(
+        vec![live("c-programs/legacy-refused", "liteinst", vec![pass()?])],
+        vec![absent_receipt, refused_receipt],
+    );
+    if !only_dropped.legacy_rerun.entries.is_empty()
+        || only_dropped.legacy_rerun.line
+            != "legacy-rerun (retired ptrace rerun on 0 cell(s)): 0 matched / 0 diverged; 2 piece(s) of evidence dropped"
+        || only_dropped.legacy_rerun.last_hermit_sha.is_some()
+        || only_dropped.legacy_dropped != dropped
+    {
+        return Err(format!(
+            "dropped receipts alone were not counted in the legacy-rerun line: {:?}, {:?}",
+            only_dropped.legacy_rerun, only_dropped.legacy_dropped
+        ));
+    }
+
+    // Only with no comparison, receipt or parity failure at all does the line
+    // say that nothing is retained.
+    let nothing = summarize(
+        vec![live("c-programs/aio-refusal", "kvm", vec![pass()?])],
+        Vec::new(),
+    );
+    if nothing.legacy_rerun.line != "legacy-rerun: no retired ptrace-rerun comparison is retained"
+        || !nothing.legacy_rerun.entries.is_empty()
+        || !nothing.legacy_dropped.is_empty()
+    {
+        return Err(format!(
+            "a ledger without retired rerun evidence did not say so: {:?}",
+            nothing.legacy_rerun
+        ));
+    }
+    Ok(())
+}
+
 fn self_test() -> Result<(), String> {
     self_test_tier(false)
 }
@@ -19699,6 +20081,9 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             "deliberate ptrace/KVM divergence did not become labelled legacy-rerun history beside a determinism non-verdict:\n{divergent_markdown}"
         ));
     }
+
+    // The rerun's comparisons that only a typed receipt still holds.
+    legacy_rerun_receipt_brackets()?;
 
     let pressure_summary = |sha: &str, tree: &str, rows| PressureSummary {
         schema: PRESSURE_SUMMARY_SCHEMA,
@@ -29091,11 +29476,11 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
 
     if include_commands {
         println!(
-            "compatibility scorecard self-test (regression and commands tiers): retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, command-line, retained-history, series-worktree, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+            "compatibility scorecard self-test (regression and commands tiers): retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, command-line, retained-history, series-worktree, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, divergence-without-a-comparison, and legacy-rerun-receipt brackets pass"
         );
     } else {
         println!(
-            "compatibility scorecard self-test (regression tier): retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass; `self-test-commands` runs the command-line, retained-history, and series-worktree brackets"
+            "compatibility scorecard self-test (regression tier): retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, divergence-without-a-comparison, and legacy-rerun-receipt brackets pass; `self-test-commands` runs the command-line, retained-history, and series-worktree brackets"
         );
     }
     Ok(())
@@ -36145,7 +36530,7 @@ mod parity_summary_tests {
         assert_eq!(divergence.current_parity_verdict, None);
         assert_eq!(
             legacy.line,
-            "legacy-rerun (retired ptrace rerun, last at abcdef012345): 1 matched / 1 diverged"
+            "legacy-rerun (retired ptrace rerun on 2 cell(s), last at abcdef012345): 1 matched / 1 diverged"
         );
         // History is never current parity: no run, no count, no credit.
         assert!(summary.producers.is_empty());
@@ -36747,7 +37132,7 @@ mod parity_summary_tests {
         assert_eq!((legacy.matched, legacy.diverged), (0, 1));
         assert_eq!(
             legacy.line,
-            "legacy-rerun (retired ptrace rerun, last at abcdef012345): 0 matched / 1 diverged"
+            "legacy-rerun (retired ptrace rerun on 1 cell(s), last at abcdef012345): 0 matched / 1 diverged"
         );
         assert_contains(
             &render_parity_section(&summary),
