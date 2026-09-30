@@ -852,7 +852,7 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
     let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
     assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 
-    let args = ["run", "--backend", "kvm", "--", "/bin/true"];
+    let args = ["--backend", "kvm", "run", "--", "/bin/true"];
     let mut host_command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     append_hermit_args_with_execution_root(&mut host_command, &args, None)
         .expect("an unset workdir request should preserve the host command");
@@ -867,9 +867,9 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
         [
-            OsStr::new("run"),
             OsStr::new("--backend"),
             OsStr::new("kvm"),
+            OsStr::new("run"),
             OsStr::new("--base-env=minimal"),
             OsStr::new("--mount=type=tmpfs,target=/test"),
             OsStr::new("--workdir=/test"),
@@ -886,7 +886,7 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
     assert!(refused.get_args().next().is_none());
 
     for args in [
-        ["run", "--backend=dbt", "--", "/bin/true"],
+        ["--backend=dbt", "run", "--", "/bin/true"],
         ["run", "--no-namespace", "--", "/bin/true"],
     ] {
         let mut outer_mount_command = Command::new(env!("CARGO_BIN_EXE_hermit"));
@@ -899,7 +899,7 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
         assert_eq!(
             outer_mount_command.get_args().collect::<Vec<_>>(),
             [
-                OsStr::new("run"),
+                OsStr::new(args[0]),
                 OsStr::new(args[1]),
                 OsStr::new("--base-env=minimal"),
                 OsStr::new("--workdir=/test"),
@@ -910,8 +910,8 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
     }
 
     let explicit_base_env_args = [
-        "run",
         "--backend=kvm",
+        "run",
         "--base-env=empty",
         "--",
         "/usr/bin/env",
@@ -926,8 +926,8 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
     assert_eq!(
         explicit_base_env.get_args().collect::<Vec<_>>(),
         [
-            OsStr::new("run"),
             OsStr::new("--backend=kvm"),
+            OsStr::new("run"),
             OsStr::new("--base-env=empty"),
             OsStr::new("--mount=type=tmpfs,target=/test"),
             OsStr::new("--workdir=/test"),
@@ -989,9 +989,9 @@ fn pinned_root_arguments_cover_split_guest_commands() {
     let cases: &[(&[&str], &[&str], bool)] = &[
         (
             &[
-                "run",
                 "--backend",
                 "dbt",
+                "run",
                 "--verify",
                 "--keep-logs",
                 "--verify-log-dir",
@@ -1004,9 +1004,9 @@ fn pinned_root_arguments_cover_split_guest_commands() {
             &[
                 "--log",
                 "info",
-                "run",
                 "--backend",
                 "dbt",
+                "run",
                 "--strict",
                 "--verify",
                 "--keep-logs",
@@ -1240,18 +1240,17 @@ fn readonly_proc_command(args: &[&str]) -> Command {
 
 fn assert_readonly_proc_run(namespace_only: bool) {
     let _guard = hermit_run_guard();
-    let mut args = vec![
-        "run",
+    let mut args = if namespace_only {
+        vec!["run", "--namespace-only"]
+    } else {
+        vec!["--backend=ptrace", "run"]
+    };
+    args.extend_from_slice(&[
         // Local networking would require another flags-zero mount for sysfs.
         "--network=host",
         "--max-timeslice=disabled",
         "--no-virtualize-cpuid",
-    ];
-    if namespace_only {
-        args.push("--namespace-only");
-    } else {
-        args.push("--backend=ptrace");
-    }
+    ]);
     args.extend_from_slice(&["--", "/bin/cat", "/proc/mounts", "/proc/self/status"]);
     let output = readonly_proc_command(&args)
         .output()
@@ -1502,8 +1501,81 @@ fn verify_verbose_requires_verify() {
 }
 
 #[test]
+fn run_rejects_subcommand_level_backend() {
+    // `--backend` is a global option. The old compatibility spelling after the
+    // subcommand must be refused as a usage error (exit 2) that names the
+    // working global form, not silently accepted and not mis-suggested as
+    // `--backend-engagement-json`. These invocations never reach a guest, so the
+    // raw binary is used without execution-root arguments.
+    let hermit_binary = env!("CARGO_BIN_EXE_hermit");
+    for (args, corrected) in [
+        (
+            &["run", "--backend=ptrace", "--", "/bin/true"][..],
+            "--backend=ptrace run -- /bin/true",
+        ),
+        (
+            &["run", "--backend", "ptrace", "--", "/bin/true"][..],
+            "--backend=ptrace run -- /bin/true",
+        ),
+        (
+            &[
+                "--log=info",
+                "run",
+                "--strict",
+                "--backend",
+                "dbt",
+                "--",
+                "/bin/true",
+            ][..],
+            "--backend=dbt --log=info run --strict -- /bin/true",
+        ),
+        (
+            &["oci", "run", "--backend=kvm", "busybox", "/bin/true"][..],
+            "--backend=kvm oci run busybox /bin/true",
+        ),
+    ] {
+        let output = Command::new(hermit_binary)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error:\n{}",
+            stderr(&output)
+        );
+        let message = stderr(&output);
+        assert!(
+            message.contains("unexpected argument '--backend"),
+            "{args:?}: unexpected error:\n{message}"
+        );
+        assert!(
+            message.contains("is a global option and must come before the subcommand"),
+            "{args:?}: error does not explain the global position:\n{message}"
+        );
+        assert!(
+            message.contains(&format!("{hermit_binary} {corrected}`")),
+            "{args:?}: error does not give the corrected command {corrected:?}:\n{message}"
+        );
+        assert!(
+            message.contains("Usage: hermit [OPTIONS] <COMMAND>"),
+            "{args:?}: error does not show where global options go:\n{message}"
+        );
+        assert!(
+            !message.contains("backend-engagement-json"),
+            "{args:?}: error points at an unrelated flag:\n{message}"
+        );
+    }
+
+    // The global form is the working path and still runs the guest.
+    let args = ["--backend=ptrace", "run", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+}
+
+#[test]
 fn run_rejects_unknown_backends_during_argument_parsing() {
-    let args = ["run", "--backend", "unknown", "--", "/bin/true"];
+    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
     let output = hermit(&args);
 
     assert_eq!(output.status.code(), Some(2));
@@ -1562,7 +1634,7 @@ fn run_dbt_executes_integrated_backend() {
     if dbt_unavailable("run_dbt_executes_integrated_backend") {
         return;
     }
-    let args = ["run", "--backend", "dbt", "--", "/bin/true"];
+    let args = ["--backend", "dbt", "run", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
 }
@@ -1573,9 +1645,9 @@ fn run_dbt_uses_the_requested_guest_environment() {
         return;
     }
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--base-env=empty",
         "--env=DBT_GUEST_ONLY=present",
@@ -1618,9 +1690,9 @@ fn run_dbt_verifies_simple_env_shebang() {
         .to_str()
         .expect("DBT env-shebang test path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -1673,9 +1745,9 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
         let mut command = hermit_command(&[
             "--log",
             "info",
-            "run",
             "--backend",
             "dbt",
+            "run",
             "--strict",
             "--verify",
             "--keep-logs",
@@ -1765,9 +1837,9 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
         .args([
-            "run",
             "--backend",
             "dbt",
+            "run",
             "--verify",
             "--keep-logs",
             "--verify-log-dir",
@@ -1871,9 +1943,9 @@ fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
         .args([
             "--log",
             "info",
-            "run",
             "--backend",
             "dbt",
+            "run",
             "--strict",
             "--verify",
             "--keep-logs",
@@ -1997,9 +2069,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
     // Positive bracket: fail-closed changes only unsupported behavior. A supported
     // guest still succeeds through the same default DBT front door.
     let supported_args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--",
         "/bin/echo",
         "dbt-supported-ok",
@@ -2010,7 +2082,7 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
 
     // Negative bracket: the real unsupported restart_syscall must fail and name
     // itself before the guest can publish its former success marker.
-    let default_args = ["run", "--backend", "dbt", "--", program];
+    let default_args = ["--backend", "dbt", "run", "--", program];
     let default = hermit(&default_args);
     assert!(
         !default.status.success(),
@@ -2029,9 +2101,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
     );
 
     let normal_args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--allow-unsupported-syscalls",
         "--verify",
         "--",
@@ -2055,9 +2127,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
     );
 
     let tamper_args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--allow-unsupported-syscalls",
         "--",
         program,
@@ -2074,9 +2146,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
     );
 
     let fork_tamper_args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--allow-unsupported-syscalls",
         "--",
         program,
@@ -2095,7 +2167,7 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
         stderr(&fork_tamper)
     );
 
-    let strict_args = ["run", "--backend", "dbt", "--strict", "--", program];
+    let strict_args = ["--backend", "dbt", "run", "--strict", "--", program];
     let strict = hermit(&strict_args);
     assert!(
         !strict.status.success(),
@@ -2108,9 +2180,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
         stderr(&strict)
     );
     let normal_fork_args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--allow-unsupported-syscalls",
         "--verify",
         "--",
@@ -2128,9 +2200,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
     );
 
     let normal_fork_exec_args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--allow-unsupported-syscalls",
         "--verify",
         "--",
@@ -2151,7 +2223,7 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
     );
 
     for mode in ["fork", "fork-exec", "fork-setsid-exec", "exec-empty"] {
-        let args = ["run", "--backend", "dbt", "--strict", "--", program, mode];
+        let args = ["--backend", "dbt", "run", "--strict", "--", program, mode];
         let output = hermit(&args);
         assert!(
             !output.status.success(),
@@ -2181,7 +2253,7 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to start blocked DBT stdin source");
-    let args = ["run", "--backend", "dbt", "--strict", "--", program];
+    let args = ["--backend", "dbt", "run", "--strict", "--", program];
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "2s", "10s"])
@@ -2207,9 +2279,9 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
 fn run_liteinst_verifies_detcore_backend() {
     liteinst_runtime::ensure_liteinst_runtime();
     let args = [
-        "run",
         "--backend",
         "liteinst",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2367,9 +2439,9 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
     fs::copy("/bin/true", &runtime).expect("failed to copy false LiteInst runtime fixture");
     write_matching_liteinst_revision(&runtime);
     let args = [
-        "run",
         "--backend",
         "liteinst",
+        "run",
         "--strict",
         "--",
         "/bin/true",
@@ -2388,9 +2460,9 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
 #[test]
 fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
     let args = [
-        "run",
         "--backend",
         "liteinst",
+        "run",
         "--strict",
         "--",
         "/bin/true",
@@ -2423,9 +2495,9 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
     let args = [
         "--log",
         "INFO",
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--",
         "/bin/bash",
@@ -2467,9 +2539,9 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
             .args([
                 "--log",
                 "INFO",
-                "run",
                 "--backend",
                 "dbt",
+                "run",
                 "--strict",
                 "--verify",
                 "--verify-strict",
@@ -2517,9 +2589,9 @@ fn run_dbt_forwards_detcore_info_logs() {
     let args = [
         "--log",
         "INFO",
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--",
         "/bin/true",
@@ -2542,9 +2614,9 @@ fn run_dbt_uses_the_normalized_backend_config() {
     let args = [
         "--log",
         "DEBUG",
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--",
         "/bin/true",
@@ -2578,9 +2650,9 @@ fn run_dbt_verifies_queued_self_signals() {
         .to_str()
         .expect("DBT self-sigqueue guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2607,7 +2679,7 @@ fn run_dbt_verifies_application_mmap() {
     let program = dbt_mmap_guest()
         .to_str()
         .expect("DBT mmap guest path should be UTF-8");
-    let args = ["run", "--backend", "dbt", "--verify", "--", program];
+    let args = ["--backend", "dbt", "run", "--verify", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "dbt-mmap-exec-ok\n");
@@ -2627,9 +2699,9 @@ fn run_dbt_verifies_process_wait_lifecycle() {
         .to_str()
         .expect("DBT wait guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2662,8 +2734,8 @@ fn run_kvm_exact_child_waits_have_stable_scheduler_turns() {
         .expect("exact-child wait guest path should be UTF-8");
     let args = [
         "--log=info",
-        "run",
         "--backend=kvm",
+        "run",
         "--strict",
         "--max-timeslice=disabled",
         "--tmp=/tmp",
@@ -2740,8 +2812,8 @@ fn run_kvm_self_sigkill_from_nonleader_is_group_fatal() {
         .to_str()
         .expect("self-SIGKILL guest path should be UTF-8");
     let args = [
-        "run",
         "--backend=kvm",
+        "run",
         "--verify",
         "--verify-strict",
         "--",
@@ -2784,9 +2856,9 @@ fn run_dbt_virtualizes_process_identities() {
         .to_str()
         .expect("DBT PID guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2832,9 +2904,9 @@ fn run_dbt_verifies_self_prlimit() {
         .to_str()
         .expect("DBT self-prlimit guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2858,9 +2930,9 @@ fn run_dbt_verifies_shell_process_lifecycle() {
         return;
     }
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--verify",
         "--",
         "/bin/sh",
@@ -2887,9 +2959,9 @@ fn run_dbt_verifies_pipe_backpressure() {
         return;
     }
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--verify",
         "--",
         "/bin/bash",
@@ -2916,9 +2988,9 @@ fn run_dbt_recovers_after_failed_exec() {
         .to_str()
         .expect("DBT exec-failure guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2943,9 +3015,9 @@ fn run_dbt_rejects_unfollowed_execveat() {
         .to_str()
         .expect("DBT execveat guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "dbt",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -2972,9 +3044,9 @@ fn run_kvm_executes_dynamic_guest() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--",
         "/bin/echo",
@@ -3043,9 +3115,9 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() 
     // state to its SECOND verification run, so the property is about what the
     // two runs inherit, not about either run alone.
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -3138,9 +3210,9 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags() 
         "print \"42\\n\";",
     );
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -3179,9 +3251,9 @@ fn run_kvm_awk_mincore_probe_terminates() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--",
@@ -3218,9 +3290,9 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -3244,9 +3316,9 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -3378,9 +3450,9 @@ fn run_kvm_propagates_explicit_environment() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=empty",
@@ -3420,9 +3492,9 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -3475,9 +3547,9 @@ fn run_kvm_cpuid_policy_is_deterministic() {
 
     let program = binary.to_str().expect("CPUID guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -3515,9 +3587,9 @@ fn run_kvm_respects_workdir_for_relative_paths() {
             temp.path().display()
         );
         let args = [
-            "run",
             "--backend",
             "kvm",
+            "run",
             "--strict",
             "--verify",
             "--tmp=/tmp",
@@ -3530,9 +3602,9 @@ fn run_kvm_respects_workdir_for_relative_paths() {
         hermit(&args)
     } else {
         let args = [
-            "run",
             "--backend",
             "kvm",
+            "run",
             "--strict",
             "--verify",
             "--tmp=/tmp",
@@ -3579,9 +3651,9 @@ fn run_kvm_lists_host_directory_metadata() {
             temp.path().display()
         );
         let args = [
-            "run",
             "--backend",
             "kvm",
+            "run",
             "--verify",
             "--base-env=minimal",
             "--tmp=/tmp",
@@ -3594,9 +3666,9 @@ fn run_kvm_lists_host_directory_metadata() {
         hermit(&args)
     } else {
         let args = [
-            "run",
             "--backend",
             "kvm",
+            "run",
             "--verify",
             "--base-env=minimal",
             "--tmp=/tmp",
@@ -3645,9 +3717,9 @@ fn run_kvm_reads_host_file() {
 
     let expected = fs::read_to_string("/etc/hostname").expect("failed to read host hostname");
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -3668,9 +3740,9 @@ fn run_kvm_reads_standard_input() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--base-env=minimal",
         "--",
@@ -3689,9 +3761,9 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--base-env=minimal",
         "--",
@@ -3713,9 +3785,9 @@ fn run_kvm_verify_f_getfl_and_replays_standard_input() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -3740,9 +3812,9 @@ fn run_kvm_verify_replays_standard_input() {
         }
 
         let args = [
-            "run",
             "--backend",
             backend,
+            "run",
             "--strict",
             "--verify",
             "--base-env=minimal",
@@ -3771,9 +3843,9 @@ fn run_kvm_preserves_closed_standard_input() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--base-env=minimal",
         "--",
@@ -3838,9 +3910,9 @@ fn run_kvm_preserves_closed_standard_input() {
     );
     for backend in ["ptrace", "kvm"] {
         let args = [
-            "run",
             "--backend",
             backend,
+            "run",
             "--strict",
             "--base-env=minimal",
             &epoch_arg,
@@ -3879,9 +3951,9 @@ fn run_kvm_verify_does_not_write_to_standard_input() {
             .open(&path)
             .expect("failed to open stdin fixture");
         let args = [
-            "run",
             "--backend",
             backend,
+            "run",
             "--strict",
             "--verify",
             "--base-env=minimal",
@@ -3914,9 +3986,9 @@ fn run_kvm_counts_standard_input() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--base-env=minimal",
         "--",
@@ -3938,9 +4010,9 @@ fn run_kvm_reports_hostname() {
     }
 
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -4026,9 +4098,9 @@ int main(void) {
 
     let program = binary.to_str().expect("pipe guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--tmp=/tmp",
@@ -4160,8 +4232,8 @@ int main(int argc, char **argv) {
         .expect("random-device lseek guest path should be UTF-8");
     let kvm_args = [
         "--log=info",
-        "run",
         "--backend=kvm",
+        "run",
         "--strict",
         "--verify",
         "--verify-strict",
@@ -4186,8 +4258,8 @@ int main(int argc, char **argv) {
     // descriptor itself.
     let ptrace_args = [
         "--log=info",
-        "run",
         "--backend=ptrace",
+        "run",
         "--strict",
         "--verify",
         "--verify-strict",
@@ -4218,9 +4290,9 @@ fn run_kvm_reports_fixed_supplementary_groups() {
     }
 
     let kvm_args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -4241,9 +4313,9 @@ fn run_kvm_reports_fixed_supplementary_groups() {
 fn namespace_only_rejects_every_explicit_backend() {
     for backend in ["ptrace", "dbt", "kvm"] {
         let args = [
-            "run",
             "--backend",
             backend,
+            "run",
             "--namespace-only",
             "--",
             "/bin/true",
@@ -4475,22 +4547,6 @@ fn sabre_backend_validation_honors_command_scope() {
         &["SaBRe backend", "only through", "strace"],
     );
 
-    let local_override = hermit(&[
-        "--backend",
-        "sabre",
-        "run",
-        "--backend",
-        "ptrace",
-        "--",
-        "/definitely/missing/sabre-backend-override-test",
-    ]);
-    assert_hermit_refusal_contains(
-        &local_override,
-        Refusal::GuestNotFound,
-        &["does not exist or is not accessible"],
-    );
-    assert!(!stderr(&local_override).contains("SaBRe backend"));
-
     let log = hermit(&[
         "--backend",
         "sabre",
@@ -4520,9 +4576,9 @@ fn sabre_rpc_socket_is_hidden_from_proc_environ() {
 
     let _guard = hermit_run_guard();
     let args = [
-        "run",
         "--backend",
         "sabre",
+        "run",
         "--strict",
         "--verify",
         "--base-env=minimal",
@@ -4581,9 +4637,9 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
     let _guard = hermit_run_guard();
     let args = [
         "--log=info",
-        "run",
         "--backend",
         "sabre",
+        "run",
         "--strict",
         "--verify",
         "--verify-strict",
@@ -8376,9 +8432,9 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
 
     for backend in ["sabre", "dbt", "kvm"] {
         let output = hermit_command(&[
-            "run",
             "--backend",
             backend,
+            "run",
             "--timeout",
             "3",
             "--",
@@ -8428,7 +8484,7 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let missing_loader = "/nonexistent/hermit-cli-test/sabre";
     let run = |timeout: bool| {
-        let mut args = vec!["run", "--backend", "sabre"];
+        let mut args = vec!["--backend", "sabre", "run"];
         if timeout {
             args.extend(["--timeout", "3"]);
         }

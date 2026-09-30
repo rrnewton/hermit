@@ -78,10 +78,10 @@ pub(super) fn run(backend: &str) {
     let report_path = directory.join("verification.json");
     let args = [
         "--log=info",
-        "run",
-        "--base-env=minimal",
         "--backend",
         backend,
+        "run",
+        "--base-env=minimal",
         "--strict",
         "--verify-strict",
         "--verify",
@@ -175,10 +175,10 @@ fn run_failed_exec_expiry(backend: &str, guest: &Path, root: &Path) {
     );
     let args = [
         "--log=info",
-        "run",
-        "--base-env=minimal",
         "--backend",
         backend,
+        "run",
+        "--base-env=minimal",
         "--strict",
         "--verify-strict",
         "--verify",

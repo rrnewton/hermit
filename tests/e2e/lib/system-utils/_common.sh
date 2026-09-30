@@ -150,7 +150,7 @@ run_strict_verify() {
     local status
     set +e
     timeout -k 5s "${SYSTEM_UTIL_TIMEOUT_SECONDS}s" \
-        "$HERMIT_BIN" --log INFO run --backend "$SYSTEM_UTIL_BACKEND" \
+        "$HERMIT_BIN" --log INFO --backend "$SYSTEM_UTIL_BACKEND" run \
         --strict -- "$@" >"$STRICT_STDOUT" 2>"$STRICT_STDERR"
     status=$?
     set -e
@@ -161,7 +161,7 @@ run_strict_verify() {
 
     set +e
     timeout -k 5s "${SYSTEM_UTIL_TIMEOUT_SECONDS}s" \
-        "$HERMIT_BIN" --log INFO run --backend "$SYSTEM_UTIL_BACKEND" \
+        "$HERMIT_BIN" --log INFO --backend "$SYSTEM_UTIL_BACKEND" run \
         --strict --verify --verify-json "$VERIFY_REPORT" -- "$@" \
         >"$VERIFY_STDOUT" 2>"$VERIFY_STDERR"
     status=$?

@@ -41,9 +41,9 @@ fn assert_l2(case: &ProgramCase) {
         .args([
             "--log",
             "DEBUG",
-            "run",
             "--backend",
             "ptrace",
+            "run",
             "--strict",
             "--verify",
             "--verify-logs",
@@ -139,9 +139,9 @@ fn thread_self_fd_keeps_the_opener_identity() {
         .args([
             "--log",
             "DEBUG",
-            "run",
             "--backend",
             "ptrace",
+            "run",
             "--strict",
             "--verify",
             "--verify-logs",

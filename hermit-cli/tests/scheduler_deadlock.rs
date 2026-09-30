@@ -923,7 +923,7 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     let mut stderr = tempfile::tempfile().expect("failed to create Hermit stderr capture");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args(["run", "--backend=ptrace", "--strict", "--"])
+        .args(["--backend=ptrace", "run", "--strict", "--"])
         .arg(&guest)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

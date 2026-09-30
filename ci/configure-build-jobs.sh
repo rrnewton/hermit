@@ -641,7 +641,7 @@ fi
 # CARRY TO 0ae0c01 (2026-08-06). dd3c178..0ae0c01 is rrnewton/reverie#396,
 # which revives the KVM backend: it stops answering the `Guest::ppid`
 # traced-tree contract from the guest-visible getppid() value, so Detcore
-# registers the root thread again. Before it, every `hermit run --backend kvm`
+# registers the root thread again. Before it, every `hermit --backend kvm run`
 # hung before the first guest syscall, including /bin/true.
 #
 # `git diff --name-only dd3c178..0ae0c01` is exactly two files, both KVM:

@@ -34,8 +34,8 @@ fn assert_l2(case: &ProgramCase) {
         .args([
             "--log",
             "DEBUG",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--verify",
             "--base-env=minimal",
@@ -86,8 +86,8 @@ fn smaps_rollup_consumers_are_deterministic_under_strict_verify() {
     command
         .args([
             "--log=ERROR",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--base-env=minimal",
             "--",

@@ -59,8 +59,8 @@ fn host_kernel_probes_fall_back_deterministically() {
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

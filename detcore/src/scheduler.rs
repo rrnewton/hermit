@@ -3350,7 +3350,7 @@ impl Scheduler {
             // that ordinary race into a panic on the scheduler task -- and a
             // panicking scheduler does not fail the run, it HANGS it, because
             // every guest thread is waiting on a task that no longer exists.
-            // Measured 2026-08-25: `hermit run --backend kvm --strict --verify`
+            // Measured 2026-08-25: `hermit --backend kvm run --strict --verify`
             // on a bash process-substitution pipeline ran 420 s with empty
             // stdout and never exited. The pipeline's short-lived subshells hit
             // this window repeatedly. Found only once the 22 `run_kvm_` cli

@@ -107,8 +107,8 @@ fn run_under_hermit(guest: &Path, backend: &str) -> String {
         .args(["--kill-after", "5s", "120s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "run",
             &format!("--backend={backend}"),
+            "run",
             "--strict",
             "--base-env=minimal",
             "--",
@@ -133,7 +133,7 @@ fn run_under_hermit_sabre(guest: &Path, loader: &Path, plugin: &Path) -> String 
     command
         .args(["--kill-after", "5s", "120s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend=sabre", "--strict", "--base-env=minimal"])
+        .args(["--backend=sabre", "run", "--strict", "--base-env=minimal"])
         .arg("--sabre")
         .arg(loader)
         .arg("--sabre-plugin")

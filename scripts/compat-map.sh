@@ -257,7 +257,9 @@ reverie_rev=$(grep -oE 'reverie[^#]*#([0-9a-f]{7,40})' "$repo_root/Cargo.lock" 2
 # ---------------------------------------------------------------------------
 
 backend_flag_supported=0
-if "$HERMIT_BIN" run --help 2>&1 | grep -q -- '--backend'; then
+# `--backend` is a global option: it is listed in the top-level help, not in
+# `run --help`.
+if "$HERMIT_BIN" --help 2>&1 | grep -q -- '--backend'; then
     backend_flag_supported=1
 fi
 
@@ -343,7 +345,7 @@ fi
 
 kvm_probe="not-run"
 if [[ $kvm_available -eq 1 ]]; then
-    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend kvm -- /bin/true </dev/null >/dev/null 2>&1; then
+    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" --backend kvm run -- /bin/true </dev/null >/dev/null 2>&1; then
         kvm_probe="pass"
     else
         kvm_probe="fail"
@@ -352,7 +354,7 @@ fi
 
 dbt_probe="not-run"
 if [[ $dbt_available -eq 1 ]]; then
-    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend dbt -- /bin/true </dev/null >/dev/null 2>&1; then
+    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" --backend dbt run -- /bin/true </dev/null >/dev/null 2>&1; then
         dbt_probe="pass"
     else
         dbt_probe="fail"

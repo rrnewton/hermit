@@ -225,7 +225,7 @@ fn run_guest(guest: &Path, verify: bool) -> Output {
     if verify {
         command.args(["--log", "DEBUG"]);
     }
-    command.args(["run", "--backend=ptrace", "--strict"]);
+    command.args(["--backend=ptrace", "run", "--strict"]);
     if verify {
         command.arg("--verify");
     }

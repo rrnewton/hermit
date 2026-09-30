@@ -3847,9 +3847,9 @@ mod tests {
                 .join(format!("{}-verify-{backend}", test.replace('/', "-")));
             let mut argv = vec![
                 "/fake/hermit".to_string(),
-                "run".to_string(),
                 "--backend".to_string(),
                 backend.to_string(),
+                "run".to_string(),
                 "--env".to_string(),
                 "LANG=C".to_string(),
                 "--workdir".to_string(),

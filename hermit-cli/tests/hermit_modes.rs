@@ -742,9 +742,9 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
     let mut command = Command::new(hermit_binary);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     command.env("HERMIT_SABRE_BINARY", &loader).args([
-        "run",
         "--backend",
         "sabre",
+        "run",
         "--strict",
         "--verify",
     ]);

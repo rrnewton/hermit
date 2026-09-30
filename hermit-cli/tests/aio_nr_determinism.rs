@@ -78,8 +78,8 @@ fn aio_nr_consumers_verify() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

@@ -408,8 +408,8 @@ fn run_fixture(scenario: Scenario) {
         let report_path = directory.join("verification.json");
         let mut args = vec![
             "--log=trace",
-            "run",
             "--backend=ptrace",
+            "run",
             "--base-env=minimal",
             // CARGO_TARGET_TMPDIR may itself be under host /tmp. Keep that
             // fixture visible just as the neighboring CLI guest tests do.
@@ -584,8 +584,8 @@ fn preemption_artifact_case(
     let report_path = directory.join("verification.json");
     let args = [
         "--log=trace",
-        "run",
         "--backend=ptrace",
+        "run",
         "--base-env=minimal",
         "--tmp=/tmp",
         "--strict",

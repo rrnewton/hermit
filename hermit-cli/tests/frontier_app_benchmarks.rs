@@ -78,8 +78,8 @@ impl Workload {
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
                 "--log=info",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--",

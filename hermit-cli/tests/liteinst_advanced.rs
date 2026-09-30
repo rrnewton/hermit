@@ -170,13 +170,13 @@ const VIRTUAL_TIME_EPOCH: &str = "2026-01-01T00:00:00Z";
 
 fn liteinst_command_at_epoch(log_level: &str, epoch: Option<&str>) -> Command {
     let mut command = Command::new(liteinst_runtime::hermit_binary());
-    command.arg(format!("--log={log_level}")).arg("run");
+    command
+        .arg(format!("--log={log_level}"))
+        .args(["--backend", "liteinst", "run"]);
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
     command.args([
-        "--backend",
-        "liteinst",
         "--strict",
         "--base-env=minimal",
         "--mount=type=tmpfs,target=/test",
@@ -200,9 +200,9 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
         args,
         [
             "--log=off",
-            "run",
             "--backend",
             "liteinst",
+            "run",
             "--strict",
             "--base-env=minimal",
             "--mount=type=tmpfs,target=/test",
@@ -217,10 +217,10 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
         epoch_args,
         [
             "--log=off",
-            "run",
-            "--epoch=2026-01-01T00:00:00Z",
             "--backend",
             "liteinst",
+            "run",
+            "--epoch=2026-01-01T00:00:00Z",
             "--strict",
             "--base-env=minimal",
             "--mount=type=tmpfs,target=/test",

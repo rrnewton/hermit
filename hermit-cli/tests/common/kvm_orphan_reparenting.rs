@@ -152,9 +152,9 @@ pub(super) fn run() {
         let config_env = format!("XDG_CONFIG_HOME={}", config.display());
         let mut args = vec![
             "--log=info",
+            "--backend=kvm",
             "run",
             "--base-env=minimal",
-            "--backend=kvm",
             "--strict",
             "--verify-strict",
             "--verify",

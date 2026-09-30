@@ -36,8 +36,9 @@ fn socket_timestamp_ioctls_use_logical_time() {
             let verify = Command::new("timeout")
                 .args(["--kill-after", "5s", "90s"])
                 .arg(env!("CARGO_BIN_EXE_hermit"))
-                .args(["--log=info", "run"])
+                .arg("--log=info")
                 .arg(format!("--backend={backend}"))
+                .arg("run")
                 .args(["--strict", "--verify", "--base-env=minimal", "--"])
                 .arg(&guest)
                 .arg(mode)
@@ -62,8 +63,8 @@ fn socket_timestamp_ioctls_use_logical_time() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=off",
-            "run",
             "--backend=ptrace",
+            "run",
             "--no-virtualize-time",
             "--no-virtualize-metadata",
             "--base-env=minimal",

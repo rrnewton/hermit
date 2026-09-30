@@ -243,8 +243,8 @@ fn emit_runtime_diagnostic(message: &str) {
 /// Emit a routine per-run lifecycle breadcrumb (`detcore-dbt: …`).
 ///
 /// These progress markers narrate DBT backend startup and are useful when
-/// debugging the runtime, but they are noise for a normal `hermit run --backend
-/// dbt`. Gate them behind `HERMIT_LOG=info` (or `debug`/`trace`) so a default
+/// debugging the runtime, but they are noise for a normal `hermit --backend dbt
+/// run`. Gate them behind `HERMIT_LOG=info` (or `debug`/`trace`) so a default
 /// run is quiet. Genuine warnings and unsupported-syscall diagnostics do not go
 /// through this helper and stay unconditional. The decision is read once and
 /// cached, so hot callers pay only an atomic load.
@@ -331,7 +331,7 @@ fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) 
     protected_level == 0 || tracing_active
 }
 
-/// Environment variable through which `hermit run --backend dbt` hands the
+/// Environment variable through which `hermit --backend dbt run` hands the
 /// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
 ///
 /// The guest process inherits it from `drrun` (see the DBT launcher), so it is

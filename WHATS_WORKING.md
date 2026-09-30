@@ -479,8 +479,8 @@ for host/runtime reasons.
 
 ```bash
 $HERMIT run --strict --verify -- /bin/echo hi   # ptrace: works
-$HERMIT run --backend dbt -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
-$HERMIT run --backend kvm -- /bin/echo hi        # fail-closed
+$HERMIT --backend dbt run -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
+$HERMIT --backend kvm run -- /bin/echo hi        # fail-closed
 ```
 
 ---

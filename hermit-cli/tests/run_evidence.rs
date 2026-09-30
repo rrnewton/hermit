@@ -445,9 +445,9 @@ fn dbt_and_sabre_evidence_are_refused_before_guest_launch() {
         let destination_arg = destination.display().to_string();
         let launched_arg = launched.display().to_string();
         let output = run(&[
-            "run",
             "--backend",
             backend,
+            "run",
             "--run-evidence-dir",
             &destination_arg,
             "--",

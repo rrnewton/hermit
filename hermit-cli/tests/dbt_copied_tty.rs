@@ -37,8 +37,8 @@ fn copied_child_tiocgpgrp_verifies_under_dbt_strict() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=info",
-            "run",
             "--backend=dbt",
+            "run",
             "--strict",
             "--verify",
             "--base-env=minimal",

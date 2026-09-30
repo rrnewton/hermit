@@ -3013,7 +3013,8 @@ mod tests {
                 r#"#!/usr/bin/python3
 import json,pathlib,sys
 root=pathlib.Path(__file__).parent
-a=sys.argv[1:]
+full=sys.argv[1:]
+a=full
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
 if 'run' in a:a=a[a.index('run'):]
@@ -3025,7 +3026,8 @@ if a[0]=='log-diff':
  if len(a)==2:
   record({'kind':'normalize','argv':a});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
  record({'kind':'compare','argv':a});sys.exit(3)
-backend=a[a.index('--backend')+1]
+# `--backend` is a global option, so it precedes `run`.
+backend=full[full.index('--backend')+1]
 if '--verify-json' not in a:
  assert '--verify' not in a and '--verify-strict' not in a,a
  record({'kind':'custom','backend':backend,'argv':a});sys.exit(0)
@@ -3350,7 +3352,8 @@ report.write_bytes((root/'verification.json').read_bytes())
             &hermit,
             r#"#!/usr/bin/python3 -IS
 import sys
-a=sys.argv[1:]
+full=sys.argv[1:]
+a=full
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
 if 'run' in a:a=a[a.index('run'):]
@@ -3364,7 +3367,8 @@ if a[0]=='log-diff':
   record('{"kind": "normalize"}');sys.stdout.buffer.write(open(a[1],'rb').read());sys.exit(0)
  record('{"kind": "compare"}')
  os.execv(sys.executable,[sys.executable,'-IS',os.path.join(root,'fake-parity-log-diff.py')]+a)
-backend=a[a.index('--backend')+1]
+# `--backend` is a global option, so it precedes `run`.
+backend=full[full.index('--backend')+1]
 report=a[a.index('--verify-json')+1]
 cell=os.path.basename(os.path.dirname(report))
 record('{"kind": "run", "cell": "%s"}'%cell)

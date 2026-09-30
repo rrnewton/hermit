@@ -161,9 +161,9 @@ pub(super) fn run() {
         fs::create_dir_all(&config).unwrap();
         let args = [
             "--log=trace",
+            "--backend=kvm",
             "run",
             "--base-env=minimal",
-            "--backend=kvm",
             "--strict",
             "--target-timeslice=6000",
             "--verify-strict",

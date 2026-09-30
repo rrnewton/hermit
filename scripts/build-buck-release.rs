@@ -4024,9 +4024,9 @@ fn behavioral_parity(
         let cargo_data = evidence_dir.join(format!("cargo-{backend}-verify-data"));
         let cargo_arguments = [
             "--log=info",
-            "run",
             "--backend",
             backend,
+            "run",
             "--base-env=minimal",
             &epoch,
             CLOCK_PARITY_MAX_TIMESLICE,
@@ -4054,9 +4054,9 @@ fn behavioral_parity(
         let buck_data = evidence_dir.join(format!("buck-{backend}-verify-data"));
         let buck_arguments = [
             "--log=info",
-            "run",
             "--backend",
             backend,
+            "run",
             "--base-env=minimal",
             &epoch,
             CLOCK_PARITY_MAX_TIMESLICE,
@@ -4311,7 +4311,13 @@ fn classify_matrix_proxy_invocation(arguments: &[String]) -> Result<MatrixProxyI
         .iter()
         .position(|argument| argument == "--")
         .ok_or_else(|| "matrix proxy invocation lacks a guest separator".to_owned())?;
-    if arguments.first().map(String::as_str) != Some("run") {
+    // The backend is a global option, so it may only precede the subcommand:
+    // `hermit --backend dbt run ...`.
+    let subcommand = match arguments {
+        [flag, _backend, rest @ ..] if flag == "--backend" => rest,
+        rest => rest,
+    };
+    if subcommand.first().map(String::as_str) != Some("run") {
         return Err("matrix proxy invocation is neither a probe nor `hermit run`".to_owned());
     }
     let guest = &arguments[separator + 1..];
@@ -10175,7 +10181,7 @@ esac
     }
 
     /// Exact stdout of the clock fixture under the pinned epoch, captured from
-    /// `run --backend ptrace --base-env=minimal --epoch=2026-01-01T00:00:00+00:00
+    /// `--backend ptrace run --base-env=minimal --epoch=2026-01-01T00:00:00+00:00
     /// --max-timeslice=200000000 --strict --verify --verify-strict` through
     /// safehermit with both a Cargo- and a Buck-built candidate (the shadow
     /// artifacts of the pre-rebase form of "Run the shadow DBT matrix under the
@@ -11101,9 +11107,9 @@ esac
         .unwrap();
         assert_eq!(host.case_identity, "probe/host-capabilities");
         let smoke = classify_matrix_proxy_invocation(&[
-            "run".to_owned(),
             "--backend".to_owned(),
             "dbt".to_owned(),
+            "run".to_owned(),
             "--strict".to_owned(),
             "--".to_owned(),
             "/bin/true".to_owned(),
@@ -11114,9 +11120,9 @@ esac
             ("probe/dbt-smoke", "probe")
         );
         let exit_zero = classify_matrix_proxy_invocation(&[
-            "run".to_owned(),
             "--backend".to_owned(),
             "dbt".to_owned(),
+            "run".to_owned(),
             "--strict".to_owned(),
             "--max-timeslice=disabled".to_owned(),
             "--".to_owned(),
@@ -11137,9 +11143,9 @@ esac
         );
         assert!(
             classify_matrix_proxy_invocation(&[
-                "run".to_owned(),
                 "--backend".to_owned(),
                 "dbt".to_owned(),
+                "run".to_owned(),
                 "--max-timeslice=disabled".to_owned(),
                 "--".to_owned(),
                 "/unknown/fixture".to_owned(),
@@ -11217,9 +11223,9 @@ esac
             fs::create_dir_all(directory).unwrap();
         }
         let hermit = [
-            "run",
             "--backend",
             "dbt",
+            "run",
             "--max-timeslice=disabled",
             "--",
             "/bin/true",

@@ -314,7 +314,7 @@ assumption:
 | KVM | Export the prepared root through a block image, virtio-fs, or equivalent guest-kernel filesystem channel | Separate performance/isolation phase |
 
 Define a backend rootfs capability such as `HostPivotRoot`, `GuestExport`, or
-`Unsupported`. `hermit oci run --backend=X` fails before guest launch when the
+`Unsupported`. `hermit --backend=X oci run` fails before guest launch when the
 backend has not passed its rootfs and runtime-artifact tests. There is no silent
 fallback to ptrace and no silent use of the host root.
 

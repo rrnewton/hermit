@@ -230,15 +230,32 @@ fn args_from_matches_with_clock(
     matches: &ArgMatches,
     capture_now: impl FnOnce() -> std::time::SystemTime,
 ) -> Result<Args, clap::Error> {
-    let run_epoch_source = matches
-        .subcommand_matches("run")
-        .or_else(|| {
-            matches
-                .subcommand_matches("oci")
-                .and_then(|oci| oci.subcommand_matches("run"))
-        })
-        .and_then(|run| run.value_source("epoch"));
+    let run_matches = matches.subcommand_matches("run").or_else(|| {
+        matches
+            .subcommand_matches("oci")
+            .and_then(|oci| oci.subcommand_matches("run"))
+    });
+    let run_epoch_source = run_matches.and_then(|run| run.value_source("epoch"));
     let mut args = Args::from_arg_matches(matches)?;
+    // `--namespace-only` bypasses instrumentation, so an explicit backend would
+    // be silently ignored. The backend is a global option, which clap's
+    // per-subcommand `conflicts_with` cannot see, so refuse the pair here as the
+    // same parse-time usage error.
+    if let (Some(backend), Some(run)) = (args.global.backend, run_matches)
+        && run.get_flag("namespace_only")
+    {
+        return Err(Args::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "the argument '--backend={}' cannot be used with '--namespace-only': \
+                 namespace-only mode bypasses instrumentation, so the backend would be \
+                 ignored. Drop `--backend` to run namespace-only, or drop \
+                 `--namespace-only` to run under the {} backend.",
+                backend.as_str(),
+                backend.as_str()
+            ),
+        ));
+    }
     if run_epoch_source == Some(ValueSource::DefaultValue) {
         match &mut args.command {
             Subcommand::Run(run) => run.capture_default_epoch(capture_now),
@@ -247,6 +264,105 @@ fn args_from_matches_with_clock(
         }
     }
     Ok(args)
+}
+
+/// Point a subcommand-level `--backend` at the global position.
+///
+/// `--backend` is a global option (`hermit --backend <BACKEND> <SUBCOMMAND>`) and
+/// no subcommand declares its own, so clap already refuses it after a subcommand
+/// as an unexpected argument. This keeps that refusal and its usage-error exit
+/// status, and only replaces clap's generic hint and subcommand usage -- which
+/// name an unrelated flag, `--backend-engagement-json` -- with the working
+/// spelling: the caller's own command with `--backend` moved in front of the
+/// subcommand, and the top-level usage that shows where global options go.
+fn redirect_misplaced_backend(error: clap::Error, argv: &[std::ffi::OsString]) -> clap::Error {
+    use clap::builder::StyledStr;
+    use clap::error::ContextKind;
+    use clap::error::ContextValue;
+    use clap::error::ErrorKind;
+
+    if error.kind() != ErrorKind::UnknownArgument {
+        return error;
+    }
+    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+        return error;
+    };
+    if invalid != "--backend" && !invalid.starts_with("--backend=") {
+        return error;
+    }
+    let mut command = Args::command();
+    let mut redirected = clap::Error::new(ErrorKind::UnknownArgument).with_cmd(&command);
+    redirected.insert(
+        ContextKind::InvalidArg,
+        ContextValue::String(invalid.clone()),
+    );
+    redirected.insert(
+        ContextKind::Usage,
+        ContextValue::StyledStr(command.render_usage()),
+    );
+    let corrected = globally_placed_backend(argv)
+        .unwrap_or_else(|| "hermit --backend=<BACKEND> <SUBCOMMAND> [OPTIONS]".to_owned());
+    redirected.insert(
+        ContextKind::Suggested,
+        ContextValue::StyledStrs(vec![StyledStr::from(format!(
+            "`--backend` is a global option and must come before the subcommand: `{corrected}`"
+        ))]),
+    );
+    redirected
+}
+
+/// `argv` with its single `--backend` option moved directly after the program
+/// name, rendered as a shell command. `None` when the option cannot be moved
+/// unambiguously (it appears more than once before `--`, or has no value).
+fn globally_placed_backend(argv: &[std::ffi::OsString]) -> Option<String> {
+    let args = argv
+        .iter()
+        .map(|arg| arg.to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let (program, rest) = args.split_first()?;
+    let options_end = rest
+        .iter()
+        .position(|arg| *arg == "--")
+        .unwrap_or(rest.len());
+    let mut positions = rest[..options_end]
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| **arg == "--backend" || arg.starts_with("--backend="))
+        .map(|(index, _)| index);
+    let index = positions.next()?;
+    if positions.next().is_some() {
+        return None;
+    }
+    let mut remaining = rest.to_vec();
+    let backend = if remaining[index] == "--backend" {
+        if index + 1 >= options_end {
+            return None;
+        }
+        let value = remaining.remove(index + 1);
+        remaining.remove(index);
+        value
+    } else {
+        remaining.remove(index).strip_prefix("--backend=")?
+    };
+    let flag = format!("--backend={backend}");
+    let words = std::iter::once(*program)
+        .chain(std::iter::once(flag.as_str()))
+        .chain(remaining.iter().copied())
+        .map(|word| {
+            // Quote only what the shell would otherwise interpret, so the common
+            // case reads as typed: `hermit --backend=ptrace run -- /bin/true`.
+            let plain = !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=,@%+".contains(&byte));
+            if plain {
+                word.to_owned()
+            } else {
+                shell_words::quote(word).into_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(words.join(" "))
 }
 
 #[derive(Debug, Parser)]
@@ -469,7 +585,10 @@ fn main() {
     // omitted epoch from an explicit CLI/environment value. `Config` keeps a
     // stable library default for wire fingerprints and unit fixtures; only an
     // actual `hermit run` invocation captures host wall time.
-    let matches = Args::command().get_matches();
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    let matches = Args::command()
+        .try_get_matches_from(&argv)
+        .unwrap_or_else(|error| redirect_misplaced_backend(error, &argv).exit());
     let Args {
         mut global,
         mut command,
@@ -1276,9 +1395,9 @@ mod tests {
                 "hermit",
                 "--log",
                 "warn",
+                "--backend=ptrace",
                 "run",
                 "--verify",
-                "--backend=ptrace",
             ],
             "RunOpts::main log-level preflight",
         );
@@ -1413,6 +1532,134 @@ mod tests {
             .expect("global-position --backend should parse");
         assert_eq!(args.global.backend, Some(Backend::Kvm));
         assert!(matches!(args.command, Subcommand::Run(_)));
+    }
+
+    fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn subcommand_level_backend_is_a_usage_error_naming_the_global_form() {
+        use clap::error::ErrorKind;
+
+        for (argv, corrected) in [
+            (
+                &["hermit", "run", "--backend=ptrace", "--", "/bin/true"][..],
+                "hermit --backend=ptrace run -- /bin/true",
+            ),
+            (
+                &[
+                    "hermit",
+                    "record",
+                    "start",
+                    "--backend",
+                    "e9patch",
+                    "--",
+                    "a b",
+                ][..],
+                "hermit --backend=e9patch record start -- 'a b'",
+            ),
+        ] {
+            let argv = os_args(argv);
+            let error = Args::command()
+                .try_get_matches_from(&argv)
+                .expect_err("a subcommand-level --backend must not parse");
+            let error = super::redirect_misplaced_backend(error, &argv);
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+            assert_eq!(error.exit_code(), 2);
+            let rendered = error.render().to_string();
+            assert!(
+                rendered.contains(&format!("must come before the subcommand: `{corrected}`")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("Usage: hermit [OPTIONS] <COMMAND>"),
+                "{rendered}"
+            );
+        }
+
+        // Other unknown arguments keep clap's own error, suggestions included.
+        let argv = os_args(&["hermit", "run", "--backend-engagement-jsn=x", "prog"]);
+        let error = Args::command().try_get_matches_from(&argv).unwrap_err();
+        let untouched = error.render().to_string();
+        let error = super::redirect_misplaced_backend(error, &argv);
+        assert_eq!(error.render().to_string(), untouched);
+        assert!(
+            untouched.contains("--backend-engagement-json"),
+            "{untouched}"
+        );
+    }
+
+    #[test]
+    fn misplaced_backend_is_only_moved_when_unambiguous() {
+        use super::globally_placed_backend;
+
+        assert_eq!(
+            globally_placed_backend(&os_args(&["h", "--log", "info", "run", "--backend", "kvm"]))
+                .as_deref(),
+            Some("h --backend=kvm --log info run")
+        );
+        // A guest argument named `--backend` is not a Hermit option.
+        assert_eq!(
+            globally_placed_backend(&os_args(&[
+                "h",
+                "run",
+                "--backend=dbt",
+                "--",
+                "prog",
+                "--backend",
+            ]))
+            .as_deref(),
+            Some("h --backend=dbt run -- prog --backend")
+        );
+        // Two backend options, or one without a value, cannot be moved safely,
+        // so the generic global spelling is shown instead.
+        for argv in [
+            &["h", "--backend=kvm", "run", "--backend=dbt", "--", "p"][..],
+            &["h", "run", "--backend"][..],
+            &["h", "run", "--backend", "--", "p"][..],
+        ] {
+            assert_eq!(globally_placed_backend(&os_args(argv)), None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn global_backend_with_namespace_only_is_a_usage_error() {
+        use clap::error::ErrorKind;
+
+        for argv in [
+            &[
+                "hermit",
+                "--backend=ptrace",
+                "run",
+                "--namespace-only",
+                "prog",
+            ][..],
+            &[
+                "hermit",
+                "--backend=kvm",
+                "oci",
+                "run",
+                "--namespace-only",
+                "img",
+                "p",
+            ][..],
+        ] {
+            let matches = Args::command().try_get_matches_from(argv).unwrap();
+            let error = args_from_matches_with_clock(&matches, || {
+                panic!("a refused command must not capture host time")
+            })
+            .expect_err("--backend with --namespace-only must be refused");
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{argv:?}");
+            assert_eq!(error.exit_code(), 2);
+            let rendered = error.render().to_string();
+            assert!(rendered.contains("--namespace-only"), "{rendered}");
+            assert!(rendered.contains("Drop `--backend`"), "{rendered}");
+        }
+        let matches = Args::command()
+            .try_get_matches_from(["hermit", "run", "--namespace-only", "prog"])
+            .unwrap();
+        assert!(args_from_matches_with_clock(&matches, || panic!("no clock")).is_ok());
     }
 
     #[test]

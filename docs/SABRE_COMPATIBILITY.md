@@ -25,7 +25,7 @@ cargo build --release --locked -p hermit \
 HERMIT_INSTALL_FORCE_RESTAGE=local-sabre \
   cargo build --release --locked -p hermit-install
 
-target/release/hermit run --backend sabre --strict --verify -- /bin/echo hello
+target/release/hermit --backend sabre run --strict --verify -- /bin/echo hello
 ```
 
 An explicit SaBRe request fails closed if the feature or artifacts are absent.
@@ -90,7 +90,7 @@ Baseline sweep provenance:
 - Host: Linux `6.18.39-0_fbk0_hardened_0_ga43d5727b443`, AMD EPYC 9D85,
   `perf_event_paranoid=1`.
 - Toolchain: `rustc 1.99.0-nightly (26ae60a9e 2026-07-28)`.
-- Comparator: `Stripped` (`run --backend sabre --strict --verify`). The portable
+- Comparator: `Stripped` (`--backend sabre run --strict --verify`). The portable
   corpus uses `--no-virtualize-cpuid --max-timeslice=disabled`; the standalone
   `/bin/echo`, `/bin/true`, and `/bin/cat /dev/null` probes matched under
   `Stripped` without additional relaxations. These results are not L2.

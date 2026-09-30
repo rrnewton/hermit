@@ -226,10 +226,10 @@ impl StressProbe {
                 )
             }
             StressProbe::KvmVerify => format!(
-                "{dbg} run --backend kvm --verify -- /bin/echo hermit-super-kvm-{iteration} </dev/null"
+                "{dbg} --backend kvm run --verify -- /bin/echo hermit-super-kvm-{iteration} </dev/null"
             ),
             StressProbe::DbtVerify => format!(
-                "{dbg} run --backend dbt --verify -- /bin/echo hermit-super-dbt-{iteration} </dev/null"
+                "{dbg} --backend dbt run --verify -- /bin/echo hermit-super-dbt-{iteration} </dev/null"
             ),
         }
     }
@@ -266,7 +266,7 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
             "dbt_available",
             "DBT backend availability (gates the DBT stress rows)",
             format!(
-                "{dbg} --log=info run --backend dbt --strict --verify -- \
+                "{dbg} --log=info --backend dbt run --strict --verify -- \
                  /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
             ),
             vec![build_dep.to_string()],

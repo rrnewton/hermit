@@ -314,8 +314,9 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         verify_command
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["--log=info", "run"])
+            .arg("--log=info")
             .arg(format!("--backend={backend}"))
+            .arg("run")
             .args(["--strict", "--verify", "--base-env=minimal", "--"])
             .arg(&guest);
         let verify_output = command_output(

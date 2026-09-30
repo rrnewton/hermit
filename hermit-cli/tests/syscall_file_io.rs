@@ -71,8 +71,8 @@ fn deterministic_file_io_syscalls_verify() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=trace",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
@@ -101,8 +101,8 @@ fn deterministic_file_io_syscalls_verify() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=info",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--verify",
             "--panic-on-unsupported-syscalls",

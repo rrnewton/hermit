@@ -669,7 +669,7 @@ whether the backend is actually present:
 
 ```console
 ls target/install_pkg/rsrcs/            # dynamorio, sabre, e9patch, liteinst runtimes
-./target/debug/hermit run --backend=dbt -- /bin/true
+./target/debug/hermit --backend=dbt run -- /bin/true
 ```
 
 **Distinguish two different causes that look identical.** A build without

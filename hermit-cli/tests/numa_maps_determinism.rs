@@ -52,8 +52,8 @@ fn assert_l2(case: &ProgramCase) {
         .args([
             "--log",
             "DEBUG",
-            "run",
             "--backend=ptrace",
+            "run",
             "--strict",
             "--verify",
             "--panic-on-unsupported-syscalls",
@@ -89,8 +89,8 @@ fn read_numa_maps() -> String {
     command.args([
         "--log",
         "ERROR",
-        "run",
         "--backend=ptrace",
+        "run",
         "--strict",
         "--panic-on-unsupported-syscalls",
         "--base-env=minimal",

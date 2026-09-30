@@ -345,8 +345,10 @@ pub(crate) struct DetOptions {
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
-    /// Select the process instrumentation backend.
-    #[clap(long, value_enum)]
+    /// The process instrumentation backend. It is selected only by the global
+    /// option (`hermit --backend <BACKEND> run ...`); `run` does not accept
+    /// `--backend` itself. [`RunOpts::main`] copies the global value here.
+    #[clap(skip)]
     backend: Option<Backend>,
 
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
@@ -476,8 +478,7 @@ pub struct RunOpts {
         long,
         alias = "lite",
         conflicts_with = "chaos",
-        conflicts_with = "verify",
-        conflicts_with = "backend"
+        conflicts_with = "verify"
     )]
     namespace_only: bool,
 
@@ -978,7 +979,10 @@ impl FromStr for SeedFrom {
     }
 }
 
-/// Displays as a string which needs only to be prepended with "hermit " to be a runnable command.
+/// Displays the `run` subcommand's own options, so that
+/// `hermit{global_backend_arg()} run{self}` is a runnable command. The backend is a
+/// global option and is therefore rendered by [`RunOpts::global_backend_arg`],
+/// not here.
 impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut dop = self.det_opts.det_config.clone();
@@ -987,9 +991,6 @@ impl fmt::Display for RunOpts {
         // false default, so its Display would otherwise add the explicit opt-in.
         dop.panic_on_unsupported_syscalls = false;
 
-        if let Some(backend) = self.backend {
-            write!(f, " --backend={}", backend.as_str())?;
-        }
         if let Some(skid_margin) = self.skid_margin {
             write!(f, " --skid-margin={skid_margin}")?;
         }
@@ -1331,6 +1332,20 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
     }
 }
 
+/// Parse `hermit [GLOBAL...] run [RUN...]` through the real top-level parser and
+/// apply the global `--backend` the way [`RunOpts::main`] does. `run` itself does
+/// not accept `--backend`; see `cli.rs::run_rejects_subcommand_level_backend`.
+#[cfg(test)]
+fn run_opts_for(argv: &[&str]) -> RunOpts {
+    let args = crate::Args::try_parse_from(argv)
+        .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+    let crate::Subcommand::Run(mut run) = args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    run.backend = args.global.backend;
+    *run
+}
+
 #[test]
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
@@ -1364,13 +1379,17 @@ fn backend_values_parse_and_round_trip() {
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
     ] {
-        let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
+        let mut ro = run_opts_for(&["hermit", "--backend", value, "run", "fakeprog"]);
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        let normalized =
-            format!(" --backend={value} --epoch=2026-01-01T00:00:00+00:00 -- fakeprog");
-        assert_eq!(format!("{}", ro), normalized);
+        // The backend is global, so it renders before the subcommand and is not
+        // part of the `run` options' own rendering.
+        assert_eq!(ro.global_backend_arg(), format!(" --backend={value}"));
+        assert_eq!(
+            format!("{}", ro),
+            " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+        );
     }
 }
 
@@ -1402,7 +1421,7 @@ fn comparator_choice_does_not_depend_on_the_backend() {
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
     ] {
-        let plain = RunOpts::parse_from(["fakehermit", "--backend", value, "--verify", "fakeprog"]);
+        let plain = run_opts_for(&["hermit", "--backend", value, "run", "--verify", "fakeprog"]);
         assert_eq!(plain.selected_backend(), backend);
         assert_eq!(
             plain.verification_strictness(),
@@ -1412,10 +1431,11 @@ fn comparator_choice_does_not_depend_on_the_backend() {
         );
 
         for flag in ["--verify-strict", "--verify-verbose"] {
-            let canonical = RunOpts::parse_from([
-                "fakehermit",
+            let canonical = run_opts_for(&[
+                "hermit",
                 "--backend",
                 value,
+                "run",
                 "--verify",
                 flag,
                 "fakeprog",
@@ -1433,7 +1453,14 @@ fn comparator_choice_does_not_depend_on_the_backend() {
 #[test]
 fn verification_always_compares_retained_logs() {
     for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
-        let run = RunOpts::parse_from(["fakehermit", "--backend", backend, "--verify", "fakeprog"]);
+        let run = run_opts_for(&[
+            "hermit",
+            "--backend",
+            backend,
+            "run",
+            "--verify",
+            "fakeprog",
+        ]);
         assert!(
             run.verification_comparison_options().compare_logs,
             "--verify on {backend} must compare both retained logs"
@@ -1444,10 +1471,11 @@ fn verification_always_compares_retained_logs() {
 #[test]
 fn every_backend_keeps_io_buffer_checking_on_by_default() {
     for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
-        let run = RunOpts::parse_from([
-            "fakehermit",
+        let run = run_opts_for(&[
+            "hermit",
             "--backend",
             backend,
+            "run",
             "--verify",
             "--verify-strict",
             "fakeprog",
@@ -1470,10 +1498,11 @@ fn every_backend_keeps_io_buffer_checking_on_by_default() {
             );
         }
 
-        let opted_out = RunOpts::parse_from([
-            "fakehermit",
+        let opted_out = run_opts_for(&[
+            "hermit",
             "--backend",
             backend,
+            "run",
             "--verify",
             "--verify-strict",
             "--no-detlog-io-buffers",
@@ -1502,7 +1531,14 @@ fn every_backend_keeps_io_buffer_checking_on_by_default() {
 
 #[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
+    let mut ro = run_opts_for(&[
+        "hermit",
+        "--backend",
+        "e9patch",
+        "run",
+        "/bin/echo",
+        "hello",
+    ]);
     ro.e9patch_overlay = Some(E9patchOverlay {
         source: PathBuf::from("/cache/patched-echo"),
         target: PathBuf::from("/bin/echo"),
@@ -1532,10 +1568,11 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
     fs::set_permissions(&tool, permissions).unwrap();
 
     let tmp_arg = format!("--tmp={}", tmp.path().display());
-    let mut ro = RunOpts::parse_from([
-        "fakehermit",
+    let mut ro = run_opts_for(&[
+        "hermit",
         "--backend",
         "e9patch",
+        "run",
         &tmp_arg,
         "-e",
         "PATH=/tmp",
@@ -1564,7 +1601,7 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
 
 #[test]
 fn non_e9patch_validation_preserves_parent_component_paths() {
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "ptrace", "/bin/../bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "ptrace", "run", "/bin/../bin/echo"]);
     ro.validate_program().unwrap();
 }
 
@@ -1583,7 +1620,7 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
     // The two variables are present with identical values regardless of the
     // selected backend, so no backend-specific spawn hook is required for parity.
     for backend in ["ptrace", "kvm", "sabre", "dbt"] {
-        let ro = RunOpts::parse_from(["fakehermit", "--backend", backend, "/bin/echo", "hi"]);
+        let ro = run_opts_for(&["hermit", "--backend", backend, "run", "/bin/echo", "hi"]);
         let envs = ro.guest_command().unwrap().get_captured_envs();
         assert_eq!(
             envs.get(asan),
@@ -1678,10 +1715,11 @@ fn namespace_only_guest_command_preserves_sanitizer_environment() {
 
 #[test]
 fn dbt_rejects_mount_and_bind_but_accepts_workdir() {
-    let mut with_mount = RunOpts::parse_from([
-        "fakehermit",
+    let mut with_mount = run_opts_for(&[
+        "hermit",
         "--backend",
         "dbt",
+        "run",
         "--mount=type=tmpfs,target=/test",
         "/bin/true",
     ]);
@@ -1691,10 +1729,11 @@ fn dbt_rejects_mount_and_bind_but_accepts_workdir() {
         .to_string();
     assert!(error.contains("dbt backend cannot apply --mount"));
 
-    let mut with_bind = RunOpts::parse_from([
-        "fakehermit",
+    let mut with_bind = run_opts_for(&[
+        "hermit",
         "--backend",
         "dbt",
+        "run",
         "--bind=/tmp:/test",
         "/bin/true",
     ]);
@@ -1704,10 +1743,11 @@ fn dbt_rejects_mount_and_bind_but_accepts_workdir() {
         .to_string();
     assert!(error.contains("dbt backend cannot apply --mount"));
 
-    let mut with_workdir = RunOpts::parse_from([
-        "fakehermit",
+    let mut with_workdir = run_opts_for(&[
+        "hermit",
         "--backend",
         "dbt",
+        "run",
         "--workdir",
         "/test",
         "/bin/true",
@@ -1727,10 +1767,11 @@ fn guest_path_normalization_rejects_parent_components() {
 
 #[test]
 fn e9patch_mount_target_rejects_parent_components() {
-    let ro = RunOpts::parse_from([
-        "fakehermit",
+    let ro = run_opts_for(&[
+        "hermit",
         "--backend",
         "e9patch",
+        "run",
         "--mount=type=tmpfs,target=/tmp/../bin",
         "/bin/echo",
     ]);
@@ -1747,7 +1788,7 @@ fn e9patch_mount_target_rejects_symlink_components() {
         "--mount=type=tmpfs,target={}",
         link.join("target").display()
     );
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", &mount, "/bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "e9patch", "run", &mount, "/bin/echo"]);
     let error = ro.validate_e9patch_mount_targets().unwrap_err();
     assert!(error.to_string().contains("mount target traverses symlink"));
 }
@@ -1781,10 +1822,11 @@ fn non_elf_entrypoints_skip_e9patch_preprocessing() {
         mount_link.join("target").display()
     );
     let tmp = format!("--tmp={}", directory.path().display());
-    let mut ro = RunOpts::parse_from([
-        "fakehermit",
+    let mut ro = run_opts_for(&[
+        "hermit",
         "--backend",
         "e9patch",
+        "run",
         &unrelated_mount,
         &tmp,
         "/tmp/script",
@@ -1795,7 +1837,7 @@ fn non_elf_entrypoints_skip_e9patch_preprocessing() {
 
 #[test]
 fn e9patch_overlay_uses_canonical_target_without_custom_mounts() {
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "e9patch", "run", "/bin/echo"]);
     assert_eq!(
         ro.resolve_e9patch_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
             .unwrap(),
@@ -1814,10 +1856,11 @@ fn e9patch_rejects_symlinked_executables_through_custom_mounts() {
         "--mount=type=bind,source={},target=/e9patch-test",
         directory.path().display()
     );
-    let ro = RunOpts::parse_from([
-        "fakehermit",
+    let ro = run_opts_for(&[
+        "hermit",
         "--backend",
         "e9patch",
+        "run",
         &mount,
         "/e9patch-test/link",
     ]);
@@ -1834,7 +1877,7 @@ fn e9patch_rejects_mounts_that_change_a_symlink_target() {
         "--mount=type=bind,source={},target=/usr",
         directory.path().display()
     );
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", &mount, "/bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "e9patch", "run", &mount, "/bin/echo"]);
     let error = ro
         .resolve_e9patch_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
         .unwrap_err();
@@ -2060,9 +2103,10 @@ fn skid_margin_override_parses_and_round_trips() {
 #[test]
 fn skid_margin_override_rejects_non_ptrace_backed_backends() {
     for backend in ["dbt", "kvm", "sabre"] {
-        let mut opts = RunOpts::parse_from([
-            "fakehermit",
+        let mut opts = run_opts_for(&[
+            "hermit",
             &format!("--backend={backend}"),
+            "run",
             "--skid-margin=500",
             "fakeprog",
         ]);
@@ -2078,17 +2122,19 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
 
 #[test]
 fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
-    let mut opts = RunOpts::parse_from([
-        "fakehermit",
+    let mut opts = run_opts_for(&[
+        "hermit",
         "--backend=liteinst",
+        "run",
         "--skid-margin=500",
         "fakeprog",
     ]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.skid_margin, Some(500));
+    assert_eq!(opts.global_backend_arg(), " --backend=liteinst");
     assert_eq!(
         format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+        " --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -2294,7 +2340,7 @@ fn dbt_backend_disables_uts_assumption() {
     // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
     // the nodename to `hermetic-container.local` instead of leaking the host
     // FQDN. Regression guard for DBT uname parity with the ptrace backend.
-    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbt", "fakeprog"]);
+    let mut opts = run_opts_for(&["hermit", "--backend=dbt", "run", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.selected_backend(), Backend::Dbt);
     assert!(!opts.no_namespace);
@@ -2336,10 +2382,11 @@ fn image_conflicts_with_no_namespace_with_explanatory_error() {
 
 #[test]
 fn image_rejects_unqualified_backend_and_namespace_paths() {
-    let mut backend = RunOpts::parse_from([
-        "fakehermit",
-        "--image=busybox@sha256:deadbeef",
+    let mut backend = run_opts_for(&[
+        "hermit",
         "--backend=dbt",
+        "run",
+        "--image=busybox@sha256:deadbeef",
         "/bin/sh",
     ]);
     let message = backend
@@ -2496,15 +2543,31 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--preemption-timeout",
         "--target-timeslice",
         "syscall boundaries",
+    ] {
+        assert!(
+            help.contains(expected),
+            "missing {expected:?} in run help:\n{help}"
+        );
+    }
+    // The backend is a global option (`hermit --backend <BACKEND> run`); `run`
+    // must not offer a second, subcommand-level spelling. The backend selection
+    // and its values are documented in the top-level help instead.
+    assert!(
+        !help.contains("--backend <BACKEND>"),
+        "run help still offers a subcommand-level --backend:\n{help}"
+    );
+    let top_level = crate::Args::command().render_long_help().to_string();
+    for expected in [
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
+        "This is a global option",
         "ptrace",
         "dbt",
         "kvm",
     ] {
         assert!(
-            help.contains(expected),
-            "missing {expected:?} in run help:\n{help}"
+            top_level.contains(expected),
+            "missing {expected:?} in top-level help:\n{top_level}"
         );
     }
 }
@@ -2516,7 +2579,7 @@ fn only_instrumented_ptrace_family_runs_depend_on_host_perf() {
     let namespace_only = RunOpts::parse_from(["fakehermit", "--namespace-only", "fakeprog"]);
     assert_eq!(namespace_only.selected_backend(), Backend::Ptrace);
     assert!(!namespace_only.arms_reverie_ptrace_pmu_timer());
-    let kvm = RunOpts::parse_from(["fakehermit", "--backend=kvm", "fakeprog"]);
+    let kvm = run_opts_for(&["hermit", "--backend=kvm", "run", "fakeprog"]);
     assert!(!kvm.arms_reverie_ptrace_pmu_timer());
 }
 
@@ -3010,10 +3073,9 @@ impl RunOpts {
         &self,
         global_backend: Option<Backend>,
     ) -> Option<(&Path, Backend)> {
-        self.run_evidence_dir.as_deref().map(|directory| {
-            let backend = self.backend.or(global_backend).unwrap_or_default();
-            (directory, backend)
-        })
+        self.run_evidence_dir
+            .as_deref()
+            .map(|directory| (directory, global_backend.unwrap_or_default()))
     }
 
     fn guest_run_capture_paths(&self) -> Result<Option<GuestRunCapturePaths>, Error> {
@@ -3044,6 +3106,15 @@ impl RunOpts {
 
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
+    }
+
+    /// The global `--backend` option that selected this run's backend, rendered
+    /// for the position before the subcommand (`hermit{this} run ...`). Empty
+    /// when no backend was requested explicitly.
+    pub(crate) fn global_backend_arg(&self) -> String {
+        self.backend
+            .map(|backend| format!(" --backend={}", backend.as_str()))
+            .unwrap_or_default()
     }
 
     fn runtime_backend(&self) -> Backend {
@@ -3177,11 +3248,9 @@ impl RunOpts {
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
-        // The backend may be given in the preferred global position
-        // (`hermit --backend X run ...`) or, for backwards compatibility, after the
-        // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
-        // value wins; otherwise fall back to the global one.
-        self.backend = self.backend.or(global.backend);
+        // The backend is a global option (`hermit --backend X run ...`), the only
+        // place it can be given.
+        self.backend = global.backend;
         let guest_capture_paths = self.guest_run_capture_paths()?;
         if let Some(paths) = &guest_capture_paths {
             // Evidence is intentionally claimed by main before this preflight.
@@ -4594,7 +4663,7 @@ impl RunOpts {
         // created -- and the comparison then reports the guest as
         // nondeterministic when the guest was identical both times.
         //
-        // MEASURED 2026-08-26 on `run --backend kvm --strict --verify --
+        // MEASURED 2026-08-26 on `hermit --backend kvm run --strict --verify --
         // /usr/bin/awk 'BEGIN { print 42 }'`: awk sets O_APPEND on fd 2 only
         // when it is not already set, so
         //     run 1  fcntl(2, F_GETFL) = 32769  -> fcntl(2, F_SETFL, 33793)
@@ -5426,7 +5495,7 @@ mod tests {
     fn ptrace_engagement_record_reads_the_typed_run_summary() {
         let summary_file = tempfile::NamedTempFile::new().unwrap();
         let engagement_file = tempfile::NamedTempFile::new().unwrap();
-        let mut options = RunOpts::parse_from(["hermit", "--backend=ptrace", "/bin/true"]);
+        let mut options = run_opts_for(&["hermit", "--backend=ptrace", "run", "/bin/true"]);
         options.summary_json = Some(summary_file.path().to_owned());
         options.backend_engagement_json = Some(engagement_file.path().to_owned());
 
@@ -5449,7 +5518,7 @@ mod tests {
     #[test]
     fn e9patch_engagement_record_follows_the_preparation_value() {
         let engagement_file = tempfile::NamedTempFile::new().unwrap();
-        let mut options = RunOpts::parse_from(["hermit", "--backend=e9patch", "/bin/true"]);
+        let mut options = run_opts_for(&["hermit", "--backend=e9patch", "run", "/bin/true"]);
         options.backend_engagement_json = Some(engagement_file.path().to_owned());
 
         for (candidate_sites, mapped_sites, b0_sites) in [(0, 0, 0), (2, 2, 0)] {
@@ -5573,9 +5642,10 @@ mod tests {
     #[test]
     fn run_evidence_backend_scope_matches_authoritative_private_sinks() {
         for backend in [Backend::Ptrace, Backend::Liteinst, Backend::Kvm] {
-            let mut options = RunOpts::parse_from([
-                "run",
+            let mut options = run_opts_for(&[
+                "hermit",
                 &format!("--backend={}", backend.as_str()),
+                "run",
                 "--run-evidence-dir=/unused/new-path",
                 "/bin/true",
             ]);
@@ -5589,9 +5659,10 @@ mod tests {
             (Backend::Sabre, "shared stderr"),
             (Backend::E9patch, "not been qualified"),
         ] {
-            let mut options = RunOpts::parse_from([
-                "run",
+            let mut options = run_opts_for(&[
+                "hermit",
                 &format!("--backend={}", backend.as_str()),
+                "run",
                 "--run-evidence-dir=/unused/new-path",
                 "/bin/true",
             ]);
@@ -5657,10 +5728,10 @@ mod tests {
             Backend::E9patch,
         ] {
             let backend_arg = format!("--backend={}", backend.as_str());
-            let mut args = vec!["run", backend_arg.as_str()];
+            let mut args = vec!["hermit", backend_arg.as_str(), "run"];
             args.extend(flags);
             args.push("/bin/true");
-            let mut options = RunOpts::try_parse_from(args).unwrap();
+            let mut options = run_opts_for(&args);
             let paths = options.guest_run_capture_paths().unwrap().unwrap();
             assert_eq!(paths.result, PathBuf::from("/unused/result.json"));
             assert_eq!(paths.stdout, PathBuf::from("/unused/stdout"));

@@ -16006,7 +16006,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             .into_iter()
             .next()
             .expect("fixture candidate has one attempt");
-        let argv = serde_json::json!(["hermit", "run", "--backend", backend]);
+        let argv = serde_json::json!(["hermit", "--backend", backend, "run"]);
         attempt["index"] = JsonValue::String(index.into());
         attempt["outcome"] = JsonValue::String("PASS".into());
         attempt["status"] = serde_json::json!(0);
@@ -16014,7 +16014,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         attempt["timed_out"] = JsonValue::Bool(false);
         attempt["argv"] = argv;
         attempt["shell_command"] = JsonValue::String(format!(
-            "cd /repo && env LC_ALL=C hermit run --backend {backend}"
+            "cd /repo && env LC_ALL=C hermit --backend {backend} run"
         ));
         attempt
     };
@@ -16140,13 +16140,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         row.failure_class = divergent.then_some(FailureClass::ProductFailure);
         row.argv = vec![
             "hermit".into(),
-            "run".into(),
             "--backend".into(),
             id.backend.clone(),
+            "run".into(),
         ];
         row.effective_args = row.argv.iter().skip(1).cloned().collect();
         row.shell_command = format!(
-            "cd /repo && env LC_ALL=C hermit run --backend {}",
+            "cd /repo && env LC_ALL=C hermit --backend {} run",
             id.backend
         );
         row.first_divergent_scheduler_turn = report.comparison.first_divergent_scheduler_turn;
@@ -28216,9 +28216,9 @@ mod post_verdict_transaction_tests {
             }
             let argv = vec![
                 "hermit",
-                "run",
                 "--backend",
                 id.backend.as_str(),
+                "run",
                 "--",
                 "fixture",
             ];

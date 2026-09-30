@@ -61,8 +61,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=trace",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--panic-on-unsupported-syscalls",
                 "--base-env=minimal",
@@ -98,8 +98,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=debug",
-                "run",
                 "--backend=ptrace",
+                "run",
                 "--strict",
                 "--verify",
                 "--panic-on-unsupported-syscalls",

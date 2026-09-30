@@ -182,8 +182,9 @@ impl RunData {
             } else {
                 None
             },
-            // Analyze threads the backend through its own `RunOpts`, so there is no
-            // separate global-position backend to apply here.
+            // Analyze always runs its trials on the default (ptrace) backend:
+            // `validate_backend_scope` refuses every other global `--backend` for
+            // `analyze`, and `run` has no subcommand-level `--backend`.
             backend: None,
             log_file_handle: None,
             run_evidence_log_handle: None,
@@ -507,7 +508,12 @@ impl RunData {
         // } else {
         //     "".to_string()
         // };
-        format!("hermit{} run {}", logging, self.runopts)
+        format!(
+            "hermit{}{} run {}",
+            logging,
+            self.runopts.global_backend_arg(),
+            self.runopts
+        )
     }
 
     pub fn into_runopts(self) -> RunOpts {
