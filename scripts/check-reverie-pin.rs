@@ -127,11 +127,15 @@ struct Config {
     /// Skip the post-bump compile check. Store the unsafe choice inverted so
     /// `Config::default()` structurally keeps verification enabled.
     skip_verify_build: bool,
-    /// Skip every NETWORKED judgement (ancestry, monotonicity, and the
-    /// main-tip query) and decide only what is decidable offline: that the
-    /// tracked manifests agree with each other, and that the LiteInst cache
-    /// keys track the pin. Used by the pre-commit hook, which the owner has
-    /// ruled must not be a hard blocker on distance from the main tip.
+    /// Make NO network call and read no remote: no main-tip query, no graph
+    /// fetch, no base fetch, and no authority URL probe. Decide only what is
+    /// decidable offline: that the tracked manifests agree with each other,
+    /// and that the LiteInst cache keys, the DBT budget bindings and
+    /// Buck-built Hermit's provenance track the pin. `run_with_config` returns
+    /// on this flag BEFORE the authority URL is even bound, so the offline
+    /// path cannot reach `query_main`. Used by the pre-commit hook, which the
+    /// owner has ruled must not be a hard blocker on distance from the main
+    /// tip, and which runs this leg without `with-proxy`.
     offline: bool,
     /// Pre-commit advisory. Judges the STAGED pin against HEAD's and against
     /// Reverie main, and speaks in exactly one of four cases (see
@@ -185,7 +189,7 @@ fn usage() -> &'static str {
        --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
        --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
-       --offline                           Local consistency only; no networked policy checks\n\
+       --offline                           Local consistency only; makes no network call\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
@@ -2541,7 +2545,34 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     Ok(0)
 }
 
+/// The derived LOCAL bindings of `pin`, in their fixed order: LiteInst cache
+/// keys, DBT budget bindings, then Buck-built Hermit's provenance. Returns the
+/// first nonzero code. None of them touches a remote, and it is the one list
+/// both the offline and the networked verdict run, so the two cannot drift.
+fn check_local_pin_bindings(root: &Path, pin: &str) -> Result<i32, String> {
+    let cache_code = check_liteinst_cache_keys(root, pin)?;
+    if cache_code != 0 {
+        return Ok(cache_code);
+    }
+    let budget_code = check_dbt_budget_bindings(root, pin)?;
+    if budget_code != 0 {
+        return Ok(budget_code);
+    }
+    check_buck_build_pin_binding(root, pin)
+}
+
 fn run_with_config(config: Config) -> Result<i32, String> {
+    // Both of these modes need Reverie main's tip, which --offline never asks
+    // for. Refused rather than silently dropped: `--offline --update-to-latest`
+    // used to ignore --offline and query the network, and the staged advisory
+    // returns before the offline branch below and always queries it.
+    if config.offline && (config.update_to_latest || config.staged_advisory) {
+        return Err(
+            "--offline cannot be combined with --update-to-latest or --staged-pin-advisory: \
+             both need Reverie main's tip, and --offline makes no network call"
+                .to_string(),
+        );
+    }
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
     let scan = read_pins(&root)?;
     let pins = &scan.occurrences;
@@ -2597,6 +2628,40 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(1);
     }
 
+    let entries = pins.len();
+    let pin_files = pinned_file_count.len();
+
+    // OFFLINE STOPS HERE, BEFORE THE AUTHORITY URL IS EVEN BOUND, having
+    // decided everything that does not need the network: manifests agree with
+    // each other (just above), LiteInst cache keys track the pin, DBT budget
+    // bindings equal it, and Buck-built Hermit's compile-time provenance does
+    // too. Those are real, offline-decidable defects that no amount of waiting
+    // fixes, so they stay BLOCKING for every caller. What offline deliberately
+    // does NOT judge is remote-policy compliance -- see the pre-commit hook for
+    // why that must not block.
+    //
+    // This return used to sit AFTER `query_main`, so --offline still asked the
+    // network for Reverie main's tip, and returned BLOCKED rc 1 whenever it
+    // could not get one. That went unnoticed while a ~/.gitconfig `insteadOf`
+    // sent the question to a local mirror, which answers with no network. Once
+    // the authority URL stopped matching that rule
+    // (https://github.com/rrnewton/hermit/issues/3398), the pre-commit hook's
+    // offline leg, which runs WITHOUT with-proxy, needed GitHub egress on every
+    // commit. The `remote` binding below is the first thing that names the
+    // authority, and nothing above it contacts any remote.
+    if config.offline {
+        let pin = unique_pin(&scan)?;
+        let local_code = check_local_pin_bindings(&root, pin)?;
+        if local_code != 0 {
+            return Ok(local_code);
+        }
+        println!(
+            "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
+             {pin_files} tracked Cargo metadata files; remote policy not evaluated, --offline)"
+        );
+        return Ok(0);
+    }
+
     // Production has no CLI/env/recorded-value override for the authority.
     // Tests substitute only the remote transport, then exercise this same
     // refs/heads/main dereference rather than injecting a well-shaped SHA.
@@ -2624,51 +2689,13 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         update_to_latest(&root, &scan, &main, !config.skip_verify_build)?;
         let updated = read_pins(&root)?;
         let updated_pin = unique_pin(&updated)?;
-        let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
-        if cache_code != 0 {
-            return Ok(cache_code);
-        }
-        let budget_code = check_dbt_budget_bindings(&root, updated_pin)?;
-        if budget_code != 0 {
-            return Ok(budget_code);
-        }
-        let buck_code = check_buck_build_pin_binding(&root, updated_pin)?;
-        if buck_code != 0 {
-            return Ok(buck_code);
-        }
-        return Ok(0);
+        return check_local_pin_bindings(&root, updated_pin);
     }
 
     let pin = unique_pin(&scan)?;
-    let cache_code = check_liteinst_cache_keys(&root, pin)?;
-    if cache_code != 0 {
-        return Ok(cache_code);
-    }
-    let budget_code = check_dbt_budget_bindings(&root, pin)?;
-    if budget_code != 0 {
-        return Ok(budget_code);
-    }
-    let buck_code = check_buck_build_pin_binding(&root, pin)?;
-    if buck_code != 0 {
-        return Ok(buck_code);
-    }
-
-    let entries = pins.len();
-    let pin_files = pinned_file_count.len();
-
-    // OFFLINE STOPS HERE, having decided everything that does not need the
-    // network: manifests agree with each other, LiteInst cache keys track the
-    // pin, DBT budget bindings equal it, and Buck-built Hermit's compile-time
-    // provenance does too. Those are real, offline-decidable defects that no
-    // amount of waiting fixes, so they stay BLOCKING for every caller. What
-    // offline deliberately does NOT judge is remote-policy compliance -- see
-    // the pre-commit hook for why that must not block.
-    if config.offline {
-        println!(
-            "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
-             {pin_files} tracked Cargo metadata files; remote policy not evaluated, --offline)"
-        );
-        return Ok(0);
+    let local_code = check_local_pin_bindings(&root, pin)?;
+    if local_code != 0 {
+        return Ok(local_code);
     }
 
     // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY; equality is
@@ -5080,10 +5107,27 @@ mod tests {
     /// the two mistakes that matter: holding it around the fork but not around
     /// the command construction, and holding it at a level that nests with
     /// another acquisition.
+    ///
+    /// Panics, by name, if this thread already holds the WRITE side inside
+    /// [`with_config_override`]: taking the read side there would deadlock
+    /// with no message. That turns a Git call that must not happen under an
+    /// environment override into a failing test rather than a hung one; the
+    /// entry-point test for the environment layer depends on exactly that.
     pub(super) fn env_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        assert!(
+            !HOLDS_ENV_WRITE.with(std::cell::Cell::get),
+            "a Git command was started inside `with_config_override`, which holds the \
+             environment WRITE lock on this thread; its read lock would deadlock here"
+        );
         ENV_LOCK
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    thread_local! {
+        /// True while THIS thread holds `ENV_LOCK` for write, i.e. inside
+        /// [`with_config_override`].
+        static HOLDS_ENV_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     thread_local! {
@@ -5120,38 +5164,50 @@ mod tests {
     }
 
     /// Set the numbered Git config override variables, run `body`, and restore
-    /// the previous values whatever happens.
+    /// the previous values whatever happens, a panicking `body` included.
     ///
     /// ⚠️ `body` MUST NOT INVOKE GIT. This holds the WRITE lock across `body`,
     /// and every git invocation in this file takes the READ lock through
-    /// `under_git_env`; write-then-read on one thread is not reentrant and will
-    /// hang the test with no message. Today both callers only read `GIT_CONFIG_*`
-    /// through `env::var`, which is why this is a warning and not a bug.
+    /// `under_git_env`; write-then-read on one thread is not reentrant. That
+    /// used to hang the test with no message; [`env_read_guard`] now panics by
+    /// name instead. Every caller's body reads `GIT_CONFIG_*` only through
+    /// `env::var` while the code under test is correct.
     fn with_config_override<T>(pairs: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+        /// Restores the saved variables and clears the write marker on drop,
+        /// so a failing assertion in `body` (or the reentrancy panic in
+        /// `env_read_guard`) cannot leak the override into later tests.
+        /// Declared after the lock guard, so it runs BEFORE the lock is
+        /// released.
+        struct Restore(Vec<(String, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => env::set_var(&name, value),
+                        None => env::remove_var(&name),
+                    }
+                }
+                HOLDS_ENV_WRITE.with(|held| held.set(false));
+            }
+        }
         let _guard = ENV_LOCK
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut saved: Vec<(String, Option<OsString>)> = vec![(
+        let mut restore = Restore(vec![(
             "GIT_CONFIG_COUNT".to_string(),
             env::var_os("GIT_CONFIG_COUNT"),
-        )];
+        )]);
+        HOLDS_ENV_WRITE.with(|held| held.set(true));
         env::set_var("GIT_CONFIG_COUNT", pairs.len().to_string());
         for (index, (key, value)) in pairs.iter().enumerate() {
             let key_var = format!("GIT_CONFIG_KEY_{index}");
             let value_var = format!("GIT_CONFIG_VALUE_{index}");
-            saved.push((key_var.clone(), env::var_os(&key_var)));
-            saved.push((value_var.clone(), env::var_os(&value_var)));
+            restore.0.push((key_var.clone(), env::var_os(&key_var)));
+            restore.0.push((value_var.clone(), env::var_os(&value_var)));
             env::set_var(&key_var, key);
             env::set_var(&value_var, value);
         }
-        let outcome = body();
-        for (name, previous) in saved {
-            match previous {
-                Some(value) => env::set_var(&name, value),
-                None => env::remove_var(&name),
-            }
-        }
-        outcome
+        body()
     }
 
     /// ITEM 1, the decision. A rewrite that redirects the authority URL is
@@ -5256,6 +5312,188 @@ mod tests {
                     .expect("a rewrite that does not touch the authority URL must be allowed")
             },
         );
+    }
+
+    /// ITEM 1, the wiring through the PRODUCTION entry point. Every authority
+    /// command is vetted by `refuse_rewritten_authority_url`, so that is the
+    /// function this drives, not the environment layer by name.
+    ///
+    /// The review of 3ddf053a deleted the `refuse_env_rewritten_authority_url`
+    /// call from it ("mutant D") and every test still passed: the
+    /// configuration layer also sees an environment rewrite and refuses, with a
+    /// different message. This asserts the ENVIRONMENT layer's message, which
+    /// names the variables to unset. Under the mutant the configuration layer
+    /// runs Git inside `with_config_override`, and `env_read_guard` fails the
+    /// test by name instead of deadlocking.
+    #[test]
+    fn the_rewrite_guard_entry_point_runs_the_environment_layer() {
+        let checkout = temp_path("env-layer-entry-point");
+        fs::create_dir_all(&checkout).expect("create fixture directory");
+        let error =
+            with_config_override(&[("url./tmp/evil.git.insteadOf", DEFAULT_REMOTE)], || {
+                refuse_rewritten_authority_url(AuthorityScope::Checkout(&checkout), DEFAULT_REMOTE)
+                    .expect_err("an environment rewrite of the authority URL must be refused")
+            });
+        assert!(
+            error.contains("an inherited url.<base>.insteadOf override redirects")
+                && error.contains(&format!("{DEFAULT_REMOTE} to /tmp/evil.git"))
+                && error.contains("GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n"),
+            "the entry point must refuse through the environment layer, naming the variables: \
+             {error}"
+        );
+        fs::remove_dir_all(checkout).expect("remove fixture directory");
+    }
+
+    // ---------------------------------------------------------------------
+    // --offline MAKES NO NETWORK CALL (review of 3ddf053a, finding (a))
+    //
+    // The pre-commit hook runs `--offline` without with-proxy and labels it
+    // "Offline, always-blocking". It used to query Reverie main's tip anyway,
+    // and a stale local mirror answered for it.
+    // ---------------------------------------------------------------------
+
+    /// A Hermit fixture checkout pinned at `pin`, whose own configuration sends
+    /// every ssh connection to a command that only creates `marker` and fails.
+    /// Paired with an `ssh://` authority, any contact leaves the marker; git
+    /// resolves no host itself, so nothing leaves the machine.
+    fn offline_fixture(label: &str, pin: &str, marker: &Path) -> PathBuf {
+        let root = temp_path(label);
+        init_fixture_repo(&root);
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{pin}\" }}\n"
+            ),
+        )
+        .expect("write fixture manifest");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let dial = format!("touch '{}'; false", marker.display());
+        assert!(
+            git_in(&root, &["config", "core.sshCommand", &dial])
+                .unwrap()
+                .status
+                .success()
+        );
+        root
+    }
+
+    /// --offline returns rc 0 on a consistent pin with no network call, keeps
+    /// blocking with rc 1 on local incoherence, and refuses the two modes that
+    /// cannot work without the network. The networked run on the same fixture
+    /// is the POSITIVE CONTROL: it must leave the marker, which proves the
+    /// detector sees a network attempt at all. Without it, an absent marker
+    /// could mean a dead detector.
+    #[test]
+    fn offline_makes_no_network_call() {
+        const REMOTE: &str = "ssh://reverie.invalid/rrnewton/reverie";
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let marker = temp_path("offline-network-marker");
+        let root = offline_fixture("offline-no-network", pin, &marker);
+        let config = |offline: bool| Config {
+            repo: Some(root.clone()),
+            remote: Some(REMOTE.to_string()),
+            offline,
+            no_base: true,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            run_with_config(config(true)),
+            Ok(0),
+            "--offline must pass a consistent pin without the network"
+        );
+        assert!(
+            !marker.exists(),
+            "--offline contacted the authority {REMOTE}"
+        );
+
+        // POSITIVE CONTROL: the same fixture, networked, dials and is BLOCKED.
+        assert_eq!(
+            run_with_config(config(false)),
+            Ok(1),
+            "a networked run whose authority cannot be reached is BLOCKED"
+        );
+        assert!(
+            marker.exists(),
+            "the networked run left no marker, so this fixture cannot detect a network call \
+             and the offline assertions above prove nothing"
+        );
+        fs::remove_file(&marker).expect("reset the network marker");
+
+        // The two modes that need the tip are refused, before any work.
+        for (update_to_latest, staged_advisory) in [(true, false), (false, true)] {
+            let error = run_with_config(Config {
+                update_to_latest,
+                staged_advisory,
+                ..config(true)
+            })
+            .expect_err("--offline with a networked mode must be refused");
+            assert!(
+                error.contains("--offline cannot be combined"),
+                "unexpected refusal: {error}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "a refused --offline mode contacted {REMOTE}"
+        );
+
+        // Local incoherence still BLOCKS offline, with the same rc 1 as before,
+        // and still without the network. First a drifted LiteInst cache key...
+        fs::write(
+            root.join("portable.json"),
+            "cmd = target/liteinst-runtime-build-deadbee\n",
+        )
+        .expect("write drifted cache key");
+        assert!(
+            git_in(&root, &["add", "portable.json"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            run_with_config(config(true)),
+            Ok(1),
+            "a drifted LiteInst cache key must block --offline"
+        );
+        assert!(
+            git_in(&root, &["rm", "-q", "-f", "portable.json"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(run_with_config(config(true)), Ok(0), "drift removed");
+
+        // ...then two manifests naming different revisions.
+        fs::create_dir_all(root.join("sub")).expect("create second crate");
+        fs::write(
+            root.join("sub/Cargo.toml"),
+            "[dependencies]\nreverie = { git = \"https://github.com/rrnewton/reverie.git\", \
+             rev = \"89abcdef0123456789abcdef0123456789abcdef\" }\n",
+        )
+        .expect("write disagreeing manifest");
+        assert!(
+            git_in(&root, &["add", "sub/Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            run_with_config(config(true)),
+            Ok(1),
+            "manifests that disagree must block --offline"
+        );
+        assert!(
+            !marker.exists(),
+            "--offline contacted the authority {REMOTE} on a blocking path"
+        );
+
+        fs::remove_dir_all(root).expect("remove fixture repository");
     }
 
     // ---------------------------------------------------------------------
