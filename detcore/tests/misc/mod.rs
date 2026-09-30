@@ -1260,7 +1260,10 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
             );
         }
         const INT_MIN: libc::c_long = libc::pid_t::MIN as libc::c_long;
-        // Nonzero high words whose low 32 bits are INT_MIN and -1.
+        // INT_MIN above is sign-extended, so its high word is 0xffff_ffff. The
+        // values below put INT_MIN in the low 32 bits under high word 0 (INT_MIN
+        // zero-extended) or 1, and -1 under high word 1.
+        const ZERO_HIGH_WORD_INT_MIN: libc::c_long = 0x0000_0000_8000_0000;
         const HIGH_WORD_INT_MIN: libc::c_long = 0x0000_0001_8000_0000;
         const HIGH_WORD_MINUS_ONE: libc::c_long = 0x0000_0001_ffff_ffff;
 
@@ -1297,6 +1300,8 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
 
         wait4_error(INT_MIN, 0, libc::ESRCH);
         wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, 0, libc::ESRCH);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
         wait4_error(HIGH_WORD_INT_MIN, 0, libc::ESRCH);
         wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
         // Only INT_MIN is refused. INT_MIN + 1 selects process group INT_MAX,
@@ -1329,6 +1334,7 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
 
         let zombie_wnohang = spawn_exiting_child(41);
         wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
         wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
         // The zombie is in this process's group, not group INT_MAX.
         wait4_error(INT_MIN + 1, libc::WNOHANG, libc::ECHILD);
@@ -1345,6 +1351,7 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
 
         let invalid_options_child = spawn_exiting_child(61);
         wait4_error(INT_MIN, 0x10, libc::EINVAL);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, 0x10, libc::EINVAL);
         wait4_error(HIGH_WORD_INT_MIN, 0x10, libc::EINVAL);
         wait4_error(-1, 0x10, libc::EINVAL);
         reap_child(invalid_options_child, 61);
