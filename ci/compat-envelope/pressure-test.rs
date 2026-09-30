@@ -1268,8 +1268,9 @@ struct ManifestBudgetRow {
     cpu_timeout_seconds: i64,
     timeout_seconds: i64,
     attempts: JsonValue,
-    /// Present only on verify cells whose manifest declares one exact nonzero
-    /// guest disposition. Older manifest tools omit the key.
+    /// Non-null only on verify cells whose manifest declares one exact nonzero
+    /// guest disposition. Current manifest tools emit the key on every row,
+    /// null elsewhere; older manifest tools omit the key.
     #[serde(default)]
     expected_guest_exit: Option<ExpectedGuestExit>,
 }

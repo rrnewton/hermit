@@ -2894,6 +2894,60 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_exit_never_qualifies_an_attempt_that_is_not_a_completed_pass() {
+        use SeriesExpectedExit::Code;
+        use SeriesExpectedExit::Signal;
+        // Ending exactly as declared is not enough: the attempt must also be a
+        // completed PASS, so a FAIL, a wall-timeout ERROR and a cli-error
+        // ERROR are refused with the ordinary contradiction.
+        for (expected, status, signal) in [(Code(3), Some(3), None), (Signal(11), None, Some(11))] {
+            for (outcome, timed_out, error_kind) in [
+                ("FAIL", false, None),
+                ("ERROR", true, None),
+                ("ERROR", false, Some("cli-error")),
+            ] {
+                let mut inner = matched_attempt(status, signal);
+                inner.outcome = outcome.into();
+                inner.timed_out = timed_out;
+                inner.error_kind = error_kind.map(Into::into);
+                let error = inner
+                    .validate_for_mode("verify", Some(expected))
+                    .expect_err("a declared exit must not qualify a non-PASS attempt");
+                assert_eq!(
+                    error, MATCHED_CONTRADICTION,
+                    "{expected:?} {outcome} timed_out={timed_out} error_kind={error_kind:?}"
+                );
+            }
+        }
+        // A stored row is refused on read and projection the same way.
+        let mut row = declared_pressure_row(Some(Code(3)), Some(3), None);
+        row.series.pressure_evidence.as_mut().unwrap().attempts[0].outcome = "FAIL".into();
+        for verdict in read_and_projection(&row) {
+            assert_eq!(
+                verdict.expect_err("a declared FAIL row was accepted"),
+                MATCHED_CONTRADICTION
+            );
+        }
+    }
+
+    #[test]
+    fn a_diverged_shell_encoded_signal_keeps_the_diverged_contradiction() {
+        use SeriesExpectedExit::Signal;
+        // The named 128+N refusal describes a matched cell only: a diverged
+        // report ending with status 139 under a declared signal 11 keeps the
+        // diverged contradiction.
+        let mut diverged = matched_attempt(Some(139), None);
+        diverged.comparison.as_mut().unwrap().verdict = Verdict::Diverged;
+        let error = diverged
+            .validate_for_mode("verify", Some(Signal(11)))
+            .expect_err("a diverged 128+N report must refuse");
+        assert_eq!(
+            error,
+            "pressure_evidence diverged report contradicts its inner process disposition"
+        );
+    }
+
+    #[test]
     fn pressure_history_without_a_declared_exit_keeps_the_success_rule() {
         let success = declared_pressure_row(None, Some(0), None);
         success.validate_for_write().unwrap();
@@ -2922,7 +2976,17 @@ mod tests {
         use SeriesExpectedExit::Code;
         use SeriesExpectedExit::Signal;
         // A caller's expected exit is itself validated.
-        for expected in [Code(0), Code(256), Code(-1), Signal(0), Signal(65)] {
+        let code_refusal =
+            "pressure_evidence expected_exit code must be a nonzero exit status in 1..=255";
+        let signal_refusal =
+            "pressure_evidence expected_exit signal must be a signal number in 1..=64";
+        for (expected, message) in [
+            (Code(0), code_refusal),
+            (Code(256), code_refusal),
+            (Code(-1), code_refusal),
+            (Signal(0), signal_refusal),
+            (Signal(65), signal_refusal),
+        ] {
             // The observed disposition is itself valid, so only the
             // declaration can be refused.
             let inner = match expected {
@@ -2932,7 +2996,7 @@ mod tests {
             let error = inner
                 .validate_for_mode("verify", Some(expected))
                 .unwrap_err();
-            assert!(error.contains("expected_exit"), "{expected:?}: {error}");
+            assert_eq!(error, message, "{expected:?}");
         }
         // The manifest accepts the declaration only on verify cells.
         for mode in ["replay", "chaos", "naked", "custom"] {
@@ -2967,10 +3031,15 @@ mod tests {
         other.series.cell = "fixture/test/replay/ptrace".into();
         cases.push(("replay cell", other, MATCHED_CONTRADICTION));
         // Chaos accepts a nonzero matched status by itself, so there the
-        // declaration's own validator refuses the row.
+        // declaration's own validator refuses the row, in the manifest's
+        // wording rather than the pressure attempt's.
         let mut other = exact();
         other.series.cell = "fixture/test/chaos/ptrace".into();
-        cases.push(("chaos cell", other, "supported only by verify mode"));
+        cases.push((
+            "chaos cell",
+            other,
+            "declared_guest_exit: expected_guest_exit is supported only by verify mode",
+        ));
         let mut other = exact();
         declared(&mut other).evidence_sha256 = "d".repeat(64);
         cases.push((
@@ -2983,12 +3052,12 @@ mod tests {
         cases.push((
             "declaration's own attempt disagrees",
             other,
-            "without Hermit reporting the declared exit code 3",
+            "declared_guest_exit attempt 1 passed without Hermit reporting the declared exit code 3",
         ));
         for (label, fixture, message) in cases {
             for verdict in read_and_projection(&fixture) {
                 let error = verdict.expect_err(&format!("{label} was accepted"));
-                assert!(error.contains(message), "{label}: {error}");
+                assert_eq!(error, message, "{label}");
             }
         }
     }
