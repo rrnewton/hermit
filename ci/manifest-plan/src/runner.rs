@@ -2048,6 +2048,15 @@ pub struct CellResult {
     /// so rows for ordinary cells are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_guest_exit: Option<ExpectedGuestExit>,
+    /// Why the harness executed this row as a retry of the preceding attempt.
+    ///
+    /// Present only on a retry row the harness admitted under its retry
+    /// policy, so a first attempt, and therefore every clean run, serializes
+    /// exactly as before. Absent on a row with `attempt >= 2` means the row
+    /// was written before this field existed, or the process was started at
+    /// that attempt and never saw the preceding row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_cause: Option<RetryCause>,
 }
 
 impl CellResult {
@@ -2543,6 +2552,162 @@ pub fn cell_result_and_attempts_after_retries(
         .map(|result| result.attempt)
         .ok_or_else(|| "cell result has no attempts".to_string())?;
     Ok((selected, attempts))
+}
+
+/// The line reverie's ptrace timer prints when precise PMU timer delivery
+/// passed its target by more than the skid margin
+/// (`reverie::SKID_OVERSHOOT_MARKER`; this crate does not link reverie).
+pub const SKID_OVERSHOOT_MARKER: &str = "HERMIT_SKID_OVERSHOOT";
+
+/// Longest marker line copied into a retry record or log line.
+const SKID_MARKER_LINE_MAX_CHARS: usize = 240;
+
+/// The attempt reason the runner records for a typed skid-overshoot verdict.
+///
+/// One definition, because [`skid_overshoot_evidence`] requires the recorded
+/// reason to be exactly this text: a row whose reason was replaced by a later
+/// classification step no longer describes the skid-overshoot verdict alone.
+fn skid_overshoot_reason(count: u64) -> String {
+    format!("verification recorded {count} {SKID_OVERSHOOT_MARKER} report(s)")
+}
+
+/// Why the harness ran a second attempt of one cell.
+///
+/// Recorded on the retry's own row, so every retry is visible in
+/// `results.jsonl` without re-deriving the policy that admitted it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RetryCause {
+    /// The preceding attempt was a FAIL classified as a product failure.
+    ProductFailure {
+        retried_attempt: u64,
+        retried_reason: String,
+    },
+    /// Every failing inner attempt of the preceding row was a typed
+    /// skid-overshoot infrastructure error from Hermit's verification report.
+    SkidOvershoot {
+        retried_attempt: u64,
+        retried_reason: String,
+        /// Total `HERMIT_SKID_OVERSHOOT` reports in the preceding row's typed
+        /// verification reports.
+        count: u64,
+        /// The first marker line on that attempt's stderr, for a reader. It is
+        /// never the reason for the retry: guest output shares that stream.
+        marker_line: Option<String>,
+    },
+}
+
+impl RetryCause {
+    /// Stable machine name, identical to the serialized `kind`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ProductFailure { .. } => "product_failure",
+            Self::SkidOvershoot { .. } => "skid_overshoot",
+        }
+    }
+
+    /// The attempt this retry was run after.
+    pub fn retried_attempt(&self) -> u64 {
+        match self {
+            Self::ProductFailure {
+                retried_attempt, ..
+            }
+            | Self::SkidOvershoot {
+                retried_attempt, ..
+            } => *retried_attempt,
+        }
+    }
+
+    /// The recorded reason of the attempt this retry was run after.
+    pub fn retried_reason(&self) -> &str {
+        match self {
+            Self::ProductFailure { retried_reason, .. }
+            | Self::SkidOvershoot { retried_reason, .. } => retried_reason,
+        }
+    }
+}
+
+/// The typed skid-overshoot evidence carried by one failed cell row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkidOvershootEvidence {
+    pub count: u64,
+    pub marker_line: Option<String>,
+}
+
+/// Return the row's skid-overshoot evidence when that is the row's only failure.
+///
+/// The decision reads the typed verification report Hermit writes from its
+/// supervisor-side overshoot count, never stderr text, which a guest can
+/// print. Every non-passing inner attempt must be an untimed-out
+/// infrastructure ERROR whose report has verdict `infrastructure_error` with a
+/// nonzero `skid_overshoot` count and whose reason is exactly the runner's
+/// skid text. The row must still carry that same first failing reason, so a
+/// row reclassified afterwards (for example, because the Hermit binary changed
+/// during the cell) is not admitted. Any other failure returns `None`.
+pub fn skid_overshoot_evidence(result: &CellResult) -> Option<SkidOvershootEvidence> {
+    if result.outcome != "ERROR"
+        || result.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
+        || result.error_kind.as_deref() != Some("infrastructure")
+    {
+        return None;
+    }
+    let mut failing = result
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.outcome != "PASS")
+        .peekable();
+    if result.reason != failing.peek()?.reason {
+        return None;
+    }
+    let mut count = 0u64;
+    let mut marker_line = None;
+    for attempt in failing {
+        count = count.checked_add(attempt_skid_overshoot_count(attempt)?)?;
+        if marker_line.is_none() {
+            marker_line = skid_marker_line(&attempt.stderr);
+        }
+    }
+    Some(SkidOvershootEvidence { count, marker_line })
+}
+
+/// The typed skid-overshoot count of one attempt classified by the skid branch.
+fn attempt_skid_overshoot_count(attempt: &AttemptResult) -> Option<u64> {
+    if attempt.outcome != "ERROR"
+        || attempt.error_kind.as_deref() != Some("infrastructure")
+        || attempt.timed_out
+    {
+        return None;
+    }
+    let report =
+        current_verification_report(attempt.verification_report.as_deref()?.as_bytes()).ok()?;
+    let count = match (report.verdict, report.infrastructure_error) {
+        (Verdict::InfrastructureError, Some(InfrastructureError::SkidOvershoot { count })) => count,
+        _ => return None,
+    };
+    (count > 0 && attempt.reason.as_deref() == Some(skid_overshoot_reason(count).as_str()))
+        .then_some(count)
+}
+
+/// First stderr line that begins with the canonical marker, trimmed and
+/// bounded for display.
+fn skid_marker_line(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.strip_prefix(SKID_OVERSHOOT_MARKER)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+        .map(|line| {
+            let mut bounded = line
+                .chars()
+                .take(SKID_MARKER_LINE_MAX_CHARS)
+                .collect::<String>();
+            if line.chars().count() > SKID_MARKER_LINE_MAX_CHARS {
+                bounded.push_str(" [truncated]");
+            }
+            bounded
+        })
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
@@ -3432,9 +3597,9 @@ fn execute_spec_until(
                                 outcome = "ERROR".into();
                                 error_kind = Some("infrastructure".into());
                                 reason = Some(match report.infrastructure_error.as_ref() {
-                                    Some(InfrastructureError::SkidOvershoot { count }) => format!(
-                                        "verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"
-                                    ),
+                                    Some(InfrastructureError::SkidOvershoot { count }) => {
+                                        skid_overshoot_reason(*count)
+                                    }
                                     None => unreachable!(
                                         "typed report parser requires an infrastructure error"
                                     ),
@@ -4927,6 +5092,7 @@ fn run_cell_inner(
         cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        retry_cause: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -5010,6 +5176,7 @@ pub fn infrastructure_error_result(
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        retry_cause: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -5085,6 +5252,7 @@ pub fn host_inapplicable_result(
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        retry_cause: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -9989,6 +10157,7 @@ backends_disabled:
     fn cell_result_that_located_nothing() -> CellResult {
         CellResult {
             cpu_observations: None,
+            retry_cause: None,
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture".into(),
             machine_shortname: "fixture-host".into(),
@@ -11093,6 +11262,235 @@ exit "$(cat "$PWD/exit-status")"
                 .as_deref()
                 .is_some_and(|reason| reason.contains("1 HERMIT_SKID_OVERSHOOT")),
             "comparison-null infrastructure error must retain its cause: {result:?}"
+        );
+    }
+
+    const SKID_FIXTURE_MARKER: &str =
+        "HERMIT_SKID_OVERSHOOT rcb_actual=1200 rcb_target=100 skid_margin=1000 overshoot=1100";
+
+    fn skid_overshoot_report(count: u64) -> VerificationReport {
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+        report
+    }
+
+    /// Run one real verify cell through `run_cell` against a fake Hermit that
+    /// writes `report` (when present) and then runs `ending`.
+    fn skid_gate_row(report: Option<VerificationReport>, ending: &str) -> CellResult {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-skid-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let copy_report = match report {
+            Some(report) => {
+                let path = root.join("verification.json");
+                fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+                format!("cp \"{}\" \"$verdict\"", path.display())
+            }
+            None => ":".into(),
+        };
+        let hermit = root.join("hermit");
+        fs::write(
+            &hermit,
+            format!(
+                r#"#!/bin/sh
+set -eu
+self=$0
+verdict=
+logdir=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --verify-json) verdict=$2; shift 2 ;;
+    --verify-log-dir) logdir=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$logdir" ]; then
+  mkdir -p "$logdir"
+  printf 'INFO detcore: shared\n' > "$logdir/run1_log_fixture.log"
+fi
+{copy_report}
+{ending}
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cell = ptrace_cell("verify");
+        cell.test.id = "fixture/skid-gate".into();
+        cell.id.test = cell.test.id.clone();
+        cell.timeout_seconds = 10;
+        cell.cpu_timeout_seconds = 5;
+        let mut context = run_context(&root);
+        context.hermit_bin = hermit;
+        context.run_verify_strict = true;
+        let result = run_cell(&context, &cell).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        result
+    }
+
+    /// The retry gate admits a row only on the typed skid-overshoot report
+    /// Hermit writes from its supervisor-side count.
+    #[test]
+    fn skid_overshoot_evidence_is_the_typed_report_on_an_unmodified_row() {
+        let skid = skid_gate_row(
+            Some(skid_overshoot_report(2)),
+            &format!("printf '%s\\n' '{SKID_FIXTURE_MARKER}' >&2; exit 122"),
+        );
+        assert_eq!(skid.outcome, "ERROR", "{skid:?}");
+        assert_eq!(
+            skid.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(
+            skid_overshoot_evidence(&skid),
+            Some(SkidOvershootEvidence {
+                count: 2,
+                marker_line: Some(SKID_FIXTURE_MARKER.into()),
+            })
+        );
+
+        // The marker line is display evidence only; the typed count decides.
+        let silent = skid_gate_row(Some(skid_overshoot_report(3)), "exit 122");
+        assert_eq!(
+            skid_overshoot_evidence(&silent),
+            Some(SkidOvershootEvidence {
+                count: 3,
+                marker_line: None,
+            })
+        );
+
+        let mut tampered = skid.clone();
+        tampered.attempts[0].reason = Some("some other infrastructure fault".into());
+        tampered.reason = tampered.attempts[0].reason.clone();
+        assert_eq!(skid_overshoot_evidence(&tampered), None);
+
+        let mut timed_out = skid.clone();
+        timed_out.attempts[0].timed_out = true;
+        assert_eq!(skid_overshoot_evidence(&timed_out), None);
+
+        let mut without_report = skid.clone();
+        without_report.attempts[0].verification_report = None;
+        assert_eq!(skid_overshoot_evidence(&without_report), None);
+
+        // A second inner attempt that failed for another reason keeps the row
+        // outside the skid rule even though the first attempt was skid.
+        let mut mixed = skid.clone();
+        let mut diverged = skid.attempts[0].clone();
+        diverged.index = "2".into();
+        diverged.outcome = "FAIL".into();
+        diverged.error_kind = None;
+        diverged.reason = Some("verify diverged".into());
+        mixed.attempts.push(diverged);
+        assert_eq!(skid_overshoot_evidence(&mixed), None);
+    }
+
+    /// Nothing but that typed report is skid evidence: not a marker printed by
+    /// the guest, not a divergence, not a pass, and not a skid row that a later
+    /// classification step replaced.
+    #[test]
+    fn skid_overshoot_evidence_refuses_every_other_row() {
+        let marker = format!("printf '%s\\n' '{SKID_FIXTURE_MARKER}' >&2");
+
+        let guest_printed = skid_gate_row(None, &format!("{marker}; exit 122"));
+        assert_eq!(guest_printed.outcome, "ERROR", "{guest_printed:?}");
+        assert_eq!(
+            guest_printed.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert!(
+            guest_printed.attempts[0]
+                .stderr
+                .contains(SKID_FIXTURE_MARKER)
+        );
+        assert_eq!(skid_overshoot_evidence(&guest_printed), None);
+
+        let mut divergence_report = canonical_verification_report();
+        divergence_report.verified = false;
+        divergence_report.bitwise_parity = false;
+        divergence_report.verdict = Verdict::Diverged;
+        let diverged = skid_gate_row(Some(divergence_report), &format!("{marker}; exit 1"));
+        assert_eq!(diverged.outcome, "FAIL", "{diverged:?}");
+        assert_eq!(diverged.failure_class, Some(FailureClass::ProductFailure));
+        assert_eq!(skid_overshoot_evidence(&diverged), None);
+
+        let passed = skid_gate_row(Some(expected_exit_report(Some(0), None)), "exit 0");
+        assert_eq!(passed.outcome, "PASS", "{passed:?}");
+        assert_eq!(skid_overshoot_evidence(&passed), None);
+
+        // The Hermit binary changes while the cell runs, so the runner replaces
+        // the skid reason. That row no longer describes skid alone.
+        let binary_changed = skid_gate_row(
+            Some(skid_overshoot_report(2)),
+            &format!("{marker}; printf '# changed\\n' >> \"$self\"; exit 122"),
+        );
+        assert_eq!(binary_changed.outcome, "ERROR", "{binary_changed:?}");
+        assert_eq!(
+            binary_changed.reason.as_deref(),
+            Some("Hermit binary changed while the cell was executing")
+        );
+        assert_eq!(skid_overshoot_evidence(&binary_changed), None);
+    }
+
+    #[test]
+    fn retry_cause_is_absent_on_ordinary_rows_and_tagged_on_retry_rows() {
+        let mut row = cell_result_that_located_nothing();
+        let rendered = serde_json::to_value(&row).unwrap();
+        assert!(
+            rendered.get("retry_cause").is_none(),
+            "a row that is not a retry must serialize as before"
+        );
+        row.attempt = 2;
+        row.retry_cause = Some(RetryCause::SkidOvershoot {
+            retried_attempt: 1,
+            retried_reason: skid_overshoot_reason(2),
+            count: 2,
+            marker_line: Some(SKID_FIXTURE_MARKER.into()),
+        });
+        let rendered = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            rendered["retry_cause"],
+            serde_json::json!({
+                "kind": "skid_overshoot",
+                "retried_attempt": 1,
+                "retried_reason": "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)",
+                "count": 2,
+                "marker_line": SKID_FIXTURE_MARKER,
+            })
+        );
+        let parsed: CellResult = serde_json::from_value(rendered).unwrap();
+        assert_eq!(parsed.retry_cause, row.retry_cause);
+        assert_eq!(
+            parsed.retry_cause.as_ref().unwrap().kind(),
+            "skid_overshoot"
+        );
+    }
+
+    #[test]
+    fn skid_marker_line_is_the_canonical_line_and_is_bounded() {
+        assert_eq!(
+            skid_marker_line(&format!("guest text\n  {SKID_FIXTURE_MARKER}  \nlater\n")),
+            Some(SKID_FIXTURE_MARKER.into())
+        );
+        // The error summary names the marker but is not the marker line.
+        assert_eq!(
+            skid_marker_line(
+                "Error: observed 2 HERMIT_SKID_OVERSHOOT report(s)\nHERMIT_SKID_OVERSHOOTX\n"
+            ),
+            None
+        );
+        let long = format!("{SKID_OVERSHOOT_MARKER} {}", "x".repeat(400));
+        let bounded = skid_marker_line(&long).unwrap();
+        assert!(bounded.ends_with(" [truncated]"));
+        assert_eq!(
+            bounded.chars().count(),
+            SKID_MARKER_LINE_MAX_CHARS + " [truncated]".len()
         );
     }
 

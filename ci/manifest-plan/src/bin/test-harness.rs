@@ -23,6 +23,7 @@ use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::RetryCause;
 use hermit_manifest_plan::runner::RunContext;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::SelectedCell;
@@ -35,6 +36,7 @@ use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::skid_overshoot_evidence;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
@@ -2329,6 +2331,164 @@ fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) 
     }
 }
 
+/// Decide whether one completed row earns its cell's single retry, and why.
+///
+/// There are exactly two causes, checked in this order:
+///
+/// - a FAIL classified as a product failure, by [`cell_result_is_retryable`];
+/// - an infrastructure ERROR whose only failure is the typed skid-overshoot
+///   evidence accepted by [`skid_overshoot_evidence`]. That evidence comes
+///   from Hermit's verification report, not from stderr text.
+///
+/// Every other row is final on its attempt, including an ERROR without that
+/// evidence, a timeout, and a no-result row. [`run_with_retry`] keeps the
+/// shared cap of one retry per cell whatever the cause.
+fn cell_retry_cause(result: &CellResult) -> Option<RetryCause> {
+    let retried_reason = || result.reason_for_display().to_owned();
+    if cell_result_is_retryable(result.outcome.as_str(), result.failure_class) {
+        return Some(RetryCause::ProductFailure {
+            retried_attempt: result.attempt,
+            retried_reason: retried_reason(),
+        });
+    }
+    skid_overshoot_evidence(result).map(|evidence| RetryCause::SkidOvershoot {
+        retried_attempt: result.attempt,
+        retried_reason: retried_reason(),
+        count: evidence.count,
+        marker_line: evidence.marker_line,
+    })
+}
+
+/// The log line that names a retry's cell, backend, cause and marker.
+fn retry_detail_line(result: &CellResult, cause: &RetryCause) -> String {
+    let cell = format!(
+        "{} ({}/{})",
+        result.test,
+        result.mode,
+        result.backend.as_deref().unwrap_or("native")
+    );
+    match cause {
+        RetryCause::ProductFailure { .. } => format!(
+            "    retry cause: product_failure in {cell} attempt {}",
+            cause.retried_attempt()
+        ),
+        RetryCause::SkidOvershoot {
+            count, marker_line, ..
+        } => format!(
+            "    retry cause: skid_overshoot in {cell} attempt {}: typed verification report \
+             recorded {count} report(s); marker line: {}",
+            cause.retried_attempt(),
+            marker_line
+                .as_deref()
+                .unwrap_or("none on stderr (typed count only)")
+        ),
+    }
+}
+
+/// Every attempt's outcome and reason, in order, for a cell that stayed red
+/// after a retry. A retried FAIL or ERROR reports both attempts' reasons.
+fn reason_after_retries(history: &[CellResult]) -> String {
+    history
+        .iter()
+        .enumerate()
+        .map(|(position, row)| {
+            let retried_as = history
+                .get(position + 1)
+                .and_then(|next| next.retry_cause.as_ref())
+                .map(|cause| format!(", retried as {}", cause.kind()))
+                .unwrap_or_default();
+            format!(
+                "attempt {} {}{}: {}",
+                row.attempt,
+                row.outcome,
+                retried_as,
+                row.reason_for_display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Count the executed retries in `histories` by cause.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct RetryCounts {
+    product_failure: usize,
+    skid_overshoot: usize,
+    recovered: usize,
+}
+
+impl RetryCounts {
+    fn from_histories(histories: &[Vec<CellResult>]) -> Self {
+        let mut counts = Self::default();
+        for history in histories {
+            let mut retried = false;
+            for row in history {
+                match &row.retry_cause {
+                    Some(RetryCause::ProductFailure { .. }) => counts.product_failure += 1,
+                    Some(RetryCause::SkidOvershoot { .. }) => counts.skid_overshoot += 1,
+                    None => continue,
+                }
+                retried = true;
+            }
+            if retried && history.last().is_some_and(|row| row.outcome == "PASS") {
+                counts.recovered += 1;
+            }
+        }
+        counts
+    }
+
+    fn total(&self) -> usize {
+        self.product_failure + self.skid_overshoot
+    }
+
+    /// The run's final line when it retried anything, so the node summary of
+    /// a run with retries differs from a clean run's. A clean run prints none.
+    fn summary_line(&self) -> Option<String> {
+        (self.total() > 0).then(|| {
+            format!(
+                "test-harness: RETRIED {} cell(s) once ({} skid_overshoot, {} product_failure); \
+                 {} passed only on retry, {} stayed red; every retry is a defect report \
+                 (retry_cause in results.jsonl, retried_cells in summary.json)",
+                self.total(),
+                self.skid_overshoot,
+                self.product_failure,
+                self.recovered,
+                self.total() - self.recovered
+            )
+        })
+    }
+}
+
+/// One `summary.json` entry per retry the run executed.
+fn retried_cells_json(histories: &[Vec<CellResult>]) -> Vec<JsonValue> {
+    histories
+        .iter()
+        .flat_map(|history| {
+            history.iter().filter_map(|row| {
+                let cause = row.retry_cause.as_ref()?;
+                let mut entry = serde_json::json!({
+                    "test": row.test,
+                    "mode": row.mode,
+                    "backend": row.backend,
+                    "cause": cause.kind(),
+                    "retried_attempt": cause.retried_attempt(),
+                    "retried_reason": cause.retried_reason(),
+                    "retry_attempt": row.attempt,
+                    "retry_outcome": row.outcome,
+                });
+                if let RetryCause::SkidOvershoot {
+                    count, marker_line, ..
+                } = cause
+                {
+                    entry["skid_overshoot_count"] = serde_json::json!(count);
+                    entry["marker_line"] = serde_json::json!(marker_line);
+                }
+                Some(entry)
+            })
+        })
+        .collect()
+}
+
 /// The selection `run` applies for `args`: its filters, over the required
 /// population unless manual cells are included.
 fn run_selection(args: &Args) -> Selection {
@@ -2407,6 +2567,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     // the harness process itself remains in the enclosing DAG cgroup.
     let mut cell_cpu_usage_usec = Some(0u64);
     let mut cpu_measurements = 0usize;
+    // The cause admitted for each cell's announced retry, stamped onto the
+    // retry's own row before that row is published.
+    let mut pending_retry_causes: Vec<Option<RetryCause>> = vec![None; cells.len()];
     let expected = cells.len();
     for_each_parallel(
         expected,
@@ -2429,11 +2592,20 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => error.into_result(&attempt_context, cell),
                     }
                 },
-                |result| cell_result_is_retryable(result.outcome.as_str(), result.failure_class),
+                |result| cell_retry_cause(result).is_some(),
                 emit,
             );
         },
         |index, mut result: CellResult, will_retry| {
+            // Decided from the row as run_cell returned it, before any
+            // publication failure below rewrites the row. The worker applied
+            // the same pure policy, so a requested retry always has a cause.
+            let next_retry_cause = if will_retry {
+                cell_retry_cause(&result)
+            } else {
+                None
+            };
+            result.retry_cause = pending_retry_causes[index].take();
             accumulate_cell_cpu_usage(
                 &mut cell_cpu_usage_usec,
                 &mut cpu_measurements,
@@ -2497,28 +2669,56 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                 suffix
             };
-            let effective_will_retry = published && will_retry;
-            let retry_note = if effective_will_retry {
-                format!(
-                    " [attempt {} of at most {}; retrying this cell only]",
-                    result.attempt, MAX_ATTEMPTS_PER_CELL
-                )
-            } else {
-                String::new()
+            let effective_will_retry = published && next_retry_cause.is_some();
+            let retry_note = match (&next_retry_cause, &result.retry_cause) {
+                (Some(cause), _) if effective_will_retry => format!(
+                    " [attempt {} of at most {}; retrying this cell only: {}]",
+                    result.attempt,
+                    MAX_ATTEMPTS_PER_CELL,
+                    cause.kind()
+                ),
+                (_, Some(cause)) => format!(
+                    " [retry attempt {} of at most {} after {}]",
+                    result.attempt,
+                    MAX_ATTEMPTS_PER_CELL,
+                    cause.kind()
+                ),
+                _ => String::new(),
+            };
+            let retry_detail = match &next_retry_cause {
+                Some(cause) if effective_will_retry => {
+                    format!("\n{}", retry_detail_line(&result, cause))
+                }
+                _ => String::new(),
             };
             println!(
-                "{} {} ({}/{}){}{}",
+                "{} {} ({}/{}){}{}{}",
                 result.outcome,
                 result.test,
                 result.mode,
                 result.backend.as_deref().unwrap_or("native"),
                 retry_note,
-                located
+                located,
+                retry_detail
             );
 
             attempt_results[index].push(result);
-            if !effective_will_retry {
-                let result = match cell_result_after_retries(&attempt_results[index]) {
+            if effective_will_retry {
+                pending_retry_causes[index] = next_retry_cause;
+            } else {
+                let history = &attempt_results[index];
+                let result = match cell_result_after_retries(history) {
+                    Ok(result) if history.len() > 1 && result.outcome != "PASS" => {
+                        let mut result = result.clone();
+                        let reason = reason_after_retries(history);
+                        println!(
+                            "    stayed {} after {} attempts: {reason}",
+                            result.outcome,
+                            history.len()
+                        );
+                        result.reason = Some(reason);
+                        result
+                    }
                     Ok(result) => result.clone(),
                     Err(error) => {
                         let mut result = attempt_results[index]
@@ -2534,7 +2734,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
                 indexed_results.push((index, result));
             }
-            published
+            if will_retry {
+                effective_will_retry
+            } else {
+                published
+            }
         },
     );
     if indexed_results.len() != expected {
@@ -2580,6 +2784,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         failed = true;
     }
     write_junit(&junit, &results).unwrap();
+    let retry_counts = RetryCounts::from_histories(&attempt_results);
     let summary = serde_json::json!({
         "schema": 1,
         "cells": results.len(),
@@ -2588,6 +2793,13 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         "errors": results.iter().filter(|result| result.outcome == "ERROR").count(),
         "host_inapplicable": host_inapplicable,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
+        "retries": {
+            "total": retry_counts.total(),
+            "skid_overshoot": retry_counts.skid_overshoot,
+            "product_failure": retry_counts.product_failure,
+            "passed_only_on_retry": retry_counts.recovered,
+        },
+        "retried_cells": retried_cells_json(&attempt_results),
         "host_inapplicable_cells": results
             .iter()
             .filter(|result| result.outcome == "HOST-INAPPLICABLE")
@@ -2618,6 +2830,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         capacity,
         &attempt_results,
     );
+    // Last, so it is the node summary line whenever the run retried a cell.
+    if let Some(line) = retry_counts.summary_line() {
+        print_best_effort(std::io::stdout(), &line);
+    }
     exit
 }
 
@@ -5335,6 +5551,555 @@ sys.exit(1 if failed else 0)
         let junit = fs::read_to_string(fixture.join("junit.xml")).unwrap();
         assert!(junit.contains("tests=\"5\" failures=\"2\" errors=\"1\" skipped=\"0\""));
         assert_eq!(junit.matches("<testcase ").count(), 5);
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    /// The skid-overshoot retry of
+    /// <https://github.com/rrnewton/hermit/issues/1845>, through the real
+    /// `run()` callback, publication, reduction and epilogue, against a fake
+    /// Hermit that writes the verification report a real one would.
+    ///
+    /// - `recovers`: a typed skid-overshoot ERROR is retried once, and the
+    ///   passing retry makes the cell PASS with the retry recorded.
+    /// - `guest-marker`: the marker text on stderr with no typed report is an
+    ///   ERROR that is not retried. If it were, the fake has no second attempt
+    ///   for this cell and would fail differently.
+    /// - `twice`: a second skid ERROR after the retry stays an ERROR, and the
+    ///   final reason carries both attempts' reasons.
+    /// - `then-diverges`: the retry diverges. The cell FAILs with both reasons,
+    ///   and there is no third attempt even though a product FAIL is itself a
+    ///   retry cause, because the cap is one retry per cell.
+    /// - `clean`: a passing first attempt is scored exactly as before.
+    #[test]
+    fn production_run_retries_a_typed_skid_overshoot_once() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::canonical_verdict::VerificationReport;
+        use hermit_manifest_plan::runner::CellResult;
+        use hermit_manifest_plan::runner::RetryCause;
+        use serde_json::json;
+
+        use super::RetryCounts;
+        use super::cell_retry_cause;
+        use super::reason_after_retries;
+        use super::retried_cells_json;
+        use super::retry_detail_line;
+
+        const CHILD_FIXTURE: &str = "HERMIT_HARNESS_SKID_RETRY_TEST_FIXTURE";
+        const TEST_NAME: &str = "tests::production_run_retries_a_typed_skid_overshoot_once";
+        const MARKER: &str =
+            "HERMIT_SKID_OVERSHOOT rcb_actual=1200 rcb_target=100 skid_margin=1000 overshoot=1100";
+        if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
+            let fixture = PathBuf::from(fixture);
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let args = parse(
+                [
+                    "--category".into(),
+                    "skid".into(),
+                    "--ci-only".into(),
+                    "--prebuilt".into(),
+                    "--jobs".into(),
+                    "2".into(),
+                    "--results".into(),
+                    fixture.join("results.jsonl").display().to_string(),
+                    "--junit".into(),
+                    fixture.join("junit.xml").display().to_string(),
+                ]
+                .into_iter(),
+            );
+            super::validate_args("run", &args);
+            assert_eq!(super::run(&root, &manifests, &args), ExitCode::FAILURE);
+            return;
+        }
+
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-skid-retry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let manifests = fixture.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+        )
+        .unwrap();
+        let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+            "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+            "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+            "liteinst": "Not selected by this control"
+        }});
+        let modes = json!({
+            "verify": {"ci": true, "backends_enabled": ["ptrace"],
+                "backends_disabled": {"dbt": "Not selected", "kvm": "Not selected",
+                    "sabre": "Not selected", "liteinst": "Not selected"}},
+            "naked": {"ci": false, "backends_enabled": [],
+                "backends_disabled": {"native": "Not selected by this CI control"}},
+            "chaos": disabled, "replay": disabled, "custom": disabled
+        });
+        let names = [
+            "clean",
+            "guest-marker",
+            "recovers",
+            "then-diverges",
+            "twice",
+        ];
+        let tests = names
+            .iter()
+            .map(|name| {
+                json!({
+                    "id": format!("skid/{name}"),
+                    "description": "Skid-overshoot retry control",
+                    "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                    "observation": {"status": true, "stdout": true, "stderr": true},
+                    "modes": modes
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            manifests.join("skid.yaml"),
+            serde_json::to_vec(&json!({"schema": 3, "bucket": "skid", "test": tests})).unwrap(),
+        )
+        .unwrap();
+
+        let empty = json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_bytes": 0, "stderr_bytes": 0});
+        let matched = json!({
+            "verified": true, "bitwise_parity": true, "verdict": "matched",
+            "no_result_reason": null, "infrastructure_error": null,
+            "comparison": {"strictness": "canonical", "display_name": "BitwiseInfoV1",
+                "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+                "record_envelope": "all_records_v1", "virtualize_time": true,
+                "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+                "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false, "skip_commit": false, "skip_detlog": false},
+            "compared_log_messages": {"left": 2, "right": 2},
+            "compared_outputs": {"left": empty, "right": empty},
+            "guest_exit_code": 0, "guest_signal": null,
+            "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null, "first_divergent_syscall": null,
+            "first_divergent_left_message": null, "first_divergent_right_message": null
+        });
+        let skid = |count: u64| {
+            let mut report = matched.clone();
+            report["verified"] = json!(false);
+            report["bitwise_parity"] = json!(false);
+            report["verdict"] = json!("infrastructure_error");
+            report["infrastructure_error"] = json!({"kind": "skid_overshoot", "count": count});
+            report
+        };
+        let mut diverged = matched.clone();
+        diverged["verified"] = json!(false);
+        diverged["bitwise_parity"] = json!(false);
+        diverged["verdict"] = json!("diverged");
+        let reports = fixture.join("reports");
+        fs::create_dir(&reports).unwrap();
+        for (name, report) in [
+            ("matched", matched.clone()),
+            ("skid-2", skid(2)),
+            ("skid-1", skid(1)),
+            ("diverged", diverged),
+        ] {
+            let bytes = serde_json::to_vec(&report).unwrap();
+            // Each fixture report is one a current Hermit could write.
+            VerificationReport::from_current_json_slice(&bytes).unwrap();
+            fs::write(reports.join(format!("{name}.json")), bytes).unwrap();
+        }
+        // Behavior per cell and outer attempt: (report, print marker, exit).
+        // A cell listed with one attempt fails loudly if it is ever retried.
+        let hermit = fixture.join("fake-hermit");
+        fs::write(
+            &hermit,
+            format!(
+                r#"#!/usr/bin/python3
+import json,pathlib,sys
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+if '--help' in a:
+ print('--verify-strict');sys.exit(0)
+if 'run' in a:a=a[a.index('run'):]
+if not a or a[0] not in ('run','log-diff'):sys.exit(0)
+if a[0]=='log-diff':
+ if len(a)==2:sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
+ sys.exit(3)
+report=pathlib.Path(a[a.index('--verify-json')+1])
+p=str(report)
+retry='-attempt-2/' in p
+cell=[n for n in ('clean','guest-marker','recovers','then-diverges','twice') if '/skid-'+n+'-verify-ptrace' in p]
+assert len(cell)==1,p
+cell=cell[0]
+with (root/'invocations').open('a') as f:f.write(json.dumps({{'cell':cell,'retry':retry}})+'\n')
+if '--verify-log-dir' in a:
+ logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
+ logdir.mkdir(parents=True,exist_ok=True)
+ (logdir/'run1_log_fixture.log').write_text('INFO detcore: shared\nINFO detcore: complete\n')
+plan={{
+ 'clean':[('matched',False,0)],
+ 'guest-marker':[(None,True,122)],
+ 'recovers':[('skid-2',True,122),('matched',False,0)],
+ 'then-diverges':[('skid-2',True,122),('diverged',False,1)],
+ 'twice':[('skid-2',True,122),('skid-1',True,122)],
+}}[cell]
+name,mark,status=plan[1 if retry else 0]
+if name:report.write_bytes((root/'reports'/(name+'.json')).read_bytes())
+if mark:sys.stderr.write('{MARKER}\n')
+sys.exit(status)
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = Command::new("timeout")
+            .args(["--kill-after=2s", "60s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(CHILD_FIXTURE, &fixture)
+            .env("HERMIT_BIN", &hermit)
+            .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
+            .env("E2E_BUILD_ROOT", fixture.join("build"))
+            .env("E2E_RUN_ID", "skid-retry-control")
+            .env("E2E_MACHINE_SHORTNAME", "skid-retry-control")
+            .env("E2E_KERNEL_VERSION", "skid-retry-control")
+            .env("E2E_PARITY_POST_PASS", "0")
+            .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        fs::write(fixture.join("child.stdout"), &stdout).unwrap();
+        fs::write(fixture.join("child.stderr"), &stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "skid retry control failed: {}\n{stdout}\n{stderr}",
+            fixture.display()
+        );
+
+        // Guest executions: two for each retried cell, one otherwise.
+        let mut executions = BTreeMap::<String, Vec<bool>>::new();
+        for line in fs::read_to_string(fixture.join("invocations"))
+            .unwrap()
+            .lines()
+        {
+            let call: serde_json::Value = serde_json::from_str(line).unwrap();
+            executions
+                .entry(call["cell"].as_str().unwrap().to_string())
+                .or_default()
+                .push(call["retry"].as_bool().unwrap());
+        }
+        assert_eq!(
+            executions,
+            BTreeMap::from([
+                ("clean".to_string(), vec![false]),
+                ("guest-marker".to_string(), vec![false]),
+                ("recovers".to_string(), vec![false, true]),
+                ("then-diverges".to_string(), vec![false, true]),
+                ("twice".to_string(), vec![false, true]),
+            ]),
+            "no third attempt and no retry without the typed report; {stdout}"
+        );
+
+        let rows = fs::read_to_string(fixture.join("results.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut histories = BTreeMap::<String, Vec<CellResult>>::new();
+        for row in &rows {
+            row.require_current_classification().unwrap();
+            row.require_current_timeout_policy().unwrap();
+            assert_eq!(
+                (row.mode.as_str(), row.backend.as_deref()),
+                ("verify", Some("ptrace"))
+            );
+            histories
+                .entry(row.test.trim_start_matches("skid/").to_string())
+                .or_default()
+                .push(row.clone());
+        }
+        let skid_cause = |count: u64, reason_count: u64| RetryCause::SkidOvershoot {
+            retried_attempt: 1,
+            retried_reason: format!(
+                "verification recorded {reason_count} HERMIT_SKID_OVERSHOOT report(s)"
+            ),
+            count,
+            marker_line: Some(MARKER.into()),
+        };
+        let infra = Some(FailureClass::UnderstoodInfrastructureFailure);
+        for (name, expected) in [
+            ("clean", vec![(1, "PASS", None, None)]),
+            (
+                "recovers",
+                vec![
+                    (1, "ERROR", infra, None),
+                    (2, "PASS", None, Some(skid_cause(2, 2))),
+                ],
+            ),
+            (
+                "then-diverges",
+                vec![
+                    (1, "ERROR", infra, None),
+                    (
+                        2,
+                        "FAIL",
+                        Some(FailureClass::ProductFailure),
+                        Some(skid_cause(2, 2)),
+                    ),
+                ],
+            ),
+            (
+                "twice",
+                vec![
+                    (1, "ERROR", infra, None),
+                    (2, "ERROR", infra, Some(skid_cause(2, 2))),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                histories[name]
+                    .iter()
+                    .map(|r| (
+                        r.attempt,
+                        r.outcome.as_str(),
+                        r.failure_class,
+                        r.retry_cause.clone()
+                    ))
+                    .collect::<Vec<_>>(),
+                expected,
+                "retry history for {name}; artifacts: {}",
+                fixture.display()
+            );
+        }
+        let guest_marker = &histories["guest-marker"];
+        assert_eq!(guest_marker.len(), 1, "{guest_marker:#?}");
+        assert_eq!(guest_marker[0].outcome, "ERROR");
+        assert_eq!(
+            guest_marker[0].error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert!(guest_marker[0].attempts[0].stderr.contains(MARKER));
+        assert_eq!(guest_marker[0].retry_cause, None);
+
+        // The pure policy on the same rows. The divergence after a retry is a
+        // product-failure cause by itself: only the per-cell cap stopped it.
+        assert_eq!(
+            cell_retry_cause(&histories["recovers"][0]),
+            Some(skid_cause(2, 2))
+        );
+        assert_eq!(
+            cell_retry_cause(&histories["twice"][1]),
+            Some(RetryCause::SkidOvershoot {
+                retried_attempt: 2,
+                retried_reason: "verification recorded 1 HERMIT_SKID_OVERSHOOT report(s)".into(),
+                count: 1,
+                marker_line: Some(MARKER.into()),
+            })
+        );
+        assert!(matches!(
+            cell_retry_cause(&histories["then-diverges"][1]),
+            Some(RetryCause::ProductFailure {
+                retried_attempt: 2,
+                ..
+            })
+        ));
+        assert_eq!(cell_retry_cause(&guest_marker[0]), None);
+        assert_eq!(cell_retry_cause(&histories["clean"][0]), None);
+        // Relabeling the marker-only row as an infrastructure ERROR is still
+        // not skid evidence: the decision needs the typed report.
+        let mut relabeled = guest_marker[0].clone();
+        relabeled.error_kind = Some("infrastructure".into());
+        relabeled.failure_class = infra;
+        relabeled.attempts[0].error_kind = Some("infrastructure".into());
+        relabeled.attempts[0].reason =
+            Some("verification recorded 1 HERMIT_SKID_OVERSHOOT report(s)".into());
+        relabeled.reason = relabeled.attempts[0].reason.clone();
+        assert_eq!(cell_retry_cause(&relabeled), None);
+        let silent = RetryCause::SkidOvershoot {
+            retried_attempt: 1,
+            retried_reason: "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into(),
+            count: 2,
+            marker_line: None,
+        };
+        assert!(
+            retry_detail_line(&histories["recovers"][0], &silent)
+                .ends_with("marker line: none on stderr (typed count only)")
+        );
+
+        let both_reasons = |second: &str| {
+            format!(
+                "attempt 1 ERROR, retried as skid_overshoot: verification recorded 2 \
+                 HERMIT_SKID_OVERSHOOT report(s); attempt 2 {second}"
+            )
+        };
+        let twice_reason =
+            both_reasons("ERROR: verification recorded 1 HERMIT_SKID_OVERSHOOT report(s)");
+        assert_eq!(reason_after_retries(&histories["twice"]), twice_reason);
+        let diverged_reason = reason_after_retries(&histories["then-diverges"]);
+        assert!(
+            diverged_reason.starts_with(&both_reasons("FAIL: ")),
+            "{diverged_reason}"
+        );
+        assert!(diverged_reason.len() > both_reasons("FAIL: ").len());
+
+        let ordered = names
+            .iter()
+            .map(|name| histories[*name].clone())
+            .collect::<Vec<_>>();
+        let counts = RetryCounts::from_histories(&ordered);
+        assert_eq!(
+            counts,
+            RetryCounts {
+                product_failure: 0,
+                skid_overshoot: 3,
+                recovered: 1
+            }
+        );
+        let clean_only = RetryCounts::from_histories(&[histories["clean"].clone()]);
+        assert_eq!(clean_only.total(), 0);
+        assert_eq!(
+            clean_only.summary_line(),
+            None,
+            "a clean run prints no retry line"
+        );
+
+        let structured: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("counts.json")).unwrap()).unwrap();
+        assert_eq!(
+            structured,
+            json!({
+                "schema": 2,
+                "executed_tests": 5,
+                "filtered_tests": 0,
+                "results": [
+                    {"id": "skid/clean [ptrace/verify]", "result": "pass", "attempts": 1},
+                    {"id": "skid/guest-marker [ptrace/verify]", "result": "fail", "attempts": 1},
+                    {"id": "skid/recovers [ptrace/verify]", "result": "pass", "attempts": 2},
+                    {"id": "skid/then-diverges [ptrace/verify]", "result": "fail", "attempts": 2},
+                    {"id": "skid/twice [ptrace/verify]", "result": "fail", "attempts": 2}
+                ]
+            })
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary["schema"], 1);
+        for (name, expected) in [("cells", 5), ("passed", 2), ("failed", 1), ("errors", 2)] {
+            assert_eq!(summary[name], expected, "summary {name}");
+        }
+        assert_eq!(
+            summary["retries"],
+            json!({"total": 3, "skid_overshoot": 3, "product_failure": 0,
+                "passed_only_on_retry": 1})
+        );
+        assert_eq!(
+            summary["retried_cells"],
+            serde_json::Value::Array(retried_cells_json(&ordered))
+        );
+        assert_eq!(
+            summary["retried_cells"][0],
+            json!({"test": "skid/recovers", "mode": "verify", "backend": "ptrace",
+                "cause": "skid_overshoot", "retried_attempt": 1,
+                "retried_reason": "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)",
+                "retry_attempt": 2, "retry_outcome": "PASS",
+                "skid_overshoot_count": 2, "marker_line": MARKER})
+        );
+
+        let junit = fs::read_to_string(fixture.join("junit.xml")).unwrap();
+        assert!(
+            junit.contains("tests=\"5\" failures=\"1\" errors=\"2\" skipped=\"0\""),
+            "{junit}"
+        );
+        assert!(junit.contains(&twice_reason), "{junit}");
+        assert!(junit.contains(&both_reasons("FAIL: ")), "{junit}");
+
+        // The log: each retry names its cell, backend, cause and marker line;
+        // each retry row says it is one; a cell that stayed red gives both
+        // reasons; and the run's last line reports the retries.
+        for name in ["recovers", "then-diverges", "twice"] {
+            assert!(
+                stdout.contains(&format!(
+                    "ERROR skid/{name} (verify/ptrace) [attempt 1 of at most 2; \
+                     retrying this cell only: skid_overshoot]"
+                )),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains(&format!(
+                    "    retry cause: skid_overshoot in skid/{name} (verify/ptrace) attempt 1: \
+                     typed verification report recorded 2 report(s); marker line: {MARKER}"
+                )),
+                "{stdout}"
+            );
+        }
+        for line in [
+            "PASS skid/recovers (verify/ptrace) [retry attempt 2 of at most 2 after skid_overshoot]",
+            "FAIL skid/then-diverges (verify/ptrace) [retry attempt 2 of at most 2 after skid_overshoot]",
+            "ERROR skid/twice (verify/ptrace) [retry attempt 2 of at most 2 after skid_overshoot]",
+        ] {
+            assert!(
+                stdout.lines().any(|l| l.starts_with(line)),
+                "{line}\n{stdout}"
+            );
+        }
+        assert!(
+            stdout.contains("PASS skid/clean (verify/ptrace)\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("ERROR skid/guest-marker (verify/ptrace) "),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "    stayed ERROR after 2 attempts: {twice_reason}"
+            )),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "    stayed FAIL after 2 attempts: {}",
+                both_reasons("FAIL: ")
+            )),
+            "{stdout}"
+        );
+        assert_eq!(
+            stdout.matches("retrying this cell only").count(),
+            3,
+            "{stdout}"
+        );
+        let retry_line = counts.summary_line().unwrap();
+        assert_eq!(
+            retry_line,
+            "test-harness: RETRIED 3 cell(s) once (3 skid_overshoot, 0 product_failure); \
+             1 passed only on retry, 2 stayed red; every retry is a defect report \
+             (retry_cause in results.jsonl, retried_cells in summary.json)"
+        );
+        let harness_lines = stdout
+            .lines()
+            .filter(|line| {
+                !line.trim().is_empty()
+                    && !line.starts_with("running ")
+                    && !line.starts_with("test ")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            harness_lines.last(),
+            Some(&retry_line.as_str()),
+            "the retry report must be the node summary line: {stdout}"
+        );
         fs::remove_dir_all(fixture).unwrap();
     }
 

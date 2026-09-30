@@ -12764,6 +12764,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         reason: None,
         artifact_dir: sample_artifact_dir.to_string_lossy().into_owned(),
         expected_guest_exit: None,
+        retry_cause: None,
     };
     if !result_row_matches_cell(
         &result_row,
@@ -14156,6 +14157,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .to_string_lossy()
             .into_owned(),
         expected_guest_exit: None,
+        retry_cause: None,
     };
     if !result_row_matches_cell(
         &repeated_result_row,

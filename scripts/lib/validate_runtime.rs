@@ -58,8 +58,10 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
-/// One initial manifest-cell attempt and at most one retry of a product failure.
-/// The manifest runner owns retry admission; validate retains the maximum when
+/// One initial manifest-cell attempt and at most one retry, of either a product
+/// failure or a typed skid-overshoot infrastructure error (`cell_retry_cause`
+/// in `ci/manifest-plan/src/bin/test-harness.rs`). Either cause shares this one
+/// cap. The manifest runner owns retry admission; validate retains the maximum when
 /// proving both possible attempts fit inside the enclosing node deadline.
 pub const MAX_ATTEMPTS_PER_CELL: usize =
     hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL as usize;
