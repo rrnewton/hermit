@@ -5467,9 +5467,215 @@ fn log_file_that_cannot_be_opened_is_refused_by_path() {
         ],
     );
 }
+/// Staging the LiteInst runtime works in a source tree with no git metadata
+/// (<https://github.com/rrnewton/hermit/issues/3419>). The fbsource Buck import
+/// runs tests from such a tree, and `stage-liteinst-runtime.sh` used to derive
+/// the pin through `ci/run-reverie-pin-check.sh --print-pin`, which lists
+/// tracked files with git, so `run_liteinst_verifies_detcore_backend` failed
+/// with "fatal: not a git repository". The test helper now hands the script
+/// the pin embedded in the Hermit binary under test.
+///
+/// This drives the helper's own staging command with git made unreachable (a
+/// stand-in `git` first on PATH, and `GIT_DIR` naming nothing) and a stand-in
+/// `cargo` that writes the runtime, so only the pin plumbing is under test. The control run without the supplied
+/// pin shows the premise: the git-based pin lookup fails here.
+#[test]
+fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let stand_in_cargo = directory.path().join("cargo");
+    fs::write(
+        &stand_in_cargo,
+        "#!/bin/sh\nprintf 'staged by a stand-in cargo\\n' > \"$HERMIT_LITEINST_STAGE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stand_in_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    // Make git unreachable for every tool, not only those that honour GIT_DIR:
+    // a stand-in `git` first on PATH answers as git does outside a repository.
+    let no_git_bin = directory.path().join("no-git-bin");
+    fs::create_dir(&no_git_bin).unwrap();
+    let stand_in_git = no_git_bin.join("git");
+    fs::write(
+        &stand_in_git,
+        "#!/bin/sh\necho 'fatal: not a git repository (stand-in)' >&2\nexit 128\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stand_in_git, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        no_git_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let no_git = directory.path().join("no-git-metadata");
+    // `None` keeps the helper's own pin, which is what this test is about.
+    // `Some("")` removes it; any other value replaces it.
+    let stage = |runtime: &Path, pin: Option<&str>| {
+        let mut command = liteinst_runtime::liteinst_stage_command(runtime);
+        command
+            .env("CARGO", &stand_in_cargo)
+            .env("GIT_DIR", &no_git)
+            .env("PATH", &path);
+        match pin {
+            None => {}
+            Some("") => {
+                command.env_remove("HERMIT_LITEINST_REVERIE_PIN");
+            }
+            Some(pin) => {
+                command.env("HERMIT_LITEINST_REVERIE_PIN", pin);
+            }
+        }
+        command
+            .output()
+            .expect("failed to run stage-liteinst-runtime.sh")
+    };
+
+    let runtime = directory.path().join("staged/libreverie_liteinst.so");
+    let output = stage(&runtime, None);
+    assert!(
+        output.status.success(),
+        "staging without git failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(&runtime).unwrap(),
+        "staged by a stand-in cargo\n"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("{}.revision", runtime.display())).unwrap(),
+        format!("{}\n", env!("HERMIT_REVERIE_PIN"))
+    );
+
+    // A supplied pin must be a revision, and must be the one
+    // liteinst-runtime-build builds from; either refusal stages nothing.
+    for (pin, reason) in [
+        (
+            "1111111111111111111111111111111111111111",
+            "liteinst-runtime-build builds Reverie at",
+        ),
+        ("not-a-revision", "must be a 40-hex Reverie revision"),
+    ] {
+        let refused_runtime = directory
+            .path()
+            .join(format!("refused-{}/libreverie_liteinst.so", &pin[..3]));
+        let refused = stage(&refused_runtime, Some(pin));
+        // EXIT-CLASS: hermit (the staging script's usage refusal)
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{pin}: {}",
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains(reason),
+            "{pin}: {}",
+            stderr(&refused)
+        );
+        assert!(!refused_runtime.exists(), "{pin} staged a runtime");
+    }
+
+    let control = stage(
+        &directory.path().join("control/libreverie_liteinst.so"),
+        Some(""),
+    );
+    assert!(
+        !control.status.success(),
+        "control: the git-based pin lookup unexpectedly worked without git:\n{}",
+        stderr(&control)
+    );
+    assert!(
+        // "fatal: not a git repository" from the stand-in git, or the
+        // uniformity checker's "not inside a git repository".
+        stderr(&control).contains("git repository"),
+        "control: {}",
+        stderr(&control)
+    );
+}
+
+/// The `hermit-dap` binary, when this build has one.
+///
+/// Cargo always builds it alongside `hermit`, so under Cargo these tests always
+/// run. A build that does not ship it -- the fbsource Buck import builds no
+/// hermit-dap (<https://github.com/rrnewton/hermit/issues/3419>) -- either leaves
+/// `CARGO_BIN_EXE_hermit-dap` unset or points it at a stand-in so the crate
+/// compiles; neither is the DAP adapter, and a failure against it says nothing
+/// about hermit-dap. Setting `HERMIT_REQUIRE_DAP` turns that skip back into a
+/// failure, so a job that means to cover hermit-dap cannot silently stop.
+fn hermit_dap_binary(test: &str) -> Option<&'static Path> {
+    let path = option_env!("CARGO_BIN_EXE_hermit-dap").map(Path::new);
+    let Some(reason) = hermit_dap_unavailable_reason(path) else {
+        return path;
+    };
+    assert!(
+        std::env::var_os("HERMIT_REQUIRE_DAP").is_none(),
+        "HERMIT_REQUIRE_DAP is set, but {reason}, so {test} cannot exercise hermit-dap"
+    );
+    eprintln!("skipping {test}: {reason}; build hermit-dap to exercise it");
+    None
+}
+
+/// Why `path` is not a hermit-dap to test, or `None` when it is one.
+///
+/// A file named `hermit-dap` is ALWAYS tested, whatever it does: it is the
+/// build product, and a broken `--help` or a missing file must fail the four
+/// tests rather than skip them. Only a differently named stand-in (fbsource maps
+/// the variable to /bin/false) is skipped, and then only if it does not identify
+/// as hermit-dap either.
+fn hermit_dap_unavailable_reason(path: Option<&Path>) -> Option<String> {
+    let Some(path) = path else {
+        return Some(
+            "this build defines no hermit-dap binary (CARGO_BIN_EXE_hermit-dap unset)".to_owned(),
+        );
+    };
+    if path.file_name() == Some(std::ffi::OsStr::new("hermit-dap")) {
+        return None;
+    }
+    let identifies = Command::new(path)
+        .arg("--help")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).starts_with("Usage: hermit-dap ")
+        });
+    (!identifies).then(|| {
+        format!(
+            "CARGO_BIN_EXE_hermit-dap names {}, which is neither named nor identifies as hermit-dap",
+            path.display()
+        )
+    })
+}
+
+#[test]
+fn hermit_dap_skip_never_applies_to_a_binary_named_hermit_dap() {
+    // The build product is tested even if it is missing or broken.
+    for missing in [
+        "/nonexistent/hermit-dap",
+        "/bin/hermit-dap-is-not-here/hermit-dap",
+    ] {
+        assert_eq!(
+            hermit_dap_unavailable_reason(Some(Path::new(missing))),
+            None
+        );
+    }
+    // Where coverage is required (validation sets HERMIT_REQUIRE_DAP on the
+    // test.cli nodes), this build must really provide hermit-dap. A build that
+    // does not ship it, such as fbsource's, does not set the variable.
+    if std::env::var_os("HERMIT_REQUIRE_DAP").is_some() {
+        assert_eq!(
+            hermit_dap_unavailable_reason(option_env!("CARGO_BIN_EXE_hermit-dap").map(Path::new)),
+            None
+        );
+    }
+    // A stand-in that does not identify, and an unset variable, are skipped.
+    assert!(hermit_dap_unavailable_reason(Some(Path::new("/bin/false"))).is_some());
+    assert!(hermit_dap_unavailable_reason(None).is_some());
+}
+
 #[test]
 fn hermit_dap_forwards_remote_settings_to_gdb() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+    let Some(hermit_dap) = hermit_dap_binary("hermit_dap_forwards_remote_settings_to_gdb") else {
+        return;
+    };
+    let output = Command::new(hermit_dap)
         .args(["--gdb", "/bin/echo"])
         .output()
         .expect("failed to run hermit-dap");
@@ -5489,7 +5695,10 @@ fn hermit_dap_forwards_remote_settings_to_gdb() {
 
 #[test]
 fn hermit_dap_reports_a_missing_gdb_path() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+    let Some(hermit_dap) = hermit_dap_binary("hermit_dap_reports_a_missing_gdb_path") else {
+        return;
+    };
+    let output = Command::new(hermit_dap)
         .arg("--gdb")
         .output()
         .expect("failed to run hermit-dap");
@@ -5504,7 +5713,10 @@ fn hermit_dap_reports_a_missing_gdb_path() {
 
 #[test]
 fn hermit_dap_help_describes_managed_replay() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+    let Some(hermit_dap) = hermit_dap_binary("hermit_dap_help_describes_managed_replay") else {
+        return;
+    };
+    let output = Command::new(hermit_dap)
         .arg("--help")
         .output()
         .expect("failed to run hermit-dap");
@@ -5518,7 +5730,11 @@ fn hermit_dap_help_describes_managed_replay() {
 
 #[test]
 fn hermit_dap_rejects_replay_options_without_replay() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+    let Some(hermit_dap) = hermit_dap_binary("hermit_dap_rejects_replay_options_without_replay")
+    else {
+        return;
+    };
+    let output = Command::new(hermit_dap)
         .args(["--data-dir", "/tmp/recordings"])
         .output()
         .expect("failed to run hermit-dap");

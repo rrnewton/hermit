@@ -52,6 +52,16 @@ fn raw_getpid() -> i32 {
     unsafe { libc::syscall(libc::SYS_getpid) as i32 }
 }
 
+/// The `Threads:` count from /proc/self/status.
+fn live_thread_count() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|count| count.trim().parse().ok())
+        .expect("/proc/self/status reports Threads:")
+}
+
 /// A minimal, kernel-acceptable `siginfo_t` for a queued signal.
 fn queued_siginfo(sig: i32) -> libc::siginfo_t {
     // SAFETY: siginfo_t is a plain-old-data union; a zeroed value is valid.
@@ -75,6 +85,21 @@ fn main() {
     // SAFETY: sa points at a fully initialized sigaction; oldact is NULL.
     let rc = unsafe { libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) };
     assert_eq!(rc, 0, "sigaction(SIGUSR1) failed");
+
+    // The process-directed form below needs this thread to be the only
+    // candidate. A build whose runtime or allocator starts a thread before
+    // `main` (jemalloc's background thread in the fbsource build) breaks that
+    // premise, and detcore then refuses the signal
+    // (https://github.com/rrnewton/hermit/issues/816). Say so directly rather
+    // than failing later as "rt_sigqueueinfo returned -1"; tests/BUCK builds
+    // this guest with the malloc allocator for that reason
+    // (https://github.com/rrnewton/hermit/issues/3419).
+    let threads = live_thread_count();
+    assert_eq!(
+        threads, 1,
+        "this guest must be single-threaded, but {threads} threads are live before any \
+         signal is sent; build it without a runtime or allocator thread"
+    );
 
     let tid = raw_gettid();
     let pid = raw_getpid();

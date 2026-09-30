@@ -90,20 +90,36 @@ fn stage_existing_runtime(source: &Path, destination: &Path) -> bool {
     result
 }
 
+/// The command that builds the LiteInst runtime and stages it at `runtime`.
+///
+/// The selected Hermit may be the validated staged artifact under target/ci.
+/// That directory is not a Cargo profile. Derive build settings only from the
+/// binary Cargo compiled for this test.
+pub(super) fn liteinst_stage_command(runtime: &Path) -> Command {
+    let compiled_hermit = PathBuf::from(env!("CARGO_BIN_EXE_hermit"));
+    let (cargo_profile, target_dir) = cargo_build_profile_and_target(&compiled_hermit);
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let mut command = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"));
+    command
+        .current_dir(repository)
+        // The marker must name the pin this Hermit binary was built with, which
+        // is what `staged_runtime_matches_current_pin` and the loader compare it
+        // to. Handing it over also means staging needs no git checkout
+        // (https://github.com/rrnewton/hermit/issues/3419).
+        .env("HERMIT_LITEINST_REVERIE_PIN", env!("HERMIT_REVERIE_PIN"))
+        .arg(cargo_profile)
+        .arg(runtime)
+        .arg(target_dir.join("liteinst-runtime-build"));
+    command
+}
+
 pub(super) fn ensure_liteinst_runtime() {
     LITEINST_RUNTIME.get_or_init(|| {
-        // The selected Hermit may be the validated staged artifact under
-        // target/ci. That directory is not a Cargo profile. Derive build
-        // settings only from the binary Cargo compiled for this test, while
-        // continuing to stage the runtime beside the selected Hermit.
+        // Continue to stage the runtime beside the selected Hermit.
         let compiled_hermit = PathBuf::from(env!("CARGO_BIN_EXE_hermit"));
-        let (cargo_profile, target_dir) = cargo_build_profile_and_target(&compiled_hermit);
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        // stage-liteinst-runtime.sh appends the current Reverie pin itself, so
-        // cache invalidation has the same source of truth as the pin gate.
-        let runtime_target = target_dir.join("liteinst-runtime-build");
+        let (_, target_dir) = cargo_build_profile_and_target(&compiled_hermit);
         let runtime = liteinst_runtime_library();
         if staged_runtime_matches_current_pin(&runtime) {
             return;
@@ -112,11 +128,7 @@ pub(super) fn ensure_liteinst_runtime() {
         if stage_existing_runtime(&release_runtime, &runtime) {
             return;
         }
-        let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
-            .current_dir(repository)
-            .arg(cargo_profile)
-            .arg(&runtime)
-            .arg(&runtime_target)
+        let output = liteinst_stage_command(&runtime)
             .output()
             .expect("failed to build the LiteInst runtime");
         assert!(

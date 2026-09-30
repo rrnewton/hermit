@@ -420,7 +420,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // relaxed_log_diff_canonicalizes_marked_host_addresses_on_request
     // (https://github.com/rrnewton/hermit/issues/3412) retain all 89 prior
     // selected CLI identities.
-    ("test.cli", 92),
+    // liteinst_runtime_staging_does_not_require_a_git_checkout and
+    // hermit_dap_skip_never_applies_to_a_binary_named_hermit_dap
+    // (https://github.com/rrnewton/hermit/issues/3419) retain all 92 prior
+    // selected CLI identities.
+    ("test.cli", 94),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -440,7 +444,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 92),
+    ("test.cli_on_host", 94),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -2754,7 +2758,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.liteinst_runtime_release"########,
             r########"setup.nextest"########,
         ],
-        env: &[],
+        // A hermit-dap missing from the build must fail the hermit_dap_*
+        // cases here rather than let them skip
+        // (https://github.com/rrnewton/hermit/issues/3419).
+        env: &[(r########"HERMIT_REQUIRE_DAP"########, r########"1"########)],
         hint: HintSpec {
             resources: &[(r########"integration_test_binaries.cli"########, 1)],
             est_duration_s: 150.0,
@@ -2787,7 +2794,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.liteinst_runtime_release"########,
             r########"setup.nextest"########,
         ],
-        env: &[],
+        // A hermit-dap missing from the build must fail the hermit_dap_*
+        // cases here rather than let them skip
+        // (https://github.com/rrnewton/hermit/issues/3419).
+        env: &[(r########"HERMIT_REQUIRE_DAP"########, r########"1"########)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 150.0,
