@@ -7891,6 +7891,70 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     }
 }
 
+/// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
+/// backend must get the same refusal as an available one
+/// (https://github.com/rrnewton/hermit/issues/3418). Before the fix the run
+/// path probed availability first, so a build without the `sabre` feature
+/// answered `class=backend-unavailable` (125) where every other build refused
+/// (122).
+///
+/// Pointing SaBRe's loader override at a missing file makes the backend
+/// unavailable in EVERY build -- without the feature it is not compiled, with
+/// it there is no loader -- so this case holds whichever features the test
+/// binary was built with. The control run without `--timeout` proves the
+/// premise: the same invocation really does report the backend unavailable.
+#[test]
+fn run_timeout_refusal_does_not_depend_on_backend_availability() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let missing_loader = "/nonexistent/hermit-cli-test/sabre";
+    let run = |timeout: bool| {
+        let mut args = vec!["run", "--backend", "sabre"];
+        if timeout {
+            args.extend(["--timeout", "3"]);
+        }
+        args.extend(["--", "/bin/echo", "unreachable"]);
+        let output = hermit_command(&args)
+            .env("HERMIT_SABRE_BINARY", missing_loader)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output, stderr)
+    };
+
+    let (control, control_stderr) = run(false);
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        control.status.code(),
+        Some(125),
+        "control: without --timeout the sabre backend must be unavailable here. \
+         stderr:\n{control_stderr}"
+    );
+    assert!(
+        control_stderr.contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre"),
+        "control: {control_stderr}"
+    );
+
+    let (refused, stderr) = run(true);
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        refused.status.code(),
+        Some(122),
+        "`--timeout` on an unavailable backend must still REFUSE (122). stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not qualified"), "{stderr}");
+    assert!(!stderr.contains("backend-unavailable"), "{stderr}");
+    assert!(
+        refused.stdout.is_empty(),
+        "the guest ran: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+}
+
 /// The diagnostic deadline is spent ONCE across every write, not restarted by each.
 ///
 /// ⚠️ THIS CELL EXISTS BECAUSE THE CELL ABOVE CANNOT DO THIS, AND THAT WAS FOUND BY
