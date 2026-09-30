@@ -385,11 +385,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // file_mappings_name_their_file_until_unmapped,
     // file_mappings_follow_mremap_and_survive_fork and
     // a_shared_file_mapping_keeps_its_file_record.
-    ("test.detcore_unit", 862),
+    // Six stat_guest_path scratch tests (syscalls::files::inject_fstat_scratch::
+    // stat_guest_path_stats_the_path_in_its_scratch_and_zeroes_it,
+    // stat_guest_path_has_no_answer_when_its_scratch_cannot_be_committed,
+    // stat_guest_path_propagates_a_commit_error_other_than_efault,
+    // stat_guest_path_has_no_answer_when_its_path_cannot_be_staged,
+    // stat_guest_path_has_no_answer_when_its_stat_buffer_faults and
+    // stat_guest_path_propagates_a_write_error_other_than_efault) retain all
+    // 862 prior identities (`cargo nextest list --profile ci` measured 868;
+    // https://github.com/rrnewton/hermit/issues/3328).
+    ("test.detcore_unit", 868),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
-    ("test.detcore_misc", 28),
+    // tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp
+    // retains all 28 prior selected identities under the unchanged skip filters
+    // (measured 29; https://github.com/rrnewton/hermit/issues/3328).
+    ("test.detcore_misc", 29),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -454,9 +466,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 28),
+    ("test.detcore_misc_on_host", 29),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 862),
+    ("test.detcore_unit_on_host", 868),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 178),
     ("test.hermit_unit_on_host", 758),

@@ -9,6 +9,7 @@
 //! misc syscall tests
 
 mod notification_fds;
+mod tight_stack_maps;
 mod tight_stack_openat;
 mod vfork;
 
