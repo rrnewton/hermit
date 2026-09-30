@@ -35,11 +35,12 @@ pub enum RecordEnvelopePolicy {
     AllRecordsV1,
     /// Exclude only records emitted by the DBT evidence transport about
     /// itself. Those records are real and present in a live evidence stream
-    /// (`evidence_emit_image_initialization`, reverie-dbt native/client.c),
-    /// but their host-arrival order is not guest behavior. Live DBT verification
-    /// uses Reverie's authenticated initialization count as separate typed
-    /// evidence and selects this policy for the remaining records. Offline
-    /// `hermit log-diff` applies the same selection to archived evidence logs.
+    /// (`evidence_emit_image_initialization`, reverie-dbt native/client.c).
+    /// Offline `hermit log-diff` applies this selection to archived evidence
+    /// logs when asked. Live DBT verification does not select it: it compares
+    /// under `AllRecordsV1`, with initialization records at their arrival
+    /// positions, and also compares Reverie's authenticated initialization
+    /// count as separate typed evidence.
     DbtEvidenceTransportV1,
     /// Select only records whose target is Detcore or one of its modules;
     /// comparison then selects INFO. Every other target is excluded, including
