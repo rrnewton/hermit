@@ -349,10 +349,10 @@ fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
         verdict["comparison"]["log_scope"], "info",
         "unexpected verdict: {verdict}"
     );
-    // Authenticated initialization records are checked separately by count;
-    // every remaining comparable record uses the named DBT transport envelope.
+    // The DBT log carries every authenticated record, initialization records
+    // included at their arrival positions, so the verdict names all_records_v1.
     assert_eq!(
-        verdict["comparison"]["record_envelope"], "dbt_evidence_transport_v1",
+        verdict["comparison"]["record_envelope"], "all_records_v1",
         "unexpected verdict: {verdict}"
     );
     assert_eq!(
