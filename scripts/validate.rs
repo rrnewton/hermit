@@ -7738,6 +7738,42 @@ fn validate_parity_expected_scope<'a>(
     Ok(expected)
 }
 
+/// The tree state this run's cell rows carry, for the parity rows appended
+/// beside them. Each `results.jsonl` row records the `source_tree_dirty`
+/// verdict of the harness process that wrote it, and
+/// [`append_validate_series`] sends those rows, from this same snapshot, to
+/// `series.py append-cells`, which skips `HOST-INAPPLICABLE` rows and
+/// refuses any other row without a bool. The parity post-pass ran in those
+/// same harness processes, so its rows take their verdict: dirty if any row
+/// is dirty. With no executed row there is no verdict, and the caller must
+/// not default one.
+fn cell_rows_source_tree_dirty(
+    cells: &validate_cell_results::CapturedResults,
+) -> Result<bool, String> {
+    let mut dirty = None;
+    for (file, line, row) in cells.rows(false)? {
+        if row.get("outcome").and_then(serde_json::Value::as_str) == Some("HOST-INAPPLICABLE") {
+            continue;
+        }
+        let Some(row_dirty) = row
+            .get("source_tree_dirty")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return Err(format!(
+                "{}:{line} records no bool source_tree_dirty, so the tree state is unknown",
+                file.display()
+            ));
+        };
+        dirty = Some(dirty.unwrap_or(false) || row_dirty);
+    }
+    dirty.ok_or_else(|| {
+        format!(
+            "no executed cell result under {} records the tree state",
+            cells.root().display()
+        )
+    })
+}
+
 /// Send this run's parity rows, as `parity::ledger_sources` reads them from
 /// the post-pass outputs under `e2e_result_root`, to the parent's
 /// `series.py append-parity` through `parity::append_ledger_rows`, which
@@ -7747,6 +7783,11 @@ fn validate_parity_expected_scope<'a>(
 /// log, `None` when there is no parent to append to. A tool root whose writer
 /// has no `append-parity` is named, with the rows left where they are, so the
 /// run can be exported later with `test-harness parity export`.
+///
+/// The rows go out with `--source-tree-dirty` from `cells`, the snapshot
+/// the series append sent, through [`cell_rows_source_tree_dirty`]; a run
+/// whose cell rows give no verdict leaves its parity rows too, because the
+/// writer never defaults the tree state.
 ///
 /// When `ledger_sources` refuses the run's outputs, the rows come from
 /// `parity::expected_ledger_sources` instead: every node it can read keeps
@@ -7759,6 +7800,7 @@ fn append_validate_parity(
     parent: Option<&Path>,
     tool_root: Option<&Path>,
     e2e_result_root: &Path,
+    cells: &validate_cell_results::CapturedResults,
     expected: Option<&hermit_manifest_plan::parity::ExpectedScope>,
     run_id: Option<&str>,
     tree: &str,
@@ -7806,18 +7848,22 @@ fn append_validate_parity(
         match (tool_root, run_id.filter(|run_id| !run_id.is_empty())) {
             (None, _) => left("no executable tool root"),
             (Some(_), None) => left("E2E_RUN_ID is missing"),
-            (Some(tool_root), Some(run_id)) => parity::append_ledger_rows(
-                &parity::LedgerAppend {
-                    series: &tool_root.join("ci-hub/series/series.py"),
-                    parent,
-                    producer: parity::ParityProducer::Validate,
-                    run_id,
-                    tree,
-                    source: e2e_result_root,
-                },
-                &rows,
-                bounds,
-            ),
+            (Some(tool_root), Some(run_id)) => match cell_rows_source_tree_dirty(cells) {
+                Err(why) => left(&why),
+                Ok(source_tree_dirty) => parity::append_ledger_rows(
+                    &parity::LedgerAppend {
+                        series: &tool_root.join("ci-hub/series/series.py"),
+                        parent,
+                        producer: parity::ParityProducer::Validate,
+                        run_id,
+                        tree,
+                        source_tree_dirty,
+                        source: e2e_result_root,
+                    },
+                    &rows,
+                    bounds,
+                ),
+            },
         }
     };
     if refused.is_empty() {
@@ -26308,6 +26354,7 @@ fn run(
             parent.as_deref(),
             tool_root.as_deref(),
             &e2e_result_root,
+            &raw_snapshot,
             expected.as_ref(),
             run_id.as_deref(),
             &commit,
@@ -27484,11 +27531,26 @@ mod parity_append_tests {
         .to_string()
     }
 
+    /// A `results.jsonl` row as the harness writes it, reduced to what the
+    /// parity append reads from it: its outcome, and the tree state the
+    /// harness process that wrote it saw.
+    fn cell_row(outcome: &str, dirty: bool) -> String {
+        serde_json::json!({
+            "schema": 4, "run_id": RUN, "hermit_sha": TREE,
+            "test": "c-programs/aio-refusal", "lane": "portable", "mode": "verify",
+            "backend": "kvm", "outcome": outcome, "source_tree_dirty": dirty,
+        })
+        .to_string()
+    }
+
     struct Fixture {
         root: PathBuf,
     }
 
     impl Fixture {
+        /// A run whose portable node measured one cell on a clean tree and
+        /// whose privileged node's post-pass failed, with a writer at
+        /// `tool/ci-hub/series/series.py`.
         fn new(label: &str, writer: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "validate-parity-append-{}-{label}-{}",
@@ -27513,6 +27575,11 @@ mod parity_append_tests {
             )
             .unwrap();
             std::fs::write(portable.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+            std::fs::write(
+                portable.join("results.jsonl"),
+                cell_row("PASS", false) + "\n",
+            )
+            .unwrap();
             std::fs::write(
                 privileged.join("parity.status.json"),
                 status(
@@ -27553,6 +27620,7 @@ mod parity_append_tests {
                 parent.then(|| self.root.join("parent")).as_deref(),
                 Some(&self.root.join("tool")),
                 &self.root.join("e2e"),
+                &validate_cell_results::CapturedResults::capture(&self.root.join("e2e")),
                 expected,
                 Some(RUN),
                 TREE,
@@ -27584,6 +27652,14 @@ mod parity_append_tests {
             std::fs::read(self.root.join("parent/captured.json"))
                 .ok()
                 .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+
+        /// The cell results of `node`'s `manifest_c_programs` bucket.
+        fn results(&self, node: &str) -> PathBuf {
+            self.root
+                .join("e2e")
+                .join(node)
+                .join("manifest_c_programs/results.jsonl")
         }
     }
 
@@ -27639,6 +27715,7 @@ sys.exit(2)
             ["--producer", "validate"],
             ["--run-id", RUN],
             ["--tree", TREE],
+            ["--source-tree-dirty", "false"],
         ] {
             assert!(
                 argv.windows(2).any(|window| window == pair),
@@ -27690,6 +27767,88 @@ sys.exit(2)
         assert_eq!(
             rows[2]["reason"],
             "parity post-pass failed: log-diff timed out"
+        );
+    }
+
+    /// The rows go out with the tree state of the cell rows the series
+    /// append sent: clean while every executed row is clean (a
+    /// `HOST-INAPPLICABLE` row, which `append-cells` skips, does not count),
+    /// dirty once any executed row is dirty. With no executed row, or a row
+    /// without the bool, there is no verdict, and the rows are left rather
+    /// than sent with a default.
+    #[test]
+    fn the_cell_rows_tree_state_reaches_append_parity() {
+        let sent = |fixture: &Fixture| {
+            let line = fixture.append(true).unwrap();
+            assert!(
+                line.starts_with("parity: appended 4 row(s) from "),
+                "{line}"
+            );
+            let captured = fixture.captured().expect("append-parity was called");
+            let argv = captured["argv"].as_array().unwrap().clone();
+            let flag = argv
+                .iter()
+                .position(|arg| arg == "--source-tree-dirty")
+                .expect("--source-tree-dirty was sent");
+            argv[flag + 1].as_str().unwrap().to_string()
+        };
+
+        let clean = Fixture::new("tree-clean", WRITER);
+        std::fs::write(
+            clean.results("privileged"),
+            cell_row("HOST-INAPPLICABLE", true) + "\n",
+        )
+        .unwrap();
+        assert_eq!(sent(&clean), "false");
+
+        let dirty = Fixture::new("tree-dirty", WRITER);
+        std::fs::write(
+            dirty.results("privileged"),
+            cell_row("PASS", false) + "\n" + &cell_row("FAIL", true) + "\n",
+        )
+        .unwrap();
+        assert_eq!(sent(&dirty), "true");
+
+        let left = |fixture: &Fixture, why: String| {
+            format!(
+                "parity: {why}; 4 rows left in {} (diverged 1, record-missing 3)",
+                fixture.root.join("e2e").display()
+            )
+        };
+
+        let none = Fixture::new("tree-none", WRITER);
+        std::fs::remove_file(none.results("portable")).unwrap();
+        assert_eq!(
+            none.append(true).unwrap(),
+            left(
+                &none,
+                format!(
+                    "no executed cell result under {} records the tree state",
+                    none.root.join("e2e").display()
+                )
+            )
+        );
+        assert!(
+            none.captured().is_none(),
+            "nothing is sent without a verdict"
+        );
+
+        let unknown = Fixture::new("tree-unknown", WRITER);
+        let no_tree_state = r#"{"schema":4,"outcome":"PASS"}"#.to_string() + "\n";
+        std::fs::write(unknown.results("portable"), no_tree_state).unwrap();
+        assert_eq!(
+            unknown.append(true).unwrap(),
+            left(
+                &unknown,
+                format!(
+                    "{}:1 records no bool source_tree_dirty, so the tree state is unknown",
+                    unknown.results("portable").display()
+                )
+            )
+        );
+        assert!(
+            unknown.captured().is_none(),
+            "nothing is sent without a verdict"
         );
     }
 

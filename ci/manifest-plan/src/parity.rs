@@ -4576,6 +4576,13 @@ pub struct LedgerAppend<'a> {
     pub run_id: &'a str,
     /// The Hermit tree the run measured.
     pub tree: &'a str,
+    /// Whether that tree had uncommitted changes, sent as
+    /// `--source-tree-dirty true|false`. The writer never defaults it: a
+    /// row stamped clean without the caller saying so would be admitted as
+    /// clean evidence by every scorecard that excludes dirty rows. Each
+    /// caller passes the verdict its run's other ledger evidence already
+    /// carries, never a second probe of the tree.
+    pub source_tree_dirty: bool,
     /// Where the rows were read from, named in the line.
     pub source: &'a Path,
 }
@@ -4693,7 +4700,13 @@ pub fn append_ledger_rows(
         .arg("--run-id")
         .arg(append.run_id)
         .arg("--tree")
-        .arg(append.tree);
+        .arg(append.tree)
+        .arg("--source-tree-dirty")
+        .arg(if append.source_tree_dirty {
+            "true"
+        } else {
+            "false"
+        });
     let Captured {
         status,
         stdout,
@@ -9243,12 +9256,14 @@ mod tests {
             producer: ParityProducer::Validate,
             run_id: LEDGER_RUN,
             tree: SHA,
+            source_tree_dirty: false,
             source: Box::leak(source.to_path_buf().into_boxed_path()),
         }
     }
 
     /// The rows reach `append-parity` on its stdin with the run's identity
-    /// on its command line, and the writer's own words end the line.
+    /// and its tree state on its command line, and the writer's own words
+    /// end the line.
     #[test]
     fn appended_rows_reach_the_writer_with_the_runs_identity() {
         let root = result_root("append-ok");
@@ -9284,7 +9299,9 @@ mod tests {
                 "--run-id",
                 LEDGER_RUN,
                 "--tree",
-                SHA
+                SHA,
+                "--source-tree-dirty",
+                "false"
             ])
         );
         let expected = rows
@@ -9292,6 +9309,27 @@ mod tests {
             .map(|row| serde_json::to_string(row).unwrap() + "\n")
             .collect::<String>();
         assert_eq!(captured["stdin"], serde_json::json!(expected));
+
+        // A dirty tree is sent as such.
+        let line = append_ledger_rows(
+            &LedgerAppend {
+                source_tree_dirty: true,
+                ..append_to(&series, &root)
+            },
+            &rows,
+            AppendBounds::default(),
+        );
+        assert!(line.ends_with(": wrote 2 rows"), "{line}");
+        let captured: serde_json::Value =
+            serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
+        let argv = captured["argv"].as_array().unwrap();
+        assert_eq!(
+            argv[argv.len() - 2..],
+            [
+                serde_json::json!("--source-tree-dirty"),
+                serde_json::json!("true")
+            ]
+        );
     }
 
     /// A writer without `append-parity`, a missing writer and a refusing
