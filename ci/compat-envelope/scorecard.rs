@@ -5136,15 +5136,26 @@ fn latest_backend_parity(cell: &TrackedCell) -> Option<&RecordedBackendParityCom
 }
 
 fn render_backend_parity_section(tracked: &TrackedCells) -> String {
-    let ptrace_is_selected_by_full = |candidate: &TrackedCell| {
-        tracked.cells.iter().any(|reference| {
-            reference.id.lane == candidate.id.lane
-                && reference.id.category == candidate.id.category
-                && reference.id.test == candidate.id.test
-                && reference.id.mode == candidate.id.mode
-                && reference.id.backend == "ptrace"
-                && reference.status == CellStatus::Green
+    let green_ptrace = tracked
+        .cells
+        .iter()
+        .filter(|cell| cell.id.backend == "ptrace" && cell.status == CellStatus::Green)
+        .map(|cell| {
+            (
+                &cell.id.lane,
+                &cell.id.category,
+                &cell.id.test,
+                &cell.id.mode,
+            )
         })
+        .collect::<BTreeSet<_>>();
+    let ptrace_is_selected_by_full = |candidate: &TrackedCell| {
+        green_ptrace.contains(&(
+            &candidate.id.lane,
+            &candidate.id.category,
+            &candidate.id.test,
+            &candidate.id.mode,
+        ))
     };
     let eligible = tracked
         .cells
@@ -8180,11 +8191,16 @@ fn measurement_transitions(
     after: &TrackedCells,
     head: &str,
 ) -> Result<Vec<String>, String> {
+    // The first cell with each id, as a linear `find` would return.
+    let mut by_id = BTreeMap::new();
+    for cell in &after.cells {
+        by_id.entry(&cell.id).or_insert(cell);
+    }
     before
         .cells
         .iter()
         .filter_map(|old| {
-            let new = after.cells.iter().find(|cell| cell.id == old.id)?;
+            let new = *by_id.get(&old.id)?;
             (old.measurement != new.measurement).then_some((old, new))
         })
         .map(|(old, new)| measurement_transition(root, old, new, head))
