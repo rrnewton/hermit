@@ -7772,6 +7772,61 @@ fn append_validate_parity(
     ))
 }
 
+/// Append this run's parity rows through [`append_validate_parity`], under
+/// the same gate as the scorecard ([`should_write_scorecard`]). Parity is
+/// measured after determinism and never decides the run: every outcome is one
+/// `validate: parity:` log line.
+///
+/// Both cleanup paths, the interrupted run's and the completed run's, call it
+/// after the run's ledger row is written and before the local scorecard
+/// writeback, which publishes the rows it spooled. It runs inside the cleanup
+/// critical section, where INT, TERM and HUP are ignored, and the append can
+/// wait up to its default bounds (a 60 s probe and a 300 s append). No stop
+/// signal can cut that wait short, so it must never run before the ledger
+/// row: the run's record would wait on parity, which decides nothing.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+#[allow(clippy::too_many_arguments)]
+fn append_run_parity<'a>(
+    root: &Path,
+    nested: bool,
+    off_the_record: bool,
+    release_builder: &str,
+    steps: impl IntoIterator<Item = &'a Step>,
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+    e2e_result_root: &Path,
+    cells: &validate_cell_results::CapturedResults,
+    tree: &str,
+) {
+    if !should_write_scorecard(nested, off_the_record, release_builder) {
+        return;
+    }
+    let expected = match validate_parity_expected_scope(root, steps, host_inapplicable) {
+        Ok(expected) => Some(expected),
+        Err(error) => {
+            eprintln!(
+                "validate: parity: expected scope unavailable, so a planned node that left \
+                 no parity status is not reported as record-missing: {error}"
+            );
+            None
+        }
+    };
+    let run_id = std::env::var("E2E_RUN_ID").ok();
+    if let Some(line) = append_validate_parity(
+        parent,
+        tool_root,
+        e2e_result_root,
+        cells,
+        expected.as_ref(),
+        run_id.as_deref(),
+        tree,
+        hermit_manifest_plan::parity::AppendBounds::default(),
+    ) {
+        eprintln!("validate: {line}");
+    }
+}
+
 /// Merge one top-level validate's completed per-cell rows into the tracked
 /// scorecard files. Nested and off-the-record validates leave the tracked view
 /// untouched; only a receipt-producing top-level run owns that projection.
@@ -25140,46 +25195,9 @@ fn run(
             }
         }
     };
-    // Parity is measured after determinism and appended beside it, under the
-    // same gate, and never decides this run: every outcome is one log line.
-    if should_write_scorecard(
-        nesting.nested,
-        args.allow_local_off_the_record_run,
-        release_builder,
-    ) {
-        let expected = match validate_parity_expected_scope(
-            &root,
-            execution_plan.cfg.steps.iter().chain(
-                execution_plan
-                    .second
-                    .iter()
-                    .flat_map(|second| second.steps.iter()),
-            ),
-            &plan.host_inapplicable,
-        ) {
-            Ok(expected) => Some(expected),
-            Err(error) => {
-                eprintln!(
-                    "validate: parity: expected scope unavailable, so a planned node that left \
-                     no parity status is not reported as record-missing: {error}"
-                );
-                None
-            }
-        };
-        let run_id = std::env::var("E2E_RUN_ID").ok();
-        if let Some(line) = append_validate_parity(
-            parent.as_deref(),
-            tool_root.as_deref(),
-            &e2e_result_root,
-            &raw_snapshot,
-            expected.as_ref(),
-            run_id.as_deref(),
-            &commit,
-            hermit_manifest_plan::parity::AppendBounds::default(),
-        ) {
-            eprintln!("validate: {line}");
-        }
-    }
+    // Parity is not appended here: each path below appends it after its
+    // ledger row (`append_run_parity`), because the append can wait minutes
+    // and nothing in this section may hold the run's record back for it.
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
     let (peak_active, peak_live) = match &monitor {
@@ -25393,6 +25411,26 @@ fn run(
         } else {
             None
         };
+        // Parity goes out after the ledger row, as in a completed run, and
+        // before the writeback that publishes what it spooled.
+        append_run_parity(
+            &root,
+            nesting.nested,
+            args.allow_local_off_the_record_run,
+            release_builder,
+            execution_plan.cfg.steps.iter().chain(
+                execution_plan
+                    .second
+                    .iter()
+                    .flat_map(|second| second.steps.iter()),
+            ),
+            &plan.host_inapplicable,
+            parent.as_deref(),
+            tool_root.as_deref(),
+            &e2e_result_root,
+            &raw_snapshot,
+            &commit,
+        );
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
@@ -25876,6 +25914,27 @@ fn run(
             }
         }
     }
+
+    // Parity goes out after the ledger row and the receipt, neither of which
+    // may wait on it, and before the writeback that publishes what it spooled.
+    append_run_parity(
+        &root,
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+        release_builder,
+        execution_plan.cfg.steps.iter().chain(
+            execution_plan
+                .second
+                .iter()
+                .flat_map(|second| second.steps.iter()),
+        ),
+        &plan.host_inapplicable,
+        parent.as_deref(),
+        tool_root.as_deref(),
+        &e2e_result_root,
+        &raw_snapshot,
+        &commit,
+    );
 
     // This must remain below the ledger append and receipt publication. Writing
     // the generated scorecard sooner changes the working tree while the run is
