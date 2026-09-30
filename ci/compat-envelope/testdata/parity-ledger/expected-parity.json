@@ -1,5 +1,5 @@
 {
-  "schema": "parity-summary/v1",
+  "schema": "parity-summary/v2",
   "generated_from": {
     "store_sha256": "cd19380683195a5ef899ee52d6718ba2f3909ed3a383a0716b0e32d3810c6cab",
     "series_commit": null,
@@ -15,6 +15,7 @@
       "conflicting_hermit_shas": [],
       "depth": null,
       "emitted_at": "2026-09-29T04:10:00Z",
+      "source_tree_dirty": false,
       "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; excluded: 0 no golden; 14 not compared) [inputs not equalized]",
       "committed_unknown": null,
       "committed_cells_without_row": [],
@@ -4527,12 +4528,15 @@
       "hermit_sha": "d3a0a4ae3d168565595ae4157b25ab8efbb1861a",
       "depth": null,
       "emitted_at": "2026-09-29T04:10:00Z",
+      "source_tree_dirty": false,
       "headline": true,
       "line": "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; excluded: 0 no golden; 14 not compared) [inputs not equalized]"
     }
   ],
   "refused_rows": 0,
   "duplicate_rows": 0,
+  "source_tree_dirty_rows": 0,
+  "source_tree_unreported_rows": 0,
   "refusals": [],
   "legacy_rerun": {
     "label": "legacy-rerun",
