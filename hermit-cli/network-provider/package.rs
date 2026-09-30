@@ -31,6 +31,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -151,6 +152,20 @@ fn step(
     stdout: Option<&Path>,
 ) -> Result<()> {
     let started = Instant::now();
+    ensure!(
+        work.is_absolute(),
+        "package step work directory must be absolute"
+    );
+    let metadata = fs::symlink_metadata(work).context("stat package step work directory")?;
+    ensure!(
+        metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() },
+        "package step work directory must be a real owned directory"
+    );
+    // Resolve the step's existing output directory, never ambient TMPDIR. The
+    // caller owns this newly created package build directory and its lifetime.
+    let scratch = work
+        .canonicalize()
+        .context("resolve package step work directory")?;
     let remaining = deadline
         .checked_duration_since(started)
         .context("120-second package deadline exceeded")?
@@ -174,6 +189,7 @@ fn step(
         .stdout(output)
         .stderr(error)
         .env_clear()
+        .env("TMPDIR", &scratch)
         .env("PATH", "/usr/bin:/bin")
         .env("LANG", "C")
         .env("LC_ALL", "C");
@@ -1670,5 +1686,210 @@ mod compiler_supervision_tests {
             [8192, MAX_INPUT as libc::rlim_t],
             [256 * 1024 * 1024, 512 * 1024 * 1024],
         );
+    }
+}
+
+#[cfg(test)]
+mod scratch_environment_tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn evidence() -> PathBuf {
+        let root = std::env::var_os("HERMIT_TEST_ACTION_RESULTS")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!(
+            "package-scratch-control-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    fn parent_environment() -> BTreeMap<OsString, OsString> {
+        std::env::vars_os().collect()
+    }
+
+    fn natural_cleanup(receipt: &Value) {
+        let owner = &receipt["supervision"];
+        assert_eq!(owner["pid"], receipt["pid"]);
+        assert_eq!(owner["raw_status"], receipt["returncode"]);
+        assert_eq!(receipt["signal"], Value::Null);
+        assert_eq!(owner["signal"], Value::Null);
+        assert_eq!(owner["timed_out"], false);
+        assert_eq!(owner["log_overflow"], false);
+        assert_eq!(owner["primary_error"], Value::Null);
+        assert_eq!(owner["terminal_bounds_error"], Value::Null);
+        assert_eq!(owner["terminal_observed_without_reap"], true);
+        assert_eq!(owner["natural_terminal_group"], true);
+        assert_eq!(owner["group_members_before_kill"], json!([receipt["pid"]]));
+        assert_eq!(owner["naturally_reaped_descendants"], json!([]));
+        assert_eq!(owner["cleanup_reaped_descendants"], json!([]));
+        assert_eq!(owner["owned_group_kill_before_reap"], true);
+        assert_eq!(owner["cleanup_attempted"], true);
+        assert_eq!(owner["cleanup_complete"], true);
+        assert_eq!(owner["cleanup_within_bound"], true);
+        assert_eq!(owner["unreaped_child_retained_until_receipt"], false);
+        assert_eq!(owner["cleanup_errors"], json!([]));
+        assert_eq!(owner["final_group_absent"], true);
+        assert_eq!(receipt["group_absent"], true);
+        // The original supervise() already consumed Child::wait(). This
+        // nonconsuming observation must now report that no such child exists.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    receipt["pid"].as_u64().unwrap() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn actual_step_owns_tmpdir() {
+        let work = evidence();
+        let before = parent_environment();
+        // Refuse BEFORE tempfile can fall back to /tmp. The expected directory
+        // is a literal argv value, independent of the child's environment.
+        // -I/-B prevent user startup hooks and Python bytecode cache writes.
+        let script = r#"
+import json, os, sys
+expected = sys.argv[1]
+actual = os.environ.get('TMPDIR')
+row = {'pid': os.getpid(), 'expected': expected, 'actual': actual,
+       'path': None, 'content': None}
+if actual != expected:
+    print(json.dumps(row), flush=True)
+    sys.exit(73)
+import tempfile
+fd, path = tempfile.mkstemp(prefix='provider-step-scratch-')
+with os.fdopen(fd, 'wb') as stream:
+    stream.write(b'provider scratch\n')
+with open(path, 'rb') as stream:
+    row.update(path=os.path.realpath(path), content=stream.read().decode('ascii'))
+print(json.dumps(row), flush=True)
+"#;
+        let result = step(
+            &work,
+            "scratch",
+            &[
+                "/usr/bin/python3".into(),
+                "-I".into(),
+                "-B".into(),
+                "-c".into(),
+                script.into(),
+                work.as_os_str().to_owned(),
+            ],
+            Instant::now() + Duration::from_secs(30),
+            None,
+        );
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(work.join("scratch.json")).unwrap()).unwrap();
+        let observed: Value =
+            serde_json::from_slice(&fs::read(work.join("scratch.stdout")).unwrap()).unwrap();
+        let unchanged = before == parent_environment();
+        let record = json!({"work":work,"observation":observed,"receipt":receipt,
+            "parent_tmpdir":before.get(&OsString::from("TMPDIR")).map(PathBuf::from),
+            "parent_environment_unchanged":unchanged,
+            "step_error":result.as_ref().err().map(|error| format!("{error:#}"))});
+        emit(&work.join("parent.json"), &record).unwrap();
+        println!("PACKAGE-SCRATCH-OBSERVATION {record}");
+        // These checks run after the unchanged authentic child cleanup, even
+        // on the old producer's exit73. That failure is never labelled a pass.
+        natural_cleanup(&receipt);
+        assert!(unchanged, "parent environment changed");
+        assert_eq!(observed["pid"], receipt["pid"]);
+        let matched = observed["actual"] == observed["expected"];
+        assert_eq!(receipt["returncode"], if matched { 0 } else { 73 });
+        assert_eq!(receipt["passed"], matched);
+        assert_eq!(result.is_ok(), matched);
+        assert_eq!(observed["expected"], json!(work));
+        assert_eq!(
+            observed["actual"],
+            json!(work),
+            "scratch ownership mismatch"
+        );
+        result.unwrap();
+        assert_eq!(receipt["returncode"], 0);
+        let path = PathBuf::from(observed["path"].as_str().unwrap());
+        assert_eq!(path.parent(), Some(work.as_path()));
+        assert_eq!(path.canonicalize().unwrap(), path);
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(observed["content"], "provider scratch\n");
+        assert_eq!(fs::read(&path).unwrap(), b"provider scratch\n");
+        assert!(fs::read(work.join("scratch.stderr")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn actual_step_does_not_forward_ambient_tmpdir() {
+        let work = evidence();
+        let ambient = work.join("adversarial-ambient");
+        fs::create_dir(&ambient).unwrap();
+        let before = parent_environment();
+        // Change only a fresh, genuinely supervised child's environment. The
+        // parallel libtest parent never calls set_var or remove_var. This uses
+        // the same step/OwnedChild lifecycle, not a separate launcher protocol.
+        let result = step(
+            &work,
+            "ambient",
+            &[
+                "/usr/bin/env".into(),
+                format!("TMPDIR={}", ambient.display()).into(),
+                format!("HERMIT_TEST_ACTION_RESULTS={}", work.display()).into(),
+                std::env::current_exe().unwrap().into_os_string(),
+                "--exact".into(),
+                "scratch_environment_tests::actual_step_owns_tmpdir".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ],
+            Instant::now() + Duration::from_secs(30),
+            None,
+        );
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(work.join("ambient.json")).unwrap()).unwrap();
+        let unchanged = before == parent_environment();
+        let empty = fs::read_dir(&ambient).unwrap().next().is_none();
+        emit(
+            &work.join("parent.json"),
+            &json!({"receipt":receipt,
+            "ambient":ambient,"ambient_empty":empty,"parent_environment_unchanged":unchanged,
+            "step_error":result.as_ref().err().map(|error| format!("{error:#}"))}),
+        )
+        .unwrap();
+        natural_cleanup(&receipt);
+        assert!(unchanged, "parent environment changed");
+        assert!(
+            empty,
+            "scratch escaped into the adversarial ambient directory"
+        );
+        result.unwrap();
+        assert_eq!(receipt["returncode"], 0);
+        assert_eq!(receipt["passed"], true);
+        let nested = fs::read_dir(&work)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.join("scratch.json").is_file())
+            .collect::<Vec<_>>();
+        assert_eq!(nested.len(), 1);
+        let child_record: Value =
+            serde_json::from_slice(&fs::read(nested[0].join("parent.json")).unwrap()).unwrap();
+        assert_eq!(child_record["parent_tmpdir"], json!(ambient));
+        assert_eq!(child_record["parent_environment_unchanged"], true);
+        assert_eq!(child_record["observation"]["actual"], json!(nested[0]));
+        assert_ne!(child_record["observation"]["actual"], json!(ambient));
     }
 }
