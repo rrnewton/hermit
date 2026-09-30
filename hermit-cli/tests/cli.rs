@@ -1586,7 +1586,18 @@ fn analyze_rejects_backend_in_its_run_arguments() {
             "hermit --backend=kvm analyze ...",
         ),
         (
-            &["analyze", "--", "--backend", "dbt", "/bin/true"][..],
+            &[
+                "analyze",
+                "--",
+                "--backend",
+                "kvm",
+                "/bin/true",
+                "--backend=x",
+            ][..],
+            "hermit --backend=kvm analyze ...",
+        ),
+        (
+            &["analyze", "--", "--backend", "--strict", "/bin/true"][..],
             "hermit --backend=<BACKEND> analyze ...",
         ),
     ] {

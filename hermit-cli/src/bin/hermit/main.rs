@@ -465,17 +465,17 @@ enum Subcommand {
 
 impl Subcommand {
     fn validate_backend_scope(&self, backend: Option<hermit::Backend>) -> Result<(), Error> {
-        // `analyze` and `bisect` launch ordinary `run` trials (chaos plus
-        // preemption recording and replay) on the selected backend. Until `run`
-        // lost its own `--backend`, `--backend=X` in their run arguments reached
-        // every backend this way; the global option is now the spelling for it,
-        // so they are in scope wherever `run` is.
-        let runs_guest = matches!(
-            self,
-            Subcommand::Run(_) | Subcommand::Analyze(_) | Subcommand::Bisect(_)
-        );
+        // `analyze` and `bisect` launch their trials through `RunOpts::run`,
+        // not `RunOpts::main`, so a trial gets none of `main`'s per-backend
+        // preparation: no e9patch rewrite, no LiteInst activation probe, no
+        // availability preflight. Only a backend whose trials are measured to
+        // run on it through that path is in scope for them: KVM (measured
+        // 2026-09-30: `hermit --backend=kvm analyze` ran its target trial on
+        // KVM). Before `run` lost its own `--backend`, this was spelled
+        // `analyze --run-arg=--backend=kvm`.
+        let runs_trials = matches!(self, Subcommand::Analyze(_) | Subcommand::Bisect(_));
         if backend == Some(hermit::Backend::Sabre)
-            && !(runs_guest || matches!(self, Subcommand::Strace(_)))
+            && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
         {
             // The predicate admits Strace AND Run, and `run` genuinely works --
             // measured 2026-08-06 on a 4-thread guest: `hermit --backend sabre run`
@@ -484,39 +484,42 @@ impl Subcommand {
             // and hid real backend maturity. Message and predicate are now derived
             // from the same list; if the predicate changes, this text must too.
             anyhow::bail!(
-                "the SaBRe backend is available only through `hermit --backend sabre run`, \
-                 `hermit --backend sabre analyze` and `hermit --backend sabre strace`"
+                "the SaBRe backend is available only through `hermit --backend sabre run` \
+                 and `hermit --backend sabre strace`"
             );
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-696): Review the expanded e9patch CLI scope.
-        let starts_e9patch_guest =
-            runs_guest || matches!(self, Subcommand::Record(record) if record.starts_recording());
+        let starts_e9patch_guest = matches!(self, Subcommand::Run(_))
+            || matches!(self, Subcommand::Record(record) if record.starts_recording());
         if backend == Some(hermit::Backend::E9patch) && !starts_e9patch_guest {
             anyhow::bail!(
                 "the e9patch preprocessor is available only through `hermit --backend e9patch \
-                 run`, `hermit --backend e9patch analyze` and `hermit --backend e9patch \
-                 record`; other subcommands do not preprocess their guest"
+                 run` and `hermit --backend e9patch record`; other subcommands, including \
+                 `analyze` and `bisect`, do not preprocess their guest"
             );
         }
-        if backend == Some(hermit::Backend::Liteinst) && !runs_guest {
+        if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
             anyhow::bail!(
                 "the LiteInst preload backend is available only through `hermit --backend \
-                 liteinst run` and `hermit --backend liteinst analyze`; other subcommands do \
-                 not use the preload runtime"
+                 liteinst run`; other subcommands, including `analyze` and `bisect`, do not \
+                 use the preload runtime"
             );
         }
-        if backend == Some(hermit::Backend::Kvm) && !runs_guest {
+        if backend == Some(hermit::Backend::Kvm)
+            && !(matches!(self, Subcommand::Run(_)) || runs_trials)
+        {
             anyhow::bail!(
-                "the KVM backend is available only through `hermit --backend kvm run` and \
-                 `hermit --backend kvm analyze`; record and replay require the ptrace \
-                 runtime's sequentialized scheduler"
+                "the KVM backend is available only through `hermit --backend kvm run`, \
+                 `hermit --backend kvm analyze` and `hermit --backend kvm bisect`; record and \
+                 replay require the ptrace runtime's sequentialized scheduler"
             );
         }
-        if backend == Some(hermit::Backend::Dbt) && !runs_guest {
+        if backend == Some(hermit::Backend::Dbt) && !matches!(self, Subcommand::Run(_)) {
             anyhow::bail!(
-                "the DBT backend is available only through `hermit --backend dbt run` and \
-                 `hermit --backend dbt analyze`; record and replay use the ptrace runtime"
+                "the DBT backend is available only through `hermit --backend dbt run`; record \
+                 and replay use the ptrace runtime, and `analyze` and `bisect` bind a \
+                 workspace into every trial, which DBT cannot apply"
             );
         }
         Ok(())
@@ -1563,12 +1566,22 @@ mod tests {
         assert!(matches!(args.command, Subcommand::Run(_)));
     }
 
-    /// `analyze` and `bisect` run ordinary `run` trials, and the global option is
-    /// the only way to pick their backend, so every backend `run` accepts is in
-    /// scope for them. A management subcommand stays out of scope.
+    /// `analyze` and `bisect` launch trials through `RunOpts::run`, which skips
+    /// `main`'s per-backend preparation, so only backends whose trials really run
+    /// on them through that path are in scope: ptrace and KVM. The rest must be
+    /// refused rather than silently run as ptrace (e9patch without its rewrite)
+    /// or fail on analyze's workspace bind (DBT). A management subcommand stays
+    /// out of scope for every non-default backend.
     #[test]
-    fn analyze_and_bisect_accept_every_run_backend() {
-        for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+    fn analyze_and_bisect_scope_is_limited_to_backends_whose_trials_run() {
+        for (backend, in_scope) in [
+            ("ptrace", true),
+            ("kvm", true),
+            ("dbt", false),
+            ("liteinst", false),
+            ("sabre", false),
+            ("e9patch", false),
+        ] {
             for argv in [
                 vec!["hermit", "--backend", backend, "analyze", "--", "/bin/true"],
                 vec![
@@ -1584,9 +1597,19 @@ mod tests {
             ] {
                 let args = Args::try_parse_from(&argv)
                     .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-                args.command
-                    .validate_backend_scope(args.global.backend)
-                    .unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
+                let scope = args.command.validate_backend_scope(args.global.backend);
+                if in_scope {
+                    scope.unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
+                } else {
+                    let error =
+                        scope.expect_err("a backend whose trials cannot run must be refused");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("hermit --backend {backend} run")),
+                        "{argv:?}: refusal does not name the working path: {error:#}"
+                    );
+                }
             }
             if backend != "ptrace" {
                 let args = Args::try_parse_from(["hermit", "--backend", backend, "record", "list"])
