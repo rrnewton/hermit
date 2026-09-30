@@ -4384,15 +4384,79 @@ fn failure_class(
 /// Apply a failed chaos population assertion without erasing an attempt-level
 /// infrastructure result. A timeout or unavailable verification report means
 /// the population was not fully measured; it is not a product failure merely
-/// because the incomplete sample also missed `min_passes`.
+/// because the incomplete sample also missed `min_passes`. A timed-out
+/// attempt's outcome is FAIL, not ERROR, so its cause arrives as `incomplete`
+/// ([`chaos_incomplete_reason`]) and leads the reason.
 fn apply_failed_chaos_assertion(
     outcome: &mut String,
     reason: &mut Option<String>,
+    incomplete: Option<&str>,
     assertion_reason: String,
 ) {
     if outcome != "ERROR" {
         *outcome = "FAIL".into();
-        *reason = Some(assertion_reason);
+        *reason = Some(match incomplete {
+            Some(incomplete) => format!("{incomplete}; {assertion_reason}"),
+            None => assertion_reason,
+        });
+    }
+}
+
+/// A chaos population's passes, failures and timed-out attempts. A timed-out
+/// attempt is neither a pass nor a failure, even when the guest exited 0 just
+/// as the cell's CPU budget ran out: counting it as a pass would claim a seed
+/// the budget refused, and counting a killed seed as a failure would satisfy
+/// `min_failures` with no product failure.
+fn chaos_population_counts(attempts: &[AttemptResult]) -> (u64, u64, u64) {
+    let timed_out = attempts.iter().filter(|attempt| attempt.timed_out).count() as u64;
+    let passes = attempts
+        .iter()
+        .filter(|attempt| attempt.status == Some(0) && !attempt.timed_out)
+        .count() as u64;
+    (
+        passes,
+        attempts.len() as u64 - passes - timed_out,
+        timed_out,
+    )
+}
+
+/// Why a chaos population is incomplete: the attempt that timed out, which
+/// stops the seed loop, and how many planned seeds never ran. An earlier
+/// seed's reason (a product failure before the budget ran out) follows it,
+/// naming that seed, so the timeout does not hide it.
+fn chaos_incomplete_reason(attempts: &[AttemptResult], planned_seeds: usize) -> Option<String> {
+    let timed_out = attempts.iter().find(|attempt| attempt.timed_out)?;
+    let incomplete = format!(
+        "{}: {} at {}; {} of {planned_seeds} seeds ran",
+        timed_out.error_kind.as_deref().unwrap_or("timeout"),
+        timed_out
+            .reason
+            .as_deref()
+            .unwrap_or("the attempt timed out"),
+        timed_out.index,
+        attempts.len(),
+    );
+    let earlier = attempts
+        .iter()
+        .take_while(|attempt| !attempt.timed_out)
+        .find_map(|attempt| Some((&attempt.index, attempt.reason.as_deref()?)));
+    Some(match earlier {
+        Some((index, reason)) => format!("{incomplete}; {index}: {reason}"),
+        None => incomplete,
+    })
+}
+
+/// A chaos cell's reason before its population floors are checked: a
+/// timeout's incomplete reason leads, unless an attempt-level ERROR already
+/// explains the cell.
+fn chaos_cell_reason(
+    outcome: &str,
+    reason: Option<String>,
+    incomplete: Option<&str>,
+) -> Option<String> {
+    match incomplete {
+        Some(incomplete) if outcome != "ERROR" => Some(incomplete.to_string()),
+        _ => reason,
     }
 }
 
@@ -4762,11 +4826,9 @@ fn run_cell_inner(
     }
     if cell.id.mode == "chaos" {
         let assert = mode.assert.as_ref().cloned().unwrap_or_default();
-        let pass_count = attempts
-            .iter()
-            .filter(|attempt| attempt.status == Some(0))
-            .count() as u64;
-        let failure_count = attempts.len() as u64 - pass_count;
+        let (pass_count, failure_count, timed_out_count) = chaos_population_counts(attempts);
+        let incomplete = chaos_incomplete_reason(attempts, mode.seeds.as_ref().map_or(0, Vec::len));
+        reason = chaos_cell_reason(&outcome, reason, incomplete.as_deref());
         let diversity = diversity_evidence(
             &hashes,
             mode.outcome_classes,
@@ -4803,8 +4865,9 @@ fn run_cell_inner(
             apply_failed_chaos_assertion(
                 &mut outcome,
                 &mut reason,
+                incomplete.as_deref(),
                 format!(
-                    "chaos distinct={distinct} passes={pass_count} failures={failure_count} normalized_entropy={normalized_entropy:.4}"
+                    "chaos distinct={distinct} passes={pass_count} failures={failure_count} timed_out={timed_out_count} normalized_entropy={normalized_entropy:.4}"
                 ),
             );
         }
@@ -12199,6 +12262,7 @@ cp "{}" "$verdict"
         apply_failed_chaos_assertion(
             &mut outcome,
             &mut reason,
+            Some("cpu-timeout: cell exceeded 46 CPU s at seed-31; 32 of 32 seeds ran"),
             "chaos distinct=8 passes=31 failures=1 normalized_entropy=0.9180".into(),
         );
         assert_eq!(outcome, "ERROR");
@@ -12212,12 +12276,133 @@ cp "{}" "$verdict"
         apply_failed_chaos_assertion(
             &mut outcome,
             &mut reason,
+            None,
             "chaos distinct=6 passes=32 failures=0 normalized_entropy=0.7000".into(),
         );
         assert_eq!(outcome, "FAIL");
         assert_eq!(
             reason.as_deref(),
             Some("chaos distinct=6 passes=32 failures=0 normalized_entropy=0.7000")
+        );
+    }
+
+    /// The shape of the fp-reduction chaos/ptrace red in the local validation
+    /// of 84da7b816939 (2026-09-29): seed 30 exited 0 as the cell's cumulative
+    /// 46 CPU s ran out, so it timed out, the loop stopped and seed 31 never
+    /// ran. The cell reason said only `chaos distinct=7 passes=31 failures=0`,
+    /// counting the timed-out seed as a pass and naming no timeout.
+    #[test]
+    fn a_chaos_timeout_leads_the_reason_and_is_not_counted_as_a_pass() {
+        let attempt = |index: &str, status: i32, timed_out: bool| {
+            let mut attempt = attempt_with_sabre_evidence("{}");
+            attempt.index = index.into();
+            attempt.status = Some(status);
+            attempt.timed_out = timed_out;
+            if timed_out {
+                attempt.outcome = "FAIL".into();
+                attempt.error_kind = Some("cpu-timeout".into());
+                attempt.reason = Some("cell exceeded 46 CPU s".into());
+            }
+            attempt
+        };
+        let attempts = [
+            attempt("seed-28", 0, false),
+            attempt("seed-29", 1, false),
+            attempt("seed-30", 0, true),
+        ];
+        assert_eq!(chaos_population_counts(&attempts), (1, 1, 1));
+        // A killed seed (no exit status) is not a failure either.
+        let mut killed = attempt("seed-30", 0, true);
+        killed.status = None;
+        assert_eq!(
+            chaos_population_counts(&[attempt("seed-28", 1, false), killed]),
+            (0, 1, 1)
+        );
+
+        let incomplete = chaos_incomplete_reason(&attempts, 32);
+        assert_eq!(
+            incomplete.as_deref(),
+            Some("cpu-timeout: cell exceeded 46 CPU s at seed-30; 3 of 32 seeds ran")
+        );
+        assert_eq!(chaos_incomplete_reason(&attempts[..2], 32), None);
+
+        let mut outcome = "FAIL".to_string();
+        let mut reason = incomplete.clone();
+        apply_failed_chaos_assertion(
+            &mut outcome,
+            &mut reason,
+            incomplete.as_deref(),
+            "chaos distinct=2 passes=1 failures=1 timed_out=1 normalized_entropy=1.0000".into(),
+        );
+        assert_eq!(outcome, "FAIL");
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "cpu-timeout: cell exceeded 46 CPU s at seed-30; 3 of 32 seeds ran; \
+                 chaos distinct=2 passes=1 failures=1 timed_out=1 normalized_entropy=1.0000"
+            )
+        );
+    }
+
+    /// A seed that failed for a product reason before the CPU budget ran out
+    /// keeps its reason in the cell reason, after the timeout's, whether or
+    /// not the population floors pass; an attempt-level ERROR keeps its own.
+    #[test]
+    fn a_chaos_timeout_keeps_an_earlier_seeds_failure_reason() {
+        let mut attempts = [
+            attempt_with_sabre_evidence("{}"),
+            attempt_with_sabre_evidence("{}"),
+            attempt_with_sabre_evidence("{}"),
+        ];
+        for (attempt, index) in attempts.iter_mut().zip(["seed-4", "seed-5", "seed-30"]) {
+            attempt.index = index.into();
+            attempt.status = Some(0);
+            attempt.reason = None;
+        }
+        attempts[1].outcome = "FAIL".into();
+        attempts[1].reason = Some("expected stdout mismatch".into());
+        attempts[2].outcome = "FAIL".into();
+        attempts[2].timed_out = true;
+        attempts[2].error_kind = Some("cpu-timeout".into());
+        attempts[2].reason = Some("cell exceeded 46 CPU s".into());
+        let expected = "cpu-timeout: cell exceeded 46 CPU s at seed-30; 3 of 32 seeds ran; \
+                        seed-5: expected stdout mismatch";
+        let incomplete = chaos_incomplete_reason(&attempts, 32);
+        assert_eq!(incomplete.as_deref(), Some(expected));
+
+        // Every floor passes: the cell reason is the timeout, then seed 5's.
+        let first_reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
+        assert_eq!(first_reason.as_deref(), Some("expected stdout mismatch"));
+        assert_eq!(
+            chaos_cell_reason("FAIL", first_reason.clone(), incomplete.as_deref()).as_deref(),
+            Some(expected)
+        );
+        // An attempt-level ERROR keeps its reason; no timeout keeps the first.
+        assert_eq!(
+            chaos_cell_reason("ERROR", first_reason.clone(), incomplete.as_deref()),
+            first_reason
+        );
+        assert_eq!(
+            chaos_cell_reason("FAIL", first_reason.clone(), None),
+            first_reason
+        );
+
+        // A floor fails too: the assertion follows both.
+        let mut outcome = "FAIL".to_string();
+        let mut reason = chaos_cell_reason("FAIL", first_reason, incomplete.as_deref());
+        apply_failed_chaos_assertion(
+            &mut outcome,
+            &mut reason,
+            incomplete.as_deref(),
+            "chaos distinct=1 passes=1 failures=1 timed_out=1 normalized_entropy=0.0000".into(),
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "cpu-timeout: cell exceeded 46 CPU s at seed-30; 3 of 32 seeds ran; \
+                 seed-5: expected stdout mismatch; \
+                 chaos distinct=1 passes=1 failures=1 timed_out=1 normalized_entropy=0.0000"
+            )
         );
     }
 
