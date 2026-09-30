@@ -70,6 +70,7 @@ global_asm!(
     .hidden hermit_liteinst_probe_getpid
     .type hermit_liteinst_probe_getpid,@function
 hermit_liteinst_probe_getpid:
+    .cfi_startproc
     mov eax, 39
     .global hermit_liteinst_probe_getpid_site
     .hidden hermit_liteinst_probe_getpid_site
@@ -79,6 +80,7 @@ hermit_liteinst_probe_getpid_site:
     nop
     nop
     ret
+    .cfi_endproc
     .size hermit_liteinst_probe_getpid, .-hermit_liteinst_probe_getpid
 "#
 );
