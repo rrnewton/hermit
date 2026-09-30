@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+use crate::types::MmId;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -380,6 +381,15 @@ pub(crate) struct ProcfsFile {
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
+    /// True for a `maps`/`smaps` file the guest spelled through `/proc/self`
+    /// or `/proc/thread-self`, which therefore shows the address space of the
+    /// task that opened it.
+    #[serde(default)]
+    shows_opener_address_space: bool,
+    /// The opener's address space, bound at open time when
+    /// `shows_opener_address_space` holds. See `mapping_address_space`.
+    #[serde(default)]
+    mapping_address_space: Option<MmId>,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -626,8 +636,9 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64, u64)>,
-    /// Raw `(device, inode)` -> determinized `(device, inode)` for every backed
-    /// mapping in a `maps`/`smaps` snapshot.
+    /// Raw mapping header (`MappingKey`: device, inode and pathname columns) ->
+    /// determinized `(device, inode)` for every backed mapping in a
+    /// `maps`/`smaps` snapshot.
     ///
     /// ⚠️ BUILT BY THE CALLER, NEVER HERE. The sanitizers in this module are
     /// pure functions of content and have no guest handle, so they cannot reach
@@ -637,7 +648,23 @@ pub(crate) struct ProcfsSnapshotContext {
     /// `determinize_inode`/`determinize_device` that `determinize_stat` uses,
     /// exactly as `fdinfo_identity` above is built, and this table is only a
     /// lookup for rendering.
-    pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
+    ///
+    /// ⚠️ THE MAPS DEVICE IS NOT ALWAYS `st_dev`. On btrfs, maps prints the
+    /// superblock's device (`0:32` for `/` on the machine this was measured on)
+    /// while `stat` prints the subvolume's anonymous device (`0:33`, and `0:50`
+    /// for `/var/tmp` on the same filesystem); overlayfs prints the lower
+    /// file's device in maps and its own in `stat`. The inode pool is keyed on
+    /// device AND inode (<https://github.com/rrnewton/hermit/issues/3307>), so
+    /// determinizing the maps pair as-is gives the maps inode column a
+    /// different value from `st_ino` for the same file, where Linux prints the
+    /// same number in both. The caller therefore determinizes the inode from
+    /// the raw identity `stat` reports for the mapped file (see
+    /// `mapping_stat_identity` in `syscalls/files.rs`, and the limits it
+    /// documents), and only the DEVICE column from the maps device -- which
+    /// disagrees with `st_dev` on native Linux too. The pathname is part of
+    /// the key because two btrfs subvolumes number their inodes independently,
+    /// so one maps `(device, inode)` pair can name two different files.
+    pub(crate) mapping_identities: MappingIdentities,
     pub(crate) mountinfo: Option<MountInfoSnapshot>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
@@ -823,11 +850,18 @@ impl ProcfsFile {
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
+        let shows_opener_address_space = matches!(kind, ProcfsKind::Maps | ProcfsKind::Smaps)
+            && path_text
+                .strip_prefix("/proc/")
+                .and_then(|relative| relative.split('/').next())
+                .is_some_and(|task| matches!(task, "self" | "thread-self"));
         Some(Self {
             kind,
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
+            shows_opener_address_space,
+            mapping_address_space: None,
             contents: None,
             offset: 0,
         })
@@ -838,6 +872,32 @@ impl ProcfsFile {
     /// device and inode columns must be determinized by the caller.
     pub(crate) fn needs_mapping_identities(&self) -> bool {
         matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
+    }
+
+    /// Records the address space of the task opening this file. Only a
+    /// `maps`/`smaps` file spelled through `/proc/self` or `/proc/thread-self`
+    /// keeps it; any other spelling, including the opener's own numeric
+    /// `/proc/<pid>`, is left unbound.
+    pub(crate) fn bind_mapping_address_space(&mut self, mm: MmId) {
+        if self.shows_opener_address_space {
+            self.mapping_address_space = Some(mm);
+        }
+    }
+
+    /// The address space this `maps`/`smaps` file is known to show, if any.
+    ///
+    /// A mapping's recorded file (`MemoryMetadata::mapped_file_at`) belongs to
+    /// ONE address space, and the reader's record describes the snapshot only
+    /// when this is the reader's address space. It is not in general: the
+    /// kind matches `/proc/<any pid>/maps`, a descriptor opened through
+    /// `/proc/self` still shows the opener after a `fork` hands it to the
+    /// child, and an `execve` replaces the opener's address space. Without
+    /// this check another file with the same inode number at the same address
+    /// in the reader -- for example a file of another btrfs subvolume, whose
+    /// inode numbers repeat, in a guest without address randomization --
+    /// would key the line on the wrong file.
+    pub(crate) fn mapping_address_space(&self) -> Option<MmId> {
+        self.mapping_address_space
     }
 
     pub(crate) fn needs_mountinfo_identities(&self) -> bool {
@@ -2978,7 +3038,7 @@ fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-949): Review the /proc/self/smaps accounting field policy.
-fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+fn sanitize_smaps(contents: &[u8], table: &MappingIdentities) -> Vec<u8> {
     const ACCOUNTING_FIELDS: &[&str] = &[
         "Rss",
         "Pss",
@@ -3078,11 +3138,100 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
     Some((libc::makedev(major, minor), inode))
 }
 
+/// One backed mapping as its `maps`/`smaps` header names it: the raw device
+/// and inode columns and the pathname column, byte for byte.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MappingKey {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) pathname: String,
+}
+
+/// Mapping header -> determinized `(device, inode)`; see
+/// `ProcfsSnapshotContext::mapping_identities`.
+pub(crate) type MappingIdentities = BTreeMap<MappingKey, (u64, u64)>;
+
+/// Parse the device, inode and pathname of a backed mapping header.
+///
+/// The pathname is everything after the padding that follows the inode, and
+/// may itself contain spaces. It is empty for a backed mapping the kernel
+/// prints without a name.
+pub(crate) fn mapping_header_key(line: &str) -> Option<MappingKey> {
+    let (device, inode) = mapping_header_identity(line)?;
+    let mut rest = line;
+    for _ in 0..5 {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    Some(MappingKey {
+        device,
+        inode,
+        pathname: rest.trim_start().to_string(),
+    })
+}
+
+/// Every distinct backed mapping header in a `maps`/`smaps` snapshot, with the
+/// start address of each line that carries it, in line order.
+///
+/// Splits on `\n` exactly as `sanitize_maps`/`sanitize_smaps` do, so each key
+/// is the one `rewrite_mapping_header` will look up for the same line. A line
+/// whose address range does not parse still contributes its key, without a
+/// start address.
+pub(crate) fn mapping_keys(contents: &[u8]) -> BTreeMap<MappingKey, Vec<usize>> {
+    let mut keys: BTreeMap<MappingKey, Vec<usize>> = BTreeMap::new();
+    let Ok(text) = std::str::from_utf8(contents) else {
+        // The sanitizers pass non-UTF-8 content through unchanged, so no key
+        // built from it would ever be looked up.
+        return keys;
+    };
+    for line in text.split('\n') {
+        let Some(key) = mapping_header_key(line) else {
+            continue;
+        };
+        let start = line
+            .split_whitespace()
+            .next()
+            .and_then(|range| range.split_once('-'))
+            .and_then(|(start, _)| usize::from_str_radix(start, 16).ok());
+        let starts = keys.entry(key).or_default();
+        starts.extend(start);
+    }
+    keys
+}
+
+/// Paths under which the guest can `stat` the file a mapping names, most
+/// likely first. Empty when the pathname cannot name it.
+///
+/// The kernel prints the path relative to the READER's root (`d_path`), with
+/// `\n` escaped as `\012` and ` (deleted)` appended once the file is unlinked.
+/// A deleted file has no path left, and a name that does not start with `/`
+/// (`[heap]`, `[vdso]`, an anonymous `[anon:...]` name) is not a path. The
+/// escape is ambiguous against a file whose name really contains the four
+/// characters `\012`, so both spellings are offered.
+///
+/// A candidate only ever PROPOSES an identity. The caller accepts it only if
+/// the inode `stat` returns is the inode this mapping reports, so a path that
+/// names some other file (renamed in between, or a literal ` (deleted)` name)
+/// is not used to borrow another file's identity. A file with no candidate is
+/// found, if at all, by where the guest mapped it (`mapping_stat_identity`).
+pub(crate) fn mapping_path_candidates(pathname: &str) -> Vec<String> {
+    if !pathname.starts_with('/') || pathname.ends_with(" (deleted)") {
+        return Vec::new();
+    }
+    let unescaped = pathname.replace("\\012", "\n");
+    if unescaped == pathname {
+        vec![unescaped]
+    } else {
+        vec![unescaped, pathname.to_string()]
+    }
+}
+
 /// Rewrite the device and inode of one mapping header from the caller-supplied
 /// table, preserving every other byte of the line and the COLUMN its pathname
 /// starts in.
 ///
-/// A raw pair absent from the table is left ALONE rather than guessed at: the
+/// A header absent from the table is left ALONE rather than guessed at: the
 /// table is built from this same snapshot, so a miss means the pair was not
 /// determinizable (an anonymous mapping), and inventing a value here is the
 /// precise failure this design exists to avoid.
@@ -3106,8 +3255,8 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
 ///
 /// Padding to the column the RAW line used keeps this in step with the kernel
 /// rather than hard-coding 73, and that column does not depend on the inode.
-fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) -> String {
-    let Some(raw) = mapping_header_identity(line) else {
+fn rewrite_mapping_header(line: &str, table: &MappingIdentities) -> String {
+    let Some(raw) = mapping_header_key(line) else {
         return line.to_string();
     };
     let Some((det_dev, det_inode)) = table.get(&raw).copied() else {
@@ -3172,7 +3321,7 @@ fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) 
 }
 
 /// `/proc/*/maps`: rewrite only the device and inode columns.
-fn sanitize_maps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+fn sanitize_maps(contents: &[u8], table: &MappingIdentities) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -4326,7 +4475,7 @@ mod tests {
         let raw =
             b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n" as &[u8];
         let table = BTreeMap::from([(
-            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
             (libc::makedev(0x00, 0x2a), 99u64),
         )]);
         let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
@@ -4371,7 +4520,7 @@ mod tests {
         };
         let table = |inode: u64| {
             BTreeMap::from([(
-                (libc::makedev(0x00, 0x06), inode),
+                mapping_key(libc::makedev(0x00, 0x06), inode, NAME),
                 (libc::makedev(0x00, 0x06), 8u64),
             )])
         };
@@ -4436,7 +4585,7 @@ mod tests {
 Size:                  4 kB\n\
 Rss:                   4 kB\n" as &[u8];
         let table = BTreeMap::from([(
-            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
             (libc::makedev(0x00, 0x2a), 99u64),
         )]);
         let out = String::from_utf8(sanitize_smaps(raw, &table)).unwrap();
@@ -4445,6 +4594,168 @@ Rss:                   4 kB\n" as &[u8];
             !out.contains("1234567"),
             "raw inode must not survive smaps: {out}"
         );
+    }
+
+    fn mapping_key(device: u64, inode: u64, pathname: &str) -> MappingKey {
+        MappingKey {
+            device,
+            inode,
+            pathname: pathname.to_string(),
+        }
+    }
+
+    /// The key carries the pathname column verbatim: spaces inside it, the
+    /// ` (deleted)` suffix, and nothing of the padding in front of it.
+    #[test]
+    fn mapping_header_key_reads_the_pathname_column() {
+        let line = "7f0000000000-7f0000001000 r--p 00000000 00:20 4242                       /opt/my lib/libx.so (deleted)";
+        assert_eq!(
+            mapping_header_key(line),
+            Some(mapping_key(
+                libc::makedev(0x00, 0x20),
+                4242,
+                "/opt/my lib/libx.so (deleted)"
+            ))
+        );
+        let unnamed = "7f0000000000-7f0000001000 r--p 00000000 00:20 4242";
+        assert_eq!(
+            mapping_header_key(unnamed),
+            Some(mapping_key(libc::makedev(0x00, 0x20), 4242, ""))
+        );
+        assert_eq!(
+            mapping_header_key("7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]"),
+            None
+        );
+    }
+
+    /// ⚠️ ONE MAPS `(device, inode)` PAIR CAN NAME TWO FILES. btrfs numbers
+    /// inodes per subvolume but prints the superblock's device in maps, so two
+    /// subvolumes' files can share the pair while `stat` gives them different
+    /// devices. Each must keep the identity the caller resolved for its own
+    /// pathname rather than whichever one the table happened to hold.
+    #[test]
+    fn maps_keeps_two_files_that_share_a_maps_device_and_inode_apart() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 00:20 257 /usr/lib/a.so\n\
+7f0000002000-7f0000003000 r-xp 00000000 00:20 257 /home/u/b.so\n" as &[u8];
+        let keys = mapping_keys(raw);
+        assert_eq!(keys.len(), 2, "both headers keyed separately: {keys:?}");
+        let table = BTreeMap::from([
+            (
+                mapping_key(libc::makedev(0x00, 0x20), 257, "/usr/lib/a.so"),
+                (libc::makedev(0x00, 0x2a), 11u64),
+            ),
+            (
+                mapping_key(libc::makedev(0x00, 0x20), 257, "/home/u/b.so"),
+                (libc::makedev(0x00, 0x2a), 12u64),
+            ),
+        ]);
+        let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
+        let inodes: Vec<_> = out
+            .lines()
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(inodes, ["11", "12"], "{out}");
+    }
+
+    /// The keys the caller builds must be exactly the keys the sanitizers look
+    /// up, smaps accounting lines and the trailing newline included.
+    #[test]
+    fn mapping_keys_are_the_keys_the_sanitizers_look_up() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n\
+Size:                  4 kB\n\
+VmFlags: rd ex mr mw me\n\
+7f0000001000-7f0000002000 rw-p 00000000 00:00 0 \n" as &[u8];
+        let keys = mapping_keys(raw);
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            [(
+                mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
+                vec![0x7f00_0000_0000]
+            )]
+        );
+        assert!(mapping_keys(b"\xff\xfe not utf-8 08:02 1 /x\n").is_empty());
+    }
+
+    /// Each key carries the start address of every line with that header, so
+    /// the caller can look the file up by where it is mapped; a deleted file's
+    /// lines keep their own key.
+    #[test]
+    fn mapping_keys_carry_the_start_of_every_line() {
+        let raw = b"7f0000000000-7f0000001000 r--p 00000000 00:20 257 /d/x\n\
+7f0000001000-7f0000002000 r-xp 00001000 00:20 257 /d/x\n\
+7f0000005000-7f0000006000 r--p 00000000 00:20 258 /d/y (deleted)\n\
+not-a-range r--p 00000000 00:20 259 /d/z\n" as &[u8];
+        let keys = mapping_keys(raw);
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            [
+                (
+                    mapping_key(libc::makedev(0x00, 0x20), 257, "/d/x"),
+                    vec![0x7f00_0000_0000, 0x7f00_0000_1000]
+                ),
+                (
+                    mapping_key(libc::makedev(0x00, 0x20), 258, "/d/y (deleted)"),
+                    vec![0x7f00_0000_5000]
+                ),
+                (mapping_key(libc::makedev(0x00, 0x20), 259, "/d/z"), vec![]),
+            ]
+        );
+    }
+
+    /// Only a live absolute path is offered for resolution; the `\n` escape is
+    /// offered in both spellings because a name can contain a literal `\012`.
+    #[test]
+    fn mapping_path_candidates_offer_only_live_paths() {
+        assert_eq!(
+            mapping_path_candidates("/usr/lib/libc.so.6"),
+            ["/usr/lib/libc.so.6"]
+        );
+        assert!(mapping_path_candidates("/tmp/x (deleted)").is_empty());
+        assert!(mapping_path_candidates("/memfd:liteinst2-trampoline (deleted)").is_empty());
+        assert!(mapping_path_candidates("[heap]").is_empty());
+        assert!(mapping_path_candidates("[anon:glibc]").is_empty());
+        assert!(mapping_path_candidates("").is_empty());
+        assert_eq!(
+            mapping_path_candidates("/tmp/a\\012b"),
+            ["/tmp/a\nb", "/tmp/a\\012b"]
+        );
+    }
+
+    /// A maps file spelled through `/proc/self` or `/proc/thread-self` shows
+    /// its opener's address space and keeps the one bound at open time; every
+    /// other spelling stays unbound, so the reader's mapping records are never
+    /// consulted for it (see `mapping_address_space`).
+    #[test]
+    fn only_self_spelled_maps_bind_the_openers_address_space() {
+        let opener = MmId::initial(crate::types::DetTid::from_raw(7));
+        for path in [
+            "/proc/self/maps",
+            "/proc/thread-self/maps",
+            "/proc/self/task/8/maps",
+            "/proc/self/smaps",
+            "/proc/./self/maps",
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert!(file.needs_mapping_identities(), "{path}");
+            assert_eq!(file.mapping_address_space(), None, "{path}");
+            file.bind_mapping_address_space(opener);
+            assert_eq!(file.mapping_address_space(), Some(opener), "{path}");
+        }
+        for path in ["/proc/7/maps", "/proc/7/task/8/maps", "/proc/7/smaps"] {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert!(file.needs_mapping_identities(), "{path}");
+            file.bind_mapping_address_space(opener);
+            assert_eq!(file.mapping_address_space(), None, "{path}");
+        }
+        for path in [
+            "/proc/self/stat",
+            "/proc/self/smaps_rollup",
+            "/proc/self/numa_maps",
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            file.bind_mapping_address_space(opener);
+            assert_eq!(file.mapping_address_space(), None, "{path}");
+        }
     }
 
     #[test]

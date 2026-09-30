@@ -329,7 +329,24 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands)
     // retain all 843 prior identities (`cargo nextest list --profile ci`
     // measured 845; https://github.com/rrnewton/hermit/issues/3360).
-    ("test.detcore_unit", 845),
+    // Fourteen device-and-inode identity tests
+    // (https://github.com/rrnewton/hermit/issues/3307) retain all 845 prior
+    // identities (`cargo nextest list --profile ci` measured 859):
+    // tool_global::tests::det_inodes_do_not_depend_on_raw_inode_coincidences;
+    // syscalls::namespace::tests::stdio_identity_requires_the_same_device,
+    // anonymous_object_devices_match_fresh_objects,
+    // link_stat_must_describe_the_object_the_target_names and
+    // a_failed_device_probe_keys_an_unconfirmed_link_on_device_zero;
+    // procfs::tests::mapping_header_key_reads_the_pathname_column,
+    // maps_keeps_two_files_that_share_a_maps_device_and_inode_apart,
+    // mapping_keys_are_the_keys_the_sanitizers_look_up,
+    // mapping_keys_carry_the_start_of_every_line,
+    // mapping_path_candidates_offer_only_live_paths and
+    // only_self_spelled_maps_bind_the_openers_address_space; and memory::tests::
+    // file_mappings_name_their_file_until_unmapped,
+    // file_mappings_follow_mremap_and_survive_fork and
+    // a_shared_file_mapping_keeps_its_file_record.
+    ("test.detcore_unit", 859),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -379,7 +396,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 845),
+    ("test.detcore_unit_on_host", 859),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),

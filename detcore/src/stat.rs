@@ -80,6 +80,17 @@ pub struct DetStat {
     pub mtime: Timespec,
 }
 
+impl DetStat {
+    /// The raw (host) identity of the file this stat describes: its device and
+    /// inode together, as the key the deterministic inode pool requires.
+    ///
+    /// Only meaningful for a stat taken from the kernel, before
+    /// `determinize_stat` overwrites `dev` and `inode`.
+    pub fn raw_file_id(&self) -> crate::types::RawFileId {
+        crate::types::RawFileId::new(self.dev, self.inode)
+    }
+}
+
 impl Default for DetStat {
     fn default() -> Self {
         let statx: libc::statx = unsafe { std::mem::zeroed() };
