@@ -5232,6 +5232,218 @@ fn log_file_under_tmp_lands_on_the_host() {
     assert_eq!(output.stderr, b"guest-stderr-control\n");
 }
 
+/// One `hermit --log=<level> --log-file=<log> run` of `/bin/true` at a pinned
+/// epoch, for the log-diff tests below.
+fn log_true_run(log: &Path, level: &str, epoch: &str) {
+    let log_arg = format!("--log-file={}", log.display());
+    let level_arg = format!("--log={level}");
+    let epoch_arg = format!("--epoch={epoch}");
+    let args = [
+        level_arg.as_str(),
+        log_arg.as_str(),
+        "run",
+        "--base-env=minimal",
+        "--max-timeslice=disabled",
+        epoch_arg.as_str(),
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit_command(&args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    assert_success(&output, &args);
+}
+
+fn log_diff(args: &[&str]) -> Output {
+    hermit_command(&[&["log-diff"], args].concat())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit log-diff")
+}
+
+/// The log files of two separate runs are comparable
+/// (<https://github.com/rrnewton/hermit/issues/3410>). The virtual-time epoch
+/// notice is the first thing a run writes to `--log-file`; as a bare line it
+/// made `hermit log-diff` refuse every such pair at "log line 0 has no
+/// ERROR/WARN/INFO/DEBUG/TRACE tag". It is now a DEBUG record: the file
+/// parses, and both the default DETLOG/COMMIT comparison and the canonical INFO
+/// comparison accept two runs at one epoch. (It is deliberately outside both
+/// selections; see `log_diff_does_not_count_the_epoch_notice_as_evidence`.)
+#[test]
+fn log_diff_compares_the_log_files_of_two_separate_runs() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = "2026-01-01T00:00:00.123456789+00:00";
+    let logs = [
+        directory.path().join("a.log"),
+        directory.path().join("b.log"),
+    ];
+    let notice = format!(
+        " DEBUG hermit::controller: hermit: virtual-time epoch={epoch} source=explicit; \
+         reproduce with --epoch={epoch}\n"
+    );
+    let first_record = regex::Regex::new(&format!(
+        r"^\d{{4}}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z{}",
+        regex::escape(&notice)
+    ))
+    .unwrap();
+    for log in &logs {
+        log_true_run(log, "info", epoch);
+        let contents = std::fs::read_to_string(log).unwrap();
+        assert!(first_record.is_match(&contents), "{contents}");
+    }
+    let (a, b) = (logs[0].to_str().unwrap(), logs[1].to_str().unwrap());
+    for options in [&[][..], &["--canonical-info"][..]] {
+        let output = log_diff(&[options, &[a, b]].concat());
+        let stderr = stderr(&output);
+        assert_eq!(output.status.code(), Some(0), "{options:?}: {stderr}");
+        assert!(!stderr.contains("has no ERROR/WARN/INFO"), "{stderr}");
+        assert!(!stderr.contains("no comparable"), "{stderr}");
+    }
+}
+
+/// The epoch notice is harness context, not guest or Detcore evidence, so it
+/// must never make a comparison non-vacuous. At the default log level a run's
+/// `--log-file` holds nothing but the notice; two such logs must still be
+/// refused as having no comparable messages in every mode, as they were before
+/// the notice was a parseable record
+/// (review of <https://github.com/rrnewton/hermit/pull/3427>).
+#[test]
+fn log_diff_does_not_count_the_epoch_notice_as_evidence() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let logs = [
+        directory.path().join("a.log"),
+        directory.path().join("b.log"),
+    ];
+    for log in &logs {
+        let log_arg = format!("--log-file={}", log.display());
+        let args = [
+            log_arg.as_str(),
+            "run",
+            "--base-env=minimal",
+            // Without CPUID faulting Reverie logs one ERROR record per exec;
+            // not asking for CPUID interception keeps the notice the only
+            // record on every host.
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            "/bin/true",
+        ];
+        let output = hermit_command(&args)
+            .env_remove("HERMIT_LOG")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        assert_success(&output, &args);
+        let contents = std::fs::read_to_string(log).unwrap();
+        // The premise: the notice is the log's only record.
+        assert_eq!(contents.lines().count(), 1, "{contents}");
+        assert!(contents.contains("hermit::controller: hermit: virtual-time epoch="));
+    }
+    let (a, b) = (logs[0].to_str().unwrap(), logs[1].to_str().unwrap());
+    let report = directory.path().join("report.json");
+    let report_arg = report.to_str().unwrap();
+    for options in [
+        &[a, b][..],
+        &["--canonical-info", a, b][..],
+        &["--json", report_arg, a, b][..],
+        &[a][..],
+    ] {
+        let output = log_diff(options);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{options:?} must refuse two logs without evidence: {}{}",
+            stdout(&output),
+            stderr(&output)
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(json["verdict"], "no_comparable_messages", "{json}");
+}
+
+/// Relaxed comparisons of two processes' logs canonicalize marked host
+/// addresses when asked (<https://github.com/rrnewton/hermit/issues/3412>).
+/// `--canonical-info` and `--json` always did; the options hermit-verify uses
+/// (`--include-detlogs=...`) could not, so ASLR-varying launcher pointers such
+/// as `syscall.intercept{... syscall=execve args=... <hostaddr 0x...>}` made
+/// every trace-level comparison diverge.
+///
+/// The second log is the first with every marked address shifted by the same
+/// amount -- an ASLR move with identical structure -- so the premise does not
+/// depend on the host's ASLR. Without the flag it diverges (the addresses are
+/// compared raw); with it the logs agree; and breaking one aliasing relation
+/// still diverges under the flag, because identity is kept.
+#[test]
+fn relaxed_log_diff_canonicalizes_marked_host_addresses_on_request() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let original = directory.path().join("original.log");
+    log_true_run(&original, "trace", "2026-01-01T00:00:00Z");
+    let contents = std::fs::read_to_string(&original).unwrap();
+    let marker = regex::Regex::new(r"<hostaddr 0x([0-9a-f]+)>").unwrap();
+    let marked: std::collections::BTreeSet<&str> = marker
+        .captures_iter(&contents)
+        .map(|capture| capture.get(1).unwrap().as_str())
+        .collect();
+    assert!(
+        marked.len() >= 2,
+        "a trace-level run should mark several launcher pointers: {marked:?}"
+    );
+
+    let shifted = marker.replace_all(&contents, |capture: &regex::Captures<'_>| {
+        let value = u64::from_str_radix(&capture[1], 16).unwrap();
+        format!("<hostaddr {:#x}>", value + 0x10_0000)
+    });
+    let moved = directory.path().join("moved.log");
+    std::fs::write(&moved, shifted.as_bytes()).unwrap();
+
+    // In the first compared (DETLOG) record that carries a marked address,
+    // give that ONE occurrence a value of its own, breaking its aliasing with
+    // every other use of the same address.
+    let line = contents
+        .lines()
+        .find(|line| line.contains("DETLOG") && marker.is_match(line))
+        .expect("a DETLOG record carries a marked launcher pointer");
+    let dealiased = contents.replacen(line, &marker.replace(line, "<hostaddr 0x1>"), 1);
+    assert_ne!(dealiased, contents);
+    let broken = directory.path().join("dealiased.log");
+    std::fs::write(&broken, dealiased.as_bytes()).unwrap();
+
+    // The DETLOG selection hermit-verify's run comparison passes.
+    let relaxed = [
+        "--include-detlogs=other",
+        "--include-detlogs=syscallresult",
+        "--include-detlogs=syscall",
+        "--syscall-history=5",
+    ];
+    let (original, moved, broken) = (
+        original.to_str().unwrap(),
+        moved.to_str().unwrap(),
+        broken.to_str().unwrap(),
+    );
+    let raw = log_diff(&[&relaxed[..], &[original, moved]].concat());
+    // EXIT-CLASS: hermit (log-diff reports a divergence)
+    assert_eq!(raw.status.code(), Some(1), "raw: {}", stderr(&raw));
+    let flag = "--canonicalize-host-addresses";
+    let canonical = log_diff(&[&relaxed[..], &[flag, original, moved]].concat());
+    assert_eq!(
+        canonical.status.code(),
+        Some(0),
+        "canonical: {}{}",
+        stdout(&canonical),
+        stderr(&canonical)
+    );
+    let dealiased = log_diff(&[&relaxed[..], &[flag, original, broken]].concat());
+    // EXIT-CLASS: hermit (log-diff reports a divergence)
+    assert_eq!(dealiased.status.code(), Some(1), "{}", stderr(&dealiased));
+}
+
 /// A log destination that cannot be opened must say so and fail, never exit 0
 /// having written nothing. This half needs no policy ruling: silent success is
 /// never the right answer to "write my diagnostics here".

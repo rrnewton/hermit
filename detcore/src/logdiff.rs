@@ -166,7 +166,13 @@ pub struct LogDiffOpts {
     /// content digests, cpuid leaves. A blanket `0x` canonicalization would
     /// collapse those too, silently erasing real syscall-argument divergence:
     /// a "softer strip" and exactly the fake-green this policy exists to prevent.
-    #[clap(skip)]
+    ///
+    /// `--canonical-info` and `--json` always apply it. This flag applies it
+    /// to the other comparisons too (DETLOG/COMMIT subsets, `--ignore-lines`),
+    /// which is what separate-process comparisons such as hermit-verify need:
+    /// ASLR moves the marked launcher pointers between the two processes
+    /// (<https://github.com/rrnewton/hermit/issues/3412>).
+    #[clap(long = "canonicalize-host-addresses")]
     pub canonicalize_addresses: bool,
 
     /// The internal message set to compare.

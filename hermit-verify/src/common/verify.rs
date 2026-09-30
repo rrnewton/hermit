@@ -79,6 +79,24 @@ impl<P: AsRef<OsStr>> Verify<P> {
         Self { hermit_bin }
     }
 
+    /// Whether the child hermit's `log-diff` offers
+    /// `--canonicalize-host-addresses`. `hermit_bin` comes from `HERMIT_BIN` or
+    /// the PATH, so it can be a published bundle that predates the flag, where
+    /// passing it is `error: unexpected argument` (see
+    /// `log_diff_command_does_not_pin_a_record_envelope_the_child_may_lack`).
+    fn child_offers_host_address_canonicalization(&self) -> bool {
+        std::process::Command::new(&self.hermit_bin)
+            .args(["log-diff", "--help"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("--canonicalize-host-addresses")
+            })
+    }
+
     fn verify_lines<S1: AsRef<str>, S2: AsRef<str>>(left: S1, right: S2) -> anyhow::Result<bool> {
         let result = similar::TextDiff::configure()
             .algorithm(similar::Algorithm::Myers)
@@ -176,15 +194,27 @@ impl<P: AsRef<OsStr>> Verify<P> {
         Ok(true)
     }
 
+    /// The `log-diff` argument vector. `canonicalize_host_addresses` says
+    /// whether the child hermit offers `--canonicalize-host-addresses`.
+    ///
+    /// The two logs come from two hermit processes, so ASLR moves every marked
+    /// launcher pointer (`<hostaddr 0x...>`) between them; compared by raw
+    /// value they always differ. The flag compares them by per-run ordinal
+    /// instead, keeping identity, order and aliasing
+    /// (<https://github.com/rrnewton/hermit/issues/3412>).
     fn build_command_args(
         &self,
         left: &RunEnvironment,
         right: &RunEnvironment,
         options: LogDiffOptions,
+        canonicalize_host_addresses: bool,
     ) -> Vec<String> {
         let mut result = vec![];
         result.push(String::from("log-diff"));
         result.append(&mut options.into_args());
+        if canonicalize_host_addresses {
+            result.push("--canonicalize-host-addresses".to_owned());
+        }
         result.push(format!("{}", left.log_file_path.display()));
         result.push(format!("{}", right.log_file_path.display()));
 
@@ -198,8 +228,15 @@ impl<P: AsRef<OsStr>> Verify<P> {
         options: LogDiffOptions,
     ) -> anyhow::Result<bool> {
         println!("{}", "::  Comparing log files".bold());
+        let canonicalize_host_addresses = self.child_offers_host_address_canonicalization();
+        if !canonicalize_host_addresses {
+            println!(
+                "    (this hermit's log-diff has no --canonicalize-host-addresses; \
+                 marked host addresses are compared by raw value)"
+            );
+        }
         let mut command = std::process::Command::new(&self.hermit_bin);
-        command.args(self.build_command_args(left, right, options));
+        command.args(self.build_command_args(left, right, options, canonicalize_host_addresses));
 
         println!("{}", format!("    {}", display_cmd(&command)).bold());
         Ok(command.status()?.success())
@@ -241,6 +278,7 @@ mod test {
                 ignore_lines: vec![String::from("test")],
                 ..Default::default()
             },
+            false,
         );
 
         assert_eq!(args.into_iter().any(|x| x == "--ignore-lines=test"), true);
@@ -258,6 +296,7 @@ mod test {
                 ignore_lines: Vec::new(),
                 ..Default::default()
             },
+            false,
         );
 
         assert_eq!(
@@ -277,12 +316,60 @@ mod test {
     fn log_diff_command_does_not_pin_a_record_envelope_the_child_may_lack() -> anyhow::Result<()> {
         let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
         let verify = Verify::new(PathBuf::from("hermit"));
-        let args =
-            verify.build_command_args(&env.runs()[0], &env.runs()[1], LogDiffOptions::default());
+        for canonicalize_host_addresses in [false, true] {
+            let args = verify.build_command_args(
+                &env.runs()[0],
+                &env.runs()[1],
+                LogDiffOptions::default(),
+                canonicalize_host_addresses,
+            );
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--record-envelope")),
+                "hermit-verify must not pass --record-envelope to a hermit it did not build: \
+                 {args:?}"
+            );
+        }
+        Ok(())
+    }
 
+    /// <https://github.com/rrnewton/hermit/issues/3412>: a child that offers the
+    /// flag is asked to canonicalize marked host addresses; one that does not
+    /// is never passed an argument it would reject.
+    #[test]
+    fn log_diff_canonicalizes_host_addresses_only_when_the_child_offers_it() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new(PathBuf::from("hermit"));
+        let args = |offered| {
+            verify.build_command_args(
+                &env.runs()[0],
+                &env.runs()[1],
+                LogDiffOptions::default(),
+                offered,
+            )
+        };
+        let flag = "--canonicalize-host-addresses".to_owned();
+        assert!(args(true).contains(&flag));
+        assert!(!args(false).contains(&flag));
+
+        // The probe itself: a child whose log-diff help lacks the flag, and a
+        // child that cannot run at all, both read as "not offered".
+        let directory = tempfile::tempdir()?;
+        let old = directory.path().join("old-hermit");
+        std::fs::write(&old, "#!/bin/sh\necho 'Usage: hermit log-diff [OPTIONS]'\n")?;
+        let new = directory.path().join("new-hermit");
+        std::fs::write(
+            &new,
+            "#!/bin/sh\necho '      --canonicalize-host-addresses'\n",
+        )?;
+        for script in [&old, &new] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))?;
+        }
+        assert!(!Verify::new(&old).child_offers_host_address_canonicalization());
+        assert!(Verify::new(&new).child_offers_host_address_canonicalization());
         assert!(
-            !args.iter().any(|arg| arg.starts_with("--record-envelope")),
-            "hermit-verify must not pass --record-envelope to a hermit it did not build: {args:?}"
+            !Verify::new(directory.path().join("absent"))
+                .child_offers_host_address_canonicalization()
         );
         Ok(())
     }
