@@ -866,6 +866,144 @@ impl<T: RecordOrReplay> Detcore<T> {
         statptr.read(&guest.memory())
     }
 
+    /// The raw identity `stat` reports for the file a `maps`/`smaps` header
+    /// names, which keys that mapping's deterministic inode. `starts` are the
+    /// start addresses of the snapshot's lines with this header, and must be
+    /// empty unless the snapshot shows the reader's own address space
+    /// (`ProcfsFile::mapping_address_space`).
+    ///
+    /// The header's own `(device, inode)` pair is NOT always that identity: on
+    /// btrfs maps prints the superblock's device and `stat` the subvolume's,
+    /// and on overlayfs maps prints the lower file's device. Keying the inode
+    /// pool on the maps pair then gives the maps inode column a different
+    /// value from `st_ino` for the same file
+    /// (<https://github.com/rrnewton/hermit/issues/3307>). In order:
+    ///
+    /// 1. A file the reader mapped through a descriptor Detcore tracks is
+    ///    keyed on the `fstat` identity `handle_mmap` recorded for that
+    ///    address range (`MemoryMetadata::mapped_file_at`). That record needs
+    ///    no path, so it still holds after the file is unlinked or replaced
+    ///    and its descriptor closed, when the line reads ` (deleted)`, and for
+    ///    a path too long to resolve below. It is consulted only for a
+    ///    snapshot of the reader's own address space, which Detcore knows
+    ///    only for a file opened through `/proc/self` or `/proc/thread-self`
+    ///    in that same address space.
+    /// 2. Otherwise the pathname is resolved in the guest. This covers the
+    ///    executable and the ELF interpreter, which `execve` maps without a
+    ///    system call Detcore sees, and files mapped through a descriptor
+    ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
+    ///
+    /// Either answer is accepted only if its inode is the one the header
+    /// reports.
+    ///
+    /// Falls back to the header's pair -- which IS `stat`'s identity on every
+    /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
+    /// and tmpfs -- when metadata is not virtualized (record/replay, where
+    /// `stat` is not determinized either and a resolution at replay time would
+    /// depend on the replay host), and when neither step names the file.
+    ///
+    /// ⚠️ ON BTRFS AND OVERLAYFS THAT FALLBACK DISAGREES WITH `stat`. The maps
+    /// inode column then differs from `st_ino` for a file that is BOTH absent
+    /// from the record and unresolvable by path: the executable or the
+    /// interpreter after it is unlinked or replaced, a file mapped through an
+    /// untracked descriptor and then unlinked, any unlinked file in another
+    /// process's maps (or in `/proc/<own pid>/maps`, which is not recognized
+    /// as the reader's own), or one of those under a path of 512 bytes or
+    /// more (see `stat_guest_path`).
+    async fn mapping_stat_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        key: &crate::procfs::MappingKey,
+        starts: &[usize],
+    ) -> Result<RawFileId, Error> {
+        let header = RawFileId::new(key.device, key.inode);
+        if !guest.config().virtualize_metadata {
+            return Ok(header);
+        }
+        let recorded = {
+            let thread = guest.thread_state();
+            starts.iter().find_map(|&start| {
+                thread
+                    .mapped_file_at(start)
+                    .filter(|file| file.inode == key.inode)
+            })
+        };
+        if let Some(file) = recorded {
+            return Ok(file);
+        }
+        for candidate in crate::procfs::mapping_path_candidates(&key.pathname) {
+            if let Some(stat) = self.stat_guest_path(guest, candidate.as_bytes()).await?
+                && stat.st_ino == key.inode
+            {
+                return Ok(RawFileId::new(stat.st_dev, stat.st_ino));
+            }
+        }
+        Ok(header)
+    }
+
+    /// `stat(path)` performed BY THE GUEST, through an injected
+    /// `fstatat(AT_FDCWD, path, _, 0)`; `None` when it fails or when the path
+    /// does not fit in the scratch buffer.
+    ///
+    /// Injected rather than performed here for the reason `handle_stat_family`
+    /// gives: an access from the tracer can hang on some FUSE filesystems
+    /// (squashfs_ll), and on in-guest backends "here" is the guest process
+    /// anyway. The guest resolves the path in its own mount namespace and
+    /// root, which is also the root `maps` printed the path relative to. The
+    /// injection is not a guest-visible system call, and both scratch buffers
+    /// are zeroed afterwards so no host inode number or timestamp is left
+    /// behind in guest memory below the stack pointer.
+    ///
+    /// ⚠️ THE PATH IS BOUNDED BY THE SMALLEST INJECTION STACK. The ptrace
+    /// backend allows 896 bytes per injection, which must hold the path and a
+    /// 144-byte `struct stat`; a path of `GUEST_STAT_PATH_CAPACITY` bytes or
+    /// more is not resolved (see `mapping_stat_identity` for what a mapping
+    /// then keys on).
+    pub(crate) async fn stat_guest_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Option<libc::stat>, Error> {
+        const GUEST_STAT_PATH_CAPACITY: usize = 512;
+        if path.len() >= GUEST_STAT_PATH_CAPACITY || path.contains(&0) {
+            return Ok(None);
+        }
+        let mut stack = guest.stack().await;
+        let needed = GUEST_STAT_PATH_CAPACITY + std::mem::size_of::<libc::stat>();
+        if stack.capacity().saturating_sub(stack.size()) < needed {
+            return Ok(None);
+        }
+        let path_address: AddrMut<[u8; GUEST_STAT_PATH_CAPACITY]> = stack.reserve();
+        let statptr = StatPtr(stack.reserve());
+        let stack_guard = stack.commit()?;
+        // `reserve` zero-fills, so the path stays NUL-terminated.
+        guest
+            .memory()
+            .write_exact(path_address.cast::<u8>(), path)?;
+        let call = syscalls::Fstatat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_stat(Some(statptr))
+            .with_flags(AtFlags::empty());
+        let identity = match guest.inject_with_retry(call).await {
+            Ok(_) => Some(statptr.read(&guest.memory())?),
+            Err(error) => {
+                trace!(
+                    "guest stat of {:?} failed: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                None
+            }
+        };
+        let mut memory = guest.memory();
+        memory.write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
+        memory.write_exact(path_address.cast::<u8>(), &[0; GUEST_STAT_PATH_CAPACITY])?;
+        drop(stack_guard);
+        Ok(identity)
+    }
+
     // helper function to track a new file descriptor.
     pub(crate) async fn add_fd<G: Guest<Self>>(
         &self,
@@ -991,6 +1129,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .filter(|resolved| resolved != &observed_path)
                         .and_then(|resolved| ProcfsFile::from_path(&resolved))
                 });
+                if let Some(procfs) = procfs.as_mut() {
+                    // A `/proc/self/maps` descriptor shows the opener's address
+                    // space even when a forked child reads it, or the opener
+                    // after an `execve`.
+                    procfs.bind_mapping_address_space(guest.thread_state().mm_id);
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -1435,10 +1579,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                 })?;
             let raw_inode = match cached_stat {
-                Some(stat) => stat.inode,
+                Some(stat) => stat.raw_file_id(),
                 None => {
                     let stat = self.inject_fstat(guest, target_fd).await?;
-                    stat.st_ino
+                    RawFileId::new(stat.st_dev, stat.st_ino)
                 }
             };
             let virtual_inode = match inode_override {
@@ -1538,39 +1682,64 @@ impl<T: RecordOrReplay> Detcore<T> {
         let needs_mapping_identities = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
-        let mut mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
+        let mut mapping_identities = crate::procfs::MappingIdentities::new();
         if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
             // reports for that fd, which is the fixed `deterministic_stdio_inode`
-            // value rather than a pooled one. Matching is by raw inode, read
-            // from the cached stat only: injecting an fstat here would add
-            // syscalls to every maps read and perturb the very traces this
-            // change is meant to keep consistent.
-            let mut stdio_by_raw_inode: BTreeMap<u64, DetInode> = BTreeMap::new();
+            // value rather than a pooled one. Matching is by the raw device and
+            // inode `stat` reported for the stdio descriptor, read from its
+            // cached stat.
+            //
+            // The inode alone is not enough: an unrelated file on another
+            // filesystem can share the stdio inode number (a fresh tmpfs
+            // numbers its files 2, 3, ...; `/dev/null` is inode 3 on
+            // devtmpfs), and it would then be rendered with the stdio inode
+            // in the runs where the host numbers happened to coincide
+            // (https://github.com/rrnewton/hermit/issues/3307).
+            //
+            // When several stdio descriptors share one raw identity the LOWEST
+            // descriptor's inode wins. The tracer-side backends cache the
+            // tracer's own `fstat(0)` for all three descriptors (see
+            // `setup_stdio`), so every mapping of the stdin file matches all
+            // three; letting the last insert win reported it as stderr's inode
+            // (1002) while `fstat(0)` reports 1000. `namespace.rs`'s
+            // `deterministic_stdio_inode_for_raw` applies the same precedence.
+            let mut stdio_by_raw_file: BTreeMap<RawFileId, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let cached = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| {
                         let inode = deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                        detfd.stat().map(|stat| (stat.inode, inode))
+                        detfd.stat().map(|stat| (stat.raw_file_id(), inode))
                     })
                     .ok()
                     .flatten();
                 if let Some((raw, det)) = cached {
-                    stdio_by_raw_inode.insert(raw, det);
+                    stdio_by_raw_file.entry(raw).or_insert(det);
                 }
             }
-            let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)
-                .lines()
-                .filter_map(crate::procfs::mapping_header_identity)
-                .collect();
-            for (raw_dev, raw_inode) in raw_pairs {
-                let det_inode = match stdio_by_raw_inode.get(&raw_inode) {
+            // The reader's mapping records describe this snapshot only when it
+            // shows the reader's own address space.
+            let readers_address_space = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_mapping_address_space())?
+                == Some(guest.thread_state().mm_id);
+            for (key, starts) in crate::procfs::mapping_keys(&contents) {
+                // The INODE is keyed on what `stat` reports for this file, the
+                // DEVICE column on what maps printed: on btrfs and overlayfs
+                // the two devices differ on native Linux as well, while the
+                // inode numbers agree. See `ProcfsSnapshotContext::
+                // mapping_identities`.
+                let recorded_starts: &[usize] = if readers_address_space { &starts } else { &[] };
+                let raw_file = self
+                    .mapping_stat_identity(guest, &key, recorded_starts)
+                    .await?;
+                let det_inode = match stdio_by_raw_file.get(&raw_file) {
                     Some(inode) => *inode,
-                    None => determinize_inode(guest, raw_inode).await.0,
+                    None => determinize_inode(guest, raw_file).await.0,
                 };
-                let det_dev = determinize_device(guest, raw_dev).await;
-                mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
+                let det_dev = determinize_device(guest, key.device).await;
+                mapping_identities.insert(key, (det_dev, det_inode.as_raw()));
             }
         }
         let mountinfo = if guest
@@ -2086,7 +2255,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 (
                     detfd.ty(),
                     detfd.resource(),
-                    detfd.stat().map(|stat| stat.inode),
+                    detfd.stat().map(|stat| stat.raw_file_id()),
                 )
             })?;
 
@@ -2113,9 +2282,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        // `out_inode` is the fd's cached HOST inode, so it must be
+        // `out_inode` is the fd's cached HOST identity, so it must be
         // determinized before naming a resource. It is deliberately left raw
-        // for the `touch_file` call below, which takes a `RawInode`.
+        // for the `touch_file` call below, which takes a `RawFileId`.
         let out_resource = match out_resource {
             Some(resource) => Some(resource),
             None => match out_inode {
@@ -2169,7 +2338,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.is_nonblocking(),
                 detfd.open_file_id(),
                 detfd.resource(),
-                detfd.stat().map(|x| x.inode),
+                detfd.stat().map(|x| x.raw_file_id()),
             )
         })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
@@ -2269,7 +2438,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+            (
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.raw_file_id()),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2387,7 +2559,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.is_nonblocking(),
                 detfd.open_file_id(),
                 detfd.resource(),
-                detfd.stat().map(|x| x.inode),
+                detfd.stat().map(|x| x.raw_file_id()),
             )
         })?;
 
@@ -2712,7 +2884,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+            (
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.raw_file_id()),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2772,7 +2947,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+            (
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.raw_file_id()),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2844,11 +3022,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // The raw identity `fstat` reported for a mapped file, from the
+        // descriptor's cached stat (present only under `virtualize_metadata`).
+        // A maps line for this range keys its inode on it; see
+        // `mapping_stat_identity`.
+        let mapped_file = if call.flags().contains(MapFlags::MAP_ANONYMOUS) || call.fd() < 0 {
+            None
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |fd| fd.stat().map(|stat| stat.raw_file_id()))
+                .ok()
+                .flatten()
+        };
         let len = call.len();
         let result = self.record_or_replay(guest, call).await?;
         let start = usize::try_from(result).expect("a successful mmap must return an address");
 
         guest.thread_state().unmap_memory(start, len);
+        if let Some(file) = mapped_file {
+            guest.thread_state().map_file(start, len, file);
+        }
         match backing {
             Some(SharedBacking::Anonymous) => {
                 guest.thread_state().map_shared_anonymous(start, len);
@@ -2921,7 +3115,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     as u64;
                 (inode, LogicalTime::from_nanos(nanos))
             }
-            None => determinize_inode(guest, stat.inode).await,
+            // Key on the raw device as well as the raw inode, read before
+            // `stat.dev` is overwritten below: inode numbers repeat across
+            // filesystems (https://github.com/rrnewton/hermit/issues/3307).
+            None => determinize_inode(guest, stat.raw_file_id()).await,
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
 
@@ -4475,6 +4672,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    /// The raw device of the filesystem an open descriptor refers to.
+    ///
+    /// Directory entries carry only an inode number; they belong to the
+    /// directory's filesystem, which is also the device `stat` reports for each
+    /// entry, so the directory's device is what keys their deterministic
+    /// inodes. Uses the descriptor's cached stat when there is one and injects
+    /// an `fstat` otherwise.
+    ///
+    /// A descriptor Detcore does not track (one received over `SCM_RIGHTS`,
+    /// for example) has no cached stat, which is not an error: the kernel owns
+    /// the descriptor table, and the injected `fstat` asks it directly. The
+    /// getdents handlers call this BEFORE the real system call, so an `fstat`
+    /// failure (only possible for a descriptor the kernel would also reject)
+    /// is reported without consuming directory entries, and a successful
+    /// getdents is never turned into an error afterwards.
+    async fn raw_device_of_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<u64, Errno> {
+        let cached = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.dev))
+            .ok()
+            .flatten();
+        match cached {
+            Some(device) => Ok(device),
+            None => Ok(self.inject_fstat(guest, fd).await?.st_dev),
+        }
+    }
+
     /// getdents system call.
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
@@ -4486,6 +4714,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let dirent = call.dirent().ok_or(Errno::EFAULT)?;
+        let fd = call.fd() as RawFd;
+        // Resolved before the real call: see `raw_device_of_fd`.
+        let device = self.raw_device_of_fd(guest, fd).await?;
 
         let nb = self.record_or_replay(guest, call).await?;
         if nb == 0 {
@@ -4502,7 +4733,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut dents = unsafe { deserialize_dirents(&dents_bytes) };
         dents.sort();
         for dent in &mut dents {
-            let (d_ino, _) = determinize_inode(guest, dent.ino).await;
+            let (d_ino, _) = determinize_inode(guest, RawFileId::new(device, dent.ino)).await;
             dent.ino = d_ino.as_raw();
         }
 
@@ -4526,6 +4757,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let dirent = call.dirent().ok_or(Errno::EFAULT)?;
+        let fd = call.fd() as RawFd;
+        // Resolved before the real call: see `raw_device_of_fd`.
+        let device = self.raw_device_of_fd(guest, fd).await?;
 
         let nb = self.record_or_replay(guest, call).await?;
         if nb == 0 {
@@ -4542,7 +4776,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut dents = unsafe { deserialize_dirents64(&dents_bytes) };
         dents.sort();
         for dent in &mut dents {
-            let (d_ino, _) = determinize_inode(guest, dent.ino).await;
+            let (d_ino, _) = determinize_inode(guest, RawFileId::new(device, dent.ino)).await;
             dent.ino = d_ino.as_raw();
         }
 

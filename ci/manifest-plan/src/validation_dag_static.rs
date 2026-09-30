@@ -368,7 +368,24 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // descriptor_is_closed_when_no_scratch_can_be_found) retain all 845 prior
     // identities (`cargo nextest list --profile ci` measured 848;
     // https://github.com/rrnewton/hermit/issues/3328).
-    ("test.detcore_unit", 848),
+    // Fourteen device-and-inode identity tests
+    // (https://github.com/rrnewton/hermit/issues/3307) retain all 848 prior
+    // identities (`cargo nextest list --profile ci` measured 862):
+    // tool_global::tests::det_inodes_do_not_depend_on_raw_inode_coincidences;
+    // syscalls::namespace::tests::stdio_identity_requires_the_same_device,
+    // anonymous_object_devices_match_fresh_objects,
+    // link_stat_must_describe_the_object_the_target_names and
+    // a_failed_device_probe_keys_an_unconfirmed_link_on_device_zero;
+    // procfs::tests::mapping_header_key_reads_the_pathname_column,
+    // maps_keeps_two_files_that_share_a_maps_device_and_inode_apart,
+    // mapping_keys_are_the_keys_the_sanitizers_look_up,
+    // mapping_keys_carry_the_start_of_every_line,
+    // mapping_path_candidates_offer_only_live_paths and
+    // only_self_spelled_maps_bind_the_openers_address_space; and memory::tests::
+    // file_mappings_name_their_file_until_unmapped,
+    // file_mappings_follow_mremap_and_survive_fork and
+    // a_shared_file_mapping_keeps_its_file_record.
+    ("test.detcore_unit", 862),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -421,7 +438,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 848),
+    ("test.detcore_unit_on_host", 862),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),

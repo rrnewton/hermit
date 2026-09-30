@@ -117,7 +117,11 @@ pub(crate) async fn yield_once() {
 #[derive(Debug)]
 struct InodePool {
     // TODO(T87258449): merge these two maps:
-    inodes: HashMap<RawInode, DetInode>,
+    /// Keyed by device and inode together, never the inode alone: inode
+    /// numbers are unique only within one filesystem, and which numbers
+    /// coincide across filesystems depends on host counters
+    /// (<https://github.com/rrnewton/hermit/issues/3307>).
+    inodes: HashMap<RawFileId, DetInode>,
     detinodes_info: HashMap<DetInode, DetInodeInfo>,
     /// Counter backing the minted [`DetInode`]s. Deliberately a plain integer:
     /// it is the *source* of deterministic inodes, not one itself, and typing
@@ -128,7 +132,7 @@ struct InodePool {
 /// Everything we know (globally) about a DetInode.
 #[derive(Debug)]
 struct DetInodeInfo {
-    raw: RawInode,
+    raw: RawFileId,
     mtime: LogicalTime,
 }
 
@@ -185,11 +189,12 @@ impl InodePool {
         }
     }
 
-    // Allocate the next deterministic inode.  This takes the raw-inode and
-    // can return an existing mapping or extend the mapping by creating a
-    // new deterministic inode. The returned inode is strictly increasing
-    // to avoid inode re-use issue in some filesystem like ext4.
-    fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
+    // Allocate the next deterministic inode.  This takes the raw file
+    // identity (device and inode) and can return an existing mapping or
+    // extend the mapping by creating a new deterministic inode. The returned
+    // inode is strictly increasing to avoid inode re-use issue in some
+    // filesystem like ext4.
+    fn add_inode(&mut self, raw_inode: RawFileId, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         match self.inodes.get(&raw_inode) {
             None => {
                 // THE determinization boundary: the single place a host inode
@@ -217,6 +222,25 @@ impl InodePool {
                 (*dino, info.mtime)
             }
         }
+    }
+
+    // Set the logical mtime of the file with this raw identity. A file not
+    // seen before (e.g. because there hasn't been a stat on it) is added
+    // just-in-time with `first_seen` as its initial mtime, then bumped.
+    fn touch_inode(
+        &mut self,
+        raw_inode: RawFileId,
+        first_seen: LogicalTime,
+        mtime: LogicalTime,
+    ) -> DetInode {
+        let (dino, _) = self.add_inode(raw_inode, first_seen);
+        let info = self
+            .detinodes_info
+            .get_mut(&dino)
+            // TODO(T87258449): remove this `expect`:
+            .expect("Invariant violation: det inode missing from map.");
+        info.mtime = mtime;
+        dino
     }
 
     // remove a det inode
@@ -2496,7 +2520,7 @@ impl GlobalState {
         sched.wake_futex_waiters_after_exit(&wakes)
     }
 
-    async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
+    async fn recv_determinize_inode(&self, from: Tid, ino: RawFileId) -> (DetInode, LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
         // Here we establish a policy that when we first see a file its mtime is epoch.
         let nanos = self
@@ -2568,7 +2592,7 @@ impl GlobalState {
         self.inodes.lock().unwrap().remove_inode(d_ino);
     }
 
-    async fn recv_touch_file(&self, from: Tid, ino: RawInode) {
+    async fn recv_touch_file(&self, from: Tid, ino: RawFileId) {
         let _sched = self.lock_rpc_scheduler(false).await;
         let mtime = if self.cfg.virtualize_time {
             self.global_time.lock().unwrap().as_nanos()
@@ -2585,26 +2609,17 @@ impl GlobalState {
             "[dtid {}] bumping mtime on file (rawinode {:?}) to {}",
             from, ino, mtime,
         );
-        let mut mg = self.inodes.lock().unwrap();
-        let dino =
-            if let Some(d) = mg.inodes.get(&ino) {
-                *d
-            } else {
-                // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
-                // stat on it), so we just-in-time add it.
-                let nanos =
-                    self.cfg.epoch.timestamp_nanos_opt().expect(
-                        "epoch cannot be represented in a timestamp with nanosecond precision",
-                    ) as u64;
-                let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
-                d
-            };
-        let info = mg
-            .detinodes_info
-            .get_mut(&dino)
-            // TODO(T87258449): remove this `expect`:
-            .expect("Invariant violation: det inode missing from map.");
-        info.mtime = mtime;
+        let first_seen = LogicalTime::from_nanos(
+            self.cfg
+                .epoch
+                .timestamp_nanos_opt()
+                .expect("epoch cannot be represented in a timestamp with nanosecond precision")
+                as u64,
+        );
+        self.inodes
+            .lock()
+            .unwrap()
+            .touch_inode(ino, first_seen, mtime);
     }
 
     async fn recv_trace_schedevent(
@@ -2958,8 +2973,9 @@ pub enum GlobalRequest {
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
-    /// Translate nondeterministic to deterministic inode.
-    DeterminizeInode(RawInode),
+    /// Translate a nondeterministic file identity (device and inode, as one
+    /// kernel interface reported them) to a deterministic inode.
+    DeterminizeInode(RawFileId),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -2978,8 +2994,8 @@ pub enum GlobalRequest {
     /// unlink an inode
     UnlinkInode(DetInode),
 
-    /// Bump mtime
-    TouchFile(RawInode),
+    /// Bump mtime of the file with this raw identity (device and inode).
+    TouchFile(RawFileId),
 
     /// Retrieve global time.
     GlobalTimeLowerBound,
@@ -3656,7 +3672,10 @@ where
 /// track a (possibly new) inode, by returning a deterministic inode.
 /// Also return the logical mtime for the inode, though this is only
 /// used if `virtualize_metadata` is set.
-pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawInode) -> (DetInode, LogicalTime)
+///
+/// `inode` must pair the raw inode with the raw device reported by the same
+/// kernel interface; see [`RawFileId`].
+pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawFileId) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3735,9 +3754,9 @@ where
     }
 }
 
-/// Update the modification time for a file, using its inode.
-/// This will set the mtime to a coherent global-time value.
-pub async fn touch_file<G, T>(guest: &mut G, inode: RawInode)
+/// Update the modification time for a file, using its raw identity (device and
+/// inode). This will set the mtime to a coherent global-time value.
+pub async fn touch_file<G, T>(guest: &mut G, inode: RawFileId)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -6993,14 +7012,15 @@ mod tests {
     #[test]
     fn det_inodes_are_minted_not_passed_through() {
         use crate::types::DetInode;
+        use crate::types::RawFileId;
 
         let mut pool = super::InodePool::new();
         let t = LogicalTime::from_nanos(0);
 
         let host_a = 221_742_951; // the value observed leaking into FileContents
         let host_b = 998_877_665;
-        let (a, _) = pool.add_inode(host_a, t);
-        let (b, _) = pool.add_inode(host_b, t);
+        let (a, _) = pool.add_inode(RawFileId::new(0x32, host_a), t);
+        let (b, _) = pool.add_inode(RawFileId::new(0x32, host_b), t);
 
         assert_ne!(a.as_raw(), host_a, "det inode must not be the host inode");
         assert_ne!(b.as_raw(), host_b, "det inode must not be the host inode");
@@ -7008,8 +7028,68 @@ mod tests {
         assert_eq!(b, DetInode::mint(2), "minting is monotonic");
 
         // Re-determinizing the same host inode is stable, not a fresh mint.
-        let (a_again, _) = pool.add_inode(host_a, t);
+        let (a_again, _) = pool.add_inode(RawFileId::new(0x32, host_a), t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// Regression test for <https://github.com/rrnewton/hermit/issues/3307>.
+    ///
+    /// Inode numbers are unique only within one filesystem. Whether a file on
+    /// one filesystem shares its raw inode number with a file on another
+    /// depends on host counters (fresh tmpfs mounts all number from 1; memfds
+    /// and pipes draw from shared counters), so the same guest sees a
+    /// coincidence in one run and not in the next. The deterministic inode of
+    /// every file, and its logical mtime, must not depend on that.
+    ///
+    /// When the pool was keyed on the inode alone, the colliding run gave the
+    /// second file the first file's deterministic inode, minted the third file
+    /// one lower than in the run without the collision, and a write to one
+    /// file changed the reported mtime of the other.
+    #[test]
+    fn det_inodes_do_not_depend_on_raw_inode_coincidences() {
+        use crate::types::DetInode;
+        use crate::types::RawFileId;
+
+        let epoch = LogicalTime::from_nanos(0);
+        let written = LogicalTime::from_nanos(5_000);
+        let mint_run = |second_raw_inode: u64| {
+            let mut pool = super::InodePool::new();
+            // Three files on three filesystems, observed in a fixed order.
+            let first = RawFileId::new(0x2f, 2);
+            let second = RawFileId::new(0x30, second_raw_inode);
+            let third = RawFileId::new(0x31, 9);
+            let first_det = pool.add_inode(first, epoch).0;
+            let second_det = pool.add_inode(second, epoch).0;
+            let third_det = pool.add_inode(third, epoch).0;
+            // The guest writes the first file, then stats the second.
+            let touched = pool.touch_inode(first, epoch, written);
+            let second_after_write = pool.add_inode(second, epoch);
+            (
+                [first_det, second_det, third_det],
+                touched,
+                second_after_write,
+            )
+        };
+
+        // Run without a coincidence, and a run whose second file happens to
+        // carry the first file's raw inode number on a different device.
+        let (apart, apart_touched, apart_second) = mint_run(7);
+        let (colliding, colliding_touched, colliding_second) = mint_run(2);
+
+        let expected = [DetInode::mint(1), DetInode::mint(2), DetInode::mint(3)];
+        assert_eq!(apart, expected);
+        assert_eq!(
+            colliding, expected,
+            "a raw inode shared across devices must not change minted inodes"
+        );
+        assert_eq!(apart_touched, DetInode::mint(1));
+        assert_eq!(colliding_touched, DetInode::mint(1));
+        assert_eq!(apart_second, (DetInode::mint(2), epoch));
+        assert_eq!(
+            colliding_second,
+            (DetInode::mint(2), epoch),
+            "writing one file must not change another file's mtime"
+        );
     }
 }
 
