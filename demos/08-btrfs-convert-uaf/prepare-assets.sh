@@ -27,8 +27,11 @@ access to github.com.
 
 Env: DEMO08_DIR (assets), DEMO08_BUILD_ROOT, DEMO08_ARTIFACTS, DEMO08_BTRFS_REPO,
 DEMO08_BUILD_JOBS, DEMO08_CALIBRATION_SEEDS (default 64), DEMO08_TIMEOUT (the
-demo's per-run timeout, default 90, which also caps each calibration run), and
-DEMO08_CALIBRATION_TIMEOUT (must not exceed DEMO08_TIMEOUT).
+demo's per-run timeout, default 90, which also caps each calibration run),
+DEMO08_CALIBRATION_TIMEOUT (must not exceed DEMO08_TIMEOUT), and
+DEMO08_REFUSAL_RETRIES (default 2: how many more times to run a seed when
+Hermit refuses a run with exit status 122; a seed refused on every attempt is
+reported as refused and skipped, not counted as tested).
 EOF
             exit 0
             ;;
@@ -59,6 +62,9 @@ DEMO_TIMEOUT="${DEMO08_TIMEOUT:-90}"
 # 11 s median, and 103 s maximum per run. A shorter cap would miss slow crashing
 # seeds; a longer one would record seeds that run.sh then cuts off.
 CALIBRATION_TIMEOUT="${DEMO08_CALIBRATION_TIMEOUT:-$DEMO_TIMEOUT}"
+# How many more times to run a seed when Hermit refuses the run (exit status
+# 122); see run_variant_unrefused.
+REFUSAL_RETRIES="${DEMO08_REFUSAL_RETRIES:-2}"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -87,6 +93,8 @@ command -v timeout >/dev/null 2>&1 || fail "timeout is required to prepare demo 
 [ "$CALIBRATION_TIMEOUT" -le "$DEMO_TIMEOUT" ] || \
   fail "DEMO08_CALIBRATION_TIMEOUT=$CALIBRATION_TIMEOUT exceeds the demo's per-run budget" \
     "DEMO08_TIMEOUT=$DEMO_TIMEOUT; a seed calibrated above that budget is cut off by the demo"
+[[ $REFUSAL_RETRIES =~ ^[0-9]+$ ]] || \
+  fail "DEMO08_REFUSAL_RETRIES must be a non-negative integer"
 
 # A crashing seed belongs to the exact buggy binary it was found with, so it is
 # stored together with that binary's sha256. A recorded seed whose hash does not
@@ -112,7 +120,9 @@ fixture_source_identity() {
 # A run in which the guest executed ends in a clean conversion (0), an ASAN
 # abort (134), or the timeout (124), and leaves output. Any other status means
 # Hermit or the environment failed around the guest, which is not the same fact
-# as "this seed did not crash".
+# as "this seed did not crash". Exit status 122 is Hermit refusing the run; it
+# is not counted here either, and run_variant_unrefused retries it and the
+# callers report it as refused rather than as "not executed".
 seed_executed() {
   local rc=$1 output=$2
   case "$rc" in
@@ -175,6 +185,48 @@ run_variant() {
   RUN_UAF=$uaf
 }
 
+# Hermit exits 122 when it refuses a run under a fail-closed policy and prints a
+# HERMIT_POLICY_REFUSAL line naming the cause, for example cause=skid-overshoot
+# after a performance-counter interrupt arrived later than its safety margin,
+# which heavy host load makes more likely. A refused run did not test the seed:
+# it is neither "this seed did not crash" nor a guest failure. So run_variant is
+# repeated, up to REFUSAL_RETRIES more times. Each refused attempt that is
+# retried keeps its output as <output>-refused-<n>.out and gets a calibration.tsv
+# row whose qualifies column says "refused". The RUN_* globals describe the last
+# attempt, so RUN_RC=122 afterwards means every attempt was refused, and the
+# caller must report that seed as refused.
+#
+# A refused fixed-variant run that printed a use-after-free is not retried:
+# confirm_seed treats that report as a regression whatever the exit status, and
+# a retry must not replace it with a cleaner run.
+REFUSED_RUNS=0
+
+run_variant_unrefused() {
+  local variant=$1 seed=$2 image=$3 output=$4 report=$5 source=$6 label=$7
+  local attempt kept attempts=$((REFUSAL_RETRIES + 1))
+  for ((attempt = 1; ; attempt++)); do
+    run_variant "$variant" "$seed" "$image" "$output"
+    [ "$RUN_RC" = 122 ] || return 0
+    REFUSED_RUNS=$((REFUSED_RUNS + 1))
+    if [ "$variant" = fixed ] && [ "$RUN_UAF" != none ]; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$attempts" ]; then
+      echo "demo 8: Hermit refused the $label run on seed $seed (rc=122) on all $attempts" \
+        "attempt(s); its HERMIT_POLICY_REFUSAL line in $output names the cause." >&2
+      return 0
+    fi
+    kept="${output%.out}-refused-${attempt}.out"
+    # Checked explicitly: errexit is suspended when this runs under confirm_seed.
+    mv -f -- "$output" "$kept" ||
+      fail "demo 8 could not keep the refused $label run's output: moving $output to $kept failed"
+    record_run "$report" "$seed" "$source" "$label" "$RUN_ENGAGEMENT" "$RUN_UAF" "$RUN_RC" \
+      "$RUN_ELAPSED" refused "$kept"
+    echo "demo 8: Hermit refused the $label run on seed $seed (rc=122, attempt $attempt of" \
+      "$attempts); its HERMIT_POLICY_REFUSAL line in $kept names the cause. Running it again." >&2
+  done
+}
+
 # Is this buggy-variant run the crash the demo requires: the guest executed,
 # reached the progress thread, printed a complete report, and aborted?
 run_qualifies() {
@@ -201,30 +253,41 @@ record_run() {
 # that seed completes cleanly.
 #
 # Return 0 to accept, 1 to reject this seed and keep searching. Only a timeout
-# (rc=124) rejects a seed, because it means the seed does not fit the demo's
-# timeout. Any other disagreement between two runs of one seed is a determinism
-# or environment failure, and searching for a friendlier seed would hide it, so
-# those stop the whole calibration.
+# (rc=124) or a run that Hermit refused on every attempt (rc=122) rejects a
+# seed: the first means the seed does not fit the demo's timeout, the second
+# that the check was not run. Any other disagreement between two runs of one
+# seed is a determinism or environment failure, and searching for a friendlier
+# seed would hide it, so those stop the whole calibration.
 #
 # The two timeout rejections are counted separately: one says the seed is too
 # slow, the other says the fixed control is.
 REJECTED_REPLAY_BUDGET=0
 REJECTED_FIXED_BUDGET=0
+REJECTED_REFUSED=0
 
 confirm_seed() {
   local report=$1 artifacts=$2 seed=$3 source=$4
   local rc elapsed engagement uaf output qualifies
 
   output="$artifacts/calibration-confirm-replay-seed-${seed}.out"
-  run_variant buggy "$seed" "$artifacts/chaos-buggy.img" "$output"
+  run_variant_unrefused buggy "$seed" "$artifacts/chaos-buggy.img" "$output" \
+    "$report" "$source" buggy-replay
   rc=$RUN_RC elapsed=$RUN_ELAPSED engagement=$RUN_ENGAGEMENT uaf=$RUN_UAF
   qualifies=no
-  if run_qualifies "$rc" "$engagement" "$uaf" "$output"; then
+  if [ "$rc" = 122 ]; then
+    qualifies=refused
+  elif run_qualifies "$rc" "$engagement" "$uaf" "$output"; then
     qualifies=yes
   fi
   record_run "$report" "$seed" "$source" buggy-replay "$engagement" "$uaf" "$rc" "$elapsed" \
     "$qualifies" "$output"
   if [ "$qualifies" != yes ]; then
+    if [ "$rc" = 122 ]; then
+      echo "demo 8 seed $seed crashed on its first run, but Hermit refused every replay" \
+        "attempt (rc=122), so the replay was not tested and this seed is not accepted." >&2
+      REJECTED_REFUSED=$((REJECTED_REFUSED + 1))
+      return 1
+    fi
     if [ "$rc" = 124 ]; then
       echo "demo 8 seed $seed replayed past the ${CALIBRATION_TIMEOUT}s budget (rc=124);" \
         "the demo would cut the same run off, so this seed is not accepted." >&2
@@ -238,13 +301,22 @@ confirm_seed() {
   fi
 
   output="$artifacts/calibration-confirm-fixed-seed-${seed}.out"
-  run_variant fixed "$seed" "$artifacts/chaos-fixed.img" "$output"
+  run_variant_unrefused fixed "$seed" "$artifacts/chaos-fixed.img" "$output" \
+    "$report" "$source" fixed
   rc=$RUN_RC elapsed=$RUN_ELAPSED engagement=$RUN_ENGAGEMENT uaf=$RUN_UAF
-  record_run "$report" "$seed" "$source" fixed "$engagement" "$uaf" "$rc" "$elapsed" n/a \
-    "$output"
+  qualifies=n/a
+  [ "$rc" != 122 ] || qualifies=refused
+  record_run "$report" "$seed" "$source" fixed "$engagement" "$uaf" "$rc" "$elapsed" \
+    "$qualifies" "$output"
   if [ "$uaf" != none ]; then
     fail "demo 8 fixed variant reported a use-after-free on seed $seed (rc=$rc): the fix does" \
       "not close the window on this schedule (report: $report)"
+  fi
+  if [ "$rc" = 122 ]; then
+    echo "demo 8 fixed control on seed $seed was refused by Hermit on every attempt" \
+      "(rc=122), so the control was not tested and this seed is not accepted." >&2
+    REJECTED_REFUSED=$((REJECTED_REFUSED + 1))
+    return 1
   fi
   if [ "$rc" = 124 ]; then
     echo "demo 8 fixed control on seed $seed ran past the ${CALIBRATION_TIMEOUT}s budget" \
@@ -267,7 +339,10 @@ calibrate_crash_seed() {
   # complete_reports counts the subset of uaf_hits whose report reached ASAN's
   # closing SUMMARY, which separates "the report was cut off" from "the report
   # finished and the guest never aborted".
+  # refused counts seeds whose search run Hermit refused on every attempt; they
+  # were not tested and are not in executed.
   local executed=0 attempted=0 engaged=0 uaf_hits=0 complete_reports=0 qualified=0 rejected=0
+  local refused=0
   local last_rc="" found_seed="" found_source=""
   local cached_seed=""
   local -a seeds=() sources=()
@@ -312,10 +387,17 @@ calibrate_crash_seed() {
     seed="${seeds[$i]}"
     source="${sources[$i]}"
     output="$artifacts/calibration-${source}-seed-${seed}.out"
-    run_variant buggy "$seed" "$image" "$output"
+    run_variant_unrefused buggy "$seed" "$image" "$output" "$report" "$source" buggy
     rc=$RUN_RC elapsed=$RUN_ELAPSED engagement=$RUN_ENGAGEMENT uaf=$RUN_UAF
     attempted=$((attempted + 1))
     last_rc=$rc
+    if [ "$rc" = 122 ]; then
+      refused=$((refused + 1))
+      record_run "$report" "$seed" "$source" buggy "$engagement" "$uaf" "$rc" "$elapsed" \
+        refused "$output"
+      echo "demo 8 seed $seed was not tested: Hermit refused every attempt; trying the next seed." >&2
+      continue
+    fi
     if seed_executed "$rc" "$output"; then
       executed=$((executed + 1))
     fi
@@ -350,9 +432,13 @@ calibrate_crash_seed() {
   # uaf_hits counts report text; qualified counts runs that also aborted with a
   # complete report; unconfirmed counts qualifying seeds that failed the replay
   # or fixed-variant check.
-  printf 'Demo 8 calibration summary: engagement=%s/%s uaf_hits=%s/%s qualified=%s/%s executed=%s/%s unconfirmed=%s report=%s\n' \
+  printf 'Demo 8 calibration summary: engagement=%s/%s uaf_hits=%s/%s qualified=%s/%s executed=%s/%s unconfirmed=%s refused=%s/%s refused_runs=%s report=%s\n' \
     "$engaged" "$attempted" "$uaf_hits" "$attempted" "$qualified" "$attempted" \
-    "$executed" "$attempted" "$rejected" "$report"
+    "$executed" "$attempted" "$rejected" "$refused" "$attempted" "$REFUSED_RUNS" "$report"
+  if [ "$refused" -gt 0 ]; then
+    echo "note: $refused of $attempted seeds were not tested, because Hermit refused every" \
+      "attempt on them (rc=122; rows marked refused in $report)." >&2
+  fi
   rm -f -- "$image" "$artifacts/chaos-fixed.img"
   if [ -n "$found_seed" ]; then
     printf '%s %s\n' "$found_seed" "$fixture" >"$ASSETS/.crash-seed"
@@ -368,6 +454,14 @@ calibrate_crash_seed() {
 
   # "No seed crashed" says something about the program only once the guest has
   # both executed and reached the progress thread.
+  if [ "$refused" -eq "$attempted" ]; then
+    fail "demo 8 calibration was refused by Hermit on every seed: each of the $attempted" \
+      "attempted seeds exited 122 on all $((REFUSAL_RETRIES + 1)) attempt(s). The" \
+      "HERMIT_POLICY_REFUSAL line in each output names the cause; cause=skid-overshoot, a late" \
+      "performance-counter interrupt, is more likely under heavy host load. No seed was tested," \
+      "so this says nothing about the use-after-free. Re-run on a quieter host or raise" \
+      "DEMO08_REFUSAL_RETRIES (report: $report)"
+  fi
   if [ "$executed" -eq 0 ]; then
     fail "demo 8 calibration never executed the guest: 0 of $attempted seeds produced a guest" \
       "exit status (0/124/134) with output; last rc=$last_rc. This is an environment failure" \
@@ -375,10 +469,12 @@ calibrate_crash_seed() {
   fi
   if [ "$qualified" -gt 0 ]; then
     fail "demo 8 calibration found $qualified qualifying seed(s) but confirmed none:" \
-      "$REJECTED_REPLAY_BUDGET seed(s) replayed past the ${CALIBRATION_TIMEOUT}s per-run budget" \
-      "and $REJECTED_FIXED_BUDGET had a fixed control that ran past it. The first means the" \
-      "seed is too slow for the demo; the second means the fixed variant is. Either way no" \
-      "seed is usable at DEMO08_TIMEOUT=$DEMO_TIMEOUT (report: $report)"
+      "$REJECTED_REPLAY_BUDGET seed(s) replayed past the ${CALIBRATION_TIMEOUT}s per-run budget," \
+      "$REJECTED_FIXED_BUDGET had a fixed control that ran past it, and $REJECTED_REFUSED had a" \
+      "replay or fixed control that Hermit refused on every attempt (rc=122). The first means" \
+      "the seed is too slow for the demo, the second that the fixed variant is, and the third" \
+      "that the check was not run. No seed is confirmed at DEMO08_TIMEOUT=$DEMO_TIMEOUT" \
+      "(report: $report)"
   fi
   if [ "$engaged" -eq 0 ]; then
     fail "demo 8 calibration NO-RESULT: path engagement 0/$attempted; $uaf_hits UAF hits" \

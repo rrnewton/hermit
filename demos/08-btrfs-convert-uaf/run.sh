@@ -170,6 +170,18 @@ chaos_convert() {
     -- "$conv" "$img" >"$out" 2>&1
 }
 
+# Explain exit status 122 for the chaos run whose output is in $1. Every chaos
+# step uses it, so a refusal reads the same whichever step it happens in.
+explain_refusal() {
+  local out="$1"
+  echo "rc=122 means Hermit refused the run: a performance-counter" \
+    "interrupt arrived later than its safety margin, so it printed" \
+    "HERMIT_SKID_OVERSHOOT and HERMIT_POLICY_REFUSAL ..." \
+    "cause=skid-overshoot instead of treating the run as deterministic" \
+    "evidence. Heavy host load makes this more likely; see both lines" \
+    "in $out and re-run on a quieter host" >&2
+}
+
 echo "=== Demo 8: schedule-dependent btrfs-convert use-after-free ==="
 echo "Using $(hermit --version 2>/dev/null || echo 'hermit (version unavailable)') ($(command -v hermit))"
 echo "seed=$CRASH_SEED timeout=${TIMEOUT}s"
@@ -218,12 +230,7 @@ if [ "$buggy_rc" -ne 134 ]; then
     0)   echo "rc=0 means the crash did not occur. If the seed came from an earlier" \
            "prepare-assets.sh, re-run it: it re-checks the recorded seed and" \
            "searches again when that seed no longer crashes" >&2 ;;
-    122) echo "rc=122 means Hermit refused the run: a performance-counter" \
-           "interrupt arrived later than its safety margin, so it printed" \
-           "HERMIT_SKID_OVERSHOOT and HERMIT_POLICY_REFUSAL ..." \
-           "cause=skid-overshoot instead of treating the run as deterministic" \
-           "evidence. Heavy host load makes this more likely; see both lines" \
-           "in $ARTIFACTS/chaos-buggy.out and re-run on a quieter host" >&2 ;;
+    122) explain_refusal "$ARTIFACTS/chaos-buggy.out" ;;
     124) echo "rc=124 means the ${TIMEOUT}s timeout cut the run off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest crash" >&2 ;;
   esac
@@ -257,12 +264,7 @@ fi
 if [ "$fixed_rc" -ne 0 ]; then
   echo "the fixed control did not complete: rc=$fixed_rc, no use-after-free reported" >&2
   case "$fixed_rc" in
-    122) echo "rc=122 means Hermit refused the run: a performance-counter" \
-           "interrupt arrived later than its safety margin, so it printed" \
-           "HERMIT_SKID_OVERSHOOT and HERMIT_POLICY_REFUSAL ..." \
-           "cause=skid-overshoot instead of treating the run as deterministic" \
-           "evidence. Heavy host load makes this more likely; see both lines" \
-           "in $ARTIFACTS/chaos-fixed.out and re-run on a quieter host" >&2 ;;
+    122) explain_refusal "$ARTIFACTS/chaos-fixed.out" ;;
     124) echo "rc=124 is the ${TIMEOUT}s timeout: the control was cut off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest result" >&2 ;;
     *)   echo "rc=$fixed_rc is an execution or environment failure" >&2 ;;
@@ -286,6 +288,11 @@ chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy-replay
   || replay_rc=$?
 if [ "$replay_rc" -ne 134 ]; then
   echo "replay did not complete with the ASAN abort: rc=$replay_rc, expected 134" >&2
+  case "$replay_rc" in
+    122) explain_refusal "$ARTIFACTS/chaos-buggy-replay.out" ;;
+    124) echo "rc=124 means the ${TIMEOUT}s timeout cut the run off" >&2 ;;
+    125) echo "rc=125 is a wrapper failure, not a guest crash" >&2 ;;
+  esac
   exit 1
 fi
 if ! complete_asan_uaf "$ARTIFACTS/chaos-buggy-replay.out"; then

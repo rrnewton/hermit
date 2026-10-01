@@ -88,8 +88,9 @@ file system or network deterministic.
 > all 44 runs of the demo's command over more than three hours, from 21:08 UTC on
 > 2026-09-30 to 00:19 UTC on 2026-10-01, and every report we kept from them
 > was byte-identical, with the same heap address and the same stacks.
-> (Measured with Hermit commit `dc92644f96f4` on 316 hardware threads at a
-> load average of 10 to 20; the writeup has the full table. On a shared or
+> (Measured with Hermit commit `dc92644f96f4` on 316 hardware threads. The
+> host's load was not recorded during those runs; demo 8's README gives it for
+> three later passing runs. The writeup has the full table. On a shared or
 > heavily loaded machine the crash may not reproduce reliably; see demo 8's
 > README.)
 > On a lightly loaded machine, a crash that native runs showed only in part,
@@ -195,7 +196,7 @@ boot. The groups are not balanced in length:
 | Group | Demos | Needs, beyond Hermit | How long |
 | --- | --- | --- | --- |
 | 1 | 1, 2, 3 | `cargo`, a C compiler, `python3`; `gdb` for demo 2; performance counters for demo 1's last step | 31.6 s. Demos 1, 2, and 3 took 9, 6, and 16 s. The first run in a checkout also builds the test programs, which demo 1's README puts at about 20 s more. |
-| 2 | 4, 8, 9 | Demo 4: `python3`, `timeout`. Demo 8: the assets from its `prepare-assets.sh` (a compiler with AddressSanitizer, btrfs-progs build tools, network access). Demo 9: QEMU, a static BusyBox, `cpio`, `gzip`, `curl`, performance counters | 172.1 s. Demos 4, 8, and 9 took 5, 9, and 158 s. The bounds are much longer: demo 4 gives up after 10 minutes and demo 8 allows each of its three Hermit runs 90 s. With `VERIFY=1`, demo 9 boots twice; its README measured 320 s. |
+| 2 | 4, 8, 9 | Demo 4: `python3`, `timeout`. Demo 8: the assets from its `prepare-assets.sh` (a compiler with AddressSanitizer, btrfs-progs build tools, network access). Demo 9: QEMU, a static BusyBox, `cpio`, `gzip`, `curl`, performance counters | 172.1 s. Demos 4, 8, and 9 took 5, 9, and 158 s. The bounds are much longer: demo 4 gives up after 10 minutes and demo 8 allows each of its three Hermit runs 90 s. With `VERIFY=1`, demo 9 boots twice; the run in its README took 335 s. |
 | 3 | 5, 6, 7 | QEMU with `qemu-img`, `python3`, a static BusyBox, `cpio`, `gzip`, `curl`, `file`; performance counters for demo 5; `drgn`, `bpftool`, `gcc`, and `readelf` for demo 7 | 111.1 s. Demos 5, 6, and 7 took 71, 26, and 15 s, with demo 5's and demo 6's reference runs already saved. Without them, demo 5 boots twice (three such runs took 136.8 to 147.3 s) and demo 6 resumes twice (46.0 to 46.4 s). |
 
 Measured on 2026-09-30 by running `make -C demos group1`, `group2`, and
