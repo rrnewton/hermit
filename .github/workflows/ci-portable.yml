@@ -562,10 +562,12 @@ jobs:
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
       # build.workspace_on_host already builds detcore-dbt (its first command is
-      # `cargo build --locked -p detcore-dbt`, followed by the feature-unified
-      # workspace build) and then hashes target/debug/deps/libdetcore_dbt.{so,rlib}
-      # into the prepared-Nextest record as runtime files of every -p hermit and
-      # --workspace selection. A step here used to re-run
+      # `cargo build --locked --profile validate -p detcore-dbt`, followed by
+      # the feature-unified workspace build, both in the validate profile since
+      # the one-build change d44bbbb79ac) and then hashes
+      # target/validate/deps/libdetcore_dbt.{so,rlib} into the prepared-Nextest
+      # record as runtime files of every -p hermit and --workspace selection.
+      # A step here used to re-run
       # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
       # resolves different dependency features from the workspace build (for
       # example parking_lot, bytes, syn and tracing-core), so Cargo recompiled
@@ -575,8 +577,9 @@ jobs:
       # executable, package identity, or runtime file changed", about 5 s after
       # start and before any test ran. The pack step below ships the recorded
       # runtime unchanged. Re-verify the whole prepared record here, after the
-      # last step that may touch target/debug and before anything is packed, so
-      # a later mutation fails in this producer instead of in every consumer.
+      # last step that may touch target/validate or target/debug and before
+      # anything is packed, so a later mutation fails in this producer instead
+      # of in every consumer.
       - name: Verify prepared Nextest inputs are unchanged
         run: |
           set -euo pipefail
@@ -593,23 +596,48 @@ jobs:
           # empty dir so the pack is robust — e2e cells run with --allow-empty and
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
-          test -f target/debug/deps/libdetcore_dbt.so
-          # Cargo test shards may rewrite target/debug/deps. Keep the DBT runtime
-          # in Hermit's normal install-resource location so later CLI nodes do
-          # not depend on that mutable Cargo output directory.
-          install -Dm755 target/debug/deps/libdetcore_dbt.so \
+          # build.workspace_on_host compiles Hermit once, in the validate
+          # profile (d44bbbb79ac), so hermit, verification-report and the DBT
+          # runtime are under target/validate. test-harness,
+          # hermit-manifest-plan and the Nextest CPU wrapper are dev-profile
+          # tools and stay under target/debug. Report every absent input before
+          # failing: a bare `test` under `set -e` exits 1 without a word, which
+          # is how run 36836745615 failed here when this step still named the
+          # target/debug copies.
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Pack debug prebuilt tree: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/validate/hermit
+          require -x target/debug/test-harness
+          require -x target/debug/hermit-manifest-plan
+          require -x target/validate/verification-report
+          require -x target/debug/nextest-cpu-wrapper
+          require -f target/validate/deps/libdetcore_dbt.so
+          require -x target/ci/bin/cargo-nextest
+          require -f target/ci/nextest-binaries/current.json
+          if ((missing > 0)); then
+            echo "Pack debug prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
+            exit 1
+          fi
+          # Cargo test shards may rewrite target/validate/deps, and hermit-install
+          # stages this resource as a symlink to ../../validate/libdetcore_dbt.so,
+          # which this tarball does not carry. Replace the symlink with a regular
+          # copy in Hermit's install-resource location so later CLI nodes depend
+          # on neither.
+          rm -f target/install_pkg/rsrcs/libdetcore_dbt.so
+          install -Dm755 target/validate/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
-          test -x target/debug/verification-report
-          test -x target/debug/nextest-cpu-wrapper
-          test -x target/ci/bin/cargo-nextest
-          test -f target/ci/nextest-binaries/current.json
           tar --zstd -cf "$DEBUG_TARBALL" \
-            target/debug/hermit \
+            target/validate/hermit \
             target/debug/test-harness \
             target/debug/hermit-manifest-plan \
-            target/debug/verification-report \
+            target/validate/verification-report \
             target/debug/nextest-cpu-wrapper \
-            target/debug/deps/libdetcore_dbt.so \
+            target/validate/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
             target/ci/nextest-binaries \
@@ -782,7 +810,7 @@ jobs:
           rm -f "$DEBUG_TARBALL"
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
-          test -x target/debug/hermit
+          test -x target/validate/hermit
           test -x target/release/hermit
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
       - name: Run artifact and LiteInst build nodes
@@ -920,10 +948,10 @@ jobs:
           rm -f "$DEBUG_TARBALL"
           tar --zstd -xf "$NEXTEST_TARBALL"
           rm -f "$NEXTEST_TARBALL"
-          test -x target/debug/hermit
-          test -x target/debug/verification-report
+          test -x target/validate/hermit
+          test -x target/validate/verification-report
           test -x target/debug/nextest-cpu-wrapper
-          test -f target/debug/deps/libdetcore_dbt.so
+          test -f target/validate/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
           test -f target/ci/nextest-binaries/current.json
@@ -1200,7 +1228,7 @@ jobs:
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"; rm -f "$DEBUG_TARBALL"
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
-          test -x target/debug/hermit
+          test -x target/validate/hermit
           test -x target/release/hermit
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run constructed E2E node (${{ matrix.node }})

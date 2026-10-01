@@ -267,22 +267,40 @@ workflow_step_body() {
     ' <<<"$workflow_text"
 }
 
+# build.workspace_on_host builds Hermit in the validate profile (d44bbbb79ac),
+# so hermit, verification-report and the DBT runtime must be packed from
+# target/validate. Run 36836745615 failed when this step still named the
+# target/debug copies, while this contract, which pinned the same stale path,
+# stayed green. The pack step checks each input with `require`, which names a
+# missing path and counts it, then exits 1 once every input has been checked.
+# The last four lines below are that fail-closed gate: without them a missing
+# input is reported and the tree is packed anyway.
 debug_artifact_contract() {
     local workflow_text=$1 pack_step unpack_step
-    local archive_member='            target/debug/verification-report \'
+    local archive_member='            target/validate/verification-report \'
     local cpu_wrapper_member='            target/debug/nextest-cpu-wrapper \'
     local nextest_member='            target/ci/nextest-binaries \'
     pack_step=$(workflow_step_body "Pack debug prebuilt tree" "$workflow_text")
     unpack_step=$(workflow_step_body "Unpack debug tree" "$workflow_text")
-    grep -Fqx '          test -x target/debug/verification-report' <<<"$pack_step" &&
+    grep -Fqx '          require -x target/validate/verification-report' <<<"$pack_step" &&
         grep -Fqx "$archive_member" <<<"$pack_step" &&
-        grep -Fqx '          test -x target/debug/verification-report' <<<"$unpack_step" &&
-        grep -Fqx '          test -x target/debug/nextest-cpu-wrapper' <<<"$pack_step" &&
+        grep -Fqx '          test -x target/validate/verification-report' <<<"$unpack_step" &&
+        grep -Fqx '          require -x target/debug/nextest-cpu-wrapper' <<<"$pack_step" &&
         grep -Fqx "$cpu_wrapper_member" <<<"$pack_step" &&
         grep -Fqx '          test -x target/debug/nextest-cpu-wrapper' <<<"$unpack_step" &&
-        grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$pack_step" &&
+        grep -Fqx '          require -f target/ci/nextest-binaries/current.json' <<<"$pack_step" &&
         grep -Fqx "$nextest_member" <<<"$pack_step" &&
-        grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$unpack_step"
+        grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$unpack_step" &&
+        grep -Fqx '          require -x target/validate/hermit' <<<"$pack_step" &&
+        grep -Fqx '            target/validate/hermit \' <<<"$pack_step" &&
+        grep -Fqx '          test -x target/validate/hermit' <<<"$unpack_step" &&
+        grep -Fqx '          require -f target/validate/deps/libdetcore_dbt.so' <<<"$pack_step" &&
+        grep -Fqx '            target/validate/deps/libdetcore_dbt.so \' <<<"$pack_step" &&
+        grep -Fqx '          test -f target/validate/deps/libdetcore_dbt.so' <<<"$unpack_step" &&
+        grep -Fqx '            if ! test "$1" "$2"; then' <<<"$pack_step" &&
+        grep -Fqx '              missing=$((missing + 1))' <<<"$pack_step" &&
+        grep -Fqx '          if ((missing > 0)); then' <<<"$pack_step" &&
+        grep -Fqx '            exit 1' <<<"$pack_step"
 }
 
 prepared_nextest_artifact_contract() {
@@ -528,26 +546,39 @@ workflow_wiring_contract() {
             regular pattern 'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*' "$workflow_text"
 }
 
-# check.backend_parity_suites runs target/debug/verification-report after the
-# debug tree crosses a job boundary. Guard all three parts of that contract:
+# check.backend_parity_suites_on_host runs target/validate/verification-report
+# (build.workspace_on_host builds in the validate profile) after the debug tree
+# crosses a job boundary. Guard all three parts of that contract:
 # producer existence, archive membership, and executable consumer assertion.
 # The mutation bracket proves the guard rejects the original omission instead
 # of passing merely because the binary is mentioned somewhere in the workflow.
 workflow_text=$(<"$workflow")
 if ! debug_artifact_contract "$workflow_text"; then
-    echo "check-shard-coverage.sh: FAIL — debug artifact must transport executable target/debug/verification-report" >&2
+    echo "check-shard-coverage.sh: FAIL — debug artifact must transport target/validate/{hermit,verification-report,deps/libdetcore_dbt.so} and fail closed on a missing input" >&2
     status=1
 fi
 if ! prepared_nextest_artifact_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — prepared Nextest artifact must transport every identity-bound input to all Nextest consumers" >&2
     status=1
 fi
-omitted_artifact=${workflow_text/$'            target/debug/verification-report \\\n'/}
+omitted_artifact=${workflow_text/$'            target/validate/verification-report \\\n'/}
 if [[ $omitted_artifact == "$workflow_text" ]]; then
     echo "check-shard-coverage.sh: FAIL — artifact omission fixture did not remove verification-report" >&2
     status=1
 elif debug_artifact_contract "$omitted_artifact"; then
     echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing verification-report member" >&2
+    status=1
+fi
+# Delete only the pack step's `exit 1`: the step would then report a missing
+# input and pack the tree anyway.
+pack_step_text=$(workflow_step_body "Pack debug prebuilt tree" "$workflow_text")
+open_pack_step=${pack_step_text/$'            exit 1\n'/}
+open_pack_gate=${workflow_text/"$pack_step_text"/"$open_pack_step"}
+if [[ $open_pack_step == "$pack_step_text" || $open_pack_gate == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — pack-gate mutation did not remove the pack step's exit 1" >&2
+    status=1
+elif debug_artifact_contract "$open_pack_gate"; then
+    echo "check-shard-coverage.sh: FAIL — artifact guard accepted a pack step that reports a missing input and packs anyway" >&2
     status=1
 fi
 omitted_cpu_wrapper=${workflow_text/$'            target/debug/nextest-cpu-wrapper \\\n'/}
