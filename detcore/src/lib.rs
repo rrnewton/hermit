@@ -1935,9 +1935,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         let syscall_cost_ns = syscall_time::cost_ns(call.number());
         // The backend-runtime bootstrap window. A backend-resident runtime (the
-        // LiteInst preload constructor) issues a few hundred syscalls on one
-        // thread between its validated begin trap and the trap that ends its
-        // bootstrap: the ready report, or the report that preparation failed.
+        // LiteInst preload constructor) issues hundreds to thousands of syscalls
+        // on one thread (315 for a small C program, 6,970 for emacs; see
+        // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`) between its validated
+        // begin trap and the trap that ends its bootstrap: the ready report, or
+        // the report that preparation failed.
         // Reverie reports that window only for the bootstrapping thread; every
         // other thread and every forked process sees no window.
         //
