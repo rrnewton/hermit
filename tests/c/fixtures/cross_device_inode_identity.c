@@ -6,7 +6,7 @@
 
 // ONE FILE IDENTITY IS A DEVICE AND AN INODE, NEVER AN INODE ALONE.
 //
-// Usage: cross_device_inode_identity probe|check DIR_A DIR_B
+// Usage: cross_device_inode_identity probe|check|child-maps DIR_A DIR_B
 //
 // DIR_A and DIR_B must be the roots of two fresh tmpfs mounts. Since Linux 5.9
 // each tmpfs numbers its own inodes from 1, so the first file created in each,
@@ -28,6 +28,14 @@
 // `check` asserts only things that hold on native Linux too: writing one file
 // changes that file's mtime and not the other's, and each file's
 // /proc/self/maps line reports the device and inode that `stat` reports.
+//
+// `child-maps` asserts that another process's maps line names the file THAT
+// process maps, which also holds natively. The parent maps DIR_A/f at some
+// address; a forked child maps DIR_B/g over the same address with MAP_FIXED;
+// the parent then reads /proc/<child>/maps. The parent's own mapping at that
+// address is a different file with the SAME inode number, so a reader that
+// keyed another process's line on its own record of the address would report
+// f's identity for g.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -39,6 +47,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,10 +82,14 @@ static int same_mtime(struct stat left, struct stat right) {
       left.st_mtim.tv_nsec == right.st_mtim.tv_nsec;
 }
 
-// Find the /proc/self/maps header covering `addr`; return its dev and inode.
-static void
-maps_identity(const void* addr, dev_t* dev_out, unsigned long* inode_out) {
-  FILE* maps = fopen("/proc/self/maps", "r");
+// Find the header covering `addr` in `maps_path`, a maps file; return its dev
+// and inode.
+static void maps_identity(
+    const char* maps_path,
+    const void* addr,
+    dev_t* dev_out,
+    unsigned long* inode_out) {
+  FILE* maps = fopen(maps_path, "r");
   CHECK(maps != NULL);
   char line[4096];
   while (fgets(line, sizeof(line), maps)) {
@@ -101,23 +114,25 @@ maps_identity(const void* addr, dev_t* dev_out, unsigned long* inode_out) {
     }
   }
   fclose(maps);
-  fprintf(stderr, "no /proc/self/maps line covers %p\n", addr);
+  fprintf(stderr, "no %s line covers %p\n", maps_path, addr);
   exit(1);
 }
 
 static void check_maps_agrees_with_stat(
+    const char* maps_path,
     const char* name,
     const void* mapping,
     struct stat st) {
   dev_t dev = 0;
   unsigned long inode = 0;
-  maps_identity(mapping, &dev, &inode);
+  maps_identity(maps_path, mapping, &dev, &inode);
   if (dev != st.st_dev || inode != (unsigned long)st.st_ino) {
     fprintf(
         stderr,
-        "%s: maps reports %x:%x inode %lu but stat reports %x:%x inode "
+        "%s: %s reports %x:%x inode %lu but stat reports %x:%x inode "
         "%lu\n",
         name,
+        maps_path,
         major(dev),
         minor(dev),
         inode,
@@ -128,10 +143,63 @@ static void check_maps_agrees_with_stat(
   }
 }
 
+// The `child-maps` mode; see the header comment. `fd_f` and `fd_g` are open on
+// DIR_A/f and DIR_B/g, whose raw inode numbers are equal.
+static int child_maps(int fd_f, struct stat f_st, int fd_g, struct stat g_st) {
+  void* map_f = mmap(NULL, FILE_SIZE, PROT_READ, MAP_SHARED, fd_f, 0);
+  CHECK(map_f != MAP_FAILED);
+  check_maps_agrees_with_stat("/proc/self/maps", "f", map_f, f_st);
+
+  // `ready` carries one byte once the child has mapped g; closing `done`
+  // releases the child. Either side's exit closes its ends, so a failure on
+  // one side ends the other's wait instead of hanging the run.
+  int ready[2];
+  int done[2];
+  CHECK(pipe2(ready, O_CLOEXEC) == 0);
+  CHECK(pipe2(done, O_CLOEXEC) == 0);
+  pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    CHECK(close(ready[0]) == 0);
+    CHECK(close(done[1]) == 0);
+    void* map_g =
+        mmap(map_f, FILE_SIZE, PROT_READ, MAP_SHARED | MAP_FIXED, fd_g, 0);
+    CHECK(map_g == map_f);
+    check_maps_agrees_with_stat(
+        "/proc/self/maps", "g in the child", map_g, g_st);
+    CHECK(write(ready[1], "r", 1) == 1);
+    char byte;
+    CHECK(read(done[0], &byte, 1) == 0);
+    _exit(0);
+  }
+  CHECK(close(ready[1]) == 0);
+  CHECK(close(done[0]) == 0);
+  char byte;
+  CHECK(read(ready[0], &byte, 1) == 1);
+
+  char child_maps_path[64];
+  int printed = snprintf(
+      child_maps_path, sizeof(child_maps_path), "/proc/%d/maps", (int)child);
+  CHECK(printed > 0 && printed < (int)sizeof(child_maps_path));
+  // The parent still maps f at this address; the child's line there is g.
+  check_maps_agrees_with_stat(
+      child_maps_path, "g in the child, read by the parent", map_f, g_st);
+  check_maps_agrees_with_stat(
+      "/proc/self/maps", "f after the child mapped g", map_f, f_st);
+
+  CHECK(close(done[1]) == 0);
+  int status = 0;
+  CHECK(waitpid(child, &status, 0) == child);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  printf("another process's maps line names the file it maps\n");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 4 ||
-      (strcmp(argv[1], "probe") != 0 && strcmp(argv[1], "check") != 0)) {
-    fprintf(stderr, "usage: %s probe|check DIR_A DIR_B\n", argv[0]);
+      (strcmp(argv[1], "probe") != 0 && strcmp(argv[1], "check") != 0 &&
+       strcmp(argv[1], "child-maps") != 0)) {
+    fprintf(stderr, "usage: %s probe|check|child-maps DIR_A DIR_B\n", argv[0]);
     return 2;
   }
   int fd_f = create_sized(argv[2], "f");
@@ -157,12 +225,16 @@ int main(int argc, char** argv) {
   // equal raw inode number an ordinary, legal coincidence.
   CHECK(f_before.st_dev != g_before.st_dev);
 
+  if (strcmp(argv[1], "child-maps") == 0) {
+    return child_maps(fd_f, f_before, fd_g, g_before);
+  }
+
   void* map_f = mmap(NULL, FILE_SIZE, PROT_READ, MAP_SHARED, fd_f, 0);
   CHECK(map_f != MAP_FAILED);
   void* map_g = mmap(NULL, FILE_SIZE, PROT_READ, MAP_SHARED, fd_g, 0);
   CHECK(map_g != MAP_FAILED);
-  check_maps_agrees_with_stat("f", map_f, f_before);
-  check_maps_agrees_with_stat("g", map_g, g_before);
+  check_maps_agrees_with_stat("/proc/self/maps", "f", map_f, f_before);
+  check_maps_agrees_with_stat("/proc/self/maps", "g", map_g, g_before);
 
   // Let the clock move past the creation timestamps (a coarse host clock
   // would otherwise leave f's mtime unchanged on native Linux).
@@ -192,8 +264,8 @@ int main(int argc, char** argv) {
         g_after.st_mtim.tv_nsec);
     return 1;
   }
-  check_maps_agrees_with_stat("f", map_f, f_after);
-  check_maps_agrees_with_stat("g", map_g, g_after);
+  check_maps_agrees_with_stat("/proc/self/maps", "f", map_f, f_after);
+  check_maps_agrees_with_stat("/proc/self/maps", "g", map_g, g_after);
 
   printf("cross-device files keep separate identities\n");
   return 0;

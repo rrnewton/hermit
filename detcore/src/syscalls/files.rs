@@ -8400,4 +8400,117 @@ pub(crate) mod inject_fstat_scratch {
         );
         assert_eq!(guest.thread.mapped_file_at(start), Some(identity));
     }
+
+    /// A maps header's device for the tests below: not the device `stat`
+    /// reports for any file they use, as on btrfs, where maps prints the
+    /// superblock's device and `stat` the subvolume's.
+    const HEADER_DEVICE: u64 = 0xdead_0001;
+    /// The device a seeded mapping record names: neither the header's nor
+    /// any file's.
+    const RECORD_DEVICE: u64 = 0xdead_0002;
+    /// The start of a seeded mapping record. Nothing is mapped there: the
+    /// record alone is under test.
+    const RECORDED_START: usize = 0x7e00_0000_0000;
+
+    /// A live file, its raw identity, and a maps header naming it by path
+    /// with its inode and `HEADER_DEVICE`.
+    fn mapped_path() -> (
+        tempfile::NamedTempFile,
+        RawFileId,
+        crate::procfs::MappingKey,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let identity = RawFileId::new(metadata.dev(), metadata.ino());
+        assert!(
+            ![HEADER_DEVICE, RECORD_DEVICE].contains(&identity.device),
+            "precondition: the file's device {:#x} must differ from the header's and the record's",
+            identity.device
+        );
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: identity.inode,
+            pathname: file.path().to_str().unwrap().to_owned(),
+        };
+        (file, identity, key)
+    }
+
+    // A record whose inode is not the header's describes another file -- it is
+    // stale (see `mapping_stat_identity`) -- so the path decides. Without the
+    // inode check the record would key the line on that other file.
+    #[tokio::test]
+    async fn mapping_stat_identity_discards_a_record_with_another_inode() {
+        let (_file, identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let stale = RawFileId::new(RECORD_DEVICE, identity.inode + 1);
+        guest.thread.map_file(RECORDED_START, page_size(), stale);
+
+        let result = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START])
+            .await;
+
+        assert_eq!(
+            result.expect("mapping_stat_identity failed"),
+            identity,
+            "a record with inode {} must not key a header with inode {}; the path's stat must",
+            stale.inode,
+            key.inode
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+    }
+
+    // Control for the test above: a record with the header's inode keys the
+    // line, and no stat is made.
+    #[tokio::test]
+    async fn mapping_stat_identity_uses_a_record_with_the_headers_inode() {
+        let (_file, identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let recorded = RawFileId::new(RECORD_DEVICE, identity.inode);
+        guest.thread.map_file(RECORDED_START, page_size(), recorded);
+
+        let result = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START])
+            .await;
+
+        assert_eq!(result.expect("mapping_stat_identity failed"), recorded);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    // The reader's mapping records describe only its own address space. For a
+    // snapshot of another one, even a record with the header's inode -- the
+    // same inode number on another device -- must not key the line.
+    #[tokio::test]
+    async fn another_address_spaces_maps_line_ignores_the_readers_record() {
+        use crate::procfs::MappingIdentityMinter;
+
+        let (_file, identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let recorded = RawFileId::new(RECORD_DEVICE, identity.inode);
+        guest.thread.map_file(RECORDED_START, page_size(), recorded);
+
+        let own = GuestMappingMinter::new(&tool, &mut guest, true)
+            .stat_identity(&key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            own.expect("stat_identity failed for the reader's own address space"),
+            recorded,
+            "control: the reader's own snapshot is keyed on its record"
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+
+        let other = GuestMappingMinter::new(&tool, &mut guest, false)
+            .stat_identity(&key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            other.expect("stat_identity failed for another address space"),
+            identity,
+            "another address space's line must be keyed on the path's stat, not the reader's record"
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+    }
 }
