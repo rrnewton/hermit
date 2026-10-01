@@ -392,6 +392,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/fixtures/cross_device_inode_identity.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/fixtures/cross_device_inode_identity.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite mounts two fresh tmpfs filesystems for this guest, first proves the raw inode collision under --no-virtualize-metadata, then asserts that the two files keep separate modification times and that each /proc/self/maps line agrees with stat; the mounts are setup a generic manifest cell does not express."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/fixtures/stdio_inode_identity.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/fixtures/stdio_inode_identity.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this fixture and controls descriptor replacement so it can assert ordinary inode identity on inherited standard streams; that setup is owned by the dedicated integration test."
