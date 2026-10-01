@@ -2223,7 +2223,11 @@ fn run_refuses_a_summary_json_hidden_by_the_private_tmp() {
         !stderr.contains("panicked") && !stderr.contains("class=container-child-panic"),
         "a --summary-json under the host /tmp panicked instead of being refused:\n{stderr}"
     );
-    assert_eq!(output.status.code(), Some(125), "{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{stderr}"
+    );
     assert!(stderr.contains("class=cli-error"), "{stderr}");
     assert!(
         stderr.contains(&format!(
@@ -2255,7 +2259,11 @@ fn run_refuses_a_summary_json_hidden_by_the_private_tmp() {
     ];
     let other = hermit(&other_args);
     let other_stderr = String::from_utf8_lossy(&other.stderr).into_owned();
-    assert_eq!(other.status.code(), Some(125), "{other_stderr}");
+    assert_eq!(
+        other.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{other_stderr}"
+    );
     assert!(
         other_stderr.contains("is not visible inside the run container")
             && !other_stderr.contains("panicked"),

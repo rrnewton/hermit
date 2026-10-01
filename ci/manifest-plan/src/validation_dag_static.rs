@@ -521,7 +521,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze_rejects_backend_in_its_run_arguments
     // (https://github.com/rrnewton/hermit/pull/3439) retain all 97 prior
     // selected CLI identities.
-    ("test.cli", 99),
+    // run_verify_from_a_working_directory_under_host_tmp,
+    // run_refuses_a_summary_json_hidden_by_the_private_tmp and
+    // run_ptrace_backend_engagement_from_a_working_directory_under_host_tmp
+    // (https://github.com/rrnewton/hermit/issues/3260) retain all 99 prior
+    // selected CLI identities.
+    ("test.cli", 102),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -545,7 +550,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 99),
+    // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
+    // test.cli; all 99 prior identities retained.
+    ("test.cli_on_host", 102),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
