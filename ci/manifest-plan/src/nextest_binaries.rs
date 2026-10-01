@@ -1261,17 +1261,6 @@ pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
     }
 }
 
-/// The one Cargo selection that compiles every prepared selection of a profile.
-///
-/// Separate Cargo invocations resolve dependency features separately, so each
-/// one rebuilt the shared crates it resolved differently and relinked the
-/// unhashed `hermit` executable, and every later selection whose tests depend on
-/// that executable then rebuilt too. At d44bbbb79acd the sixteen `full`
-/// selections took about 520 of the producer's 830 seconds that way. One
-/// selection is its own union. Several are compiled as the whole workspace with
-/// all targets and the union of their package-qualified features, which is also
-/// exactly the workspace build the validate-profile producers run first (see
-/// [`unifies`]), so preparation then compiles nothing new.
 /// Whether `prepare` compiles this profile's selections as one unified listing.
 ///
 /// Only the validate-profile graph profiles do: their producers build the whole
@@ -1305,6 +1294,17 @@ fn listings(
         .collect())
 }
 
+/// The one Cargo selection that compiles every prepared selection of a profile.
+///
+/// Separate Cargo invocations resolve dependency features separately, so each
+/// one rebuilt the shared crates it resolved differently and relinked the
+/// unhashed `hermit` executable, and every later selection whose tests depend on
+/// that executable then rebuilt too. At d44bbbb79acd the sixteen `full`
+/// selections took about 520 of the producer's 830 seconds that way. One
+/// selection is its own union. Several are compiled as the whole workspace with
+/// all targets and the union of their package-qualified features, which is also
+/// exactly the workspace build the validate-profile producers run first (see
+/// [`unifies`]), so preparation then compiles nothing new.
 pub fn unified_selection(
     selections: &BTreeMap<String, Vec<String>>,
 ) -> Result<Vec<String>, String> {
@@ -1459,6 +1459,24 @@ impl CargoSelection {
             || (self.bins && kind == "bin")
             || (kind == "test" && self.named_tests.iter().any(|test| test == name))
     }
+}
+
+/// A listing of exactly one selection must hand that selection every
+/// executable Cargo listed for it; a smaller subset means the matcher and
+/// Cargo disagree about the selection's targets.
+fn require_listing_kept(
+    listing: &[String],
+    selection: &[String],
+    listed: &Value,
+    metadata: &Value,
+) -> Result<(), String> {
+    let count = |value: &Value| value["rust-binaries"].as_object().map(|b| b.len());
+    if selection == listing && count(metadata) != count(listed) {
+        return Err(format!(
+            "the prepared subset of {listing:?} drops executables Cargo listed for it"
+        ));
+    }
+    Ok(())
 }
 
 /// The nextest kind of a Cargo target: every library crate type is `lib`.
@@ -1648,15 +1666,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         let listed = read_json(&listing_path)?;
         for key in keys {
             let metadata = selection_metadata(&listed, &cargo, &selections[&key])?;
-            if selections[&key] == listing
-                && metadata["rust-binaries"].as_object().map(|b| b.len())
-                    != listed["rust-binaries"].as_object().map(|b| b.len())
-            {
-                return Err(format!(
-                    "the prepared subset of {listing:?} drops executables Cargo listed for it"
-                )
-                .into());
-            }
+            require_listing_kept(&listing, &selections[&key], &listed, &metadata)?;
             fs::write(
                 generation.join(format!("{key}.json")),
                 serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
@@ -2037,7 +2047,7 @@ mod tests {
     fn membership_fixture() -> (Value, Value) {
         let target = |name: &str, kind: &str, test: bool| serde_json::json!({"name": name, "kind": [kind], "test": test});
         let cargo = serde_json::json!({
-            "workspace_members": ["id-a", "id-b"],
+            "workspace_members": ["id-a", "id-b", "id-pm"],
             "packages": [
                 {"name": "a", "id": "id-a", "targets": [
                     target("a", "lib", true), target("tool", "bin", true),
@@ -2047,6 +2057,7 @@ mod tests {
                 {"name": "b", "id": "id-b", "targets": [
                     target("b", "lib", true), target("t1", "test", true)
                 ]},
+                {"name": "pm", "id": "id-pm", "targets": [target("pm", "proc-macro", true)]},
                 {"name": "dep", "id": "id-dep", "targets": [target("dep", "lib", true)]}
             ]
         });
@@ -2066,6 +2077,7 @@ mod tests {
             binary("a::t2", "id-a", "t2", "test"),
             binary("b", "id-b", "b", "lib"),
             binary("b::t1", "id-b", "t1", "test"),
+            binary("pm", "id-pm", "pm", "proc-macro"),
         ]
         .into_iter()
         .collect::<serde_json::Map<_, _>>();
@@ -2093,6 +2105,8 @@ mod tests {
         let (unified, cargo) = membership_fixture();
         let cases: &[(&str, &[&str])] = &[
             ("-p a --lib", &["a"]),
+            ("-p pm --lib", &["pm"]),
+            ("--workspace --exclude a --exclude b", &["pm"]),
             ("-p a --test t1", &["a::t1"]),
             ("-p a -p b --test t1", &["a::t1", "b::t1"]),
             ("-p a --bins", &["a::bin/guest", "a::bin/tool"]),
@@ -2100,12 +2114,12 @@ mod tests {
             // No target selector: every target whose manifest `test` flag is
             // set, so the untested guest binary is not a member.
             (
-                "--workspace --exclude b",
+                "--workspace --exclude b --exclude pm",
                 &["a", "a::bin/tool", "a::t1", "a::t2"],
             ),
             ("-p a --tests", &["a", "a::bin/tool", "a::t1", "a::t2"]),
             (
-                "--workspace --all-targets",
+                "--workspace --all-targets --exclude pm",
                 &[
                     "a",
                     "a::bin/guest",
@@ -2133,6 +2147,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["id-a"]
         );
+    }
+
+    #[test]
+    fn a_one_selection_listing_must_keep_every_executable_cargo_listed() {
+        let (unified, cargo) = membership_fixture();
+        let all = args("--workspace --all-targets");
+        let kept = selection_metadata(&unified, &cargo, &all).unwrap();
+        require_listing_kept(&all, &all, &unified, &kept).unwrap();
+        // The matcher keeping less than Cargo listed is a disagreement.
+        let lib = args("-p a --lib");
+        let fewer = selection_metadata(&unified, &cargo, &lib).unwrap();
+        let error = require_listing_kept(&lib, &lib, &unified, &fewer).unwrap_err();
+        assert!(error.contains("drops executables Cargo listed"), "{error}");
+        // A subset of a unified listing is expected and not checked here.
+        require_listing_kept(&all, &lib, &unified, &fewer).unwrap();
     }
 
     #[test]

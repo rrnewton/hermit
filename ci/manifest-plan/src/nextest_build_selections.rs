@@ -624,6 +624,88 @@ mod tests {
     }
 
     #[test]
+    fn a_unifying_producer_must_end_with_exactly_its_union_build() {
+        let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_producers_build_the_unified_selection(&graph).unwrap();
+        let mutated = |edit: &dyn Fn(&str) -> String| {
+            let mut changed = graph.clone();
+            let producer = changed
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == "build.workspace_in_pinned_root")
+                .unwrap();
+            producer.cmd = edit(&producer.cmd);
+            assert_ne!(
+                producer.cmd,
+                graph
+                    .steps
+                    .iter()
+                    .find(|s| s.tag() == "build.workspace_in_pinned_root")
+                    .unwrap()
+                    .cmd
+            );
+            assert_producers_build_the_unified_selection(&changed).unwrap_err()
+        };
+        // A second Hermit link between the union build and preparation.
+        let relinked = mutated(&|cmd| {
+            cmd.replace(
+                " && ./ci/nextest-binaries.rs prepare full",
+                " && cargo build --locked --profile validate -p hermit --bin hermit && ./ci/nextest-binaries.rs prepare full",
+            )
+        });
+        assert!(
+            relinked.contains("must end with its unified workspace build"),
+            "{relinked}"
+        );
+        // A workspace build whose features are not the union.
+        let narrowed = mutated(&|cmd| cmd.replace("hermit/kvm-execution-tests,", ""));
+        assert!(
+            narrowed.contains("must end with its unified workspace build"),
+            "{narrowed}"
+        );
+
+        // A union that no longer carries the third-party backends: every
+        // selection drops the feature, and the producer follows the union, so
+        // only the backend requirement refuses it.
+        let mut stripped = graph.clone();
+        for step in &mut stripped.steps {
+            let Some(raw) = step.env.get(SELECTION_ENV).cloned() else {
+                continue;
+            };
+            let mut args: Vec<String> = serde_json::from_str(&raw).unwrap();
+            if let Some(index) = args.iter().position(|arg| arg == "--features") {
+                let kept = args[index + 1]
+                    .split(',')
+                    .filter(|feature| *feature != "third-party-backends")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if kept.is_empty() {
+                    args.drain(index..=index + 1);
+                } else {
+                    args[index + 1] = kept;
+                }
+            }
+            step.env
+                .insert(SELECTION_ENV.into(), serde_json::to_string(&args).unwrap());
+        }
+        for profile in ["full", crate::validation_dag::HOSTED_PORTABLE_LABEL] {
+            let before =
+                crate::nextest_binaries::unified_prebuild_command(&graph, profile).unwrap();
+            let after =
+                crate::nextest_binaries::unified_prebuild_command(&stripped, profile).unwrap();
+            assert!(!after.contains("third-party-backends"), "{after}");
+            for step in &mut stripped.steps {
+                step.cmd = step.cmd.replace(&before, &after);
+            }
+        }
+        let error = assert_producers_build_the_unified_selection(&stripped).unwrap_err();
+        assert!(
+            error.contains("without hermit/third-party-backends"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn prepared_metadata_requires_the_consumers_filesystem_root() {
         let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         assert_preparation_dependencies(&graph).unwrap();

@@ -370,7 +370,7 @@ jobs:
           sudo apt-get install -y liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
-      # check.lint_checks runs the real structured-Nextest fixture.  Installing
+      # check.script_unit_tests runs the real structured-Nextest fixture.  Installing
       # rust-script alone made that fixture fail with "no such command:
       # nextest" on run 35335623037; the fixture is a test of the production
       # adapter, not a reason to replace it with a mock in hosted CI.
@@ -401,7 +401,7 @@ jobs:
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           ./ci/prepare-rust-scripts.sh --check
-      # selftest.scorecard_commands and check.lint_checks (which runs every
+      # selftest.scorecard_commands and check.script_unit_tests (which runs every
       # rust-script test suite) both read the pinned ledger corpus and never
       # fetch, so this job prepares it. Run 36485831200 omitted it here: the corpus test failed
       # and 14 unrelated scorecard tests failed behind it on the poisoned
@@ -413,7 +413,7 @@ jobs:
           set -euo pipefail
           corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
           printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
-      # check.lint_checks runs scripts/build-buck-release.rs's tests, two of
+      # check.script_unit_tests runs scripts/build-buck-release.rs's tests, two of
       # which enter the exact `unshare --user --map-root-user --mount` stage the
       # matrix proxy composes. Ubuntu 24.04 runners restrict unprivileged user
       # namespaces through AppArmor, so run 36499357369 failed both with

@@ -338,7 +338,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // selection_membership_follows_cargo_target_selection,
     // selection_membership_refuses_an_empty_or_unknown_selection) retain all
     // 728 prior identities.
-    ("test.regular_crates", 734),
+    // nextest_binaries::tests::a_one_selection_listing_must_keep_every_executable_cargo_listed
+    // and nextest_build_selections::tests::a_unifying_producer_must_end_with_exactly_its_union_build
+    // retain all 734 prior identities.
+    ("test.regular_crates", 736),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -489,7 +492,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 734),
+    ("test.regular_crates_on_host", 736),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -1442,7 +1445,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"check"########,
         job: r########"script_unit_tests"########,
         desc: r########"Run the unit tests carried by every test-bearing rust-script entrypoint"########,
-        description: r########"Runs scripts/run-script-tests.sh: the #[cfg(test)] unit tests of every tracked rust-script entrypoint that has them (discovered from the tree, not listed), using the test harnesses build.rust_scripts compiled, so nothing is compiled here. The harnesses are independent processes; up to HERMIT_SCRIPT_TEST_JOBS of them run at once, which dagrun sets to this node's 8-core width, and each harness's output is printed whole in discovery order. Until 2026-09-30 they ran serially inside check.lint_checks under that node's one-core CPU cap, where they took about 890 of its 1,194 seconds at d44bbbb79acd. The slowest harness, ci/compat-envelope/scorecard.rs, bounds this node's wall time."########,
+        description: r########"Runs scripts/run-script-tests.sh: the #[cfg(test)] unit tests of every tracked rust-script entrypoint that has them (discovered from the tree, not listed), using the test harnesses build.rust_scripts compiled, so nothing is compiled here. The harnesses are independent processes; up to HERMIT_SCRIPT_TEST_JOBS of them run at once, which dagrun sets to this node's 8-core width, and each harness's stdout and stderr are printed whole, on their own streams, as soon as it finishes. Until 2026-09-30 they ran serially inside check.lint_checks under that node's one-core CPU cap, where they took about 890 of its 1,194 seconds at d44bbbb79acd. The slowest harness, ci/compat-envelope/scorecard.rs, bounds this node's wall time."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
