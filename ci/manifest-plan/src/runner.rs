@@ -363,12 +363,22 @@ pub struct ModeRecipe {
     /// requires `comparator_reason` and is recorded.
     pub comparator: Option<Comparator>,
     pub comparator_reason: Option<String>,
+    /// Backends on which this verify cell is a DIAGNOSTIC, each with the
+    /// standing reason: a product failure of the cell is reported and counted
+    /// as a diagnostic failure, recorded as a relaxation, and does not fail
+    /// the run. Every other outcome keeps its meaning, so an ERROR (the cell
+    /// could not produce a product verdict) still fails it. Only a
+    /// `comparator: stripped` cell may declare one: a canonical cell exists to
+    /// supply L2 evidence, and its divergence must keep failing.
+    #[serde(default)]
+    pub diagnostic: BTreeMap<String, String>,
 }
 
 /// A stripped cell's report must hold the comparison it declared: Hermit's
-/// stripped log comparison over a non-empty event stream on both runs. A
-/// report without one is incomplete evidence, never a pass.
-fn require_stripped_comparison(report: &VerificationReport) -> Result<(), String> {
+/// stripped log comparison, with virtual time, over a non-empty event stream
+/// on both runs. A report without one is incomplete evidence, never a pass.
+/// The scorecard admits a stripped PASS by this same rule.
+pub fn require_stripped_comparison(report: &VerificationReport) -> Result<(), String> {
     let counts = report.compared_log_messages.as_ref();
     let Some(comparison) = report.comparison.as_ref() else {
         return Err(format!(
@@ -378,19 +388,28 @@ fn require_stripped_comparison(report: &VerificationReport) -> Result<(), String
     };
     if comparison.strictness == crate::canonical_verdict::LogCompareStrictness::Stripped
         && comparison.compare_logs
+        && comparison.virtualize_time == Some(true)
         && counts.is_some_and(|counts| counts.left > 0 && counts.right > 0)
     {
         Ok(())
     } else {
         Err(format!(
-            "stripped verification did not compare non-vacuous stripped evidence: strictness={} compare_logs={} messages={}/{}",
+            "stripped verification did not compare non-vacuous stripped evidence with virtual time: strictness={} compare_logs={} virtualize_time={:?} messages={}/{}",
             comparison.strictness,
             comparison.compare_logs,
+            comparison.virtualize_time,
             counts.map_or(0, |counts| counts.left),
             counts.map_or(0, |counts| counts.right),
         ))
     }
 }
+
+/// The report the real Hermit wrote for `run --strict --verify
+/// --base-env=minimal -- /bin/echo hermit-compat` at hermit d44bbbb79acd
+/// (validate profile): its default, stripped comparison. One copy for every
+/// test that reads a stripped report (runner, ledger cell verdict, schema 10).
+#[cfg(test)]
+pub(crate) const PRODUCER_STRIPPED_REPORT: &str = r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","no_result_reason":null,"infrastructure_error":null,"comparison":{"strictness":"stripped","display_name":"Stripped","compare_logs":true,"compare_io_buffers":true,"log_scope":"deterministic","record_envelope":"all_records_v1","virtualize_time":true,"strip_lines":true,"canonicalize_addresses":false,"full_trace":false,"exact_remainder":false,"stripped_prefixes":["real-wall-clock-prefix/v1","unsafe-numeric-address-and-path-normalization/v1"],"canonicalizations":[],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":243,"right":243},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0},"right":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0}},"runtime":{"run1":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40},"run2":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40}},"guest_exit_code":0,"guest_signal":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_left_message":null,"first_divergent_right_message":null}"#;
 
 /// The comparison a verify cell requires; see [`ModeRecipe::comparator`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1732,11 +1751,109 @@ fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     if recipe.comparator == Some(Comparator::Stripped) {
         relaxations.push(format!(
-            "comparator=stripped: {}",
+            "{STRIPPED_COMPARATOR_RELAXATION_PREFIX}{}",
             reason(&recipe.comparator_reason)
         ));
     }
+    if let Some(reason) = cell_diagnostic_reason(cell) {
+        relaxations.push(format!("{DIAGNOSTIC_RELAXATION_PREFIX}{reason}"));
+    }
     relaxations
+}
+
+/// The relaxation that records a stripped-comparator cell and its reason. The
+/// ledger reads it back to judge the cell by the comparison it declared.
+pub const STRIPPED_COMPARATOR_RELAXATION_PREFIX: &str = "comparator=stripped: ";
+
+/// The relaxation that records a diagnostic cell and its reason. It is the
+/// one place a result row says which cell was diagnostic, so
+/// [`diagnostic_failure_reason`] reads it back by this exact prefix.
+const DIAGNOSTIC_RELAXATION_PREFIX: &str = "diagnostic (a product failure does not fail the run): ";
+
+/// The manifest's diagnostic reason for this cell's backend, if it is one.
+fn cell_diagnostic_reason(cell: &SelectedCell) -> Option<&str> {
+    let backend = cell.id.backend.as_deref()?;
+    cell.test.modes[&cell.id.mode]
+        .diagnostic
+        .get(backend)
+        .map(String::as_str)
+}
+
+/// Whether the manifest declares this cell a diagnostic on its backend.
+pub fn is_diagnostic_cell(cell: &SelectedCell) -> bool {
+    cell.enabled && cell_diagnostic_reason(cell).is_some()
+}
+
+/// A result row's classification: `disabled` for a cell outside
+/// `backends_enabled`, `diagnostic` for an enabled cell the manifest declares
+/// diagnostic on this backend, `required` for every other enabled cell.
+fn cell_classification(cell: &SelectedCell) -> &'static str {
+    if !cell.enabled {
+        "disabled"
+    } else if cell_diagnostic_reason(cell).is_some() {
+        "diagnostic"
+    } else {
+        "required"
+    }
+}
+
+/// The reason one cell's attempt history ends in a NON-BLOCKING diagnostic
+/// failure, or `None` when it must count as an ordinary result.
+///
+/// Only a history whose LAST attempt is a measured FAIL of a `diagnostic`
+/// cell qualifies: a product failure, or the cell exceeding its own time
+/// budget (a timed-out compatibility probe was a product failure of its node
+/// before these probes became cells). A PASS is a pass; an ERROR, or a FAIL
+/// with any other no-result cause, keeps failing the run, including an ERROR
+/// retry after a product FAIL, as does a diagnostic row that lost its
+/// recorded reason.
+pub fn diagnostic_failure_reason(history: &[CellResult]) -> Option<&str> {
+    row_diagnostic_reason(history.last()?)
+}
+
+fn row_diagnostic_reason(result: &CellResult) -> Option<&str> {
+    terminal_diagnostic_reason(
+        &result.classification,
+        &result.outcome,
+        result.failure_class,
+        result.result,
+        &result.relaxations,
+    )
+}
+
+/// The row-level rule behind [`diagnostic_failure_reason`], over the fields a
+/// result reader has: a measured FAIL (a product failure, or a timeout) of a
+/// `diagnostic` cell whose relaxations record exactly one non-blank
+/// diagnostic reason. The scorecard applies it to the terminal attempt's row.
+pub fn terminal_diagnostic_reason<'a>(
+    classification: &str,
+    outcome: &str,
+    failure_class: Option<FailureClass>,
+    result: Option<ObservedResult>,
+    relaxations: &'a [String],
+) -> Option<&'a str> {
+    let measured = failure_class == Some(FailureClass::ProductFailure)
+        || result == Some(ObservedResult::Timeout);
+    if classification != "diagnostic" || outcome != "FAIL" || !measured {
+        return None;
+    }
+    recorded_relaxation_reason(relaxations, DIAGNOSTIC_RELAXATION_PREFIX)
+}
+
+/// Whether relaxations record the stripped comparator with a reason.
+pub fn records_stripped_comparator(relaxations: &[String]) -> bool {
+    recorded_relaxation_reason(relaxations, STRIPPED_COMPARATOR_RELAXATION_PREFIX).is_some()
+}
+
+/// The reason of the one non-blank relaxation with `prefix`; `None` when there
+/// is none, or more than one, since the runner records each at most once.
+fn recorded_relaxation_reason<'a>(relaxations: &'a [String], prefix: &str) -> Option<&'a str> {
+    let mut reasons = relaxations
+        .iter()
+        .filter_map(|relaxation| relaxation.strip_prefix(prefix))
+        .filter(|reason| !reason.trim().is_empty());
+    let reason = reasons.next()?;
+    reasons.next().is_none().then_some(reason)
 }
 
 fn ci_selection(recipe: &ModeRecipe) -> Result<CiSelection, String> {
@@ -5086,7 +5203,7 @@ fn run_cell_inner(
         // `ci` controls ordinary validate selection, not whether a manual red
         // measurement is real. Pressure re-runs enabled ci=false cells and
         // must be able to admit their evidence under the same identity.
-        classification: if cell.enabled { "required" } else { "disabled" }.into(),
+        classification: cell_classification(cell).into(),
         outcome,
         result,
         failure_class,
@@ -5165,7 +5282,7 @@ pub fn infrastructure_error_result(
         lane: cell.test.lane.clone(),
         mode: cell.id.mode.clone(),
         backend: cell.id.backend.clone(),
-        classification: if cell.enabled { "required" } else { "disabled" }.into(),
+        classification: cell_classification(cell).into(),
         outcome: "ERROR".into(),
         result: None,
         failure_class: Some(FailureClass::UnderstoodInfrastructureFailure),
@@ -5240,7 +5357,7 @@ pub fn host_inapplicable_result(
         lane: cell.test.lane.clone(),
         mode: cell.id.mode.clone(),
         backend: cell.id.backend.clone(),
-        classification: if cell.enabled { "required" } else { "disabled" }.into(),
+        classification: cell_classification(cell).into(),
         outcome: "HOST-INAPPLICABLE".into(),
         result: None,
         failure_class: Some(FailureClass::UnderstoodPrerequisiteFailure),
@@ -5720,10 +5837,11 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         || recipe.hermit_args_reason.is_some()
         || !recipe.env.is_empty()
         || recipe.comparator.is_some()
-        || recipe.comparator_reason.is_some();
+        || recipe.comparator_reason.is_some()
+        || !recipe.diagnostic.is_empty();
     if extends && mode != "verify" {
         return Err(format!(
-            "{id}: {mode} declares hermit_args, env or comparator, which only a verify mode accepts"
+            "{id}: {mode} declares hermit_args, env, comparator or diagnostic, which only a verify mode accepts"
         ));
     }
     // Each flag at most once. An exact repeat would repeat a relaxation
@@ -5810,6 +5928,23 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         return Err(format!(
             "{id}: comparator stripped cannot establish the bitwise_parity it asserts"
         ));
+    }
+    for (backend, reason) in &recipe.diagnostic {
+        if !stripped {
+            return Err(format!(
+                "{id}: diagnostic is only for comparator stripped cells; a canonical cell's failure must fail the run"
+            ));
+        }
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: diagnostic names backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if reason.trim().is_empty() || reason.trim() != reason {
+            return Err(format!(
+                "{id}: diagnostic on `{backend}` requires a substantive, trimmed reason"
+            ));
+        }
     }
     Ok(())
 }
@@ -6524,6 +6659,38 @@ mod tests {
             "verify",
             "not a valid NAME=VALUE",
         );
+        // A diagnostic is accepted only on an enabled backend of a stripped
+        // cell, with a substantive reason, and only in verify.
+        let diagnostic = || BTreeMap::from([("ptrace".into(), "bounded probe".into())]);
+        let mut with_diagnostic = accepted.clone();
+        with_diagnostic.diagnostic = diagnostic();
+        validate_mode_extensions("fixture/test", "verify", &with_diagnostic).unwrap();
+        refused(
+            &|r| r.diagnostic = diagnostic(),
+            "replay",
+            "only a verify mode accepts",
+        );
+        refused(
+            &|r| {
+                r.diagnostic = diagnostic();
+                r.comparator = None;
+                r.comparator_reason = None;
+            },
+            "verify",
+            "a canonical cell's failure must fail the run",
+        );
+        refused(
+            &|r| r.diagnostic = BTreeMap::from([("kvm".into(), "bounded probe".into())]),
+            "verify",
+            "not in backends_enabled",
+        );
+        for reason in ["", " ", " padded"] {
+            refused(
+                &|r| r.diagnostic = BTreeMap::from([("ptrace".into(), reason.into())]),
+                "verify",
+                "requires a substantive, trimmed reason",
+            );
+        }
         // The validation is wired into document loading, not only callable.
         let five_modes = || {
             let mut test = recipe(true);
@@ -6775,10 +6942,7 @@ mod tests {
         assert_eq!(stripped.comparator, Comparator::Stripped);
     }
 
-    /// The report the real Hermit wrote for `run --strict --verify
-    /// --base-env=minimal -- /bin/echo hermit-compat` at hermit d44bbbb79acd
-    /// (validate profile): its default, stripped comparison.
-    const PRODUCER_STRIPPED_REPORT: &str = r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","no_result_reason":null,"infrastructure_error":null,"comparison":{"strictness":"stripped","display_name":"Stripped","compare_logs":true,"compare_io_buffers":true,"log_scope":"deterministic","record_envelope":"all_records_v1","virtualize_time":true,"strip_lines":true,"canonicalize_addresses":false,"full_trace":false,"exact_remainder":false,"stripped_prefixes":["real-wall-clock-prefix/v1","unsafe-numeric-address-and-path-normalization/v1"],"canonicalizations":[],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":243,"right":243},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0},"right":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0}},"runtime":{"run1":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40},"run2":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40}},"guest_exit_code":0,"guest_signal":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_left_message":null,"first_divergent_right_message":null}"#;
+    use super::PRODUCER_STRIPPED_REPORT;
 
     #[test]
     fn a_stripped_cell_passes_only_a_matched_report_and_a_strict_one_still_needs_canonical() {
@@ -6815,6 +6979,12 @@ mod tests {
             {
                 let mut report = matched.clone();
                 report.compared_log_messages.as_mut().unwrap().right = 0;
+                report
+            },
+            // Without virtual time it is not the comparison a verify cell runs.
+            {
+                let mut report = matched.clone();
+                report.comparison.as_mut().unwrap().virtualize_time = Some(false);
                 report
             },
         ] {
@@ -10844,6 +11014,80 @@ backends_disabled:
             reason: None,
             artifact_dir: "/repo/artifacts".into(),
             expected_guest_exit: None,
+        }
+    }
+
+    #[test]
+    fn only_a_reasoned_product_failure_of_a_diagnostic_cell_is_a_diagnostic_failure() {
+        let reason = "bounded probe";
+        let diagnostic = |outcome: &str, class: Option<FailureClass>, relaxations: Vec<String>| {
+            let mut row = cell_result_that_located_nothing();
+            row.classification = "diagnostic".into();
+            row.outcome = outcome.into();
+            row.failure_class = class;
+            row.relaxations = relaxations;
+            row
+        };
+        let recorded = || vec![format!("{DIAGNOSTIC_RELAXATION_PREFIX}{reason}")];
+        let failure = diagnostic("FAIL", Some(FailureClass::ProductFailure), recorded());
+        assert_eq!(
+            diagnostic_failure_reason(std::slice::from_ref(&failure)),
+            Some(reason)
+        );
+        // The cell exceeding its own budget is a measured failure too.
+        let mut timeout = diagnostic("FAIL", Some(FailureClass::NoResult), recorded());
+        timeout.result = Some(ObservedResult::Timeout);
+        timeout.error_kind = Some("wall-timeout".into());
+        assert_eq!(diagnostic_failure_reason(&[timeout]), Some(reason));
+        assert_eq!(diagnostic_failure_reason(&[]), None);
+        // A retried product failure that ends in an ERROR has no terminal product verdict.
+        let mut error_retry = diagnostic("ERROR", Some(FailureClass::NoResult), recorded());
+        error_retry.attempt = 2;
+        assert_eq!(
+            diagnostic_failure_reason(&[failure.clone(), error_retry]),
+            None
+        );
+        let mut fail_retry = failure.clone();
+        fail_retry.attempt = 2;
+        assert_eq!(
+            diagnostic_failure_reason(&[failure.clone(), fail_retry]),
+            Some(reason)
+        );
+        let mut required = failure.clone();
+        required.classification = "required".into();
+        for (name, row) in [
+            ("a required cell", required),
+            ("a pass", diagnostic("PASS", None, recorded())),
+            (
+                "an error",
+                diagnostic("ERROR", Some(FailureClass::NoResult), recorded()),
+            ),
+            (
+                "a FAIL with no product verdict that is not a timeout",
+                diagnostic("FAIL", Some(FailureClass::NoResult), recorded()),
+            ),
+            (
+                "an infrastructure failure",
+                diagnostic(
+                    "FAIL",
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                    recorded(),
+                ),
+            ),
+            (
+                "a row that lost its reason",
+                diagnostic("FAIL", Some(FailureClass::ProductFailure), Vec::new()),
+            ),
+            (
+                "a row with two reasons",
+                diagnostic(
+                    "FAIL",
+                    Some(FailureClass::ProductFailure),
+                    [recorded(), recorded()].concat(),
+                ),
+            ),
+        ] {
+            assert_eq!(diagnostic_failure_reason(&[row]), None, "{name}");
         }
     }
 

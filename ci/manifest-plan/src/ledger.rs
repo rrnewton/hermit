@@ -522,6 +522,26 @@ impl ComparisonSpec {
             && counts.left > 0
             && counts.right > 0
     }
+
+    /// Whether this is the stripped comparison a verify cell that declared
+    /// `comparator: stripped` must carry: Hermit's stripped log comparison,
+    /// with virtual time, over a non-empty event stream on both runs. Such a
+    /// cell's compared verdict has tier `ExitAndStreamEquality` and is never
+    /// canonical evidence; the runner and the scorecard require the same
+    /// shape of the report they read.
+    pub fn is_stripped_verify_comparison(
+        &self,
+        compared_log_messages: &RequiredNullable<ComparedLogCounts>,
+    ) -> bool {
+        let RequiredNullable::Value(counts) = compared_log_messages else {
+            return false;
+        };
+        self.strictness == ComparisonStrictness::Stripped
+            && self.compare_logs
+            && self.virtualize_time == Some(true)
+            && counts.left > 0
+            && counts.right > 0
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1333,6 +1353,11 @@ impl TestResultsValue {
 pub enum TestResultVerdict {
     Pass,
     Fail,
+    /// A failed test its producer declared a non-blocking diagnostic (dagrun
+    /// structured-result schema 4). It is not a pass, and it is not counted in
+    /// `failed_tests`: `TestResultTotals::diagnostic_failed_tests` counts it.
+    #[serde(rename = "diagnostic_fail")]
+    DiagnosticFail,
 }
 
 /// One producer-owned terminal test row in the retained JSONL artifact.
@@ -1458,6 +1483,15 @@ pub struct TestResultTotals {
     pub passed_tests: u64,
     pub failed_tests: u64,
     pub filtered_tests: u64,
+    /// Executed tests that failed as declared non-blocking diagnostics; not in
+    /// `passed_tests` or `failed_tests`. Omitted when zero, so every artifact
+    /// without one keeps its existing bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub diagnostic_failed_tests: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1536,6 +1570,7 @@ struct RecomputedTestResultCounts {
     executed_tests: u64,
     passed_tests: u64,
     failed_tests: u64,
+    diagnostic_failed_tests: u64,
 }
 
 impl RecomputedTestResultCounts {
@@ -1547,6 +1582,7 @@ impl RecomputedTestResultCounts {
         let count = match verdict {
             TestResultVerdict::Pass => &mut self.passed_tests,
             TestResultVerdict::Fail => &mut self.failed_tests,
+            TestResultVerdict::DiagnosticFail => &mut self.diagnostic_failed_tests,
         };
         *count = count
             .checked_add(1)
@@ -1575,6 +1611,7 @@ fn checked_summary(summary: &TestResultTotals, row_count: u64) -> Result<(), Str
     if summary
         .passed_tests
         .checked_add(summary.failed_tests)
+        .and_then(|total| total.checked_add(summary.diagnostic_failed_tests))
         .ok_or_else(|| "test-results pass/fail total overflowed u64".to_string())?
         != summary.executed_tests
     {
@@ -1654,6 +1691,7 @@ impl TestResultsEvidenceV9 {
             passed_tests: 0,
             failed_tests: 0,
             filtered_tests: 0,
+            diagnostic_failed_tests: 0,
         };
         let mut recorded_count = 0u64;
         let mut add = |summary: &TestResultTotals, row_count: u64| -> Result<(), String> {
@@ -1674,6 +1712,10 @@ impl TestResultsEvidenceV9 {
                 .filtered_tests
                 .checked_add(summary.filtered_tests)
                 .ok_or("schema 9 filtered_tests overflowed u64")?;
+            totals.diagnostic_failed_tests = totals
+                .diagnostic_failed_tests
+                .checked_add(summary.diagnostic_failed_tests)
+                .ok_or("schema 9 diagnostic_failed_tests overflowed u64")?;
             recorded_count = recorded_count
                 .checked_add(row_count)
                 .ok_or("schema 9 recorded_count overflowed u64")?;
@@ -1887,6 +1929,7 @@ impl TestResultsEvidenceV9 {
             passed_tests: 0,
             failed_tests: 0,
             filtered_tests: 0,
+            diagnostic_failed_tests: 0,
         };
         let mut add_verified = |counts: RecomputedTestResultCounts,
                                 filtered_tests: u64|
@@ -1896,6 +1939,7 @@ impl TestResultsEvidenceV9 {
                 passed_tests: counts.passed_tests,
                 failed_tests: counts.failed_tests,
                 filtered_tests,
+                diagnostic_failed_tests: counts.diagnostic_failed_tests,
             };
             verified_totals.executed_tests = verified_totals
                 .executed_tests
@@ -1913,6 +1957,10 @@ impl TestResultsEvidenceV9 {
                 .filtered_tests
                 .checked_add(totals.filtered_tests)
                 .ok_or("schema 9 verified filtered_tests overflowed u64")?;
+            verified_totals.diagnostic_failed_tests = verified_totals
+                .diagnostic_failed_tests
+                .checked_add(totals.diagnostic_failed_tests)
+                .ok_or("schema 9 verified diagnostic_failed_tests overflowed u64")?;
             Ok(totals)
         };
 
@@ -1928,6 +1976,7 @@ impl TestResultsEvidenceV9 {
                 || recomputed.executed_tests != summary.totals.executed_tests
                 || recomputed.passed_tests != summary.totals.passed_tests
                 || recomputed.failed_tests != summary.totals.failed_tests
+                || recomputed.diagnostic_failed_tests != summary.totals.diagnostic_failed_tests
             {
                 return Err(format!(
                     "schema 9 test-results artifact totals differ for producer {}",
@@ -1955,6 +2004,7 @@ impl TestResultsEvidenceV9 {
                     || recomputed.executed_tests != summary.totals.executed_tests
                     || recomputed.passed_tests != summary.totals.passed_tests
                     || recomputed.failed_tests != summary.totals.failed_tests
+                    || recomputed.diagnostic_failed_tests != summary.totals.diagnostic_failed_tests
                 {
                     return Err(
                         "schema 9 test-results artifact totals differ for compatibility producer"

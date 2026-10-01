@@ -55,6 +55,9 @@ use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::parse_expected_output_failure_reason;
+use hermit_manifest_plan::runner::records_stripped_comparator;
+use hermit_manifest_plan::runner::require_stripped_comparison;
+use hermit_manifest_plan::runner::terminal_diagnostic_reason;
 use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
@@ -1619,7 +1622,9 @@ impl ResultRow {
     /// run now performs only its own backend's verification, and its row is
     /// refused here.
     fn is_ingestible_classification(&self) -> bool {
-        self.classification == "required"
+        // `diagnostic` is an enabled cell like `required`; only a product FAIL
+        // of one is excused, by `verify_candidate_set`.
+        matches!(self.classification.as_str(), "required" | "diagnostic")
             || (self.classification == "disabled"
                 && (self.backend_parity.is_some()
                     || self.error_kind.as_deref() == Some("incomplete-parity-evidence")))
@@ -1627,7 +1632,7 @@ impl ResultRow {
 
     fn require_ingestible_classification(&self) -> Result<(), String> {
         match self.classification.as_str() {
-            "required" => Ok(()),
+            "required" | "diagnostic" => Ok(()),
             "disabled" if self.is_ingestible_classification() => Ok(()),
             "disabled" => Err("disabled result has neither a typed backend-parity report nor an incomplete-parity disposition; only explicit parity probes are admissible".into()),
             _ => Err(format!(
@@ -2097,9 +2102,88 @@ impl ResultRow {
         Ok(format!("{:x}", Sha256::digest(encoded)))
     }
 
+    /// Whether this row is a verify cell that declared the stripped
+    /// comparator, which the runner allows only in verify mode.
+    fn declares_stripped_comparator(&self) -> bool {
+        self.mode == "verify" && records_stripped_comparator(&self.relaxations)
+    }
+
+    /// The reason this terminal row is an excused diagnostic failure, by the
+    /// runner's own rule; `None` for every row that must pass.
+    fn diagnostic_failure_reason(&self) -> Option<&str> {
+        terminal_diagnostic_reason(
+            &self.classification,
+            &self.outcome,
+            self.failure_class,
+            self.result,
+            &self.relaxations,
+        )
+    }
+
+    /// A PASS of a declared stripped-comparator cell: every attempt's report
+    /// holds the stripped comparison the runner requires, matched, from an
+    /// attempt that passed. It is admitted as below-L2 evidence, never as the
+    /// canonical match `require_canonical_pass_evidence` demands of every other
+    /// PASS.
+    fn require_stripped_pass_evidence(&self) -> Result<(), String> {
+        for (index, attempt) in self.attempts.iter().enumerate() {
+            let report = self.embedded_report(index, attempt)?;
+            require_stripped_comparison(&report).map_err(|error| {
+                format!(
+                    "attempt {} cannot support a green result: {error}",
+                    index + 1
+                )
+            })?;
+            if !(report.verified && report.verdict == canonical_verdict::Verdict::Matched) {
+                return Err(format!(
+                    "attempt {} stripped report is not a verified match (verdict={})",
+                    index + 1,
+                    report.verdict
+                ));
+            }
+            if !self.matched_attempt_passed(index, attempt, &report)? {
+                return Err(format!(
+                    "attempt {} matched report belongs to an attempt that did not pass",
+                    index + 1
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn embedded_report(
+        &self,
+        index: usize,
+        attempt: &JsonValue,
+    ) -> Result<canonical_verdict::VerificationReport, String> {
+        let report = attempt
+            .get("verification_report")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("attempt {} has no embedded verification report", index + 1))?;
+        let recorded_sha = attempt
+            .get("verification_report_sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("attempt {} has no verification-report identity", index + 1))?;
+        if recorded_sha != format!("{:x}", Sha256::digest(report.as_bytes())) {
+            return Err(format!(
+                "attempt {} verification-report identity does not match its embedded report",
+                index + 1
+            ));
+        }
+        serde_json::from_str(report).map_err(|error| {
+            format!(
+                "attempt {} has an incomplete verification report: {error}",
+                index + 1
+            )
+        })
+    }
+
     fn require_canonical_pass_evidence(&self) -> Result<(), String> {
         if self.outcome != "PASS" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(());
+        }
+        if self.declares_stripped_comparator() {
+            return self.require_stripped_pass_evidence();
         }
         for (index, attempt) in self.attempts.iter().enumerate() {
             let report = attempt
@@ -13159,7 +13243,8 @@ fn verify_results(
     let head = git_head(root)?;
     let (expected, omitted) = select_verified_cells(&derived.selected, lanes, excluded_backends)?;
     let candidates = read_result_candidates(result_root, &head)?;
-    let admitted = verify_candidate_set(&expected, candidates)?;
+    let admission = verify_candidate_set(&expected, candidates)?;
+    let admitted = admission.passed + admission.diagnostic_failures.len();
     if admitted != expected.len() {
         return Err(format!(
             "result admission counted {admitted} cells, expected {}",
@@ -13186,6 +13271,9 @@ fn verify_results(
             custom_checked,
         )
     );
+    for line in below_l2_summary(&admission) {
+        println!("{line}");
+    }
     if !excluded_backends.is_empty() {
         println!(
             "Omitted by --exclude-backend {}: {omitted} selected cells were not required and are not counted as passed.",
@@ -13229,6 +13317,31 @@ fn select_verified_cells(
     }
     let omitted = in_lanes.len() - expected.len();
     Ok((expected, omitted))
+}
+
+/// The lines that keep stripped passes and diagnostic failures visible beside
+/// the fresh-result summary; empty when there are neither.
+fn below_l2_summary(admission: &CandidateAdmission) -> Vec<String> {
+    let mut lines = Vec::new();
+    if admission.stripped > 0 {
+        lines.push(format!(
+            "Of the passing cells, {} are declared stripped-comparator (below-L2) comparisons, not canonical matches.",
+            admission.stripped
+        ));
+    }
+    if !admission.diagnostic_failures.is_empty() {
+        lines.push(format!(
+            "Diagnostic failures, not counted as passed and not failing this check: {}",
+            admission.diagnostic_failures.len()
+        ));
+        lines.extend(
+            admission
+                .diagnostic_failures
+                .iter()
+                .map(|failure| format!("  diagnostic: {failure}")),
+        );
+    }
+    lines
 }
 
 fn fresh_result_summary(
@@ -14311,13 +14424,26 @@ fn find_result_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// What `verify_candidate_set` admitted from one complete fresh result set.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CandidateAdmission {
+    /// Cells with an admitted PASS, canonical or stripped.
+    passed: usize,
+    /// The subset of `passed` admitted as declared below-L2 stripped
+    /// comparisons rather than canonical matches.
+    stripped: usize,
+    /// Diagnostic cells whose terminal attempt is an excused product FAIL,
+    /// each named with its recorded reason. They pass no cell.
+    diagnostic_failures: Vec<String>,
+}
+
 fn verify_candidate_set(
     expected: &BTreeSet<CellId>,
     candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
-) -> Result<usize, String> {
+) -> Result<CandidateAdmission, String> {
     let mut missing = Vec::new();
     let mut failed = Vec::new();
-    let mut admitted = 0usize;
+    let mut admission = CandidateAdmission::default();
     let mut binary_identities = BTreeMap::<String, Vec<String>>::new();
     for id in expected {
         let Some(rows) = candidates.get(id) else {
@@ -14400,7 +14526,14 @@ fn verify_candidate_set(
             )
             .or_default()
             .push(display_id(id));
-        if candidate.row.outcome != "PASS" {
+        if let Some(reason) = candidate.row.diagnostic_failure_reason() {
+            admission.diagnostic_failures.push(format!(
+                "{}={} ({}; diagnostic: {reason})",
+                display_id(id),
+                candidate.row.outcome,
+                candidate.path.display()
+            ));
+        } else if candidate.row.outcome != "PASS" {
             failed.push(format!(
                 "{}={} ({})",
                 display_id(id),
@@ -14408,7 +14541,10 @@ fn verify_candidate_set(
                 candidate.path.display()
             ));
         } else {
-            admitted += 1;
+            admission.passed += 1;
+            if candidate.row.declares_stripped_comparator() {
+                admission.stripped += 1;
+            }
         }
     }
     if binary_identities.len() > 1 {
@@ -14437,7 +14573,7 @@ fn verify_candidate_set(
         }
         return Err(message);
     }
-    Ok(admitted)
+    Ok(admission)
 }
 
 fn require_sha256(label: &str, value: &str) -> Result<(), String> {
@@ -16335,6 +16471,122 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     weak.attempts[0]["verification_report"] = JsonValue::String(report);
     if weak.require_canonical_pass_evidence().is_ok() {
         return Err("negative result bracket accepted a stripped PASS receipt".into());
+    }
+    // A cell that DECLARED the stripped comparator is admitted on the same
+    // report, as below-L2 evidence counted apart from canonical matches; the
+    // canonical report is not the comparison it declared and is refused.
+    let stripped_relaxation =
+        "comparator=stripped: the corpus verdict policy is the stripped comparison".to_string();
+    let mut declared = weak.clone();
+    declared.relaxations = vec![stripped_relaxation.clone()];
+    declared
+        .require_canonical_pass_evidence()
+        .map_err(|e| format!("a declared stripped PASS was refused: {e}"))?;
+    let mut declared_canonical = candidate("PASS").row;
+    declared_canonical.relaxations = vec![stripped_relaxation.clone()];
+    if declared_canonical.require_canonical_pass_evidence().is_ok() {
+        return Err("a declared stripped cell was admitted on a canonical report".into());
+    }
+    let mut declared_mismatch = declared.clone();
+    let mut report: JsonValue = serde_json::from_str(
+        declared_mismatch.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    report["compared_log_messages"]["left"] = JsonValue::from(0);
+    let report = serde_json::to_string(&report).unwrap();
+    declared_mismatch.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    declared_mismatch.attempts[0]["verification_report"] = JsonValue::String(report);
+    if declared_mismatch.require_canonical_pass_evidence().is_ok() {
+        return Err("a declared stripped PASS with vacuous evidence was admitted".into());
+    }
+    let mut stripped_candidate = candidate("PASS");
+    stripped_candidate.row = declared.clone();
+    stripped_candidate.evidence_identity = stripped_candidate.row.evidence_identity().unwrap();
+    let admission = verify_candidate_set(
+        &expected,
+        BTreeMap::from([(id.clone(), vec![stripped_candidate])]),
+    )
+    .map_err(|e| format!("a declared stripped PASS was not admitted: {e}"))?;
+    if admission
+        != (CandidateAdmission {
+            passed: 1,
+            stripped: 1,
+            diagnostic_failures: Vec::new(),
+        })
+    {
+        return Err(format!("stripped admission was miscounted: {admission:?}"));
+    }
+    // A diagnostic cell's terminal product FAIL is excused and named; it
+    // passes no cell. Without its recorded reason, or as an infrastructure
+    // failure, or on a `required` cell, the same FAIL still refuses the set.
+    let diagnostic_relaxation =
+        "diagnostic (a product failure does not fail the run): bounded probe".to_string();
+    let diagnostic_candidate =
+        |classification: &str, relaxations: Vec<String>, failure_class: FailureClass| {
+            let mut failure = candidate("FAIL");
+            failure.row.classification = classification.into();
+            failure.row.relaxations = relaxations;
+            failure.row.failure_class = Some(failure_class);
+            failure.evidence_identity = failure.row.evidence_identity().unwrap();
+            failure
+        };
+    let admission = verify_candidate_set(
+        &expected,
+        BTreeMap::from([(
+            id.clone(),
+            vec![diagnostic_candidate(
+                "diagnostic",
+                vec![stripped_relaxation.clone(), diagnostic_relaxation.clone()],
+                FailureClass::ProductFailure,
+            )],
+        )]),
+    )
+    .map_err(|e| format!("a diagnostic failure refused the result set: {e}"))?;
+    if admission.passed != 0
+        || admission.diagnostic_failures.len() != 1
+        || !admission.diagnostic_failures[0].contains("diagnostic: bounded probe")
+    {
+        return Err(format!(
+            "diagnostic admission was miscounted: {admission:?}"
+        ));
+    }
+    for (name, refused) in [
+        (
+            "a diagnostic FAIL without its reason",
+            diagnostic_candidate(
+                "diagnostic",
+                vec![stripped_relaxation.clone()],
+                FailureClass::ProductFailure,
+            ),
+        ),
+        (
+            "a diagnostic infrastructure failure",
+            diagnostic_candidate(
+                "diagnostic",
+                vec![stripped_relaxation.clone(), diagnostic_relaxation.clone()],
+                FailureClass::UnderstoodInfrastructureFailure,
+            ),
+        ),
+        (
+            "a required cell carrying a diagnostic reason",
+            diagnostic_candidate(
+                "required",
+                vec![stripped_relaxation.clone(), diagnostic_relaxation.clone()],
+                FailureClass::ProductFailure,
+            ),
+        ),
+    ] {
+        if verify_candidate_set(&expected, BTreeMap::from([(id.clone(), vec![refused])])).is_ok() {
+            return Err(format!("{name} was excused"));
+        }
+    }
+    if below_l2_summary(&CandidateAdmission::default()) != Vec::<String>::new() {
+        return Err(
+            "a run without stripped or diagnostic cells printed extra summary lines".into(),
+        );
     }
     let mut missing_report = candidate("PASS").row;
     missing_report.attempts[0]
@@ -29527,7 +29779,14 @@ mod post_verdict_transaction_tests {
         // The `verify-results` admission gate reads the same candidates; the
         // genuine declared row is admitted there as well.
         let expected = BTreeSet::from([id.clone()]);
-        assert_eq!(verify_candidate_set(&expected, candidates), Ok(1));
+        assert_eq!(
+            verify_candidate_set(&expected, candidates),
+            Ok(CandidateAdmission {
+                passed: 1,
+                stripped: 0,
+                diagnostic_failures: Vec::new(),
+            })
+        );
 
         let genuine = serde_json::json!({
             "code": 3, "signal": null, "reason": reason, "evidence_sha256": identity,
@@ -30780,7 +31039,11 @@ mod post_verdict_transaction_tests {
             );
             assert_eq!(
                 verify_candidate_set(&expected, candidates),
-                Ok(1),
+                Ok(CandidateAdmission {
+                    passed: 1,
+                    stripped: 0,
+                    diagnostic_failures: Vec::new(),
+                }),
                 "{label}"
             );
         }

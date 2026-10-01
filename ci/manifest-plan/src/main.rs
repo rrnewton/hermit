@@ -1276,6 +1276,7 @@ fn validate_mode_with_cpu(
             "env",
             "comparator",
             "comparator_reason",
+            "diagnostic",
         ]),
         _ => {}
     }
@@ -1925,6 +1926,9 @@ comparator_reason = "the corpus verdict policy is the stripped comparison"
 
 [env]
 TMPDIR = "/tmp"
+
+[diagnostic]
+ptrace = "bounded probe; its product failure does not fail the run"
 
 [backends_disabled]
 dbt = "unsupported"

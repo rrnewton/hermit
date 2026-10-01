@@ -1978,11 +1978,23 @@ pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs"];
 
 /// The selector flags a manifest node for `category` passes after
 /// `--lane <lane> --category <category>`.
+/// Manifest buckets that contain diagnostic cells. Their nodes run the
+/// harness with `--diagnostic-results` and declare dagrun structured-result
+/// schema 4, so a diagnostic cell's failure is reported without failing the
+/// node; every other bucket writes and declares schema 2, and the harness
+/// refuses to run a diagnostic cell without the flag. Empty until a bucket
+/// with diagnostic cells exists.
+pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &[];
+
 pub fn manifest_selector_flags(category: &str) -> &'static str {
-    if FAIL_CLOSED_MANIFEST_BUCKETS.contains(&category) {
-        "--ci-only --prebuilt"
-    } else {
-        "--ci-only --allow-empty --prebuilt"
+    match (
+        FAIL_CLOSED_MANIFEST_BUCKETS.contains(&category),
+        DIAGNOSTIC_MANIFEST_BUCKETS.contains(&category),
+    ) {
+        (true, true) => "--ci-only --prebuilt --diagnostic-results",
+        (true, false) => "--ci-only --prebuilt",
+        (false, true) => "--ci-only --allow-empty --prebuilt --diagnostic-results",
+        (false, false) => "--ci-only --allow-empty --prebuilt",
     }
 }
 

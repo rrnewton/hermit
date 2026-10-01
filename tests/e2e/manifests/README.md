@@ -331,6 +331,8 @@ specific configuration:
         env: {TMPDIR: /tmp}
         comparator: stripped
         comparator_reason: The corpus verdict policy is Hermit's default --verify
+        diagnostic:
+          ptrace: A bounded probe; its failure is reported, not blocking
 ```
 
 - `hermit_args` are Hermit `run` flags added after the runner's own. Only
@@ -348,8 +350,28 @@ specific configuration:
   verdict. It requires a non-empty `comparator_reason`, is recorded in
   `relaxations` as `comparator=stripped`, and is refused together with
   `assert.bitwise_parity: true`. `strict` is the default. The scorecard's
-  verify-results gate still refuses any non-canonical PASS, so a stripped cell
-  cannot yet run in a lane whose results the scorecard admits.
+  verify-results gate admits a stripped PASS only from a cell that declared it,
+  by the same report rule, and counts it apart from canonical matches. The
+  ledger records it as `compared-and-matched` (or `compared-and-diverged`) at
+  tier `exit-and-stream-equality` with `bitwise_parity: false`, which no
+  qualification counts as canonical evidence.
+- `diagnostic` names, per enabled backend, why that cell is a diagnostic. Only
+  a `comparator: stripped` cell may declare one: a canonical cell exists to
+  supply L2 evidence, so its failures always block. The result row's
+  `classification` is `diagnostic` and the reason is recorded in
+  `relaxations`. When the cell's last attempt is a measured failure (a FAIL
+  that is a product failure or the cell exceeding its time budget), the
+  harness prints it as `DIAGNOSTIC`, counts it in `summary.json`
+  (`diagnostic_failures`), writes it to dagrun as a `diagnostic_fail` row
+  (structured-result schema 4), and does not fail the run; the scorecard and
+  the validation ledger count it separately as well. Only a bucket listed in
+  `DIAGNOSTIC_MANIFEST_BUCKETS` (ci/manifest-plan/src/validation_dag.rs) may
+  hold diagnostic cells: its node runs `test-harness run --diagnostic-results`
+  and declares schema 4. Every other node writes schema 2, and the harness
+  refuses to run a diagnostic cell without the flag. An ERROR, any other
+  no-result cause, or a FAIL retried into an ERROR still fails the run.
+  Because the ledger keeps the failure out of `passed_tests`, a run with a
+  diagnostic failure is not a qualifying receipt.
 
 A test may carry `labels` (lowercase words joined by `-`, unique), naming the
 run types it belongs to. `test-harness run --label LABEL[,LABEL...]` keeps only

@@ -13,6 +13,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
@@ -31,7 +33,9 @@ use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
+use hermit_manifest_plan::runner::diagnostic_failure_reason;
 use hermit_manifest_plan::runner::host_inapplicable_result;
+use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
@@ -90,6 +94,9 @@ Selection options:
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
+  --diagnostic-results             Write dagrun structured-result schema 4, which
+                                   reports a diagnostic cell's failure without
+                                   failing the node (run only)
   --allow-empty                    Permit an empty explicit CI selection
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
@@ -302,6 +309,7 @@ fn root() -> PathBuf {
 struct Args {
     selection: Selection,
     prebuilt: bool,
+    diagnostic_results: bool,
     allow_empty: bool,
     ci_only: bool,
     probe_disabled: bool,
@@ -390,6 +398,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             }
             "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
+            "--diagnostic-results" => args.diagnostic_results = true,
             "--allow-empty" => args.allow_empty = true,
             "--results" => {
                 args.results = Some(PathBuf::from(required_value(&mut values, "--results")))
@@ -413,40 +422,145 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
     args
 }
 
-fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
-    let rows = histories
-        .iter()
-        .map(|history| {
-            let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
-            Ok((result.outcome != "HOST-INAPPLICABLE").then(|| {
-                (
-                    format!(
-                        "{} [{}/{}]",
-                        result.test,
-                        result.backend.as_deref().unwrap_or("native"),
-                        result.mode
-                    ),
-                    result.outcome == "PASS",
-                    attempts,
-                )
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    structured_test_results_from_rows(rows.into_iter().flatten())
+/// A node that does not declare diagnostic results writes schema 2, which
+/// cannot say a failure is non-blocking. Refuse to run a diagnostic cell there
+/// rather than report its excused failure as an ordinary one.
+fn require_declared_diagnostics(
+    cells: &[SelectedCell],
+    diagnostic_results: bool,
+) -> Result<(), String> {
+    if diagnostic_results {
+        return Ok(());
+    }
+    match cells.iter().find(|cell| is_diagnostic_cell(cell)) {
+        Some(cell) => Err(format!(
+            "{} ({}/{}) is a diagnostic cell; only a node that runs with --diagnostic-results may select it",
+            cell.id.test,
+            cell.id.mode,
+            cell.id.backend.as_deref().unwrap_or("native")
+        )),
+        None => Ok(()),
+    }
 }
 
-fn structured_test_results_from_rows(
-    rows: impl IntoIterator<Item = (String, bool, u64)>,
-) -> Result<TestResults, String> {
-    let rows = rows
-        .into_iter()
-        .map(|(id, passed, attempts)| TestResult::new(id, passed, attempts))
-        .collect::<Result<Vec<_>, _>>()?;
+/// The default schema-2 structured report: one terminal row per executed
+/// cell, `pass` only for a PASS (an ERROR is a `fail`), with its attempt
+/// count. A HOST-INAPPLICABLE cell executed nothing and has no row.
+fn terminal_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
+    let mut rows = Vec::new();
+    for history in histories {
+        let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
+        if result.outcome == "HOST-INAPPLICABLE" {
+            continue;
+        }
+        let id = format!(
+            "{} [{}/{}]",
+            result.test,
+            result.backend.as_deref().unwrap_or("native"),
+            result.mode
+        );
+        rows.push(TestResult::new(id, result.outcome == "PASS", attempts)?);
+    }
     TestResults::current(
         u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
         0,
         rows,
     )
+}
+
+/// The schema-4 structured report dagrun reads for one `--diagnostic-results` run.
+///
+/// One row per cell that executed (a HOST-INAPPLICABLE cell executed nothing
+/// and has no row), named `<test> [<backend>/<mode>]`, with every attempt's
+/// classified cause. A diagnostic cell's product failure is a
+/// `diagnostic_fail` row carrying the manifest's reason, so dagrun reports it
+/// without failing the node; every other failure is a blocking `fail`.
+fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
+    let mut rows = Vec::new();
+    for history in histories {
+        let (result, _) = cell_result_and_attempts_after_retries(history)?;
+        if result.outcome == "HOST-INAPPLICABLE" {
+            continue;
+        }
+        let id = format!(
+            "{} [{}/{}]",
+            result.test,
+            result.backend.as_deref().unwrap_or("native"),
+            result.mode
+        );
+        let attempts = history
+            .iter()
+            .map(structured_attempt)
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.push(match diagnostic_failure_reason(history) {
+            Some(reason) => TestResult::diagnostic_failure(id, attempts, reason.to_string())?,
+            None => TestResult::with_attempt_results(id, result.outcome == "PASS", attempts)?,
+        });
+    }
+    TestResults::diagnostic(
+        u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
+        0,
+        rows,
+    )
+}
+
+/// The reason a finished cell is an excused diagnostic failure: the row the
+/// harness reports for it is a FAIL, and its history ends in a diagnostic
+/// cell's measured failure. A cell whose history could not be summarized is
+/// reported as an ERROR and is never excused.
+fn excused_diagnostic<'a>(summarized: &CellResult, history: &'a [CellResult]) -> Option<&'a str> {
+    if summarized.outcome != "FAIL" {
+        return None;
+    }
+    diagnostic_failure_reason(history)
+}
+
+/// One attempt's classified cause, from the row that attempt published.
+///
+/// The runner's own typed fields decide it: its `cpu-timeout` and
+/// `wall-timeout` error kinds are the two timeouts; otherwise the
+/// producer-owned failure class, where `no_result` stays `no_result` and an
+/// understood infrastructure or prerequisite failure is
+/// `infrastructure_error`; a FAIL with a product failure is `failed`. The
+/// detail is the row's own reason, never an invented one.
+fn structured_attempt(result: &CellResult) -> Result<TestAttemptResult, String> {
+    let outcome = match (
+        result.outcome.as_str(),
+        result.error_kind.as_deref(),
+        result.failure_class,
+    ) {
+        ("PASS", _, _) => {
+            return TestAttemptResult::new(result.attempt, TestAttemptOutcome::Passed, None);
+        }
+        ("FAIL", Some("cpu-timeout"), _) => TestAttemptOutcome::CpuTimeout,
+        ("FAIL", Some("wall-timeout"), _) => TestAttemptOutcome::WallTimeout,
+        ("FAIL" | "ERROR", _, Some(FailureClass::NoResult)) => TestAttemptOutcome::NoResult,
+        (
+            "FAIL" | "ERROR",
+            _,
+            Some(
+                FailureClass::UnderstoodInfrastructureFailure
+                | FailureClass::UnderstoodPrerequisiteFailure,
+            ),
+        )
+        | ("ERROR", _, Some(FailureClass::ProductFailure) | None) => {
+            TestAttemptOutcome::InfrastructureError
+        }
+        ("FAIL", _, Some(FailureClass::ProductFailure) | None) => TestAttemptOutcome::Failed,
+        (other, _, _) => {
+            return Err(format!(
+                "{} ({}) attempt {} has outcome {other}, which has no structured attempt cause",
+                result.test, result.mode, result.attempt
+            ));
+        }
+    };
+    let detail = result.reason_for_display().trim();
+    let detail = if detail.is_empty() {
+        format!("{} with an empty recorded reason", result.outcome)
+    } else {
+        detail.to_string()
+    };
+    TestAttemptResult::new(result.attempt, outcome, Some(detail))
 }
 
 fn accumulate_cell_cpu_usage(
@@ -603,6 +717,9 @@ fn validate_args(command: &str, args: &Args) {
     }
     if command == "build" && args.prebuilt {
         fail("build does not accept --prebuilt");
+    }
+    if command != "run" && args.diagnostic_results {
+        fail("--diagnostic-results is accepted by run only");
     }
     if !matches!(command, "build" | "run") && args.jobs.is_some() {
         fail("--jobs is accepted by build and run only");
@@ -2379,6 +2496,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
+    if let Err(error) = require_declared_diagnostics(&cells, args.diagnostic_results) {
+        fail(error);
+    }
     let capacity = scheduled_worker_capacity(args);
     let planned_verify = planned_verify(&cells);
     let parity_scope = parity_scope(root, manifests, &planned_verify);
@@ -2542,7 +2662,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         result
                     }
                 };
-                failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                if let Some(reason) = excused_diagnostic(&result, &attempt_results[index]) {
+                    // Reported and counted, never silent; it does not fail the run.
+                    println!(
+                        "DIAGNOSTIC {} ({}/{}): this product failure does not fail the run: {reason}",
+                        result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native"),
+                    );
+                } else {
+                    failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                }
                 indexed_results.push((index, result));
             }
             published
@@ -2556,6 +2686,19 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         failed = true;
     }
     indexed_results.sort_by_key(|(index, _)| *index);
+    let diagnostic_cells = indexed_results
+        .iter()
+        .filter_map(|(index, result)| {
+            let reason = excused_diagnostic(result, &attempt_results[*index])?;
+            Some(serde_json::json!({
+                "test": result.test,
+                "mode": result.mode,
+                "backend": result.backend,
+                "diagnostic_reason": reason,
+                "failure_reason": result.reason,
+            }))
+        })
+        .collect::<Vec<_>>();
     let results = indexed_results
         .into_iter()
         .map(|(_, result)| result)
@@ -2576,9 +2719,16 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .flatten();
     if let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") {
         let path = PathBuf::from(path);
-        if let Err(error) =
-            structured_test_results(&attempt_results).and_then(|report| report.write_current(&path))
-        {
+        let written = if args.diagnostic_results {
+            structured_test_results(&attempt_results).and_then(|report| {
+                report
+                    .write_diagnostic_typed(&path)
+                    .map_err(|error| error.to_string())
+            })
+        } else {
+            terminal_test_results(&attempt_results).and_then(|report| report.write_current(&path))
+        };
+        if let Err(error) = written {
             eprintln!("test-harness: {error}");
             failed = true;
         }
@@ -2597,6 +2747,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         "passed": results.iter().filter(|result| result.outcome == "PASS").count(),
         "failed": results.iter().filter(|result| result.outcome == "FAIL").count(),
         "errors": results.iter().filter(|result| result.outcome == "ERROR").count(),
+        // A subset of `failed`: product failures of diagnostic cells, which do
+        // not fail the run. Counted and named separately so they stay visible.
+        "diagnostic_failures": diagnostic_cells.len(),
+        "diagnostic_failure_cells": diagnostic_cells,
         "host_inapplicable": host_inapplicable,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
         "host_inapplicable_cells": results
@@ -2872,6 +3026,7 @@ mod tests {
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::CellResult;
     use super::DEFAULT_BUILD_JOBS;
     use super::DEFAULT_VALIDATE_AUDIT_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
@@ -2880,6 +3035,7 @@ mod tests {
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
+    use super::TestResults;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
@@ -2889,6 +3045,7 @@ mod tests {
     use super::command_jobs;
     use super::command_runs_exactly;
     use super::command_timeout_seconds;
+    use super::excused_diagnostic;
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
@@ -2899,7 +3056,7 @@ mod tests {
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::shell_quote_one;
-    use super::structured_test_results_from_rows;
+    use super::structured_test_results;
     use super::unique_plan_rows;
     use super::validate_args;
     use super::validation_audit_worker_capacity;
@@ -4395,37 +4552,241 @@ sys.exit(1 if failed else 0)
         assert_eq!(total, None);
     }
 
+    /// A terminal attempt row of one cell, with only the fields the
+    /// structured report reads set; every other field takes its serde default.
+    fn attempt_row(
+        test: &str,
+        attempt: u64,
+        outcome: &str,
+        failure_class: Option<&str>,
+        classification: &str,
+        relaxations: &[&str],
+        reason: Option<&str>,
+    ) -> CellResult {
+        serde_json::from_value(serde_json::json!({
+            "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+            "test": test, "category": "fixture", "lane": "portable", "mode": "verify",
+            "backend": "ptrace", "classification": classification, "outcome": outcome,
+            "failure_class": failure_class, "attempt": attempt, "relaxations": relaxations,
+            "reason": reason, "argv": [], "guest_argv": [], "env": {}, "cwd": "/repo",
+            "shell_command": "", "attempts": [], "artifact_dir": "/repo/a",
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn structured_test_results_are_machine_readable_and_exact_on_failure() {
-        let path = std::env::temp_dir().join(format!(
-            "hermit-manifest-counts-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        structured_test_results_from_rows([
-            ("suite$passes".into(), true, 1),
-            ("suite$fails".into(), false, 2),
-        ])
-        .unwrap()
-        .write_current(&path)
-        .unwrap();
-        let counts: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        std::fs::remove_file(path).unwrap();
+        use hermit_manifest_plan::runner::ObservedResult;
+        let diagnostic = "diagnostic (a product failure does not fail the run): bounded probe";
+        let histories = vec![
+            vec![attempt_row(
+                "t/pass",
+                1,
+                "PASS",
+                None,
+                "required",
+                &[],
+                None,
+            )],
+            vec![
+                attempt_row(
+                    "t/recovers",
+                    1,
+                    "FAIL",
+                    Some("product_failure"),
+                    "required",
+                    &[],
+                    Some("diverged at rec 7"),
+                ),
+                attempt_row("t/recovers", 2, "PASS", None, "required", &[], None),
+            ],
+            vec![attempt_row(
+                "t/fails",
+                1,
+                "FAIL",
+                Some("product_failure"),
+                "required",
+                &[],
+                Some("exit 3"),
+            )],
+            vec![attempt_row(
+                "t/noresult",
+                1,
+                "ERROR",
+                Some("no_result"),
+                "required",
+                &[],
+                Some("empty run 1"),
+            )],
+            vec![attempt_row(
+                "t/diag",
+                1,
+                "FAIL",
+                Some("product_failure"),
+                "diagnostic",
+                &[diagnostic],
+                Some("timed out"),
+            )],
+            // A diagnostic cell that could not produce a product verdict still blocks.
+            vec![attempt_row(
+                "t/diag-error",
+                1,
+                "ERROR",
+                Some("understood_infrastructure_failure"),
+                "diagnostic",
+                &[diagnostic],
+                Some("launch refused"),
+            )],
+            vec![attempt_row(
+                "t/skipped",
+                1,
+                "HOST-INAPPLICABLE",
+                None,
+                "required",
+                &[],
+                Some("no kvm"),
+            )],
+            // A diagnostic cell that exceeded its own budget is a measured failure.
+            vec![{
+                let mut row = attempt_row(
+                    "t/diag-timeout",
+                    1,
+                    "FAIL",
+                    Some("no_result"),
+                    "diagnostic",
+                    &[diagnostic],
+                    Some("cell exceeded 20 wall s backstop (20 s CPU budget)"),
+                );
+                row.error_kind = Some("wall-timeout".into());
+                row.result = Some(ObservedResult::Timeout);
+                row
+            }],
+            // A retried diagnostic product failure that ends without a product verdict blocks.
+            vec![
+                attempt_row(
+                    "t/diag-retry",
+                    1,
+                    "FAIL",
+                    Some("product_failure"),
+                    "diagnostic",
+                    &[diagnostic],
+                    Some("diverged"),
+                ),
+                attempt_row(
+                    "t/diag-retry",
+                    2,
+                    "ERROR",
+                    Some("no_result"),
+                    "diagnostic",
+                    &[diagnostic],
+                    Some("empty run 2"),
+                ),
+            ],
+        ];
+        let report = structured_test_results(&histories).unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&report.to_diagnostic_json().unwrap()).unwrap();
+        assert_eq!(wire["schema"], 4);
         assert_eq!(
-            counts,
-            serde_json::json!({
-                "schema": 2,
-                "executed_tests": 2,
-                "filtered_tests": 0,
-                "results": [
-                    {"id": "suite$passes", "result": "pass", "attempts": 1},
-                    {"id": "suite$fails", "result": "fail", "attempts": 2},
-                ],
+            wire["executed_tests"], 8,
+            "the host-inapplicable cell executed nothing"
+        );
+        let rows = wire["results"].as_array().unwrap();
+        let summary: Vec<(String, String, Vec<String>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["result"].as_str().unwrap().to_string(),
+                    row["attempt_results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|attempt| attempt["outcome"].as_str().unwrap().to_string())
+                        .collect(),
+                )
             })
+            .collect();
+        let s = |value: &str| value.to_string();
+        assert_eq!(
+            summary,
+            vec![
+                (s("t/pass [ptrace/verify]"), s("pass"), vec![s("passed")]),
+                (
+                    s("t/recovers [ptrace/verify]"),
+                    s("pass"),
+                    vec![s("failed"), s("passed")]
+                ),
+                (s("t/fails [ptrace/verify]"), s("fail"), vec![s("failed")]),
+                (
+                    s("t/noresult [ptrace/verify]"),
+                    s("fail"),
+                    vec![s("no_result")]
+                ),
+                (
+                    s("t/diag [ptrace/verify]"),
+                    s("diagnostic_fail"),
+                    vec![s("failed")]
+                ),
+                (
+                    s("t/diag-error [ptrace/verify]"),
+                    s("fail"),
+                    vec![s("infrastructure_error")]
+                ),
+                (
+                    s("t/diag-timeout [ptrace/verify]"),
+                    s("diagnostic_fail"),
+                    vec![s("wall_timeout")]
+                ),
+                (
+                    s("t/diag-retry [ptrace/verify]"),
+                    s("fail"),
+                    vec![s("failed"), s("no_result")]
+                ),
+            ]
+        );
+        assert_eq!(rows[4]["diagnostic_reason"], "bounded probe");
+        assert_eq!(rows[4]["attempt_results"][0]["detail"], "timed out");
+        assert_eq!(rows[1]["attempt_results"][0]["detail"], "diverged at rec 7");
+        assert!(
+            rows.iter()
+                .enumerate()
+                .all(|(index, row)| matches!(index, 4 | 6) != row["diagnostic_reason"].is_null())
+        );
+        // The report dagrun reads back has exactly one diagnostic and three blocking failures.
+        let parsed = TestResults::from_declared_schema_json_slice(
+            &report.to_diagnostic_json().unwrap(),
+            dagrun::DIAGNOSTIC_RESULTS_SCHEMA,
+        )
+        .unwrap();
+        let parsed = parsed.results.unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|row| row.is_diagnostic_failure())
+                .count(),
+            2
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|row| row.is_blocking_failure())
+                .count(),
+            4
+        );
+        // A cell the harness reports as an ERROR (its history could not be
+        // summarized) is never excused, even if its last attempt was a
+        // diagnostic product FAIL.
+        let diagnostic_history = &histories[4];
+        let mut summarized_error = diagnostic_history[0].clone();
+        summarized_error.outcome = "ERROR".into();
+        assert_eq!(
+            excused_diagnostic(&summarized_error, diagnostic_history),
+            None
+        );
+        assert_eq!(
+            excused_diagnostic(&diagnostic_history[0], diagnostic_history),
+            Some("bounded probe")
         );
     }
 
@@ -5115,6 +5476,91 @@ sys.exit(1 if failed else 0)
     }
 
     #[test]
+    fn only_a_diagnostic_results_run_may_select_a_diagnostic_cell() {
+        use serde_json::json;
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-diagnostic-selection-{}",
+            std::process::id()
+        ));
+        let manifests = fixture.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 2\ncpu_timeout_seconds: 1\n",
+        )
+        .unwrap();
+        let off = |backends: &[&str]| {
+            json!({
+                "ci": false,
+                "ci_disabled_reason": "Only the verify cell is measured here",
+                "backends_enabled": [],
+                "backends_disabled": backends
+                    .iter()
+                    .map(|backend| (backend.to_string(), json!("Only the verify cell is measured here")))
+                    .collect::<serde_json::Map<_, _>>(),
+            })
+        };
+        let all = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+        let test = |id: &str, diagnostic: bool| {
+            let mut verify = json!({
+                "ci": true,
+                "backends_enabled": ["ptrace"],
+                "backends_disabled": {
+                    "dbt": "fixture", "kvm": "fixture", "sabre": "fixture", "liteinst": "fixture"
+                },
+                "comparator": "stripped",
+                "comparator_reason": "The fixture corpus uses the stripped comparison",
+            });
+            if diagnostic {
+                verify["diagnostic"] = json!({"ptrace": "A bounded fixture probe"});
+            }
+            json!({
+                "id": format!("pick/{id}"),
+                "description": "Diagnostic selection fixture",
+                "lane": "portable",
+                "occasional": false,
+                "direct": ["/bin/true"],
+                "observation": {"status": true, "stdout": true, "stderr": true},
+                "modes": {
+                    "verify": verify,
+                    "naked": off(&["native"]),
+                    "replay": off(&all),
+                    "chaos": off(&all),
+                    "custom": off(&all),
+                }
+            })
+        };
+        fs::write(
+            manifests.join("pick.yaml"),
+            serde_json::to_vec(&json!({
+                "schema": 3,
+                "bucket": "pick",
+                "test": [test("probe", true), test("plain", false)],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = ManifestSet::load(&fixture).unwrap();
+        let select = |id: &str| {
+            loaded
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some(format!("pick/{id}")),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+        };
+        let probe = select("probe");
+        let error = super::require_declared_diagnostics(&probe, false).unwrap_err();
+        assert!(
+            error.contains("pick/probe (verify/ptrace) is a diagnostic cell"),
+            "{error}"
+        );
+        super::require_declared_diagnostics(&probe, true).unwrap();
+        super::require_declared_diagnostics(&select("plain"), false).unwrap();
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn production_run_retries_only_product_failures() {
         use std::path::Path;
         use std::path::PathBuf;
@@ -5126,6 +5572,7 @@ sys.exit(1 if failed else 0)
         use serde_json::json;
 
         const CHILD_FIXTURE: &str = "HERMIT_HARNESS_RETRY_TEST_FIXTURE";
+        const CHILD_DIAGNOSTIC: &str = "HERMIT_HARNESS_RETRY_TEST_DIAGNOSTIC_RESULTS";
         const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
@@ -5134,19 +5581,20 @@ sys.exit(1 if failed else 0)
                 .canonicalize()
                 .unwrap();
             let manifests = ManifestSet::load(&fixture).unwrap();
-            let args = parse(
-                [
-                    "--mode".into(),
-                    "naked".into(),
-                    "--jobs".into(),
-                    "2".into(),
-                    "--results".into(),
-                    fixture.join("results.jsonl").to_string_lossy().into_owned(),
-                    "--junit".into(),
-                    fixture.join("junit.xml").to_string_lossy().into_owned(),
-                ]
-                .into_iter(),
-            );
+            let mut argv: Vec<String> = vec![
+                "--mode".into(),
+                "naked".into(),
+                "--jobs".into(),
+                "2".into(),
+                "--results".into(),
+                fixture.join("results.jsonl").to_string_lossy().into_owned(),
+                "--junit".into(),
+                fixture.join("junit.xml").to_string_lossy().into_owned(),
+            ];
+            if std::env::var_os(CHILD_DIAGNOSTIC).is_some() {
+                argv.push("--diagnostic-results".into());
+            }
+            let args = parse(argv.into_iter());
             super::validate_args("run", &args);
             // Exercise the real run() callback, publication, result reduction and
             // epilogue. Its product failure and non-product errors must stay red.
@@ -5221,30 +5669,34 @@ sys.exit(1 if failed else 0)
             })
         })
         .collect::<Vec<_>>();
-        fs::write(
-            manifests.join("retry.yaml"),
-            serde_json::to_vec(&json!({"schema": 3, "bucket": "retry", "test": recipes})).unwrap(),
-        )
-        .unwrap();
+        let manifest_text =
+            serde_json::to_vec(&json!({"schema": 3, "bucket": "retry", "test": recipes})).unwrap();
+        fs::write(manifests.join("retry.yaml"), &manifest_text).unwrap();
         // Only the isolated child receives execution environment changes. A
         // missing Hermit path makes the optional metadata/help probes inert;
         // all five cells use the actual native execution path.
-        let output = Command::new("timeout")
-            .args(["--kill-after=2s", "25s"])
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", TEST_NAME, "--nocapture"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env(CHILD_FIXTURE, &fixture)
-            .env("HERMIT_BIN", fixture.join("missing-hermit"))
-            .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
-            .env("E2E_BUILD_ROOT", fixture.join("build"))
-            .env("E2E_RUN_ID", "native-retry-control")
-            .env("E2E_MACHINE_SHORTNAME", "native-retry-control")
-            .env("E2E_KERNEL_VERSION", "native-retry-control")
-            .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"))
-            .output()
-            .unwrap();
+        let run_child = |fixture: &Path, diagnostic_results: bool| {
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "25s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD_FIXTURE, fixture)
+                .env("HERMIT_BIN", fixture.join("missing-hermit"))
+                .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
+                .env("E2E_BUILD_ROOT", fixture.join("build"))
+                .env("E2E_RUN_ID", "native-retry-control")
+                .env("E2E_MACHINE_SHORTNAME", "native-retry-control")
+                .env("E2E_KERNEL_VERSION", "native-retry-control")
+                .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"));
+            if diagnostic_results {
+                command.env(CHILD_DIAGNOSTIC, "1");
+            }
+            command.output().unwrap()
+        };
+        let output = run_child(&fixture, false);
         fs::write(fixture.join("child.stdout"), &output.stdout).unwrap();
         fs::write(fixture.join("child.stderr"), &output.stderr).unwrap();
         assert!(
@@ -5320,6 +5772,7 @@ sys.exit(1 if failed else 0)
         assert!(histories["retry/infra"][0].attempts.is_empty());
         let counts: serde_json::Value =
             serde_json::from_slice(&fs::read(fixture.join("counts.json")).unwrap()).unwrap();
+        // Without --diagnostic-results: schema 2, one terminal row per cell.
         assert_eq!(
             counts,
             json!({
@@ -5332,6 +5785,68 @@ sys.exit(1 if failed else 0)
                     {"id": "retry/product [native/naked]", "result": "fail", "attempts": 2},
                     {"id": "retry/recovers [native/naked]", "result": "pass", "attempts": 2},
                     {"id": "retry/timeout [native/naked]", "result": "fail", "attempts": 1}
+                ]
+            })
+        );
+        // The same cells with --diagnostic-results: schema 4, every attempt with
+        // its typed cause and the row's own reason.
+        let diagnostic_fixture = fixture.join("diagnostic");
+        fs::create_dir_all(diagnostic_fixture.join("tests/e2e/manifests")).unwrap();
+        for name in ["defaults.yaml", "retry.yaml"] {
+            fs::copy(
+                manifests.join(name),
+                diagnostic_fixture.join("tests/e2e/manifests").join(name),
+            )
+            .unwrap();
+        }
+        let diagnostic_output = run_child(&diagnostic_fixture, true);
+        assert!(
+            diagnostic_output.status.success(),
+            "native diagnostic-results run control failed: {}\n{}\n{}",
+            diagnostic_fixture.display(),
+            String::from_utf8_lossy(&diagnostic_output.stdout),
+            String::from_utf8_lossy(&diagnostic_output.stderr)
+        );
+        let counts: serde_json::Value =
+            serde_json::from_slice(&fs::read(diagnostic_fixture.join("counts.json")).unwrap())
+                .unwrap();
+        let unrecorded = "no specific failure reason was recorded";
+        let failed =
+            |attempt: u64| json!({"attempt": attempt, "outcome": "failed", "detail": unrecorded});
+        let passed =
+            |attempt: u64| json!({"attempt": attempt, "outcome": "passed", "detail": null});
+        let row = |id: &str, result: &str, attempt_results: Vec<serde_json::Value>| {
+            json!({
+                "id": id,
+                "result": result,
+                "attempts": attempt_results.len(),
+                "attempt_results": attempt_results,
+                "diagnostic_reason": null,
+            })
+        };
+        assert_eq!(
+            counts,
+            json!({
+                "schema": 4,
+                "executed_tests": 5,
+                "filtered_tests": 0,
+                "results": [
+                    row("retry/infra [native/naked]", "fail", vec![json!({
+                        "attempt": 1,
+                        "outcome": "infrastructure_error",
+                        "detail": format!(
+                            "cannot execute {}: No such file or directory (os error 2)",
+                            missing.display()
+                        ),
+                    })]),
+                    row("retry/pass [native/naked]", "pass", vec![passed(1)]),
+                    row("retry/product [native/naked]", "fail", vec![failed(1), failed(2)]),
+                    row("retry/recovers [native/naked]", "pass", vec![failed(1), passed(2)]),
+                    row("retry/timeout [native/naked]", "fail", vec![json!({
+                        "attempt": 1,
+                        "outcome": "wall_timeout",
+                        "detail": "cell exceeded 2 wall s backstop (1 s CPU budget)",
+                    })]),
                 ]
             })
         );

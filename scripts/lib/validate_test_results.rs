@@ -87,7 +87,9 @@ pub fn terminal_results(
     filtered: u64,
     rows: Vec<dagrun::TestResult>,
 ) -> Result<dagrun::TestResults, String> {
-    if rows.iter().any(|row| row.attempt_results.is_some()) {
+    if rows.iter().any(|row| row.diagnostic.is_some()) {
+        dagrun::TestResults::diagnostic(executed, filtered, rows)
+    } else if rows.iter().any(|row| row.attempt_results.is_some()) {
         dagrun::TestResults::classified(executed, filtered, rows)
     } else {
         dagrun::TestResults::current(executed, filtered, rows)
@@ -118,29 +120,43 @@ fn checked_results(
     }
     let passed_tests = u64::try_from(sorted.iter().filter(|result| result.passed).count())
         .map_err(|_| "structured passed-test count does not fit u64".to_string())?;
+    let diagnostic_failed_tests = u64::try_from(
+        sorted
+            .iter()
+            .filter(|result| result.is_diagnostic_failure())
+            .count(),
+    )
+    .map_err(|_| "structured diagnostic-failure count does not fit u64".to_string())?;
     let failed_tests = row_count
         .checked_sub(passed_tests)
+        .and_then(|rest| rest.checked_sub(diagnostic_failed_tests))
         .ok_or("structured failed-test count underflowed")?;
     let totals = TestResultTotals {
         executed_tests: results.executed_tests,
         passed_tests,
         failed_tests,
         filtered_tests: results.filtered_tests,
+        diagnostic_failed_tests,
     };
     let rows = sorted
         .into_iter()
-        .map(|result| TestResultArtifactRow {
-            run_id: String::new(),
-            hermit_sha: String::new(),
-            path: ValidatePath::Full,
-            producer: producer.clone(),
-            id: result.id,
-            result: if result.passed {
+        .map(|result| {
+            let verdict = if result.passed {
                 TestResultVerdict::Pass
+            } else if result.is_diagnostic_failure() {
+                TestResultVerdict::DiagnosticFail
             } else {
                 TestResultVerdict::Fail
-            },
-            attempts: result.attempts,
+            };
+            TestResultArtifactRow {
+                run_id: String::new(),
+                hermit_sha: String::new(),
+                path: ValidatePath::Full,
+                producer: producer.clone(),
+                id: result.id,
+                result: verdict,
+                attempts: result.attempts,
+            }
         })
         .collect();
     Ok((rows, totals))
@@ -163,6 +179,10 @@ fn add_totals(total: &mut TestResultTotals, add: TestResultTotals) -> Result<(),
         .filtered_tests
         .checked_add(add.filtered_tests)
         .ok_or("retained filtered_tests overflowed u64")?;
+    total.diagnostic_failed_tests = total
+        .diagnostic_failed_tests
+        .checked_add(add.diagnostic_failed_tests)
+        .ok_or("retained diagnostic_failed_tests overflowed u64")?;
     Ok(())
 }
 
@@ -247,12 +267,17 @@ pub fn verify_artifact(
         passed_tests: 0,
         failed_tests: 0,
         filtered_tests: 0,
+        diagnostic_failed_tests: 0,
     };
     let mut verify_group = |producer: TestResultProducer,
                             totals: TestResultTotals,
                             expected_rows: u64|
      -> Result<(), String> {
-        if totals.passed_tests.checked_add(totals.failed_tests) != Some(totals.executed_tests)
+        if totals
+            .passed_tests
+            .checked_add(totals.failed_tests)
+            .and_then(|total| total.checked_add(totals.diagnostic_failed_tests))
+            != Some(totals.executed_tests)
             || expected_rows != totals.executed_tests
         {
             return Err("retained test-results summary totals are inconsistent".into());
@@ -272,15 +297,13 @@ pub fn verify_artifact(
                 "retained test-results artifact producer grouping or test-id order mismatch".into(),
             );
         }
-        let passed = u64::try_from(
-            group
-                .iter()
-                .filter(|row| row.result == TestResultVerdict::Pass)
-                .count(),
-        )
-        .map_err(|_| "retained test-results passed count does not fit u64")?;
-        if passed != totals.passed_tests
-            || expected_rows.checked_sub(passed) != Some(totals.failed_tests)
+        let count = |verdict: TestResultVerdict| {
+            u64::try_from(group.iter().filter(|row| row.result == verdict).count())
+                .map_err(|_| "retained test-results verdict count does not fit u64")
+        };
+        if count(TestResultVerdict::Pass)? != totals.passed_tests
+            || count(TestResultVerdict::Fail)? != totals.failed_tests
+            || count(TestResultVerdict::DiagnosticFail)? != totals.diagnostic_failed_tests
         {
             return Err("retained test-results artifact verdict totals mismatch".into());
         }
@@ -357,6 +380,7 @@ pub fn retain(
         passed_tests: 0,
         failed_tests: 0,
         filtered_tests: 0,
+        diagnostic_failed_tests: 0,
     };
     for node in nodes {
         if node.outer_attempt == 0 {
@@ -405,14 +429,18 @@ pub fn retain(
     } else {
         None
     };
+    // The run totals count passes and executions only; every executed test
+    // that did not pass is either a blocking or a diagnostic failure.
     let expected_totals = TestResultTotals {
         executed_tests: expected.executed_tests,
         passed_tests: expected.passed_tests,
         failed_tests: expected
             .executed_tests
             .checked_sub(expected.passed_tests)
+            .and_then(|rest| rest.checked_sub(totals.diagnostic_failed_tests))
             .ok_or("expected passed_tests exceeds executed_tests")?,
         filtered_tests: expected.filtered_tests,
+        diagnostic_failed_tests: totals.diagnostic_failed_tests,
     };
     if totals != expected_totals {
         return Err(format!(
@@ -700,6 +728,110 @@ mod tests {
             "a verdict mutation with a recomputed artifact digest was accepted"
         );
         assert!(retain_once().unwrap_err().contains("already exists"));
+    }
+
+    #[test]
+    fn diagnostic_failures_are_retained_and_counted_apart_from_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = fixture_selected_producers(&["e2e.bucket"], false).unwrap();
+        let diagnostic = dagrun::TestResult::diagnostic_failure(
+            "probe".into(),
+            vec![
+                dagrun::TestAttemptResult::new(
+                    1,
+                    dagrun::TestAttemptOutcome::WallTimeout,
+                    Some("exceeded 20 s".into()),
+                )
+                .unwrap(),
+            ],
+            "bounded probe".into(),
+        )
+        .unwrap();
+        let nodes = vec![NodeTestResultsInput {
+            node: "e2e.bucket".into(),
+            outer_attempt: 1,
+            test_results: terminal_results(
+                3,
+                0,
+                vec![result("ok", true), result("red", false), diagnostic],
+            )
+            .unwrap(),
+        }];
+        let retain_with = |root: &Path, nodes: Vec<NodeTestResultsInput>| {
+            retain(
+                root,
+                ValidatePath::Full,
+                "fixture-run",
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
+                &selected,
+                nodes,
+                None,
+                ExactTestTotals {
+                    executed_tests: 3,
+                    passed_tests: 1,
+                    filtered_tests: 0,
+                },
+            )
+        };
+        let retained = retain_with(root.path(), nodes.clone()).unwrap();
+        let totals = retained.evidence.totals;
+        assert_eq!(
+            (
+                totals.executed_tests,
+                totals.passed_tests,
+                totals.failed_tests,
+                totals.diagnostic_failed_tests
+            ),
+            (3, 1, 1, 1),
+            "a diagnostic failure is neither a pass nor a blocking failure"
+        );
+        let bytes = fs::read(root.path().join(&retained.evidence.artifact.path)).unwrap();
+        let rows = verify_artifact(&retained.evidence, &bytes).unwrap();
+        let verdicts: Vec<_> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.result))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [
+                ("ok", TestResultVerdict::Pass),
+                ("probe", TestResultVerdict::DiagnosticFail),
+                ("red", TestResultVerdict::Fail),
+            ]
+        );
+        // Relabelling the diagnostic row as a pass or a plain failure is refused.
+        for relabel in [TestResultVerdict::Pass, TestResultVerdict::Fail] {
+            let mut mutated = rows.clone();
+            mutated[1].result = relabel;
+            let mutated_bytes = canonical_jsonl(&mutated).unwrap();
+            let mut spoofed = retained.evidence.clone();
+            spoofed.artifact.sha256 = hex_digest(&mutated_bytes);
+            assert!(
+                verify_artifact(&spoofed, &mutated_bytes)
+                    .unwrap_err()
+                    .contains("verdict totals"),
+                "{relabel:?}"
+            );
+        }
+        // An artifact without diagnostic rows keeps its exact earlier bytes:
+        // the count is omitted when it is zero.
+        let encoded = serde_json::to_value(TestResultTotals {
+            executed_tests: 1,
+            passed_tests: 1,
+            failed_tests: 0,
+            filtered_tests: 0,
+            diagnostic_failed_tests: 0,
+        })
+        .unwrap();
+        assert!(
+            encoded.get("diagnostic_failed_tests").is_none(),
+            "{encoded}"
+        );
+        assert_eq!(
+            serde_json::to_value(totals).unwrap()["diagnostic_failed_tests"],
+            1
+        );
     }
 
     #[test]

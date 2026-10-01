@@ -48,6 +48,26 @@ pub(super) enum StructuredResultProducerKind {
 }
 
 impl StructuredResultProducerKind {
+    /// The exact structured-result schema this producer writes: schema 4 for a
+    /// harness node of a bucket in
+    /// [`crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS`], which runs with
+    /// `--diagnostic-results`; the default schema 2 for every other producer.
+    pub(super) fn declaration(
+        self,
+        owner: String,
+        manifest_category: Option<&str>,
+    ) -> StructuredTestResultsManifest {
+        let diagnostic = self == Self::TestHarness
+            && manifest_category.is_some_and(|category| {
+                crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS.contains(&category)
+            });
+        if diagnostic {
+            StructuredTestResultsManifest::diagnostic(owner)
+        } else {
+            StructuredTestResultsManifest::current(owner)
+        }
+    }
+
     pub(super) const ALL: [Self; 4] = [
         Self::Nextest,
         Self::TestHarness,
@@ -357,7 +377,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_shared_paragraph_is_printed_once_per_group,
     // ascii_prepends_the_group_graph, arguments_are_parsed_strictly) retain
     // all 746 prior identities.
-    ("test.regular_crates", 750),
+    // The diagnostic-cell and stripped-ledger tests
+    // (only_a_reasoned_product_failure_of_a_diagnostic_cell_is_a_diagnostic_failure,
+    // a_declared_stripped_match_is_a_weak_tier_match_never_canonical,
+    // a_stripped_divergence_is_sticky_and_stays_at_the_weak_tier,
+    // only_a_declared_complete_stripped_pass_is_a_match,
+    // a_declared_stripped_cell_is_retained_and_verified_as_weak_ordinary_evidence,
+    // the_weak_tier_is_refused_unless_it_is_exactly_a_stripped_verify_comparison,
+    // only_a_diagnostic_results_run_may_select_a_diagnostic_cell)
+    // retain all 750 prior identities.
+    ("test.regular_crates", 757),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -508,7 +537,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 750),
+    ("test.regular_crates_on_host", 757),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -672,10 +701,11 @@ impl StaticStepSpec {
                 .map(|values| values.iter().map(|value| (*value).into()).collect()),
             result_manifests: Some(
                 producer
-                    .map(|_| {
-                        vec![ResultManifest::StructuredTestResults(
-                            StructuredTestResultsManifest::current(tag.clone()),
-                        )]
+                    .map(|kind| {
+                        vec![ResultManifest::StructuredTestResults(kind.declaration(
+                            tag.clone(),
+                            self.manifest.as_ref().map(|manifest| manifest.category),
+                        ))]
                     })
                     .unwrap_or_default(),
             ),

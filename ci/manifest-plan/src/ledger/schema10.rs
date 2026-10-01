@@ -1853,13 +1853,24 @@ pub fn validate_ordinary_verdict(
                 "replay" => false,
                 _ => return Err("schema 10 non-comparison mode carries a compared verdict".into()),
             };
-            if *comparison_tier != ComparisonTier::CanonicalBitwise
-                || !comparison.is_canonical_bitwise_info_v1_for_time_policy(
+            let canonical = *comparison_tier == ComparisonTier::CanonicalBitwise
+                && comparison.is_canonical_bitwise_info_v1_for_time_policy(
                     expected_time,
                     compared_log_messages,
                 )
-                || *bitwise_parity != matches!(verdict, CellVerdict::ComparedAndMatched { .. })
-            {
+                && *bitwise_parity == matches!(verdict, CellVerdict::ComparedAndMatched { .. });
+            // A verify cell that declared the stripped comparator: a real
+            // two-run comparison below L2, never bitwise parity, never the
+            // canonical shape.
+            let stripped = *comparison_tier == ComparisonTier::ExitAndStreamEquality
+                && identity.mode == "verify"
+                && comparison.is_stripped_verify_comparison(compared_log_messages)
+                && !comparison.is_canonical_bitwise_info_v1_for_time_policy(
+                    expected_time,
+                    compared_log_messages,
+                )
+                && !*bitwise_parity;
+            if !canonical && !stripped {
                 return Err(
                     "schema 10 ordinary verdict contradicts its canonical comparison".into(),
                 );

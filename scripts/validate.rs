@@ -6951,7 +6951,17 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
     let declaration = step
         .structured_test_results_manifest()?
         .ok_or_else(|| format!("{tag} has no required structured harness report"))?;
-    if declaration.schema != 2 {
+    // A diagnostic bucket's harness writes schema 4 (`--diagnostic-results`);
+    // every other bucket writes schema 2. One list decides both.
+    let expected_schema = if step.manifest.as_ref().is_some_and(|manifest| {
+        hermit_manifest_plan::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS
+            .contains(&manifest.category.as_str())
+    }) {
+        dagrun::DIAGNOSTIC_RESULTS_SCHEMA
+    } else {
+        dagrun::CURRENT_SCHEMA
+    };
+    if declaration.schema != expected_schema {
         return Err(format!("{tag} does not declare the normal harness report"));
     }
     for name in [
@@ -22302,6 +22312,10 @@ fn nextest_test_observations(
                 attempts: inner_attempts,
                 // This terminal summary does not consume schema-3 attempt causes.
                 attempt_results: _,
+                // A diagnostic failure keeps `passed: false`. It reaches the
+                // failed-test listing only if its node failed, and a node fails
+                // only on blocking rows, so it is not reported as the cause.
+                diagnostic: _,
             } = result;
             let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
                 errors.push(format!(

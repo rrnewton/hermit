@@ -196,6 +196,7 @@ fn fixture_with_path(
         passed_tests: 1,
         failed_tests: 0,
         filtered_tests: 0,
+        diagnostic_failed_tests: 0,
     };
     let tests = TestResultsEvidenceV9 {
         path,
@@ -2597,4 +2598,169 @@ fn finalized_raw_verifier_requires_full_zero_selection_not_merely_an_empty_censu
             .is_err(),
         "missing selected test work cannot become zero selection"
     );
+}
+
+/// One ordinary (non-parity) verify cell with `verdict`, through the same
+/// artifact, summary and plan shapes the producer writes.
+fn ordinary_fixture(verdict: CellVerdict) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let mut plan: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
+    let mut cfg = plan.constructed_dag().unwrap();
+    cfg.steps[0].cmd = crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND.into();
+    plan.dag_json = dag_to_json(&cfg);
+    let plan = serde_json::to_vec(&plan).unwrap();
+    let mut cell: CellArtifactResultV10 = {
+        let mut value: Value = serde_json::from_slice(&cells).unwrap();
+        for field in ["run_id", "hermit_sha", "source_tree_dirty"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        serde_json::from_value(value).unwrap()
+    };
+    cell.backend_parity = RequiredNullable::Null;
+    cell.cell_verdict = verdict;
+    let mut cell_row = serde_json::to_value(&cell).unwrap();
+    cell_row["run_id"] = Value::String("fixture-v10".into());
+    cell_row["hermit_sha"] = Value::String("a".repeat(40));
+    cell_row["source_tree_dirty"] = Value::Bool(false);
+    let mut cell_bytes = serde_json::to_vec(&cell_row).unwrap();
+    cell_bytes.push(b'\n');
+    let mut row = serde_json::to_value(&row).unwrap();
+    row["cell_results"]["selected_backend_parity"] = serde_json::json!([]);
+    row["cell_results"]["cells"][0] =
+        serde_json::to_value(cell.summary("fixture-v10", &"a".repeat(40)).unwrap()).unwrap();
+    row["cell_results"]["artifact"]["sha256"] = hex_digest(&cell_bytes).into();
+    row["constructed_plan"]["sha256"] = hex_digest(&plan).into();
+    row["constructed_plan"]["bytes"] = (plan.len() as u64).into();
+    (
+        serde_json::from_value(row).unwrap(),
+        plan,
+        cell_bytes,
+        tests,
+    )
+}
+
+/// The verdict the ledger derives for a declared stripped verify cell from
+/// the real stripped report Hermit wrote, matched or diverged.
+fn stripped_verdict(diverged: bool) -> CellVerdict {
+    let report = if diverged {
+        crate::runner::PRODUCER_STRIPPED_REPORT
+            .replace(r#""verified":true"#, r#""verified":false"#)
+            .replace(r#""verdict":"matched""#, r#""verdict":"diverged""#)
+    } else {
+        crate::runner::PRODUCER_STRIPPED_REPORT.to_string()
+    };
+    super::super::cell_verdict_from_source(&serde_json::json!({
+        "mode": "verify",
+        "outcome": if diverged { "FAIL" } else { "PASS" },
+        "relaxations": ["comparator=stripped: the corpus verdict policy is the stripped comparison"],
+        "attempts": [{
+            "verification_report_sha256": hex_digest(report.as_bytes()),
+            "verification_report": report,
+        }],
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_declared_stripped_cell_is_retained_and_verified_as_weak_ordinary_evidence() {
+    for (diverged, expected) in [
+        (false, ComparisonObservationVerdictV10::Matched),
+        (true, ComparisonObservationVerdictV10::Diverged),
+    ] {
+        let verdict = stripped_verdict(diverged);
+        assert!(
+            matches!(
+                &verdict,
+                CellVerdict::ComparedAndMatched {
+                    comparison_tier: ComparisonTier::ExitAndStreamEquality,
+                    bitwise_parity: false,
+                    ..
+                } | CellVerdict::ComparedAndDiverged {
+                    comparison_tier: ComparisonTier::ExitAndStreamEquality,
+                    bitwise_parity: false,
+                    ..
+                }
+            ),
+            "{verdict:?}"
+        );
+        let (row, plan, cells, tests) = ordinary_fixture(verdict);
+        let verified = row
+            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .unwrap()
+            .unwrap();
+        assert!(verified.missing_cells.is_empty() && verified.full_test_results);
+        assert_eq!(verified.observations.len(), 1);
+        assert_eq!(
+            verified.observations[0].relation,
+            ComparisonRelationV10::Ordinary
+        );
+        assert_eq!(verified.observations[0].verdict, expected);
+    }
+}
+
+#[test]
+fn the_weak_tier_is_refused_unless_it_is_exactly_a_stripped_verify_comparison() {
+    let identity = identity();
+    let CellVerdict::ComparedAndMatched {
+        comparison,
+        compared_log_messages,
+        ..
+    } = stripped_verdict(false)
+    else {
+        panic!("expected a stripped match");
+    };
+    let weak =
+        |comparison: &ComparisonSpec, bitwise_parity: bool| CellVerdict::ComparedAndMatched {
+            comparison_tier: ComparisonTier::ExitAndStreamEquality,
+            comparison: comparison.clone(),
+            bitwise_parity,
+            compared_log_messages: compared_log_messages.clone(),
+        };
+    validate_ordinary_verdict(&identity, &weak(&comparison, false)).unwrap();
+    let refused = |identity: &CellIdentity, verdict: &CellVerdict| {
+        assert!(
+            validate_ordinary_verdict(identity, verdict)
+                .unwrap_err()
+                .contains("contradicts its canonical comparison"),
+            "{verdict:?}"
+        );
+    };
+    // Claiming bitwise parity, or the canonical tier, on a stripped comparison.
+    refused(&identity, &weak(&comparison, true));
+    refused(
+        &identity,
+        &CellVerdict::ComparedAndMatched {
+            comparison_tier: ComparisonTier::CanonicalBitwise,
+            comparison: comparison.clone(),
+            bitwise_parity: true,
+            compared_log_messages: compared_log_messages.clone(),
+        },
+    );
+    // Any weaker stripped evidence.
+    for change in [
+        |c: &mut ComparisonSpec| c.compare_logs = false,
+        |c: &mut ComparisonSpec| c.virtualize_time = Some(false),
+        |c: &mut ComparisonSpec| c.virtualize_time = None,
+        |c: &mut ComparisonSpec| c.strictness = ComparisonStrictness::Canonical,
+    ] {
+        let mut weaker = comparison.clone();
+        change(&mut weaker);
+        refused(&identity, &weak(&weaker, false));
+    }
+    let empty = CellVerdict::ComparedAndMatched {
+        comparison_tier: ComparisonTier::ExitAndStreamEquality,
+        comparison: comparison.clone(),
+        bitwise_parity: false,
+        compared_log_messages: RequiredNullable::Value(ComparedLogCounts { left: 0, right: 7 }),
+    };
+    refused(&identity, &empty);
+    // The stripped comparator exists only in verify mode.
+    for mode in ["replay", "chaos"] {
+        let other = CellIdentity {
+            mode: mode.into(),
+            ..identity.clone()
+        };
+        refused(&other, &weak(&comparison, false));
+    }
 }

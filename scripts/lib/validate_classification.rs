@@ -138,7 +138,9 @@ pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
     if attempt
         .test_results
         .as_ref()
-        .is_some_and(|results| results.iter().any(|result| !result.passed))
+        // A declared diagnostic failure is reported by the runner and does not
+        // fail the node; only a blocking failure is product-failure evidence.
+        .is_some_and(|results| results.iter().any(dagrun::TestResult::is_blocking_failure))
     {
         return true;
     }
@@ -1553,6 +1555,36 @@ mod publication_tests {
         attempt.test_results_error = Some("real import refusal; prose is not authority".into());
         attempt.test_results_error_kind = kind;
         attempt
+    }
+
+    #[test]
+    fn a_diagnostic_failure_row_is_not_product_failure_evidence() {
+        let failed = || {
+            vec![
+                dagrun::TestAttemptResult::new(
+                    1,
+                    dagrun::TestAttemptOutcome::Failed,
+                    Some("exit 1".into()),
+                )
+                .unwrap(),
+            ]
+        };
+        let mut passing = reported_attempt(&fixture_outcome("e2e.bucket", 0), 1);
+        passing.test_results = Some(vec![
+            dagrun::TestResult::diagnostic_failure("probe".into(), failed(), "bounded".into())
+                .unwrap(),
+        ]);
+        assert_eq!(attempt_classification(&passing), NodeClassification::Pass);
+        let mut blocking = passing.clone();
+        blocking
+            .test_results
+            .as_mut()
+            .unwrap()
+            .push(dagrun::TestResult::with_attempt_results("red".into(), false, failed()).unwrap());
+        assert_eq!(
+            attempt_classification(&blocking),
+            NodeClassification::ProductFailure
+        );
     }
 
     #[test]
