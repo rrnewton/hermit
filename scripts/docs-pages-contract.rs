@@ -29,11 +29,6 @@ const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
 const SERVED_REGISTRY_QUERY: &str = "if jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\" >/dev/null; then";
 const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\" >/dev/null";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
-const LANDING_MARKER: &str = "id=\"compatibility-scorecard\"";
-// Keep this opening tag in sync with the publisher. The stable marker belongs
-// on the sole latest-scorecard link; its visible wording is editorial content.
-const LANDING_LINK: &str =
-    "<a id=\"compatibility-scorecard\" class=\"button primary\" href=\"compatibility/latest/\">";
 
 fn repository_root() -> PathBuf {
     let script = Path::new(file!());
@@ -428,8 +423,6 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
     }
 
     require_once(&mut errors, "landing page", landing, LANDING_ALIAS);
-    require_once(&mut errors, "landing page", landing, LANDING_MARKER);
-    require_once(&mut errors, "landing page", landing, LANDING_LINK);
     require_once(
         &mut errors,
         "deployment step",
@@ -523,8 +516,6 @@ helper = pathlib.Path(sys.argv[1]).resolve()
 checked_in_registry = pathlib.Path(sys.argv[2]).resolve()
 landing = pathlib.Path(sys.argv[3]).read_text()
 landing_alias = 'href="compatibility/latest/"'
-landing_marker = 'id="compatibility-scorecard"'
-landing_link = '<a id="compatibility-scorecard" class="button primary" href="compatibility/latest/">'
 
 def run_helper(arguments, *, cwd=None, expected=None):
     result = subprocess.run(
@@ -710,16 +701,8 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     invalid_landings = (
         ("zero-links", landing.replace(landing_alias, 'href="compatibility/missing/"'),
          "exactly one compatibility/latest link"),
-        ("two-marked-links", landing + landing_link + "Duplicate</a>",
-         "exactly one compatibility/latest link"),
         ("second-unmarked-link", landing + '<a href="compatibility/latest/">Other</a>',
          "exactly one compatibility/latest link"),
-        ("detached-marker", landing.replace(landing_marker, "", 1)
-         + '<span id="compatibility-scorecard"></span>', "scorecard link marker"),
-        ("wrong-marker", landing.replace(landing_marker, 'id="other-scorecard"', 1),
-         "scorecard link marker"),
-        ("duplicate-marker", landing + '<span id="compatibility-scorecard"></span>',
-         "scorecard link marker"),
     )
     for name, contents, expected in invalid_landings:
         assert contents != landing, f"{name} must mutate the actual page"
@@ -727,6 +710,15 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
         install_landing(document, contents)
         run_helper(["extract", retained_archive, document / "compatibility" / retained_identity,
                     first_registry_path, 0], expected=expected)
+
+    # Only the literal href and its count are structural. Copy and presentation
+    # changes must still extract the same pinned archive successfully.
+    presentation = '<a\n href="compatibility/latest/"\n title="Compatibility results" >See current results</a>'
+    document = base / "changed-presentation"
+    install_landing(document, presentation)
+    target = document / "compatibility" / retained_identity
+    run_helper(["extract", retained_archive, target, first_registry_path, 0])
+    assert inventory(target) == retained_before
 
     second_registry_path = base / "second-registry.json"
     write_registry(second_registry_path, [retained_pin, latest_pin], latest_identity)
@@ -1111,36 +1103,15 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     #[test]
     fn landing_page_must_have_only_one_scorecard_link() {
         let (workflow, landing) = actual();
-        for extra in [
-            format!("{LANDING_LINK}Duplicate</a>"),
-            format!("<a {LANDING_ALIAS}>Other</a>"),
-        ] {
-            assert_rejected(&workflow, &format!("{landing}{extra}"), LANDING_ALIAS);
-        }
+        let duplicate = format!("{landing}<a {LANDING_ALIAS}>Other</a>");
+        assert_rejected(&workflow, &duplicate, LANDING_ALIAS);
     }
 
     #[test]
-    fn landing_page_marker_must_be_unique_and_on_the_scorecard_link() {
-        let (workflow, landing) = actual();
-        for (changed, expected) in [
-            (
-                format!(
-                    "{}<span {LANDING_MARKER}></span>",
-                    landing.replacen(LANDING_MARKER, "", 1)
-                ),
-                LANDING_LINK,
-            ),
-            (
-                landing.replacen(LANDING_MARKER, "id=\"other-scorecard\"", 1),
-                LANDING_MARKER,
-            ),
-            (
-                format!("{landing}<span {LANDING_MARKER}></span>"),
-                LANDING_MARKER,
-            ),
-        ] {
-            assert_ne!(changed, landing, "opponent must mutate the actual page");
-            assert_rejected(&workflow, &changed, expected);
-        }
+    fn landing_page_presentation_is_not_part_of_the_alias_contract() {
+        let (workflow, _) = actual();
+        let landing = "<a\n href=\"compatibility/latest/\"\n title=\"Compatibility results\" >See current results</a>";
+        validate_contract(&workflow, landing)
+            .expect("scorecard copy and presentation must not affect the alias contract");
     }
 }

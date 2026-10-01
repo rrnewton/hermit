@@ -683,14 +683,9 @@ if archive_sha256.hexdigest() != PIN["archive_sha256"]:
     refuse("release archive digest disagrees with the pin")
 
 
-# Keep this opening tag in sync with scripts/docs-pages-contract.rs. The
-# marker must belong to the sole latest-scorecard link, independent of its text.
+# Keep the alias count in sync with scripts/docs-pages-contract.rs. Copy and
+# presentation are not part of the publication contract.
 landing_alias = b'href="compatibility/latest/"'
-landing_marker = b'id="compatibility-scorecard"'
-landing_link = (
-    b'<a id="compatibility-scorecard" class="button primary" '
-    b'href="compatibility/latest/">'
-)
 landing_path = TARGET.parent.parent / "index.html"
 try:
     landing_bytes = landing_path.read_bytes()
@@ -698,8 +693,6 @@ except OSError as error:
     refuse(f"cannot read the installed landing page: {error}")
 if landing_bytes.count(landing_alias) != 1:
     refuse("landing page does not contain exactly one compatibility/latest link")
-if landing_bytes.count(landing_marker) != 1 or landing_bytes.count(landing_link) != 1:
-    refuse("landing page does not contain exactly one scorecard link marker on that link")
 
 
 with tarfile.open(ARCHIVE, mode="r:gz") as archive:
