@@ -10,6 +10,7 @@
 
 mod notification_fds;
 mod readdir_order;
+mod tight_stack_maps;
 mod tight_stack_openat;
 mod vfork;
 
