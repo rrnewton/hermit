@@ -9,6 +9,9 @@
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
+#[path = "common/inode_identity_views.rs"]
+mod inode_identity_views;
+
 use std::fs;
 use std::io::Read;
 use std::io::Seek;
@@ -229,13 +232,14 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
     );
 }
 
-fn run_liteinst_with_input(
+/// The LiteInst command that runs `program`, with an isolated HOME that must
+/// outlive the run.
+fn liteinst_guest_command(
     program: &Path,
     args: &[&str],
     verify: bool,
-    input: Option<&[u8]>,
     epoch: Option<&str>,
-) -> Output {
+) -> (Command, tempfile::TempDir) {
     liteinst_runtime::ensure_liteinst_runtime();
     let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
     let xdg_config_home = home.path().join(".config");
@@ -254,6 +258,17 @@ fn run_liteinst_with_input(
         .env("HOME", home.path())
         .env("PYTHONDONTWRITEBYTECODE", "1");
     command.arg("--").arg(program).args(args);
+    (command, home)
+}
+
+fn run_liteinst_with_input(
+    program: &Path,
+    args: &[&str],
+    verify: bool,
+    input: Option<&[u8]>,
+    epoch: Option<&str>,
+) -> Output {
+    let (mut command, _home) = liteinst_guest_command(program, args, verify, epoch);
     let Some(input) = input else {
         return command.output().expect("failed to run Hermit LiteInst");
     };
@@ -341,6 +356,22 @@ fn run_liteinst_strict_verify_with_stdin(program: &Path, args: &[&str], input: &
         Some(input),
         None,
     ))
+}
+
+/// A strict verified LiteInst run whose stdin is `stdin` itself, so the guest
+/// can map it, rather than a pipe.
+fn run_liteinst_strict_verify_with_stdin_file(
+    program: &Path,
+    args: &[&str],
+    stdin: fs::File,
+) -> Output {
+    let (mut command, _home) = liteinst_guest_command(program, args, true, None);
+    assert_liteinst_strict_verify_output(
+        command
+            .stdin(stdin)
+            .output()
+            .expect("failed to run Hermit LiteInst with a stdin file"),
+    )
 }
 
 fn assert_liteinst_strict_verify_output(output: Output) -> Output {
@@ -1333,5 +1364,54 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
     assert!(
         exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
         "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
+}
+
+// getdents keys each entry's deterministic inode on the directory's device as
+// well as the entry's inode (https://github.com/rrnewton/hermit/issues/3307),
+// and a descriptor received over SCM_RIGHTS is one Detcore does not track, so
+// it has no cached stat to read that device from. This guards that getdents on
+// such a descriptor still succeeds and lists every entry with the inode number
+// `stat` reports for it.
+#[test]
+fn liteinst_strict_verify_untracked_directory_descriptor_lists_stat_inodes() {
+    let guest = inode_identity_views::compile_guest("liteinst-scm-getdents");
+    let output = run_liteinst_strict_verify(&guest, &["scm-getdents", "/test"]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        inode_identity_views::scm_getdents_expected_stdout()
+    );
+}
+
+// Every file-backed /proc/self/maps line must report the inode `stat` reports
+// for that file. Deterministic inodes are keyed on device and inode
+// (https://github.com/rrnewton/hermit/issues/3307), and on btrfs maps and stat
+// report different devices for one file, so the device in a maps line cannot
+// be the key. This guards that every mapping of a live path, the mapped stdin
+// file, and two files mapped and then unlinked (no path leads to them; one
+// descriptor is still open, the other closed) keep the inode fstat reports.
+// The unlinked files go in a host directory rather than the guest's tmpfs
+// working directory, so that on a btrfs host they are the two-device case.
+#[test]
+fn liteinst_strict_verify_maps_inodes_equal_stat_inodes() {
+    let guest = inode_identity_views::compile_guest("liteinst-maps-stat");
+    let mut input =
+        tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR")).expect("stdin file to map");
+    input.write_all(&[b'x'; 4096]).expect("fill stdin file");
+    let stdin = input.reopen().expect("reopen stdin file");
+    let unlinked =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to unlink files in");
+    let unlinked_arg = unlinked
+        .path()
+        .to_str()
+        .expect("CARGO_TARGET_TMPDIR should be UTF-8");
+    let output =
+        run_liteinst_strict_verify_with_stdin_file(&guest, &["maps-stat", unlinked_arg], stdin);
+    let stdout = String::from_utf8(output.stdout).expect("maps-stat output should be UTF-8");
+    inode_identity_views::assert_maps_stat_summary(
+        stdout.trim_end(),
+        &guest,
+        "agrees",
+        Some(unlinked.path()),
     );
 }
