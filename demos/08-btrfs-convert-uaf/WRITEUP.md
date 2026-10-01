@@ -232,8 +232,10 @@ Three limits are worth knowing:
   `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot` and exits
   with status 122, and `run.sh` reports rc=122 instead of the expected crash.
   All 44 seed-7 runs counted in the
-  [demo's README](README.md#what-to-notice) crashed; they ran on a 316-thread
-  host at a load average of 10 to 20.
+  [demo's README](README.md#what-to-notice) crashed. The host's load was not
+  recorded during them; the README gives the 1-minute load average during
+  three later passing runs of `run.sh` on 2026-10-01, 18.18 to 38.72 on 316
+  hardware threads.
 
 ## Try it
 

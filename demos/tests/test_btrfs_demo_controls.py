@@ -89,13 +89,14 @@ case "$conv" in
       partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
       truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
       skid-refusal) skid_refusal ;;
-      replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different)
+      replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different|replay-skid-refusal)
         if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
         case "$DEMO08_TEST_BUGGY_MODE" in
           replay-partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
           replay-partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
           replay-truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
           replay-different) cat "$DEMO08_TEST_OTHER_FILE"; exit 134 ;;
+          replay-skid-refusal) skid_refusal ;;
         esac ;;
       *) echo "stub: unknown DEMO08_TEST_BUGGY_MODE" >&2; exit 9 ;;
     esac ;;
@@ -154,8 +155,36 @@ partial_report() {
   echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
   echo 'READ of size 8 at 0x606000000210 thread T1'
 }
+# Hermit's refusal after a late performance-counter interrupt (exit 122).
+refusal() {
+  echo 'HERMIT_SKID_OVERSHOOT rcb_actual=1008 rcb_target=1000 skid_margin=32 overshoot=8' >&2
+  echo 'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1' >&2
+  exit 122
+}
 
 case "${DEMO08_TEST_MODE:?}" in
+  refused-once)
+    # Each (variant, seed) pair is refused on its first run only; after that
+    # the buggy variant crashes on DEMO08_TEST_UAF_SEED and the fixed one is
+    # clean.
+    if [ "$count" -eq 1 ]; then refusal; fi
+    engage
+    if [ "$variant" = buggy ] && [ "$seed" = "${DEMO08_TEST_UAF_SEED:?}" ]; then
+      abort_with_uaf
+    fi
+    echo 'Conversion complete' ;;
+  always-refused)
+    refusal ;;
+  replay-refused)
+    engage
+    if [ "$variant" = fixed ]; then echo 'Conversion complete'; exit 0; fi
+    if [ "$count" -eq 1 ]; then abort_with_uaf; fi
+    refusal ;;
+  fixed-refused-uaf)
+    engage
+    if [ "$variant" = buggy ]; then abort_with_uaf; fi
+    abort_with_uaf || true
+    refusal ;;
   no-engagement)
     echo 'exited before the progress thread started' ;;
   engaged-no-hit)
@@ -456,6 +485,13 @@ class DemoRunControlsTest(unittest.TestCase):
             self._run(buggy_mode="replay-partial-rc124"),
             "replay did not complete with the ASAN abort",
         )
+
+    def test_a_second_run_refused_after_a_skid_overshoot_is_explained(self):
+        """Step 4 explains a refusal as steps 2 and 3 do, and still exits 1."""
+        result = self._run(buggy_mode="replay-skid-refusal")
+        self._assert_refused(result, "replay did not complete with the ASAN abort: rc=122")
+        self.assertIn("rc=122 means Hermit refused the run", result.stdout)
+        self.assertIn("chaos-buggy-replay.out", result.stdout)
 
     def test_a_second_run_with_a_truncated_report_is_refused(self):
         self._assert_refused(
@@ -815,6 +851,76 @@ class CalibrationControlsTest(unittest.TestCase):
     def test_crash_text_from_a_failed_run_does_not_qualify(self):
         result = self._prepare("runner-failure-with-signatures", 1)
         self._assert_refused(result, "never executed the guest: 0 of 1 seeds")
+
+    def test_a_refused_run_is_retried_and_the_seed_still_found(self):
+        """A refusal (exit 122) is not "this seed did not crash": run it again."""
+        result = self._calibrated(
+            self._prepare("refused-once", 1, DEMO08_TEST_UAF_SEED="0")
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Demo 8 crash seed calibrated: 0", result.stdout)
+        self.assertIn(
+            "Hermit refused the buggy run on seed 0 (rc=122, attempt 1 of 3)",
+            result.stdout,
+        )
+        self.assertIn(
+            "Hermit refused the fixed run on seed 0 (rc=122, attempt 1 of 3)",
+            result.stdout,
+        )
+        self.assertIn("executed=1/1 unconfirmed=0 refused=0/1 refused_runs=2", result.stdout)
+        self.assertEqual(
+            (self.assets / ".crash-seed").read_text(), "0 {}\n".format(self.fixture)
+        )
+        # The two refused attempts are rows of their own, with their output kept.
+        self.assertEqual(len(self._rows()), 6)
+        self.assertEqual(self._count_rows(r"\t122\t\d+\trefused\t"), 2)
+        self.assertEqual(
+            self._count_rows(r"^0\tcold\tbuggy\treached\tcomplete\t134\t\d+\tyes\t"), 1
+        )
+        for name in (
+            "calibration-cold-seed-0-refused-1.out",
+            "calibration-confirm-fixed-seed-0-refused-1.out",
+        ):
+            self.assertIn(
+                "HERMIT_POLICY_REFUSAL", (self.artifacts / name).read_text()
+            )
+
+    def test_seeds_refused_on_every_attempt_are_reported_as_refused(self):
+        result = self._prepare("always-refused", 2)
+        self._assert_refused(
+            result,
+            "refused by Hermit on every seed: each of the 2 attempted seeds "
+            "exited 122 on all 3 attempt(s)",
+            "refused=2/2 refused_runs=6",
+            "seed 0 was not tested: Hermit refused every attempt",
+        )
+        self.assertNotIn("never executed the guest", result.stdout)
+        self.assertEqual(len(self._rows()), 7)
+        self.assertEqual(self._count_rows(r"\t122\t\d+\trefused\t"), 6)
+
+    def test_refusal_retries_can_be_turned_off(self):
+        result = self._prepare("always-refused", 1, DEMO08_REFUSAL_RETRIES="0")
+        self._assert_refused(result, "exited 122 on all 1 attempt(s)", "refused_runs=1")
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_a_replay_refused_on_every_attempt_is_not_a_disagreement(self):
+        result = self._prepare("replay-refused", 1)
+        self._assert_refused(
+            result,
+            "Hermit refused every replay attempt (rc=122), so the replay was not tested",
+            "qualifying seed(s) but confirmed none",
+            "1 had a replay or fixed control that Hermit refused on every attempt",
+        )
+        self.assertNotIn("did not on its replay", result.stdout)
+        self.assertEqual(
+            self._count_rows(r"\tbuggy-replay\treached\tnone\t122\t\d+\trefused\t"), 3
+        )
+
+    def test_a_refused_fixed_run_with_a_uaf_is_not_retried_away(self):
+        """The fixed variant's use-after-free stops calibration even when refused."""
+        result = self._prepare("fixed-refused-uaf", 1)
+        self._assert_refused(result, "fixed variant reported a use-after-free on seed 0")
+        self.assertEqual(self._count_rows(r"\tfixed\t"), 1)
 
 
 if __name__ == "__main__":
