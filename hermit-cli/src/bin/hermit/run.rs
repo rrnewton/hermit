@@ -241,8 +241,34 @@ fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
         }
     }
     // Outside a work tree only. Nothing enumerates source here, so the previous
-    // location is still correct and still visible to both run containers.
+    // location is still correct. It is NOT necessarily visible inside the run
+    // container -- a working directory under the host /tmp is hidden behind
+    // the guest's private /tmp -- which is why the container reaches these
+    // files only through `private_summary_descriptor_path`, never by this name.
     Ok(start.to_path_buf())
+}
+
+/// The pathname through which the run container reaches a private summary.
+///
+/// ⚠️ NEVER HAND THE CONTAINER `file.path()`. That name is a HOST path, and
+/// the container mounts a private directory over `/tmp`, so a summary created
+/// under a host working directory below `/tmp` does not exist there. Detcore's
+/// end-of-run summary write then failed with NotFound and panicked as PID 1 of
+/// the container, so `hermit run --verify -- /bin/true` exited 125 before run 2
+/// for every caller that starts tests from a temporary directory (Buck/TPX,
+/// lit): https://github.com/rrnewton/hermit/issues/3260, 221 of the fbsource
+/// import's Buck/TPX failures. A git work tree under `/tmp` fails the same way,
+/// through `<work tree>/ignored/`.
+///
+/// The controller keeps `file` open across the container fork, and a fork
+/// keeps descriptor numbers, so this one spelling names the same inode in the
+/// controller and in the container whatever either mount namespace hides.
+/// Captured runs already hand their staged summary to the container this way
+/// (`staged_summary::writer_path`). The named file and its location are
+/// unchanged, so what the guest can observe is unchanged too.
+fn private_summary_descriptor_path(file: &tempfile::NamedTempFile) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_file().as_raw_fd()))
 }
 
 fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
@@ -666,6 +692,9 @@ pub struct RunOpts {
     pub(crate) summary: bool,
 
     /// Print a machine readable version of --summary to a file.
+    ///
+    /// The summary is written from inside the run container, so an absolute
+    /// path under host /tmp is refused unless --tmp=/tmp exposes host /tmp.
     #[clap(long)]
     pub(crate) summary_json: Option<PathBuf>,
 
@@ -3360,6 +3389,7 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
+        self.validate_summary_json_visibility()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
         }
@@ -3385,7 +3415,16 @@ impl RunOpts {
             && self.summary_json.is_none()
         {
             let file = private_backend_engagement_summary()?;
-            self.summary_json = Some(file.path().to_owned());
+            // A captured run stages its summary through its own descriptor and
+            // then publishes it by renaming into this destination's directory,
+            // so it needs the directory entry itself; a `/proc/self/fd` name
+            // has no directory to rename into. Every other run hands the
+            // container the descriptor: see private_summary_descriptor_path.
+            self.summary_json = Some(if guest_capture.is_some() {
+                file.path().to_owned()
+            } else {
+                private_summary_descriptor_path(&file)
+            });
             Some(file)
         } else {
             None
@@ -4131,6 +4170,62 @@ impl RunOpts {
         )
     }
 
+    /// Refuse an absolute `--summary-json` that the run container cannot see.
+    ///
+    /// Detcore writes the summary from inside the container, at the end of the
+    /// run, and the container mounts a private directory over `/tmp`. A host
+    /// path under `/tmp` therefore names nothing there: the write failed with
+    /// NotFound and panicked at teardown, after the whole guest had run, or --
+    /// when its parent happened to exist in the private `/tmp`, as for
+    /// `/tmp/summary.json` -- succeeded into a directory that is deleted with
+    /// the container, losing the summary without a word. Hermit's own private
+    /// summaries no longer take this route (private_summary_descriptor_path);
+    /// this is the same fault for a path the caller chose, so it is refused
+    /// before anything runs, like a program under host `/tmp`. See
+    /// https://github.com/rrnewton/hermit/issues/3260.
+    ///
+    /// "Cannot see" is decided by the same guest-path mapping the program check
+    /// uses, so `--tmp`, a `--bind` into `/tmp` and a sourced `--mount` keep
+    /// working, and a source-less `--mount` (a tmpfs, equally discarded) is
+    /// refused for the same reason. A relative path is not refused: the
+    /// container inherits the caller's working directory itself, not its name,
+    /// so a relative summary reaches the host directory even when that
+    /// directory is under `/tmp`. DBT does not write `--summary-json`,
+    /// `--no-namespace` has no private mounts, and `--image` (a prototype)
+    /// replaces the whole root, which this mapping does not model.
+    fn validate_summary_json_visibility(&self) -> Result<(), Error> {
+        let Some(path) = self.summary_json.as_deref() else {
+            return Ok(());
+        };
+        if self.no_namespace
+            || self.image.is_some()
+            || self.selected_backend() == Backend::Dbt
+            || !path.is_absolute()
+        {
+            return Ok(());
+        }
+        if matches!(self.mapped_host_program(path), GuestPathMapping::Hidden) {
+            let (cause, remedy) = if path.starts_with(TMP_DIR) {
+                (
+                    "it is under host /tmp, but Hermit replaces guest /tmp with an isolated \
+                     directory",
+                    "Write it outside /tmp, or pass --tmp=/tmp to expose host /tmp.",
+                )
+            } else {
+                (
+                    "a --mount without a source hides it",
+                    "Write it outside that mount.",
+                )
+            };
+            anyhow::bail!(
+                "--summary-json {} is not visible inside the run container: {cause}. The summary \
+                 is written from inside the container, so it would be lost. {remedy}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn validate_program(&self) -> Result<(), Error> {
         // PROTOTYPE (--image): the guest program is interpreted inside the
         // materialized OCI rootfs, not on the host filesystem. Resolve and
@@ -4527,10 +4622,17 @@ impl RunOpts {
         // 1's JSON in it while run 2 executes changes the guest's input: a guest
         // that reads the file sees zero bytes in run 1 and a completed summary
         // in run 2. Emptying it before run 2 preserves the initial contents.
+        //
+        // Both runs and every read below use the descriptor spelling, never
+        // `summary1_file.path()`: that host name does not exist inside the
+        // container when the working directory is under the host /tmp. See
+        // private_summary_descriptor_path. `summary1_file` stays open, and so
+        // the spelling stays valid, until this function returns.
         let summary1_file = private_verify_summary()?;
-        let summary2_path = self.summary_json.as_deref().unwrap_or(summary1_file.path());
+        let summary1_path = private_summary_descriptor_path(&summary1_file);
+        let summary2_path = self.summary_json.as_deref().unwrap_or(&summary1_path);
         let mut run1_options = self.clone();
-        run1_options.summary_json = Some(summary1_file.path().to_owned());
+        run1_options.summary_json = Some(summary1_path.clone());
         let mut run2_options = self.clone();
         run2_options.summary_json = Some(summary2_path.to_owned());
 
@@ -4550,7 +4652,7 @@ impl RunOpts {
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
                     && let Some(path) = &self.verify_json
                 {
-                    let summary1 = read_verify_summary(summary1_file.path());
+                    let summary1 = read_verify_summary(&summary1_path);
                     if let Err(report_error) = write_skid_overshoot_without_comparison_json(
                         path,
                         overshoot.count(),
@@ -4605,7 +4707,7 @@ impl RunOpts {
         if !self.verify_allow.satisfies(out1.status) {
             if skid_overshoots_run1 > 0 {
                 if let Some(path) = &self.verify_json {
-                    let summary1 = read_verify_summary(summary1_file.path());
+                    let summary1 = read_verify_summary(&summary1_path);
                     write_skid_overshoot_without_comparison_json(
                         path,
                         skid_overshoots_run1,
@@ -4633,7 +4735,7 @@ impl RunOpts {
             // result. A best-effort write: an unwritable artifact must not
             // convert a rejected first run into a different error.
             if let Some(path) = &self.verify_json {
-                let summary1 = read_verify_summary(summary1_file.path());
+                let summary1 = read_verify_summary(&summary1_path);
                 let report = first_run_rejected_report(
                     &out1,
                     verification_runtime_from_summaries(summary1.as_ref(), None),
@@ -4652,7 +4754,7 @@ impl RunOpts {
             return Err(Error::msg(format!("First run during --verify {status}")));
         }
 
-        let summary1 = take_verify_summary_before_next_run(summary1_file.path())?;
+        let summary1 = take_verify_summary_before_next_run(&summary1_path)?;
         if skid_overshoots_run1 > 0
             && let Some(path) = &self.verify_json
         {

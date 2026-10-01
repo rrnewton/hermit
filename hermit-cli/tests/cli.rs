@@ -2101,6 +2101,206 @@ fn run_ptrace_fails_closed_by_default_on_unsupported_syscall() {
          {compatibility_stderr}"
     );
 }
+
+/// A working directory under the host `/tmp`, made with `tempdir_in("/tmp")`
+/// rather than `tempfile::tempdir()`: the latter follows `TMPDIR`, which
+/// validation points elsewhere, and then the test would not reach the case.
+fn working_directory_under_host_tmp(purpose: &str) -> tempfile::TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("hermit-3260-{purpose}-"))
+        .tempdir_in("/tmp")
+        .expect("failed to create a working directory under the host /tmp");
+    assert!(
+        directory.path().starts_with("/tmp/"),
+        "fixture working directory {} is not under the host /tmp, so this test \
+         would not exercise https://github.com/rrnewton/hermit/issues/3260",
+        directory.path().display()
+    );
+    directory
+}
+
+/// Names left in `directory` (and its `ignored/`) that a private run summary uses.
+fn leftover_private_summaries(directory: &Path) -> Vec<PathBuf> {
+    [directory.to_path_buf(), directory.join("ignored")]
+        .iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
+        .map(|entry| entry.expect("listing the working directory").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(".hermit-"))
+        })
+        .collect()
+}
+
+/// https://github.com/rrnewton/hermit/issues/3260: `hermit run --verify` from
+/// a working directory under the host `/tmp`, the way Buck/TPX and lit start
+/// tests (221 of the fbsource import's Buck/TPX failures).
+///
+/// The private run-1 summary used to be handed to the container by its host
+/// name, which the container hides behind its own private `/tmp`. Three shapes:
+///
+/// - a plain directory: the summary is created in the cwd itself, Detcore's
+///   write fails with NotFound and panics as PID 1 of the container, so even
+///   `/bin/true` exits 125 before run 2;
+/// - a git work tree that ignores `ignored/`: the same, via `<tree>/ignored/`;
+/// - `/tmp` itself: the parent exists in the private `/tmp`, so the write
+///   "succeeds" into a directory deleted with the container and verification
+///   silently loses run 1's statistics.
+///
+/// "No statistics warning" is asserted, not just success: it proves run 1's
+/// summary actually reached the controller. It is what catches the third
+/// shape, and a fix that merely swallowed the failed write.
+#[test]
+fn run_verify_from_a_working_directory_under_host_tmp() {
+    for shape in ["a plain directory", "a git work tree", "/tmp itself"] {
+        let fixture =
+            (shape != "/tmp itself").then(|| working_directory_under_host_tmp("verify-cwd"));
+        let directory = fixture
+            .as_ref()
+            .map_or(Path::new("/tmp"), |directory| directory.path());
+        if shape == "a git work tree" {
+            fs::create_dir(directory.join(".git")).expect("fixture work tree");
+            fs::write(directory.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
+        }
+        let args = ["run", "--verify", "--", "/bin/true"];
+        let output = hermit_command(&args)
+            .current_dir(directory)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let stderr = stderr(&output);
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains("class=container-child-panic"),
+            "hermit run --verify panicked from {shape} under the host /tmp ({}):\n{stderr}",
+            directory.display()
+        );
+        assert_success(&output, &args);
+        assert!(
+            stderr.contains(":: Success: deterministic. Determinism verified."),
+            "determinism confirmation missing from {shape} under the host /tmp:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("verification runtime statistics unavailable"),
+            "run 1's private summary did not reach the controller from {shape} under \
+             the host /tmp:\n{stderr}"
+        );
+        // Not for /tmp itself: unrelated processes create names there.
+        if fixture.is_some() {
+            assert_eq!(
+                leftover_private_summaries(directory),
+                Vec::<PathBuf>::new(),
+                "hermit run --verify left a private summary behind in {shape}"
+            );
+        }
+    }
+}
+
+/// The same fault for a `--summary-json` the caller chose: an absolute path
+/// under the host `/tmp` used to let the whole guest run and then panic at
+/// teardown (exit 125, `class=container-child-panic`). It is refused before
+/// the guest starts, and the refusal names the path. `--tmp=/tmp` exposes the
+/// host `/tmp`, so the same path then works and the summary lands on the host.
+#[test]
+fn run_refuses_a_summary_json_hidden_by_the_private_tmp() {
+    let directory = working_directory_under_host_tmp("summary-json");
+    let summary = directory
+        .path()
+        .join("missing-in-guest")
+        .join("summary.json");
+    fs::create_dir(summary.parent().unwrap()).expect("fixture summary directory");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let args = [
+        "run",
+        summary_arg.as_str(),
+        "--",
+        "/bin/echo",
+        "guest-ran-3260",
+    ];
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("class=container-child-panic"),
+        "a --summary-json under the host /tmp panicked instead of being refused:\n{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(125), "{stderr}");
+    assert!(stderr.contains("class=cli-error"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "--summary-json {} is not visible inside the run container",
+            summary.display()
+        )),
+        "the refusal does not name the summary path:\n{stderr}"
+    );
+    assert_eq!(
+        stdout(&output),
+        "",
+        "the guest ran before the refusal, so it was not refused up front"
+    );
+    assert!(!summary.exists(), "a refused run wrote a summary");
+
+    // Control: the check discriminates rather than refusing every /tmp path.
+    let exposed_args = [
+        "run",
+        "--tmp=/tmp",
+        summary_arg.as_str(),
+        "--",
+        "/bin/echo",
+        "guest-ran-3260",
+    ];
+    let exposed = hermit(&exposed_args);
+    assert_success(&exposed, &exposed_args);
+    assert_eq!(stdout(&exposed), "guest-ran-3260\n");
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summary).expect("--tmp=/tmp summary was not written"))
+            .expect("--tmp=/tmp summary is not JSON");
+    assert!(written.is_object(), "{written}");
+}
+
+/// The sibling private summary from the same issue: a ptrace run asked for
+/// `--backend-engagement-json` without `--summary-json` reads its scheduler
+/// turns from a private summary resolved the same way.
+#[test]
+fn run_ptrace_backend_engagement_from_a_working_directory_under_host_tmp() {
+    let directory = working_directory_under_host_tmp("engagement-cwd");
+    let records = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the engagement record directory");
+    let record = records.path().join("engagement.json");
+    let record_arg = format!("--backend-engagement-json={}", record.display());
+    let args = [
+        "--backend=ptrace",
+        "run",
+        record_arg.as_str(),
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit_command(&args)
+        .current_dir(directory.path())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+    let stderr = stderr(&output);
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("class=container-child-panic"),
+        "ptrace engagement run panicked from under the host /tmp:\n{stderr}"
+    );
+    assert_success(&output, &args);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("the engagement record was not written"))
+            .expect("the engagement record is not JSON");
+    assert_eq!(report["engagement"]["backend"], "ptrace", "{report}");
+    assert!(
+        report["engagement"]["scheduler_turns"]
+            .as_u64()
+            .is_some_and(|turns| turns > 0),
+        "the engagement record carries no scheduler turns: {report}"
+    );
+    assert_eq!(
+        leftover_private_summaries(directory.path()),
+        Vec::<PathBuf>::new(),
+        "the ptrace engagement run left a private summary behind"
+    );
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.
 // TODO(#2791): Remove the portable test.cli skip when DBT aggregation defect #2804 is fixed.
