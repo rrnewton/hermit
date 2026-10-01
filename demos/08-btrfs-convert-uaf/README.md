@@ -78,9 +78,14 @@ would with any other exit status. When a refused attempt is followed by another
 one, its output is kept in a file ending in `-refused-1.out`, `-refused-2.out`,
 and so on, and every refused attempt gets a row in `calibration.tsv` whose
 `qualifies` column says `refused`. A seed that is refused on every attempt is
-reported as refused and skipped. The summary line counts such seeds as
-`refused=` and all refused attempts as `refused_runs=`, and the script fails,
-saying that no seed was tested, if every seed it tried was refused.
+reported as refused and skipped. The summary line's `refused=` counts only the
+seeds whose first run was refused on every attempt. A seed whose first run
+crashed but whose repeat or fixed-build run was refused on every attempt is
+counted under `unconfirmed=`, together with the seeds whose repeat or
+fixed-build run went past the per-run time limit. `refused_runs=` counts every
+refused attempt, including those of repeats and fixed-build runs. The script
+fails, saying that no seed was tested, if the first run of every seed it tried
+was refused on every attempt.
 
 To run one chaos trial yourself, with the seed that `prepare-assets.sh`
 recorded (the tool rewrites its input, so give it a fresh copy each time):
@@ -300,9 +305,10 @@ picks thread switches pseudo-randomly from `--sched-seed`. Some seeds happen to
 let the main thread free the memory just before the progress thread's last
 read, and AddressSanitizer turns that read into an abort with exit status 134.
 Because the schedule is a function of the seed, running the same seed on the
-same input reproduced the same interleaving and the same report on a lightly
-loaded host. Under heavy host load a late counter interrupt makes Hermit refuse
-the run with exit status 122; see [What to notice](#what-to-notice).
+same input reproduced the same interleaving and the same report on the host
+described under [What to notice](#what-to-notice), which also gives the host's
+load where it was recorded. Under heavy host load a late counter interrupt
+makes Hermit refuse the run with exit status 122.
 
 The two variants carry a small harness, applied identically to both, in
 [`fixtures/`](fixtures/):

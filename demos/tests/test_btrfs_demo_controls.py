@@ -185,6 +185,10 @@ case "${DEMO08_TEST_MODE:?}" in
     if [ "$variant" = buggy ]; then abort_with_uaf; fi
     abort_with_uaf || true
     refusal ;;
+  fixed-refused)
+    engage
+    if [ "$variant" = buggy ]; then abort_with_uaf; fi
+    refusal ;;
   no-engagement)
     echo 'exited before the progress thread started' ;;
   engaged-no-hit)
@@ -911,9 +915,25 @@ class CalibrationControlsTest(unittest.TestCase):
             "qualifying seed(s) but confirmed none",
             "1 had a replay or fixed control that Hermit refused on every attempt",
         )
+        # refused= counts only seeds whose first run was refused; a refused
+        # replay is counted under unconfirmed=, and refused_runs= counts every
+        # refused attempt.
+        self.assertIn("unconfirmed=1 refused=0/1 refused_runs=3", result.stdout)
         self.assertNotIn("did not on its replay", result.stdout)
         self.assertEqual(
             self._count_rows(r"\tbuggy-replay\treached\tnone\t122\t\d+\trefused\t"), 3
+        )
+
+    def test_a_fixed_run_refused_on_every_attempt_is_unconfirmed_not_refused(self):
+        result = self._prepare("fixed-refused", 1)
+        self._assert_refused(
+            result,
+            "fixed control on seed 0 was refused by Hermit on every attempt",
+            "qualifying seed(s) but confirmed none",
+            "unconfirmed=1 refused=0/1 refused_runs=3",
+        )
+        self.assertEqual(
+            self._count_rows(r"\tfixed\treached\tnone\t122\t\d+\trefused\t"), 3
         )
 
     def test_a_refused_fixed_run_with_a_uaf_is_not_retried_away(self):

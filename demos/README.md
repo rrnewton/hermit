@@ -41,15 +41,18 @@ file system or network deterministic.
   ([demo 9](09-qemu-busybox/README.md), which saves no snapshot).
 - **Inspect a running guest kernel without disturbing it**, and see the same
   kernel state on every run ([demo 7](07-drgn-kernel/README.md)).
-- **Catch a real use-after-free that normal runs expose only by chance**, and,
-  on a lightly loaded machine, reproduce it on request
-  ([demo 8](08-btrfs-convert-uaf/README.md)). On a shared or heavily loaded
-  machine the crash may not reproduce reliably: Hermit arms the retired-branch
-  counter interrupt for each chaos-mode thread switch a safety margin early and
-  single-steps to the exact point, and if the interrupt arrives later than that
-  margin, which is more likely under heavy host load, Hermit prints
-  `HERMIT_SKID_OVERSHOOT` and refuses the run (`HERMIT_POLICY_REFUSAL ...
-  cause=skid-overshoot`, exit status 122) instead of reporting the crash.
+- **Catch a real use-after-free that normal runs expose only by chance**, and
+  reproduce it on request ([demo 8](08-btrfs-convert-uaf/README.md)). On one
+  316-thread host, seed 7 crashed it in all 44 counted runs of the demo's
+  command, during which the host's load was not recorded, and in three later
+  runs of the demo, with the 1-minute load average between 18.18 and 38.72 at
+  their starts and ends. On a shared or heavily loaded machine the crash may
+  not reproduce reliably: Hermit arms the retired-branch counter interrupt for
+  each chaos-mode thread switch a safety margin early and single-steps to the
+  exact point, and if the interrupt arrives later than that margin, which is
+  more likely under heavy host load, Hermit prints `HERMIT_SKID_OVERSHOOT` and
+  refuses the run (`HERMIT_POLICY_REFUSAL ... cause=skid-overshoot`, exit
+  status 122) instead of reporting the crash.
 - **Build Debian packages bit for bit reproducibly**: in a 58-package sample
   measured with Hermit commit `1fadc03779f2`, 52 built byte-identically from two
   different root directories and none differed; an earlier, larger run found
@@ -67,7 +70,7 @@ file system or network deterministic.
 | 5 | [Boot Linux in QEMU and save a snapshot](05-qemu-boot/README.md) | QEMU boots Linux under Hermit; a second boot started the same way, with the same Python interpreter, gives the same console output, snapshot file, and event log (the interpreter runs inside the guest, and one value QEMU reads, the set of ignored signals, still comes from the host: https://github.com/rrnewton/hermit/issues/3441). |
 | 6 | [Resume the snapshot and run a command](06-qemu-resume/README.md) | Restore the demo 5 snapshot, run any shell command in the guest, and get identical output and an identical post-command snapshot. |
 | 7 | [Watch the guest kernel's task list with drgn](07-drgn-kernel/README.md) | Read the guest kernel's task list with the drgn debugger before and after a fixed command, with the same result on every run. |
-| 8 | [Find and reproduce a schedule-dependent use-after-free](08-btrfs-convert-uaf/README.md) | Chaos mode crashes a `btrfs-convert` build with a real 2015 race put back, the fixed build survives the same seed, and on a lightly loaded host the crash report repeats byte for byte (on a shared or heavily loaded machine the crash may not reproduce reliably). |
+| 8 | [Find and reproduce a schedule-dependent use-after-free](08-btrfs-convert-uaf/README.md) | Chaos mode crashes a `btrfs-convert` build with a real 2015 race put back, the fixed build survives the same seed, and on the 316-thread host where it was measured the crash report repeated byte for byte (on a shared or heavily loaded machine the crash may not reproduce reliably). |
 | 9 | [Boot BusyBox in QEMU, from a single script](09-qemu-busybox/README.md) | The smallest whole-machine demo: one script boots a kernel and BusyBox under `hermit run --strict`. |
 
 > **Catching a use-after-free that normal runs expose only by chance (btrfs-progs).**
@@ -93,8 +96,8 @@ file system or network deterministic.
 > three later passing runs. The writeup has the full table. On a shared or
 > heavily loaded machine the crash may not reproduce reliably; see demo 8's
 > README.)
-> On a lightly loaded machine, a crash that native runs showed only in part,
-> and never on request, becomes one command you can hand to a colleague. Both
+> On that host, a crash that native runs showed only in part, and never on
+> request, became one command you can hand to a colleague. Both
 > binaries carry the same small test harness. Among other things it skips
 > btrfs-convert's check that its target is not mounted, because the mount
 > table it reads under Hermit comes from the host's current mounts
