@@ -254,7 +254,7 @@ Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 Commands:
   run [--results DIR] [--mode MODE] [--sample COUNT] [--seed SEED]
       [--cells-file PATH]
-      [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
+      [--green --backend BACKEND --repetitions COUNT] [--no-retry] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
@@ -310,6 +310,15 @@ Exact-cell options (run and plan):
                            be positive. Plan and run
                            require a clean commit. At most four manifest guests
                            run at once, including KVM guests.
+  --no-retry               With --repetitions, run every repetition as exactly one
+                           harness attempt (test-harness run --no-retry), so N
+                           repetitions are N first-attempt observations. The
+                           per-cell table then gives each cell's verdict:
+                           CLEAN (every repetition passed), FLAKY (some passed,
+                           some failed), FAILING (none passed), or INCOMPLETE
+                           (no product failure, but some repetition produced no
+                           product verdict: infrastructure, prerequisite,
+                           timeout/OOM no-result, or missing evidence).
   --run-id-prefix ID       Bind each retained result to this physical invocation.
                            Accepted only with one exact repeated cell; letters,
                            digits, '.', '_', and '-' only.
@@ -393,6 +402,10 @@ Examples:
   # Check every cell selected by full once with one shared build.
   ./ci/compat-envelope/pressure-test.rs run \
     --green --repetitions 1 --run-timeout 14400
+
+  # Flake census: every cell selected by full, 10 first attempts each.
+  ./ci/compat-envelope/pressure-test.rs run \
+    --green --repetitions 10 --no-retry --cell-timeout 600 --run-timeout 14400
 
   # Inspect the bounded plan without executing it.
   ./ci/compat-envelope/pressure-test.rs plan \
@@ -619,6 +632,11 @@ struct CellSelection {
     green: bool,
     #[serde(default)]
     probe_disabled: bool,
+    /// `--no-retry`: every repetition is exactly one harness attempt, so the
+    /// repeated sample is N first-attempt observations (`test-harness run
+    /// --no-retry`). Requires `--repetitions`.
+    #[serde(default)]
+    no_retry: bool,
     #[serde(default)]
     jobs: Option<i64>,
     #[serde(default)]
@@ -780,6 +798,9 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
         }
         if selection.green {
             return Err("--green requires --repetitions".into());
+        }
+        if selection.no_retry {
+            return Err("--no-retry requires --repetitions".into());
         }
         return Ok(());
     };
@@ -1532,6 +1553,9 @@ struct RunMetadata {
     green: bool,
     #[serde(default)]
     probe_disabled: bool,
+    /// Whether every harness invocation ran with `--no-retry`.
+    #[serde(default)]
+    no_retry: bool,
     #[serde(default = "default_pressure_jobs")]
     jobs: i64,
     #[serde(default = "default_manifest_guest_cap")]
@@ -2545,6 +2569,12 @@ fn result_options(
                     return Err("--probe-disabled may be specified only once".into());
                 }
                 selection.probe_disabled = true;
+            }
+            "--no-retry" if allow_selection => {
+                if selection.no_retry {
+                    return Err("--no-retry may be specified only once".into());
+                }
+                selection.no_retry = true;
             }
             "--jobs" if allow_selection => {
                 let raw = args.next().ok_or("--jobs requires a count")?;
@@ -4477,6 +4507,11 @@ fn write_plan_after_scorecard_check(
             } else {
                 String::new()
             };
+            let no_retry = if selection.no_retry {
+                " --no-retry"
+            } else {
+                ""
+            };
             let harness = if selection.is_exact() {
                 let prebuilt = if selection.uses_shared_preparation() {
                     " --prebuilt"
@@ -4484,10 +4519,11 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "{hermit_bin} target/debug/test-harness run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{hermit_bin} target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     hermit_bin = EXACT_CELL_HERMIT_BIN,
                     selector = selector,
                     prebuilt = prebuilt,
+                    no_retry = no_retry,
                     test = shell_quote(&cell.test),
                     mode = shell_quote(&cell.mode),
                     backend = backend,
@@ -4496,8 +4532,9 @@ fn write_plan_after_scorecard_check(
                 )
             } else {
                 format!(
-                    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
+                    no_retry = no_retry,
                     test = shell_quote(&cell.test),
                     mode = shell_quote(&cell.mode),
                     backend = backend,
@@ -4738,6 +4775,7 @@ fn write_plan_after_scorecard_check(
         run_id_prefix: selection.run_id_prefix.clone(),
         green: selection.green,
         probe_disabled: selection.probe_disabled,
+        no_retry: selection.no_retry,
         jobs: selection.scheduler_jobs(),
         manifest_guest_cap: selection.manifest_guest_cap(),
         manifest_guest_cap_explicit: selection.manifest_guest_cap.is_some(),
@@ -4990,6 +5028,7 @@ fn validate_run_contract(
         run_id_prefix: metadata.run_id_prefix.clone(),
         green: metadata.green,
         probe_disabled: metadata.probe_disabled,
+        no_retry: metadata.no_retry,
         jobs: Some(metadata.jobs),
         manifest_guest_cap: metadata
             .manifest_guest_cap_explicit
@@ -5791,6 +5830,34 @@ fn repeated_result_description(
     }
 }
 
+/// The flake-census verdict for one repeated cell, from the shared failure
+/// classes already folded into its counts.
+///
+/// Anything other than all-pass or all-fail is FLAKY: a cell whose first
+/// attempt failed in some repetitions and passed in others (including a pass
+/// that needed the framework retry) is FLAKY, and one that never passed is
+/// FAILING. Only product failures decide those two. A repetition that produced
+/// no product verdict (infrastructure, prerequisite, no-result, mixed or
+/// missing) never makes a cell FLAKY; if it is the only non-pass, the cell is
+/// INCOMPLETE rather than CLEAN.
+fn flake_verdict(counts: RepeatedOutcomeCounts) -> &'static str {
+    let passes_after_retry = counts.terminal_passes.saturating_sub(counts.clean_passes);
+    if counts.product_failures > 0 || passes_after_retry > 0 {
+        if counts.terminal_passes > 0 {
+            "FLAKY"
+        } else {
+            "FAILING"
+        }
+    } else if counts.expected_repetitions > 0
+        && counts.clean_passes == counts.expected_repetitions
+        && counts.retried_repetitions == 0
+    {
+        "CLEAN"
+    } else {
+        "INCOMPLETE"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 struct RepeatedOutcomeCounts {
     expected_repetitions: usize,
@@ -6463,6 +6530,7 @@ fn repeated_cell_summary(cell: &CellId, counts: RepeatedOutcomeCounts, result: &
         "retried_repetitions": counts.retried_repetitions,
         "total": counts.expected_repetitions,
         "result": result,
+        "verdict": flake_verdict(counts),
         "classification": classification,
         "promotion_candidate": classification == PressureSampleClassification::PromotionCandidate,
         "expected_repetitions": counts.expected_repetitions,
@@ -7705,8 +7773,20 @@ fn summarize(
         repeated_cells.push(repeated_cell_summary(cell, counts, result));
         Some(result)
     } else if metadata.repetitions.is_some() {
-        println!("| Cell | Terminal passes | Clean passes | Result |");
-        println!("| --- | ---: | ---: | --- |");
+        println!(
+            "Retries: {}",
+            if metadata.no_retry {
+                "off (--no-retry): every repetition is one first-attempt observation"
+            } else {
+                "framework retry on; clean passes count first attempts"
+            }
+        );
+        println!();
+        println!(
+            "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Result | Verdict |"
+        );
+        println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |");
+        let mut verdicts = BTreeMap::<&'static str, usize>::new();
         for cell in &metadata.cells {
             let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
             let clean_passes = repeated_clean_passes.get(cell).copied().unwrap_or(0);
@@ -7723,20 +7803,29 @@ fn summarize(
                 retried,
                 total,
             );
-            println!(
-                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {result} |",
-                display_id(cell)
-            );
             let counts = sample_counts.get(cell).copied().unwrap_or_default();
+            let verdict = flake_verdict(counts);
+            *verdicts.entry(verdict).or_default() += 1;
             println!(
-                "Sample classification for `{}`: {}; {}/{} qualifying first attempts.",
+                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {result} | {verdict} |",
                 display_id(cell),
-                classify_pressure_sample(counts).as_str(),
-                counts.qualifying_passes,
-                counts.expected_repetitions
+                counts.product_failures,
+                counts.infrastructure_failures,
+                counts.prerequisite_failures,
+                counts.no_results,
+                counts.mixed_repetitions + counts.missing_repetitions,
             );
             repeated_cells.push(repeated_cell_summary(cell, counts, result));
         }
+        println!();
+        println!(
+            "Flake verdicts over {} cell(s): {} CLEAN, {} FLAKY, {} FAILING, {} INCOMPLETE.",
+            metadata.cells.len(),
+            verdicts.get("CLEAN").copied().unwrap_or(0),
+            verdicts.get("FLAKY").copied().unwrap_or(0),
+            verdicts.get("FAILING").copied().unwrap_or(0),
+            verdicts.get("INCOMPLETE").copied().unwrap_or(0),
+        );
         println!();
         let infrastructure_errors: usize = repeated_infrastructure_errors.values().sum();
         let result = top_level_repeated_result_description(
@@ -7787,6 +7876,7 @@ fn summarize(
         "run_id_prefix": metadata.run_id_prefix,
         "green": metadata.green,
         "probe_disabled": metadata.probe_disabled,
+        "no_retry": metadata.no_retry,
         "jobs": metadata.jobs,
         "eligible_cells": (metadata.eligible_cells != 0).then_some(metadata.eligible_cells),
         "selected_cells": metadata.cells.len(),
@@ -10060,6 +10150,122 @@ fn host_build_variant_self_test(canonical: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// The census verdict decides on product failures only, and `--no-retry` is a
+/// repeated-run option that reaches the harness command.
+fn flake_verdict_self_test() -> Result<(), String> {
+    let base = RepeatedOutcomeCounts {
+        expected_repetitions: 10,
+        observed_repetitions: 10,
+        ..RepeatedOutcomeCounts::default()
+    };
+    let cases = [
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 10,
+                terminal_passes: 10,
+                ..base
+            },
+            "CLEAN",
+        ),
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 9,
+                terminal_passes: 9,
+                product_failures: 1,
+                ..base
+            },
+            "FLAKY",
+        ),
+        // A first-attempt failure that the framework retry recovered is still
+        // a flake, not a clean pass.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 9,
+                terminal_passes: 10,
+                retried_repetitions: 1,
+                ..base
+            },
+            "FLAKY",
+        ),
+        (
+            RepeatedOutcomeCounts {
+                product_failures: 10,
+                ..base
+            },
+            "FAILING",
+        ),
+        // Infrastructure and no-result repetitions never make a cell FLAKY
+        // and never let it read CLEAN.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 9,
+                terminal_passes: 9,
+                infrastructure_failures: 1,
+                ..base
+            },
+            "INCOMPLETE",
+        ),
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 9,
+                terminal_passes: 9,
+                no_results: 1,
+                ..base
+            },
+            "INCOMPLETE",
+        ),
+        // A product failure is an observation even beside an infrastructure
+        // error in another repetition.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 8,
+                terminal_passes: 8,
+                product_failures: 1,
+                infrastructure_failures: 1,
+                ..base
+            },
+            "FLAKY",
+        ),
+        (RepeatedOutcomeCounts::default(), "INCOMPLETE"),
+    ];
+    for (counts, expected) in cases {
+        let observed = flake_verdict(counts);
+        if observed != expected {
+            return Err(format!(
+                "flake verdict for {counts:?} is {observed}, expected {expected}"
+            ));
+        }
+    }
+    let root = Path::new(".");
+    let parse = |args: &[&str]| {
+        result_options(
+            root,
+            &mut args.iter().map(|arg| arg.to_string()),
+            true,
+            true,
+        )
+    };
+    match parse(&["--no-retry"]) {
+        Err(error) if error.contains("--no-retry requires --repetitions") => {}
+        other => {
+            return Err(format!(
+                "--no-retry without --repetitions must refuse, got {:?}",
+                other.map(|(_, _, selection)| selection.no_retry)
+            ));
+        }
+    }
+    match parse(&["--green", "--repetitions", "10", "--no-retry"]) {
+        Ok((_, _, selection)) if selection.no_retry => {}
+        other => {
+            return Err(format!(
+                "--green --repetitions 10 --no-retry must select no_retry, got {:?}",
+                other.map(|(_, _, selection)| selection.no_retry)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -10070,6 +10276,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     safe_ci_scope::self_test()?;
     pressure_timeout_self_test()?;
+    flake_verdict_self_test()?;
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
     {
@@ -11639,6 +11846,38 @@ fn self_test(root: &Path) -> Result<(), String> {
             "--cells-file plan lost its exact identities, repetitions, timeout, jobs, digest, or verify-harness contract"
                 .into(),
         );
+    }
+    // --no-retry reaches every repetition's harness command, and only then.
+    if cells_file_cell_steps
+        .iter()
+        .any(|step| step.cmd.contains("--no-retry"))
+        || cells_file_metadata.no_retry
+    {
+        return Err("a repeated plan without --no-retry turned harness retries off".into());
+    }
+    let no_retry_results = scratch.join("cells-file-no-retry-plan");
+    let (no_retry_metadata, no_retry_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &no_retry_results,
+        &no_retry_results.join("dag.json"),
+        &CellSelection {
+            no_retry: true,
+            ..cells_file_selection.clone()
+        },
+    )?;
+    let no_retry_cell_steps: Vec<_> = no_retry_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    if !no_retry_metadata.no_retry
+        || no_retry_cell_steps.len() != cells_file_cell_steps.len()
+        || no_retry_cell_steps.iter().any(|step| {
+            step.cmd.matches("test-harness run").count() != 1
+                || step.cmd.matches(" --no-retry ").count() != 1
+        })
+    {
+        return Err("--no-retry did not reach every repeated harness command".into());
     }
     let kvm_template = cells_file_cell_steps
         .iter()
@@ -13245,6 +13484,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         run_id_prefix: None,
         green: false,
         probe_disabled: false,
+        no_retry: false,
         jobs: default_jobs(),
         manifest_guest_cap: DEFAULT_MANIFEST_GUEST_CAP,
         manifest_guest_cap_explicit: false,
