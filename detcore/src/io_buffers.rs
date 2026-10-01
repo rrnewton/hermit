@@ -1118,8 +1118,15 @@ mod event_tests {
         (tool, guest)
     }
 
-    #[derive(Clone, Default)]
-    struct BufferLog(Arc<Mutex<Vec<String>>>);
+    /// Collects the INFO messages that contain the second field.
+    #[derive(Clone)]
+    struct BufferLog(Arc<Mutex<Vec<String>>>, &'static str);
+
+    impl Default for BufferLog {
+        fn default() -> Self {
+            Self(Arc::default(), "[iobuf]")
+        }
+    }
 
     struct MessageVisitor(Option<String>);
 
@@ -1148,7 +1155,7 @@ mod event_tests {
             let mut visitor = MessageVisitor(None);
             event.record(&mut visitor);
             if let Some(message) = visitor.0
-                && message.contains("[iobuf]")
+                && message.contains(self.1)
             {
                 self.0.lock().unwrap().push(message);
             }
@@ -1306,8 +1313,9 @@ mod event_tests {
     /// A syscall that observes virtual time is charged exactly as outside the
     /// window, so two reads in a row see different times. Other syscalls are
     /// left uncharged only up to `MAX_UNCHARGED_BOOTSTRAP_SYSCALLS` per window;
-    /// the next one is charged its normal cost, and a new window starts counting
-    /// from zero. The harness's clock is syscall-driven (`max_timeslice: None`),
+    /// the syscall that reaches the cap logs one info line, the next one is
+    /// charged its normal cost, and a new window starts counting from zero. The
+    /// harness's clock is syscall-driven (`max_timeslice: None`),
     /// the configuration in which nothing else would advance this thread.
     #[tokio::test(flavor = "current_thread")]
     async fn backend_runtime_bootstrap_window_charges_time_reads_and_caps_uncharged_syscalls() {
@@ -1403,7 +1411,16 @@ mod event_tests {
 
         // (2) The first MAX_UNCHARGED_BOOTSTRAP_SYSCALLS other syscalls of the
         // window are uncharged; the next one, and every one after it, is charged.
+        // The window logs one info line, at the syscall that reaches the cap.
+        let cap_logs = BufferLog(Arc::default(), "reached its cap");
+        let _subscriber = tracing::subscriber::set_default(cap_logs.clone());
         for index in 0..MAX_UNCHARGED_BOOTSTRAP_SYSCALLS {
+            if index == MAX_UNCHARGED_BOOTSTRAP_SYSCALLS - 1 {
+                assert!(
+                    cap_logs.0.lock().unwrap().is_empty(),
+                    "the cap line was logged before the window reached the cap"
+                );
+            }
             assert_eq!(
                 advance(&tool, &mut booting, readv(1)).await,
                 0,
@@ -1413,6 +1430,15 @@ mod event_tests {
         assert_eq!(
             booting.thread.uncharged_bootstrap_syscalls,
             MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+        );
+        let cap_line = vec![format!(
+            "[dtid {}] backend runtime bootstrap window reached its cap of {} uncharged syscalls; every further syscall in this window is charged",
+            booting.thread.dettid, MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+        )];
+        assert_eq!(
+            *cap_logs.0.lock().unwrap(),
+            cap_line,
+            "reaching the cap must log exactly one info line"
         );
         assert_eq!(
             advance(&tool, &mut booting, readv(1)).await,
@@ -1424,6 +1450,11 @@ mod event_tests {
             booting.thread.uncharged_bootstrap_syscalls,
             MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
         );
+        assert_eq!(
+            *cap_logs.0.lock().unwrap(),
+            cap_line,
+            "syscalls charged past the cap must not log the cap line again"
+        );
 
         // (3) Closing the window resets the count, so a reopened window (the
         // next exec'd image) starts uncharged again.
@@ -1433,6 +1464,7 @@ mod event_tests {
         booting.backend_runtime_bootstrap = true;
         assert_eq!(advance(&tool, &mut booting, readv(1)).await, 0);
         assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 1);
+        assert_eq!(*cap_logs.0.lock().unwrap(), cap_line);
     }
 
     #[tokio::test(flavor = "current_thread")]
