@@ -42,8 +42,10 @@ hermit --log=info run --verify --no-virtualize-cpuid -- /bin/bash examples/race.
 
 `--base-env=minimal` gives the program a small, fixed set of environment
 variables instead of yours. `--no-virtualize-cpuid` lets the commands run on
-CPUs that cannot trap the `CPUID` instruction; on such hosts the CPU model is
-still visible to the program. `--epoch` sets the instant at which the virtual
+CPUs that cannot trap the `CPUID` instruction. With it, the program sees the
+host's real `CPUID` results on every host, CPU model and features included, so
+`CPUID` becomes an input from the host and a different CPU can change what the
+program does. `--epoch` sets the instant at which the virtual
 clock starts (see [How it works](#how-it-works)).
 
 Every `hermit run` prints one line on standard error that names the clock's

@@ -8,10 +8,14 @@ interleaving. On the reference host, 29 of 40 native runs of the buggy build
 showed no sign of the bug, and the other 11 printed the first lines of an
 AddressSanitizer report and then exited with status 0 before the report was
 complete. This demo runs AddressSanitizer builds of the tool from before and
-after the upstream fix. Hermit's chaos mode finds a thread schedule that crashes
-the old build every time it is run, the fixed build survives that same
-schedule, and running the schedule again reproduces the crash report byte for
-byte. The story of the bug is in [WRITEUP.md](WRITEUP.md).
+after the upstream fix. Hermit's chaos mode finds a thread schedule that crashed
+the old build every time it was run on the reference host, the fixed build
+survives that same schedule, and running the schedule again reproduced the
+crash report byte for byte. On a shared or heavily loaded machine the crash may
+not reproduce reliably: chaos mode switches threads at interrupts from the
+CPU's retired-branch counter, and those interrupts can arrive late (skid) by
+an amount that depends on host load. The story of the bug is in
+[WRITEUP.md](WRITEUP.md).
 
 ## Prerequisites
 
@@ -210,6 +214,13 @@ one whose environment carried 3,000 extra bytes.
   00:19 UTC on 2026-10-01: one seed search and six rechecks by
   `prepare-assets.sh`, 11 runs of `run.sh`, and 8 single trials. One recheck
   and one `run.sh` run had 3,000 extra bytes in their environment.
+- Those 44 runs were on a 316-thread host with a load average of 10 to 20,
+  lightly loaded for its size (see the timing notes below). On a shared or
+  heavily loaded machine the crash may not reproduce reliably, even with the
+  same build, seed, and command line. Chaos mode switches threads at
+  interrupts from the CPU's retired-branch counter, and those interrupts can
+  arrive late (skid) by an amount that depends on host load, so the same seed
+  can then give a different schedule that misses the race.
 - The program no longer reads the mount table. Under Hermit,
   `/proc/self/mounts` lists mounts that come from the host at the time of the
   run, and Hermit passes it through unchanged

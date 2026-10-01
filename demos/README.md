@@ -42,7 +42,10 @@ file system or network deterministic.
 - **Inspect a running guest kernel without disturbing it**, and see the same
   kernel state on every run ([demo 7](07-drgn-kernel/README.md)).
 - **Catch a real use-after-free that normal runs expose only by chance**, and
-  reproduce it on request ([demo 8](08-btrfs-convert-uaf/README.md)).
+  reproduce it on request ([demo 8](08-btrfs-convert-uaf/README.md)). On a
+  shared or heavily loaded machine the crash may not reproduce reliably,
+  because chaos mode's thread switches land at retired-branch counter
+  interrupts, which can arrive late under host load.
 - **Build Debian packages bit for bit reproducibly**: in a 58-package sample
   measured with Hermit commit `1fadc03779f2`, 52 built byte-identically from two
   different root directories and none differed; an earlier, larger run found
@@ -60,7 +63,7 @@ file system or network deterministic.
 | 5 | [Boot Linux in QEMU and save a snapshot](05-qemu-boot/README.md) | QEMU boots Linux under Hermit; a second boot started the same way, with the same Python interpreter, gives the same console output, snapshot file, and event log (the interpreter runs inside the guest, and one value QEMU reads, the set of ignored signals, still comes from the host: https://github.com/rrnewton/hermit/issues/3441). |
 | 6 | [Resume the snapshot and run a command](06-qemu-resume/README.md) | Restore the demo 5 snapshot, run any shell command in the guest, and get identical output and an identical post-command snapshot. |
 | 7 | [Watch the guest kernel's task list with drgn](07-drgn-kernel/README.md) | Read the guest kernel's task list with the drgn debugger before and after a fixed command, with the same result on every run. |
-| 8 | [Find and reproduce a schedule-dependent use-after-free](08-btrfs-convert-uaf/README.md) | Chaos mode crashes a `btrfs-convert` build with a real 2015 race put back, the fixed build survives the same seed, and the crash report repeats byte for byte. |
+| 8 | [Find and reproduce a schedule-dependent use-after-free](08-btrfs-convert-uaf/README.md) | Chaos mode crashes a `btrfs-convert` build with a real 2015 race put back, the fixed build survives the same seed, and on a lightly loaded host the crash report repeats byte for byte (on a shared or heavily loaded machine the crash may not reproduce reliably). |
 | 9 | [Boot BusyBox in QEMU, from a single script](09-qemu-busybox/README.md) | The smallest whole-machine demo: one script boots a kernel and BusyBox under `hermit run --strict`. |
 
 > **Catching a use-after-free that normal runs expose only by chance (btrfs-progs).**
@@ -76,12 +79,15 @@ file system or network deterministic.
 > and 11 printed the start of a report and then exited with status 0, because
 > the main thread finished before the report did. Under `hermit run --chaos`,
 > 5 of 32 scheduler seeds crashed it with a complete report, while the fixed
-> binary showed no use-after-free on any of the same 32 seeds. A crashing seed
-> crashes again every time: seed 7 crashed the buggy binary in all 44
-> runs of the demo's command over more than three hours, from 21:08 UTC on
+> binary showed no use-after-free on any of the same 32 seeds. On that host
+> a crashing seed crashed again every time: seed 7 crashed the buggy binary in
+> all 44 runs of the demo's command over more than three hours, from 21:08 UTC on
 > 2026-09-30 to 00:19 UTC on 2026-10-01, and every report we kept from them
 > was byte-identical, with the same heap address and the same stacks.
-> (Measured with Hermit commit `dc92644f96f4`; the writeup has the full table.)
+> (Measured with Hermit commit `dc92644f96f4` on 316 hardware threads at a
+> load average of 10 to 20; the writeup has the full table. On a shared or
+> heavily loaded machine the crash may not reproduce reliably; see demo 8's
+> README.)
 > A crash that native runs showed only in part, and never on request, becomes
 > one command you can hand to a colleague. Both binaries carry the same small
 > test harness. Among other things it skips
