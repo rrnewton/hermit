@@ -835,7 +835,7 @@ fn retirement_socket(connected: bool) -> (std::os::fd::OwnedFd, Option<std::net:
     }
 }
 
-fn retirement_binding(e: &mut NetworkReplayEngine, ofd: OpenFileId) -> NetworkChannelId {
+pub(super) fn retirement_binding(e: &mut NetworkReplayEngine, ofd: OpenFileId) -> NetworkChannelId {
     e.controlled_connect_socket_premise(ofd);
     e.ensure_channel(
         ofd,
@@ -865,12 +865,26 @@ fn retirement_fixture(
     std::os::fd::OwnedFd,
     Option<std::net::TcpStream>,
 ) {
-    let (socket, peer) = retirement_socket(connected);
     let thread = crate::types::DetTid::from_raw(61);
     let owner = NetworkStreamOwner {
         thread,
         mm: detcore_model::futex::MmId::initial(thread),
     };
+    retirement_fixture_for_owner(connected, owner)
+}
+
+pub(super) fn retirement_fixture_for_owner(
+    connected: bool,
+    owner: NetworkStreamOwner,
+) -> (
+    NetworkReplayEngine,
+    NetworkStreamOwner,
+    OpenFileId,
+    NetworkChannelId,
+    std::os::fd::OwnedFd,
+    Option<std::net::TcpStream>,
+) {
+    let (socket, peer) = retirement_socket(connected);
     let ofd = file(1);
     let mut e = NetworkReplayEngine::record_native_receive(empty().epoch);
     let channel = retirement_binding(&mut e, ofd);
@@ -897,7 +911,7 @@ fn retirement_fixture(
     (e, owner, ofd, channel, socket, peer)
 }
 
-fn close_retirement_socket(socket: std::os::fd::OwnedFd) {
+pub(super) fn close_retirement_socket(socket: std::os::fd::OwnedFd) {
     use std::os::fd::IntoRawFd;
     let raw = socket.into_raw_fd();
     assert_eq!(unsafe { libc::close(raw) }, 0);
@@ -926,10 +940,12 @@ fn retirement_close(
     )
 }
 
-#[test]
-fn native_retirement_real_unconnected_close_needs_no_establishment() {
-    let (mut e, owner, ofd, channel, socket, _peer) = retirement_fixture(false);
-    retirement_close(&mut e, owner, ofd, socket).unwrap();
+#[tokio::test]
+async fn native_retirement_real_unconnected_close_needs_no_establishment() {
+    let policy = super::policy_tests::ClosePolicyFixture::new().await;
+    let (mut e, _owner, ofd, channel, socket, _peer) =
+        retirement_fixture_for_owner(false, policy.owner());
+    policy.close(&mut e, ofd, socket).unwrap();
     assert_eq!(e.channel_for(ofd), None);
     assert!(!e.reverse_bindings.contains_key(&channel));
     assert!(e.retired_channels.contains(&channel));
@@ -950,10 +966,12 @@ fn native_retirement_real_unconnected_close_needs_no_establishment() {
     trace.validate().unwrap();
 }
 
-#[test]
-fn native_retirement_real_established_close_appends_once() {
-    let (mut e, owner, ofd, channel, socket, _peer) = retirement_fixture(true);
-    retirement_close(&mut e, owner, ofd, socket).unwrap();
+#[tokio::test]
+async fn native_retirement_real_established_close_appends_once() {
+    let policy = super::policy_tests::ClosePolicyFixture::new().await;
+    let (mut e, _owner, ofd, channel, socket, _peer) =
+        retirement_fixture_for_owner(true, policy.owner());
+    policy.close(&mut e, ofd, socket).unwrap();
     assert_eq!(e.channel_for(ofd), None);
     assert_eq!(e.retire_open_file(ofd), None);
     assert_eq!(e.retire_open_file(ofd), None);
@@ -973,9 +991,11 @@ fn native_retirement_real_established_close_appends_once() {
     trace.validate().unwrap();
 }
 
-#[test]
-fn native_retirement_real_close_waits_for_actual_call_pin_release() {
-    let (mut e, owner, ofd, channel, socket, _peer) = retirement_fixture(true);
+#[tokio::test]
+async fn native_retirement_real_close_waits_for_actual_call_pin_release() {
+    let policy = super::policy_tests::ClosePolicyFixture::new().await;
+    let (mut e, owner, ofd, channel, socket, _peer) =
+        retirement_fixture_for_owner(true, policy.owner());
     let control = e.begin_socket_controls(owner, vec![ofd]).unwrap()[0].1;
     let call = e.begin_stream_call(owner, control).unwrap().id;
     let raw_pin = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -985,7 +1005,7 @@ fn native_retirement_real_close_waits_for_actual_call_pin_release() {
         .unwrap();
     e.finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
         .unwrap();
-    retirement_close(&mut e, owner, ofd, socket).unwrap();
+    policy.close(&mut e, ofd, socket).unwrap();
     assert_eq!(e.channel_for(ofd), Some(channel));
     assert!(!e.retired_channels.contains(&channel));
     assert_eq!(e.native_trace_fixture().release_model.nodes().len(), 2);

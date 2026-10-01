@@ -525,6 +525,10 @@ struct Task<T> {
     retired: bool,
     enrollment: Option<Enrollment>,
     native_birth: Option<super::native_birth::NativeBirthAdmission>,
+    foreground_metadata: Option<(
+        std::sync::Weak<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+        std::sync::Weak<std::sync::Mutex<crate::memory::MemoryMetadata>>,
+    )>,
     foreground_root: Option<std::sync::Arc<ForegroundRoot>>,
 }
 #[derive(Debug)]
@@ -532,6 +536,8 @@ pub(super) struct CustodyTasks<T> {
     tasks: BTreeMap<DetTid, Task<T>>,
     next_registration: u64,
     foreground_lineage_lost: bool,
+    // Loss of the narrow V4 premise does not revoke live shared-task roots.
+    sole_initial_root_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     first_task: Option<DetTid>,
 }
 impl<T> Default for CustodyTasks<T> {
@@ -540,6 +546,7 @@ impl<T> Default for CustodyTasks<T> {
             tasks: BTreeMap::new(),
             next_registration: 0,
             foreground_lineage_lost: false,
+            sole_initial_root_lost: Default::default(),
             first_task: None,
         }
     }
@@ -580,12 +587,19 @@ impl<T> CustodyTasks<T> {
         }
         let handle = open()?;
         if self.first_task.is_some_and(|first| first != owner.thread)
-            || self
-                .tasks
-                .get(&owner.thread)
-                .is_some_and(|old| old.initial_exec.is_some())
+            || (self.first_task.is_some()
+                && self
+                    .tasks
+                    .get(&owner.thread)
+                    .is_none_or(|old| old.initial_exec.is_some() || old.foreground_root.is_some()))
         {
-            self.revoke_foreground_lineage();
+            self.sole_initial_root_lost
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(old) = self.tasks.get(&owner.thread)
+            && let Some(root) = &old.foreground_root
+        {
+            root.revoke();
         }
         self.first_task.get_or_insert(owner.thread);
         self.tasks.insert(
@@ -599,6 +613,7 @@ impl<T> CustodyTasks<T> {
                 retired: false,
                 enrollment: None,
                 native_birth: None,
+                foreground_metadata: None,
                 foreground_root: None,
             },
         );
@@ -682,7 +697,6 @@ impl<T> CustodyTasks<T> {
         &mut self,
         birth: &super::native_birth::NativeBirthAdmission,
     ) -> std::io::Result<()> {
-        self.revoke_foreground_lineage();
         if birth.terminal() {
             return Err(std::io::Error::other(
                 "terminal child cannot gain live custody",
@@ -698,6 +712,16 @@ impl<T> CustodyTasks<T> {
             ));
         }
         task.native_birth = Some(birth.clone());
+        if let Some((metadata, memory)) = &task.foreground_metadata
+            && let (Some(metadata), Some(memory)) = (metadata.upgrade(), memory.upgrade())
+        {
+            // Re-enter after releasing the task borrow; this issues the child
+            // root only from the now-retained authenticated birth.
+            let metadata = metadata.clone();
+            let memory = memory.clone();
+            let _ = task;
+            return self.bind_foreground_metadata(birth.child_owner(), &metadata, &memory);
+        }
         Ok(())
     }
 
@@ -1165,22 +1189,26 @@ impl<T> CustodyTasks<T> {
         &mut self,
         owner: NetworkStreamOwner,
     ) -> std::io::Result<()> {
-        self.revoke_foreground_lineage();
         if let Some(task) = self.tasks.get_mut(&owner.thread) {
             if task.mm != owner.mm {
                 return Err(std::io::Error::other("terminal task changed custody MM"));
+            }
+            if let Some(root) = &task.foreground_root {
+                root.revoke();
             }
             task.retired = true;
         }
         Ok(())
     }
     pub(super) fn forget(&mut self, owner: NetworkStreamOwner) {
-        self.revoke_foreground_lineage();
         if self
             .tasks
             .get(&owner.thread)
             .is_some_and(|task| task.mm == owner.mm)
         {
+            if let Some(root) = &self.tasks[&owner.thread].foreground_root {
+                root.revoke();
+            }
             if self.tasks[&owner.thread]
                 .enrollment
                 .as_ref()

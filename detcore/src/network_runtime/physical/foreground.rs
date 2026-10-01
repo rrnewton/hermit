@@ -9,22 +9,68 @@ use super::*;
 use crate::memory::MemoryMetadata;
 use crate::tool_local::FileMetadata;
 
+#[cfg(test)]
+mod policy_tests;
+
 /// Private census/EXEC provenance. Neither serde, a config bit nor a numeric
 /// task/file identifier constructs this authority. Revocation is irreversible.
 #[derive(Debug)]
 pub(crate) struct ForegroundRoot {
     association: InitialTableAssociation,
-    exec: ExecFilesReceipt,
+    owner: NetworkStreamOwner,
+    logical_process: crate::types::DetPid,
+    process: i32,
+    thread: i32,
+    native_identity: (u64, u64, u64, u64),
+    initial_exec: Option<ExecFilesReceipt>,
+    parent: Option<Arc<ForegroundRoot>>,
     metadata: Weak<Mutex<FileMetadata>>,
     memory: Weak<Mutex<MemoryMetadata>>,
     revoked: AtomicBool,
+    sole_initial_root_lost: Arc<AtomicBool>,
 }
 impl ForegroundRoot {
+    #[cfg(test)]
+    pub(crate) async fn controlled_shared_birth_fixture(
+        thread: i32,
+    ) -> policy_tests::SharedBirthFixture {
+        policy_tests::SharedBirthFixture::new(thread).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn controlled_shared_birth_after_close_setup(
+        thread: i32,
+        before: impl FnOnce(&Arc<Self>, &InitialTableClaim),
+    ) -> policy_tests::SharedBirthFixture {
+        policy_tests::SharedBirthFixture::new_after_setup(thread, before).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn controlled_shared_birth_after_entry(
+        thread: i32,
+        before: impl FnOnce(
+            &crate::network_runtime::NetworkRuntimeResources,
+            &Arc<Self>,
+            &crate::network_runtime::JoinedNativePrefix,
+        ),
+    ) -> policy_tests::SharedBirthFixture {
+        policy_tests::SharedBirthFixture::new_after_entry(thread, before).await
+    }
+    pub(in crate::network_runtime) fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
     pub(crate) fn association(&self) -> &InitialTableAssociation {
         &self.association
     }
     pub(crate) fn owner(&self) -> NetworkStreamOwner {
-        self.association.owner()
+        self.owner
+    }
+    pub(crate) fn process(&self) -> i32 {
+        self.process
+    }
+    pub(crate) fn logical_process(&self) -> crate::types::DetPid {
+        self.logical_process
+    }
+    pub(crate) fn thread(&self) -> i32 {
+        self.thread
     }
     pub(crate) fn files(&self) -> crate::types::FilesId {
         self.association.files
@@ -32,16 +78,28 @@ impl ForegroundRoot {
     pub(crate) fn is_current(&self, owner: NetworkStreamOwner) -> bool {
         !self.revoked.load(Ordering::Acquire)
             && self.owner() == owner
-            && self.exec.mm.for_exec(self.exec.process) == owner.mm
-            && self.exec.new_files == self.files()
+            && self.initial_exec.is_none_or(|exec| {
+                exec.mm.for_exec(exec.process) == owner.mm && exec.new_files == self.files()
+            })
+            && self
+                .parent
+                .as_ref()
+                .is_none_or(|parent| parent.files() == self.files())
     }
     pub(crate) fn native_identity(&self) -> (u64, u64, u64, u64) {
-        (
-            self.association.provider,
-            self.association.enrollment.task,
-            self.association.enrollment.task_start,
-            self.association.enrollment.table,
-        )
+        self.native_identity
+    }
+    /// Retained initial census/exec provenance with no subsequent physical
+    /// sibling or replacement. Terminal cleanup may inspect this history even
+    /// after this task exits; it cannot authorize a new guest operation.
+    pub(crate) fn has_sole_initial_root_history(&self) -> bool {
+        self.initial_exec.is_some()
+            && self.parent.is_none()
+            && self.owner == self.association.owner
+            && !self.sole_initial_root_lost.load(Ordering::Acquire)
+    }
+    pub(crate) fn is_sole_initial_root(&self, owner: NetworkStreamOwner) -> bool {
+        self.is_current(owner) && self.has_sole_initial_root_history()
     }
     pub(crate) fn metadata(&self) -> std::io::Result<Arc<Mutex<FileMetadata>>> {
         if !self.is_current(self.owner()) {
@@ -65,14 +123,27 @@ impl ForegroundRoot {
     pub(crate) fn matches_memory(&self, actual: &Arc<Mutex<MemoryMetadata>>) -> bool {
         self.memory.ptr_eq(&Arc::downgrade(actual))
     }
+    /// Exact in-process proof that two current task roots name the same native
+    /// address space and the same non-serialized memory ledger.  This permits a
+    /// CLONE_VM sibling to use a mapping observed from its creator without
+    /// treating equal numeric MM IDs or independently reconstructed metadata as
+    /// authority.
+    pub(crate) fn same_memory_authority(&self, other: &ForegroundRoot) -> bool {
+        self.is_current(self.owner())
+            && other.is_current(other.owner())
+            && self.owner().mm == other.owner().mm
+            && self.process == other.process
+            && self.memory.ptr_eq(&other.memory)
+    }
 }
 
 impl<T> CustodyTasks<T> {
     pub(in crate::network_runtime) fn revoke_foreground_lineage(&mut self) {
         self.foreground_lineage_lost = true;
+        self.sole_initial_root_lost.store(true, Ordering::Release);
         for task in self.tasks.values() {
             if let Some(root) = &task.foreground_root {
-                root.revoked.store(true, Ordering::Release);
+                root.revoke();
             }
         }
     }
@@ -84,11 +155,86 @@ impl<T> CustodyTasks<T> {
         metadata: &Arc<Mutex<FileMetadata>>,
         memory: &Arc<Mutex<MemoryMetadata>>,
     ) -> std::io::Result<()> {
-        if self.foreground_lineage_lost || self.tasks.len() != 1 {
+        if self.foreground_lineage_lost {
+            return Ok(());
+        }
+        let sole_initial_root_lost = self.sole_initial_root_lost.clone();
+        self.task_mut(owner)?.foreground_metadata =
+            Some((Arc::downgrade(metadata), Arc::downgrade(memory)));
+        let (retired, birth, process, thread, old_root) = {
+            let task = self.tasks.get(&owner.thread).expect("validated task");
+            (
+                task.retired,
+                task.native_birth.clone(),
+                task.process,
+                task.thread,
+                task.foreground_root.clone(),
+            )
+        };
+        if retired {
+            return Ok(());
+        }
+        if let Some(birth) = birth {
+            let raw = birth.raw();
+            if birth.child_owner() != owner
+                || raw.shared_mm != 1
+                || raw.shared_files != 1
+                || raw.same_thread_group != 1
+            {
+                return Ok(());
+            }
+            let parent = self
+                .tasks
+                .get(&birth.permit().owner.thread)
+                .and_then(|task| task.foreground_root.clone())
+                .ok_or_else(|| {
+                    std::io::Error::other("foreground child lost its authenticated creator root")
+                })?;
+            if parent.files() != birth.permit().files
+                || !parent.matches_metadata(metadata)
+                || !parent.matches_memory(memory)
+                || process != parent.process()
+                || thread != owner.thread.as_raw()
+            {
+                return Err(std::io::Error::other(
+                    "foreground child changed shared MM/files or physical task identity",
+                ));
+            }
+            if let Some(old) = &old_root {
+                if !old.is_current(owner)
+                    || !old.metadata.ptr_eq(&Arc::downgrade(metadata))
+                    || !old.memory.ptr_eq(&Arc::downgrade(memory))
+                {
+                    return Err(std::io::Error::other(
+                        "foreground child changed its state-ready Arc",
+                    ));
+                }
+                return Ok(());
+            }
+            self.tasks.get_mut(&owner.thread).unwrap().foreground_root =
+                Some(Arc::new(ForegroundRoot {
+                    association: parent.association.clone(),
+                    owner,
+                    logical_process: birth.child_process(),
+                    process,
+                    thread,
+                    native_identity: (
+                        raw.provider,
+                        raw.child_task,
+                        raw.child_start,
+                        raw.child_table,
+                    ),
+                    initial_exec: None,
+                    parent: Some(parent),
+                    metadata: Arc::downgrade(metadata),
+                    memory: Arc::downgrade(memory),
+                    revoked: AtomicBool::new(false),
+                    sole_initial_root_lost,
+                }));
             return Ok(());
         }
         let task = self.task_mut(owner)?;
-        if task.retired || task.native_birth.is_some() || task.process != task.thread {
+        if task.process != task.thread {
             return Ok(());
         }
         let Some(exec) = task.initial_exec else {
@@ -130,10 +276,22 @@ impl<T> CustodyTasks<T> {
         }
         task.foreground_root = Some(Arc::new(ForegroundRoot {
             association: association.clone(),
-            exec,
+            owner,
+            logical_process: owner.thread,
+            process: task.process,
+            thread: task.thread,
+            native_identity: (
+                association.provider,
+                association.enrollment.task,
+                association.enrollment.task_start,
+                association.enrollment.table,
+            ),
+            initial_exec: Some(exec),
+            parent: None,
             metadata: Arc::downgrade(metadata),
             memory: Arc::downgrade(memory),
             revoked: AtomicBool::new(false),
+            sole_initial_root_lost,
         }));
         Ok(())
     }
@@ -142,16 +300,16 @@ impl<T> CustodyTasks<T> {
         owner: NetworkStreamOwner,
     ) -> std::io::Result<Arc<ForegroundRoot>> {
         self.get(owner)?;
-        if self.foreground_lineage_lost || self.tasks.len() != 1 {
+        if self.foreground_lineage_lost {
             return Err(std::io::Error::other(
-                "foreground ctl requires unchanged single-root lineage",
+                "foreground ctl lineage was revoked by an unsupported physical owner",
             ));
         }
         let task = &self.tasks[&owner.thread];
         let root = task
             .foreground_root
             .as_ref()
-            .filter(|root| root.is_current(owner) && task.native_birth.is_none())
+            .filter(|root| root.is_current(owner))
             .ok_or_else(|| {
                 std::io::Error::other("foreground ctl lacks positive initial-root authority")
             })?;
@@ -312,35 +470,30 @@ mod tests {
         assert!(Arc::ptr_eq(&root, &tasks.foreground_root(owner).unwrap()));
     }
     #[test]
-    fn foreground_root_cannot_survive_child_exec_final_wait_or_registration_reuse() {
-        for transition in 0..4 {
-            let (mut tasks, owner, metadata, memory, _) = controlled_tasks(61);
-            tasks
-                .bind_foreground_metadata(owner, &metadata, &memory)
-                .unwrap();
-            let root = tasks.foreground_root(owner).unwrap();
-            match transition {
-                0 => {
-                    let child = NetworkStreamOwner {
-                        thread: DetTid::from_raw(62),
-                        mm: owner.mm,
-                    };
-                    tasks.register(child, 61, 62, || Ok(101)).unwrap();
-                }
-                1 => {
-                    let next = NetworkStreamOwner {
-                        mm: owner.mm.for_exec(owner.thread),
-                        ..owner
-                    };
-                    tasks.register(next, 61, 61, || Ok(102)).unwrap();
-                }
-                2 => tasks.close_native_preparations(owner).unwrap(),
-                3 => tasks.forget(owner),
-                _ => unreachable!(),
-            }
-            assert!(!root.is_current(owner));
-            assert!(tasks.foreground_root(owner).is_err());
-        }
+    fn foreground_root_keeps_live_parent_but_loses_sole_policy_after_child_registration() {
+        let (mut tasks, owner, metadata, memory, _) = controlled_tasks(61);
+        tasks
+            .bind_foreground_metadata(owner, &metadata, &memory)
+            .unwrap();
+        let root = tasks.foreground_root(owner).unwrap();
+        assert!(root.is_sole_initial_root(owner));
+        let child = NetworkStreamOwner {
+            thread: DetTid::from_raw(62),
+            mm: owner.mm,
+        };
+        tasks.register(child, 61, 62, || Ok(101)).unwrap();
+        assert!(root.is_current(owner));
+        assert!(Arc::ptr_eq(&root, &tasks.foreground_root(owner).unwrap()));
+        assert!(!root.is_sole_initial_root(owner));
+        assert!(
+            tasks.foreground_root(child).is_err(),
+            "registration is not birth authority"
+        );
+        tasks.forget(child);
+        assert!(
+            !root.is_sole_initial_root(owner),
+            "forget cannot erase physical history"
+        );
     }
 }
 
@@ -372,6 +525,7 @@ pub(crate) fn controlled_foreground_runtime(
     let mut actual = runtime.shared.physical.lock().unwrap();
     actual.first_task = tasks.first_task;
     actual.next_registration = tasks.next_registration;
+    actual.sole_initial_root_lost = tasks.sole_initial_root_lost.clone();
     actual.tasks.insert(
         owner.thread,
         Task {
@@ -384,6 +538,7 @@ pub(crate) fn controlled_foreground_runtime(
             retired: task.retired,
             enrollment: task.enrollment,
             native_birth: task.native_birth,
+            foreground_metadata: task.foreground_metadata,
         },
     );
     drop(actual);

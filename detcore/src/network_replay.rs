@@ -1468,6 +1468,17 @@ struct SocketControlPhysical {
         Result<StreamSocketOptionsV3, i32>,
     )>,
     shutdown_pending: Option<NetworkShutdownV2>,
+    transmit_pending: Option<NativeTransmitPending>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeTransmitPending {
+    call: NetworkStreamCallId,
+    bytes: Vec<u8>,
+    flags: i32,
+    entry_cut: detcore_model::network_trace::NetworkReceiveEntryCutV4,
+    prerequisites: Vec<detcore_model::network_trace::NetworkReleaseNodeIdV4>,
+    submitted: bool,
 }
 
 impl SocketControlPhysical {
@@ -1475,6 +1486,7 @@ impl SocketControlPhysical {
         self.pending.is_none()
             && self.option_pending.is_none()
             && self.shutdown_pending.is_none()
+            && self.transmit_pending.is_none()
             && self.descriptor_released != Some(true)
     }
 }
@@ -2074,9 +2086,25 @@ pub struct NetworkShadowProbe {
     pub local_read_shutdown: bool,
 }
 
+/// Known completion of one bounded V4 Record readiness observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkNativePollObservation {
+    /// Actual readiness bits from the retained original OFD.
+    pub revents: i16,
+    /// Actual queued byte count when `POLLIN` was reported.
+    pub queued: Option<usize>,
+}
+
 /// Host operations whose completion cannot be inferred from future destruction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkStreamPhysicalEffect {
+    /// Immutable guest bytes submitted as the sole physical stream send.
+    Transmit {
+        /// Exact owned payload copied while the original task is stopped.
+        bytes: Vec<u8>,
+        /// Exact Linux send flags admitted by the engine.
+        flags: i32,
+    },
     /// Physical in Record, modeled from the recorded environment in Replay.
     SetSocketOption {
         /// Raw option value whose normalization is owned by the engine.
@@ -2395,6 +2423,11 @@ impl NetworkReplayEngine {
 /// Exact result matched against the just-submitted physical operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkStreamPhysicalResult {
+    /// Actual successful stream-send byte count.
+    Transmitted {
+        /// Kernel-returned count, bounded by the immutable submitted payload.
+        count: usize,
+    },
     /// Record kernel result or Replay's explicitly modeled result.
     SocketOption {
         /// Success or the positive Linux errno; mismatches remain unresolved.
@@ -2537,6 +2570,10 @@ impl NetworkReplayEngine {
     ) -> Result<(), NetworkReplayError> {
         self.require_no_helper_copy_for_lease(owner, lease)?;
         let probe = self.owned_shadow_probe(owner, lease)?;
+        let native_poll = matches!(
+            &self.mode,
+            EngineState::Native(native) if native.mode() == NetworkEngineMode::Record
+        );
         if probe.pending.is_some() {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
@@ -2565,12 +2602,18 @@ impl NetworkReplayEngine {
                     && probe.retained_prefix.checked_add(1024) == Some(maximum)
             }
             NetworkStreamPhysicalEffect::PollState => {
-                probe.peek.is_some() && probe.cursor_restored() && probe.poll.is_none()
+                probe.poll.is_none()
+                    && ((probe.peek.is_some() && probe.cursor_restored())
+                        || (native_poll
+                            && probe.peek.is_none()
+                            && !probe.cursor_observed
+                            && probe.current_cursor == probe.original_cursor))
             }
             NetworkStreamPhysicalEffect::QueuedBytes => {
                 probe.poll.is_some() && probe.queued.is_none()
             }
             NetworkStreamPhysicalEffect::Drain { .. }
+            | NetworkStreamPhysicalEffect::Transmit { .. }
             | NetworkStreamPhysicalEffect::ReadSocketError
             | NetworkStreamPhysicalEffect::SetSocketOption { .. }
             | NetworkStreamPhysicalEffect::Shutdown { .. } => false,
@@ -2646,10 +2689,17 @@ impl NetworkReplayEngine {
                 NetworkStreamPhysicalEffect::QueuedBytes,
                 NetworkStreamPhysicalResult::QueuedBytes { count },
             ) => {
-                let observed = next
-                    .peek
-                    .expect("submission required PEEK")
-                    .unwrap_or_default();
+                // V3 publication orders this after PEEK. V4's bounded poll
+                // witness instead orders it after PollState and publishes no
+                // bytes; FinishNativePollProbe applies the stronger low-water
+                // and terminal-bit checks before releasing the probe.
+                let observed = match next.peek {
+                    Some(peek) => peek.unwrap_or_default(),
+                    None if next.poll.is_some() => 0,
+                    None => {
+                        return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
+                    }
+                };
                 if count < next.retained_prefix || count < observed {
                     return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
                 }
@@ -3015,6 +3065,9 @@ impl NetworkReplayEngine {
         if let NetworkStreamPhysicalEffect::Shutdown { direction } = effect {
             return self.submit_socket_shutdown(owner, lease, direction);
         }
+        if let NetworkStreamPhysicalEffect::Transmit { bytes, flags } = effect {
+            return self.submit_native_transmit(owner, lease, bytes, flags);
+        }
         if self.shadow_probes.contains_key(&lease) {
             return self.submit_shadow_probe_physical(owner, lease, effect);
         }
@@ -3063,6 +3116,13 @@ impl NetworkReplayEngine {
         }
         if let NetworkStreamPhysicalResult::Shutdown { result } = result {
             return self.confirm_socket_shutdown(owner, lease, result);
+        }
+        if matches!(result, NetworkStreamPhysicalResult::Transmitted { .. })
+            || self.socket_controls.values().any(|control| {
+                control.lease == lease && control.physical.transmit_pending.is_some()
+            })
+        {
+            return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
         if self.shadow_probes.contains_key(&lease) {
             return self.confirm_shadow_probe_physical(owner, lease, result);
@@ -6396,7 +6456,9 @@ impl NetworkReplayEngine {
     }
 
     fn check_stream_operations_finished(&self) -> Result<(), NetworkReplayError> {
-        self.check_native_retirement()?;
+        if let EngineState::Native(native) = &self.mode {
+            native.check_retirement_failure()?;
+        }
         // Replay keeps its FD-first diagnostics; Record preserves its existing
         // accepted/stream diagnostics before checking pure descriptor custody.
         let fd_first = self.mode() == NetworkEngineMode::Replay;
@@ -6419,7 +6481,10 @@ impl NetworkReplayEngine {
         if !fd_first {
             self.finish_fd_mutations()?;
         }
-        Ok(())
+        // Policy loss cannot hide an actual unresolved Call/control. Once all
+        // custody is resolved it still forbids successful trace finalization.
+        // New effects retain their full pre-effect policy checks elsewhere.
+        self.check_native_retirement()
     }
 }
 

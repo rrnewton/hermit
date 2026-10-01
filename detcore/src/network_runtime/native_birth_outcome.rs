@@ -82,6 +82,14 @@ impl NativeTaskProjection {
     pub(crate) fn same_process(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.process, &other.process)
     }
+    pub(crate) fn matches_foreground_identity(
+        &self,
+        owner: NetworkStreamOwner,
+        identity: (u64, u64, u64, u64),
+    ) -> bool {
+        self.thread == owner.thread
+            && (self.provider, self.task, self.start) == (identity.0, identity.1, identity.2)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -212,9 +212,12 @@ impl TestCutHook {
 
 /// Exact selected network-capture grant, borrowed under the scheduler guard.
 /// This is distinct from foreground execution and ordinary external file IO.
+#[derive(Debug)]
 pub(crate) struct NativeCaptureEntryObservation<'a> {
     owner: NetworkStreamOwner,
     operation: &'a ExternalOpId,
+    root: &'a crate::network_runtime::ForegroundRoot,
+    epoch: u64,
 }
 impl NativeCaptureEntryObservation<'_> {
     pub(crate) fn owner(&self) -> NetworkStreamOwner {
@@ -223,14 +226,23 @@ impl NativeCaptureEntryObservation<'_> {
     pub(crate) fn operation(&self) -> ExternalOpId {
         *self.operation
     }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub(crate) fn admits_sole_initial_root(
+        &self,
+        root: &crate::network_runtime::ForegroundRoot,
+    ) -> bool {
+        std::ptr::eq(self.root, root) && root.is_sole_initial_root(self.owner)
+    }
 }
 impl Scheduler {
-    pub(crate) fn native_capture_entry_observation(
-        &self,
+    pub(crate) fn native_capture_entry_observation<'a>(
+        &'a self,
         owner: NetworkStreamOwner,
         operation: ExternalOpId,
-        root: &crate::network_runtime::ForegroundRoot,
-    ) -> std::io::Result<NativeCaptureEntryObservation<'_>> {
+        root: &'a crate::network_runtime::ForegroundRoot,
+    ) -> std::io::Result<NativeCaptureEntryObservation<'a>> {
         let bad = || std::io::Error::other("native entry lacks its selected network-capture grant");
         if self.backend_failed()
             || self.thread_is_logically_killed(owner.thread)
@@ -250,6 +262,8 @@ impl Scheduler {
         self.validate_native_initial_root(owner, root)?;
         Ok(NativeCaptureEntryObservation {
             owner,
+            root,
+            epoch: self.next_turns[&owner.thread].protocol.epoch,
             operation: self
                 .network_capture_blockers
                 .get(&owner.thread)

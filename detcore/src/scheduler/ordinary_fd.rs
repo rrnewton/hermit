@@ -57,6 +57,7 @@ impl ForegroundFdGrant {
 #[derive(Debug)]
 pub(crate) struct OrdinaryFdObservation<'a> {
     grant: &'a ForegroundFdGrant,
+    sole_initial_root: Option<&'a crate::network_runtime::ForegroundRoot>,
 }
 
 impl OrdinaryFdObservation<'_> {
@@ -71,6 +72,16 @@ impl OrdinaryFdObservation<'_> {
     /// Original handback kind, never a native syscall completion.
     pub(crate) fn resume(&self) -> OrdinaryFdResume {
         self.grant.resume
+    }
+    /// Only the full retained census/history check below fills this borrow.
+    /// A generic Normal grant cannot be promoted by the engine.
+    pub(crate) fn admits_sole_initial_root(
+        &self,
+        root: &crate::network_runtime::ForegroundRoot,
+    ) -> bool {
+        self.sole_initial_root.is_some_and(|retained| {
+            std::ptr::eq(retained, root) && root.is_sole_initial_root(self.owner())
+        }) && self.resume() == OrdinaryFdResume::Normal
     }
 }
 
@@ -121,7 +132,10 @@ impl Scheduler {
         if !grant.matches(turn, owner) || !self.ordinary_fd_gate(owner.thread) {
             return Err(ProtocolFailure::Phase);
         }
-        Ok(OrdinaryFdObservation { grant })
+        Ok(OrdinaryFdObservation {
+            grant,
+            sole_initial_root: None,
+        })
     }
 
     // Read before clear_nextturn discards the request origin. A signal-only
@@ -196,25 +210,23 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    /// Narrow positive grant for an unchanged native initial root. The actual
-    /// census projection, backend registration and normal foreground transport
-    /// must all agree; no queue-length or host-ready heuristic issues authority.
-    pub(crate) fn foreground_native_observation(
-        &self,
+    /// V4's existing sole-initial-root policy, distinct from generic task/epoll
+    /// identity. The borrow keeps the scheduler census fixed through admission.
+    pub(crate) fn foreground_native_observation<'a>(
+        &'a self,
         owner: NetworkStreamOwner,
-        root: &crate::network_runtime::ForegroundRoot,
-    ) -> std::io::Result<OrdinaryFdObservation<'_>> {
+        root: &'a crate::network_runtime::ForegroundRoot,
+    ) -> std::io::Result<OrdinaryFdObservation<'a>> {
         let bad = || std::io::Error::other("foreground ctl lacks unchanged sole native root grant");
-        let grant = self.ordinary_fd_observation(owner).map_err(|_| bad())?;
+        let mut grant = self.ordinary_fd_observation(owner).map_err(|_| bad())?;
         if grant.resume() != OrdinaryFdResume::Normal {
             return Err(bad());
         }
         self.validate_native_initial_root(owner, root)?;
+        grant.sole_initial_root = Some(root);
         Ok(grant)
     }
 
-    /// Common unchanged census/registration predicate. This grants no turn or
-    /// external request; each caller must separately prove its actual phase.
     pub(super) fn validate_native_initial_root(
         &self,
         owner: NetworkStreamOwner,
@@ -222,8 +234,8 @@ impl Scheduler {
     ) -> std::io::Result<()> {
         use crate::network_runtime::native_birth_outcome::NativeTaskProjection;
         let bad = || std::io::Error::other("native observation lacks unchanged sole initial root");
-        if !root.is_current(owner)
-            || root.owner() != owner
+        self.validate_native_foreground_task(owner, root)?;
+        if !root.is_sole_initial_root(owner)
             || self.thread_tree.root != Some(owner.thread)
             || self.thread_tree.tree.len() != 1
             || self.physical_thread_pidfds.len() != 1
@@ -274,6 +286,53 @@ impl Scheduler {
         }
         Ok(())
     }
+
+    /// Common unchanged census/registration predicate. This grants no turn or
+    /// external request; each caller must separately prove its actual phase.
+    pub(super) fn validate_native_foreground_task(
+        &self,
+        owner: NetworkStreamOwner,
+        root: &crate::network_runtime::ForegroundRoot,
+    ) -> std::io::Result<()> {
+        let bad = || std::io::Error::other("native observation lacks an unchanged task projection");
+        if !root.is_current(owner)
+            || root.owner() != owner
+            || self.thread_tree.tree.get(&owner.thread).is_none()
+        {
+            return Err(bad());
+        }
+        let process = self.registered_process(owner.thread).ok_or_else(bad)?;
+        let (mm, raw_process, raw_thread, _pin, _) = self
+            .physical_thread_pidfds
+            .get(&owner.thread)
+            .ok_or_else(bad)?;
+        if *mm != owner.mm || *raw_process != root.process() || *raw_thread != root.thread() {
+            return Err(bad());
+        }
+        let entry = self
+            .thread_tree
+            .process_wait
+            .get(&process)
+            .ok_or_else(bad)?;
+        let identity = root.native_identity();
+        let Some(projection) = entry
+            .native_projections
+            .iter()
+            .find(|projection| projection.thread() == owner.thread)
+        else {
+            return Err(bad());
+        };
+        if entry.reaped
+            || !projection.matches_foreground_identity(owner, identity)
+            || entry
+                .native_projections
+                .iter()
+                .any(|other| !other.same_process(projection))
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
 }
 
 impl Scheduler {
@@ -282,12 +341,68 @@ impl Scheduler {
         owner: NetworkStreamOwner,
         root: &crate::network_runtime::ForegroundRoot,
     ) -> std::io::Result<OrdinaryFdObservation<'_>> {
-        self.foreground_native_observation(owner, root)
+        let grant = self
+            .ordinary_fd_observation(owner)
+            .map_err(|_| std::io::Error::other("foreground epoll lacks its actual grant"))?;
+        if grant.resume() != OrdinaryFdResume::Normal {
+            return Err(std::io::Error::other(
+                "foreground epoll lacks a normal grant",
+            ));
+        }
+        self.validate_native_foreground_task(owner, root)?;
+        Ok(grant)
     }
 }
 
 #[cfg(test)]
 impl Scheduler {
+    /// Component composition: select a real BlockingNetworkCapture request.
+    /// The fixture separately obtains/binds the engine's actual FD reader;
+    /// this does not claim a backend syscall or fabricate a GoFdRead receipt.
+    pub(crate) fn controlled_selected_network_capture(
+        &mut self,
+        owner: NetworkStreamOwner,
+        operation: crate::resources::ExternalOpId,
+    ) {
+        use super::parked::ControlCapability;
+        use super::parked::ResourceOrigin;
+        use super::parked::RpcOrigin;
+        use crate::resources::Permission;
+        use crate::resources::ResourceID;
+        use crate::resources::Resources;
+        self.install_resource_origin(
+            owner.thread,
+            ResourceOrigin {
+                rpc: RpcOrigin::DirectRequestResources,
+                mm: owner.mm,
+                control: ControlCapability::None,
+            },
+        )
+        .unwrap();
+        let mut request = Resources::new(owner.thread);
+        request.insert(
+            ResourceID::BlockingNetworkCapture(operation),
+            Permission::RW,
+        );
+        let req = self.next_turns[&owner.thread].req.clone();
+        self.request_put(
+            &req,
+            request,
+            &std::sync::Arc::new(std::sync::Mutex::new(crate::types::GlobalTime::new(
+                &crate::config::Config::default(),
+            ))),
+        );
+        let (tid, request, response) = self.step3_peek().unwrap();
+        assert_eq!(tid, owner.thread);
+        let request = request.try_read().unwrap().unwrap();
+        assert!(matches!(
+            self.step4_resource_block(tid, &request, &response),
+            Err(super::SkipTurn)
+        ));
+        assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+        assert!(self.original_external_grant_matches(owner, operation));
+    }
+
     /// Component fixture using the actual initial projection and turn issuer.
     /// Controlled census metadata is not a native provider qualification.
     pub(crate) fn controlled_foreground_store_grant(
