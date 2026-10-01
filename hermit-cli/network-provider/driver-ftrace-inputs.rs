@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+// Test-only compile/readback identity. No provider admission algorithm here.
+// This complete local C include closure is copied to the private compile
+// directory from these exact bytes; no original source directory is on -I.
+pub(super) const C_INPUTS: &[(&str, &[u8])] = &[
+    ("connect-copy.h", include_bytes!("connect-copy.h")),
+    ("driver-ftrace-facade.h", include_bytes!("driver-ftrace-facade.h")),
+    ("driver-ftrace-test.c", include_bytes!("driver-ftrace-test.c")),
+    ("driver-grouped.c", include_bytes!("driver-grouped.c")),
+    ("driver.c", include_bytes!("driver.c")),
+    ("epoll-ctl-copy-driver.h", include_bytes!("epoll-ctl-copy-driver.h")),
+    ("epoll-ctl-copy.h", include_bytes!("epoll-ctl-copy.h")),
+    ("fd-effects-driver.h", include_bytes!("fd-effects-driver.h")),
+    ("fd-effects.h", include_bytes!("fd-effects.h")),
+    ("fd-enrollment-driver.h", include_bytes!("fd-enrollment-driver.h")),
+    ("fd-enrollment.h", include_bytes!("fd-enrollment.h")),
+    ("ftrace-coverage.h", include_bytes!("ftrace-coverage.h")),
+    ("grouped-driver.h", include_bytes!("grouped-driver.h")),
+    ("grouped-io.h", include_bytes!("grouped-io.h")),
+    ("grouped-owner.h", include_bytes!("grouped-owner.h")),
+    ("grouped-probes.h", include_bytes!("grouped-probes.h")),
+    ("grouped-target.h", include_bytes!("grouped-target.h")),
+    ("provider.h", include_bytes!("provider.h")),
+    ("retirement-target.h", include_bytes!("retirement-target.h")),
+    ("stream-copy-driver.h", include_bytes!("stream-copy-driver.h")),
+    ("stream-copy.h", include_bytes!("stream-copy.h")),
+    ("task-disarm.h", include_bytes!("task-disarm.h")),
+];
+pub(super) const INPUTS: &[(&str, &[u8])] = &[
+    ("driver-ftrace-ready-bridge.rs", include_bytes!("driver-ftrace-ready-bridge.rs")),
+    ("driver-ftrace-inputs.rs", include_bytes!("driver-ftrace-inputs.rs")),
+    ("driver-ftrace-process.rs", include_bytes!("driver-ftrace-process.rs")),
+    ("process_group.rs", include_bytes!("process_group.rs")),
+    ("test.rs", include_bytes!("test.rs")),
+    ("accepted-contract.json", include_bytes!("accepted-contract.json")),
+    ("../../detcore/src/network_runtime/accepted_parent.rs",
+        include_bytes!("../../detcore/src/network_runtime/accepted_parent.rs")),
+    ("../../detcore/src/network_runtime/provider_topology.rs",
+        include_bytes!("../../detcore/src/network_runtime/provider_topology.rs")),
+    ("../../detcore/src/network_runtime/provider_wire.rs",
+        include_bytes!("../../detcore/src/network_runtime/provider_wire.rs")),
+];

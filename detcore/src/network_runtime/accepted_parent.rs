@@ -2,6 +2,10 @@
 //! before workload permission, outside the guest namespaces. No capability is
 //! inferred from Config or from an ordinary tracer's credentials.
 
+#[cfg(test)]
+#[path = "../../../hermit-cli/network-provider/driver-ftrace-ready-bridge.rs"]
+mod driver_ftrace_ready_bridge;
+
 use std::io;
 use std::num::NonZeroU64;
 use std::os::fd::AsFd;

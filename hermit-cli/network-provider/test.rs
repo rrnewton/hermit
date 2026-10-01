@@ -20,10 +20,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -82,17 +81,105 @@ fn sources(source: &Path, manifest: &Value) -> Result<BTreeMap<String, String>> 
 
 #[path = "process_group.rs"]
 mod process_group;
-use process_group::{Limits, OwnedChild, bounds, supervise};
-const LIMITS: Limits = Limits {
-    wall: Duration::from_secs(60),
-    logs: 4 * MIB,
-    cleanup: Duration::from_secs(2),
-};
-#[cfg(test)]
-use process_group::{absent, exited_without_reap, only_terminal_leader};
+#[path = "driver-ftrace-process.rs"]
+mod driver_ftrace_process;
+use driver_ftrace_process::{DRIVER_FTRACE_IMPORT_FENCE, execute_stage};
+
+// Only independent role executions use this fixed bound. Each worker owns its
+// Command/Child and calls the unchanged stage supervisor with the action's
+// original start and aggregate append-only logs. Compilers remain serial.
+const ROLE_MUTANT_CONCURRENCY: usize = 4;
+
+fn role_worker_failure(error: String) -> Value {
+    // No child receipt is available on a thread admission failure or panic.
+    // In particular, joining a panicked worker does not certify its cleanup.
+    json!({"passed":false,"expected_refusal":true,"raw":null,"worker_error":error})
+}
+
+fn role_batches(
+    roles: std::ops::RangeInclusive<u32>,
+    execute: impl Fn(u32) -> Value + Sync,
+) -> Vec<(u32, Value)> {
+    let roles: Vec<_> = roles.collect();
+    let mut results = Vec::new();
+    for batch in roles.chunks(ROLE_MUTANT_CONCURRENCY) {
+        let completed = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            let mut admission_failure = None;
+            for &role in batch {
+                let execute = &execute;
+                match std::thread::Builder::new().spawn_scoped(scope, move || execute(role)) {
+                    Ok(worker) => workers.push((role, worker)),
+                    Err(error) => {
+                        admission_failure = Some((role, role_worker_failure(format!(
+                            "role worker spawn: {error}"
+                        ))));
+                        break;
+                    }
+                }
+            }
+            // Join ALL launched workers, including after a failed receipt or
+            // panic. Preserve canonical role order rather than completion order.
+            let mut completed: Vec<_> = workers.into_iter().map(|(role, worker)| {
+                let receipt = worker.join().unwrap_or_else(|panic| {
+                    let message = panic.downcast_ref::<String>().map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic");
+                    role_worker_failure(format!("role worker panic: {message}"))
+                });
+                (role, receipt)
+            }).collect();
+            completed.extend(admission_failure);
+            completed
+        });
+        let failed = completed.iter().any(|(_, receipt)| receipt["passed"] != true);
+        results.extend(completed);
+        if failed { break; }
+    }
+    results
+}
+
+fn role_mutant_receipt(tested: Value) -> Value {
+    let refused=tested["passed"]==false &&
+        tested["signal"].as_i64()==Some(libc::SIGABRT as i64) && tested["timed_out"]==false &&
+        tested["log_overflow"]==false && tested["primary_error"].is_null() &&
+        tested["terminal_bounds_error"].is_null() &&
+        tested["natural_terminal_group"]==true && tested["cleanup_complete"]==true &&
+        tested["cleanup_errors"].as_array().is_some_and(|errors| errors.is_empty());
+    json!({"passed":refused,"expected_refusal":true,"raw":tested})
+}
+
+fn execute_role_mutants(
+    executable: &Path,
+    roles: std::ops::RangeInclusive<u32>,
+    started: Instant,
+    stdout: &Path,
+    stderr: &Path,
+) -> Vec<(u32, Value)> {
+    role_batches(roles, |role| {
+        let mut command = Command::new(executable);
+        command.env("AP_FTRACE_MUTATE_ROLE", role.to_string());
+        role_mutant_receipt(execute_stage(&mut command, started, stdout, stderr))
+    })
+}
+
+fn append_role_receipts(
+    stages: &mut Vec<Value>,
+    receipt: &mut Value,
+    completed: Vec<(u32, Value)>,
+) {
+    for (role, accepted) in completed {
+        // A later success in this already-started batch cannot erase failure.
+        if accepted["passed"] != true && receipt["passed"] == true {
+            *receipt = accepted.clone();
+        }
+        stages.push(json!({"name":format!("test:ftrace-mutant-{role}"),"receipt":accepted}));
+    }
+}
 
 const ACCEPTED_CONTROLS: &[&str] = &[
     "ftrace-coverage-test.c",
+    "driver-ftrace-test.c",
     "fd-effects-test.c",
     "fd-effects-driver-test.c",
     "fd-table-test.c",
@@ -148,6 +235,10 @@ fn channel_control_inputs(source: &Path, accepted: bool) -> Result<BTreeMap<Stri
     }).collect()
 }
 
+// Test-only facade identity: never add these files to the production DSO contract.
+const DRIVER_FTRACE_CONTROL_INPUTS: &[&str] = &[
+    "driver-ftrace-facade.h", "driver-ftrace-process.rs", "test.rs",
+];
 fn control_sources(source: &Path, accepted: bool) -> Result<BTreeMap<String, String>> {
     if !accepted {
         return [
@@ -161,63 +252,9 @@ fn control_sources(source: &Path, accepted: bool) -> Result<BTreeMap<String, Str
     }
     ACCEPTED_CONTROLS
         .iter()
+        .chain(DRIVER_FTRACE_CONTROL_INPUTS)
         .map(|name| Ok(((*name).to_owned(), digest(&read(&source.join(name), MIB)?))))
         .collect()
-}
-
-// Every stage shares the original action start and the same append-only logs.
-// A new compiler or test never receives another 60-second or 4-MiB allowance.
-fn execute_stage(command: &mut Command, started: Instant, stdout: &Path, stderr: &Path) -> Value {
-    let admission = (|| -> Result<()> {
-        let current = bounds(started, stdout, stderr, LIMITS)?;
-        ensure!(
-            !current.0 && !current.1,
-            "aggregate wall/log bound before next stage"
-        );
-        process_group::own_descendants()?;
-        command
-            .stdin(Stdio::null())
-            .stdout(File::options().append(true).open(stdout)?)
-            .stderr(File::options().append(true).open(stderr)?);
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                for (resource, limit) in [
-                    (libc::RLIMIT_CORE, 0),
-                    (libc::RLIMIT_AS, 4 * 1024 * MIB),
-                    (libc::RLIMIT_FSIZE, 64 * MIB),
-                ] {
-                    let value = libc::rlimit {
-                        rlim_cur: limit,
-                        rlim_max: limit,
-                    };
-                    if libc::setrlimit(resource, &value) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-        Ok(())
-    })();
-    match admission.and_then(|()| command.spawn().map_err(Into::into)) {
-        Ok(child) => supervise(
-            OwnedChild {
-                child,
-                cleanup_attempted: false,
-                reaped: false,
-            },
-            started,
-            stdout,
-            stderr,
-            LIMITS,
-        ),
-        Err(error) => json!({ "pid":null, "raw_status":null, "signal":null,
-            "primary_error":format!("stage admission/spawn: {error:#}"),
-            "cleanup_attempted":false, "cleanup_complete":null, "passed":false }),
-    }
 }
 
 fn run() -> Result<()> {
@@ -310,6 +347,14 @@ fn run() -> Result<()> {
         for name in ACCEPTED_CONTROLS {
             let executable = output.join(name.strip_suffix(".c").unwrap());
             let mut compile = Command::new("clang");
+            let driver_ftrace = *name == "driver-ftrace-test.c";
+            let driver_object = output.join("driver-ftrace-test.o");
+            if driver_ftrace {
+                // No libbpf, dynamic lookup, GC of unreachable effects or native
+                // syscall fallback. Inspect every undefined symbol before run.
+                compile.args(["-std=gnu11", "-fno-builtin", "-DAP_FTRACE_PROVIDER=1",
+                    "-DAP_NATIVE_COPY_VERSION=5ULL", "-c"]);
+            }
             if *name == "birth-cleanup-driver-test.c" {
                 // This existing control includes driver.c and mocks only the
                 // reached boundaries. Keep its reviewed standalone flags;
@@ -337,12 +382,24 @@ fn run() -> Result<()> {
                 .arg(&source)
                 .arg(source.join(name))
                 .arg("-o")
-                .arg(&executable);
+                .arg(if driver_ftrace { &driver_object } else { &executable });
             let compiled = execute_stage(&mut compile, started, &stdout_path, &stderr_path);
             stages.push(json!({ "name":format!("compile:{name}"), "receipt":compiled }));
             if compiled["passed"] != true {
                 receipt = compiled;
                 break;
+            }
+            if driver_ftrace {
+                let mut fence = Command::new("python3");
+                fence.arg("-c").arg(DRIVER_FTRACE_IMPORT_FENCE).arg(&driver_object);
+                let checked = execute_stage(&mut fence, started, &stdout_path, &stderr_path);
+                stages.push(json!({"name":"fence:driver-ftrace-imports","receipt":checked}));
+                if checked["passed"] != true { receipt = checked; break; }
+                let mut link = Command::new("clang");
+                link.arg(&driver_object).arg("-Wl,--no-undefined").arg("-o").arg(&executable);
+                let linked = execute_stage(&mut link, started, &stdout_path, &stderr_path);
+                stages.push(json!({"name":"link:driver-ftrace-control","receipt":linked}));
+                if linked["passed"] != true { receipt = linked; break; }
             }
             let tested = execute_stage(
                 &mut Command::new(&executable),
@@ -355,6 +412,7 @@ fn run() -> Result<()> {
                 receipt = tested;
                 break;
             }
+
         }
     }
     if receipt["passed"] == true && !accepted {
@@ -487,25 +545,14 @@ fn run() -> Result<()> {
             let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
             stages.push(json!({"name":format!("compile:ftrace-mutants-{label}"),"receipt":compiled}));
             if compiled["passed"]!=true {receipt=compiled;break;}
-            for role in roles {
-                let mut command=Command::new(&executable);
-                command.env("AP_FTRACE_MUTATE_ROLE",role.to_string());
-                let tested=execute_stage(&mut command,started,&stdout_path,&stderr_path);
-                let refused=tested["passed"]==false &&
-                    tested["signal"].as_i64()==Some(libc::SIGABRT as i64) && tested["timed_out"]==false &&
-                    tested["log_overflow"]==false && tested["primary_error"].is_null() &&
-                    tested["terminal_bounds_error"].is_null() &&
-                    tested["natural_terminal_group"]==true && tested["cleanup_complete"]==true &&
-                    tested["cleanup_errors"].as_array().is_some_and(|errors| errors.is_empty());
-                let accepted=json!({"passed":refused,"expected_refusal":true,"raw":tested});
-                stages.push(json!({"name":format!("test:ftrace-mutant-{role}"),"receipt":accepted}));
-                if !refused {receipt=accepted;break;}
-            }
+            append_role_receipts(&mut stages, &mut receipt, execute_role_mutants(
+                &executable, roles, started, &stdout_path, &stderr_path,
+            ));
             if receipt["passed"]!=true {break;}
         }
     }
     let expected_stages = 1 + if accepted {
-        2 * ACCEPTED_CONTROLS.len()+30
+        2 * ACCEPTED_CONTROLS.len()+32 // actual driver closed-import fence and link
     } else {
         2 * UNIX_CONTROLS.len()
     };
@@ -554,8 +601,17 @@ fn main() {
 }
 
 #[cfg(test)]
+#[path = "role_mutant_batch_tests.rs"]
+mod role_mutant_batch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use super::driver_ftrace_process::LIMITS;
+    use super::process_group::{Limits, OwnedChild, absent, exited_without_reap, only_terminal_leader, supervise};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::Duration;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -627,17 +683,45 @@ mod tests {
     fn accepted_controls_are_required_and_fenced_as_an_exact_population() {
         let case = Case::new();
         assert!(control_sources(&case.path, true).is_err());
-        assert_eq!(control_sources(&case.path, false).unwrap(), BTreeMap::new());
-        for name in ACCEPTED_CONTROLS {
+        // Both actual populations require their declared files. An empty
+        // fixture is not a valid empty Unix population.
+        assert!(control_sources(&case.path, false).is_err());
+        fs::create_dir(case.path.join("unix")).unwrap();
+        let unix_names = [
+            "unix/keeper-phase-tests.c",
+            "unix/keeper-readback-tests.c",
+            "unix/keeper-terminal-tests.c",
+        ];
+        for name in unix_names {
+            fs::write(case.path.join(name), name).unwrap();
+        }
+        let unix_expected: BTreeMap<String, String> = unix_names
+            .into_iter()
+            .map(|name| (name.to_owned(), digest(name.as_bytes())))
+            .collect();
+        assert_eq!(unix_expected.len(), 3);
+        assert_eq!(control_sources(&case.path, false).unwrap(), unix_expected);
+        for name in unix_names {
+            fs::remove_file(case.path.join(name)).unwrap();
+            assert!(control_sources(&case.path, false).is_err());
+            fs::write(case.path.join(name), "changed actual Unix control").unwrap();
+            assert_ne!(control_sources(&case.path, false).unwrap(), unix_expected);
+            fs::write(case.path.join(name), name).unwrap();
+            assert_eq!(control_sources(&case.path, false).unwrap(), unix_expected);
+        }
+        for name in ACCEPTED_CONTROLS.iter().chain(DRIVER_FTRACE_CONTROL_INPUTS) {
             fs::write(case.path.join(name), name).unwrap();
         }
         let before = control_sources(&case.path, true).unwrap();
-        assert_eq!(ACCEPTED_CONTROLS.len(), 21);
-        assert_eq!(before.len(), 21);
+        assert_eq!(ACCEPTED_CONTROLS.len(), 22);
+        assert_eq!(before.len(), 25);
         assert_eq!(
             before.keys().map(String::as_str).collect::<Vec<_>>(),
             [
                 "birth-cleanup-driver-test.c",
+                "driver-ftrace-facade.h",
+                "driver-ftrace-process.rs",
+                "driver-ftrace-test.c",
                 "fd-effects-driver-test.c",
                 "fd-effects-test.c",
                 "fd-enrollment-driver-test.c",
@@ -657,9 +741,18 @@ mod tests {
                 "stream-copy-v5-driver-test.c",
                 "stream-frontier-test.c",
                 "stream-membership-test.c",
-                "stream-membership-v5-test.c"
+                "stream-membership-v5-test.c",
+                "test.rs"
             ]
         );
+        for name in ["driver-ftrace-test.c", "driver-ftrace-facade.h", "driver-ftrace-process.rs", "test.rs"] {
+            fs::write(case.path.join(name), "changed facade or closed import fence").unwrap();
+            assert_ne!(before, control_sources(&case.path, true).unwrap());
+            fs::remove_file(case.path.join(name)).unwrap();
+            assert!(control_sources(&case.path, true).is_err());
+            fs::write(case.path.join(name), name).unwrap();
+            assert_eq!(before, control_sources(&case.path, true).unwrap());
+        }
         fs::write(case.path.join("grouped-wire-test.c"), "changed actual SCM assertion").unwrap();
         assert_ne!(before, control_sources(&case.path, true).unwrap());
         fs::remove_file(case.path.join("grouped-wire-test.c")).unwrap();
@@ -727,12 +820,14 @@ mod tests {
         assert_eq!(channel_control_inputs(&case.path, false).unwrap(), BTreeMap::new());
         for name in CHANNEL_CONTROL_INPUTS { fs::write(case.path.join(name), name).unwrap(); }
         let before = channel_control_inputs(&case.path, true).unwrap();
-        assert_eq!(before.len(), 8);
+        assert_eq!(before.len(), 10);
         assert_eq!(before.keys().map(String::as_str).collect::<Vec<_>>(), [
             "grouped-adoption-wire.c", "grouped-adoption-wire.h",
             "grouped-guardian-bootstrap.c", "grouped-guardian-bootstrap.h",
+            "grouped-io.c",
             "grouped-keeper-dual.c", "grouped-keeper-dual.h",
             "grouped-keeper-wire.c", "grouped-keeper-wire.h",
+            "grouped-owner.c",
         ]);
         for name in CHANNEL_CONTROL_INPUTS {
             fs::write(case.path.join(name), "changed actual channel implementation").unwrap();
