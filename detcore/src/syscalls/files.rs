@@ -361,6 +361,29 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// Whether a descriptor carries an inherited container stdio resource: one of
+/// descriptors 0-2 as the guest received them, or a dup of one. Its cached
+/// stat is the tracer's `fstat(0)` stand-in, not the descriptor's own.
+fn is_container_stdio(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
+}
+
+/// Where `handle_mmap` takes the identity it records for a file mapping.
+enum MappedFileIdentity {
+    /// No file identity: an anonymous mapping, an untracked descriptor, or one
+    /// with no cached stat.
+    None,
+    /// The descriptor's cached stat.
+    Cached(RawFileId),
+    /// A stdio descriptor, whose cached stat is a stand-in.
+    Stdio,
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -3480,22 +3503,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        // The raw identity `fstat` reported for a mapped file, from the
-        // descriptor's cached stat (present only under `virtualize_metadata`).
-        // A maps line for this range keys its inode on it; see
-        // `mapping_stat_identity`.
+        // The raw identity `fstat` reports for a mapped file. A maps line for
+        // this range keys its inode on it; see `mapping_stat_identity`.
+        //
+        // For an ordinary descriptor it is the descriptor's cached stat
+        // (present only under `virtualize_metadata`), so it costs no syscall.
+        // An inherited stdio descriptor, or a dup of one, is the exception:
+        // its cached stat is a stand-in -- the tracer's `fstat(0)`, given to
+        // all three (see `setup_stdio`) whether or not metadata is
+        // virtualized -- so its identity comes from a real `fstat` of the
+        // descriptor once the mapping has succeeded, and only under
+        // `virtualize_metadata`. When that `fstat` fails nothing is recorded,
+        // and the maps line resolves its pathname instead.
         let mapped_file = if call.flags().contains(MapFlags::MAP_ANONYMOUS) || call.fd() < 0 {
-            None
+            MappedFileIdentity::None
         } else {
             guest
                 .thread_state()
-                .with_detfd(call.fd(), |fd| fd.stat().map(|stat| stat.raw_file_id()))
-                .ok()
-                .flatten()
+                .with_detfd(call.fd(), |fd| {
+                    if is_container_stdio(fd.resource()) {
+                        MappedFileIdentity::Stdio
+                    } else {
+                        fd.stat().map_or(MappedFileIdentity::None, |stat| {
+                            MappedFileIdentity::Cached(stat.raw_file_id())
+                        })
+                    }
+                })
+                .unwrap_or(MappedFileIdentity::None)
         };
+        let fd = call.fd();
         let len = call.len();
         let result = self.record_or_replay(guest, call).await?;
         let start = usize::try_from(result).expect("a successful mmap must return an address");
+        let mapped_file = match mapped_file {
+            MappedFileIdentity::Cached(file) => Some(file),
+            MappedFileIdentity::Stdio if guest.config().virtualize_metadata => {
+                match self.inject_fstat(guest, fd).await {
+                    Ok(stat) => Some(RawFileId::new(stat.st_dev, stat.st_ino)),
+                    Err(errno) => {
+                        debug!(
+                            "fstat of stdio descriptor {fd} after mapping it failed ({errno}); \
+                             its maps line resolves the pathname instead"
+                        );
+                        None
+                    }
+                }
+            }
+            MappedFileIdentity::Stdio | MappedFileIdentity::None => None,
+        };
 
         guest.thread_state().unmap_memory(start, len);
         if let Some(file) = mapped_file {
@@ -7423,6 +7478,8 @@ pub(crate) mod inject_fstat_scratch {
         mapped: Vec<(usize, usize)>,
         /// (address, length) of each successful munmap.
         unmapped: Vec<(usize, usize)>,
+        /// (address, length) of each file mapping the guest made.
+        file_mapped: Vec<(usize, usize)>,
         /// Descriptors closed through injection.
         closed: Vec<RawFd>,
         /// Whether `send_rpc` answers `DeterminizeInode`. Off by default, so
@@ -7466,6 +7523,7 @@ pub(crate) mod inject_fstat_scratch {
                 fstatat_buffers: Vec::new(),
                 mapped: Vec::new(),
                 unmapped: Vec::new(),
+                file_mapped: Vec::new(),
                 closed: Vec::new(),
                 answers_determinize_inode: false,
                 determinized: std::sync::Mutex::new(Vec::new()),
@@ -7570,6 +7628,26 @@ pub(crate) mod inject_fstat_scratch {
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
+                // A guest's file mapping, forwarded by `handle_mmap`.
+                Syscall::Mmap(call) if call.fd() >= 0 => {
+                    let address = unsafe {
+                        libc::mmap(
+                            call.addr()
+                                .map_or(std::ptr::null_mut(), |addr| addr.as_raw() as *mut _),
+                            call.len(),
+                            call.prot().bits(),
+                            call.flags().bits(),
+                            call.fd(),
+                            call.offset(),
+                        )
+                    };
+                    if address == libc::MAP_FAILED {
+                        -1
+                    } else {
+                        self.file_mapped.push((address as usize, call.len()));
+                        address as i64
+                    }
+                }
                 Syscall::Mmap(call) => {
                     assert!(call.addr().is_none(), "the kernel must choose the address");
                     assert_eq!(call.prot(), ProtFlags::PROT_READ | ProtFlags::PROT_WRITE);
@@ -8189,5 +8267,137 @@ pub(crate) mod inject_fstat_scratch {
             outcome(&result)
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    /// `(device, inode)` that `fstat` reports for `fd`.
+    fn fd_identity(fd: RawFd) -> RawFileId {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        RawFileId::new(stat.st_dev, stat.st_ino)
+    }
+
+    /// `handle_mmap` of a page of `fd`, returning the mapping's start once the
+    /// test has unmapped it.
+    async fn map_and_unmap(tool: &Detcore, guest: &mut ScriptedGuest, fd: RawFd) -> usize {
+        let len = page_size();
+        let result = tool
+            .handle_mmap(
+                guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ)
+                    .with_flags(MapFlags::MAP_PRIVATE)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+            .await;
+        let start = usize::try_from(result.expect("the file mmap must succeed")).unwrap();
+        assert_eq!(guest.file_mapped, [(start, len)]);
+        assert_eq!(unsafe { libc::munmap(start as *mut libc::c_void, len) }, 0);
+        start
+    }
+
+    /// A descriptor that the guest's table records as a dup of inherited
+    /// stdout -- `prog > file` -- whose cached stat is the tracer's `fstat(0)`
+    /// stand-in rather than the file's own.
+    fn stdio_backed_by_a_file(guest: &mut ScriptedGuest) -> (RawFd, RawFileId) {
+        let (fd, _) = open_file();
+        guest
+            .thread
+            .dup_fd(libc::STDOUT_FILENO, fd, OFlag::empty())
+            .unwrap();
+        let identity = fd_identity(fd);
+        let cached = guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_file_id()))
+            .unwrap();
+        assert_ne!(
+            cached,
+            Some(identity),
+            "precondition: the cached stdio stat must not already be the file's"
+        );
+        (fd, identity)
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_a_stdio_descriptor_by_a_real_fstat() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let (fd, identity) = stdio_backed_by_a_file(&mut guest);
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::fstat],
+            "the identity must come from an fstat after the mapping succeeds"
+        );
+        assert_eq!(
+            guest.thread.mapped_file_at(start),
+            Some(identity),
+            "a stdio descriptor's mapping must be recorded with the file's own identity, \
+             not the cached fstat(0) stand-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_nothing_when_a_stdio_fstat_fails() {
+        // No writable stack scratch and no transient page: the fstat has
+        // nowhere to put its buffer.
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::mmap],
+            "the file mapping, then the failed transient page for the fstat"
+        );
+        assert_eq!(
+            guest.thread.mapped_file_at(start),
+            None,
+            "a failed fstat must leave the mapping unrecorded, not recorded with the stand-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_no_stdio_identity_without_virtualized_metadata() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "no fstat without virtualize_metadata"
+        );
+        assert_eq!(guest.thread.mapped_file_at(start), None);
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_an_ordinary_descriptor_from_its_cached_stat() {
+        let (fd, _) = open_file();
+        let identity = fd_identity(fd);
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .unwrap();
+        guest.injected.clear();
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "an ordinary descriptor's mapping must cost no extra syscall"
+        );
+        assert_eq!(guest.thread.mapped_file_at(start), Some(identity));
     }
 }
