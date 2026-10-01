@@ -39,9 +39,9 @@ archive timestamps, by 1 to 2 seconds, with identical contents; one,
 library archive in `libadminutil-dev`; two, `3depict` and `7kaa`, crashed, a
 failure traced to hardware performance-counter skid under host load; and one,
 `a56`, was skipped by the harness. So the 58-package run's zero differences
-hold for that sample, not for Hermit in general. The full record is
-`ai_docs/reproducible-builds-debian-high-water-mark.md` in the dev-hermit
-workspace at commit `737a447c9c`.
+hold for that sample, not for Hermit in general. The counts in this section
+are that run's complete published results; its per-package record is not
+published separately.
 
 ## Terms
 

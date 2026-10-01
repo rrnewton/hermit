@@ -2,7 +2,10 @@
 
 This is the story behind [demo 8](README.md): a real, historical concurrency
 bug in btrfs-progs that an ordinary run cannot reproduce on demand, and that
-Hermit reproduces every time from a recorded seed.
+Hermit reproduced every time from a recorded seed on a lightly loaded host. On
+a shared or heavily loaded machine it may not reproduce reliably, because
+chaos mode's thread switches land at retired-branch counter interrupts, which
+can arrive late (skid) under host load.
 
 ## The bug
 
