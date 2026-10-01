@@ -15,14 +15,18 @@
 //! `struct stat` buffers are staged in the guest's stack below `rsp`. The
 //! ptrace backend writes that scratch when it commits it, so a guest whose
 //! stack pointer sat close to the end of its writable stack saw its `read` of
-//! the maps file fail with `EFAULT`. A scratch fault now means only that the
-//! pathname gives no answer, and the line keeps the maps header's identity.
+//! the maps file fail with `EFAULT`. A scratch fault now sends the `fstatat`
+//! to a transient page that Detcore maps and unmaps around it, so the line
+//! still gets `stat`'s identity.
 //!
 //! The guest here runs as a forked child, so every file it has mapped was
 //! mapped before tracing began, has no `mmap` record, and is resolved by
 //! pathname. It issues the first `read` of `/proc/self/maps`, which takes the
 //! snapshot, with its stack pointer a chosen number of bytes above memory it
-//! cannot write, and requires what Linux gives natively: the file's contents.
+//! cannot write, and requires what Linux gives natively: the file's contents,
+//! with the executable's maps inode equal to the `st_ino` it reports. On a
+//! filesystem whose maps header pair is not `stat`'s (btrfs, overlayfs) that
+//! equality holds only if the pathname was resolved despite the fault.
 
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
@@ -113,16 +117,14 @@ fn maps_read_succeeds_without_writable_stack_below_rsp() {
             let inode = maps_inode_of(&contents, &executable).unwrap_or_else(|| {
                 panic!("{MAPS:?} read on a tight stack does not map {executable}:\n{contents}")
             });
-            // Without a scratch the line keeps the header's identity, which
-            // differs from `stat`'s on btrfs and overlayfs, so only the control
-            // is compared with `stat`.
-            if writable_bytes == 1024 {
-                assert_eq!(
-                    inode, executable_inode,
-                    "with room for the whole scratch area, the maps inode of {executable} \
-                     must be the inode stat reports"
-                );
-            }
+            // Every case, the control included, must resolve the executable's
+            // path: a faulting stack scratch falls back to a transient page,
+            // not to the header's identity.
+            assert_eq!(
+                inode, executable_inode,
+                "with {writable_bytes} writable bytes above a {below:?} region, the maps \
+                 inode of {executable} must be the inode stat reports"
+            );
         }
     });
 }

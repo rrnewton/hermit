@@ -43,6 +43,7 @@ use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
@@ -482,6 +483,29 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
             .times()
             .is_some_and(|times| overlaps(times.as_raw(), std::mem::size_of::<[Timespec; 2]>()));
     path || times
+}
+
+/// The longest path, NUL excluded, that `Detcore::stat_guest_path` stages in
+/// the guest stack scratch; a longer one goes to a transient page.
+const GUEST_STAT_PATH_CAPACITY: usize = 512;
+
+/// What the stack-scratch attempt of `Detcore::stat_guest_path` found.
+enum StackStat {
+    /// The scratch held the stat: the guest's answer, `None` when its stat
+    /// failed.
+    Answered(Option<libc::stat>),
+    /// The scratch is too small, or faulted with `EFAULT`.
+    Unusable,
+}
+
+/// Length of the transient mapping `Detcore::stat_guest_path` stages a path
+/// of `path_len` bytes in: the path and its NUL, then an 8-aligned
+/// `struct stat`, rounded up to whole pages.
+fn transient_stat_page_len(path_len: usize) -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .expect("page size must be positive");
+    ((path_len + 1).next_multiple_of(8) + std::mem::size_of::<libc::stat>()).next_multiple_of(page)
 }
 
 /// The run-global identity pools, reached through this guest's RPCs to the
@@ -1019,18 +1043,34 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    keyed on the `fstat` identity `handle_mmap` recorded for that
     ///    address range (`MemoryMetadata::mapped_file_at`). That record needs
     ///    no path, so it still holds after the file is unlinked or replaced
-    ///    and its descriptor closed, when the line reads ` (deleted)`, and for
-    ///    a path too long to resolve below. It is consulted only for a
-    ///    snapshot of the reader's own address space, which Detcore knows
-    ///    only for a file opened through `/proc/self` or `/proc/thread-self`
-    ///    in that same address space.
+    ///    and its descriptor closed, when the line reads ` (deleted)`. It is
+    ///    consulted only for a snapshot of the reader's own address space,
+    ///    which Detcore knows only for a file opened through `/proc/self` or
+    ///    `/proc/thread-self` in that same address space.
     /// 2. Otherwise the pathname is resolved in the guest. This covers the
     ///    executable and the ELF interpreter, which `execve` maps without a
     ///    system call Detcore sees, and files mapped through a descriptor
     ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
     ///
     /// Either answer is accepted only if its inode is the one the header
-    /// reports.
+    /// reports. For the record that check is a guard against staleness: the
+    /// record can outlive the mapping it describes, because `handle_mmap`,
+    /// `handle_munmap` and `handle_mremap` update it only after a successful
+    /// call, and only they (and `execve`, which starts an empty record) change
+    /// it. Unmodelled sources of a stale record:
+    ///
+    /// - a range replaced by a call those handlers never see: `shmat` with
+    ///   `SHM_REMAP` (refused with `ENOSYS` today, so latent), or any mapping
+    ///   call that escapes interception on an in-guest backend;
+    /// - a failed `MAP_FIXED` mmap or `MREMAP_FIXED` mremap, which some
+    ///   kernels return after unmapping the target range, leaving a record
+    ///   for a hole that one of the calls above can then fill.
+    ///
+    /// A stale record names another file, which almost always has another
+    /// inode, so the check discards it and the path or the header decides.
+    /// ⚠️ A STALE RECORD WITH THE NEW FILE'S INODE NUMBER STILL WINS: the
+    /// same inode number on another device passes, because the check cannot
+    /// compare devices when the header's device is not `stat`'s.
     ///
     /// Falls back to the header's pair -- which IS `stat`'s identity on every
     /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
@@ -1042,10 +1082,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// inode column then differs from `st_ino` for a file that is BOTH absent
     /// from the record and unresolvable by path: the executable or the
     /// interpreter after it is unlinked or replaced, a file mapped through an
-    /// untracked descriptor and then unlinked, any unlinked file in another
+    /// untracked descriptor and then unlinked, or any unlinked file in another
     /// process's maps (or in `/proc/<own pid>/maps`, which is not recognized
-    /// as the reader's own), or one of those under a path of 512 bytes or
-    /// more (see `stat_guest_path`).
+    /// as the reader's own). A path that exists also goes unresolved when
+    /// `stat_guest_path` cannot map the transient page it falls back to,
+    /// which is not always a function of guest state (see there).
     ///
     /// Directory entries have the same overlayfs gap: `getdents` keys `d_ino`
     /// on the directory's device (`raw_device_of_fd`), but with `xino=off` and
@@ -1084,56 +1125,96 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `stat(path)` performed BY THE GUEST, through an injected
-    /// `fstatat(AT_FDCWD, path, _, 0)`; `None` when it fails, when the path
-    /// does not fit in the scratch buffer, or when the scratch faults.
+    /// `fstatat(AT_FDCWD, path, _, 0)`. `None` when the guest's stat fails,
+    /// when `path` contains a NUL, or when no scratch can be found for it.
     ///
     /// Injected rather than performed here for the reason `handle_stat_family`
     /// gives: an access from the tracer can hang on some FUSE filesystems
     /// (squashfs_ll), and on in-guest backends "here" is the guest process
     /// anyway. The guest resolves the path in its own mount namespace and
     /// root, which is also the root `maps` printed the path relative to. The
-    /// injection is not a guest-visible system call, and both scratch buffers
-    /// are zeroed afterwards so no host inode number or timestamp is left
-    /// behind in guest memory below the stack pointer.
+    /// injection is not a guest-visible system call, charges no virtual time,
+    /// and leaves no host inode number or timestamp in guest memory.
     ///
-    /// ⚠️ THE PATH IS BOUNDED BY THE SMALLEST INJECTION STACK. The ptrace
-    /// backend allows 896 bytes per injection, which must hold the path and a
-    /// 144-byte `struct stat`; a path of `GUEST_STAT_PATH_CAPACITY` bytes or
-    /// more is not resolved (see `mapping_stat_identity` for what a mapping
-    /// then keys on).
+    /// The path and the `struct stat` are staged in one of two scratches, as
+    /// `inject_fstat` stages its buffer:
     ///
-    /// The scratch may not be writable, for the reasons `inject_fstat` gives,
-    /// and this one spans 656 bytes to its 144. That fault belongs to
-    /// Detcore's bookkeeping, not to the guest, so an `EFAULT` from committing
-    /// the scratch, staging the path or zeroing either buffer means "no
-    /// answer", as a failed stat does, and every caller falls back to its
-    /// answer without the stat instead of failing the guest's `read` or
-    /// `readlink` (<https://github.com/rrnewton/hermit/issues/3328>). Once the
-    /// scratch is committed, both buffers are zeroed as far as they are
-    /// writable even after a fault. Every other error propagates.
+    /// 1. The guest stack scratch, for a path shorter than
+    ///    `GUEST_STAT_PATH_CAPACITY` bytes. On the ptrace backend it lies below
+    ///    the red zone under the guest's stack pointer, and an injection there
+    ///    has 896 bytes, which must hold the path buffer and the 144-byte
+    ///    `struct stat`. Both buffers are zeroed afterwards. That memory need
+    ///    not be writable, for the reasons `inject_fstat` gives. The fault
+    ///    belongs to Detcore's bookkeeping, not to the guest
+    ///    (<https://github.com/rrnewton/hermit/issues/3328>), so an `EFAULT`
+    ///    from committing the scratch, staging the path, the `fstatat` itself
+    ///    (whose path and buffer are both Detcore's) or zeroing either buffer
+    ///    sends the stat to the transient page below. Both buffers are first
+    ///    zeroed as far as they are writable: every write into the scratch,
+    ///    the kernel's included, runs forward from a buffer's start and stops
+    ///    at its first fault, so whatever it left is a prefix that zeroing
+    ///    from the same start reaches. Every other error propagates.
+    /// 2. A private anonymous mapping made for this call alone, of whole
+    ///    pages sized for the NUL-terminated path and an 8-aligned
+    ///    `struct stat`. It serves a stack scratch that is too small, a fault
+    ///    there, and every path of `GUEST_STAT_PATH_CAPACITY` bytes or more.
+    ///    The guest never learns its address, and it is unmapped whole before
+    ///    the guest resumes, so the guest's address space is the same as
+    ///    before the call. An `EFAULT` there means no answer.
+    ///
+    /// ⚠️ WHEN THAT MAPPING CANNOT BE MADE, THE STAT HAS NO ANSWER. This
+    /// returns `Ok(None)`, as a failed stat does, rather than an error:
+    /// every caller has an answer without the stat, and the call it serves
+    /// (a `read` of `maps` or `smaps`, a `readlink` of `/proc/<pid>/fd/<n>`)
+    /// must not fail because Detcore could not map a page of its own. The
+    /// failure is not always a function of guest state, though:
+    /// `RLIMIT_AS` and the guest's mapping count are, but a strict
+    /// overcommit policy (`vm.overcommit_memory=2`) refuses the page on
+    /// the host's commit charge, so on such a host the answer -- and the
+    /// identity a caller keys on without it -- can differ between runs.
     pub(crate) async fn stat_guest_path<G: Guest<Self>>(
         &self,
         guest: &mut G,
         path: &[u8],
     ) -> Result<Option<libc::stat>, Error> {
-        const GUEST_STAT_PATH_CAPACITY: usize = 512;
-        if path.len() >= GUEST_STAT_PATH_CAPACITY || path.contains(&0) {
+        if path.contains(&0) {
             return Ok(None);
         }
+        if path.len() < GUEST_STAT_PATH_CAPACITY {
+            match Self::stat_guest_path_on_stack(guest, path).await? {
+                StackStat::Answered(identity) => return Ok(identity),
+                StackStat::Unusable => {}
+            }
+        }
+        Ok(Self::stat_guest_path_in_transient_page(guest, path).await?)
+    }
+
+    /// The fast path of [`Self::stat_guest_path`]: the path and the
+    /// `struct stat` live in the guest stack scratch.
+    async fn stat_guest_path_on_stack<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<StackStat, Errno> {
         let mut stack = guest.stack().await;
         let needed = GUEST_STAT_PATH_CAPACITY + std::mem::size_of::<libc::stat>();
         if stack.capacity().saturating_sub(stack.size()) < needed {
-            return Ok(None);
+            trace!(
+                "guest stack scratch has no room for a stat of {:?}",
+                String::from_utf8_lossy(path)
+            );
+            return Ok(StackStat::Unusable);
         }
         let path_address: AddrMut<[u8; GUEST_STAT_PATH_CAPACITY]> = stack.reserve();
         let statptr = StatPtr(stack.reserve());
+        // Keep the guard until both buffers are zeroed: backends whose scratch
+        // is a Tool-owned arena (DBT, SaBRe) free it when the guard drops.
         let stack_guard = match stack.commit() {
             Err(Errno::EFAULT) => {
                 trace!(
                     "guest stack scratch cannot hold a stat of {:?}",
                     String::from_utf8_lossy(path)
                 );
-                return Ok(None);
+                return Ok(StackStat::Unusable);
             }
             result => result?,
         };
@@ -1142,36 +1223,115 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Both buffers are zeroed even after a fault: a staging write or the
         // kernel may have filled a prefix first.
         let mut memory = guest.memory();
-        let zeroed = memory
-            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])
-            .and(memory.write_exact(path_address.cast::<u8>(), &[0; GUEST_STAT_PATH_CAPACITY]));
+        let zeroed_stat =
+            memory.write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()]);
+        let zeroed_path =
+            memory.write_exact(path_address.cast::<u8>(), &[0; GUEST_STAT_PATH_CAPACITY]);
         drop(stack_guard);
-        match (identity, zeroed) {
-            (Ok(identity), Ok(())) => Ok(identity),
-            // Tried for each side in turn, so an error other than EFAULT from
-            // either one wins over an EFAULT from the other.
-            (Err(errno), _) | (_, Err(errno)) if errno != Errno::EFAULT => Err(errno.into()),
-            _ => {
+        // An error other than EFAULT from any step wins over an EFAULT from
+        // another.
+        let failure = [
+            identity.as_ref().err(),
+            zeroed_stat.as_ref().err(),
+            zeroed_path.as_ref().err(),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .reduce(|kept, next| if kept == Errno::EFAULT { next } else { kept });
+        match failure {
+            None => identity.map(StackStat::Answered),
+            Some(Errno::EFAULT) => {
                 trace!(
                     "guest stack scratch faulted during a stat of {:?}",
                     String::from_utf8_lossy(path)
                 );
-                Ok(None)
+                Ok(StackStat::Unusable)
             }
+            Some(errno) => Err(errno),
         }
     }
 
-    /// The body of [`Self::stat_guest_path`] once its scratch is committed:
-    /// stage `path` NUL-terminated at `path_address` and inject
+    /// The fallback of [`Self::stat_guest_path`]: the path and the
+    /// `struct stat` live in a private anonymous mapping made for this call
+    /// only, and unmapped whole before it returns.
+    async fn stat_guest_path_in_transient_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Option<libc::stat>, Errno> {
+        let stat_offset = (path.len() + 1).next_multiple_of(8);
+        let len = transient_stat_page_len(path.len());
+        let mapped = match guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await
+        {
+            Ok(mapped) => mapped,
+            Err(errno) => {
+                debug!(
+                    "could not map a transient page for a stat of {:?} ({}); it has no answer",
+                    String::from_utf8_lossy(path),
+                    errno
+                );
+                return Ok(None);
+            }
+        };
+        let page = usize::try_from(mapped)
+            .ok()
+            .and_then(AddrMut::<u8>::from_raw)
+            .unwrap_or_else(|| panic!("transient stat page mmap returned {mapped}"));
+        // SAFETY: `stat_offset` is within the `len` bytes just mapped.
+        let statptr = StatPtr(unsafe { page.add(stat_offset) }.cast::<libc::stat>());
+        let identity = Self::fstatat_in_scratch(guest, path, page, statptr).await;
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(page.cast::<libc::c_void>().into()))
+                    .with_len(len),
+            ))
+            .await
+        {
+            // Not expected: the page was mapped by this call and its address
+            // never reached the guest. The answer is still valid, so a
+            // leftover page is no reason to discard it.
+            warn!(
+                "[detcore] could not unmap the transient stat page for {:?}: {}",
+                String::from_utf8_lossy(path),
+                errno
+            );
+        }
+        match identity {
+            Err(Errno::EFAULT) => {
+                trace!(
+                    "transient page faulted during a stat of {:?}",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(None)
+            }
+            identity => identity,
+        }
+    }
+
+    /// The body of [`Self::stat_guest_path`] once a scratch is in place: stage
+    /// `path` NUL-terminated at `path_address` and inject
     /// `fstatat(AT_FDCWD, path, statptr, 0)`. `Ok(None)` when the guest's stat
-    /// fails.
+    /// fails; `Err(EFAULT)` when the scratch faults, from the kernel as from a
+    /// staging write, since the path and the buffer are both Detcore's.
     async fn fstatat_in_scratch<G: Guest<Self>>(
         guest: &mut G,
         path: &[u8],
         path_address: AddrMut<'_, u8>,
         statptr: StatPtr<'_>,
     ) -> Result<Option<libc::stat>, Errno> {
-        // `reserve` zero-fills, so the path stays NUL-terminated.
+        // Both scratches start zero-filled -- `reserve` zero-fills, and so
+        // does a fresh anonymous mapping -- so the path stays NUL-terminated.
         guest.memory().write_exact(path_address, path)?;
         let call = syscalls::Fstatat::new()
             .with_dirfd(libc::AT_FDCWD)
@@ -1182,6 +1342,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_flags(AtFlags::empty());
         match guest.inject_with_retry(call).await {
             Ok(_) => statptr.read(&guest.memory()).map(Some),
+            Err(Errno::EFAULT) => Err(Errno::EFAULT),
             Err(error) => {
                 trace!(
                     "guest stat of {:?} failed: {error}",
@@ -7652,6 +7813,43 @@ mod inject_fstat_scratch {
         }
     }
 
+    /// `(device, inode)` of `path` as this process's `stat` reports it.
+    fn identity_of(path: &[u8]) -> (u64, u64) {
+        let metadata = std::fs::metadata(std::ffi::OsStr::from_bytes(path)).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    /// The one transient page `stat_guest_path` mapped for a path of
+    /// `path_len` bytes, after checking that it was the whole pages that hold
+    /// the NUL-terminated path and an 8-aligned `struct stat`, and that it was
+    /// unmapped whole.
+    fn sole_transient_page(guest: &ScriptedGuest, path_len: usize) -> usize {
+        let [(page, len)] = guest.mapped[..] else {
+            panic!(
+                "expected exactly one transient page, got {:?}",
+                guest.mapped
+            );
+        };
+        let needed = (path_len + 1).next_multiple_of(8) + std::mem::size_of::<libc::stat>();
+        assert_eq!(
+            len,
+            needed.div_ceil(page_size()) * page_size(),
+            "the transient mapping must be the whole pages that hold {needed} bytes"
+        );
+        assert_eq!(
+            guest.unmapped,
+            [(page, len)],
+            "the transient page must be unmapped, whole"
+        );
+        page
+    }
+
+    /// Offset of the `struct stat` in the transient page, after the
+    /// NUL-terminated path.
+    fn transient_stat_offset(path_len: usize) -> usize {
+        (path_len + 1).next_multiple_of(8)
+    }
+
     #[tokio::test]
     async fn stat_guest_path_stats_the_path_in_its_scratch_and_zeroes_it() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -7679,30 +7877,93 @@ mod inject_fstat_scratch {
              scratch is an arena free it when the guard drops"
         );
         assert!(
+            guest.mapped.is_empty(),
+            "a stack scratch that works needs no transient page: {:?}",
+            guest.mapped
+        );
+        assert!(
             scratch.zeroed(0, scratch.len),
             "neither the path nor the stat may be left in the guest's stack scratch"
         );
     }
 
     #[tokio::test]
-    async fn stat_guest_path_has_no_answer_when_its_scratch_cannot_be_committed() {
+    async fn stat_guest_path_refuses_a_path_containing_nul() {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let result = tool.stat_guest_path(&mut guest, b"/\0/").await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a path with a NUL in it names no file: {}",
+            outcome(&result)
+        );
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 0);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_uses_a_transient_page_when_its_scratch_is_too_small() {
+        // One byte short of the path buffer and the stat buffer.
+        let needed = 512 + std::mem::size_of::<libc::stat>();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, needed - 1, None);
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch too small for the stat must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            0,
+            "a scratch without room must not be committed"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_paths, [b"/".to_vec()]);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(scratch.zeroed(0, scratch.len), "the stack scratch was used");
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_uses_a_transient_page_when_its_scratch_cannot_be_committed() {
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) =
             ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
 
         let result = tool.stat_guest_path(&mut guest, b"/").await;
 
-        assert!(
-            matches!(result, Ok(None)),
-            "a scratch the guest cannot hold must mean no answer, not an error: {}",
-            outcome(&result)
-        );
+        let stat = result
+            .expect("a scratch the guest cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
         assert_eq!(
             guest.commits.load(Ordering::SeqCst),
             1,
-            "the answer must come from the commit, not from the capacity check"
+            "the fallback must come from the commit, not from the capacity check"
         );
-        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_paths, [b"/".to_vec()]);
+        assert_eq!(
+            guest.fstatat_buffers,
+            [page + transient_stat_offset(1)],
+            "the stat must be written into the transient page"
+        );
+        assert_eq!(guest.fstatat_guard_live, [false]);
+        assert!(
+            scratch.zeroed(0, scratch.len),
+            "nothing may be left in the stack scratch"
+        );
     }
 
     #[tokio::test]
@@ -7715,34 +7976,72 @@ mod inject_fstat_scratch {
 
         assert!(
             matches!(result, Err(Error::Errno(Errno::ESRCH))),
-            "only EFAULT means no answer: {}",
+            "only EFAULT sends the stat to a transient page: {}",
             outcome(&result)
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
     }
 
     #[tokio::test]
-    async fn stat_guest_path_has_no_answer_when_its_path_cannot_be_staged() {
+    async fn stat_guest_path_uses_a_transient_page_when_its_path_cannot_be_staged() {
+        // No byte of this scratch is writable, so there is nothing to zero.
         let scratch = Pages::map(1, 0);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
 
         let result = tool.stat_guest_path(&mut guest, b"/").await;
 
-        assert!(
-            matches!(result, Ok(None)),
-            "a path the scratch cannot hold must mean no answer, not an error: {}",
-            outcome(&result)
-        );
+        let stat = result
+            .expect("a path the scratch cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
         assert_eq!(guest.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap],
+            "no stat may be injected into the stack scratch without its path"
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_zeroes_a_partly_staged_path_before_using_a_transient_page() {
+        // The path buffer starts four bytes before the end of a writable page,
+        // so staging a five-byte path writes four bytes and then faults.
+        let path = b"/////";
+        let staged = 4;
+        let scratch = Pages::map(2, 1);
+        let path_buffer = page_size() - staged;
+        let (tool, mut guest) = ScriptedGuest::with_scratch(
+            scratch.address + path_buffer,
+            scratch.len - path_buffer,
+            None,
+        );
+
+        let result = tool.stat_guest_path(&mut guest, path).await;
+
+        let stat = result
+            .expect("a path the scratch cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, path.len());
+        assert_eq!(guest.fstatat_paths, [path.to_vec()]);
+        assert_eq!(
+            guest.fstatat_buffers,
+            [page + transient_stat_offset(path.len())]
+        );
         assert!(
-            guest.injected.is_empty(),
-            "no stat may be injected without its path: injected {:?}",
-            guest.injected
+            scratch.zeroed(path_buffer, staged),
+            "the staged prefix of the path must be zeroed"
         );
     }
 
     #[tokio::test]
-    async fn stat_guest_path_has_no_answer_when_its_stat_buffer_faults() {
+    async fn stat_guest_path_retries_in_a_transient_page_when_its_stat_buffer_faults() {
         // The path buffer fills the last 512 bytes of a writable page and the
         // stat buffer starts the inaccessible page after it.
         let path_capacity = 512;
@@ -7756,22 +8055,96 @@ mod inject_fstat_scratch {
 
         let result = tool.stat_guest_path(&mut guest, b"/").await;
 
-        assert!(
-            matches!(result, Ok(None)),
-            "a stat buffer the scratch cannot hold must mean no answer, not an \
-             error: {}",
-            outcome(&result)
+        let stat = result
+            .expect("a stat buffer the scratch cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.injected,
+            [
+                Sysno::newfstatat,
+                Sysno::mmap,
+                Sysno::newfstatat,
+                Sysno::munmap
+            ]
         );
-        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        let page = sole_transient_page(&guest, 1);
         assert_eq!(
             guest.fstatat_buffers,
-            [scratch.address + page_size()],
-            "this test needs the stat buffer at the start of the inaccessible page"
+            [
+                scratch.address + page_size(),
+                page + transient_stat_offset(1)
+            ],
+            "this test needs the first stat buffer at the start of the inaccessible \
+             page, and the retry in the transient page"
+        );
+        assert_eq!(
+            guest.fstatat_guard_live,
+            [true, false],
+            "the stack guard must outlive the first fstatat and be gone by the retry"
         );
         assert!(
             scratch.zeroed(path_buffer, path_capacity),
             "the staged path must still be zeroed"
         );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_stages_a_long_path_in_a_transient_page() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let name = file.path().as_os_str().as_bytes();
+        let expected = identity_of(name);
+        // 600 bytes needs one page; 4000 bytes needs two.
+        for len in [600, 4000] {
+            // Extra leading slashes resolve to the same file.
+            let mut path = vec![b'/'; len - name.len()];
+            path.extend_from_slice(name);
+            assert_eq!(path.len(), len);
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+            let result = tool.stat_guest_path(&mut guest, &path).await;
+
+            let stat = result
+                .expect("stat_guest_path failed")
+                .unwrap_or_else(|| panic!("a {len}-byte path must be resolved"));
+            assert_eq!((stat.st_dev, stat.st_ino), expected);
+            assert_eq!(
+                guest.commits.load(Ordering::SeqCst),
+                0,
+                "a {len}-byte path must not be staged in the stack scratch"
+            );
+            assert_eq!(
+                guest.injected,
+                [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+            );
+            let page = sole_transient_page(&guest, len);
+            assert_eq!(
+                guest.fstatat_paths,
+                [path.clone()],
+                "fstatat must name the whole {len}-byte path, NUL-terminated"
+            );
+            assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(len)]);
+            assert!(scratch.zeroed(0, scratch.len), "the stack scratch was used");
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_has_no_answer_when_its_transient_page_cannot_be_mapped() {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+        guest.mmap_fails = true;
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a page Detcore cannot map must mean no answer, not an error: {}",
+            outcome(&result)
+        );
+        assert_eq!(guest.injected, [Sysno::mmap]);
+        assert!(guest.unmapped.is_empty(), "unmapped {:?}", guest.unmapped);
     }
 
     #[tokio::test]
@@ -7784,7 +8157,7 @@ mod inject_fstat_scratch {
 
         assert!(
             matches!(result, Err(Error::Errno(Errno::EIO))),
-            "only EFAULT means no answer: {}",
+            "only EFAULT sends the stat to a transient page: {}",
             outcome(&result)
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
