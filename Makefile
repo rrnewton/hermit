@@ -220,6 +220,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/core-review-protocol-lint-test.sh
 	python3 ./ci/test_audit_test_binary_registration.py
 	./ci/run-with-reverie-dbt-budget-test.sh
+	./ci/apt-network-hardening-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its

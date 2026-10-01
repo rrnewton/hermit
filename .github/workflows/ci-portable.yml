@@ -286,6 +286,7 @@ jobs:
       # was missing both.
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y binutils liblzma-dev
       # build.rust_scripts compiles every tracked rust-script with `cargo
@@ -376,6 +377,7 @@ jobs:
         run: git submodule update --init --recursive
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y liblzma-dev
       - name: Rust components
@@ -488,6 +490,7 @@ jobs:
           cache-on-failure: true
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
@@ -772,6 +775,7 @@ jobs:
           save-if: false
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
       - name: Install rust-script
@@ -907,6 +911,7 @@ jobs:
           save-if: false
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk gdb git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
@@ -1060,6 +1065,7 @@ jobs:
           save-if: false
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Install rust-script
@@ -1166,6 +1172,7 @@ jobs:
           save-if: false
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git iproute2 jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
       # Release shards now execute individual tests through the same pinned
@@ -1283,6 +1290,7 @@ jobs:
         run: git submodule update --init agent-utils
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y bc binutils bsdextrautils btrfs-progs bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Install rust-script
@@ -1383,6 +1391,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Dependencies
         run: |
+          sudo ./ci/apt-network-hardening.sh
           sudo apt-get update
           sudo apt-get install -y bsdextrautils jq libunwind-dev liblzma-dev zstd
       - name: Enable unprivileged user and mount namespaces
