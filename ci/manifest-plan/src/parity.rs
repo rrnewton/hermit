@@ -2719,8 +2719,8 @@ pub fn records_mismatch(row: &CellResult) -> bool {
 /// The row of one verify cell whose single retained first-run log is to be
 /// compared, or the typed cause that it has none, decided from the typed
 /// result fields ([`CellResult::result`], [`CellResult::outcome`] and
-/// [`CellResult::error_kind`]) and never from reason text. Every cause names
-/// `operand`.
+/// [`CellResult::error_kind`]) and its attempts' verification reports, and
+/// never from reason text. Every cause names `operand`.
 ///
 /// In order:
 /// - any attempt of `history` that records a mismatch ([`records_mismatch`]:
@@ -2738,6 +2738,23 @@ pub fn records_mismatch(row: &CellResult) -> bool {
 /// - the selected row passed: it is returned. Earlier failures other than a
 ///   mismatch, such as a timeout, are not evidence that the passing
 ///   attempt's log is nondeterministic;
+/// - the selected row failed with result `crash-error` or `timeout`, did not
+///   use the stripped comparator, has exactly one attempt, which retains a
+///   strict matched comparison
+///   ([`crate::runner::verification_matched_canonically`]), and carries no
+///   SaBRe execution-path evidence that the runner calls ineligible
+///   ([`crate::runner::execution_path_ineligible`]): it is returned. Its two
+///   runs agreed, so its first-run log is deterministic although the cell
+///   failed for another reason, such as unexpected stdout, the wrong exit
+///   disposition, or a CPU budget reached after both runs completed
+///   (<https://github.com/rrnewton/hermit/issues/3455>). One attempt, as
+///   every verify row has, keeps the matched comparison and the retained log
+///   in the same pair of runs. An earlier row that timed out does not take
+///   the log away, and an attempt that diverged in any row was decided by the
+///   first item. A row with more than one attempt keeps its own cause below,
+///   and so does a SaBRe row whose execution path the runner found incomplete
+///   or on fallback or native sites, because its log is no measurement of
+///   SaBRe;
 /// - otherwise the row's own cause: host-inapplicable, its typed result
 ///   (timeout, crash, oom, infrastructure-error or sandbox-denied), a `FAIL`
 ///   with no typed cause ([`UnavailableClass::FailedUntyped`]), or another
@@ -2853,6 +2870,26 @@ fn evaluate_history(
             ),
         )),
         ("PASS", _) => Ok(row.clone()),
+        // Its two runs agreed under the strict comparison, so its first-run
+        // log is deterministic although the cell failed afterwards: a
+        // nonzero exit, unexpected stdout, or a timeout flagged once both
+        // runs had completed (https://github.com/rrnewton/hermit/issues/3455).
+        // Only a row with exactly one attempt, the shape of every verify row,
+        // is admitted, so the matched comparison and the retained log come
+        // from the same pair of runs; a mismatch on any row was decided
+        // above. A SaBRe row whose execution path the runner found
+        // incomplete or on fallback or native sites is no measurement of
+        // SaBRe, so it keeps its cause below.
+        ("FAIL", Some(UnavailableClass::Crash | UnavailableClass::Timeout))
+            if !stripped
+                && !crate::runner::execution_path_ineligible(row.execution_path.as_ref())
+                && matches!(
+                    row.attempts.as_slice(),
+                    [attempt] if crate::runner::verification_matched_canonically(attempt)
+                ) =>
+        {
+            Ok(row.clone())
+        }
         ("HOST-INAPPLICABLE", _) => Err(unusable(
             missing,
             UnavailableClass::HostInapplicable,
@@ -2883,12 +2920,12 @@ fn evaluate_history(
     }
 }
 
-/// The single retained first-run log of the passing verify cell `row`, or
-/// why there is none: [`UnavailableClass::LogNotRetained`] when the cell did
-/// not retain exactly one nonempty first-run log, and
-/// [`UnavailableClass::LogUnreadable`] when its one log exists but cannot be
-/// read. Only first-run logs are considered; a second-run log kept for
-/// determinism debugging is never read.
+/// The single retained first-run log of the verify cell `row` that
+/// [`evaluate_history`] returned, or why there is none:
+/// [`UnavailableClass::LogNotRetained`] when the cell did not retain exactly
+/// one nonempty first-run log, and [`UnavailableClass::LogUnreadable`] when
+/// its one log exists but cannot be read. Only first-run logs are considered;
+/// a second-run log kept for determinism debugging is never read.
 fn retained_log(
     test: &str,
     operand: ParityOperand,
@@ -2958,12 +2995,12 @@ fn retained_log(
     }
 }
 
-/// The ptrace golden of `test`, from the passing reference row `row`: its
-/// single retained log is hashed, then linked or copied below
-/// `config.output_dir` beside a sidecar. When that log is gone, a golden
-/// already written from the same run, cell attempt and artifact directory is
-/// used if it still has its recorded hash: first the one below
-/// `config.output_dir`, then the one the harness wrote below
+/// The ptrace golden of `test`, from the reference row `row` that
+/// [`evaluate_history`] returned: its single retained log is hashed, then
+/// linked or copied below `config.output_dir` beside a sidecar. When that
+/// log is gone, a golden already written from the same run, cell attempt and
+/// artifact directory is used if it still has its recorded hash: first the
+/// one below `config.output_dir`, then the one the harness wrote below
 /// `config.artifacts`.
 ///
 /// Its errors are unmeasured classes: the reference's log
@@ -3464,10 +3501,14 @@ pub enum UnavailableClass {
     /// attempt (its result `determinism-failure`), so it has no deterministic
     /// log. Only verdict `nondeterministic`.
     DeterminismMismatch,
-    /// An operand's final attempt timed out (result `timeout`).
+    /// An operand's final attempt timed out (result `timeout`). A row with
+    /// exactly one attempt, whose strict comparison matched, is compared
+    /// instead, unless its SaBRe execution path was ineligible.
     Timeout,
     /// An operand's final attempt crashed or exited wrongly (result
-    /// `crash-error`).
+    /// `crash-error`). A row with exactly one attempt, whose strict comparison
+    /// matched, is compared instead, unless its SaBRe execution path was
+    /// ineligible.
     Crash,
     /// An operand's final attempt ran out of memory (result `oom`).
     Oom,
@@ -3496,11 +3537,11 @@ pub enum UnavailableClass {
     /// `inputs-not-equalized`, operand `candidate`.
     InputsNotEqualized,
     // Unmeasured.
-    /// An operand passed but did not retain exactly one nonempty first-run
-    /// log (no `--verify-log-dir`, no readable directory, an empty log, or
-    /// not exactly one), or the caller refused its row because it did not
-    /// retain the verify logs the caller requires
-    /// ([`ParityRejection::LogNotRetained`]).
+    /// An operand passed, or failed after a strict matched comparison, but did
+    /// not retain exactly one nonempty first-run log (no `--verify-log-dir`,
+    /// no readable directory, an empty log, or not exactly one), or the caller
+    /// refused its row because it did not retain the verify logs the caller
+    /// requires ([`ParityRejection::LogNotRetained`]).
     LogNotRetained,
     /// An operand's single retained log exists but cannot be resolved, read
     /// or hashed. Verdict `reference-missing` or `candidate-missing`.
@@ -6785,7 +6826,16 @@ mod tests {
     /// credit. A determinism failure on any attempt of either operand is
     /// `nondeterministic` even when a later attempt passed, and a mismatched
     /// reference writes no golden; another failure followed by a pass is not
-    /// evidence against the passing log, which is compared.
+    /// evidence against the passing log, which is compared. A cell typed
+    /// `crash-error` that failed after its two runs matched under the strict
+    /// comparison keeps its first-run log, which is compared
+    /// (https://github.com/rrnewton/hermit/issues/3455), unless an attempt
+    /// diverged in that row or an earlier one; a `matched` verdict over no log
+    /// records, a canonical match that is not bitwise, a first run rejected
+    /// before any comparison, an untyped failure, an infrastructure error, a
+    /// stripped comparison and a SaBRe run whose execution path was incomplete
+    /// or on fallback or native sites leave none, and a cell whose strict
+    /// match retained no log is unmeasured.
     #[test]
     fn the_post_pass_measures_each_cell_from_retained_logs_only() {
         let fixture = Fixture::new("measures");
@@ -7163,6 +7213,406 @@ mod tests {
         ] {
             assert!(summary.contains(part), "{part:?} not in {summary}");
         }
+
+        // A cell that failed after its two runs matched under the strict
+        // comparison still has one deterministic log, which is compared
+        // (https://github.com/rrnewton/hermit/issues/3455). These cells are
+        // measured in a fixture of their own, so every count above stands.
+        {
+            let (matched, vacuous, canonical, rejected) = (
+                matched_report(),
+                vacuous_matched_report(),
+                canonical_not_strict_report(),
+                first_run_rejected_report(),
+            );
+            for (report, verdict, strict) in [
+                (&matched, Verdict::Matched, true),
+                (&vacuous, Verdict::Matched, false),
+                (&canonical, Verdict::Matched, false),
+                (&rejected, Verdict::NoResult, false),
+            ] {
+                let attempt = verify_attempt("1", "FAIL", false, Some(report));
+                assert_eq!(
+                    crate::runner::verification_verdict(&attempt),
+                    Some(verdict),
+                    "the fixture must retain a current report: {report}"
+                );
+                assert_eq!(
+                    crate::runner::verification_matched_canonically(&attempt),
+                    strict,
+                    "{report}"
+                );
+            }
+            // Its canonical comparison stands and its outputs match, so only
+            // its missing bitwise parity keeps it from a strict match.
+            let parsed = crate::canonical_verdict::VerificationReport::from_current_json_slice(
+                canonical.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(parsed.require_canonical_comparison(), Ok(()));
+            assert_eq!(parsed.require_exact_output_match(), Ok(()));
+            let error = parsed.require_canonical_match().unwrap_err();
+            assert!(
+                error.ends_with("verified=true verdict=matched bitwise_parity=false"),
+                "{error}"
+            );
+            let fixture = Fixture::new("measures-matched-fail");
+            // A FAIL row typed crash-error whose one attempt retains `report`.
+            let crashed = |test: &str, backend: &str, attempt: u64, report: &str| {
+                let mut row = typed(
+                    fixture.row(test, backend, attempt, "FAIL", Some(REFERENCE)),
+                    ObservedResult::CrashError,
+                    None,
+                );
+                row.attempts = vec![verify_attempt("1", "FAIL", false, Some(report))];
+                row
+            };
+            // Its comparison matched, then publishing the result failed.
+            let mut untyped =
+                fixture.row("fx/untyped-matched", "ptrace", 1, "FAIL", Some(REFERENCE));
+            untyped.error_kind = Some("result-publication".into());
+            untyped.attempts = vec![verify_attempt("1", "FAIL", false, Some(&matched))];
+            // Its comparison matched, then the runner typed an infrastructure
+            // error.
+            let mut infrastructure = typed(
+                fixture.row("fx/infra-matched", "ptrace", 1, "FAIL", Some(REFERENCE)),
+                ObservedResult::InfrastructureError,
+                None,
+            );
+            infrastructure.attempts = vec![verify_attempt("1", "FAIL", false, Some(&matched))];
+            let mut stripped = crashed("fx/stripped-crash", "ptrace", 1, &matched);
+            stripped.relaxations = vec!["comparator=stripped: fixture policy".into()];
+            // A retry that left no log, after a FAIL whose comparison matched.
+            let mut error = fixture.row("fx/fail-then-error", "kvm", 2, "ERROR", None);
+            error.error_kind = Some("incomplete-verification-evidence".into());
+            // An earlier attempt of the same row diverged.
+            let mut diverged = crashed("fx/diverged-first", "kvm", 1, &matched);
+            diverged.attempts = vec![
+                verify_attempt("1", "FAIL", false, Some(DIVERGED_REPORT)),
+                verify_attempt("2", "FAIL", false, Some(&matched)),
+            ];
+            // A SaBRe row whose one attempt matched strictly and recorded the
+            // execution path of both runs, as the runner summarizes it.
+            let sabre = |test: &str, outcome: &str, fallback_sites: usize, reason: &str| {
+                let mut row = typed(
+                    fixture.row(test, "sabre", 1, "FAIL", Some(REFERENCE)),
+                    ObservedResult::CrashError,
+                    None,
+                );
+                row.argv.insert(4, "--verify".into());
+                let execution = serde_json::json!({
+                    "schema": 1,
+                    "guest_rpc_observed": true,
+                    "ptrace_fallback_sites": fallback_sites,
+                    "trusted_shared_object_sites": 0,
+                    "trusted_shared_objects": [],
+                });
+                let mut attempt = verify_attempt("1", outcome, false, Some(&matched));
+                attempt.argv = row.argv.clone();
+                attempt.sabre_path_evidence = Some(format!("{execution}\n{execution}\n"));
+                row.execution_path =
+                    crate::runner::summarize_sabre_path_evidence(std::slice::from_ref(&attempt))
+                        .unwrap();
+                row.reason = Some(reason.into());
+                row.attempts = vec![attempt];
+                row
+            };
+            // Its attempt passed, and the runner failed the row because the
+            // run used fallback sites, so its log measures no SaBRe run.
+            let ineligible = sabre(
+                "fx/sabre-path-ineligible",
+                "PASS",
+                3,
+                "SaBRe execution path is incomplete or used fallback/native sites",
+            );
+            assert_eq!(
+                ineligible.execution_path.as_ref().unwrap()["eligible"],
+                false
+            );
+            // The same log from a run that stayed on SaBRe's own path.
+            let eligible = sabre("fx/sabre-path-eligible", "FAIL", 0, "fixture FAIL");
+            assert_eq!(eligible.execution_path.as_ref().unwrap()["eligible"], true);
+            // Its comparison matched, but it retained no log.
+            let mut no_log = typed(
+                fixture.row("fx/matched-no-log", "kvm", 1, "FAIL", None),
+                ObservedResult::CrashError,
+                None,
+            );
+            no_log.attempts = vec![verify_attempt("1", "FAIL", false, Some(&matched))];
+            let rows = vec![
+                crashed("fx/crash-golden", "ptrace", 1, &matched),
+                crashed("fx/crash-golden", "kvm", 1, &matched),
+                // A mismatch on an earlier attempt is decided first.
+                fixture.row("fx/df-then-matched", "ptrace", 1, "PASS", Some(REFERENCE)),
+                typed(
+                    fixture.row("fx/df-then-matched", "kvm", 1, "FAIL", Some(REFERENCE)),
+                    ObservedResult::DeterminismFailure,
+                    None,
+                ),
+                crashed("fx/df-then-matched", "kvm", 2, &matched),
+                fixture.row("fx/diverged-first", "ptrace", 1, "PASS", Some(REFERENCE)),
+                diverged,
+                fixture.row("fx/fail-then-error", "ptrace", 1, "PASS", Some(REFERENCE)),
+                crashed("fx/fail-then-error", "kvm", 1, &matched),
+                error,
+                crashed("fx/weak-match", "ptrace", 1, &vacuous),
+                fixture.row("fx/weak-match", "kvm", 1, "PASS", Some(REFERENCE)),
+                fixture.row("fx/first-rejected", "ptrace", 1, "PASS", Some(REFERENCE)),
+                crashed("fx/first-rejected", "kvm", 1, &rejected),
+                untyped,
+                fixture.row("fx/untyped-matched", "kvm", 1, "PASS", Some(REFERENCE)),
+                stripped,
+                fixture.row("fx/stripped-crash", "kvm", 1, "PASS", Some(REFERENCE)),
+                infrastructure,
+                fixture.row("fx/infra-matched", "kvm", 1, "PASS", Some(REFERENCE)),
+                crashed("fx/canonical-not-strict", "ptrace", 1, &canonical),
+                fixture.row("fx/canonical-not-strict", "kvm", 1, "PASS", Some(REFERENCE)),
+                fixture.row(
+                    "fx/sabre-path-ineligible",
+                    "ptrace",
+                    1,
+                    "PASS",
+                    Some(REFERENCE),
+                ),
+                ineligible,
+                fixture.row(
+                    "fx/sabre-path-eligible",
+                    "ptrace",
+                    1,
+                    "PASS",
+                    Some(REFERENCE),
+                ),
+                eligible,
+                fixture.row("fx/matched-no-log", "ptrace", 1, "PASS", Some(REFERENCE)),
+                no_log,
+            ];
+            let scope = BTreeSet::from([
+                parity_cell("fx/crash-golden", ParityBackend::Kvm),
+                parity_cell("fx/df-then-matched", ParityBackend::Kvm),
+                parity_cell("fx/diverged-first", ParityBackend::Kvm),
+                parity_cell("fx/fail-then-error", ParityBackend::Kvm),
+                parity_cell("fx/weak-match", ParityBackend::Kvm),
+                parity_cell("fx/first-rejected", ParityBackend::Kvm),
+                parity_cell("fx/untyped-matched", ParityBackend::Kvm),
+                parity_cell("fx/stripped-crash", ParityBackend::Kvm),
+                parity_cell("fx/infra-matched", ParityBackend::Kvm),
+                parity_cell("fx/canonical-not-strict", ParityBackend::Kvm),
+                parity_cell("fx/sabre-path-ineligible", ParityBackend::Sabre),
+                parity_cell("fx/sabre-path-eligible", ParityBackend::Sabre),
+                parity_cell("fx/matched-no-log", ParityBackend::Kvm),
+            ]);
+            let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
+            assert_eq!(report.log_diff_runs, 3, "the three cells with both logs");
+            assert_eq!(fixture.log_diff_calls(), 3);
+            let written = read_records(&report.path);
+            assert_eq!(written.len(), 13);
+            let by_test = |test: &str| {
+                written
+                    .iter()
+                    .find(|record| record.test_id == test)
+                    .unwrap()
+            };
+            let golden = |test: &str| {
+                path_text(
+                    &fixture
+                        .artifacts()
+                        .join(PARITY_GOLDEN_DIR)
+                        .join(format!("{test}.detlog")),
+                )
+            };
+            for record in &written {
+                record.validate().unwrap();
+            }
+            // Each measured cell compares the golden with the candidate's
+            // first-run log from the FAIL attempt whose comparison matched.
+            for test in [
+                "fx/crash-golden",
+                "fx/fail-then-error",
+                "fx/sabre-path-eligible",
+            ] {
+                let record = by_test(test);
+                assert_eq!(record.verdict, ParityVerdict::Matched, "{record:?}");
+                assert_eq!((record.unavailable_class, record.operand), (None, None));
+                assert_eq!(record.unequalized_credit, Some(1.0), "{record:?}");
+                assert_eq!((record.left_len, record.right_len), (Some(3), Some(3)));
+                assert_eq!(record.matched_prefix, Some(3));
+                assert!(record.first_difference.is_none(), "{record:?}");
+                assert_eq!(record.reference_log, Some(golden(test)), "{record:?}");
+                assert!(
+                    record
+                        .candidate_log
+                        .as_deref()
+                        .unwrap()
+                        .ends_with("verify-logs/verify-1/run1_log_fixture.log"),
+                    "{record:?}"
+                );
+            }
+            // The reference that failed after its comparison matched is the
+            // golden, and its sidecar records that row.
+            let (golden_log, sidecar) =
+                golden_paths(&fixture.artifacts(), "fx/crash-golden").unwrap();
+            assert_eq!(fs::read_to_string(&golden_log).unwrap(), REFERENCE);
+            let sidecar: ParityGoldenSidecar =
+                serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+            assert_eq!(
+                (
+                    sidecar.backend.as_str(),
+                    sidecar.outcome.as_str(),
+                    sidecar.attempt
+                ),
+                ("ptrace", "FAIL", 1)
+            );
+            let (reference, candidate) = (
+                Some(ParityOperand::Reference),
+                Some(ParityOperand::Candidate),
+            );
+            for (test, verdict, class, operand, reason, golden_named) in [
+                (
+                    "fx/df-then-matched",
+                    ParityVerdict::Nondeterministic,
+                    UnavailableClass::DeterminismMismatch,
+                    candidate,
+                    "the kvm candidate verify cell of fx/df-then-matched failed determinism on \
+                     attempt 1 (its two runs diverged)",
+                    true,
+                ),
+                (
+                    "fx/diverged-first",
+                    ParityVerdict::Nondeterministic,
+                    UnavailableClass::DeterminismMismatch,
+                    candidate,
+                    "the kvm candidate verify cell of fx/diverged-first retained a diverged \
+                     verification report on attempt 1 (its two runs diverged) although it ended \
+                     with result crash-error (no error kind)",
+                    true,
+                ),
+                (
+                    "fx/weak-match",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::Crash,
+                    reference,
+                    "the ptrace reference verify cell of fx/weak-match ended FAIL with result \
+                     crash-error (no error kind): fixture FAIL",
+                    false,
+                ),
+                (
+                    "fx/first-rejected",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::Crash,
+                    candidate,
+                    "the kvm candidate verify cell of fx/first-rejected ended FAIL with result \
+                     crash-error (no error kind): fixture FAIL",
+                    true,
+                ),
+                (
+                    "fx/untyped-matched",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::FailedUntyped,
+                    reference,
+                    "the ptrace reference verify cell of fx/untyped-matched failed with no typed \
+                     result (result-publication): fixture FAIL",
+                    false,
+                ),
+                (
+                    "fx/stripped-crash",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::Crash,
+                    reference,
+                    "the ptrace reference verify cell of fx/stripped-crash ended FAIL with result \
+                     crash-error (no error kind): fixture FAIL",
+                    false,
+                ),
+                (
+                    "fx/infra-matched",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::InfrastructureError,
+                    reference,
+                    "the ptrace reference verify cell of fx/infra-matched ended FAIL with result \
+                     infrastructure-error (no error kind): fixture FAIL",
+                    false,
+                ),
+                (
+                    "fx/canonical-not-strict",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::Crash,
+                    reference,
+                    "the ptrace reference verify cell of fx/canonical-not-strict ended FAIL with \
+                     result crash-error (no error kind): fixture FAIL",
+                    false,
+                ),
+                (
+                    "fx/sabre-path-ineligible",
+                    ParityVerdict::Unavailable,
+                    UnavailableClass::Crash,
+                    candidate,
+                    "the sabre candidate verify cell of fx/sabre-path-ineligible ended FAIL with \
+                     result crash-error (no error kind): SaBRe execution path is incomplete or \
+                     used fallback/native sites",
+                    true,
+                ),
+                (
+                    "fx/matched-no-log",
+                    ParityVerdict::CandidateMissing,
+                    UnavailableClass::LogNotRetained,
+                    candidate,
+                    "the kvm candidate verify cell of fx/matched-no-log retained no logs (its \
+                     argv has no --verify-log-dir)",
+                    true,
+                ),
+            ] {
+                let record = by_test(test);
+                assert_eq!(record.verdict, verdict, "{record:?}");
+                assert_eq!(record.unavailable_class, Some(class), "{record:?}");
+                assert_eq!(record.operand, operand, "{record:?}");
+                assert!(
+                    record.reason.as_deref().unwrap().contains(reason),
+                    "{test}: {record:?}"
+                );
+                assert_eq!(record.measured_credit(), None, "{record:?}");
+                assert_eq!(record.candidate_log, None, "{record:?}");
+                // A candidate with no log still names its reference's
+                // golden; a reference with none writes no golden.
+                assert_eq!(
+                    record.reference_log,
+                    golden_named.then(|| golden(test)),
+                    "{record:?}"
+                );
+                let (golden_log, sidecar) = golden_paths(&fixture.artifacts(), test).unwrap();
+                assert_eq!(
+                    golden_log.exists() && sidecar.exists(),
+                    golden_named,
+                    "{test}"
+                );
+            }
+            // Only a mismatch is called one.
+            for record in written
+                .iter()
+                .filter(|record| record.verdict != ParityVerdict::Nondeterministic)
+            {
+                assert!(
+                    !record
+                        .reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("determinism"),
+                    "{record:?}"
+                );
+            }
+            let summary = report.summary_line();
+            for part in [
+                "13 cell(s)",
+                "matched 3, diverged 0, nondeterministic 2, reference-missing 0, \
+                 candidate-missing 1, unavailable 7, inputs-not-equalized 0",
+                "measured 3; no golden 9 (determinism-mismatch 2, crash 5, \
+                 infrastructure-error 1, failed-untyped 1); not compared 0; unmeasured 1 \
+                 (log-not-retained 1)",
+                "none measured with equal inputs; mean credit 1.0000 over 3 measured with \
+                 unequal inputs",
+                "3 log-diff comparison(s), 0 guest runs",
+            ] {
+                assert!(summary.contains(part), "{part:?} not in {summary}");
+            }
+        }
     }
 
     /// A current verification report whose verdict is `diverged`, as a verify
@@ -7190,6 +7640,67 @@ mod tests {
             "verification_report": report,
         }))
         .unwrap()
+    }
+
+    /// [`DIVERGED_REPORT`] as an attempt retains it when its two runs matched
+    /// under the strict comparison and the guest exited 7 both times: what a
+    /// verify cell keeps when it fails after the comparison, for example on
+    /// unexpected stdout or the wrong exit status.
+    fn matched_report() -> String {
+        let mut report: serde_json::Value = serde_json::from_str(DIVERGED_REPORT).unwrap();
+        report["verified"] = true.into();
+        report["bitwise_parity"] = true.into();
+        report["verdict"] = "matched".into();
+        for field in [
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+            "first_divergent_record",
+            "first_divergent_syscall",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
+        ] {
+            report[field] = serde_json::Value::Null;
+        }
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["exit_code"] = 7.into();
+        }
+        report["guest_exit_code"] = 7.into();
+        report.to_string()
+    }
+
+    /// [`matched_report`] from a comparison of no log records: its verdict is
+    /// `matched` but it is not a strict match, like the output-only comparison
+    /// that [`crate::canonical_verdict::VerificationReport::require_canonical_match`]
+    /// refuses.
+    fn vacuous_matched_report() -> String {
+        let mut report: serde_json::Value = serde_json::from_str(&matched_report()).unwrap();
+        report["compared_log_messages"] = serde_json::json!({"left": 0, "right": 0});
+        report.to_string()
+    }
+
+    /// [`matched_report`] without bitwise parity: its canonical comparison
+    /// stands and its verdict is `matched`, but it fails only the last clause
+    /// of [`crate::canonical_verdict::VerificationReport::require_canonical_match`].
+    fn canonical_not_strict_report() -> String {
+        let mut report: serde_json::Value = serde_json::from_str(&matched_report()).unwrap();
+        report["bitwise_parity"] = false.into();
+        report.to_string()
+    }
+
+    /// The report of an attempt whose first run exited 7: the default
+    /// `--verify` rejects it before a second run, so nothing was compared.
+    fn first_run_rejected_report() -> String {
+        use crate::canonical_verdict::NoResultReason;
+        use crate::canonical_verdict::VerificationReport;
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = Some(NoResultReason::FirstRunRejected {
+            exit_code: Some(7),
+            signal: None,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        });
+        report.guest_exit_code = Some(7);
+        serde_json::to_string(&report).unwrap()
     }
 
     /// A located divergence decides the side whatever result the runner typed
@@ -8469,7 +8980,13 @@ mod tests {
 
     /// A timeout is not a mismatch: as the candidate or as the reference it
     /// is `unavailable` with class `timeout`, a side with no golden that is
-    /// outside the floor, and never called a determinism failure.
+    /// outside the floor, and never called a determinism failure. A timeout
+    /// flagged after both runs completed and matched under the strict
+    /// comparison keeps its first-run log, which is compared, when that
+    /// comparison is the single attempt of the selected row; an earlier row
+    /// that timed out does not take the log away, and a row with more than
+    /// one attempt keeps its timeout
+    /// (https://github.com/rrnewton/hermit/issues/3455).
     #[test]
     fn a_timeout_is_unavailable_with_its_own_class() {
         let fixture = Fixture::new("timeout");
@@ -8556,6 +9073,221 @@ mod tests {
             "measured 0; no golden 2 (timeout 2); not compared 0; unmeasured 0",
         ] {
             assert!(summary.contains(part), "{part:?} not in {summary}");
+        }
+
+        // These cells are measured in a fixture of their own, so every count
+        // above stands.
+        {
+            let (matched, canonical) = (matched_report(), canonical_not_strict_report());
+            let fixture = Fixture::new("timeout-matched");
+            let timed_out = |test: &str, backend: &str, attempt: u64, kind: &str| {
+                typed(
+                    fixture.row(test, backend, attempt, "FAIL", Some(REFERENCE)),
+                    ObservedResult::Timeout,
+                    Some(kind),
+                )
+            };
+            // Both runs completed and were compared, then its CPU was found
+            // at the budget.
+            let mut late = timed_out("fx/late-cpu-timeout", "kvm", 1, "cpu-timeout");
+            late.attempts = vec![verify_attempt("1", "FAIL", true, Some(&matched))];
+            // An earlier row timed out before any comparison, as the runner
+            // records it: an ERROR with no report, here with a partial
+            // first-run log. The retry's one attempt matched.
+            let mut earlier = typed(
+                fixture.row(
+                    "fx/earlier-timeout",
+                    "ptrace",
+                    1,
+                    "ERROR",
+                    Some("INFO detcore: open\n"),
+                ),
+                ObservedResult::Timeout,
+                Some("wall-timeout"),
+            );
+            earlier.attempts = vec![verify_attempt("1", "ERROR", true, None)];
+            let mut retried = typed(
+                fixture.row("fx/earlier-timeout", "ptrace", 2, "FAIL", Some(REFERENCE)),
+                ObservedResult::CrashError,
+                None,
+            );
+            retried.attempts = vec![verify_attempt("1", "FAIL", false, Some(&matched))];
+            // A row whose first attempt matched and whose last one timed out
+            // with no comparison.
+            let mut last = timed_out("fx/last-timed-out", "kvm", 1, "wall-timeout");
+            last.attempts = vec![
+                verify_attempt("1", "FAIL", false, Some(&matched)),
+                verify_attempt("2", "ERROR", true, None),
+            ];
+            // A row whose first attempt timed out with no comparison and
+            // whose last one matched: its retained log is the first
+            // attempt's, so the match does not vouch for it.
+            let mut two_attempts = timed_out("fx/two-attempt-row", "ptrace", 1, "wall-timeout");
+            two_attempts.attempts = vec![
+                verify_attempt("1", "ERROR", true, None),
+                verify_attempt("2", "FAIL", false, Some(&matched)),
+            ];
+            // A retry whose CPU was found at the budget after its two runs
+            // matched canonically but not bitwise, after a FAIL whose
+            // comparison matched strictly. The selected retry decides.
+            let mut crashed = typed(
+                fixture.row("fx/timed-out-retry", "ptrace", 1, "FAIL", Some(REFERENCE)),
+                ObservedResult::CrashError,
+                None,
+            );
+            crashed.attempts = vec![verify_attempt("1", "FAIL", false, Some(&matched))];
+            let mut retry = timed_out("fx/timed-out-retry", "ptrace", 2, "cpu-timeout");
+            retry.attempts = vec![verify_attempt("1", "FAIL", true, Some(&canonical))];
+            let rows = vec![
+                fixture.row("fx/late-cpu-timeout", "ptrace", 1, "PASS", Some(REFERENCE)),
+                late,
+                earlier,
+                retried,
+                fixture.row("fx/earlier-timeout", "kvm", 1, "PASS", Some(REFERENCE)),
+                fixture.row("fx/last-timed-out", "ptrace", 1, "PASS", Some(REFERENCE)),
+                last,
+                two_attempts,
+                fixture.row("fx/two-attempt-row", "kvm", 1, "PASS", Some(REFERENCE)),
+                crashed,
+                retry,
+                fixture.row("fx/timed-out-retry", "kvm", 1, "PASS", Some(REFERENCE)),
+            ];
+            let scope = BTreeSet::from([
+                parity_cell("fx/late-cpu-timeout", ParityBackend::Kvm),
+                parity_cell("fx/earlier-timeout", ParityBackend::Kvm),
+                parity_cell("fx/last-timed-out", ParityBackend::Kvm),
+                parity_cell("fx/two-attempt-row", ParityBackend::Kvm),
+                parity_cell("fx/timed-out-retry", ParityBackend::Kvm),
+            ]);
+            let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
+            assert_eq!(fixture.log_diff_calls(), 2);
+            let by_test = |test: &str| {
+                report
+                    .records
+                    .iter()
+                    .find(|record| record.test_id == test)
+                    .unwrap()
+            };
+            let golden = |test: &str| golden_paths(&fixture.artifacts(), test).unwrap();
+            for record in &report.records {
+                record.validate().unwrap();
+                assert!(
+                    !record
+                        .reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("determinism"),
+                    "{record:?}"
+                );
+            }
+            for test in ["fx/late-cpu-timeout", "fx/earlier-timeout"] {
+                let record = by_test(test);
+                assert_eq!(record.verdict, ParityVerdict::Matched, "{record:?}");
+                assert_eq!(record.unequalized_credit, Some(1.0), "{record:?}");
+                assert_eq!(
+                    record.reference_log,
+                    Some(path_text(&golden(test).0)),
+                    "{record:?}"
+                );
+                assert!(
+                    record
+                        .candidate_log
+                        .as_deref()
+                        .unwrap()
+                        .ends_with("verify-logs/verify-1/run1_log_fixture.log"),
+                    "{record:?}"
+                );
+            }
+            // The reference's retry, whose one attempt matched, is the golden,
+            // not the partial log of the row that timed out before it.
+            let (golden_log, sidecar) = golden("fx/earlier-timeout");
+            assert_eq!(fs::read_to_string(&golden_log).unwrap(), REFERENCE);
+            let sidecar: ParityGoldenSidecar =
+                serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+            assert_eq!(
+                (
+                    sidecar.backend.as_str(),
+                    sidecar.outcome.as_str(),
+                    sidecar.attempt
+                ),
+                ("ptrace", "FAIL", 2)
+            );
+            let found = report
+                .records
+                .iter()
+                .filter(|record| record.verdict != ParityVerdict::Matched)
+                .map(|record| {
+                    (
+                        record.test_id.as_str(),
+                        record.verdict,
+                        record.unavailable_class,
+                        record.operand,
+                        record.reason.as_deref().unwrap_or(""),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                found,
+                [
+                    (
+                        "fx/last-timed-out",
+                        ParityVerdict::Unavailable,
+                        Some(UnavailableClass::Timeout),
+                        Some(ParityOperand::Candidate),
+                        "the kvm candidate verify cell of fx/last-timed-out ended FAIL with \
+                         result timeout (wall-timeout): fixture FAIL"
+                    ),
+                    (
+                        "fx/timed-out-retry",
+                        ParityVerdict::Unavailable,
+                        Some(UnavailableClass::Timeout),
+                        Some(ParityOperand::Reference),
+                        "the ptrace reference verify cell of fx/timed-out-retry ended FAIL with \
+                         result timeout (cpu-timeout): fixture FAIL"
+                    ),
+                    (
+                        "fx/two-attempt-row",
+                        ParityVerdict::Unavailable,
+                        Some(UnavailableClass::Timeout),
+                        Some(ParityOperand::Reference),
+                        "the ptrace reference verify cell of fx/two-attempt-row ended FAIL with \
+                         result timeout (wall-timeout): fixture FAIL"
+                    ),
+                ]
+            );
+            for test in [
+                "fx/last-timed-out",
+                "fx/timed-out-retry",
+                "fx/two-attempt-row",
+            ] {
+                let record = by_test(test);
+                assert_eq!(record.measured_credit(), None, "{record:?}");
+                assert_eq!(record.candidate_log, None, "{record:?}");
+            }
+            // The timed-out candidate's reference is good, so its golden is
+            // named; a reference whose selected row keeps its timeout writes
+            // none.
+            assert_eq!(
+                by_test("fx/last-timed-out").reference_log,
+                Some(path_text(&golden("fx/last-timed-out").0))
+            );
+            for test in ["fx/timed-out-retry", "fx/two-attempt-row"] {
+                assert_eq!(by_test(test).reference_log, None, "{test}");
+                let (golden_log, sidecar) = golden(test);
+                assert!(!golden_log.exists() && !sidecar.exists(), "{test}");
+            }
+            let summary = report.summary_line();
+            for part in [
+                "5 cell(s)",
+                "matched 2, diverged 0, nondeterministic 0, reference-missing 0, \
+                 candidate-missing 0, unavailable 3, inputs-not-equalized 0",
+                "measured 2; no golden 3 (timeout 3); not compared 0; unmeasured 0",
+                "none measured with equal inputs; mean credit 1.0000 over 2 measured with \
+                 unequal inputs",
+                "2 log-diff comparison(s), 0 guest runs",
+            ] {
+                assert!(summary.contains(part), "{part:?} not in {summary}");
+            }
         }
     }
 
