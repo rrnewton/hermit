@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Build the demo 9 initramfs: a static BusyBox plus the /init script beside
+# this file, archived reproducibly so the same BusyBox gives the same bytes.
 
 set -euo pipefail
 
@@ -51,7 +53,7 @@ done < <("$busybox" --list-full)
 find "$root" -exec touch -h -d @0 {} +
 (
   cd "$root"
-  find . -print0 | sort -z | \
+  find . -print0 | LC_ALL=C sort -z | \
     cpio --quiet --null --create --format=newc --owner=0:0 --reproducible
 ) | gzip -n -9 >"$output"
 
