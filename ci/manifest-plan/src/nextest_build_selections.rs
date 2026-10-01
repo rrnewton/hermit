@@ -64,6 +64,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cli_owned_lifecycle",
             "--test",
+            "cli_startup_stderr",
+            "--test",
             "clock_determinism",
             "--test",
             "clock_discipline_determinism",

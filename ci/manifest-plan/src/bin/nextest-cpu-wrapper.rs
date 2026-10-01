@@ -54,6 +54,9 @@ mod nextest_attempt;
 #[path = "../../../network-test-boundary.rs"]
 mod network_test_boundary;
 
+#[path = "../../../cli-refusal-test-boundary.rs"]
+mod cli_refusal_test_boundary;
+
 #[path = "../../../network-unix-provision.rs"]
 mod network_unix_provision;
 
@@ -1515,6 +1518,23 @@ fn run_wrapper_owned(
         invocation.cpu_budget_usec =
             Some(ResolvedBudgets::read_bound(path, digest)?.cpu_budget_usec(&identity)?);
     }
+    let cli_refusal_case =
+        cli_refusal_test_boundary::case(&identity.package, &identity.binary, &identity.test);
+    let cli_refusal_binary = if cli_refusal_case.is_some() {
+        if invocation.cpu_budget_usec.is_none()
+            || invocation.termination_grace > Duration::from_secs(2)
+        {
+            return Err("CLI refusal requires the official budgeted attempt owner".into());
+        }
+        // The official artifact wrapper verified this published CLI before Nextest.
+        let cli = PathBuf::from(required_env("HERMIT_BIN")?);
+        if !cli.is_absolute() || !cli.is_file() {
+            return Err("CLI refusal requires the verified prepared CLI".into());
+        }
+        Some(cli)
+    } else {
+        None
+    };
     let network_case = env::var(network_test_boundary::REQUEST_ENV)
         .map(Some)
         .or_else(|error| match error {
@@ -1674,8 +1694,68 @@ fn run_wrapper_owned(
         None
     };
     let network_fd = network_directory.as_ref().map(AsRawFd::as_raw_fd);
+    let cli_refusal_directory = if cli_refusal_case.is_some() {
+        let cgroup = attempt_cgroup
+            .as_mut()
+            .expect("CLI profile requires an owned cgroup");
+        let prepared = (|| {
+            cgroup.verify_identity()?;
+            for (name, value) in [
+                ("memory.max", "8589934592"),
+                ("memory.swap.max", "0"),
+                ("cpu.max", "200000 100000"),
+            ] {
+                let mut control = openat_file(
+                    &cgroup.child,
+                    name,
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    "CLI refusal resource control",
+                )?;
+                use std::io::Write;
+                control
+                    .write_all(value.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let mut actual = [0; 64];
+                let n = control.read_at(&mut actual, 0).map_err(|e| e.to_string())?;
+                if std::str::from_utf8(&actual[..n])
+                    .map_err(|e| e.to_string())?
+                    .trim()
+                    != value
+                {
+                    return Err(format!("CLI refusal {name} readback mismatch"));
+                }
+            }
+            cgroup.child.try_clone().map_err(|e| e.to_string())
+        })();
+        match prepared {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                let cleanup = cgroup.remove_empty();
+                return Err(format!(
+                    "CLI refusal owner preparation: {error}; cleanup: {cleanup:?}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let cli_refusal_fd = cli_refusal_directory.as_ref().map(AsRawFd::as_raw_fd);
     let mut command = Command::new(program);
     command.args(child_args);
+    for name in [
+        cli_refusal_test_boundary::FD_ENV,
+        cli_refusal_test_boundary::CLI_ENV,
+        cli_refusal_test_boundary::CASE_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    if let (Some(fd), Some(case), Some(cli)) =
+        (cli_refusal_fd, cli_refusal_case, cli_refusal_binary)
+    {
+        command.env(cli_refusal_test_boundary::FD_ENV, fd.to_string());
+        command.env(cli_refusal_test_boundary::CASE_ENV, case);
+        command.env(cli_refusal_test_boundary::CLI_ENV, cli);
+    }
     command.env_remove(network_test_boundary::REQUEST_ENV);
     command.env_remove(network_test_boundary::FD_ENV);
     command.env_remove(network_test_boundary::CASE_ENV);
@@ -1728,7 +1808,19 @@ fn run_wrapper_owned(
             .enrollment_fd();
         unsafe {
             command.pre_exec(move || {
-                for fd in [network_fd, network_cause_fd].into_iter().flatten() {
+                if cli_refusal_fd.is_some() {
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                for fd in [network_fd, network_cause_fd, cli_refusal_fd]
+                    .into_iter()
+                    .flatten()
+                {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         return Err(io::Error::last_os_error());
@@ -1831,6 +1923,13 @@ fn run_wrapper_owned(
                 break FirstCause::ExternalSignal {
                     signal: supervisor_signal,
                 };
+            }
+            if cli_refusal_case.is_some()
+                && started.elapsed() >= Duration::from_secs(cli_refusal_test_boundary::WALL_SECONDS)
+            {
+                break reserve_or_external(FirstCause::AccountingUnavailable {
+                    error: "CLI refusal original wall bound exceeded".into(),
+                });
             }
             let population = match reap_available_children(
                 child_pid,
