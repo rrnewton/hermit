@@ -424,7 +424,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // global_backend_reaches_every_trial_run
     // (https://github.com/rrnewton/hermit/pull/3439) retain all 758 prior
     // identities.
-    ("test.hermit_unit", 763),
+    // instruction_map::tests::decodes_instructions_that_end_at_or_cross_a_4gib_host_address
+    // (https://github.com/rrnewton/hermit/issues/3462) retains all 763 prior
+    // identities.
+    ("test.hermit_unit", 764),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -547,7 +550,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 850),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 177),
-    ("test.hermit_unit_on_host", 763),
+    // The host twin selects the same 4 GiB iced decode regression
+    // (https://github.com/rrnewton/hermit/issues/3462).
+    ("test.hermit_unit_on_host", 764),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
