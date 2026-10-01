@@ -4527,6 +4527,20 @@ pub(crate) fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
         .map(|report| report.verdict)
 }
 
+/// Whether `attempt` retains a current verification report whose strict
+/// comparison matched: [`VerificationReport::require_canonical_match`], the
+/// check a strict verify cell must pass before the runner can pass it. A
+/// `matched` verdict from a weaker comparison does not count. The parity
+/// post-pass reads it from the single attempt of a `FAIL` row to decide that
+/// the row still has one deterministic log (`parity::evaluate_history`).
+pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| report.require_canonical_match().is_ok())
+}
+
 fn observed_result(
     mode: &str,
     outcome: &str,
@@ -5141,11 +5155,7 @@ fn run_cell_inner(
             None
         }
     };
-    if outcome == "PASS"
-        && execution_path
-            .as_ref()
-            .is_some_and(|evidence| evidence["eligible"] != true)
-    {
+    if outcome == "PASS" && execution_path_ineligible(execution_path.as_ref()) {
         outcome = "FAIL".into();
         reason = Some("SaBRe execution path is incomplete or used fallback/native sites".into());
     }
@@ -5448,6 +5458,17 @@ fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
         left_message: messages.and_then(|attempt| attempt.first_divergent_left_message.clone()),
         right_message: messages.and_then(|attempt| attempt.first_divergent_right_message.clone()),
     }
+}
+
+/// Whether a row's SaBRe execution-path evidence
+/// ([`summarize_sabre_path_evidence`]) shows that its run did not stay on
+/// SaBRe's own path: the evidence is incomplete, or the run used fallback or
+/// native sites. A row with no such evidence, which is every row of another
+/// backend, is not ineligible. The runner fails a `PASS` whose evidence is
+/// ineligible, and the parity post-pass does not score such a row from its
+/// log (`parity::evaluate_history`).
+pub(crate) fn execution_path_ineligible(execution_path: Option<&JsonValue>) -> bool {
+    execution_path.is_some_and(|evidence| evidence["eligible"] != true)
 }
 
 pub(crate) fn summarize_sabre_path_evidence(
