@@ -431,6 +431,15 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_mapping_identities)
     }
 
+    /// The address space this `maps`/`smaps` snapshot is known to show; see
+    /// `ProcfsFile::mapping_address_space`.
+    pub(crate) fn procfs_mapping_address_space(&self) -> Option<MmId> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(ProcfsFile::mapping_address_space)
+    }
+
     pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
         self.description()
             .procfs
