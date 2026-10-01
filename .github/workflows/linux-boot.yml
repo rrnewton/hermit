@@ -5,8 +5,8 @@ name: Linux boot (QEMU) — dedicated lane
 # Booting a Linux kernel under Hermit is the heaviest thing in the demo suite:
 # it needs QEMU, a pinned kernel, a BusyBox initramfs, and — because it runs
 # under `--strict` — PMU retired-branch preemption, so it can only run on the
-# self-hosted `pmu` lane. The broader `demo-hot-path.yml` diagnostic also runs
-# this boot as part of `scripts/super-validate.sh --demos-only`.
+# self-hosted `pmu` lane. No other workflow in this repository runs this boot;
+# the separate manual `demo-hot-path.yml` diagnostic covers demos 1 to 8 only.
 #
 # This lane does one thing: boot Linux under Hermit and assert it reached
 # userspace deterministically. It is manually dispatched and never runs on a
