@@ -582,8 +582,35 @@ fi
 # b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
 # source-identity carry, not a new timing sample or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != dbf2b5c8880bac5fd6a06fa1f296b3eec3590569 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie dbf2b5c8880bac5fd6a06fa1f296b3eec3590569 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 096cbcc8cd945cc26753d12f35ad0bae6d2ad277 (2026-10-01): from
+# dbf2b5c8880bac5fd6a06fa1f296b3eec3590569, the 1-commit range is the 0.4.0 release version bump.
+# It changes reverie-dbt only in Cargo.toml (blob 8da5d73a60b920b3077a57836e7fa5fb9c66edb7
+# -> 0e24d047d544a3daae2d6350270b26ceb74139d1; tree a58869784a49b28fe187f955585bf3cf0597455a
+# -> 0cbe39248f8b7ce6fce78f42963e6231b9ab7fc3): the package version and three
+# first-party dependency version requirements go from 0.2.0 to 0.4.0. Cargo.toml is
+# not a DynamoRIO SDK recipe input. build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0; DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains blob
+# 4168dea2771f18a00fb1afdfd2218efba415ecbb; rust-toolchain.toml remains blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
+# source-identity carry, not a new timing sample or runtime qualification.
+# CARRY TO c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb (2026-10-02): from
+# 096cbcc8cd945cc26753d12f35ad0bae6d2ad277, the 47-commit range (ptrace, safeptrace,
+# KVM, LiteInst and preload fixes, including the vfork fix chain) leaves the whole
+# reverie-dbt tree byte-identical: it remains tree
+# 0cbe39248f8b7ce6fce78f42963e6231b9ab7fc3, so Cargo.toml remains blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains blob
+# 4168dea2771f18a00fb1afdfd2218efba415ecbb; rust-toolchain.toml remains blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
+# source-identity carry, not a new timing sample or runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

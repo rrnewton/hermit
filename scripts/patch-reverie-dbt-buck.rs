@@ -21,14 +21,14 @@ use std::process::ExitCode;
 
 const EXPECTED_FILES: usize = 931;
 const CRATE_RELATIVE: &str = "reverie-dbt";
-const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.2.0";
-const TARGET_NAME: &str = "reverie-dbt-0.2-materialized-manifest";
+const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.4.0";
+const TARGET_NAME: &str = "reverie-dbt-0.4-materialized-manifest";
 const PRELUDE_LOAD: &str = "load(\"@prelude//rust:cargo_buildscript.bzl\", \"buildscript_run\")\n";
 const MATERIALIZED_LOAD: &str =
     "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")\n";
 const BUILDSCRIPT_START: &str =
-    "buildscript_run(\n    name = \"reverie-dbt-0.2-build-script-run\",\n";
-const MANIFEST_ARGUMENT: &str = "    manifest_dir = \":reverie-dbt-0.2-materialized-manifest\",\n";
+    "buildscript_run(\n    name = \"reverie-dbt-0.4-build-script-run\",\n";
+const MANIFEST_ARGUMENT: &str = "    manifest_dir = \":reverie-dbt-0.4-materialized-manifest\",\n";
 
 fn repository_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
@@ -197,7 +197,7 @@ fn render_target(files: &[String]) -> String {
         target.push_str(&starlark_string(relative));
         target.push_str(": ");
         target.push_str(&starlark_string(&format!(
-            "vendor/reverie-dbt-0.2.0/{relative}"
+            "vendor/reverie-dbt-0.4.0/{relative}"
         )));
         target.push_str(",\n");
     }
@@ -321,7 +321,7 @@ mod tests {
     use super::*;
 
     fn fixture() -> String {
-        format!("# generated\n{PRELUDE_LOAD}\n{BUILDSCRIPT_START}    version = \"0.2.0\",\n)\n")
+        format!("# generated\n{PRELUDE_LOAD}\n{BUILDSCRIPT_START}    version = \"0.4.0\",\n)\n")
     }
 
     fn files() -> Vec<String> {
