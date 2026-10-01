@@ -1587,7 +1587,22 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    assert!(guest.config().sequentialize_threads);
+    // PROTOTYPE (impl-recording-without-seq): permit schedule-event OBSERVATION
+    // under --no-sequentialize-threads. Previously this asserted
+    // `sequentialize_threads`. When threads are NOT sequentialized the recorded
+    // trace is a best-effort observation of intercepted events (cpuid/rdtsc/
+    // rcb-branch; syscall/signal SchedEvent sites are separately gated on
+    // sequentialize_threads and do NOT fire here), serialized only at the global
+    // RPC boundary. It is NOT a deterministic, replayable schedule: concurrent
+    // sub-syscall memory interleavings are unobserved. GlobalState still owns the
+    // Scheduler + PreemptionWriter without the sched_loop task, so record_event
+    // works. See task notes for the full feasibility analysis.
+    if !guest.config().sequentialize_threads {
+        tracing::trace!(
+            "[trace_schedevent] observation-only record (no sequentialization) for dtid {:?}",
+            guest.thread_state().dettid
+        );
+    }
 
     // trace_schedevent is called AFTER the event is complete, and the rip is resting just after it.
     let ev = if tag_end_rip {
