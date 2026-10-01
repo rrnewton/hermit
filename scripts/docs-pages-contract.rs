@@ -29,7 +29,11 @@ const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
 const SERVED_REGISTRY_QUERY: &str = "if jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\" >/dev/null; then";
 const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\" >/dev/null";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
-const LANDING_WORDING: &str = "<strong>Compatibility snapshot:</strong>";
+const LANDING_MARKER: &str = "id=\"compatibility-scorecard\"";
+// Keep this opening tag in sync with the publisher. The stable marker belongs
+// on the sole latest-scorecard link; its visible wording is editorial content.
+const LANDING_LINK: &str =
+    "<a id=\"compatibility-scorecard\" class=\"button primary\" href=\"compatibility/latest/\">";
 
 fn repository_root() -> PathBuf {
     let script = Path::new(file!());
@@ -424,7 +428,8 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
     }
 
     require_once(&mut errors, "landing page", landing, LANDING_ALIAS);
-    require_once(&mut errors, "landing page", landing, LANDING_WORDING);
+    require_once(&mut errors, "landing page", landing, LANDING_MARKER);
+    require_once(&mut errors, "landing page", landing, LANDING_LINK);
     require_once(
         &mut errors,
         "deployment step",
@@ -516,6 +521,10 @@ import tempfile
 
 helper = pathlib.Path(sys.argv[1]).resolve()
 checked_in_registry = pathlib.Path(sys.argv[2]).resolve()
+landing = pathlib.Path(sys.argv[3]).read_text()
+landing_alias = 'href="compatibility/latest/"'
+landing_marker = 'id="compatibility-scorecard"'
+landing_link = '<a id="compatibility-scorecard" class="button primary" href="compatibility/latest/">'
 
 def run_helper(arguments, *, cwd=None, expected=None):
     result = subprocess.run(
@@ -670,12 +679,9 @@ def write_registry(path, releases, latest, repository="fixture/repo"):
     path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
     return value
 
-def install_landing(document_root):
+def install_landing(document_root, contents=landing):
     document_root.mkdir(parents=True)
-    (document_root / "index.html").write_text(
-        "<strong>Compatibility snapshot:</strong>\n"
-        '        <a href="compatibility/latest/">Open the real-ledger compatibility website</a>'
-    )
+    (document_root / "index.html").write_text(contents)
 
 def git(repository, *arguments):
     subprocess.run(["git", *arguments], cwd=repository, check=True, stdout=subprocess.DEVNULL)
@@ -698,6 +704,29 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     run_helper(["finalize", first_registry_path, first_document / "compatibility"])
     retained_before = inventory(first_document / "compatibility" / retained_identity)
     assert inventory(first_document / "compatibility" / "latest") == retained_before
+
+    # Exercise the extract command on mutations of the actual landing page,
+    # using the same fully pinned archive as the successful publication above.
+    invalid_landings = (
+        ("zero-links", landing.replace(landing_alias, 'href="compatibility/missing/"'),
+         "exactly one compatibility/latest link"),
+        ("two-marked-links", landing + landing_link + "Duplicate</a>",
+         "exactly one compatibility/latest link"),
+        ("second-unmarked-link", landing + '<a href="compatibility/latest/">Other</a>',
+         "exactly one compatibility/latest link"),
+        ("detached-marker", landing.replace(landing_marker, "", 1)
+         + '<span id="compatibility-scorecard"></span>', "scorecard link marker"),
+        ("wrong-marker", landing.replace(landing_marker, 'id="other-scorecard"', 1),
+         "scorecard link marker"),
+        ("duplicate-marker", landing + '<span id="compatibility-scorecard"></span>',
+         "scorecard link marker"),
+    )
+    for name, contents, expected in invalid_landings:
+        assert contents != landing, f"{name} must mutate the actual page"
+        document = base / name
+        install_landing(document, contents)
+        run_helper(["extract", retained_archive, document / "compatibility" / retained_identity,
+                    first_registry_path, 0], expected=expected)
 
     second_registry_path = base / "second-registry.json"
     write_registry(second_registry_path, [retained_pin, latest_pin], latest_identity)
@@ -894,6 +923,7 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
                 BLACK_BOX_FIXTURE,
                 root.join(PUBLISHER).to_str().unwrap(),
                 root.join(RELEASE_PINS).to_str().unwrap(),
+                root.join(LANDING_PAGE).to_str().unwrap(),
             ])
             .output()
             .expect("python3 should run black-box publisher fixtures");
@@ -1076,5 +1106,41 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
         let (workflow, landing) = actual();
         let weakened = landing.replacen(LANDING_ALIAS, "href=\"compatibility/missing/\"", 1);
         assert_rejected(&workflow, &weakened, LANDING_ALIAS);
+    }
+
+    #[test]
+    fn landing_page_must_have_only_one_scorecard_link() {
+        let (workflow, landing) = actual();
+        for extra in [
+            format!("{LANDING_LINK}Duplicate</a>"),
+            format!("<a {LANDING_ALIAS}>Other</a>"),
+        ] {
+            assert_rejected(&workflow, &format!("{landing}{extra}"), LANDING_ALIAS);
+        }
+    }
+
+    #[test]
+    fn landing_page_marker_must_be_unique_and_on_the_scorecard_link() {
+        let (workflow, landing) = actual();
+        for (changed, expected) in [
+            (
+                format!(
+                    "{}<span {LANDING_MARKER}></span>",
+                    landing.replacen(LANDING_MARKER, "", 1)
+                ),
+                LANDING_LINK,
+            ),
+            (
+                landing.replacen(LANDING_MARKER, "id=\"other-scorecard\"", 1),
+                LANDING_MARKER,
+            ),
+            (
+                format!("{landing}<span {LANDING_MARKER}></span>"),
+                LANDING_MARKER,
+            ),
+        ] {
+            assert_ne!(changed, landing, "opponent must mutate the actual page");
+            assert_rejected(&workflow, &changed, expected);
+        }
     }
 }

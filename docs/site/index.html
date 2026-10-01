@@ -158,6 +158,10 @@
           <h3>LiteInst</h3>
           <p>A library for patching x86-64 machine instructions while a program runs. LiteInst2 brings the original C++ project's patching core to Rust. Hermit's experimental LiteInst integration uses this technique to intercept program operations.</p>
           <div class="card-links">
+            <a href="https://github.com/rrnewton/liteinst2">LiteInst2 Rust port <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://github.com/iu-parfunc/liteinst">Original LiteInst <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://doi.org/10.1145/2908080.2908084">PLDI '16 &mdash; Living on the edge <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://doi.org/10.1145/3062341.3062344">PLDI '17 &mdash; Instruction punning <span aria-hidden="true">&nearr;</span></a>
             <a href="https://github.com/rrnewton/hermit#execution-backends">Hermit integration <span aria-hidden="true">&rarr;</span></a>
           </div>
         </article>
@@ -180,7 +184,7 @@
         <li><a href="compatibility/latest/cells/detail.html?cell=841666ca0a4d9bc178f3bd642449fa8555cee6159e19ddfe52d8d063d4b5e613"><strong>SQLite</strong></a> creating and reopening a database, then running queries that use random numbers and time.</li>
       </ul>
       <p class="reading-width">These checks compare repeated executions. The scorecard records results separately for each workload, mode, and backend; try the workload you depend on.</p>
-      <a class="button primary" href="compatibility/latest/">Latest compatibility scorecard <span aria-hidden="true">&rarr;</span></a>
+      <a id="compatibility-scorecard" class="button primary" href="compatibility/latest/">Latest compatibility scorecard <span aria-hidden="true">&rarr;</span></a>
     </section>
 
     <section id="examples" class="section" aria-labelledby="examples-title">
@@ -192,21 +196,21 @@
       <div class="card-grid">
         <article class="example-card">
           <h3>Boot and inspect Linux under QEMU</h3>
-          <p>A minimal Linux guest boots under QEMU with Hermit's controlled thread scheduling and QEMU's instruction-based clock. Repeated boots matched after log normalization. Separate drgn experiments reproduced kernel task lists at chosen stopping points.</p>
+          <p>A minimal Linux guest boots under QEMU with Hermit's controlled thread scheduling and QEMU's instruction-based clock. Repeated boots matched after log normalization. Separate experiments with the drgn kernel debugger reproduced kernel task lists at chosen stopping points.</p>
           <div class="card-links">
             <a href="https://github.com/rrnewton/hermit/blob/main/docs/QEMU_BOOT.md">QEMU boot guide <span aria-hidden="true">&rarr;</span></a>
           </div>
         </article>
         <article class="example-card">
           <h3>Reproduce a btrfs concurrency bug</h3>
-          <p>With a historical bug restored in an instrumented btrfs-convert, Hermit's chaos scheduler triggered a use-after-free. Repeating the seed reproduced the same failure report; the fixed version had no such crashes in the same sweep.</p>
+          <p>With a historical bug restored in an instrumented btrfs-convert and its progress timer replaced by a pipe, Hermit's chaos scheduler triggered a use-after-free. Repeating the seed reproduced the same failure report; the fixed version had no such crashes in the same sweep.</p>
           <div class="card-links">
             <a href="https://github.com/rrnewton/hermit/blob/main/docs/USER_GUIDE.md#chaos-mode">Explore thread schedules <span aria-hidden="true">&rarr;</span></a>
           </div>
         </article>
         <article class="example-card">
           <h3>Reproduce build outputs</h3>
-          <p>Hermit has rebuilt Debian packages such as hello, hostname, and tree with byte-identical package files across independent build environments. A Nix builder prototype also made example builds that read the clock and random bytes reproducible.</p>
+          <p>Hermit has rebuilt Debian packages such as hello, hostname, and tree with byte-identical package files across independent build environments. A Nix builder prototype also made an example build that reads the clock and random bytes reproducible.</p>
         </article>
       </div>
     </section>
