@@ -2239,6 +2239,47 @@ fn run_refuses_a_summary_json_hidden_by_the_private_tmp() {
     );
     assert!(!summary.exists(), "a refused run wrote a summary");
 
+    // `--tmp=<dir>` other than /tmp makes the guest's /tmp that directory, so
+    // the write would land in `<dir>/...` (here a missing subdirectory, which
+    // panicked at teardown before): refused the same way.
+    let other_tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the --tmp directory");
+    let other_tmp_arg = format!("--tmp={}", other_tmp.path().display());
+    let other_args = [
+        "run",
+        other_tmp_arg.as_str(),
+        summary_arg.as_str(),
+        "--",
+        "/bin/echo",
+        "guest-ran-3260",
+    ];
+    let other = hermit(&other_args);
+    let other_stderr = String::from_utf8_lossy(&other.stderr).into_owned();
+    assert_eq!(other.status.code(), Some(125), "{other_stderr}");
+    assert!(
+        other_stderr.contains("is not visible inside the run container")
+            && !other_stderr.contains("panicked"),
+        "--tmp=<dir> with a /tmp summary was not refused up front:\n{other_stderr}"
+    );
+    assert_eq!(
+        stdout(&other),
+        "",
+        "the guest ran before the --tmp=<dir> refusal"
+    );
+
+    // A mode that never writes the summary is not refused.
+    let namespace_only_args = [
+        "run",
+        "--namespace-only",
+        summary_arg.as_str(),
+        "--",
+        "/bin/echo",
+        "guest-ran-3260",
+    ];
+    let namespace_only = hermit(&namespace_only_args);
+    assert_success(&namespace_only, &namespace_only_args);
+    assert_eq!(stdout(&namespace_only), "guest-ran-3260\n");
+
     // Control: the check discriminates rather than refusing every /tmp path.
     let exposed_args = [
         "run",

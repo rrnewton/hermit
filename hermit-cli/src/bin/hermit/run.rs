@@ -694,7 +694,9 @@ pub struct RunOpts {
     /// Print a machine readable version of --summary to a file.
     ///
     /// The summary is written from inside the run container, so an absolute
-    /// path under host /tmp is refused unless --tmp=/tmp exposes host /tmp.
+    /// path the container cannot see is refused before the guest starts: one
+    /// under host /tmp (unless --tmp=/tmp or a --bind exposes it) or under a
+    /// --mount without a source.
     #[clap(long)]
     pub(crate) summary_json: Option<PathBuf>,
 
@@ -3389,10 +3391,11 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
-        self.validate_summary_json_visibility()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
         }
+        // After the event listing, which runs no guest and writes no summary.
+        self.validate_summary_json_visibility()?;
         if self.happens_before.is_some() {
             // Resolve the spec against the guest binary's debug info now and cache
             // it so every subsequent `effective_det_config()` (including both
@@ -4185,30 +4188,46 @@ impl RunOpts {
     /// https://github.com/rrnewton/hermit/issues/3260.
     ///
     /// "Cannot see" is decided by the same guest-path mapping the program check
-    /// uses, so `--tmp`, a `--bind` into `/tmp` and a sourced `--mount` keep
-    /// working, and a source-less `--mount` (a tmpfs, equally discarded) is
-    /// refused for the same reason. A relative path is not refused: the
-    /// container inherits the caller's working directory itself, not its name,
-    /// so a relative summary reaches the host directory even when that
-    /// directory is under `/tmp`. DBT does not write `--summary-json`,
-    /// `--no-namespace` has no private mounts, and `--image` (a prototype)
-    /// replaces the whole root, which this mapping does not model.
+    /// uses, so `--tmp=/tmp`, a `--bind` into `/tmp` and a sourced `--mount`
+    /// keep working, and a source-less `--mount` (a tmpfs, equally discarded)
+    /// is refused for the same reason. `--tmp=<dir>` other than `/tmp` is
+    /// refused for a `/tmp` path too: the guest's `/tmp` is then `<dir>`, so
+    /// the write would go to `<dir>/...` -- not the requested host path, and a
+    /// NotFound panic when that subdirectory is absent. A relative path is not
+    /// refused: the container inherits the caller's working directory itself,
+    /// not its name, so a relative summary reaches the host directory even
+    /// when that directory is under `/tmp`. Modes that never write the summary
+    /// are not refused: DBT, `--namespace-only` and `--hb-list-events` (checked
+    /// earlier). `--no-namespace` has no private mounts, and `--image` (a
+    /// prototype) replaces the whole root, which this mapping does not model.
     fn validate_summary_json_visibility(&self) -> Result<(), Error> {
         let Some(path) = self.summary_json.as_deref() else {
             return Ok(());
         };
         if self.no_namespace
+            || self.namespace_only
             || self.image.is_some()
             || self.selected_backend() == Backend::Dbt
             || !path.is_absolute()
         {
             return Ok(());
         }
-        if matches!(self.mapped_host_program(path), GuestPathMapping::Hidden) {
+        let hidden = match self.mapped_host_program(path) {
+            GuestPathMapping::Hidden => true,
+            // Mapped through `--tmp=<dir>` rather than a bind or mount.
+            GuestPathMapping::Mapped(host) => self.tmp.as_deref().is_some_and(|tmp| {
+                tmp != Path::new(TMP_DIR)
+                    && path
+                        .strip_prefix(TMP_DIR)
+                        .is_ok_and(|suffix| host == tmp.join(suffix))
+            }),
+            GuestPathMapping::Unchanged => false,
+        };
+        if hidden {
             let (cause, remedy) = if path.starts_with(TMP_DIR) {
                 (
                     "it is under host /tmp, but Hermit replaces guest /tmp with an isolated \
-                     directory",
+                     directory (or the --tmp directory)",
                     "Write it outside /tmp, or pass --tmp=/tmp to expose host /tmp.",
                 )
             } else {
