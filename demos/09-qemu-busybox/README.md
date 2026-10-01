@@ -174,9 +174,10 @@ last two summary lines can land inside the console output. In the observed run
 kernel's `Calibrating delay loop` message, and
 `:: Success: deterministic. Determinism verified.` on the next line. In that run
 `verify.json` reported `"verdict": "matched"`, `"bitwise_parity": true`, and
-for each boot 37,385 scheduler turns, 251,622 system calls, and
-193.051448405 seconds of virtual time. This is an L2 result for the ptrace
-backend at log level `info` with no relaxations.
+for each boot 37,385 scheduler turns and 251,622 system calls. Two fresh
+`VERIFY=1` boots with Hermit build `gca6afb1b3124` gave the same counts and
+193.051453375 seconds of virtual time, identically. This is an L2 result for
+the ptrace backend at log level `info` with no relaxations.
 
 The by-hand launcher command above prints the same kernel messages and workload
 to the terminal, preceded by Hermit's

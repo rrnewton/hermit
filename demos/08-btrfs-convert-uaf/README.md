@@ -12,10 +12,13 @@ after the upstream fix. Hermit's chaos mode finds a thread schedule that crashed
 the old build every time it was run on the reference host, the fixed build
 survives that same schedule, and running the schedule again reproduced the
 crash report byte for byte. On a shared or heavily loaded machine the crash may
-not reproduce reliably: chaos mode switches threads at interrupts from the
-CPU's retired-branch counter, and those interrupts can arrive late (skid) by
-an amount that depends on host load. The story of the bug is in
-[WRITEUP.md](WRITEUP.md).
+not reproduce reliably. Chaos mode places each thread switch by counting the
+CPU's retired branches: Hermit arms the counter's interrupt a safety margin of
+branches early and single-steps the rest of the way to the exact switch point.
+If the interrupt arrives later than that margin, which is more likely under
+heavy host load (Hermit then prints a line starting with
+`HERMIT_SKID_OVERSHOOT`), the switch lands past its planned point and the seed
+may miss the race. The story of the bug is in [WRITEUP.md](WRITEUP.md).
 
 ## Prerequisites
 
@@ -217,10 +220,17 @@ one whose environment carried 3,000 extra bytes.
 - Those 44 runs were on a 316-thread host with a load average of 10 to 20,
   lightly loaded for its size (see the timing notes below). On a shared or
   heavily loaded machine the crash may not reproduce reliably, even with the
-  same build, seed, and command line. Chaos mode switches threads at
-  interrupts from the CPU's retired-branch counter, and those interrupts can
-  arrive late (skid) by an amount that depends on host load, so the same seed
-  can then give a different schedule that misses the race.
+  same build, seed, and command line. Chaos mode places each thread switch by
+  counting the CPU's retired branches. This demo's command does not pass
+  `--imprecise-timers`, so Hermit uses precise timers: it arms the counter's
+  interrupt a safety margin of branches early and single-steps the rest of
+  the way to the exact switch point. If the interrupt arrives later than that
+  margin, which is more likely under heavy host load, Hermit prints a line
+  starting with `HERMIT_SKID_OVERSHOOT` and the switch lands past its planned
+  point, so the same seed can give a different schedule that misses the race.
+  `run.sh` saves each Hermit run's standard error with its output in its
+  artifacts directory, `target/demos/08-btrfs-convert-uaf/` by default (for
+  example `chaos-buggy.out`), so look there for that line if the seed misses.
 - The program no longer reads the mount table. Under Hermit,
   `/proc/self/mounts` lists mounts that come from the host at the time of the
   run, and Hermit passes it through unchanged
@@ -263,7 +273,9 @@ picks thread switches pseudo-randomly from `--sched-seed`. Some seeds happen to
 let the main thread free the memory just before the progress thread's last
 read, and AddressSanitizer turns that read into an abort with exit status 134.
 Because the schedule is a function of the seed, running the same seed on the
-same input reproduces the same interleaving and the same report.
+same input reproduced the same interleaving and the same report on a lightly
+loaded host. Under heavy host load a late counter interrupt can move a thread
+switch and the seed may miss; see [What to notice](#what-to-notice).
 
 The two variants carry a small harness, applied identically to both, in
 [`fixtures/`](fixtures/):
