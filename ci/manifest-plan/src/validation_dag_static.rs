@@ -683,14 +683,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_exact_canonical_host_mtimes_are_kept and
     // first_seen_mtime_is_resolved_by_the_first_stat) retain all 874 prior
     // identities: 874 + 2 = 876.
-    ("test.detcore_unit", 876),
+    // Forty-four unit tests (memory::tests 3, procfs::tests 7,
+    // syscalls::files::inject_fstat_scratch 18,
+    // syscalls::files::procfs_wiring_guard 2, syscalls::namespace::tests 4,
+    // syscalls::namespace::tests::other_proc_fd_target 3 and tool_global::tests 7;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 876 prior
+    // identities.
+    ("test.detcore_unit", 920),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
     // The wait4 argument-error regression
     // (wait4_argument_errors_match_linux_and_preserve_children) retains all 28
     // prior identities selected after the node's five named skips.
-    ("test.detcore_misc", 29),
+    // tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 29 prior selected
+    // identities under the unchanged skip filters (measured 30).
+    ("test.detcore_misc", 30),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -741,7 +750,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_renamed_over_target_does_not_get_the_explicit_mtime
     // (https://github.com/rrnewton/hermit/issues/3565); they retain all 193
     // prior identities.
-    ("test.hermit_integration", 195),
+    // Six procfs_determinism inode identity tests
+    // (files_sharing_a_raw_inode_on_two_devices_keep_separate_identities,
+    // another_process_maps_line_is_not_keyed_on_the_readers_mapping_record,
+    // untracked_directory_descriptor_lists_entries_with_stat_inodes,
+    // maps_inodes_equal_stat_inodes_for_every_mapped_file,
+    // other_process_pipe_and_socket_links_match_fstat and
+    // dbt_other_process_links_resolve_with_a_full_descriptor_table;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 195 prior
+    // identities.
+    ("test.hermit_integration", 201),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -829,10 +847,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // liteinst_dispatch_record_reports_patched_sites retains all 27 prior
     // identities.
-    ("test.liteinst_strict", 28),
+    // liteinst_strict_verify_untracked_directory_descriptor_lists_stat_inodes and
+    // liteinst_strict_verify_maps_inodes_equal_stat_inodes
+    // (https://github.com/rrnewton/hermit/pull/3255) retain all 28 prior
+    // identities.
+    ("test.liteinst_strict", 30),
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
     // prior identities.
-    ("test.sabre_examples", 7),
+    // sabre_other_process_links_resolve_with_a_full_descriptor_table
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 7 prior
+    // identities.
+    ("test.sabre_examples", 8),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -882,7 +907,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical 29-test tests_misc selection.
-    ("test.detcore_misc_on_host", 29),
+    // tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 29 prior selected
+    // identities under the unchanged skip filters (measured 30).
+    ("test.detcore_misc_on_host", 30),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -896,7 +924,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin carries test.detcore_time's PMU-free filter: 2 of 31
     // (https://github.com/rrnewton/hermit/issues/3663).
     ("test.detcore_time_on_host", 2),
-    ("test.detcore_unit_on_host", 876),
+    // Forty-four unit tests (memory::tests 3, procfs::tests 7,
+    // syscalls::files::inject_fstat_scratch 18,
+    // syscalls::files::procfs_wiring_guard 2, syscalls::namespace::tests 4,
+    // syscalls::namespace::tests::other_proc_fd_target 3 and tool_global::tests 7;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 876 prior
+    // identities.
+    ("test.detcore_unit_on_host", 920),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -909,7 +943,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3639).
     // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
-    ("test.hermit_integration_on_host", 195),
+    // Six procfs_determinism inode identity tests
+    // (files_sharing_a_raw_inode_on_two_devices_keep_separate_identities,
+    // another_process_maps_line_is_not_keyed_on_the_readers_mapping_record,
+    // untracked_directory_descriptor_lists_entries_with_stat_inodes,
+    // maps_inodes_equal_stat_inodes_for_every_mapped_file,
+    // other_process_pipe_and_socket_links_match_fstat and
+    // dbt_other_process_links_resolve_with_a_full_descriptor_table;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 195 prior
+    // identities.
+    ("test.hermit_integration_on_host", 201),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -934,7 +977,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
     // identities. The host twin also selects
     // liteinst_dispatch_record_reports_patched_sites.
-    ("test.liteinst_strict_on_host", 28),
+    // liteinst_strict_verify_untracked_directory_descriptor_lists_stat_inodes and
+    // liteinst_strict_verify_maps_inodes_equal_stat_inodes
+    // (https://github.com/rrnewton/hermit/pull/3255) retain all 28 prior
+    // identities.
+    ("test.liteinst_strict_on_host", 30),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
@@ -957,7 +1004,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
-    ("test.sabre_examples_on_host", 7),
+    // sabre_other_process_links_resolve_with_a_full_descriptor_table
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 7 prior
+    // identities.
+    ("test.sabre_examples_on_host", 8),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
