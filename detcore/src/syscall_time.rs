@@ -162,23 +162,41 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
 /// syscall in it is charged its normal cost, so a window cannot stop the thread's
 /// syscall-driven clock indefinitely.
 ///
-/// The LiteInst runtime's own constructor left 321 syscalls uncharged per window
-/// when measured on `tests/c/host_identity.c` and on each of the two images of
-/// `hermit-cli/tests/fixtures/clock_trajectory.c` under `--backend liteinst`, so
-/// the cap is about 12.8 times what the runtime itself needs. The cap must stay
-/// at least four times the largest such count.
-pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 4096;
+/// The LiteInst runtime's own constructor makes more syscalls the larger the
+/// image: for each executable mapping it rereads `/proc/self/maps` and
+/// allocates a trampoline arena. Uncharged syscalls per window, measured under
+/// `--backend liteinst --max-timeslice=disabled` (lines of `ldd` output in
+/// parentheses): 321 for `tests/c/host_identity.c` and for each image of
+/// `hermit-cli/tests/fixtures/clock_trajectory.c`; 405 for `python3` (5);
+/// 1,597 for `curl` (28); 3,588 for `gdb` (58); 4,759 for
+/// `qemu-system-x86_64` (72); 6,977 for `emacs` (95). The cap must stay at
+/// least four times the largest such count; 32,768 is 4.7 times emacs's. A
+/// window that reaches the cap says so once, at info level (see
+/// `ThreadState::charge_syscall_time`).
+pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 
-/// Returns true for syscalls whose result lets a guest read virtual time: the
+/// Returns true for syscalls whose main result is a clock or timer value: the
 /// wall-clock and monotonic clocks, the CPU-time clocks and counters, uptime,
-/// and the time left on a timer.
+/// the time left on a timer, and the `time` field an `adjtimex` or
+/// `clock_adjtime` query returns (glibc's `ntp_gettime` reads the clock that
+/// way).
 ///
 /// Inside a backend-runtime bootstrap window these syscalls are always charged,
 /// so two such reads on the bootstrapping thread differ by at least one syscall
 /// cost, exactly as outside the window. `clock_getres` is not listed: it reports
-/// a constant. Syscalls that expose time only as a side output (for example the
-/// old value written by `setitimer` or `timer_settime`) are not listed either;
-/// inside a window they are bounded by [`MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`].
+/// a constant.
+///
+/// Some syscalls give the guest virtual time without it being their main
+/// result. They are not listed, so inside a window they are bounded only by
+/// [`MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`]:
+/// - side outputs: the old value written by `setitimer`, `timer_settime` or
+///   `timerfd_settime`, and the seconds `alarm` returns;
+/// - a `read` of a procfs file Detcore renders from virtual time, such as
+///   `/proc/uptime` (whole seconds);
+/// - `utime` and `utimes` with no times given, which stamp the file with the
+///   virtual time, readable back through `stat`;
+/// - socket receive timestamps, which Detcore sets to the virtual time of the
+///   receive.
 pub(crate) fn observes_virtual_time(sysno: Sysno) -> bool {
     matches!(
         sysno,
@@ -191,6 +209,8 @@ pub(crate) fn observes_virtual_time(sysno: Sysno) -> bool {
             | Sysno::timerfd_gettime
             | Sysno::timer_gettime
             | Sysno::getitimer
+            | Sysno::adjtimex
+            | Sysno::clock_adjtime
     )
 }
 

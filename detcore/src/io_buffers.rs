@@ -1346,7 +1346,23 @@ mod event_tests {
             usage.ru_stime.tv_sec as u64 * 1_000_000_000 + usage.ru_stime.tv_usec as u64 * 1_000
         }
 
-        assert!(observes_virtual_time(Sysno::getrusage));
+        // Every syscall whose main result is a clock or timer value.
+        const TIME_READS: [Sysno; 11] = [
+            Sysno::gettimeofday,
+            Sysno::time,
+            Sysno::clock_gettime,
+            Sysno::sysinfo,
+            Sysno::times,
+            Sysno::getrusage,
+            Sysno::timerfd_gettime,
+            Sysno::timer_gettime,
+            Sysno::getitimer,
+            Sysno::adjtimex,
+            Sysno::clock_adjtime,
+        ];
+        for sysno in TIME_READS {
+            assert!(observes_virtual_time(sysno), "{sysno} reads virtual time");
+        }
         assert!(!observes_virtual_time(Sysno::readv));
         assert!(!observes_virtual_time(Sysno::clock_getres));
 
@@ -1375,6 +1391,14 @@ mod event_tests {
             "two time reads inside the window must observe different times"
         );
         assert_eq!(second_read - first_read, time_read_cost);
+        // The other time reads are charged inside the window as well, and
+        // none of them counts toward the cap.
+        for sysno in TIME_READS {
+            assert!(
+                booting.thread.charge_syscall_time(true, sysno),
+                "{sysno} inside the window must be charged"
+            );
+        }
         assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 0);
 
         // (2) The first MAX_UNCHARGED_BOOTSTRAP_SYSCALLS other syscalls of the

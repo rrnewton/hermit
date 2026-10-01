@@ -40,6 +40,7 @@ use serde::Serialize;
 use sha2::Digest as _;
 use sha2::Sha256;
 use tracing::debug;
+use tracing::info;
 
 use crate::config::Config;
 use crate::detlog;
@@ -2102,7 +2103,8 @@ impl<T> ThreadState<T> {
     /// window a syscall that observes virtual time is always charged; any
     /// other syscall is left uncharged until
     /// [`syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`] of them have been,
-    /// and every syscall after that in the same window is charged.
+    /// and every syscall after that in the same window is charged. Reaching
+    /// the cap logs one info line for the window.
     ///
     /// [`syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`]: crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
     pub(crate) fn charge_syscall_time(
@@ -2126,6 +2128,16 @@ impl<T> ThreadState<T> {
         if self.uncharged_bootstrap_syscalls < crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
         {
             self.uncharged_bootstrap_syscalls += 1;
+            if self.uncharged_bootstrap_syscalls
+                == crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+            {
+                // Once per window: the count stays at the cap from here on.
+                info!(
+                    "[dtid {}] backend runtime bootstrap window reached its cap of {} uncharged syscalls; every further syscall in this window is charged",
+                    self.dettid,
+                    crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+                );
+            }
             return false;
         }
         true
