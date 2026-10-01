@@ -165,13 +165,16 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
 /// The LiteInst runtime's own constructor makes more syscalls the larger the
 /// image: for each executable mapping it rereads `/proc/self/maps` and
 /// allocates a trampoline arena. Uncharged syscalls per window, measured under
-/// `--backend liteinst --max-timeslice=disabled` (lines of `ldd` output in
-/// parentheses): 321 for `tests/c/host_identity.c` and for each image of
-/// `hermit-cli/tests/fixtures/clock_trajectory.c`; 405 for `python3` (5);
-/// 1,597 for `curl` (28); 3,588 for `gdb` (58); 4,759 for
-/// `qemu-system-x86_64` (72); 6,977 for `emacs` (95). The cap must stay at
-/// least four times the largest such count; 32,768 is 4.7 times emacs's. A
-/// window that reaches the cap says so once, at info level (see
+/// `--backend liteinst --max-timeslice=disabled` with Reverie dbf2b5c8 (lines
+/// of `ldd` output in parentheses): 315 for `tests/c/host_identity.c` and for
+/// each image of `hermit-cli/tests/fixtures/clock_trajectory.c`; 401 for
+/// `python3` (5); 1,589 for `curl` (28); 3,588 for `gdb` (58); 4,752 for
+/// `qemu-system-x86_64` (72); 6,970 for `emacs` (95). Beyond a fixed cost the
+/// count grows faster than the number of libraries, because each reread of
+/// `/proc/self/maps` is longer: about 57 syscalls per `ldd` line for `curl` and
+/// 73 for `emacs`. So the margin below shrinks as images grow. The cap must
+/// stay at least four times the largest such count; 32,768 is 4.7 times
+/// emacs's. A window that reaches the cap says so once, at info level (see
 /// `ThreadState::charge_syscall_time`).
 pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 
@@ -179,7 +182,10 @@ pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 /// wall-clock and monotonic clocks, the CPU-time clocks and counters, uptime,
 /// the time left on a timer, and the `time` field an `adjtimex` or
 /// `clock_adjtime` query returns (glibc's `ntp_gettime` reads the clock that
-/// way).
+/// way). Timerfd calls currently pass through to a host timer
+/// (https://github.com/rrnewton/hermit/issues/1923), so `timerfd_gettime`
+/// reports host time left, not virtual time; it is listed because its result
+/// is a timer value.
 ///
 /// Inside a backend-runtime bootstrap window these syscalls are always charged,
 /// so two such reads on the bootstrapping thread differ by at least one syscall
@@ -189,12 +195,14 @@ pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 /// Some syscalls give the guest virtual time without it being their main
 /// result. They are not listed, so inside a window they are bounded only by
 /// [`MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`]:
-/// - side outputs: the old value written by `setitimer`, `timer_settime` or
-///   `timerfd_settime`, and the seconds `alarm` returns;
+/// - side outputs: the old value written by `setitimer` or `timer_settime`,
+///   and the seconds `alarm` returns;
 /// - a `read` of a procfs file Detcore renders from virtual time, such as
 ///   `/proc/uptime` (whole seconds);
-/// - `utime` and `utimes` with no times given, which stamp the file with the
-///   virtual time, readable back through `stat`;
+/// - `utime` and `utimes` with no times given, and every write that updates a
+///   file's modification time (`write`, `writev`, `pwrite64`, `pwritev`,
+///   `pwritev2` and `sendfile`), which stamp the file with the virtual time,
+///   readable back through `stat`;
 /// - socket receive timestamps, which Detcore sets to the virtual time of the
 ///   receive.
 pub(crate) fn observes_virtual_time(sysno: Sysno) -> bool {
