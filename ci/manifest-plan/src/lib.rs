@@ -11,6 +11,7 @@ pub mod host_capability;
 pub mod ledger;
 #[path = "../../../hermit-cli/src/logdiff_report.rs"]
 pub mod logdiff_report;
+pub mod manifest_corpus;
 pub mod manifest_metadata;
 pub mod manifest_value;
 pub mod nextest_binaries;

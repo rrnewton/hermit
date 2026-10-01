@@ -938,10 +938,16 @@ fn generated_plan_populations_preserve_command_policy() {
     // 41 more (26 DBT and 13 ptrace verify cells, and one DBT and one ptrace
     // custom cell for c-programs/io-uring-fallback) when it moves the retired DBT
     // backend-parity matrix onto manifest cells. Preserve raw cardinality as well
-    // as the set: duplicates are not cells.
-    assert!(exact_rng_population(&raw_expected, 900));
+    // as the set: duplicates are not cells. Fold 1 of
+    // https://github.com/rrnewton/hermit/issues/3448 adds the 189 portable
+    // ptrace verify cells of the strict compatibility corpus, which ran as
+    // generated compat.<label> nodes before; every plan below carries them on
+    // both sides, so only its count moves.
+    let compat = crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
+    let total = 900 + compat;
+    assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(expected_cells.len(), 900);
+    assert_eq!(expected_cells.len(), total);
     let rng = raw_expected
         .iter()
         .enumerate()
@@ -951,13 +957,13 @@ fn generated_plan_populations_preserve_command_policy() {
     assert_eq!(rng.len(), 3);
     let mut renamed = raw_expected.clone();
     renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
-    assert!(!exact_rng_population(&renamed, 900));
+    assert!(!exact_rng_population(&renamed, total));
     let mut duplicate = raw_expected.clone();
     duplicate[rng[0]] = duplicate[rng[1]].clone();
-    assert!(!exact_rng_population(&duplicate, 900));
+    assert!(!exact_rng_population(&duplicate, total));
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
-    assert!(!exact_rng_population(&missing, 900));
+    assert!(!exact_rng_population(&missing, total));
     // Today's hosted-portable plan omits the KVM cells, because GitHub-hosted
     // runners have no PMU; its commands carry the exclusion and its steps own
     // exactly the remaining portable cells.
@@ -977,7 +983,7 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(hosted_cells.len(), 893 - 241);
+    assert_eq!(hosted_cells.len(), 893 + compat - 241);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1012,19 +1018,19 @@ fn generated_plan_populations_preserve_command_policy() {
         .map(exact_identity)
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
-    assert_eq!(pre_fold_cells.len(), 900);
+    assert_eq!(pre_fold_cells.len(), total);
     for (label, tag, retained_command, cell_count) in [
         (
             "full",
             "e2e.manifest_backend_parity_c",
             LAST_LIVE_PORTABLE_PARITY_SELECTOR,
-            900,
+            total,
         ),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893,
+            893 + compat,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();

@@ -27,17 +27,12 @@ const POLICY: &str = "ci/test-footprints-policy.json";
 const OUTPUT: &str = "ci/test-footprints.json";
 const DAG: &str = "ci/dag/validate.json";
 const REGENERATE: &str = "cargo run -p hermit-manifest-plan --bin generate-test-footprints";
-const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
 
 fn known_selection_node(nodes: &BTreeSet<String>, node: &str) -> bool {
     nodes.contains(node)
         // Policy uses the public selectors shared with local validation. The
         // hosted driver resolves only an exact, present `_on_host` counterpart.
         || nodes.contains(&format!("{node}_on_host"))
-        || (node == STRICT_COMPAT_SELECTION_ALIAS
-            && nodes
-                .iter()
-                .any(|candidate| candidate.starts_with("compat.")))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -754,9 +749,10 @@ mod tests {
             &nodes,
             "test.applications_e2e_on_host"
         ));
-        assert!(known_selection_node(&nodes, STRICT_COMPAT_SELECTION_ALIAS));
-        nodes.retain(|node| !node.starts_with("compat."));
-        assert!(!known_selection_node(&nodes, STRICT_COMPAT_SELECTION_ALIAS));
+        // The strict compatibility corpus is one bucket, named like any other.
+        assert!(known_selection_node(&nodes, "e2e.manifest_compat"));
+        assert!(nodes.remove("e2e.manifest_compat_on_host"));
+        assert!(!known_selection_node(&nodes, "e2e.manifest_compat"));
     }
 
     #[test]

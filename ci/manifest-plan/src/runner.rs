@@ -106,6 +106,8 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
+#[cfg(test)]
+use crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
 use crate::timeouts::resolve_test_timeouts;
 use crate::timeouts::resolve_timeout_seconds;
@@ -372,6 +374,20 @@ pub struct ModeRecipe {
     /// supply L2 evidence, and its divergence must keep failing.
     #[serde(default)]
     pub diagnostic: BTreeMap<String, String>,
+    /// Why a product failure of this verify cell is final. Every other cell
+    /// is retried once after a product failure; this one gets one attempt,
+    /// for a corpus whose recorded verdict was a single run (the strict
+    /// compatibility corpus), so a first-attempt failure stays a failure.
+    pub no_retry_reason: Option<String>,
+}
+
+/// Whether a product failure of `cell` earns the runner's one retry: false
+/// for a verify cell that declares `no_retry_reason`.
+pub fn retries_product_failures(cell: &SelectedCell) -> bool {
+    cell.test
+        .modes
+        .get(&cell.id.mode)
+        .is_none_or(|mode| mode.no_retry_reason.is_none())
 }
 
 /// A stripped cell's report must hold the comparison it declared: Hermit's
@@ -1077,6 +1093,11 @@ pub struct Selection {
     /// hosted profile's expected population omits them by the same list, so an
     /// omitted cell is never counted as a pass.
     pub exclude_backends: Vec<String>,
+    /// Manifest categories (buckets) whose cells this selection omits. The
+    /// committed caller is the quick profile's pinned-root verify smoke, which
+    /// omits the host-bound compatibility corpus by
+    /// [`crate::validation_dag::QUICK_EXCLUDED_CATEGORIES`].
+    pub exclude_categories: Vec<String>,
     pub include_occasional: bool,
     pub include_manual: bool,
     /// When non-empty, only tests carrying at least one of these labels.
@@ -1195,7 +1216,15 @@ impl ManifestSet {
             .filter(|(path, _)| path.file_name().is_some_and(|name| name != DEFAULTS_FILE))
         {
             let document: ManifestDocument = serde_yaml::from_str(source)
-                .map_err(|e| format!("{}: invalid YAML: {e}", path.display()))?;
+                .map_err(|e| format!("{}: invalid YAML: {e}", path.display()))
+                .and_then(|value| {
+                    crate::manifest_corpus::expand_corpus(value)
+                        .map_err(|e| format!("{}: {e}", path.display()))
+                })
+                .and_then(|value| {
+                    serde_yaml::from_value(value)
+                        .map_err(|e| format!("{}: invalid manifest: {e}", path.display()))
+                })?;
             let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
             validate_document_with_cpu(
                 &document,
@@ -1249,6 +1278,17 @@ impl ManifestSet {
         }) {
             return Err(format!("--label {label} names no test in any manifest"));
         }
+        // An excluded category no manifest has is a typo that would exclude nothing.
+        if let Some(category) = selection.exclude_categories.iter().find(|category| {
+            !self
+                .tests
+                .values()
+                .any(|(bucket, _, _, _)| bucket == *category)
+        }) {
+            return Err(format!(
+                "--exclude-category {category} names no manifest category"
+            ));
+        }
         let population = selection.population.unwrap_or(Population::Enabled);
         let mut cells = Vec::new();
         for (id, (category, bucket_timeout_seconds, default_cpu_timeout_seconds, test)) in
@@ -1263,6 +1303,7 @@ impl ManifestSet {
                     .as_deref()
                     .is_some_and(|value| value != category)
                 || selection.test.as_deref().is_some_and(|value| value != id)
+                || selection.exclude_categories.contains(category)
                 || (!selection.include_occasional && test.occasional)
                 || (!selection.labels.is_empty()
                     && !test
@@ -1470,7 +1511,9 @@ fn validate_document_with_cpu(
                 }
             }
             (None, Some(DirectCommand::Shell(command))) if !command.trim().is_empty() => {}
-            (None, Some(DirectCommand::Argv(argv))) if !argv.is_empty() => {}
+            (None, Some(DirectCommand::Argv(argv))) if !argv.is_empty() => {
+                crate::manifest_corpus::check_direct_placeholders(&test.id, argv)?;
+            }
             (Some(_), Some(_)) => return Err(format!("{}: set only program or direct", test.id)),
             _ => return Err(format!("{}: missing executable program/direct", test.id)),
         }
@@ -2907,7 +2950,14 @@ fn prepare_test_until(
             }
             argv
         }
-        (None, Some(DirectCommand::Argv(argv))) => argv.clone(),
+        (None, Some(DirectCommand::Argv(argv))) => {
+            crate::manifest_corpus::resolve_direct_placeholders(
+                &cell.test.id,
+                argv,
+                &context.root,
+                crate::manifest_corpus::validate_run_state().as_deref(),
+            )?
+        }
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
@@ -5838,11 +5888,19 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         || !recipe.env.is_empty()
         || recipe.comparator.is_some()
         || recipe.comparator_reason.is_some()
-        || !recipe.diagnostic.is_empty();
+        || !recipe.diagnostic.is_empty()
+        || recipe.no_retry_reason.is_some();
     if extends && mode != "verify" {
         return Err(format!(
-            "{id}: {mode} declares hermit_args, env, comparator or diagnostic, which only a verify mode accepts"
+            "{id}: {mode} declares hermit_args, env, comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
         ));
+    }
+    if recipe
+        .no_retry_reason
+        .as_deref()
+        .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err(format!("{id}: no_retry_reason must be substantive"));
     }
     // Each flag at most once. An exact repeat would repeat a relaxation
     // identity, which the scorecard refuses; two values for one flag would
@@ -6633,6 +6691,16 @@ mod tests {
             "requires a substantive comparator_reason",
         );
         refused(
+            &|r| r.no_retry_reason = Some(" ".into()),
+            "verify",
+            "no_retry_reason must be substantive",
+        );
+        refused(
+            &|r| r.no_retry_reason = Some("single recorded run".into()),
+            "replay",
+            "only a verify mode accepts",
+        );
+        refused(
             &|r| r.comparator = None,
             "verify",
             "comparator_reason without comparator stripped",
@@ -6940,6 +7008,124 @@ mod tests {
         );
         assert!(at(&stripped.argv, "--verify").is_some());
         assert_eq!(stripped.comparator, Comparator::Stripped);
+    }
+
+    /// The strict compatibility corpus ran each program as its own validation
+    /// node with `hermit run --strict --verify --base-env=minimal
+    /// --no-virtualize-cpuid --max-timeslice=disabled
+    /// --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp --
+    /// <argv> </dev/null`. Fold 1 of
+    /// https://github.com/rrnewton/hermit/issues/3448 moved it into
+    /// compat.yaml; the shipped row, built the way the runner builds it under
+    /// e2e.manifest_compat's HERMIT_E2E_EMPTY_WORKDIR=/test, still carries
+    /// every one of those flags, the stripped comparator, and the guest argv
+    /// with its run-owned fixture path.
+    #[test]
+    fn a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cells = ManifestSet::load(&root)
+            .unwrap()
+            .select(&Selection {
+                test: Some("compat/cat".into()),
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap();
+        let [cell] = cells.as_slice() else {
+            panic!("compat/cat must have exactly one CI cell: {cells:?}");
+        };
+        assert_eq!(
+            (cell.id.mode.as_str(), cell.id.backend.as_deref()),
+            ("verify", Some("ptrace"))
+        );
+        let DirectCommand::Argv(argv) = cell.test.direct.as_ref().unwrap() else {
+            panic!("compat/cat must be a direct argv");
+        };
+        let guest = crate::manifest_corpus::resolve_direct_placeholders(
+            &cell.test.id,
+            argv,
+            &root,
+            Some(std::ffi::OsStr::new("/run-state")),
+        )
+        .unwrap();
+        assert_eq!(
+            guest,
+            [
+                "/bin/cat",
+                "/run-state/strict-compat/real-compat-fixtures/README.md"
+            ]
+        );
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: PathBuf::from("/repo/hermit"),
+            result_root: PathBuf::from("/repo/results"),
+            build_root: PathBuf::from("/repo/build"),
+            run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
+            attempt: 1,
+            run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: true,
+            keep_logs: false,
+            parity_retained: BTreeSet::new(),
+            run_verify_strict: true,
+            record_verify_strict: true,
+            timeout_multipliers: TimeoutMultipliers::default(),
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: Some(PathBuf::from("/test")),
+        };
+        let spec = build_spec(
+            &context,
+            cell,
+            PathBuf::from("/repo/results/cell"),
+            guest.clone(),
+            "1",
+            None,
+            cell.timeout_seconds,
+        )
+        .unwrap();
+        let argv = &spec.argv;
+        let at = |want: &[&str]| {
+            argv.windows(want.len())
+                .position(|window| window == want)
+                .unwrap_or_else(|| panic!("{want:?} missing from {argv:?}"))
+        };
+        let separator = at(&["--"]);
+        let ordered = [
+            at(&["run"]),
+            at(&["--base-env=minimal"]),
+            at(&["--strict"]),
+            at(&["--no-virtualize-cpuid"]),
+            at(&["--max-timeslice=disabled"]),
+            at(&["--verify"]),
+            at(&["--mount=type=tmpfs,target=/test"]),
+            at(&["--workdir", "/test"]),
+            at(&["--env", "TMPDIR=/tmp"]),
+            separator,
+        ];
+        assert!(ordered.is_sorted(), "{ordered:?} in {argv:?}");
+        assert!(!argv.iter().any(|arg| arg == "--verify-strict"), "{argv:?}");
+        assert_eq!(argv[separator + 1..], guest[..]);
+        assert_eq!(spec.comparator, Comparator::Stripped);
+        assert_eq!((cell.timeout_seconds, cell.cpu_timeout_seconds), (60, 59));
+        // One attempt, as the generated node had; an ordinary cell retries.
+        assert!(!retries_product_failures(cell));
+        let ordinary = ManifestSet::load(&root)
+            .unwrap()
+            .select(&Selection {
+                test: Some("c-programs/random-readv-stream".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert!(retries_product_failures(&ordinary[0]));
     }
 
     use super::PRODUCER_STRIPPED_REPORT;
@@ -7672,6 +7858,7 @@ mod tests {
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
                 + 3 // the exact RNG identities asserted above
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
+                + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
@@ -7744,6 +7931,35 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        // The strict compatibility corpus (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448) keeps the wall bounds
+        // its generated validation nodes carried, 60 s and 20 s for its five
+        // bounded diagnostics, with CPU one second below each (a cell's CPU
+        // budget must stay below its wall). These literals are the check; they
+        // are not read back from compat.yaml.
+        let (compat, observed): (BTreeMap<_, _>, BTreeMap<_, _>) = observed
+            .into_iter()
+            .partition(|((test, _, _), _)| test.starts_with("compat/"));
+        assert_eq!(
+            compat.len(),
+            STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
+        );
+        for ((test, mode, backend), bounds) in &compat {
+            assert_eq!((*mode, *backend), ("verify", "ptrace"), "{test}");
+            let diagnostic = matches!(
+                *test,
+                "compat/df"
+                    | "compat/ranlib"
+                    | "compat/top"
+                    | "compat/zstd"
+                    | "compat/zstd-roundtrip"
+            );
+            assert_eq!(
+                *bounds,
+                if diagnostic { (19, 20) } else { (59, 60) },
+                "{test}"
+            );
+        }
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

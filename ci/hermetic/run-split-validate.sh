@@ -46,9 +46,9 @@
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
 # gets this wrong in both directions:
-#   * the strict compatibility marker has group "test" but expands into direct
-#     `compat.*` nodes after its other test-node predecessors in a separate
-#     hosted job;
+#   * the strict compatibility bucket e2e.manifest_compat_on_host has group
+#     "e2e" but runs, with its fixture producer, after its test-node
+#     predecessors in a separate hosted job, not in the E2E job;
 #   * preflight, check, setup, and E2E audit nodes are not group "build", but
 #     they execute before the remaining test side.
 # Read the map rather than reconstructing either partition from tag prefixes.
@@ -211,39 +211,17 @@ if [[ -z "$shards" ]]; then
         --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
     plan_json=$(sed -n '1p' "$plan_out")
     rm -f "$plan_out"
-    strict_alias_count=$(tr ',' '\n' <<<"$build_nodes,$test_nodes" |
-        grep -Fxc 'test.strict_compat' || true)
-    [[ $strict_alias_count -eq 1 ]] || {
-        echo "run-split-validate: shard map has $strict_alias_count test.strict_compat aliases; expected exactly one." >&2
-        exit 1
-    }
-    compat_expansion=$(jq -r '
-        .dags[].steps[].tag
-        | select(. == "compatprep.fixtures" or . == "compatprep.fixtures_on_host" or startswith("compat."))
-    ' <<<"$plan_json")
-    [[ -n "$compat_expansion" ]] || {
-        echo "run-split-validate: constructed plan has no direct strict compatibility nodes." >&2
-        exit 1
-    }
-    # The shard map deliberately retains the stable `test.strict_compat`
-    # selection alias. Validate expands that alias at execution time; expand it
-    # here too before comparing the partition with the constructed graph.
     selected_list=$(
-        {
-            # Match validate's exact-name-first hosted selector resolution.
-            # Preserve unknown names and duplicates for the checks below.
-            tr ',' '\n' <<<"$build_nodes,$test_nodes" | grep -Fvx 'test.strict_compat' |
-                jq -Rr --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_json")" '
-                    . as $tag | ($tag + "_on_host") as $hosted
-                    | if ($available | index($tag)) == null and ($available | index($hosted)) != null
-                      then $hosted else $tag end
-                '
-            printf '%s\n' "$compat_expansion"
-        } | LC_ALL=C sort
+        # Match validate's exact-name-first hosted selector resolution.
+        # Preserve unknown names and duplicates for the checks below.
+        tr ',' '\n' <<<"$build_nodes,$test_nodes" |
+            jq -Rr --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_json")" '
+                . as $tag | ($tag + "_on_host") as $hosted
+                | if ($available | index($tag)) == null and ($available | index($hosted)) != null
+                  then $hosted else $tag end
+            ' | LC_ALL=C sort
     )
     duplicate_nodes=$(LC_ALL=C uniq -d <<<"$selected_list" || true)
-    strict_compat_node_count=$(wc -l <<<"$compat_expansion")
-    test_node_count=$((test_node_count - 1 + strict_compat_node_count))
     expected_list=$(jq -r '.dags[].steps[].tag' <<<"$plan_json" | LC_ALL=C sort)
     duplicate_dag_nodes=$(LC_ALL=C uniq -d <<<"$expected_list" || true)
     selected_unique=$(LC_ALL=C uniq <<<"$selected_list")

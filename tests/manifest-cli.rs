@@ -43,6 +43,13 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+// A `corpus:` bucket (compat.yaml) is expanded into the ordinary tests the
+// harness runs, and its argv placeholders rendered for a shell; this adapter
+// uses only that part of the shared module.
+#[allow(dead_code)]
+#[path = "../ci/manifest-plan/src/manifest_corpus.rs"]
+mod manifest_corpus;
+
 // This rust-script adapter uses only the schema-facing subset of the shared
 // timeout module; the manifest-plan crate consumes its calibration API.
 #[allow(dead_code)]
@@ -314,7 +321,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
                 fail(format!("{id}: direct argv must not be empty"));
             }
             argv.iter()
-                .map(|argument| shell_quote(argument))
+                .map(|argument| {
+                    manifest_corpus::direct_shell_word(id, argument, shell_quote)
+                        .unwrap_or_else(|error| fail(error))
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         }
@@ -559,9 +569,11 @@ fn load_manifests(root: &Path) -> Manifests {
             .unwrap_or_else(|| fail(format!("non-UTF-8 manifest name: {}", path.display())));
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
-        let manifest: Value = source
-            .parse()
-            .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
+        let manifest: Value = serde_yaml::from_str(&source)
+            .map_err(|e| e.to_string())
+            .and_then(manifest_corpus::expand_corpus)
+            .and_then(Value::from_yaml)
+            .unwrap_or_else(|e| fail(format!("{}: invalid manifest: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
         if schema != Some(MANIFEST_SCHEMA as i64) {
             fail(format!(

@@ -79,17 +79,6 @@ jq -e '.profile == "hosted-portable" and .selection_mode == "label"' \
     exit 2
 }
 mapfile -t expected < <(jq -r '.dags[].steps[].tag' <<<"$plan_json" | sort -u)
-mapfile -t strict_compat_expansion < <(
-    jq -r '
-        .dags[].steps[].tag
-        | select(. == "compatprep.fixtures" or . == "compatprep.fixtures_on_host" or startswith("compat."))
-    ' <<<"$plan_json" | sort -u
-)
-if ((${#strict_compat_expansion[@]} == 0)); then
-    echo "check-shard-coverage.sh: constructed plan has no direct strict compatibility nodes" >&2
-    exit 2
-fi
-
 # Match validate's exact-name-first hosted selector resolution before checking
 # either coverage or predecessor supply. The source shard map keeps its public
 # selectors; unknown names and duplicate resolutions remain failures below.
@@ -104,8 +93,8 @@ shards_json=$(jq --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_jso
      .release_shards[].nodes[]) |= resolve
 ' "$shards")
 
-# Every selection alias assigned by the shard map, across all job buckets.
-mapfile -t assigned_aliases < <(
+# Every node assigned by the shard map, across all job buckets.
+mapfile -t assigned < <(
     jq -r '
         (.preflight_nodes // [])
       + (.check_nodes // [])
@@ -119,18 +108,6 @@ mapfile -t assigned_aliases < <(
       + ([ (.release_shards // [])[] | .nodes[] ])
         | .[]
     ' <<<"$shards_json" | sort
-)
-strict_alias_count=$(printf '%s\n' "${assigned_aliases[@]}" |
-    grep -Fxc 'test.strict_compat' || true)
-if [[ $strict_alias_count -ne 1 ]]; then
-    echo "check-shard-coverage.sh: FAIL — shard map assigns test.strict_compat $strict_alias_count times; expected exactly one stable alias" >&2
-    exit 1
-fi
-mapfile -t assigned < <(
-    {
-        printf '%s\n' "${assigned_aliases[@]}" | grep -Fvx 'test.strict_compat'
-        printf '%s\n' "${strict_compat_expansion[@]}"
-    } | sort
 )
 
 # Duplicate assignment (a node in two buckets) is a defect.
@@ -175,8 +152,9 @@ while IFS= read -r node; do
     fi
 done < <(jq -r '.e2e_nodes[]' <<<"$shards_json")
 
-# The converse of the rule above. Only e2e jobs pack the parity-v1 transport
-# archive that the reducer in the `regular` job reads, and the reducer compares
+# The converse of the rule above. Only e2e jobs, and the strict-compat job for
+# its own buckets (workflow_strict_compat_parity_contract), pack the parity-v1
+# transport archive that the reducer in the `regular` job reads, and the reducer compares
 # its results against every portable cell in ci/expected-e2e-plan.json. A
 # manifest node that selects portable cells but is co-scheduled in a test shard
 # still runs and passes there, yet its results never reach the reducer, which
@@ -700,6 +678,31 @@ workflow_artifact_edge() {
             grep -Fqx -- "$download_value"
 }
 
+# The strict-compat job runs manifest buckets with portable cells
+# (e2e.manifest_compat_on_host), so, like an e2e matrix job, it packs each one's
+# parity-v1 archive for the reducer through ci/pack-parity-transport.sh, the
+# reducer's expected archive count includes them, and selection runs the job
+# whenever e2e runs, because the reducer requires every portable cell.
+workflow_strict_compat_parity_contract() {
+    local workflow_text=$1 map_json=$2 node slug body archive_line
+    body=$(workflow_job_body strict-compat "$workflow_text") || return 1
+    while IFS= read -r node; do
+        slug=${node#e2e.manifest_}
+        slug=${slug%_on_host}
+        grep -Fqx "        run: ./ci/pack-parity-transport.sh $slug $node" <<<"$body" &&
+            workflow_artifact_edge strict-compat name \
+                "parity-v1-\${{ github.run_id }}-\${{ github.run_attempt }}-portable-$slug" \
+                regular pattern 'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*' \
+                "$workflow_text" || return 1
+    done < <(jq -r '.strict_compat_nodes[] | select(startswith("e2e.manifest_"))' <<<"$map_json")
+    IFS= read -r archive_line <<'LINE'
+          archive_count=$(jq '[.e2e_nodes[], (.strict_compat_nodes[] | select(startswith("e2e.manifest_")))] | length' ci/portable-shards.json)
+LINE
+    grep -Fqx -- "$archive_line" <<<"$workflow_text" &&
+        grep -Fqx '          EXPECTED: ${{ needs.build-debug.outputs.parity_archive_count }}' <<<"$workflow_text" &&
+        grep -Fqx '          if [[ "$run_e2e" == "true" && "$run_strict" != "true" ]]; then' <<<"$workflow_text"
+}
+
 workflow_wiring_contract() {
     local workflow_text=$1
 
@@ -972,6 +975,23 @@ if ! workflow_wiring_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — workflow job needs/artifact transfers do not match the constructed dependency supply contract" >&2
     status=1
 fi
+if ! workflow_strict_compat_parity_contract "$workflow_text" "$shards_json"; then
+    echo "check-shard-coverage.sh: FAIL — the strict-compat job's manifest buckets do not reach the reducer: each must be packed by ci/pack-parity-transport.sh and uploaded, counted in parity_archive_count, and run whenever e2e runs" >&2
+    status=1
+fi
+for mutation in pack count; do
+    case $mutation in
+    pack) planted=${workflow_text/$'        run: ./ci/pack-parity-transport.sh compat e2e.manifest_compat_on_host\n'/} ;;
+    count) planted=${workflow_text/'${{ needs.build-debug.outputs.parity_archive_count }}'/'${{ needs.build-debug.outputs.e2e_count }}'} ;;
+    esac
+    if [[ $planted == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — strict-compat parity $mutation mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_strict_compat_parity_contract "$planted" "$shards_json"; then
+        echo "check-shard-coverage.sh: FAIL — strict-compat parity guard accepted a planted $mutation defect" >&2
+        status=1
+    fi
+done
 
 for step_name in 'Run constructed E2E node (${{ matrix.node }})' 'Run constructed E2E verdict'; do
     original="      - name: $step_name"
@@ -1101,8 +1121,7 @@ check_json=$(jq -c '.check_nodes // []' <<<"$shards_json")
 build_debug_json=$(jq -c '.build_debug_nodes // []' <<<"$shards_json")
 build_dbt_json=$(jq -c '.build_dbt_nodes // []' <<<"$shards_json")
 build_aux_json=$(jq -c '.build_aux_nodes // []' <<<"$shards_json")
-strict_compat_json=$(printf '%s\n' "${strict_compat_expansion[@]}" |
-    jq -Rsc 'split("\n") | map(select(length > 0))')
+strict_compat_json=$(jq -c '.strict_compat_nodes // []' <<<"$shards_json")
 through_preflight=$(jq -cn --argjson preflight "$preflight_json" '$preflight')
 through_checks=$(jq -cn --argjson preflight "$preflight_json" --argjson checks "$check_json" '$preflight + $checks')
 through_debug=$(jq -cn --argjson preflight "$preflight_json" --argjson debug "$build_debug_json" '$preflight + $debug')

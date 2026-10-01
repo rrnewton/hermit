@@ -89,6 +89,14 @@ impl FromStr for Value {
     }
 }
 
+impl Value {
+    /// Convert an already-parsed YAML value, such as a manifest document whose
+    /// `corpus:` section was expanded first.
+    pub fn from_yaml(value: serde_yaml::Value) -> Result<Self, String> {
+        convert(value)
+    }
+}
+
 fn convert(value: serde_yaml::Value) -> Result<Value, String> {
     match value {
         serde_yaml::Value::Null => Ok(Value::Null),

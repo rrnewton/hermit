@@ -38,6 +38,7 @@ use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
+use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
@@ -87,6 +88,7 @@ Selection options:
   --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
                                    Omit that backend's cells; may repeat
   --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat
+  --exclude-category <CATEGORY>    Omit that manifest category's cells; may repeat
   --ci-only                        Select required CI cells
   --include-occasional             Include occasional cells
   --include-manual                 Include manual cells; requires exact test and mode
@@ -155,7 +157,8 @@ const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --backend <ptrace|dbt|kvm|sabre|liteinst>
   --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
                                    Omit that backend's cells; may repeat
-  --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat";
+  --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat
+  --exclude-category <CATEGORY>    Omit that manifest category's cells; may repeat";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -386,6 +389,13 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 }
                 args.selection.exclude_backends.push(backend);
             }
+            "--exclude-category" => {
+                let category = required_value(&mut values, "--exclude-category");
+                if args.selection.exclude_categories.contains(&category) {
+                    fail(format!("--exclude-category {category} was given twice"));
+                }
+                args.selection.exclude_categories.push(category);
+            }
             "--ci-only" => {
                 args.ci_only = true;
                 args.selection.population = Some(Population::Required);
@@ -424,12 +434,16 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
 
 /// A node that does not declare diagnostic results writes schema 2, which
 /// cannot say a failure is non-blocking. Refuse to run a diagnostic cell there
-/// rather than report its excused failure as an ordinary one.
+/// rather than report its failure as an ordinary one. A run that reports to no
+/// scheduler (no `DAGRUN_TEST_COUNTS_PATH`, such as one pressure-test sample)
+/// may run it: without the declaration its failure is not excused, so it
+/// blocks like any other.
 fn require_declared_diagnostics(
     cells: &[SelectedCell],
     diagnostic_results: bool,
+    reports_to_scheduler: bool,
 ) -> Result<(), String> {
-    if diagnostic_results {
+    if diagnostic_results || !reports_to_scheduler {
         return Ok(());
     }
     match cells.iter().find(|cell| is_diagnostic_cell(cell)) {
@@ -504,12 +518,17 @@ fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults,
     )
 }
 
-/// The reason a finished cell is an excused diagnostic failure: the row the
-/// harness reports for it is a FAIL, and its history ends in a diagnostic
-/// cell's measured failure. A cell whose history could not be summarized is
-/// reported as an ERROR and is never excused.
-fn excused_diagnostic<'a>(summarized: &CellResult, history: &'a [CellResult]) -> Option<&'a str> {
-    if summarized.outcome != "FAIL" {
+/// The reason a finished cell is an excused diagnostic failure: the run
+/// declared `--diagnostic-results`, the row the harness reports for the cell is
+/// a FAIL, and its history ends in a diagnostic cell's measured failure. A cell
+/// whose history could not be summarized is reported as an ERROR and is never
+/// excused, and an undeclared run excuses nothing.
+fn excused_diagnostic<'a>(
+    declared: bool,
+    summarized: &CellResult,
+    history: &'a [CellResult],
+) -> Option<&'a str> {
+    if !declared || summarized.outcome != "FAIL" {
         return None;
     }
     diagnostic_failure_reason(history)
@@ -2457,6 +2476,13 @@ fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) 
     }
 }
 
+/// Whether this finished attempt of `cell` is retried: a retryable product
+/// failure of a cell that has not declared `no_retry_reason`.
+fn attempt_earns_retry(cell: &SelectedCell, result: &CellResult) -> bool {
+    retries_product_failures(cell)
+        && cell_result_is_retryable(result.outcome.as_str(), result.failure_class)
+}
+
 /// The selection `run` applies for `args`: its filters, over the required
 /// population unless manual cells are included.
 fn run_selection(args: &Args) -> Selection {
@@ -2496,7 +2522,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
-    if let Err(error) = require_declared_diagnostics(&cells, args.diagnostic_results) {
+    if let Err(error) = require_declared_diagnostics(
+        &cells,
+        args.diagnostic_results,
+        std::env::var_os("DAGRUN_TEST_COUNTS_PATH").is_some(),
+    ) {
         fail(error);
     }
     let capacity = scheduled_worker_capacity(args);
@@ -2560,7 +2590,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => error.into_result(&attempt_context, cell),
                     }
                 },
-                |result| cell_result_is_retryable(result.outcome.as_str(), result.failure_class),
+                |result| attempt_earns_retry(cell, result),
                 emit,
             );
         },
@@ -2662,7 +2692,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         result
                     }
                 };
-                if let Some(reason) = excused_diagnostic(&result, &attempt_results[index]) {
+                if let Some(reason) =
+                    excused_diagnostic(args.diagnostic_results, &result, &attempt_results[index])
+                {
                     // Reported and counted, never silent; it does not fail the run.
                     println!(
                         "DIAGNOSTIC {} ({}/{}): this product failure does not fail the run: {reason}",
@@ -2689,7 +2721,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let diagnostic_cells = indexed_results
         .iter()
         .filter_map(|(index, result)| {
-            let reason = excused_diagnostic(result, &attempt_results[*index])?;
+            let reason =
+                excused_diagnostic(args.diagnostic_results, result, &attempt_results[*index])?;
             Some(serde_json::json!({
                 "test": result.test,
                 "mode": result.mode,
@@ -4349,10 +4382,11 @@ sys.exit(1 if failed else 0)
                 );
             }
         }
-        // Twelve hosted-portable manifest buckets, one step each, after
-        // backend-parity-c was folded into c-programs
-        // (https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(hosted, 12, "hosted-portable harness steps");
+        // Thirteen hosted-portable manifest buckets, one step each: twelve
+        // after backend-parity-c was folded into c-programs
+        // (https://github.com/rrnewton/hermit/issues/3301), plus compat since
+        // fold 1 of https://github.com/rrnewton/hermit/issues/3448.
+        assert_eq!(hosted, 13, "hosted-portable harness steps");
         assert!(local > hosted, "local harness steps: {local}");
     }
 
@@ -4404,8 +4438,11 @@ sys.exit(1 if failed else 0)
         // (18, 15) until slice S6 of https://github.com/rrnewton/hermit/issues/3301
         // folded e2e.manifest_backend_parity_c and its _on_host twin into the
         // c-programs pair; +2 pinned and +1 direct for the privileged
-        // system-utils bucket that owns sysfs-sanitized-prefixes.
-        assert_eq!((pinned, direct), (19, 15));
+        // system-utils bucket that owns sysfs-sanitized-prefixes; +2 direct
+        // for e2e.manifest_compat and its _on_host twin, which run on the host
+        // because the corpus's programs are host-installed (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448).
+        assert_eq!((pinned, direct), (19, 17));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -4464,7 +4501,10 @@ sys.exit(1 if failed else 0)
         // privileged-e2e.manifest_system_utils. The selected cells are still
         // each reported once. Slice S13 added the DBT parity cells of
         // c-programs/cpuid-probe and c-programs/pid-probe, taking 192 to 194.
-        assert_eq!(nodes, 15);
+        // 16 since e2e.manifest_compat (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448); it plans no parity
+        // cell, so the selected cells and their reports are unchanged.
+        assert_eq!(nodes, 16);
         let lines = reported.values().map(Vec::len).sum::<usize>();
         assert_eq!((selection.len(), lines), (194, 194));
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
@@ -4781,12 +4821,17 @@ sys.exit(1 if failed else 0)
         let mut summarized_error = diagnostic_history[0].clone();
         summarized_error.outcome = "ERROR".into();
         assert_eq!(
-            excused_diagnostic(&summarized_error, diagnostic_history),
+            excused_diagnostic(true, &summarized_error, diagnostic_history),
             None
         );
         assert_eq!(
-            excused_diagnostic(&diagnostic_history[0], diagnostic_history),
+            excused_diagnostic(true, &diagnostic_history[0], diagnostic_history),
             Some("bounded probe")
+        );
+        // A run that did not declare --diagnostic-results excuses nothing.
+        assert_eq!(
+            excused_diagnostic(false, &diagnostic_history[0], diagnostic_history),
+            None
         );
     }
 
@@ -5550,13 +5595,16 @@ sys.exit(1 if failed else 0)
                 .unwrap()
         };
         let probe = select("probe");
-        let error = super::require_declared_diagnostics(&probe, false).unwrap_err();
+        let error = super::require_declared_diagnostics(&probe, false, true).unwrap_err();
         assert!(
             error.contains("pick/probe (verify/ptrace) is a diagnostic cell"),
             "{error}"
         );
-        super::require_declared_diagnostics(&probe, true).unwrap();
-        super::require_declared_diagnostics(&select("plain"), false).unwrap();
+        super::require_declared_diagnostics(&probe, true, true).unwrap();
+        super::require_declared_diagnostics(&select("plain"), false, true).unwrap();
+        // With no scheduler report there is no schema to misstate it, and an
+        // undeclared run does not excuse its failure (excused_diagnostic).
+        super::require_declared_diagnostics(&probe, false, false).unwrap();
         fs::remove_dir_all(fixture).unwrap();
     }
 
@@ -5889,6 +5937,40 @@ sys.exit(1 if failed else 0)
         );
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         assert_eq!(rows, [(1, true), (2, false)]);
+    }
+
+    /// The production retry decision: a product FAIL of a shipped
+    /// strict-compatibility row (no_retry_reason) is final, while the same
+    /// FAIL of an ordinary verify cell earns its retry.
+    #[test]
+    fn a_no_retry_cell_is_not_retried_after_a_product_failure() {
+        let manifests = ManifestSet::load(&super::root()).unwrap();
+        let cell = |test: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some(test.into()),
+                    mode: Some("verify".into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let failed = attempt_row(
+            "fixture/t",
+            1,
+            "FAIL",
+            Some("product_failure"),
+            "required",
+            &[],
+            None,
+        );
+        assert!(!super::attempt_earns_retry(&cell("compat/cat"), &failed));
+        assert!(super::attempt_earns_retry(
+            &cell("c-programs/random-readv-stream"),
+            &failed
+        ));
     }
 
     #[test]

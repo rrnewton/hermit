@@ -242,11 +242,12 @@ fn hosted_portable_exclusion_flags() -> String {
         .map(|backend| format!(" --exclude-backend {backend}"))
         .collect()
 }
-const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 12] = [
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 8),
     ("e2e.manifest_bin_c", "manifest_guest", 1, 8),
     ("e2e.manifest_c_programs", "manifest_guest", 8, 8),
     ("e2e.manifest_chaos_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_compat", "manifest_guest", 8, 8),
     ("e2e.manifest_data_handling", "manifest_guest", 1, 8),
     ("e2e.manifest_debugger_c", "manifest_guest", 1, 8),
     ("e2e.manifest_determinism_stress", "manifest_guest", 1, 8),
@@ -374,16 +375,19 @@ struct Profile {
 // check.dbt_runtime_abi became check.dbt_runtime_abi_on_host: 256/256 before.
 // full, portable and hosted-portable then gained check.script_unit_tests, split
 // out of check.lint_checks: 273/274, 260/261 and 254/254 before.
+// full, portable and hosted-portable then replaced 189 compat.<program> nodes
+// with one e2e.manifest_compat bucket (its hosted twin for hosted-portable):
+// 274/275, 261/262 and 255/255 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 274,
-        selected_steps: 275,
+        direct_steps: 86,
+        selected_steps: 87,
     },
     Profile {
         label: "portable",
-        direct_steps: 261,
-        selected_steps: 262,
+        direct_steps: 73,
+        selected_steps: 74,
     },
     Profile {
         label: "quick",
@@ -402,8 +406,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 255,
-        selected_steps: 255,
+        direct_steps: 67,
+        selected_steps: 67,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -679,8 +683,14 @@ fn is_pinned_root_producer(step: &Step) -> bool {
             && step.cmd.contains("publish-hermit-e2e-artifact.sh"))
 }
 
+/// Manifest bucket nodes that run on the validation host rather than in the
+/// pinned root: the compatibility corpus exercises programs installed on the
+/// host, 31 of which the pinned image does not carry.
+pub const HOST_MANIFEST_RUNS: &[&str] = &["e2e.manifest_compat"];
+
 fn runs_in_pinned_root(step: &Step) -> bool {
     !is_hosted_variant(step)
+        && !HOST_MANIFEST_RUNS.contains(&step.tag().as_str())
         && (is_manifest_run(step)
             || PINNED_ROOT_EXECUTION_STEPS.contains(&step.tag().as_str())
             || matches!(step.group.as_str(), "portablecompat" | "portablecompatprep"))
@@ -1016,10 +1026,12 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         }
     }
     // 213 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301).
-    if split.len() != 212 {
+    // https://github.com/rrnewton/hermit/issues/3301); 212 until the 189
+    // compat.<program> nodes that depended on compatprep.fixtures became the
+    // e2e.manifest_compat bucket (2026-10-01), whose hosted twin is authored.
+    if split.len() != 23 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 212",
+            "hosted test dependency closure has {} nodes, expected 23",
             split.len()
         ));
     }
@@ -1505,7 +1517,9 @@ fn refresh_generated_partitions(
         replacements.entry(partition).or_default().push(step);
     }
     for (partition, expected) in [
-        (GeneratedPartition::PortableCompat, 190usize),
+        // 1 since the portable strict corpus became the manifest bucket
+        // e2e.manifest_compat on 2026-10-01: only compatprep.fixtures remains.
+        (GeneratedPartition::PortableCompat, 1usize),
         (GeneratedPartition::PortableFocusedCompat, 190usize),
         (GeneratedPartition::StrictCompat, 194usize),
         (GeneratedPartition::SabreCompat, 213usize),
@@ -1593,16 +1607,7 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
             Vec::new()
         };
         if step.tag() == "quick.e2e_verify" {
-            owned.extend(
-                cells
-                    .iter()
-                    .filter(|cell| {
-                        cell.lane == "portable"
-                            && cell.mode.as_deref() == Some("verify")
-                            && cell.backend.as_deref() == Some("ptrace")
-                    })
-                    .cloned(),
-            );
+            owned.extend(cells.iter().filter(|cell| quick_verify_cell(cell)).cloned());
         }
         owned.sort_by_key(result_identity);
         let mut manifests = owned
@@ -1625,9 +1630,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 107 {
+    // 109 since e2e.manifest_compat and its hosted twin joined the
+    // test-harness producers (2026-10-01).
+    if expected.len() != 109 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 107",
+            "structured result producer registry has {} entries, expected 109",
             expected.len()
         ));
     }
@@ -1762,7 +1769,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [69, 34, 2, 2] {
+    // TestHarness 34 -> 36 with the compat bucket and its hosted twin.
+    if actual_group_counts != [69, 36, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1781,6 +1789,36 @@ fn result_identity(result: &DagManifest) -> String {
     )
 }
 
+/// Manifest categories the quick profile's pinned-root verify smoke
+/// (quick.e2e_verify) omits: the compatibility corpus runs programs installed
+/// on the validation host and reads fixtures compatprep.fixtures prepares,
+/// neither of which the quick profile has. quick.e2e_verify passes
+/// `--exclude-category` for each, and neither its expected cells nor its
+/// owned results include them.
+pub const QUICK_EXCLUDED_CATEGORIES: &[&str] = &["compat"];
+
+/// The exact harness command quick.e2e_verify runs, with one
+/// `--exclude-category` per [`QUICK_EXCLUDED_CATEGORIES`] entry. The generator
+/// requires the committed node to end with it and validate.rs requires it of
+/// the raw publisher, so the omitted cells and the omitted results agree.
+pub fn quick_verify_command() -> String {
+    let mut command =
+        "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only"
+            .to_string();
+    for category in QUICK_EXCLUDED_CATEGORIES {
+        command.push_str(" --exclude-category ");
+        command.push_str(category);
+    }
+    command
+}
+
+fn quick_verify_cell(cell: &DagManifest) -> bool {
+    cell.lane == "portable"
+        && cell.mode.as_deref() == Some("verify")
+        && cell.backend.as_deref() == Some("ptrace")
+        && !QUICK_EXCLUDED_CATEGORIES.contains(&cell.category.as_str())
+}
+
 fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagManifest> {
     cells
         .iter()
@@ -1790,11 +1828,7 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
             HOSTED_PORTABLE_LABEL => cell.lane == "portable" && !hosted_portable_excludes(cell),
             HOSTED_PRIVILEGED_LABEL => cell.lane == "privileged",
             "privileged" => cell.lane == "privileged",
-            "quick" => {
-                cell.lane == "portable"
-                    && cell.mode.as_deref() == Some("verify")
-                    && cell.backend.as_deref() == Some("ptrace")
-            }
+            "quick" => quick_verify_cell(cell),
             "super" => false,
             _ => false,
         })
@@ -1974,7 +2008,7 @@ fn assert_dagrun_preparation_placement(cfg: &DagConfig) -> Result<(), String> {
 /// that large must not be able to report green on an empty selection. The
 /// generator, the manifest DAG audit in `test-harness validate`, and the
 /// validation driver's raw-publisher check all read this one list.
-pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs"];
+pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs", "compat"];
 
 /// The selector flags a manifest node for `category` passes after
 /// `--lane <lane> --category <category>`.
@@ -1984,7 +2018,7 @@ pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs"];
 /// node; every other bucket writes and declares schema 2, and the harness
 /// refuses to run a diagnostic cell without the flag. Empty until a bucket
 /// with diagnostic cells exists.
-pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &[];
+pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &["compat"];
 
 pub fn manifest_selector_flags(category: &str) -> &'static str {
     match (
@@ -2233,10 +2267,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // build.host_hermit_link, the hosted check.dbt_runtime_abi_on_host and the
     // e9patch lane's e9patchcompatprep.release_resources. 1616 since
     // check.script_unit_tests took the rust-script unit tests out of
-    // check.lint_checks.
-    if cfg.steps.len() != 1616 {
+    // check.lint_checks. 1240 since the 189 compat.<program> nodes and their
+    // 189 hosted twins became e2e.manifest_compat and its hosted twin
+    // (2026-10-01).
+    if cfg.steps.len() != 1240 {
         return Err(format!(
-            "superset has {} steps, expected 1616",
+            "superset has {} steps, expected 1240",
             cfg.steps.len()
         ));
     }
@@ -2511,6 +2547,21 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             pin.cmd
         ));
     }
+    let quick_verify = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "quick.e2e_verify")
+        .ok_or("committed DAG lost quick.e2e_verify")?;
+    if !quick_verify
+        .cmd
+        .ends_with(&format!("{}'", quick_verify_command()))
+    {
+        return Err(format!(
+            "quick.e2e_verify must run exactly `{}`; got {:?}",
+            quick_verify_command(),
+            quick_verify.cmd
+        ));
+    }
     let missing_rust_script_dep = cfg
         .steps
         .iter()
@@ -2519,7 +2570,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 && !is_hosted_variant(step)
                 && !step.deps.iter().any(|dependency| {
                     dependency
-                        == if step
+                        == if HOST_MANIFEST_RUNS.contains(&step.tag().as_str()) {
+                            // A host-run bucket reads the host's prepared scripts.
+                            "build.rust_scripts"
+                        } else if step
                             .labels
                             .iter()
                             .any(|label| label == "quick" || label == "super")
@@ -2534,7 +2588,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .collect::<Vec<_>>();
     if !missing_rust_script_dep.is_empty() {
         return Err(format!(
-            "local manifest nodes lost their direct build.rust_scripts_in_pinned_root dependency: {}",
+            "local manifest nodes lost their direct rust-script producer dependency: {}",
             missing_rust_script_dep.join(", ")
         ));
     }
@@ -2712,8 +2766,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 .steps
                 .iter()
                 .filter(|step| {
-                    if step.manifest.is_some() {
-                        !carries_hosted_exclusion_once(&step.cmd, "--prebuilt", " ")
+                    if let Some(manifest) = &step.manifest {
+                        // The exclusion follows the bucket's whole selector.
+                        !carries_hosted_exclusion_once(
+                            &step.cmd,
+                            manifest_selector_flags(&manifest.category),
+                            " ",
+                        )
                     } else if step.tag() == "scorecard.compatibility_on_host" {
                         !carries_hosted_exclusion_once(&step.cmd, "--lanes portable", "")
                     } else {
@@ -3475,7 +3534,7 @@ sys.exit(37)
         generated_mutation
             .steps
             .iter_mut()
-            .find(|step| step.tag() == "compat.echo")
+            .find(|step| step.tag() == "compatprep.fixtures")
             .unwrap()
             .cmd
             .push_str(" --planted-generated-mutation");
@@ -3485,7 +3544,7 @@ sys.exit(37)
             !refreshed
                 .steps
                 .iter()
-                .find(|step| step.tag() == "compat.echo")
+                .find(|step| step.tag() == "compatprep.fixtures")
                 .unwrap()
                 .cmd
                 .contains("planted-generated-mutation")
@@ -3622,8 +3681,12 @@ sys.exit(37)
             .iter()
             .filter(|step| step.manifest.is_some() && step.labels == [HOSTED_PORTABLE_LABEL])
         {
+            let category = &step.manifest.as_ref().unwrap().category;
             assert!(
-                step.cmd.contains("--prebuilt --exclude-backend kvm "),
+                step.cmd.contains(&format!(
+                    "{} --exclude-backend kvm ",
+                    manifest_selector_flags(category)
+                )),
                 "{}: {}",
                 step.tag(),
                 step.cmd
@@ -3781,6 +3844,9 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 67 since the 189 per-program compat.<label>_on_host nodes were
+        // folded into the one bucket e2e.manifest_compat_on_host (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448: 255 - 189 + 1);
         // 255 since check.script_unit_tests left check.lint_checks;
         // 254 since the one-build change of 2026-09-30 retired the hosted
         // copies of build.runtime_release and build.liteinst_runtime_release
@@ -3790,7 +3856,7 @@ sys.exit(37)
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 255);
+        assert_eq!(selected.steps.len(), 67);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3806,6 +3872,7 @@ sys.exit(37)
             "e2e.manifest_shared_futex_c_on_host",
             "e2e.manifest_system_utils_on_host",
             "e2e.manifest_util_c_on_host",
+            "e2e.manifest_compat_on_host",
             "scorecard.compatibility_on_host",
         ];
         let shared_tests = [
@@ -3825,17 +3892,16 @@ sys.exit(37)
             "rr_suite_contract",
             "sabre_examples",
         ];
-        let mut new_variants = committed
-            .steps
-            .iter()
-            .filter(|step| {
-                step.group == "compat"
-                    && !is_hosted_variant(step)
-                    && step.labels.iter().any(|label| label == "portable")
-            })
-            .map(|step| format!("{}_on_host", step.tag()))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(new_variants.len(), 189);
+        // The strict compatibility corpus has no per-program node left: its
+        // hosted twin is the manifest bucket listed above.
+        assert!(
+            committed
+                .steps
+                .iter()
+                .all(|step| step.group != "compat"
+                    || step.labels.iter().all(|label| label == "super"))
+        );
+        let mut new_variants = BTreeSet::new();
         new_variants.extend(shared_tests.map(|job| format!("test.{job}_on_host")));
         new_variants.extend([
             "build.e2e_artifact_on_host".into(),
@@ -3847,21 +3913,27 @@ sys.exit(37)
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
+        // 23 since the 189 compat.<label>_on_host nodes became the one
+        // manifest bucket e2e.manifest_compat_on_host, counted with the other
+        // bucket twins above (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448);
         // 212 since test.dbt_parity_on_host was retired with its pinned twin
         // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); still
         // 212 after the one-build change of 2026-09-30 retired
         // build.liteinst_runtime_release_on_host and moved check.dbt_runtime_abi
         // into the pinned root, which gave it the hosted twin
         // check.dbt_runtime_abi_on_host.
-        assert_eq!(new_variants.len(), 212);
+        assert_eq!(new_variants.len(), 23);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
             .collect::<BTreeSet<_>>();
-        // 15 since e2e.manifest_backend_parity_c_on_host was folded into
+        // 16 since e2e.manifest_compat_on_host replaced the per-program
+        // compat.<label>_on_host nodes; 15 since
+        // e2e.manifest_backend_parity_c_on_host was folded into
         // e2e.manifest_c_programs_on_host (slice S6 of
         // https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(expected.len(), 15);
+        assert_eq!(expected.len(), 16);
         assert!(expected.is_disjoint(&new_variants));
         expected.extend(new_variants);
         assert_eq!(
@@ -3937,7 +4009,26 @@ sys.exit(37)
             .retain(|dependency| dependency != "build.rust_scripts_in_pinned_root");
         let error = assert_invariants(&planted_missing_rust_script_dep, &cells).unwrap_err();
         assert!(
-            error.contains("lost their direct build.rust_scripts_in_pinned_root dependency"),
+            error.ends_with(
+                "lost their direct rust-script producer dependency: e2e.manifest_applications"
+            ),
+            "{error}"
+        );
+        // A host-run bucket reads the host's prepared scripts, so its required
+        // producer is build.rust_scripts, not the pinned-root one.
+        let mut planted_missing_host_rust_script_dep = committed.clone();
+        planted_missing_host_rust_script_dep
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_compat")
+            .unwrap()
+            .deps
+            .retain(|dependency| dependency != "build.rust_scripts");
+        let error = assert_invariants(&planted_missing_host_rust_script_dep, &cells).unwrap_err();
+        assert!(
+            error.ends_with(
+                "lost their direct rust-script producer dependency: e2e.manifest_compat"
+            ),
             "{error}"
         );
 
@@ -3951,14 +4042,18 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 254 = the 255 hosted-portable direct steps since
+            // 66 = the 67 hosted-portable direct steps since the 189
+            // compat.<label>_on_host nodes became e2e.manifest_compat_on_host
+            // (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
+            // minus the one planted loss; 254 = the 255 hosted-portable direct
+            // steps before that, since
             // check.script_unit_tests left check.lint_checks (254 after the
             // one-build change of 2026-09-30; 256 before it, since the five
             // selftest.<name> nodes left gate.manifest and
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 254 direct steps"),
+            error.contains("hosted-portable label has 66 direct steps"),
             "{error}"
         );
     }

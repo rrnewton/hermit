@@ -238,9 +238,9 @@ explicit partial/debug mode and skips the manifest population.
 Two things worth knowing before touching this:
 
 - **The partition is the shard map, not the `group` field.**
-  The stable `test.strict_compat` selection alias has group `test`, expands to
-  direct `compat.*` nodes, and runs after its other test-node predecessors in a
-  separate hosted job; `setup.manifest_plan`,
+  The strict compatibility bucket `e2e.manifest_compat_on_host` has group `e2e`
+  but runs, with its fixture producer, after its test-node predecessors in a
+  separate hosted job rather than the E2E job; `setup.manifest_plan`,
   `setup.nextest`, `gate.manifest` and `e2e.audit_compile_c_programs` are
   not group `build` but execute before the remaining test side. Partitioning on
   `group` therefore does not reproduce the hosted grouping.

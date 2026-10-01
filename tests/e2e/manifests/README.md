@@ -14,12 +14,14 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `target/debug/test-harness` loads them through the structured Rust parser in
 `ci/manifest-plan`.
 
-`defaults.yaml` declares the global per-cell timeout. The 12 bucket manifests
-(13 until the backend-parity-c bucket was folded into c-programs,
+`defaults.yaml` declares the global per-cell timeout. The 13 bucket manifests
+(12 until the strict compatibility corpus became `compat.yaml`,
+https://github.com/rrnewton/hermit/issues/3448, and 13 before that until the
+backend-parity-c bucket was folded into c-programs,
 https://github.com/rrnewton/hermit/issues/3301)
 separate calibrated blocking cells from discoverable migration inventory. CI
 creates one independently schedulable run node for every bucket.
-Six buckets currently contain calibrated blocking workloads:
+Seven buckets currently contain calibrated blocking workloads:
 
 - `system-utils.yaml`
 - `data-handling.yaml`
@@ -27,6 +29,8 @@ Six buckets currently contain calibrated blocking workloads:
 - `language-runtimes.yaml`
 - `applications.yaml`
 - `c-programs.yaml` (eight calibrated Buck-derived C probes)
+- `compat.yaml` (the 189-program strict compatibility corpus, written as a
+  `corpus` section; five of its rows are diagnostics)
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
 centrally discoverable. Eight `c-programs.yaml` entries have calibrated
@@ -367,11 +371,32 @@ specific configuration:
   the validation ledger count it separately as well. Only a bucket listed in
   `DIAGNOSTIC_MANIFEST_BUCKETS` (ci/manifest-plan/src/validation_dag.rs) may
   hold diagnostic cells: its node runs `test-harness run --diagnostic-results`
-  and declares schema 4. Every other node writes schema 2, and the harness
-  refuses to run a diagnostic cell without the flag. An ERROR, any other
+  and declares schema 4. Every other node writes schema 2, and a run that
+  reports to dagrun without the flag refuses to select a diagnostic cell. A
+  standalone run without the flag (one pressure-test sample, for example) may
+  run it, and excuses nothing: its failure fails the run. An ERROR, any other
   no-result cause, or a FAIL retried into an ERROR still fails the run.
   Because the ledger keeps the failure out of `passed_tests`, a run with a
   diagnostic failure is not a qualifying receipt.
+
+A bucket whose tests share one recipe may state it once in a `corpus` section
+instead of a `test` list (`compat.yaml` is the one such bucket).
+`ci/manifest-plan/src/manifest_corpus.rs` expands every row into an ordinary
+recipe before validation, so the harness, the front door and every audit see
+ordinary tests: id `<bucket>/<id or label>`, one CI verify cell on the
+section's `backend` carrying its `verify` settings, and every other mode and
+backend disabled with a stated reason. `diagnostic.rows` names, per row label,
+why that row's cell is a diagnostic, with its own shortened budget. A row's
+`argv` is a `direct` argv list, run without a shell; in it `{{ROOT_DIR}}` is
+the repository root and `{{VALIDATE_RUN_STATE}}` the validation's per-run state
+directory (`$VALIDATE_RUN_STATE`). A row that names the latter is refused, not
+run with the literal text, when the variable is unset, and any other `{{...}}`
+token is refused outright.
+
+A verify mode may declare `no_retry_reason`: the cell then gets one attempt
+instead of the runner's retry after a product failure, so a first-attempt
+failure stays a failure. `compat.yaml` declares it because each of its programs
+ran once per validation as its own node before the corpus moved here.
 
 A test may carry `labels` (lowercase words joined by `-`, unique), naming the
 run types it belongs to. `test-harness run --label LABEL[,LABEL...]` keeps only

@@ -107,16 +107,20 @@ else
     printf 'run-node-args-test: ok — shared portable test IDs retain hosted execution\n'
 fi
 
+# The exact selection the hosted strict-compat job passes (ci-portable.yml).
+compat_selection=$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)
 compat_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \
     VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
-    "$RUN_NODE" portable test.strict_compat 2>&1)
+    "$RUN_NODE" portable "$compat_selection" 2>&1)
 compat_status=$?
 if ((compat_status != 0)); then
-    fail "the hosted strict compatibility selector was refused: exit $compat_status. Output: $compat_output"
+    fail "the hosted strict compatibility selection was refused: exit $compat_status. Output: $compat_output"
+elif [[ $compat_output != *"e2e.manifest_compat_on_host"* ]]; then
+    fail "the hosted strict compatibility selection lost its bucket. Output: $compat_output"
 elif [[ $compat_output != *"compatprep.fixtures_on_host"* ]]; then
     fail "strict compatibility omitted its hosted fixture producer. Output: $compat_output"
 else
-    printf 'run-node-args-test: ok — strict compatibility retains its hosted fixture\n'
+    printf 'run-node-args-test: ok — strict compatibility runs its bucket with its hosted fixture\n'
 fi
 
 privileged_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \

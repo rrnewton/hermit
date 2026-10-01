@@ -118,6 +118,9 @@ struct PlanRow {
     timeout_seconds: i64,
     cpu_timeout_seconds: i64,
     attempts: Option<i64>,
+    /// A verify cell that declares `comparator: stripped`: below L2, so the
+    /// scorecard counts it apart from canonical cells.
+    stripped: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,8 +287,7 @@ fn main() {
     for path in &manifests {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|error| die(format!("cannot read {}: {error}", path.display())));
-        let document: Value = text
-            .parse()
+        let document = parse_manifest_document(&text)
             .unwrap_or_else(|error| die(format!("{}: invalid YAML: {error}", path.display())));
         let location = path.file_name().unwrap().to_string_lossy().to_string();
         ensure_keys(
@@ -417,6 +419,7 @@ fn main() {
                         "timeout_seconds": row.timeout_seconds,
                         "cpu_timeout_seconds": row.cpu_timeout_seconds,
                         "attempts": row.attempts,
+                        "stripped": row.stripped,
                     })
                 })
                 .collect();
@@ -918,6 +921,14 @@ fn parse_schema_value<T: DeserializeOwned>(value: &Value, location: &str) -> T {
         .unwrap_or_else(|error| die(format!("{location} has invalid shape: {error}")))
 }
 
+/// Parse one E2E manifest document, expanding a `corpus:` section into
+/// ordinary test recipes exactly as the runner does.
+fn parse_manifest_document(source: &str) -> Result<Value, String> {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(source).map_err(|error| error.to_string())?;
+    Value::from_yaml(hermit_manifest_plan::manifest_corpus::expand_corpus(yaml)?)
+}
+
 fn validate_direct(value: &Value, id: &str) {
     match value {
         Value::String(command) if !command.trim().is_empty() => {}
@@ -1277,6 +1288,7 @@ fn validate_mode_with_cpu(
             "comparator",
             "comparator_reason",
             "diagnostic",
+            "no_retry_reason",
         ]),
         _ => {}
     }
@@ -1664,6 +1676,8 @@ fn validate_mode_with_cpu(
     }
 
     let attempts = mode_attempts(id, mode, spec_value);
+    let stripped =
+        mode == "verify" && spec.get("comparator").and_then(Value::as_str) == Some("stripped");
     for backend in enabled {
         let timeout_seconds = timeout_overrides
             .get(&backend)
@@ -1688,6 +1702,7 @@ fn validate_mode_with_cpu(
             timeout_seconds,
             cpu_timeout_seconds,
             attempts,
+            stripped,
         });
     }
     for (backend, reason) in disabled {
@@ -1707,6 +1722,7 @@ fn validate_mode_with_cpu(
             timeout_seconds: inherited_timeout_seconds,
             cpu_timeout_seconds: inherited_cpu_timeout_seconds,
             attempts,
+            stripped,
         });
     }
 }
@@ -1905,7 +1921,7 @@ mod tests {
         );
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("manifest must be readable");
-            documents.push(text.parse::<Value>().expect("manifest must be valid YAML"));
+            documents.push(parse_manifest_document(&text).expect("manifest must be valid YAML"));
         }
         assert_eq!(
             host_requirement_pairs(&documents).unwrap(),

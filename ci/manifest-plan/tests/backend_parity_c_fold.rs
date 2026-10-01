@@ -18,13 +18,15 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 900 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1089 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
-//!    added (895 portable and 5 privileged), after applying the later lane
-//!    moves listed in `LATER_LANE_MOVES` (now 893 portable and 7 privileged).
-//! 3. The committed compatibility cell table has 5984 rows with
+//!    added (895 portable and 5 privileged) and the 189 portable cells of the
+//!    compatibility-corpus fold, after applying the later lane moves listed in
+//!    `LATER_LANE_MOVES` (now 1082 portable and 7 privileged).
+//! 3. The committed compatibility cell table has 9008 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
-//!    exactly the rows slice S13 added or reclassified.
+//!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
+//!    compatibility-corpus fold.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -38,10 +40,11 @@
 //! 3f66a249b30fada86b81e722b8e5439ac0789f8e, the last commit that declared
 //! backend-parity-c; the plan, the cell table and both manifests are
 //! byte-identical at the two commits. A later change that moves a count has to
-//! change this file and say why. Slice S13 of the same issue is the one such
-//! change so far: it moved the retired DBT backend-parity matrix onto manifest
-//! cells, and its counts are listed separately below so the pre-fold snapshot
-//! stays byte-for-byte what was measured.
+//! change this file and say why. Slice S13 of the same issue moved the retired
+//! DBT backend-parity matrix onto manifest cells, and fold 1 of
+//! <https://github.com/rrnewton/hermit/issues/3448> moved the strict
+//! compatibility corpus into the manifest; their counts are listed separately
+//! below so the pre-fold snapshot stays byte-for-byte what was measured.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -101,6 +104,33 @@ const S13_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[
     ("portable", "ptrace", "verify", 13),
     ("privileged", "dbt", "verify", 1),
 ];
+
+/// Fold 1 of <https://github.com/rrnewton/hermit/issues/3448> moved the
+/// portable strict compatibility corpus from 189 generated validation nodes into
+/// `tests/e2e/manifests/compat.yaml`. Each of its 189 programs adds one
+/// selected portable ptrace verify cell to the plan. In the cell table each adds
+/// the 16 rows every test has: its ptrace verify row is selected (green), and
+/// its other 15 rows are not applicable, because it declares only that cell
+/// enabled.
+const COMPAT_FOLD_TESTS: usize = 189;
+const COMPAT_FOLD_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "ptrace", "verify", COMPAT_FOLD_TESTS)];
+
+fn compat_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let tests = COMPAT_FOLD_TESTS as isize;
+    let mut deltas = vec![
+        ("ptrace", "verify", "green", tests),
+        ("native", "naked", "not-applicable", tests),
+    ];
+    for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+        deltas.push((backend, "verify", "not-applicable", tests));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", tests));
+        deltas.push((backend, "replay", "not-applicable", tests));
+    }
+    deltas
+}
 
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
@@ -232,8 +262,11 @@ fn manifests() -> Manifests {
         .collect::<Vec<_>>();
     entries.sort();
     for path in entries {
-        let document: Value =
-            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // A corpus section expands into ordinary recipes, as the harness reads it.
+        let document = hermit_manifest_plan::manifest_corpus::expand_corpus(
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+        )
+        .unwrap();
         let Some(bucket) = document.get("bucket").and_then(Value::as_str) else {
             continue;
         };
@@ -426,14 +459,14 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900,
-            895 - moved_out("portable") + moved_in("portable"),
+            900 + COMPAT_FOLD_TESTS,
+            895 + COMPAT_FOLD_TESTS - moved_out("portable") + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893, 7),
+        (893 + COMPAT_FOLD_TESTS, 7),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -469,7 +502,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .iter()
         .map(|&(lane, backend, mode, n)| ((lane.into(), backend.into(), mode.into()), n))
         .collect::<BTreeMap<(String, String, String), usize>>();
-    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS {
+    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS.iter().chain(COMPAT_FOLD_PLAN_ADDITIONS) {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
             .or_default() += n;
@@ -516,7 +549,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
 fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
-    assert_eq!(rows.len(), 5776 + 208);
+    assert_eq!(rows.len(), 5776 + 208 + 16 * COMPAT_FOLD_TESTS);
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
         assert_ne!(field(row, "category"), RETIRED_BUCKET, "{row}");
@@ -535,7 +568,11 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .iter()
         .map(|&(backend, mode, status, n)| ((backend.into(), mode.into(), status.into()), n))
         .collect::<BTreeMap<(String, String, String), usize>>();
-    for &(backend, mode, status, delta) in S13_CELL_DELTAS {
+    for (backend, mode, status, delta) in S13_CELL_DELTAS
+        .iter()
+        .copied()
+        .chain(compat_fold_cell_deltas())
+    {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
             .or_default();

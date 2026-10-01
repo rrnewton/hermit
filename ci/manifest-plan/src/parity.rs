@@ -2755,7 +2755,7 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 1496);
+        assert_eq!(parsed.cells.len(), 2252);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -2782,7 +2782,12 @@ mod tests {
                 count.selected_selectable,
             )
         };
-        assert_eq!(row(&counts.all), (1496, 628, 527, 194, 177));
+        // 2252 cells (563 per backend) since fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448 moved the 189
+        // strict compatibility programs into the manifest: each declares its
+        // verify cell disabled on the four non-ptrace backends, so the census
+        // gains 756 cells and no applicable, selectable or selected one.
+        assert_eq!(row(&counts.all), (2252, 628, 527, 194, 177));
         let by_backend: Vec<_> = counts
             .by_backend
             .iter()
@@ -2791,10 +2796,10 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (374, 85, 26, 16, 2)),
-                ("kvm", (374, 250, 243, 77, 76)),
-                ("liteinst", (374, 149, 146, 99, 98)),
-                ("sabre", (374, 144, 112, 2, 1)),
+                ("dbt", (563, 85, 26, 16, 2)),
+                ("kvm", (563, 250, 243, 77, 76)),
+                ("liteinst", (563, 149, 146, 99, 98)),
+                ("sabre", (563, 144, 112, 2, 1)),
             ]
         );
     }

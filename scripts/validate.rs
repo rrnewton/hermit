@@ -197,10 +197,6 @@ const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = validate_plan::MANIFEST_AUDIT_COMMAND;
 const INTEGRATION_ARTIFACT_WRAPPER: &str =
     "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
-/// Compatibility-selection alias retained for CLI callers that used the old
-/// placeholder tag. The committed DAG contains the real `compat.*` population;
-/// this name is never a node and never triggers runtime graph generation.
-const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
 // The FULL plan's workspace producer prepares the FULL profile. Each build
 // producer prepares the profile of the plan it serves -- full/full,
 // privileged/privileged, liteinst/liteinst, quick/quick, super/super -- and
@@ -634,9 +630,11 @@ mod artifact_plan_tests {
                 "HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ",
             ),
             (
-                "compat.echo",
-                "$PWD/target/ci/hermit run",
-                "$PWD/target/release/hermit run",
+                // The host-run strict compatibility bucket must reach the
+                // published artifact, never a per-profile binary.
+                "e2e.manifest_compat",
+                "./ci/run-with-hermit-e2e-artifact.sh --require-install",
+                "HERMIT_BIN=$PWD/target/release/hermit ./ci/run-with-hermit-e2e-artifact.sh --require-install",
             ),
         ] {
             let mut changed = cfg.clone();
@@ -4445,7 +4443,7 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: committed graph has more than one pin authority: {pin_nodes:?}"
             ));
         }
-        for required in ["compat.echo", "privileged-cpuid.faulting"] {
+        for required in ["e2e.manifest_compat", "privileged-cpuid.faulting"] {
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: committed plan lost {required}"));
             }
@@ -4462,10 +4460,29 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
-        if full.compat != Some(CompatMode::PortableStrict) {
-            return Err(
-                "full-plan bracket: flattened portable compatibility lost its typed verdict".into(),
-            );
+        // The strict compatibility corpus reports its own typed results as a
+        // manifest bucket (schema 4, with its non-blocking diagnostic rows);
+        // the legacy population synthesized from per-program node outcomes is
+        // gone from the full plan.
+        let compat_bucket_schema = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_compat")
+            .and_then(|step| step.result_manifests.as_ref())
+            .into_iter()
+            .flatten()
+            .find_map(|manifest| match manifest {
+                dagrun::model::ResultManifest::StructuredTestResults(structured) => {
+                    Some(structured.schema)
+                }
+                dagrun::model::ResultManifest::ManifestCell(_) => None,
+            });
+        if full.compat.is_some() || compat_bucket_schema != Some(4) {
+            return Err(format!(
+                "full-plan bracket: strict compatibility must report through e2e.manifest_compat's schema-4 test results, not a synthesized population: legacy={:?} schema={compat_bucket_schema:?}",
+                full.compat
+            ));
         }
         let workspace_build = full
             .cfg
@@ -4591,18 +4608,33 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.cmd
                 ));
             }
-            if !consumer
+            // A host-run bucket (programs the pinned image does not carry)
+            // reaches the same published artifact through the host pointer
+            // build.host_hermit_link writes and verifies.
+            let host_run = hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
+                .contains(&consumer.tag().as_str());
+            if consumer
                 .cmd
                 .starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                == host_run
                 || !consumer.cmd.contains("run-with-hermit-e2e-artifact.sh")
             {
                 return Err(format!(
-                    "full-plan bracket: {} is not a committed pinned-root consumer of the published Hermit artifact: {}",
+                    "full-plan bracket: {} is not a committed {} consumer of the published Hermit artifact: {}",
                     consumer.tag(),
+                    if host_run { "host-run" } else { "pinned-root" },
                     consumer.cmd
                 ));
             }
-            let producer = if lane == "portable" {
+            let producer = if host_run && lane == "portable" {
+                if !consumer.cmd.contains("--require-install") {
+                    return Err(format!(
+                        "full-plan bracket: host-run consumer {} did not require the backend-resource bundle",
+                        consumer.tag()
+                    ));
+                }
+                "build.host_hermit_link"
+            } else if lane == "portable" {
                 if !consumer.cmd.contains("--require-install") {
                     return Err(format!(
                         "full-plan bracket: portable consumer {} did not require the backend-resource bundle",
@@ -4747,9 +4779,13 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
+        // A host-run manifest bucket does not enter the pinned root at all;
+        // the consumer check above requires exactly that.
         for step in full.cfg.steps.iter().filter(|step| {
             step.tag().ends_with("_in_pinned_root")
-                || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                || (validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                    && !hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
+                        .contains(&step.tag().as_str()))
         }) {
             if !step
                 .cmd
@@ -6936,7 +6972,9 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         .as_ref()
         .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
     {
-        Some(("portable", "c-programs")) => Some("--jobs"),
+        // The strict compatibility corpus runs its rows eight at a time, the
+        // same width transport as c-programs.
+        Some(("portable", "c-programs" | "compat")) => Some("--jobs"),
         Some(("portable" | "privileged", "system-utils")) => Some(""),
         _ => None,
     };
@@ -7035,8 +7073,10 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         {
             return Err("quick raw publisher requires one run-id path component".into());
         }
-        ("target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".to_owned(),
-            Path::new(run_id).join("results.jsonl"))
+        (
+            hermit_manifest_plan::validation_dag::quick_verify_command(),
+            Path::new(run_id).join("results.jsonl"),
+        )
     } else {
         let manifest = step
             .manifest
@@ -10516,33 +10556,6 @@ fn requested_step_ids(raw: &str, option: &str) -> Result<BTreeSet<String>, Strin
     }
 }
 
-fn expand_strict_compat_alias(
-    cfg: &DagConfig,
-    tags: &mut BTreeSet<String>,
-    profile: &str,
-) -> Result<(), String> {
-    if !tags.remove(STRICT_COMPAT_SELECTION_ALIAS) {
-        return Ok(());
-    }
-    let compat = cfg
-        .steps
-        .iter()
-        .filter(|step| {
-            step.group == "compat"
-                || (step.group == "compatprep"
-                    && matches!(step.job.as_str(), "fixtures" | "fixtures_on_host"))
-        })
-        .map(Step::tag)
-        .collect::<Vec<_>>();
-    if compat.is_empty() {
-        return Err(format!(
-            "{STRICT_COMPAT_SELECTION_ALIAS} is not part of the committed {profile} profile"
-        ));
-    }
-    tags.extend(compat);
-    Ok(())
-}
-
 const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 13] = [
     ("build.rust_scripts", "build.rust_scripts"),
     ("check.reverie_pin", "pre.reverie_pin"),
@@ -10722,6 +10735,10 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
                 | "build.rust_scripts"
                 | "build.rust_scripts_in_pinned_root"
                 | "setup.pinned_root_fetch"
+                // The strict compatibility corpus reads fixtures this node
+                // writes under the run's own state directory, so a focused
+                // run of e2e.manifest_compat must produce them itself.
+                | "compatprep.fixtures"
         )
     };
     loop {
@@ -10751,7 +10768,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let mut tags = requested_step_ids(nodes, "--only")?;
         map_privileged_public_tags(&mut tags, lane);
         map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
-        expand_strict_compat_alias(&lane_cfg, &mut tags, lane)?;
         let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
             ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
             ("hosted-privileged", false) => &[
@@ -10786,8 +10802,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
         let cfg =
             dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), true)?;
-        let compat = (lane == "portable" && cfg.steps.iter().any(|step| step.group == "compat"))
-            .then_some(CompatMode::PortableStrict);
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -10797,8 +10811,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 .expect("matched focused mode")
                 .profile(),
             selection_mode: "only",
-            compat,
-            compat_prefix: compat.map(|_| "compat."),
             cacheable: false,
             ..Default::default()
         };
@@ -10892,18 +10904,11 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             .unwrap_or_else(|| SelectDecision::Full("no trustworthy green baseline".into()));
         let total = base.steps.len();
         let cfg = select_from_committed_decision(&base, total, decision)?;
-        let compat = cfg
-            .steps
-            .iter()
-            .any(|step| step.group == "compat")
-            .then_some(CompatMode::PortableStrict);
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
             profile: "selective".into(),
             selection_mode: "selective",
-            compat,
-            compat_prefix: compat.map(|_| "compat."),
             cacheable: false,
             ..Default::default()
         };
@@ -10952,7 +10957,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             let mut tags = requested_step_ids(selected, "--selected")?;
             map_privileged_public_tags(&mut tags, label);
             map_hosted_portable_tags(&cfg, &mut tags, label);
-            expand_strict_compat_alias(&cfg, &mut tags, label)?;
             cfg = dagrun::select_steps_by_tags(
                 &cfg,
                 &tags.into_iter().collect::<Vec<_>>(),
@@ -10961,9 +10965,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             selection_mode = "selected";
         }
         let (compat, compat_prefix) = match label {
-            "portable" | "full" if cfg.steps.iter().any(|step| step.group == "compat") => {
-                (Some(CompatMode::PortableStrict), Some("compat."))
-            }
             "strict-compat-only" => (Some(CompatMode::Strict), Some("strictcompat.")),
             "portable-strict-compat-only" => {
                 (Some(CompatMode::PortableStrict), Some("portablecompat."))
@@ -11160,15 +11161,11 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
         })
         .collect::<Result<Vec<_>, String>>()?;
 
+    // The portable strict corpus itself is the manifest bucket
+    // e2e.manifest_compat (tests/e2e/manifests/compat.yaml); this node only
+    // prepares the files its rows read.
     let portable_root = tmp.join("strict-compat");
     let portable_fixtures = portable_root.join("real-compat-fixtures");
-    let portable_shell_build = portable_root.join("shell-build");
-    let portable_paths = validate_corpus::CorpusPaths {
-        root_dir: &root.to_string_lossy(),
-        real_compat_fixtures: &portable_fixtures.to_string_lossy(),
-        validation_tmp_dir: &portable_root.to_string_lossy(),
-        shell_build_dir: &portable_shell_build.to_string_lossy(),
-    };
     let mut portable_prep = prepare_fixtures_node("compatprep.fixtures", &portable_fixtures);
     portable_prep.deps = [
         "build.e2e_artifact",
@@ -11183,25 +11180,19 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     .into_iter()
     .map(str::to_string)
     .collect();
-    portable_prep.desc = "Functional compatibility fixtures for direct outer-DAG probes".into();
+    portable_prep.desc =
+        "Prepare the fixture files the portable strict compatibility corpus reads".into();
     portable_prep.description = format!(
-        "Generated for this validation under {}; the former nested scheduler is not invoked.",
-        portable_root.display()
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {}: a copy of README.md, \
+         compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's \
+         mount fixture, and cargo/rustc links into the active toolchain, so the corpus \
+         rows of e2e.manifest_compat read run-owned files instead of the checkout. It \
+         starts after every non-guest Cargo node so the corpus's shell-build row cannot \
+         observe a concurrent target or cache mutation.",
+        portable_fixtures.display()
     );
     portable_prep.labels = vec!["full".into(), "portable".into()];
     steps.push(portable_prep);
-    let mut portable = validate_plan::compat_nodes(
-        root,
-        CompatMode::PortableStrict,
-        &root.join("target/ci/hermit").to_string_lossy(),
-        "",
-        &portable_paths,
-        Some("compatprep.fixtures"),
-    )?;
-    for step in &mut portable {
-        step.labels = vec!["full".into(), "portable".into()];
-    }
-    steps.extend(portable);
 
     for (mode, namespace, label) in [
         (
@@ -11435,11 +11426,205 @@ fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
 }
 
+/// One row of the strict compatibility corpus as e2e.manifest_compat runs it.
+struct CompatManifestRow {
+    /// The guest argv when the run's state directory is the given one.
+    argv: Vec<std::ffi::OsString>,
+    timeout_seconds: u64,
+    diagnostic: bool,
+}
+
+/// Each row of the strict compatibility corpus (tests/e2e/manifests/compat.yaml),
+/// keyed by its corpus label (the last backquoted word of the description the
+/// expansion writes; `g++` has the test id `compat/gxx`).
+fn compat_manifest_rows(
+    root: &Path,
+    run_state: &Path,
+) -> Result<BTreeMap<String, CompatManifestRow>, String> {
+    let cells = ManifestSet::load(root)?.select(&hermit_manifest_plan::runner::Selection {
+        category: Some("compat".into()),
+        population: Some(hermit_manifest_plan::runner::Population::Required),
+        ..Default::default()
+    })?;
+    let mut rows = BTreeMap::new();
+    for cell in cells {
+        let Some(hermit_manifest_plan::runner::DirectCommand::Argv(argv)) = &cell.test.direct
+        else {
+            return Err(format!("{} is not a direct argv row", cell.test.id));
+        };
+        let argv = hermit_manifest_plan::manifest_corpus::resolve_direct_placeholders(
+            &cell.test.id,
+            argv,
+            root,
+            Some(run_state.as_os_str()),
+        )?;
+        let label = cell
+            .test
+            .description
+            .strip_suffix('`')
+            .and_then(|text| text.rsplit_once(" `"))
+            .map(|(_, label)| label.to_string())
+            .ok_or_else(|| format!("{} does not name its corpus label", cell.test.id))?;
+        let diagnostic = cell
+            .test
+            .modes
+            .get(&cell.id.mode)
+            .is_some_and(|mode| !mode.diagnostic.is_empty());
+        let row = CompatManifestRow {
+            argv: argv.into_iter().map(Into::into).collect(),
+            timeout_seconds: cell.timeout_seconds,
+            diagnostic,
+        };
+        if rows.insert(label, row).is_some() {
+            return Err(format!("{} repeats a corpus label", cell.test.id));
+        }
+    }
+    Ok(rows)
+}
+
+/// The guest argv of each compat.yaml row, keyed by its corpus label.
+fn compat_manifest_argv(
+    root: &Path,
+    run_state: &Path,
+) -> Result<BTreeMap<String, Vec<std::ffi::OsString>>, String> {
+    Ok(compat_manifest_rows(root, run_state)?
+        .into_iter()
+        .map(|(label, row)| (label, row.argv))
+        .collect())
+}
+
+/// tests/e2e/manifests/compat.yaml and ci/compat/corpus-strict.json both hold
+/// the portable strict corpus until the focused compatibility lanes and the
+/// super rows move too. Bind the copies: the generator's expansion of every
+/// portable corpus row must equal the compat.yaml row's argv, wall budget and
+/// diagnostic status, and neither may hold a row the other lacks. (The
+/// diagnostic reasons are not compared: compat.yaml spells the tracking
+/// issues as full links.)
+fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-compat-binding-")
+        .tempdir()
+        .map_err(|error| format!("compat corpus binding: cannot create fixture: {error}"))?;
+    // Like the generator's production input, $VALIDATE_RUN_STATE, the state
+    // path has no space: some corpus commands interpolate it unquoted.
+    let run_state = fixture.path().join("run-state");
+    let compat = run_state.join("strict-compat");
+    let fixtures = compat.join("real-compat-fixtures");
+    let shell_build = compat.join("shell-build");
+    let root_text = root.to_string_lossy();
+    let compat_text = compat.to_string_lossy();
+    let fixtures_text = fixtures.to_string_lossy();
+    let shell_build_text = shell_build.to_string_lossy();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root_text,
+        real_compat_fixtures: &fixtures_text,
+        validation_tmp_dir: &compat_text,
+        shell_build_dir: &shell_build_text,
+    };
+    let constructed = validate_plan::compat_nodes(
+        root,
+        CompatMode::PortableStrict,
+        "fixture-hermit",
+        "",
+        &paths,
+        None,
+    )?;
+    let mut manifest = compat_manifest_rows(root, &run_state)?;
+    let diagnostic_labels = validate_corpus::portable_diagnostic();
+    let check = |node: &Step, row: &CompatManifestRow| -> Result<(), String> {
+        let label = node.job.as_str();
+        let argv = expand_constructed_guest(node, &run_state)
+            .map_err(|error| format!("compat corpus binding: {error}"))?;
+        if argv != row.argv {
+            return Err(format!(
+                "compat corpus binding: {label} argv differs: corpus {argv:?}, compat.yaml {:?}",
+                row.argv
+            ));
+        }
+        let timeout = u64::try_from(CompatMode::PortableStrict.timeout_for(label))
+            .map_err(|_| format!("compat corpus binding: {label} has a negative timeout"))?;
+        let diagnostic = diagnostic_labels.contains_key(label);
+        if row.timeout_seconds != timeout || row.diagnostic != diagnostic {
+            return Err(format!(
+                "compat corpus binding: {label} budget or diagnostic status differs: corpus {timeout} s diagnostic={diagnostic}, compat.yaml {} s diagnostic={}",
+                row.timeout_seconds, row.diagnostic
+            ));
+        }
+        Ok(())
+    };
+    let mut compared = 0;
+    for (index, node) in constructed.iter().enumerate() {
+        let label = node.job.as_str();
+        let row = manifest.remove(label).ok_or_else(|| {
+            format!("compat corpus binding: compat.yaml lacks corpus row {label}")
+        })?;
+        check(node, &row)?;
+        if index == 0 {
+            // Planted drift on the first row must be refused.
+            let mut argv = row.argv.clone();
+            argv.push("--planted".into());
+            let changed_argv = CompatManifestRow { argv, ..row };
+            let flipped = CompatManifestRow {
+                argv: changed_argv.argv[..changed_argv.argv.len() - 1].to_vec(),
+                timeout_seconds: changed_argv.timeout_seconds,
+                diagnostic: !changed_argv.diagnostic,
+            };
+            if check(node, &changed_argv).is_ok() || check(node, &flipped).is_ok() {
+                return Err(format!(
+                    "compat corpus binding: a planted argv or diagnostic drift of {label} was accepted"
+                ));
+            }
+        }
+        compared += 1;
+    }
+    if let Some(label) = manifest.keys().next() {
+        return Err(format!(
+            "compat corpus binding: compat.yaml row {label} is not a portable corpus row"
+        ));
+    }
+    Ok(format!(
+        "compat corpus binding: {compared} compat.yaml rows equal the corpus generator's argv, wall budget and diagnostic status"
+    ))
+}
+
+/// Expand one generated corpus node's guest words the way its outer shell did,
+/// with `VALIDATE_RUN_STATE` set; NUL framing preserves spaces and
+/// metacharacters.
+fn expand_constructed_guest(
+    node: &Step,
+    run_state: &Path,
+) -> Result<Vec<std::ffi::OsString>, String> {
+    let (_, guest) = node
+        .cmd
+        .split_once(" -- ")
+        .ok_or_else(|| format!("missing guest boundary: {}", node.cmd))?;
+    let expanded = Command::new("bash")
+        .args(["-eu", "-c", &format!("printf '%s\\0' {guest}")])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("VALIDATE_RUN_STATE", run_state)
+        .output()
+        .map_err(|error| format!("cannot expand {}: {error}", node.tag()))?;
+    if !expanded.status.success() || !expanded.stderr.is_empty() {
+        return Err(format!("cannot expand {}: {expanded:?}", node.tag()));
+    }
+    Ok(expanded
+        .stdout
+        .strip_suffix(&[0])
+        .ok_or_else(|| format!("{} has no final argv delimiter", node.tag()))?
+        .split(|byte| *byte == 0)
+        .map(|bytes| std::ffi::OsString::from(OsStr::from_bytes(bytes)))
+        .collect())
+}
+
 /// Exercise both sides of the fixture-path boundary without a Hermit binary:
-/// the outer shell expands the run state, then env -i removes it before the
-/// unmodified guest argv executes. This is an argv/environment bracket, not a
-/// substitute for the real strict-verify comparator.
-fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+/// the run state is resolved into a literal operand before the guest starts,
+/// and the guest runs with a cleared environment that does not carry it. This
+/// is an argv/environment bracket, not a substitute for the real strict-verify
+/// comparator. "constructed" is the generator that still builds the focused
+/// compatibility lanes from ci/compat/corpus-strict.json; "committed" is the
+/// compat.yaml row e2e.manifest_compat runs.
+fn compat_fixture_operand_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-compat-operand-")
         .tempdir()
@@ -11476,50 +11661,52 @@ fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<St
         Some(&only),
         None,
     )?;
+    let committed = compat_manifest_argv(root, &run_state)?;
     let mut commands = Vec::new();
     for label in ["chown", "install"] {
-        for (kind, nodes) in [
-            ("constructed", constructed.iter().collect::<Vec<_>>()),
-            ("committed", committed.to_vec()),
+        let node = constructed
+            .iter()
+            .find(|node| node.job == label)
+            .ok_or_else(|| format!("compat fixture operand: missing constructed {label}"))?;
+        let constructed_argv = expand_constructed_guest(node, &run_state)
+            .map_err(|error| format!("compat fixture operand: {error}"))?;
+        let committed_argv = committed
+            .get(label)
+            .cloned()
+            .ok_or_else(|| format!("compat fixture operand: missing committed {label}"))?;
+        for (kind, argv) in [
+            ("constructed", constructed_argv),
+            ("committed", committed_argv),
         ] {
-            let node = nodes
-                .iter()
-                .find(|node| node.job == label)
-                .ok_or_else(|| format!("compat fixture operand: missing {kind} {label}"))?;
-            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
-                format!(
-                    "compat fixture operand: missing guest boundary: {}",
-                    node.cmd
-                )
-            })?;
-            if !guest.contains("\"$1\"") || guest.contains("--env VALIDATE_RUN_STATE") {
-                return Err(format!(
-                    "compat fixture operand: {kind} {label} lost positional fixture"
-                ));
-            }
-            if kind == "committed"
-                && !guest.contains(
-                    "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
-                )
+            // bash -c SCRIPT NAME FIXTURE: the script reads the fixture as its
+            // positional operand, and the operand is the literal run-owned path.
+            if argv.len() != 5
+                || argv[0] != "bash"
+                || argv[1] != "-c"
+                || !argv[2].to_string_lossy().contains("\"$1\"")
+                || argv[2].to_string_lossy().contains("VALIDATE_RUN_STATE")
+                || argv[4] != readme.as_os_str()
             {
                 return Err(format!(
-                    "compat fixture operand: {label} lost outer path quoting: {guest}"
+                    "compat fixture operand: {kind} {label} lost its literal positional fixture: {argv:?}"
                 ));
             }
-            commands.push((kind, label, guest.to_string()));
+            commands.push((kind, label, argv));
         }
     }
-    let run = |guest: &str| -> Result<std::process::Output, String> {
-        Command::new("bash").args(["-eu", "-c", &format!(
-            "exec env -i PATH=/usr/bin:/bin HOME=/root TMPDIR=\"$COMPAT_GUEST_TMP\" bash -c 'test \"${{VALIDATE_RUN_STATE+x}}\" != x || exit 91; exec \"$@\"' compat-env {guest}",
-        )])
-            .env_clear().env("PATH", "/usr/bin:/bin")
-            .env("VALIDATE_RUN_STATE", &run_state).env("COMPAT_GUEST_TMP", &guest_tmp)
-            .current_dir(fixture.path()).output()
+    let run = |argv: &[std::ffi::OsString]| -> Result<std::process::Output, String> {
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/root")
+            .env("TMPDIR", &guest_tmp)
+            .current_dir(fixture.path())
+            .output()
             .map_err(|error| format!("compat fixture operand: cannot run clean guest: {error}"))
     };
-    for (kind, label, guest) in &commands {
-        let output = run(guest)?;
+    for (kind, label, argv) in &commands {
+        let output = run(argv)?;
         let expected = if *label == "chown" {
             format!("{}:{}\n", metadata.uid(), metadata.gid())
         } else {
@@ -11533,12 +11720,16 @@ fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<St
                 String::from_utf8_lossy(&output.stderr),
             ));
         }
-        // Restore the old defect inside the single-quoted shell body. The
-        // parent still has the variable; only the guest is correctly stripped.
-        let old = guest.replace(
-            "\"$1\"",
-            "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
-        );
+        // Restore the old defect inside the script: the guest environment does
+        // not carry the run state, so a guest-side expansion must fail.
+        let mut old = argv.clone();
+        old[2] = old[2]
+            .to_string_lossy()
+            .replace(
+                "\"$1\"",
+                "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
+            )
+            .into();
         let output = run(&old)?;
         if output.status.success()
             || !String::from_utf8_lossy(&output.stderr)
@@ -11552,8 +11743,8 @@ fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<St
     std::fs::remove_file(&readme).map_err(|error| {
         format!("compat fixture operand: cannot remove negative fixture: {error}")
     })?;
-    for (kind, label, guest) in &commands {
-        if run(guest)?.status.success() {
+    for (kind, label, argv) in &commands {
+        if run(argv)?.status.success() {
             return Err(format!(
                 "compat fixture operand: {kind} {label} passed with its actual fixture missing"
             ));
@@ -11563,9 +11754,10 @@ fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<St
 }
 
 /// A digest of empty input is a successful hash operation, not proof that its
-/// compressor succeeded. Run the actual generated guest argv under Minimal's
-/// cleared environment and compare against independently compressed real input.
-fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+/// compressor succeeded. Run the actual guest argv, both the generator's and the
+/// compat.yaml row's, under Minimal's cleared environment and compare against
+/// independently compressed real input.
+fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
 
     let fixture = tempfile::Builder::new()
@@ -11616,6 +11808,7 @@ fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Resul
         Some(&only),
         None,
     )?;
+    let committed = compat_manifest_argv(root, &run_state)?;
     let mut commands = Vec::new();
     let empty_digest = format!("{:x}  -\n", Sha256::digest([]));
     for (label, flags) in compressors {
@@ -11655,46 +11848,29 @@ fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Resul
         )
         .and_then(|()| exec_safe_fs::set_executable(&stub, 0o755))
         .map_err(|error| format!("compression fixture: failing producer: {error}"))?;
-        for (kind, nodes) in [
-            ("constructed", constructed.iter().collect::<Vec<_>>()),
-            ("committed", committed.to_vec()),
+        let node = constructed
+            .iter()
+            .find(|node| node.job == label)
+            .ok_or_else(|| format!("compression fixture: missing constructed {label}"))?;
+        // Observe actual outer-shell expansion, not substring presence in the
+        // whole command: a path hidden inside bash -c is not an expanded operand.
+        let constructed_argv = expand_constructed_guest(node, &run_state)
+            .map_err(|error| format!("compression fixture: {error}"))?;
+        let committed_argv = committed
+            .get(label)
+            .cloned()
+            .ok_or_else(|| format!("compression fixture: missing committed {label}"))?;
+        for (kind, argv) in [
+            ("constructed", constructed_argv),
+            ("committed", committed_argv),
         ] {
-            let node = nodes
-                .iter()
-                .find(|node| node.job == label)
-                .ok_or_else(|| format!("compression fixture: missing {kind} {label}"))?;
-            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
-                format!("compression fixture: missing guest boundary: {}", node.cmd)
-            })?;
-            // Observe actual outer-shell expansion, not substring presence in
-            // the whole command. A literal/comment mentioning a variable is not
-            // an environment dependency; a path hidden inside bash -c is not an
-            // expanded operand. NUL framing preserves spaces and metacharacters.
-            let expanded = Command::new("bash")
-                .args(["-eu", "-c", &format!("printf '%s\\0' {guest}")])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("VALIDATE_RUN_STATE", &run_state)
-                .output()
-                .map_err(|error| format!("compression fixture: expand {kind} {label}: {error}"))?;
-            let argv = expanded
-                .stdout
-                .strip_suffix(&[0])
-                .ok_or_else(|| {
-                    format!("compression fixture: {kind} {label} has no final argv delimiter")
-                })?
-                .split(|byte| *byte == 0)
-                .map(|bytes| std::ffi::OsString::from(OsStr::from_bytes(bytes)))
-                .collect::<Vec<_>>();
-            if !expanded.status.success()
-                || !expanded.stderr.is_empty()
-                || argv.len() != 5
+            if argv.len() != 5
                 || argv[0] != "bash"
                 || argv[1] != "-c"
                 || argv[4] != readme.as_os_str()
             {
                 return Err(format!(
-                    "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {expanded:?}"
+                    "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {argv:?}"
                 ));
             }
             commands.push((kind, label, argv, expected.clone()));
@@ -11763,14 +11939,14 @@ fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Resul
     Ok("compression fixture: 4 old false passes reproduced; 8 constructed/committed argv preserve real input; 24 failed-producer/unreadable/missing cases fail".into())
 }
 
-/// Exercise committed strict-compatibility nodes through the real outer
+/// Exercise the committed strict-compatibility bucket through the real outer
 /// scheduler without running the corpus.
 ///
-/// The production plan is inspected first. The execution half replaces two
-/// guest commands and one ordinary Hermit command with a barrier: all three
-/// must be admitted concurrently and must observe dagrun's one outer-step
-/// identity. A hidden serial/nested scheduler or restored guest-exclusion
-/// resource cannot satisfy that barrier.
+/// The production plan and the bucket's compat.yaml rows are inspected first.
+/// The execution half replaces the bucket's command and one ordinary Hermit
+/// command with a barrier: both must be admitted concurrently and must observe
+/// dagrun's one outer-step identity. A hidden serial/nested scheduler or
+/// restored guest-exclusion resource cannot satisfy that barrier.
 fn committed_validation_execution_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-strict-compat-flat-")
@@ -11808,57 +11984,72 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .cloned()
         .ok_or("strict-compat flatten: coexistence fixture lost test.hermit_modes")?;
 
-    let expected =
-        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len();
-    let probes: Vec<&Step> = first
+    // The portable strict compatibility corpus is one manifest bucket: no
+    // per-program node and no selection alias remain in the portable lane.
+    if first
         .steps
         .iter()
-        .filter(|step| step.group == "compat")
-        .collect();
+        .any(|step| step.group == "compat" || step.tag() == "test.strict_compat")
+    {
+        return Err(
+            "strict-compat bucket: the portable lane still has a per-program compat node or the retired test.strict_compat alias"
+                .into(),
+        );
+    }
+    let bucket = first
+        .steps
+        .iter()
+        .find(|step| step.tag() == "e2e.manifest_compat")
+        .cloned()
+        .ok_or("strict-compat bucket: e2e.manifest_compat is absent")?;
     let prep = first
         .steps
         .iter()
         .find(|step| step.tag() == "compatprep.fixtures")
-        .ok_or("strict-compat flatten: fixture-preparation node is absent")?;
-    if probes.len() != expected
-        || first
-            .steps
-            .iter()
-            .any(|step| step.tag() == STRICT_COMPAT_SELECTION_ALIAS)
+        .ok_or("strict-compat bucket: fixture-preparation node is absent")?;
+    let selector = format!(
+        "target/debug/test-harness run --lane portable --category compat {}",
+        hermit_manifest_plan::validation_dag::manifest_selector_flags("compat")
+    );
+    if bucket.cmd.matches(selector.as_str()).count() != 1
+        || bucket.cmd.contains("run-in-pinned-root.sh")
+        || bucket
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !bucket.deps.iter().any(|dep| dep == "compatprep.fixtures")
     {
         return Err(format!(
-            "strict-compat flatten: wrong committed shape probes={} expected={expected} prep_deps={:?}",
-            probes.len(),
-            prep.deps
+            "strict-compat bucket: e2e.manifest_compat must run `{selector}` once on the host, in the isolated /test working directory, after compatprep.fixtures: env={:?} deps={:?} cmd={}",
+            bucket.env, bucket.deps, bucket.cmd
         ));
     }
-    if first.resource_caps.contains_key("hermit_guest")
-        || first
-            .steps
-            .iter()
-            .any(|step| step.hint.resources.contains_key("hermit_guest"))
-    {
-        return Err(
-            "strict-compat flatten: expansion injected a hermit_guest cap or demand".into(),
-        );
+
+    // Its rows, resolved the way the runner resolves them for a run whose
+    // state directory is /run-state.
+    let run_state = Path::new("/run-state");
+    let rows = compat_manifest_argv(root, run_state)?;
+    let expected =
+        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len();
+    if rows.len() != expected {
+        return Err(format!(
+            "strict-compat bucket: compat.yaml has {} CI rows; the corpus has {expected} portable rows",
+            rows.len()
+        ));
     }
-    let required_prefix = " run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- ";
-    if probes
+    let contains = |argv: &[std::ffi::OsString], needle: &str| {
+        argv.iter()
+            .any(|arg| arg.to_string_lossy().contains(needle))
+    };
+    println!("  {}", compat_corpus_binding_bracket(root)?);
+    println!("  {}", compat_fixture_operand_bracket(root)?);
+    println!("  {}", compat_compression_fixture_bracket(root)?);
+    let fixture_readme = "/run-state/strict-compat/real-compat-fixtures/README.md";
+    let readme_labels = rows
         .iter()
-        .any(|probe| !probe.cmd.contains(required_prefix))
-    {
-        return Err(
-            "strict-compat flatten: a portable probe lost minimal base environment or /test working-directory isolation"
-                .into(),
-        );
-    }
-    println!("  {}", compat_fixture_operand_bracket(root, &probes)?);
-    println!("  {}", compat_compression_fixture_bracket(root, &probes)?);
-    let fixture_readme = "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md";
-    let readme_labels = probes
-        .iter()
-        .filter(|probe| probe.cmd.contains("README.md"))
-        .map(|probe| probe.job.as_str())
+        .filter(|(_, argv)| contains(argv, "README.md"))
+        .map(|(label, _)| label.as_str())
         .collect::<BTreeSet<_>>();
     let expected_readme_labels = BTreeSet::from([
         "b2sum",
@@ -11889,27 +12080,45 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         "zstd",
     ]);
     if readme_labels != expected_readme_labels
-        || probes
-            .iter()
-            .filter(|probe| probe.cmd.contains("README.md"))
-            .any(|probe| !probe.cmd.contains(fixture_readme))
+        || rows
+            .values()
+            .flatten()
+            .filter(|arg| arg.to_string_lossy().contains("README.md"))
+            .any(|arg| arg != fixture_readme)
     {
         return Err(format!(
-            "strict-compat flatten: README consumers are not bound to the run-owned fixture: labels={readme_labels:?} fixture={fixture_readme}"
+            "strict-compat bucket: README consumers are not bound to the run-owned fixture: labels={readme_labels:?} fixture={fixture_readme}"
         ));
     }
-    for (tag, workload) in [("compat.cargo", "cargo"), ("compat.df", "df")] {
-        let command = probes
-            .iter()
-            .find(|probe| probe.tag() == tag)
-            .ok_or_else(|| format!("strict-compat flatten: fixture-backed probe {tag} is absent"))?
-            .cmd
-            .as_str();
-        if !command.contains("tests/compat/real_compat_workload.sh")
-            || !command.contains(&format!(" {workload} </dev/null"))
-        {
+    let workload = root.join("tests/compat/real_compat_workload.sh");
+    for label in ["cargo", "df"] {
+        let argv = rows
+            .get(label)
+            .ok_or_else(|| format!("strict-compat bucket: fixture-backed row {label} is absent"))?;
+        let want: [&OsStr; 5] = [
+            "env".as_ref(),
+            "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
+            "bash".as_ref(),
+            workload.as_os_str(),
+            label.as_ref(),
+        ];
+        if argv.as_slice() != want {
             return Err(format!(
-                "strict-compat flatten: {tag} does not use its explicit fixture/tool contract: {command}"
+                "strict-compat bucket: {label} does not use its explicit fixture/tool contract: {argv:?}"
+            ));
+        }
+    }
+    for (label, path) in [
+        ("seq", "/run-state/strict-compat/real-compat-fixtures"),
+        ("shell-build", "/run-state/strict-compat/shell-build"),
+        ("top", "/run-state/strict-compat/top-home"),
+    ] {
+        let argv = rows
+            .get(label)
+            .ok_or_else(|| format!("strict-compat bucket: path row {label} is absent"))?;
+        if !contains(argv, path) {
+            return Err(format!(
+                "strict-compat bucket: {label} does not use its run-owned path {path}: {argv:?}"
             ));
         }
     }
@@ -11920,48 +12129,23 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             || step.cmd.contains("run_dag_boxed")
     }) {
         return Err(
-            "strict-compat flatten: the production expansion still contains a nested scheduler entrypoint"
+            "strict-compat bucket: the production plan still contains a nested scheduler entrypoint"
                 .into(),
         );
     }
 
-    let path_cases = [
-        (
-            "compat.seq",
-            "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures",
-        ),
-        (
-            "compat.shell-build",
-            "$VALIDATE_RUN_STATE/strict-compat/shell-build",
-        ),
-        ("compat.top", "$VALIDATE_RUN_STATE/strict-compat/top-home"),
-    ];
-    for (tag, path) in &path_cases {
-        let command = first
-            .steps
-            .iter()
-            .find(|step| step.tag() == *tag)
-            .ok_or_else(|| format!("strict-compat flatten: path probe {tag} is absent"))?
-            .cmd
-            .as_str();
-        if !command.contains(path) {
-            return Err(format!(
-                "strict-compat flatten: {tag} does not use its run-owned path {path}: {command}"
-            ));
-        }
-    }
-
+    // One outer scheduler admits the bucket and an ordinary Hermit node at the
+    // same time: a restored guest-exclusion resource or a nested scheduler
+    // cannot satisfy this barrier.
     let barrier = fixture.path().join("barrier");
     std::fs::create_dir_all(&barrier)
-        .map_err(|error| format!("strict-compat flatten: cannot create barrier: {error}"))?;
+        .map_err(|error| format!("strict-compat bucket: cannot create barrier: {error}"))?;
     let mut execution = validate_plan::config_from_base(
         &first,
         Vec::new(),
         "strict compatibility one-scheduler execution bracket",
     );
-    // The committed probes now carry direct preflight edges so --only cannot
-    // drop their source/gate ordering. Retain those five prerequisites here as
-    // inert commands; the same three workload commands still must overlap.
+    // The bucket's source/gate prerequisites, as inert commands.
     let fixture_preflight = [
         "pre.submodules",
         PIN_GATE_TAG,
@@ -11974,7 +12158,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             .steps
             .iter()
             .find(|step| step.tag() == tag)
-            .ok_or_else(|| format!("strict-compat flatten: missing committed preflight {tag}"))?;
+            .ok_or_else(|| format!("strict-compat bucket: missing committed preflight {tag}"))?;
         execution.steps.push(step_with_caps(
             &source.group,
             &source.job,
@@ -11992,51 +12176,62 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     execution_prep.timeout = 10;
     execution_prep.cpu_timeout = 10;
     execution.steps.push(execution_prep);
-    let selected: Vec<Step> = probes.into_iter().take(2).cloned().collect();
-    if selected.len() != 2 {
-        return Err("strict-compat flatten: fewer than two probes exist for execution".into());
-    }
-    let tags = [selected[0].tag(), selected[1].tag()];
-    for (index, mut probe) in selected.into_iter().enumerate() {
-        let own = barrier.join(format!("{index}.ready"));
-        let peer = barrier.join(format!("{}.ready", 1 - index));
-        let active = barrier.join(format!("{index}.active"));
-        let ordinary_active = barrier.join("ordinary.active");
+    let tags = [bucket.tag(), ordinary.tag()];
+    for (index, mut step) in [bucket, ordinary].into_iter().enumerate() {
+        let own = barrier.join(format!("{index}.active"));
+        let peer = barrier.join(format!("{}.active", 1 - index));
         let observed = barrier.join(format!("{index}.observed"));
-        probe.cmd = format!(
-            "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active} {own}; i=0; while test ! -e {peer} || test ! -e {ordinary_active}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
+        step.deps = vec![
+            "compatprep.fixtures".into(),
+            PIN_GATE_TAG.into(),
+            "gate.manifest".into(),
+        ];
+        // Only the structured test-count report is kept; the bracket checks
+        // scheduling, not cell results.
+        step.manifest = None;
+        step.result_manifests = step.result_manifests.map(|manifests| {
+            manifests
+                .into_iter()
+                .filter(|manifest| {
+                    matches!(
+                        manifest,
+                        dagrun::model::ResultManifest::StructuredTestResults(_)
+                    )
+                })
+                .collect()
+        });
+        let schema = step
+            .result_manifests
+            .iter()
+            .flatten()
+            .find_map(|manifest| match manifest {
+                dagrun::model::ResultManifest::StructuredTestResults(structured) => {
+                    Some(structured.schema)
+                }
+                dagrun::model::ResultManifest::ManifestCell(_) => None,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "strict-compat bucket: {} declares no test-count report",
+                    step.tag()
+                )
+            })?;
+        step.cmd = format!(
+            "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {own}; i=0; while test ! -e {peer}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":{schema},\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
             tag = validate_plan::shell_quote(&tags[index]),
-            active = validate_plan::shell_quote(&active.to_string_lossy()),
             own = validate_plan::shell_quote(&own.to_string_lossy()),
             peer = validate_plan::shell_quote(&peer.to_string_lossy()),
-            ordinary_active = validate_plan::shell_quote(&ordinary_active.to_string_lossy()),
             observed = validate_plan::shell_quote(&observed.to_string_lossy()),
         );
-        probe.timeout = 10;
-        probe.cpu_timeout = 10;
-        execution.steps.push(probe);
+        // The stand-in has no inner parallelism, so dagrun appends no job count.
+        step.hint.preferred_inner_jobs = None;
+        step.timeout = 10;
+        step.cpu_timeout = 10;
+        execution.steps.push(step);
     }
-    let mut ordinary = ordinary;
-    let ordinary_observed = barrier.join("ordinary.observed");
-    ordinary.deps = vec![
-        "compatprep.fixtures".into(),
-        PIN_GATE_TAG.into(),
-        "gate.manifest".into(),
-    ];
-    ordinary.cmd = format!(
-        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":2,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
-        tag = validate_plan::shell_quote(&ordinary.tag()),
-        active = validate_plan::shell_quote(&barrier.join("ordinary.active").to_string_lossy()),
-        first = validate_plan::shell_quote(&barrier.join("0.active").to_string_lossy()),
-        second = validate_plan::shell_quote(&barrier.join("1.active").to_string_lossy()),
-        observed = validate_plan::shell_quote(&ordinary_observed.to_string_lossy()),
-    );
-    ordinary.timeout = 10;
-    ordinary.cpu_timeout = 10;
-    execution.steps.push(ordinary);
     let result = run_lane_once(
         &execution,
-        3,
+        2,
         true,
         0,
         None,
@@ -12044,20 +12239,11 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         None,
         false,
     );
-    let mut observed = (0..2)
+    let observed = (0..2)
         .map(|index| std::fs::read_to_string(barrier.join(format!("{index}.observed"))))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("strict-compat flatten: scheduler evidence missing: {error}"))?;
-    observed.push(
-        std::fs::read_to_string(&ordinary_observed).map_err(|error| {
-            format!("strict-compat flatten: ordinary scheduler evidence missing: {error}")
-        })?,
-    );
-    let expected_observed = tags
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once("test.hermit_modes"))
-        .collect::<BTreeSet<_>>();
+        .map_err(|error| format!("strict-compat bucket: scheduler evidence missing: {error}"))?;
+    let expected_observed = tags.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let expected_outcomes = fixture_preflight
         .into_iter()
         .chain(std::iter::once("compatprep.fixtures"))
@@ -12065,7 +12251,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .collect::<BTreeSet<_>>();
     if !result.ok
         || !result.complete
-        || result.outcomes.len() != 9
+        || result.outcomes.len() != 8
         || result
             .outcomes
             .iter()
@@ -12080,7 +12266,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             != expected_observed
     {
         return Err(format!(
-            "strict-compat flatten: one outer scheduler did not execute two probes and one ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
+            "strict-compat bucket: one outer scheduler did not execute e2e.manifest_compat and an ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
             result.ok,
             result.complete,
             result
@@ -12093,7 +12279,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
 
     Ok(format!(
-        "portable strict compatibility: {expected} direct outer nodes without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution"
+        "portable strict compatibility: one bucket of {expected} rows without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution"
     ))
 }
 
@@ -15188,8 +15374,11 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             "--ci-only" => selection.population = Some(Population::Required),
             "--prebuilt" => prebuilt = true,
             "--allow-empty" => {}
+            // Selects the schema-4 result report; the cells and their retries
+            // are unchanged.
+            "--diagnostic-results" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--exclude-backend"
-            | "--results" | "--junit" | "--jobs" => {
+            | "--exclude-category" | "--results" | "--junit" | "--jobs" => {
                 index += 1;
                 let value = argv
                     .get(index)
@@ -15205,6 +15394,9 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     // cells the node actually runs; the repeated-option guard
                     // above still refuses a second exclusion.
                     "--exclude-backend" => selection.exclude_backends.push(value.clone()),
+                    // The quick verify smoke omits the host-bound strict
+                    // compatibility corpus; model it like the backend omission.
+                    "--exclude-category" => selection.exclude_categories.push(value.clone()),
                     _ => {}
                 }
             }
@@ -15526,7 +15718,9 @@ mod nextest_timeout_tests {
                 })
                 .unwrap()
                 .len(),
-            900,
+            // 900 before the strict compatibility corpus moved into
+            // compat.yaml (fold 1 of https://github.com/rrnewton/hermit/issues/3448).
+            900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
@@ -15794,8 +15988,11 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // system-utils/sysfs-sanitized-prefixes moved to the privileged lane,
         // which added privileged-e2e.manifest_system_utils,
         // privileged-only-e2e.manifest_system_utils and its _on_host variant
-        // (https://github.com/rrnewton/hermit/actions/runs/36485831200).
-        assert_eq!(steps.len(), 34);
+        // (https://github.com/rrnewton/hermit/actions/runs/36485831200). 36
+        // since e2e.manifest_compat and e2e.manifest_compat_on_host replaced
+        // the per-program compat nodes (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448).
+        assert_eq!(steps.len(), 36);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -19408,12 +19605,14 @@ fn compat_test_results(
     TestResults::current(executed, 0, results)
 }
 
-/// Add the direct compatibility rows to the exact test denominator.
+/// Add a focused compatibility lane's direct rows (`strictcompat.*`,
+/// `portablecompat.*`, ...) to the exact test denominator.
 ///
-/// Before strict compatibility was flattened, its nested validate published a
-/// single structured-count file to the outer `test.strict_compat` step. The
-/// direct `compat.*` steps already carry stronger typed terminal outcomes and
-/// attempts, so the outer producer now consumes those facts itself. A failed
+/// Before those lanes were flattened, a nested validate published a single
+/// structured-count file to one outer step. The direct steps already carry
+/// stronger typed terminal outcomes and attempts, so the outer producer now
+/// consumes those facts itself. (The portable strict corpus in the full and
+/// portable profiles reports through e2e.manifest_compat instead.) A failed
 /// count-bearing non-compatibility node still leaves the passed count unknown;
 /// flattening must not turn an inexact base count into an exact-looking total.
 fn run_test_counts(
@@ -26139,11 +26338,17 @@ mod committed_selection_preservation_tests {
                     stdout.contains("test.hermit_unit,test.detcore_unit"),
                     "public selectors changed: {stdout}"
                 );
+                // The bucket and its fixture producer (190 nodes until fold 1
+                // of https://github.com/rrnewton/hermit/issues/3448 replaced
+                // the 189 per-program nodes with e2e.manifest_compat_on_host).
                 assert!(
-                    stdout.contains("190 strict compatibility"),
-                    "the fixture must accompany all 189 cases: {stdout}"
+                    stdout.contains("2 strict compatibility"),
+                    "the fixture must accompany the strict compatibility bucket: {stdout}"
                 );
             } else {
+                // 67 since the 189 compat.<label>_on_host nodes were folded
+                // into e2e.manifest_compat_on_host (fold 1 of
+                // https://github.com/rrnewton/hermit/issues/3448).
                 // 255 since check.script_unit_tests took the rust-script
                 // unit tests out of check.lint_checks, assigned to the checks
                 // job in ci/portable-shards.json.
@@ -26164,7 +26369,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "255 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "67 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -26176,7 +26381,7 @@ mod committed_selection_preservation_tests {
                 ("duplicate-resolved", "test.hermit_unit_on_host"),
                 ("duplicate-fixture", "compatprep.fixtures_on_host"),
                 ("unknown", "test.no_such_shard_node"),
-                ("missing-strict", "expected exactly one"),
+                ("missing-strict", "e2e.manifest_compat_on_host"),
             ] {
                 let mut broken = shards.clone();
                 let nodes = broken["debug_shards"][0]["nodes"].as_array_mut().unwrap();
@@ -26308,19 +26513,18 @@ mod committed_selection_preservation_tests {
             .iter()
             .map(|tag| format!("{tag}_on_host"))
             .collect::<BTreeSet<_>>();
-        let compat = hosted
-            .steps
-            .iter()
-            .filter(|step| step.group == "compat")
-            .map(Step::tag)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(compat.len(), 189);
-        expected.extend(compat);
-        expected.insert("compatprep.fixtures_on_host".into());
-        // 206 until test.dbt_parity_on_host was retired (slice S13 of
+        assert!(hosted.steps.iter().all(|step| step.group != "compat"));
+        // The strict compatibility corpus is one bucket, requested by its
+        // public name.
+        expected.insert("e2e.manifest_compat_on_host".into());
+        // 16 since the 189 compat.<label>_on_host nodes and their fixture
+        // producer, which the removed test.strict_compat alias added, became
+        // the one bucket e2e.manifest_compat_on_host (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448); 206 until
+        // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(expected.len(), 205);
-        let requested = [public.join(","), STRICT_COMPAT_SELECTION_ALIAS.into()].join(",");
+        assert_eq!(expected.len(), 16);
+        let requested = [public.join(","), "e2e.manifest_compat".into()].join(",");
         for only in [false, true] {
             let mut argv = if only {
                 vec!["--only".into(), "hosted-portable".into(), requested.clone()]
@@ -26338,7 +26542,16 @@ mod committed_selection_preservation_tests {
             let plan = build_plan(root, &args, temp.path()).unwrap();
             let mut expected = expected.clone();
             if only {
-                expected.extend(["pre.submodules".into(), PIN_GATE_TAG.into()]);
+                // A focused run keeps the run-owned fixtures the corpus reads
+                // and the bucket's harness and script producers;
+                // --ignore-selected-deps runs exactly what was named.
+                expected.extend([
+                    "pre.submodules".into(),
+                    PIN_GATE_TAG.into(),
+                    "compatprep.fixtures_on_host".into(),
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
+                    RUST_SCRIPT_PRODUCER_TAG.into(),
+                ]);
             }
             assert_eq!(
                 plan.cfg
@@ -29135,8 +29348,11 @@ mod raw_census_publication_tests {
         // system-utils/sysfs-sanitized-prefixes moved to the privileged lane,
         // which added privileged-e2e.manifest_system_utils,
         // privileged-only-e2e.manifest_system_utils and its _on_host variant
-        // (https://github.com/rrnewton/hermit/actions/runs/36485831200).
-        assert_eq!(publishers.len(), 34);
+        // (https://github.com/rrnewton/hermit/actions/runs/36485831200). 36
+        // since e2e.manifest_compat and e2e.manifest_compat_on_host replaced
+        // the per-program compat nodes (fold 1 of
+        // https://github.com/rrnewton/hermit/issues/3448).
+        assert_eq!(publishers.len(), 36);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(
@@ -29171,7 +29387,7 @@ mod raw_census_publication_tests {
                 .as_ref()
                 .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
             {
-                Some(("portable", "c-programs")) => Some("--jobs"),
+                Some(("portable", "c-programs" | "compat")) => Some("--jobs"),
                 Some(("portable" | "privileged", "system-utils")) => Some(""),
                 _ => None,
             };

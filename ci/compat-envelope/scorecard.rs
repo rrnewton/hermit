@@ -239,6 +239,9 @@ struct ManifestRow {
     #[serde(default)]
     not_applicable_reason: Option<String>,
     test: String,
+    /// A verify cell that declares `comparator: stripped` (below L2).
+    #[serde(default)]
+    stripped: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3344,6 +3347,9 @@ struct Derived {
     selected: BTreeSet<CellId>,
     green: BTreeSet<CellId>,
     selected_custom: BTreeSet<CellId>,
+    /// Selected verify cells that declare the stripped comparator: below L2,
+    /// counted as selected but never as canonical.
+    stripped_selected: BTreeSet<CellId>,
 }
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
@@ -4555,8 +4561,10 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let mut ci_enabled = BTreeSet::new();
     let mut ci_disabled_reasons = BTreeMap::new();
     let mut not_applicable_reasons = BTreeMap::new();
+    let mut stripped = BTreeSet::new();
     for row in rows {
         let comparable = row.mode != "custom";
+        let declares_stripped = row.stripped;
         let id = CellId {
             lane: row.lane,
             category: row.bucket,
@@ -4569,6 +4577,9 @@ fn derive(root: &Path) -> Result<Derived, String> {
                 "manifest-plan emitted duplicate cell {}",
                 display_id(&id)
             ));
+        }
+        if declares_stripped {
+            stripped.insert(id.clone());
         }
         // `custom` is an explicit per-test command, not a mode which applies
         // uniformly to every test/backend pair. Keep selected custom commands
@@ -4638,6 +4649,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         }
     }
     let (green, selected_custom) = selected_partition(&selected, &population)?;
+    let stripped_selected = green.intersection(&stripped).cloned().collect();
     Ok(Derived {
         population,
         applicable,
@@ -4646,7 +4658,41 @@ fn derive(root: &Path) -> Result<Derived, String> {
         selected,
         green,
         selected_custom,
+        stripped_selected,
     })
+}
+
+/// How many selected verify cells declare the stripped comparator, by
+/// category and backend: they are selected, but below L2 and never canonical.
+fn stripped_selected_sentence(derived: &Derived) -> String {
+    let verify = derived
+        .green
+        .iter()
+        .filter(|id| id.mode == "verify")
+        .count();
+    if derived.stripped_selected.is_empty() {
+        return format!(
+            "None of the **{verify}** selected `verify` cells declares the stripped comparator."
+        );
+    }
+    let mut by_group = BTreeMap::<(&str, &str), usize>::new();
+    for id in &derived.stripped_selected {
+        *by_group
+            .entry((id.category.as_str(), id.backend.as_str()))
+            .or_default() += 1;
+    }
+    let groups = by_group
+        .iter()
+        .map(|((category, backend), count)| format!("`{category}` on `{backend}`: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "**{}** of the **{verify}** selected `verify` cells declare `comparator: stripped` ({groups}). \
+They run Hermit's default `--verify` and pass only on a verified, matched report of a non-empty \
+stripped comparison; they are below L2, never `bitwise_parity`, and are counted in these tables as \
+selected, not as canonical.",
+        derived.stripped_selected.len()
+    )
 }
 
 fn selected_green(selected: &BTreeSet<CellId>, population: &BTreeSet<CellId>) -> BTreeSet<CellId> {
@@ -5073,6 +5119,7 @@ fn render_scorecard(derived: &Derived) -> String {
         .count();
     let selected_by_full_total = derived.green.len();
     let not_selected_by_full_total = derived.applicable.difference(&derived.green).count();
+    let stripped_sentence = stripped_selected_sentence(derived);
 
     let mut out = format!(
         "# Compatibility scorecard\n\n\
@@ -5085,13 +5132,15 @@ test result: a cell not selected by full may have passed, failed, produced no ve
 Of these cells, **{selected_by_full_total}** are selected by full, \
 **{not_selected_by_full_total}** are not selected by full, and **{na_total}** are \
 **Not applicable**.\n\n\
-Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
+Every selected `verify` cell that does not declare the stripped comparator, and every seed in a \
+selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
 accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
 `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical \
 `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
 comparison when invoked directly and does not satisfy \
-this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
+this regression plan. {stripped_sentence} These same-backend results do not establish \
+cross-backend parity.\n\n\
 | Backend | Selected by full | Not selected by full | Not applicable | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: |\n",
         derived.population.len()
@@ -16735,6 +16784,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected,
         green,
         selected_custom: selected_custom.clone(),
+        stripped_selected: BTreeSet::new(),
     };
     let rendered = render_scorecard(&selected_fixture);
     let status_prose = rendered
@@ -16821,6 +16871,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     if !render_scorecard(&visible_red).contains("**1** are not selected by full") {
         return Err("scorecard prose did not derive its not-selected-by-full count".into());
@@ -16933,6 +16984,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     let status_section = render_scorecard(&not_applicable);
     if !status_section.contains("**1** are **Not applicable**")
@@ -16963,6 +17015,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     if tracked_from(&regressed, Some(old_green), None, false).is_ok() {
         return Err("negative ratchet bracket accepted green-to-red movement".into());
@@ -17013,6 +17066,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::from([id.clone()]),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
         .map_err(|e| format!("recovery after an override was refused: {e}"))?;
@@ -17202,6 +17256,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::from([ptrace_id.clone()]),
         green: BTreeSet::from([ptrace_id.clone()]),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     if !retained_import_cells(&retained_fixture).contains(&parity_id) {
         return Err("retained imports excluded a disabled ptrace-referenced parity cell".into());
@@ -18888,6 +18943,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
         return Err(
@@ -26612,6 +26668,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         selected: BTreeSet::from([boundary_id.clone()]),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
+        stripped_selected: BTreeSet::new(),
     };
     let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), None, false)?;
     if rederived.projection != stamped.projection {
@@ -32497,6 +32554,44 @@ mod retired_id_join_tests {
     }
 
     #[test]
+    fn selected_stripped_cells_are_stated_apart_from_canonical_ones() {
+        let cell = |test: &str, mode: &str| CellId {
+            lane: "portable".into(),
+            category: "compat".into(),
+            test: test.into(),
+            mode: mode.into(),
+            backend: "ptrace".into(),
+        };
+        let selected = BTreeSet::from([
+            cell("compat/a", "verify"),
+            cell("compat/b", "verify"),
+            cell("compat/c", "chaos"),
+        ]);
+        let mut derived = Derived {
+            population: selected.clone(),
+            applicable: selected.clone(),
+            ci_disabled_reasons: BTreeMap::new(),
+            not_applicable_reasons: BTreeMap::new(),
+            selected: selected.clone(),
+            green: selected,
+            selected_custom: BTreeSet::new(),
+            stripped_selected: BTreeSet::new(),
+        };
+        assert_eq!(
+            super::stripped_selected_sentence(&derived),
+            "None of the **2** selected `verify` cells declares the stripped comparator."
+        );
+        derived.stripped_selected = BTreeSet::from([cell("compat/a", "verify")]);
+        let sentence = super::stripped_selected_sentence(&derived);
+        assert!(
+            sentence.starts_with(
+                "**1** of the **2** selected `verify` cells declare `comparator: stripped` (`compat` on `ptrace`: 1)."
+            ) && sentence.contains("below L2"),
+            "{sentence}"
+        );
+    }
+
+    #[test]
     fn carrying_forward_a_retired_id_is_not_a_cell_removal() {
         let (recorded, _) = super::attempt_binding_tests::fixture_for(retired());
         let derived = Derived {
@@ -32507,6 +32602,7 @@ mod retired_id_join_tests {
             selected: BTreeSet::from([successor()]),
             green: BTreeSet::new(),
             selected_custom: BTreeSet::new(),
+            stripped_selected: BTreeSet::new(),
         };
         let carried = tracked_from(&derived, Some(recorded.clone()), None, false).unwrap();
         assert_eq!(carried.cells.len(), 1);

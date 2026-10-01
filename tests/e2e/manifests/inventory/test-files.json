@@ -2876,6 +2876,12 @@
     },
     {
       "disposition": "manifest-policy",
+      "path": "tests/e2e/manifests/compat.yaml",
+      "runner": "target/debug/test-harness via ci/manifest-plan",
+      "why": "tests/e2e/manifests/compat.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `compat` YAML file is policy for the `compat` manifest bucket: a corpus section that states the portable strict compatibility lane's Hermit settings once and one (label, argv) row per host program, which ci/manifest-plan/src/manifest_corpus.rs expands into ordinary test recipes. It configures the common system and is not itself executable test input."
+    },
+    {
+      "disposition": "manifest-policy",
       "path": "tests/e2e/manifests/data-handling.yaml",
       "runner": "target/debug/test-harness via ci/manifest-plan",
       "why": "tests/e2e/manifests/data-handling.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `data-handling` YAML file is policy for the `data-handling` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."

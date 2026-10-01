@@ -219,8 +219,6 @@ struct Dag {
     deps: BTreeMap<String, Vec<String>>,
 }
 
-const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-
 impl Dag {
     fn load(path: &Path) -> Dag {
         let raw = std::fs::read_to_string(path)
@@ -279,19 +277,6 @@ impl Dag {
                     .to_string()
             })
             .collect();
-        if nodes.contains(STRICT_COMPAT_SELECTION_ALIAS) {
-            let compat = self
-                .all_nodes
-                .iter()
-                .filter(|node| node.starts_with("compat."))
-                .cloned()
-                .collect::<Vec<_>>();
-            // An absent alias target remains unknown and forces the full suite.
-            if !compat.is_empty() {
-                nodes.remove(STRICT_COMPAT_SELECTION_ALIAS);
-                nodes.extend(compat);
-            }
-        }
     }
 }
 
@@ -1227,8 +1212,8 @@ fn self_test() {
         dbt.nodes.contains("build.workspace_on_host"),
     );
     check(
-        "dbt-only skips strict compat cells",
-        !dbt.nodes.iter().any(|node| node.starts_with("compat.")),
+        "dbt-only skips the strict compatibility corpus",
+        !dbt.nodes.contains("e2e.manifest_compat_on_host"),
     );
     check(
         "dbt-only skips language_runtimes",
@@ -1249,9 +1234,8 @@ fn self_test() {
         core.decision == Decision::Selective,
     );
     check(
-        "detcore core expands the strict compat alias",
-        core.nodes.iter().any(|node| node.starts_with("compat."))
-            && !core.nodes.contains(STRICT_COMPAT_SELECTION_ALIAS),
+        "detcore core runs the strict compatibility corpus",
+        core.nodes.contains("e2e.manifest_compat_on_host"),
     );
     check(
         "detcore core runs detcore_unit",
@@ -1276,11 +1260,12 @@ fn self_test() {
         all_nodes: dag.all_nodes.clone(),
         deps: dag.deps.clone(),
     };
-    removed
-        .all_nodes
-        .retain(|node| !node.starts_with("compat."));
     check(
-        "removed compatibility alias targets force full",
+        "actual hosted strict compatibility bucket is present before removal",
+        removed.all_nodes.remove("e2e.manifest_compat_on_host"),
+    );
+    check(
+        "a removed strict compatibility bucket forces full",
         select(&fp, &removed, &["detcore/src/scheduler.rs".into()]).decision == Decision::Full,
     );
     let unknown_fp = Footprints {

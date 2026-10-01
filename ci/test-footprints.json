@@ -55,6 +55,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -81,8 +82,7 @@
         "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "common/test-allocator/**/*.rs",
@@ -100,6 +100,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -126,8 +127,7 @@
         "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "common/test-workdir/**/*.rs",
@@ -145,6 +145,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -171,8 +172,7 @@
         "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "detcore/**",
@@ -223,6 +223,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -250,8 +251,7 @@
         "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "detcore-model/**/*.rs",
@@ -288,6 +288,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -314,8 +315,7 @@
         "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "detcore/tests/testutils/**/*.rs",
@@ -353,6 +353,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -375,8 +376,7 @@
         "test.ignored_syscall_regressions_on_host",
         "test.liteinst_strict_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "hermit-cli/**",
@@ -395,6 +395,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -418,8 +419,7 @@
         "test.liteinst_strict",
         "test.regular_crates_on_host",
         "test.rr_suite_contract",
-        "test.sabre_examples",
-        "test.strict_compat"
+        "test.sabre_examples"
       ],
       "paths": [
         "hermit-install/**",
@@ -438,6 +438,7 @@
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
@@ -461,8 +462,7 @@
         "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host",
-        "test.strict_compat"
+        "test.sabre_examples_on_host"
       ],
       "paths": [
         "hermit-resources/**/*.rs",

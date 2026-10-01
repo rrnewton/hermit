@@ -71,7 +71,8 @@
     "scorecard.compatibility_on_host"
   ],
   "strict_compat_nodes": [
-    "test.strict_compat"
+    "compatprep.fixtures_on_host",
+    "e2e.manifest_compat_on_host"
   ],
   "debug_shards": [
     {
