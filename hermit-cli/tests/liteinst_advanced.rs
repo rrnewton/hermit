@@ -1250,17 +1250,20 @@ fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
 /// reaches main than the same image under ptrace.
 ///
 /// The fix for https://github.com/rrnewton/hermit/issues/3338 stops charging the
-/// runtime's preload constructor, which cost about 2.1 s per image here. It does
+/// runtime's preload constructor, which cost about 1.99 s per image here (of a
+/// 2.14 s gap between the backends with the constructor charged). It does
 /// not make the backends reach main at the same instant. Before the runtime's
 /// begin trap, the dynamic loader maps the preloaded runtime and its libgcc_s
 /// dependency as ordinary guest syscalls, and those stay charged. Scheduler
 /// turns inside the bootstrap window also still advance global time. Measured
 /// with these flags, LiteInst reaches main 151,137,500 ns after ptrace in the
-/// first image, and the exec adds 136,137,500 ns more. Both values are exact and
-/// repeat across runs; they depend on the fixture binary that the host's cc
-/// produces and on the runtime's library set, so the test bounds them instead of
-/// asserting them. 200 ms per image leaves about 50 ms of headroom and fails if
-/// even a tenth of the runtime constructor is charged again. This residual is
+/// first image in one build directory and 136,137,500 ns in another, at the
+/// same commit, and in both the exec adds 136,137,500 ns more. The values repeat
+/// across runs in one environment, but they depend on the fixture binary that
+/// the host's cc produces, on the runtime's library set and on the environment
+/// (likely the lengths of the mapped paths), so the test bounds them instead of
+/// asserting them. 200 ms per image leaves about 49 to 64 ms of headroom and
+/// fails if even a tenth of the runtime constructor is charged again. This residual is
 /// not parity: it grows with every exec, and after enough execs sysinfo uptime
 /// differs between the backends again. The follow-up is tracked from
 /// https://github.com/rrnewton/hermit/issues/3338.
@@ -1271,7 +1274,7 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
     let liteinst = clock_trajectory("liteinst");
     let ptrace = clock_trajectory("ptrace");
 
-    // The fixture's last read is about 0.92 s past the epoch under LiteInst,
+    // The fixture's last read is about 0.91 to 0.92 s past the epoch under LiteInst,
     // below the next uptime boundary, so both backends read the same uptime.
     // This is not a general guarantee; see LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS.
     let liteinst_uptime = liteinst.iter().map(|s| s.uptime).collect::<Vec<_>>();

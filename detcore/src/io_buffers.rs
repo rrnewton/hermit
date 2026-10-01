@@ -1465,6 +1465,40 @@ mod event_tests {
         assert_eq!(advance(&tool, &mut booting, readv(1)).await, 0);
         assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 1);
         assert_eq!(*cap_logs.0.lock().unwrap(), cap_line);
+
+        // (4) The reopened window has the whole cap again, and reaching it logs
+        // the window's own info line: the line is once per window, not once per
+        // thread or per process.
+        for index in 1..MAX_UNCHARGED_BOOTSTRAP_SYSCALLS {
+            if index == MAX_UNCHARGED_BOOTSTRAP_SYSCALLS - 1 {
+                assert_eq!(
+                    *cap_logs.0.lock().unwrap(),
+                    cap_line,
+                    "the reopened window logged the cap line before reaching the cap"
+                );
+            }
+            assert_eq!(
+                advance(&tool, &mut booting, readv(1)).await,
+                0,
+                "uncharged syscall {index} of the reopened window advanced logical time"
+            );
+        }
+        assert_eq!(
+            booting.thread.uncharged_bootstrap_syscalls,
+            MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+        );
+        let two_cap_lines = vec![cap_line[0].clone(), cap_line[0].clone()];
+        assert_eq!(
+            *cap_logs.0.lock().unwrap(),
+            two_cap_lines,
+            "a reopened window that reaches the cap must log its own info line"
+        );
+        assert_eq!(
+            advance(&tool, &mut booting, readv(1)).await,
+            readv_cost,
+            "the first syscall past the reopened window's cap must be charged"
+        );
+        assert_eq!(*cap_logs.0.lock().unwrap(), two_cap_lines);
     }
 
     #[tokio::test(flavor = "current_thread")]
