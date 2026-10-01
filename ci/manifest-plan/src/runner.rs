@@ -4410,6 +4410,20 @@ pub(crate) fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
         .map(|report| report.verdict)
 }
 
+/// Whether `attempt` retains a current verification report whose strict
+/// comparison matched: [`VerificationReport::require_canonical_match`], the
+/// check a strict verify cell must pass before the runner can pass it. A
+/// `matched` verdict from a weaker comparison does not count. The parity
+/// post-pass reads it from the last attempt of a `FAIL` row to decide that
+/// the row still has one deterministic log (`parity::evaluate_history`).
+pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| report.require_canonical_match().is_ok())
+}
+
 fn observed_result(
     mode: &str,
     outcome: &str,
