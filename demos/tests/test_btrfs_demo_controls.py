@@ -2,7 +2,8 @@
 """Tests for demo 8's result checks and for its seed calibration.
 
 Both scripts decide PASS or FAIL from what `hermit run --chaos` returns: the
-exit status (134 is the ASAN abort, 124 the timeout, 125 a wrapper failure) and
+exit status (134 is the ASAN abort, 124 the timeout, 125 a wrapper failure,
+122 Hermit's refusal after a late performance-counter interrupt) and
 whether the output holds a complete AddressSanitizer report. Each test puts a
 stub `hermit` first on PATH that returns one scripted outcome, runs the real
 script, and checks that the script accepts or refuses it for the stated reason.
@@ -63,6 +64,13 @@ if [ "${1:-}" = --version ]; then
   exit 0
 fi
 printf '%s\n' "$*" >>"$DEMO08_TEST_ARGS_FILE"
+# What Reverie and Hermit print when a precise-timer interrupt arrives past its
+# target: Hermit refuses the run with HERMIT_POLICY_REFUSAL_EXIT (122).
+skid_refusal() {
+  echo 'HERMIT_SKID_OVERSHOOT rcb_actual=1008 rcb_target=1000 skid_margin=32 overshoot=8' >&2
+  echo 'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1' >&2
+  exit 122
+}
 conv=""
 seen=0
 for a in "$@"; do
@@ -80,6 +88,7 @@ case "$conv" in
       partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
       partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
       truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
+      skid-refusal) skid_refusal ;;
       replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different)
         if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
         case "$DEMO08_TEST_BUGGY_MODE" in
@@ -97,6 +106,7 @@ case "$conv" in
       timeout) echo "conversion still running"; exit 124 ;;
       wrapper-failure) echo "wrapper: limit exceeded" >&2; exit 125 ;;
       regression-uaf) cat "$DEMO08_TEST_UAF_FILE"; exit 134 ;;
+      skid-refusal) skid_refusal ;;
       *) echo "stub: unknown DEMO08_TEST_FIXED_MODE" >&2; exit 9 ;;
     esac ;;
   *) echo "stub: unexpected btrfs-convert path: $conv" >&2; exit 9 ;;
@@ -407,6 +417,17 @@ class DemoRunControlsTest(unittest.TestCase):
             self._run(fixed_mode="wrapper-failure"),
             "rc=125 is a wrapper failure, not a guest result",
         )
+
+    def test_a_fixed_run_refused_after_a_skid_overshoot_is_refused(self):
+        self._assert_refused(
+            self._run(fixed_mode="skid-refusal"),
+            "rc=122 means Hermit refused the run",
+        )
+
+    def test_a_buggy_run_refused_after_a_skid_overshoot_is_explained(self):
+        result = self._run(buggy_mode="skid-refusal")
+        self._assert_refused(result, "rc=122 means Hermit refused the run")
+        self.assertIn("chaos-buggy.out", result.stdout)
 
     def test_a_partial_report_with_exit_0_is_not_a_crash(self):
         self._assert_refused(self._run(buggy_mode="partial-rc0"), "expected 134")

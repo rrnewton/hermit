@@ -14,10 +14,12 @@
 # (before 73e211a7) and `fixed` (73e211a7). It reports what one native buggy run
 # showed, then shows that the chaos buggy run crashes on a known seed, the chaos
 # fixed run on the same seed is clean, and the crash reproduces byte-for-byte
-# when run again. That held on a lightly loaded host. Under heavy host load a
-# performance-counter interrupt can arrive later than Hermit's safety margin
-# (Hermit prints HERMIT_SKID_OVERSHOOT), a thread switch can land past its
-# planned point, and the seed may miss; README.md explains this.
+# when run again. That held on a lightly loaded host. If a performance-counter
+# interrupt arrives later than Hermit's safety margin, which heavy host load
+# makes more likely, Reverie prints a HERMIT_SKID_OVERSHOOT line and Hermit
+# refuses the run: it prints "HERMIT_POLICY_REFUSAL class=policy-refusal
+# cause=skid-overshoot count=N" and exits 122, so this script reports rc=122
+# instead of the expected crash. README.md explains this.
 # prepare-assets.sh builds the binaries and the input image; WRITEUP.md tells
 # the story of the bug.
 
@@ -34,7 +36,9 @@ Usage: demos/08-btrfs-convert-uaf/run.sh
 
 Show a schedule-dependent btrfs-convert use-after-free that native execution
 cannot reproduce on demand and `hermit run --chaos` finds and, on a lightly
-loaded host, reproduces. Under heavy host load the recorded seed may miss; see
+loaded host, reproduces. Under heavy host load a late performance-counter
+interrupt makes Hermit refuse a run (HERMIT_POLICY_REFUSAL ...
+cause=skid-overshoot, exit 122), and this script then reports rc=122; see
 demos/08-btrfs-convert-uaf/README.md.
 
 Needs AddressSanitizer btrfs-convert binaries and a populated ext4 image, which
@@ -214,6 +218,12 @@ if [ "$buggy_rc" -ne 134 ]; then
     0)   echo "rc=0 means the crash did not occur. If the seed came from an earlier" \
            "prepare-assets.sh, re-run it: it re-checks the recorded seed and" \
            "searches again when that seed no longer crashes" >&2 ;;
+    122) echo "rc=122 means Hermit refused the run: a performance-counter" \
+           "interrupt arrived later than its safety margin, so it printed" \
+           "HERMIT_SKID_OVERSHOOT and HERMIT_POLICY_REFUSAL ..." \
+           "cause=skid-overshoot instead of treating the run as deterministic" \
+           "evidence. Heavy host load makes this more likely; see both lines" \
+           "in $ARTIFACTS/chaos-buggy.out and re-run on a quieter host" >&2 ;;
     124) echo "rc=124 means the ${TIMEOUT}s timeout cut the run off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest crash" >&2 ;;
   esac
@@ -247,6 +257,12 @@ fi
 if [ "$fixed_rc" -ne 0 ]; then
   echo "the fixed control did not complete: rc=$fixed_rc, no use-after-free reported" >&2
   case "$fixed_rc" in
+    122) echo "rc=122 means Hermit refused the run: a performance-counter" \
+           "interrupt arrived later than its safety margin, so it printed" \
+           "HERMIT_SKID_OVERSHOOT and HERMIT_POLICY_REFUSAL ..." \
+           "cause=skid-overshoot instead of treating the run as deterministic" \
+           "evidence. Heavy host load makes this more likely; see both lines" \
+           "in $ARTIFACTS/chaos-fixed.out and re-run on a quieter host" >&2 ;;
     124) echo "rc=124 is the ${TIMEOUT}s timeout: the control was cut off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest result" >&2 ;;
     *)   echo "rc=$fixed_rc is an execution or environment failure" >&2 ;;

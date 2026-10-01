@@ -41,14 +41,15 @@ file system or network deterministic.
   ([demo 9](09-qemu-busybox/README.md), which saves no snapshot).
 - **Inspect a running guest kernel without disturbing it**, and see the same
   kernel state on every run ([demo 7](07-drgn-kernel/README.md)).
-- **Catch a real use-after-free that normal runs expose only by chance**, and
-  reproduce it on request ([demo 8](08-btrfs-convert-uaf/README.md)). On a
-  shared or heavily loaded machine the crash may not reproduce reliably:
-  Hermit arms the retired-branch counter interrupt for each chaos-mode thread
-  switch a safety margin early and single-steps to the exact point, and if the
-  interrupt arrives later than that margin, which is more likely under heavy
-  host load (Hermit then prints `HERMIT_SKID_OVERSHOOT`), the switch lands past
-  its planned point and the seed may miss.
+- **Catch a real use-after-free that normal runs expose only by chance**, and,
+  on a lightly loaded machine, reproduce it on request
+  ([demo 8](08-btrfs-convert-uaf/README.md)). On a shared or heavily loaded
+  machine the crash may not reproduce reliably: Hermit arms the retired-branch
+  counter interrupt for each chaos-mode thread switch a safety margin early and
+  single-steps to the exact point, and if the interrupt arrives later than that
+  margin, which is more likely under heavy host load, Hermit prints
+  `HERMIT_SKID_OVERSHOOT` and refuses the run (`HERMIT_POLICY_REFUSAL ...
+  cause=skid-overshoot`, exit status 122) instead of reporting the crash.
 - **Build Debian packages bit for bit reproducibly**: in a 58-package sample
   measured with Hermit commit `1fadc03779f2`, 52 built byte-identically from two
   different root directories and none differed; an earlier, larger run found
@@ -199,10 +200,10 @@ boot. The groups are not balanced in length:
 
 Measured on 2026-09-30 by running `make -C demos group1`, `group2`, and
 `group3` one after another, with Hermit 0.2.0 `dc92644f96f4`, QEMU 10.1.2, and
-demo 8's assets prepared, on a lightly loaded 316-CPU AMD EPYC host (load
-average 10 to 20). All nine demos passed. The group times are wall-clock times
-of the `make` commands; the per-demo times are the whole seconds that
-`demos/run-all.sh` writes to `summary.tsv`.
+demo 8's assets prepared, on a shared 316-CPU AMD EPYC host. All nine demos
+passed. The group times are wall-clock times of the `make` commands; the
+per-demo times are the whole seconds that `demos/run-all.sh` writes to
+`summary.tsv`.
 
 The demo scripts have unit tests that need no QEMU and no Hermit run:
 
