@@ -1770,6 +1770,32 @@ fn raw_identity(text: &str, name: &str) -> (String, u64) {
     (dev.to_owned(), ino)
 }
 
+/// Two mount targets, `a` and `b`, in a directory that must outlive the runs,
+/// after checking that the guest's DIR_A/f and DIR_B/g really share a raw inode
+/// number on two devices. Read without metadata virtualization. Without that
+/// collision a check against these mounts would pass without having exercised
+/// it, so refuse instead.
+fn colliding_mount_targets(guest: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    // Mount targets must exist and must be visible inside the guest; the guest
+    // binary already lives under CARGO_TARGET_TMPDIR, so the targets do too.
+    let mounts = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("mount target parent");
+    let dir_a = mounts.path().join("a");
+    let dir_b = mounts.path().join("b");
+    fs::create_dir(&dir_a).expect("create first mount target");
+    fs::create_dir(&dir_b).expect("create second mount target");
+
+    let probe = run_cross_device_inode_identity(guest, "probe", &dir_a, &dir_b, true);
+    let probe = String::from_utf8(probe.stdout).expect("probe output should be UTF-8");
+    let (f_dev, f_ino) = raw_identity(&probe, "f");
+    let (g_dev, g_ino) = raw_identity(&probe, "g");
+    assert!(
+        f_ino == g_ino && f_dev != g_dev,
+        "the first file on two fresh tmpfs mounts must share a raw inode number on two devices \
+         (per-superblock tmpfs inode numbering, Linux 5.9 and later); this host reported:\n{probe}"
+    );
+    (mounts, dir_a, dir_b)
+}
+
 // A file identity is a device and an inode. Detcore keyed deterministic inodes
 // on the raw inode alone (https://github.com/rrnewton/hermit/issues/3307), so
 // two files that share a raw inode number on different filesystems became one
@@ -1780,31 +1806,35 @@ fn raw_identity(text: &str, name: &str) -> (String, u64) {
 fn files_sharing_a_raw_inode_on_two_devices_keep_separate_identities() {
     let _guard = hermit_run_lock();
     let guest = compile_cross_device_inode_identity_guest();
-    // Mount targets must exist and must be visible inside the guest; the guest
-    // binary already lives under CARGO_TARGET_TMPDIR, so the targets do too.
-    let mounts = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("mount target parent");
-    let dir_a = mounts.path().join("a");
-    let dir_b = mounts.path().join("b");
-    fs::create_dir(&dir_a).expect("create first mount target");
-    fs::create_dir(&dir_b).expect("create second mount target");
-
-    // Precondition, read without metadata virtualization: the two files really
-    // do share a raw inode number on two devices. Without it the check below
-    // would pass without having exercised the collision, so refuse instead.
-    let probe = run_cross_device_inode_identity(&guest, "probe", &dir_a, &dir_b, true);
-    let probe = String::from_utf8(probe.stdout).expect("probe output should be UTF-8");
-    let (f_dev, f_ino) = raw_identity(&probe, "f");
-    let (g_dev, g_ino) = raw_identity(&probe, "g");
-    assert!(
-        f_ino == g_ino && f_dev != g_dev,
-        "the first file on two fresh tmpfs mounts must share a raw inode number on two devices \
-         (per-superblock tmpfs inode numbering, Linux 5.9 and later); this host reported:\n{probe}"
-    );
+    let (_mounts, dir_a, dir_b) = colliding_mount_targets(&guest);
 
     let check = run_cross_device_inode_identity(&guest, "check", &dir_a, &dir_b, false);
     assert_eq!(
         String::from_utf8_lossy(&check.stdout),
         "cross-device files keep separate identities\n",
+        "stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+// A maps line is keyed on the file `handle_mmap` recorded for its address only
+// when the snapshot shows the READER'S address space, because that record
+// belongs to one address space. This guards that another process's maps line
+// does not use the reader's record: the parent maps f at an address, a forked
+// child maps g over the same address, and g has f's raw inode number on
+// another device (the two first files of two fresh tmpfs mounts). Keyed on the
+// parent's record, which the inode check cannot tell apart, the child's line
+// would report f's inode; it must report the inode `stat` reports for g.
+#[test]
+fn another_process_maps_line_is_not_keyed_on_the_readers_mapping_record() {
+    let _guard = hermit_run_lock();
+    let guest = compile_cross_device_inode_identity_guest();
+    let (_mounts, dir_a, dir_b) = colliding_mount_targets(&guest);
+
+    let check = run_cross_device_inode_identity(&guest, "child-maps", &dir_a, &dir_b, false);
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "another process's maps line names the file it maps\n",
         "stderr:\n{}",
         String::from_utf8_lossy(&check.stderr)
     );
