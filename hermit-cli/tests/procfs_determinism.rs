@@ -12,6 +12,9 @@ mod hermit_test;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[path = "common/inode_identity_views.rs"]
+mod inode_identity_views;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -1805,4 +1808,140 @@ fn files_sharing_a_raw_inode_on_two_devices_keep_separate_identities() {
         "stderr:\n{}",
         String::from_utf8_lossy(&check.stderr)
     );
+}
+
+/// Run one mode of tests/c/fixtures/inode_identity_views.c and return its
+/// stdout, failing on any unsuccessful exit. `host_nofile` lowers the soft and
+/// hard RLIMIT_NOFILE of the Hermit process, and so of its guest.
+fn run_inode_identity_views(
+    guest: &Path,
+    backend: Option<&str>,
+    args: &[&std::ffi::OsStr],
+    stdin: Option<fs::File>,
+    host_nofile: Option<libc::rlim_t>,
+) -> String {
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.arg("--log=error");
+    // --backend is a global option and must precede the subcommand.
+    if let Some(backend) = backend {
+        command.arg(format!("--backend={backend}"));
+    }
+    command.arg("run");
+    command.args([
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+    ]);
+    command.arg(guest).args(args);
+    hermit_test::configure_guest_execution(&mut command);
+    // After configure_guest_execution, which rebuilds the command.
+    if let Some(stdin) = stdin {
+        command.stdin(stdin);
+    }
+    if let Some(limit) = host_nofile {
+        inode_identity_views::limit_host_nofile(&mut command, limit);
+    }
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "inode identity views guest failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("inode identity views output should be UTF-8")
+}
+
+// getdents keys each entry's deterministic inode on the directory's device as
+// well as the entry's inode (https://github.com/rrnewton/hermit/issues/3307),
+// and a descriptor received over SCM_RIGHTS is one Detcore does not track, so
+// it has no cached stat to read that device from. This guards that getdents on
+// such a descriptor still succeeds and lists every entry with the inode number
+// `stat` reports for it.
+#[test]
+fn untracked_directory_descriptor_lists_entries_with_stat_inodes() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("scm-getdents");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to list");
+    let stdout = run_inode_identity_views(
+        &guest,
+        None,
+        &["scm-getdents".as_ref(), directory.path().as_os_str()],
+        None,
+        None,
+    );
+    assert_eq!(stdout, inode_identity_views::scm_getdents_expected_stdout());
+}
+
+// Every file-backed /proc/self/maps line must report the inode `stat` reports
+// for that file. Deterministic inodes are keyed on device and inode
+// (https://github.com/rrnewton/hermit/issues/3307), and on btrfs maps and stat
+// report different devices for one file, so the device in a maps line cannot
+// be the key. This guards that every mapping of a live path, the mapped stdin
+// file, and two files mapped and then unlinked (no path leads to them; one
+// descriptor is still open, the other closed) keep the inode fstat reports.
+#[test]
+fn maps_inodes_equal_stat_inodes_for_every_mapped_file() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("maps-stat");
+    let mut input =
+        tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR")).expect("stdin file to map");
+    input.write_all(&[b'x'; 4096]).expect("fill stdin file");
+    let stdin = input.reopen().expect("reopen stdin file");
+    let unlinked =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to unlink files in");
+    let stdout = run_inode_identity_views(
+        &guest,
+        None,
+        &["maps-stat".as_ref(), unlinked.path().as_os_str()],
+        Some(stdin),
+        None,
+    );
+    inode_identity_views::assert_maps_stat_summary(
+        stdout.trim_end(),
+        &guest,
+        "agrees",
+        Some(unlinked.path()),
+    );
+}
+
+// Another process's pipe:[N] and socket:[N] links must name the inode an fstat
+// of the same object reports.
+#[test]
+fn other_process_pipe_and_socket_links_match_fstat() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("proc-fd-links");
+    let stdout = run_inode_identity_views(
+        &guest,
+        None,
+        &["proc-fd-links".as_ref()],
+        None,
+        Some(inode_identity_views::PROC_FD_LINKS_HOST_NOFILE),
+    );
+    assert_eq!(stdout, "proc-fd-links pipe=agrees socket=agrees\n");
+}
+
+// DBT embeds Detcore in the guest process. Keying another process's pipe:[N]
+// or socket:[N] link needs the pipefs or sockfs device
+// (https://github.com/rrnewton/hermit/issues/3307), and learning it must not
+// need a free slot in the guest's descriptor table. This guards that: the
+// fixture's child fills its table before reading the links, and each link must
+// name the inode the child's own fstat of the inherited descriptor reports.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_other_process_links_resolve_with_a_full_descriptor_table() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("dbt-proc-fd-links");
+    let stdout = run_inode_identity_views(
+        &guest,
+        Some("dbt"),
+        &["proc-fd-links".as_ref()],
+        None,
+        Some(inode_identity_views::PROC_FD_LINKS_HOST_NOFILE),
+    );
+    assert_eq!(stdout, "proc-fd-links pipe=agrees socket=agrees\n");
 }
