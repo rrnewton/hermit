@@ -229,12 +229,16 @@ fn main() {
 
     let expected = git(repo.path(), &["rev-parse", "--short=12", "HEAD"]);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // The binary is read from the fixture's own target directory, so a
+    // CARGO_TARGET_DIR inherited from the caller must not move it there.
+    let fixture_target = crate_dir.join("target");
     checked_output(
         Command::new(&cargo)
             .current_dir(&crate_dir)
+            .env("CARGO_TARGET_DIR", &fixture_target)
             .args(["build", "--quiet"]),
     );
-    let binary = crate_dir.join("target/debug/provenance-fixture");
+    let binary = fixture_target.join("debug/provenance-fixture");
     assert_eq!(checked_output(&mut Command::new(&binary)), expected);
 
     fs::write(repo.path().join("tracked.txt"), "modified\n")
@@ -242,6 +246,7 @@ fn main() {
     checked_output(
         Command::new(&cargo)
             .current_dir(&crate_dir)
+            .env("CARGO_TARGET_DIR", &fixture_target)
             .args(["build", "--quiet"]),
     );
     assert_eq!(
@@ -254,6 +259,7 @@ fn main() {
     checked_output(
         Command::new(&cargo)
             .current_dir(&crate_dir)
+            .env("CARGO_TARGET_DIR", &fixture_target)
             .args(["build", "--quiet"]),
     );
     assert_eq!(
@@ -268,6 +274,7 @@ fn main() {
         .expect("failed to plant edition mismatch");
     let mismatched = Command::new(&cargo)
         .current_dir(&crate_dir)
+        .env("CARGO_TARGET_DIR", &fixture_target)
         .args(["build", "--quiet"])
         .output()
         .expect("failed to build mismatched fixture");
