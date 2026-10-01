@@ -13,6 +13,12 @@ repository is
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.
 
+For an introduction to the ideas behind Hermit, read
+[Hermit: Deterministic Linux for Controlled Testing and Software Bug-finding](https://developers.facebook.com/blog/post/2022/11/22/hermit-deterministic-linux-testing/).
+It explains how controlling thread schedules and other implicit inputs helps
+reproduce flaky tests and diagnose concurrency bugs. For current support and
+usage, see the documentation below.
+
 ## Requirements
 
 Hermit currently supports x86-64 Linux. Building and running it requires:
