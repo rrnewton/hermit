@@ -12,10 +12,10 @@ load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 oncall("hermit")
 
 hermit_build_env = {
-    "CARGO_PKG_VERSION": "0.2.0",
+    "CARGO_PKG_VERSION": "0.4.0",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "dbf2b5c8880bac5fd6a06fa1f296b3eec3590569",
+    "HERMIT_REVERIE_PIN": "096cbcc8cd945cc26753d12f35ad0bae6d2ad277",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata

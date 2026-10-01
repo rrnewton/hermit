@@ -140,8 +140,8 @@ const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
 ];
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const GENERATED_MARKERS: [&str; 3] = [
-    "name = \"reverie-dbt-0.2-materialized-manifest\"",
-    "manifest_dir = \":reverie-dbt-0.2-materialized-manifest\"",
+    "name = \"reverie-dbt-0.4-materialized-manifest\"",
+    "manifest_dir = \":reverie-dbt-0.4-materialized-manifest\"",
     "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")",
 ];
 const REQUIRED_RESOURCES: [(&str, bool); 10] = [
@@ -1474,7 +1474,7 @@ fn verify_generated_buck(text: &str) -> Result<(), String> {
     let mapped_files = text
         .lines()
         .filter(|line| {
-            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.2.0/")
+            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.4.0/")
         })
         .count();
     if mapped_files != 931 {
