@@ -157,6 +157,43 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
     }
 }
 
+/// The most syscalls one backend-runtime bootstrap window may leave uncharged on
+/// the bootstrapping thread. Once a window reaches this count, every further
+/// syscall in it is charged its normal cost, so a window cannot stop the thread's
+/// syscall-driven clock indefinitely.
+///
+/// The LiteInst runtime's own constructor left 321 syscalls uncharged per window
+/// when measured on `tests/c/host_identity.c` and on each of the two images of
+/// `hermit-cli/tests/fixtures/clock_trajectory.c` under `--backend liteinst`, so
+/// the cap is about 12.8 times what the runtime itself needs. The cap must stay
+/// at least four times the largest such count.
+pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 4096;
+
+/// Returns true for syscalls whose result lets a guest read virtual time: the
+/// wall-clock and monotonic clocks, the CPU-time clocks and counters, uptime,
+/// and the time left on a timer.
+///
+/// Inside a backend-runtime bootstrap window these syscalls are always charged,
+/// so two such reads on the bootstrapping thread differ by at least one syscall
+/// cost, exactly as outside the window. `clock_getres` is not listed: it reports
+/// a constant. Syscalls that expose time only as a side output (for example the
+/// old value written by `setitimer` or `timer_settime`) are not listed either;
+/// inside a window they are bounded by [`MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`].
+pub(crate) fn observes_virtual_time(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::gettimeofday
+            | Sysno::time
+            | Sysno::clock_gettime
+            | Sysno::sysinfo
+            | Sysno::times
+            | Sysno::getrusage
+            | Sysno::timerfd_gettime
+            | Sysno::timer_gettime
+            | Sysno::getitimer
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use detcore_model::time::DetTime;

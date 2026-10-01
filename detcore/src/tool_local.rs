@@ -34,6 +34,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest as _;
@@ -1841,6 +1842,12 @@ pub struct ThreadState<T> {
     /// the last RCB clock value committed to `thread_logical_time`
     pub committed_clock_value: u64,
 
+    /// Syscalls this thread made in the current backend-runtime bootstrap
+    /// window without charging their cost to `thread_logical_time`. Zero
+    /// outside a window; see [`ThreadState::charge_syscall_time`].
+    #[serde(default)]
+    pub(crate) uncharged_bootstrap_syscalls: u32,
+
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
 
@@ -2085,6 +2092,45 @@ impl<T> ThreadState<T> {
         self.last_accounted_system_time = system;
     }
 
+    /// Decide whether the syscall this thread is making now charges its cost
+    /// to `thread_logical_time`. `in_backend_runtime_bootstrap` is the
+    /// backend's `Guest::is_backend_runtime_bootstrap()` answer for this
+    /// thread at this syscall.
+    ///
+    /// Outside a bootstrap window every syscall is charged, and the
+    /// per-window count of uncharged syscalls goes back to zero. Inside a
+    /// window a syscall that observes virtual time is always charged; any
+    /// other syscall is left uncharged until
+    /// [`syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`] of them have been,
+    /// and every syscall after that in the same window is charged.
+    ///
+    /// [`syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`]: crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+    pub(crate) fn charge_syscall_time(
+        &mut self,
+        in_backend_runtime_bootstrap: bool,
+        sysno: Sysno,
+    ) -> bool {
+        if !in_backend_runtime_bootstrap {
+            if self.uncharged_bootstrap_syscalls != 0 {
+                debug!(
+                    "[dtid {}] backend runtime bootstrap window left {} syscalls uncharged",
+                    self.dettid, self.uncharged_bootstrap_syscalls
+                );
+                self.uncharged_bootstrap_syscalls = 0;
+            }
+            return true;
+        }
+        if crate::syscall_time::observes_virtual_time(sysno) {
+            return true;
+        }
+        if self.uncharged_bootstrap_syscalls < crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+        {
+            self.uncharged_bootstrap_syscalls += 1;
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn process_cpu_time(&mut self) -> ProcessCpuSnapshot {
         self.account_process_cpu_time();
         self.process_cpu_time
@@ -2203,6 +2249,7 @@ impl<T> ThreadState<T> {
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),
             thread_logical_time,
             committed_clock_value: 0,
+            uncharged_bootstrap_syscalls: 0,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED

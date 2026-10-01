@@ -1300,6 +1300,117 @@ mod event_tests {
         assert!(after_window.clock_after > after_window.clock_before);
     }
 
+    /// The bootstrapping thread's clock keeps moving inside a backend-runtime
+    /// bootstrap window (finding F1 of
+    /// https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696).
+    /// A syscall that observes virtual time is charged exactly as outside the
+    /// window, so two reads in a row see different times. Other syscalls are
+    /// left uncharged only up to `MAX_UNCHARGED_BOOTSTRAP_SYSCALLS` per window;
+    /// the next one is charged its normal cost, and a new window starts counting
+    /// from zero. The harness's clock is syscall-driven (`max_timeslice: None`),
+    /// the configuration in which nothing else would advance this thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_runtime_bootstrap_window_charges_time_reads_and_caps_uncharged_syscalls() {
+        use reverie::syscalls::Sysno;
+
+        use crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS;
+        use crate::syscall_time::observes_virtual_time;
+
+        const USAGE: usize = RETRY_DEST;
+
+        // getrusage(RUSAGE_THREAD) is the time read this harness can execute:
+        // it reports the thread's own CPU time without a global-clock RPC, and
+        // every charged syscall adds to that CPU time.
+        fn thread_rusage() -> Syscall {
+            reverie::syscalls::Getrusage::new()
+                .with_who(libc::RUSAGE_THREAD)
+                .with_usage(AddrMut::from_raw(USAGE))
+                .into()
+        }
+
+        /// Runs one syscall and returns how far it advanced the thread's
+        /// logical time, in nanoseconds.
+        async fn advance(tool: &Detcore, guest: &mut EventGuest, call: Syscall) -> u64 {
+            guest.memory.put_iovec(0, FIRST_DEST, 8);
+            let before = guest.thread.thread_logical_time.as_nanos().as_nanos();
+            tool.handle_syscall_event(guest, call).await.unwrap();
+            guest.thread.thread_logical_time.as_nanos().as_nanos() - before
+        }
+
+        /// The system CPU time the last getrusage wrote, in nanoseconds.
+        fn reported_system_ns(guest: &EventGuest) -> u64 {
+            let usage: libc::rusage = guest
+                .memory
+                .read_value(Addr::<libc::rusage>::from_raw(USAGE).unwrap())
+                .unwrap();
+            usage.ru_stime.tv_sec as u64 * 1_000_000_000 + usage.ru_stime.tv_usec as u64 * 1_000
+        }
+
+        assert!(observes_virtual_time(Sysno::getrusage));
+        assert!(!observes_virtual_time(Sysno::readv));
+        assert!(!observes_virtual_time(Sysno::clock_getres));
+
+        // Reference costs outside any window.
+        let (tool, mut plain) = event_guest(FdType::Rng, None);
+        let time_read_cost = advance(&tool, &mut plain, thread_rusage()).await;
+        let first_read_outside = reported_system_ns(&plain);
+        let readv_cost = advance(&tool, &mut plain, readv(1)).await;
+        assert!(time_read_cost > 0 && readv_cost > 0);
+
+        // (1) Time reads inside the window are charged like time reads outside.
+        let (tool, mut booting) = event_guest(FdType::Rng, None);
+        booting.backend_runtime_bootstrap = true;
+        let first_read_cost = advance(&tool, &mut booting, thread_rusage()).await;
+        let first_read = reported_system_ns(&booting);
+        let second_read_cost = advance(&tool, &mut booting, thread_rusage()).await;
+        let second_read = reported_system_ns(&booting);
+        assert_eq!(
+            first_read_cost, time_read_cost,
+            "a time read inside the window must advance logical time as it does outside"
+        );
+        assert_eq!(second_read_cost, time_read_cost);
+        assert_eq!(first_read, first_read_outside);
+        assert_ne!(
+            second_read, first_read,
+            "two time reads inside the window must observe different times"
+        );
+        assert_eq!(second_read - first_read, time_read_cost);
+        assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 0);
+
+        // (2) The first MAX_UNCHARGED_BOOTSTRAP_SYSCALLS other syscalls of the
+        // window are uncharged; the next one, and every one after it, is charged.
+        for index in 0..MAX_UNCHARGED_BOOTSTRAP_SYSCALLS {
+            assert_eq!(
+                advance(&tool, &mut booting, readv(1)).await,
+                0,
+                "uncharged syscall {index} of the window advanced logical time"
+            );
+        }
+        assert_eq!(
+            booting.thread.uncharged_bootstrap_syscalls,
+            MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+        );
+        assert_eq!(
+            advance(&tool, &mut booting, readv(1)).await,
+            readv_cost,
+            "the first syscall past the cap must be charged one syscall cost"
+        );
+        assert_eq!(advance(&tool, &mut booting, readv(1)).await, readv_cost);
+        assert_eq!(
+            booting.thread.uncharged_bootstrap_syscalls,
+            MAX_UNCHARGED_BOOTSTRAP_SYSCALLS
+        );
+
+        // (3) Closing the window resets the count, so a reopened window (the
+        // next exec'd image) starts uncharged again.
+        booting.backend_runtime_bootstrap = false;
+        assert_eq!(advance(&tool, &mut booting, readv(1)).await, readv_cost);
+        assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 0);
+        booting.backend_runtime_bootstrap = true;
+        assert_eq!(advance(&tool, &mut booting, readv(1)).await, 0);
+        assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn pipe_readv_event_observes_destination_imported_after_retry_wait() {
         let logs = BufferLog::default();
