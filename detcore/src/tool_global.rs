@@ -635,13 +635,22 @@ impl GlobalState {
         Self::initialize(cfg, false)
     }
 
-    /// Runs the sequential scheduler on a backend-owned executor.
-    pub async fn run_external_scheduler(&self, observer: Arc<dyn Fn(&'static str) + Send + Sync>) {
+    /// Returns the sequential scheduler loop for a backend-owned executor to run.
+    ///
+    /// This is deliberately not an `async fn`: the announcement is logged when
+    /// this is called, not when the returned future is first polled. A backend
+    /// can then order it ahead of anything it releases before polling (DBT
+    /// publishes `READY_IMAGE`, which lets the root guest thread log its
+    /// seeding lines). See https://github.com/rrnewton/hermit/issues/3463.
+    pub fn run_external_scheduler(
+        &self,
+        observer: Arc<dyn Fn(&'static str) + Send + Sync>,
+    ) -> impl Future<Output = ()> + use<> {
         // Emitted at the call site for the same reason as the spawned path in
         // `initialize`, so both ways of starting the daemon place this line at
         // a deterministic point in the caller's program order.
         info!("[scheduler] daemon task starting up, waiting for guest thread start..");
-        sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
+        sched_loop_external(self.sched.clone(), self.global_time.clone(), observer)
     }
 
     /// Reports that a backend supervisor received a process's final kernel exit status.
@@ -4237,6 +4246,54 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// DBT publishes READY_IMAGE between creating the scheduler future and
+    /// polling it, so the announcement must already be logged when
+    /// `run_external_scheduler` returns:
+    /// https://github.com/rrnewton/hermit/issues/3463.
+    #[test]
+    fn external_scheduler_announces_before_its_future_is_polled() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<Mutex<Vec<String>>>);
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    write!(self.0, "{value:?}").unwrap();
+                }
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() == tracing::Level::INFO
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = Visitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::init_for_external_scheduler(&config);
+        let captured = Capture::default();
+        let scheduler = tracing::subscriber::with_default(captured.clone(), || {
+            state.run_external_scheduler(std::sync::Arc::new(|_| {}))
+        });
+        let announcement = "[scheduler] daemon task starting up, waiting for guest thread start..";
+        assert_eq!(*captured.0.lock().unwrap(), [announcement]);
+        drop(scheduler);
+    }
+
     #[test]
     fn schedule_event_host_markers_require_command_bootstrap_provenance() {
         let event = SchedEvent::branches(DetTid::from_raw(3), 223)

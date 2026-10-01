@@ -446,7 +446,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // preemptions::tests::recorded_epoch_round_trips_and_legacy_records_have_none
     // (https://github.com/rrnewton/hermit/issues/3411) retains all 848 prior
     // identities.
-    ("test.detcore_unit", 849),
+    // tool_global::tests::external_scheduler_announces_before_its_future_is_polled
+    // (https://github.com/rrnewton/hermit/issues/3463) retains all 849 prior
+    // identities.
+    ("test.detcore_unit", 850),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -530,7 +533,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 849),
+    // The host twin selects the same announcement-order test
+    // (https://github.com/rrnewton/hermit/issues/3463).
+    ("test.detcore_unit_on_host", 850),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 177),
     ("test.hermit_unit_on_host", 763),
