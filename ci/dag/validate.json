@@ -16,7 +16,7 @@
       "group": "pre",
       "job": "submodules",
       "desc": "Verify repository submodules without initializing or repairing them",
-      "description": "",
+      "description": "Checks that every gitlink HEAD records (third-party/rr, agent-utils and reverie, recursively) is declared in .gitmodules, is its own populated repository at exactly the recorded commit, and has a clean worktree; ci/verify-submodules.sh first self-tests its refusals (missing, non-repository, wrong HEAD, dirty, conflicted, symlinked, undeclared, unsafe path) on scratch repositories, and never initializes, updates or registers a submodule. Every build and test reads these checkouts, so this keeps the validation on the sources the commit records. A reverie checkout left at an older commit is refused with \"submodule HEAD differs from recorded gitlink\"; a stray untracked file inside agent-utils is refused as a dirty worktree.",
       "labels": [
         "full",
         "hosted-portable",
@@ -50,7 +50,7 @@
       "group": "pre",
       "job": "reverie_pin",
       "desc": "Reverie pin consistency",
-      "description": "",
+      "description": "Runs ci/run-reverie-pin-check.sh. scripts/check-reverie-pin.rs requires every Reverie revision in tracked Cargo.toml and Cargo.lock files, the LiteInst cache keys, the DBT budget bindings and hermit-cli/BUCK to name one commit, and refuses a pin that is not an ancestor of Reverie main or that moves backwards from the pin on origin/main (an unreachable remote blocks rather than passes); scripts/check-git-pin-uniformity.rs then refuses any git dependency or submodule gitlink recorded at two revisions. Build and test nodes depend on it so no run compiles Reverie from mixed commits. Resolving a Cargo.lock conflict to an older Reverie prints \"REVERIE PIN REGRESSION - BLOCKED\"; moving the reverie gitlink without the Cargo revisions breaks uniformity.",
       "labels": [
         "full",
         "hosted-portable",
@@ -190,7 +190,7 @@
       "group": "check",
       "job": "skill_discovery",
       "desc": "Verify Claude and stock Codex discover the same safe product skills",
-      "description": "",
+      "description": "Makes Claude and stock Codex discover the same product skills from one copy. It compiles and runs scripts/check-skill-discovery.rs, which requires each skill to exist exactly once under .claude/skills and to resolve to that same file through .llms/skills and through one .agents/skills symlink per skill, requires CLAUDE.md to link to AGENTS.md, and requires each SKILL.md to open with frontmatter whose name equals its directory and a quoted description. The packaged set must equal the checker's list, and no parent-workspace coordinator role may appear among the product skills. A skill added without its .agents/skills link, a copied instead of linked SKILL.md, or a frontmatter name that differs from its directory breaks it.",
       "labels": [
         "full",
         "hosted-portable",
@@ -301,7 +301,7 @@
       "group": "check",
       "job": "backend_abstraction",
       "desc": "Detcore backend-abstraction check",
-      "description": "",
+      "description": "Keeps detcore independent of any concrete Reverie backend, so backends are chosen only in hermit-cli. scripts/check-detcore-backend-abstraction.sh collects every reverie-* crate a workspace manifest names (plus a reverie-e9patch sentinel), excluding reverie-core, and refuses any of them in detcore/Cargo.toml's runtime or build dependency tables and, through the syn-based scripts/detcore-backend-source.rs, any extern crate, use, path or macro reference in detcore/src. Before trusting a pass it plants each prohibited crate into scratch copies of detcore and requires the lint to name it, and requires a copy that mentions the crates only in strings and comments to pass. reverie-ptrace added to detcore's [dependencies], or `use reverie_ptrace::` in detcore/src, is refused.",
       "labels": [
         "full",
         "hosted-portable",
@@ -412,7 +412,7 @@
       "group": "check",
       "job": "portability_paths",
       "desc": "Reject developer-specific paths in build/run files",
-      "description": "",
+      "description": "Runs scripts/check-portable-paths.sh, which first self-tests that its scanner accepts ${HOME}-relative paths and rejects literal user homes and host names, then scans every tracked script, Rust, Python, TOML and YAML file, Makefile, everything under ci/ and .github/, and every executable file (skipping vendored, scratch and generated trees) for a /home/ or /users/ path naming a login, the owner's login name, or a development-host name. Such literals make a script or test work only on the machine where it was written, and break hosted runners and other checkouts. A ci/ script that hard-codes a user's CARGO_HOME is reported with its file and line.",
       "labels": [
         "full",
         "hosted-portable",
@@ -734,7 +734,7 @@
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt (cargo fmt --all -- --check)",
-      "description": "",
+      "description": "Runs `cargo fmt --all -- --check` over the root workspace (agent-utils is excluded) with the toolchain rust-toolchain.toml pins, which the nightly-only rustfmt.toml options require: std, external and crate import groups, one import per item, and formatted code in doc comments. It prints the would-be diff and exits nonzero instead of rewriting, which keeps formatting changes out of unrelated diffs. A brace import such as `use std::{fs, path::Path};`, or a std import placed after an external-crate import, is reported.",
       "labels": [
         "full",
         "hosted-portable",
@@ -770,7 +770,7 @@
       "group": "setup",
       "job": "nextest",
       "desc": "cargo-nextest available",
-      "description": "",
+      "description": "Makes cargo-nextest available: it probes `cargo nextest show-config version` and installs cargo-nextest 0.9.100 with `cargo install --locked` only when the probe fails, so an already installed nextest of any version is accepted. Only nodes that list it among their needs rely on it: hosted-portable nodes, and through its quick-super copy, super nodes. In the full and portable profiles none does, although many of their nodes run cargo nextest inside the pinned root without depending on this node. A host without nextest where the install cannot complete (no crates.io access, a compile error, or more than its 600 seconds) turns it red.",
       "labels": [
         "full",
         "hosted-portable",
@@ -912,7 +912,7 @@
       "group": "e2e",
       "job": "manifest_applications",
       "desc": "Portable manifest bucket: applications",
-      "description": "",
+      "description": "Runs the applications bucket's CI cells: workloads that exec chains of real tools (a cc and ar build-and-link, a git commit-and-archive script with pinned identities) and one that polls the wall clock (examples/timed-progress-bar.py, also on KVM). They show that a process tree of stock tools, and a clock-polling loop, give the same canonical log and stdout in both strict runs. Expect it to go red on a divergence anywhere in the cc or git process tree, or when the progress bar overruns its budget on either backend.",
       "labels": [
         "full",
         "portable"
@@ -1030,7 +1030,7 @@
       "group": "e2e",
       "job": "manifest_bin_c",
       "desc": "Portable manifest bucket: bin-c",
-      "description": "",
+      "description": "Verifies tests/bin/posix_timer_test.c on ptrace, SaBRe and LiteInst: a CLOCK_MONOTONIC POSIX timer must deliver SIGALRM inside a bounded window while the program sleeps toward an absolute deadline, so a missed timer signal fails promptly instead of hanging. This carries the timer-delivery check to the two binary-rewriting backends. A guest exit of 1 (signal missing or outside the window) or a canonical divergence is a failure, and the SaBRe cell also requires eligible execution-path evidence.",
       "labels": [
         "full",
         "portable"
@@ -6356,7 +6356,7 @@
       "group": "e2e",
       "job": "manifest_chaos_c",
       "desc": "Portable manifest bucket: chaos-c",
-      "description": "",
+      "description": "Runs tests/chaos/lock_granularity.c, whose second thread computes from a value it read under the lock and that the first thread may overwrite before the result is stored, printing Fail: the ptrace chaos cell sweeps seeds, each reproduced under its own --verify, and requires both a passing and a failing seed, while the verify cell requires the default schedule to pass identically in both runs. As a race demonstrator it fails when chaos stops exposing the race, when a seed does not reproduce itself, or when the default schedule diverges or fails.",
       "labels": [
         "full",
         "portable"
@@ -7801,7 +7801,7 @@
       "group": "e2e",
       "job": "manifest_data_handling",
       "desc": "Portable manifest bucket: data-handling",
-      "description": "",
+      "description": "Runs data-processing shell workloads under verify on ptrace, and jq also on KVM: a tar round trip, a sort, uniq and awk pipeline, jq transforming JSON that calls now(), sqlite3 printing random(), randomblob and the current time, a multithreaded zstd compression, and dd moving data in partial blocks through a pipe. They require clock and PRNG reads inside stock tools to repeat, a multithreaded compressor to emit identical frames, and partial pipe reads and writes to give the same results. Divergence, a wrong dd byte count, a zstd round-trip digest mismatch, or a budget overrun counts as failure.",
       "labels": [
         "full",
         "portable"
@@ -7905,7 +7905,7 @@
       "group": "e2e",
       "job": "manifest_debugger_c",
       "desc": "Portable manifest bucket: debugger-c",
-      "description": "",
+      "description": "Verifies tests/debugger/guests/debuggee.c, which prints its virtualized pid and a computed result, on ptrace, KVM, SaBRe and LiteInst. The debugger integration tests set breakpoints in this guest and rely on that pid being stable across runs, so this checks that the guest itself is deterministic on every backend that runs it; two runs that disagree on the pid or the canonical log, or a nonzero exit, are failures on any of the four.",
       "labels": [
         "full",
         "portable"
@@ -7988,7 +7988,7 @@
       "group": "e2e",
       "job": "manifest_determinism_stress_c",
       "desc": "Portable manifest bucket: determinism-stress-c",
-      "description": "",
+      "description": "Runs the C concurrency guests one program per test, so a divergence names one program rather than a shell chain: a fork tree, a pipe chain and pipe prefill (both also on KVM), thread stress, shared mmap across fork, a lock-free compare-and-swap counter, pid and tid identity across threads, procfs, wait and exec, a condition-variable producer-consumer queue, cross-thread signal order, and thread_contention in contention mode. thread_contention also runs, in epoll mode, as a ptrace chaos cell with distinct-outcome and entropy floors. Any verify mismatch, or the chaos cell missing a floor or failing to reproduce a seed, fails the bucket.",
       "labels": [
         "full",
         "portable"
@@ -8141,7 +8141,7 @@
       "group": "e2e",
       "job": "manifest_determinism_stress",
       "desc": "Portable manifest bucket: determinism-stress",
-      "description": "",
+      "description": "Runs concurrency workloads: two bash writers interleaving output (examples/race.sh, on ptrace and KVM), thread contention, epoll and shared-mmap stress inside one guest, a fork tree followed by a pipe chain, and the tests/chaos order-violation race under the default schedule. A ptrace chaos cell runs tests/chaos/thread_interleaving.c, sweeping seeds over four workers whose append order can permute, and requires every seed to pass while meeting distinct-order and normalized-entropy floors, so a partial loss of schedule diversity is caught, not only a total collapse. A verify divergence in any of these programs, or the chaos cell missing a floor or not reproducing a seed, makes it red.",
       "labels": [
         "full",
         "portable"
@@ -8252,7 +8252,7 @@
       "group": "e2e",
       "job": "manifest_language_runtimes",
       "desc": "Portable manifest bucket: language-runtimes",
-      "description": "",
+      "description": "Verifies programs that read entropy, hash seeds or clocks through language runtimes: Bash $RANDOM and a loop, pipe and time script, Python random numbers, hash seeds, dict order and subprocess timing, Perl rand, hash order and subprocess timing, awk, Lua, Ruby and Tcl random numbers, m4 temporary names, a C++ program reading std::random_device and std::chrono, Rust HashMap iteration, and Node.js JIT output with Math.random, on ptrace and most also on KVM (examples/rand.py also on LiteInst). It checks that Hermit's virtualization of those sources holds across independent runtime implementations, not one library path; the native-variance controls are not CI-selected, so it does not itself show the output would differ without Hermit. A runtime reaching a source Hermit does not virtualize shows as a stdout or canonical-log divergence.",
       "labels": [
         "full",
         "portable"
@@ -8538,7 +8538,7 @@
       "group": "e2e",
       "job": "manifest_shared_futex_c",
       "desc": "Portable manifest bucket: shared-futex-c",
-      "description": "",
+      "description": "Verifies tests/shared-futex-verify/qemu_hello.c on ptrace, a guest that prints a marker with its virtualized pid and exits 7; the manifest declares that exit, so the cell passes only on a matched comparison whose guest status and Hermit exit status are both exactly 7. It pins exact propagation of a nonzero guest exit; the same program is the userspace payload tests/qemu-boot/strict_l2_userspace_test.sh expects to return 7. A divergence, a zero exit, or any other status is refused.",
       "labels": [
         "full",
         "portable"
@@ -9174,7 +9174,7 @@
       "group": "e2e",
       "job": "manifest_util_c",
       "desc": "Portable manifest bucket: util-c",
-      "description": "",
+      "description": "Verifies tests/util/pmu_skid.c on ptrace as a guest: its child calls PTRACE_TRACEME, which Detcore refuses with a deterministic EPERM, so the program exits with its dedicated refused status 3, which the manifest declares. It guards Hermit's refusal of guest ptrace: guest ptrace succeeding (the program goes on to open perf counters), the refusal arriving with a different errno (a different exit status), or the two runs diverging all fail it.",
       "labels": [
         "full",
         "portable"
@@ -9236,7 +9236,7 @@
       "group": "test",
       "job": "applications_e2e",
       "desc": "Run application end-to-end strict verification",
-      "description": "",
+      "description": "Runs tests/e2e/lib/applications/run_all.sh with the published Hermit artifact: an on-disk SQLite workload, a deeper SQLite workload and a make-driven CMake build. Each must first produce different output in two native runs (timestamps, random nonces, a urandom build stamp), proving there is nondeterminism to remove, then pass `hermit run --strict --no-virtualize-cpuid --max-timeslice=disabled --verify --verify-strict` with bitwise_parity true and nonzero compared log messages; the SQLite workloads also pin their query-output digest. A divergence (DIVERGED: bitwise_parity=False), a comparison of zero log messages, or a changed query result is a failure.",
       "labels": [
         "full",
         "portable"
@@ -9900,7 +9900,7 @@
       "group": "test",
       "job": "liteinst_strict",
       "desc": "Portable LiteInst strict compatibility",
-      "description": "",
+      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red.",
       "labels": [
         "full",
         "portable"
@@ -9952,7 +9952,7 @@
       "group": "test",
       "job": "sabre_examples",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "description": "",
+      "description": "Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. SaBRe letting getrandom return host entropy, or a controller line leaking into guest stderr, is caught.",
       "labels": [
         "full",
         "portable"
@@ -10446,7 +10446,7 @@
       "group": "privileged-pmu",
       "job": "preemption",
       "desc": "PMU smoke: retired-conditional-branch overflow delivery and skid measurement",
-      "description": "",
+      "description": "Compiles tests/util/pmu_skid.c in the pinned root and runs it for 16 overflow periods of 100000 retired conditional branches on a traced child pinned to one CPU, requiring each overflow to stop the child, mid-loop, with the counter's SIGUSR1; it prints the measured skid but does not bound it. privileged-test.pmu_buck_chaos_cases, pmu_ptrace_completion_cases and pmu_cli_cases depend on it, so a host whose PMU cannot interrupt a traced thread fails here in seconds with the cause rather than deep inside those suites. Refusal of perf_event_open or PTRACE_TRACEME, a CPU that is neither Intel nor AMD, a descheduled counter, or no overflow signal within 20 seconds turns it red.",
       "labels": [
         "full"
       ],
@@ -10641,7 +10641,7 @@
       "group": "privileged-build",
       "job": "manifest_guests",
       "desc": "Prepare every CI-enabled privileged manifest guest",
-      "description": "",
+      "description": "Prepares the privileged lane's CI test programs once each under $E2E_BUILD_ROOT/<test-id>: `test-harness build --lane privileged --ci-only` compiles tests/c/cpuid_probe.c with -Werror and runs the shell programs' --prepare steps (sysfs-sanitized-prefixes.sh runs its fixture self-test there). The privileged-e2e and privileged-only-e2e buckets run with --prebuilt and depend on the _in_pinned_root copy, which runs this command in the pinned root; the host copy has no dependents. A new compiler warning in cpuid_probe.c, or a failing --prepare self-test, stops it.",
       "labels": [
         "full",
         "privileged"
@@ -10941,7 +10941,7 @@
       "group": "full-scorecard",
       "job": "compatibility",
       "desc": "Verify fresh per-cell results and print the compatibility table",
-      "description": "",
+      "description": "After every portable and privileged manifest bucket finishes, `ci/compat-envelope/scorecard.rs verify-results` requires one fresh row at git HEAD with a clean tree for every cell ci/expected-e2e-plan.json selects in those lanes. Each must be a PASS, except a cell the manifest declares diagnostic, whose FAIL is listed without failing the check; declared stripped-comparator passes are counted apart as below L2. All rows must come from one Hermit binary, and each cell's rows from one run. A cell no bucket wrote, a row from another commit, or rows from two Hermit builds fail it even when every bucket node passed; on success it prints the compatibility table.",
       "labels": [
         "full"
       ],
@@ -57500,7 +57500,7 @@
       "group": "test",
       "job": "applications_e2e_on_host",
       "desc": "Run application end-to-end strict verification",
-      "description": "",
+      "description": "Runs tests/e2e/lib/applications/run_all.sh with the published Hermit artifact: an on-disk SQLite workload, a deeper SQLite workload and a make-driven CMake build. Each must first produce different output in two native runs (timestamps, random nonces, a urandom build stamp), proving there is nondeterminism to remove, then pass `hermit run --strict --no-virtualize-cpuid --max-timeslice=disabled --verify --verify-strict` with bitwise_parity true and nonzero compared log messages; the SQLite workloads also pin their query-output digest. A divergence (DIVERGED: bitwise_parity=False), a comparison of zero log messages, or a changed query result is a failure.",
       "labels": [
         "hosted-portable"
       ],
@@ -58017,7 +58017,7 @@
       "group": "test",
       "job": "liteinst_strict_on_host",
       "desc": "Portable LiteInst strict compatibility",
-      "description": "",
+      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red.",
       "labels": [
         "hosted-portable"
       ],
@@ -58066,7 +58066,7 @@
       "group": "test",
       "job": "sabre_examples_on_host",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "description": "",
+      "description": "Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. SaBRe letting getrandom return host entropy, or a controller line leaking into guest stderr, is caught.",
       "labels": [
         "hosted-portable"
       ],
@@ -58610,7 +58610,7 @@
       "group": "privileged-build",
       "job": "manifest_guests_in_pinned_root",
       "desc": "Prepare every CI-enabled privileged manifest guest",
-      "description": "",
+      "description": "Prepares the privileged lane's CI test programs once each under $E2E_BUILD_ROOT/<test-id>: `test-harness build --lane privileged --ci-only` compiles tests/c/cpuid_probe.c with -Werror and runs the shell programs' --prepare steps (sysfs-sanitized-prefixes.sh runs its fixture self-test there). The privileged-e2e and privileged-only-e2e buckets run with --prebuilt and depend on the _in_pinned_root copy, which runs this command in the pinned root; the host copy has no dependents. A new compiler warning in cpuid_probe.c, or a failing --prepare self-test, stops it.",
       "labels": [
         "full",
         "privileged"
@@ -58821,7 +58821,7 @@
       "group": "quick-super-setup",
       "job": "nextest",
       "desc": "cargo-nextest available",
-      "description": "",
+      "description": "Makes cargo-nextest available: it probes `cargo nextest show-config version` and installs cargo-nextest 0.9.100 with `cargo install --locked` only when the probe fails, so an already installed nextest of any version is accepted. Only nodes that list it among their needs rely on it: hosted-portable nodes, and through its quick-super copy, super nodes. In the full and portable profiles none does, although many of their nodes run cargo nextest inside the pinned root without depending on this node. A host without nextest where the install cannot complete (no crates.io access, a compile error, or more than its 600 seconds) turns it red.",
       "labels": [
         "quick",
         "super"
