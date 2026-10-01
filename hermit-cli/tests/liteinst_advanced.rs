@@ -1036,3 +1036,299 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
         "stderr={diagnostics}",
     );
 }
+
+// Regression coverage for https://github.com/rrnewton/hermit/issues/3338: the
+// LiteInst runtime's preload constructor issues a few hundred syscalls before
+// the guest's main runs. Charging them as guest syscalls pushed sysinfo(2)
+// uptime from 121 to 123 under --max-timeslice=disabled, where each syscall is
+// charged at the no-PMU rate. These runs disable the timeslice explicitly so
+// the result does not depend on whether the host exposes a PMU.
+static BOOTSTRAP_TIME_HOST_IDENTITY: OnceLock<PathBuf> = OnceLock::new();
+static BOOTSTRAP_TIME_CLOCK_TRAJECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+fn compile_bootstrap_time_guest(
+    cell: &'static OnceLock<PathBuf>,
+    source: &str,
+    name: &str,
+) -> &'static Path {
+    cell.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-bootstrap-time");
+        fs::create_dir_all(&build_root).expect("failed to create bootstrap-time guest directory");
+        let guest = build_root.join(name);
+        // -D_GNU_SOURCE matches the build flags that the c-programs/host-identity
+        // cell in tests/e2e/manifests/c-programs.yaml gives host_identity.c.
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-D_GNU_SOURCE"])
+            .arg(repository.join(source))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to compile {source}: {error}"));
+        assert!(
+            output.status.success(),
+            "{source} compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn bootstrap_time_host_identity() -> &'static Path {
+    // The unchanged host-identity fixture. It asserts sysinfo.uptime == 121.
+    compile_bootstrap_time_guest(
+        &BOOTSTRAP_TIME_HOST_IDENTITY,
+        "tests/c/host_identity.c",
+        "host_identity",
+    )
+}
+
+fn bootstrap_time_clock_trajectory() -> &'static Path {
+    compile_bootstrap_time_guest(
+        &BOOTSTRAP_TIME_CLOCK_TRAJECTORY,
+        "hermit-cli/tests/fixtures/clock_trajectory.c",
+        "clock_trajectory",
+    )
+}
+
+fn bootstrap_time_command(backend: &str, home: &Path) -> Command {
+    let mut command = Command::new(liteinst_runtime::hermit_binary());
+    command
+        .arg("--log=info")
+        .args(["--backend", backend, "run"])
+        .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+        .args([
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+            "--env=LC_ALL=C",
+            "--env=TZ=UTC",
+        ])
+        .arg(format!("--env=HOME={}", home.display()))
+        .env("HOME", home);
+    command
+}
+
+fn assert_bootstrap_time_success(label: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{label}: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let scratch = tempfile::tempdir().expect("failed to create bootstrap-time scratch directory");
+    let report = scratch.path().join("verify.json");
+    let output = bootstrap_time_command("liteinst", scratch.path())
+        .args(["--verify", "--verify-strict"])
+        .arg(format!("--verify-json={}", report.display()))
+        .arg("--")
+        .arg(bootstrap_time_host_identity())
+        .output()
+        .expect("failed to run Hermit LiteInst on host_identity");
+    assert_bootstrap_time_success("liteinst host_identity", &output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.lines().any(|line| line == "sysinfo.uptime=121"),
+        "LiteInst host_identity must observe uptime 121:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Success: deterministic. Determinism verified."),
+        "{stderr}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("failed to read the --verify-json report"),
+    )
+    .expect("the --verify-json report must be JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(
+        report["verified"],
+        serde_json::Value::Bool(true),
+        "{report}"
+    );
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::Value::Bool(true),
+        "{report}"
+    );
+    let compared = &report["compared_log_messages"];
+    let left = compared["left"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("compared_log_messages.left is missing: {report}"));
+    assert!(
+        left > 0,
+        "strict verify compared no INFO messages: {report}"
+    );
+    assert_eq!(compared["right"].as_u64(), Some(left), "{report}");
+}
+
+/// clock_trajectory.c prints this many samples, the first half before it
+/// execs itself and the second half after.
+const CLOCK_TRAJECTORY_SAMPLES: usize = 10;
+const CLOCK_TRAJECTORY_FIRST_AFTER_EXEC: usize = 5;
+
+#[derive(Debug, PartialEq)]
+struct ClockSample {
+    monotonic_ns: u128,
+    uptime: i64,
+}
+
+fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
+    if backend == "liteinst" {
+        liteinst_runtime::ensure_liteinst_runtime();
+    }
+    let home = tempfile::tempdir().expect("failed to create clock-trajectory HOME");
+    let output = bootstrap_time_command(backend, home.path())
+        .arg("--")
+        .arg(bootstrap_time_clock_trajectory())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run Hermit {backend}: {error}"));
+    assert_bootstrap_time_success(backend, &output);
+    let stdout = String::from_utf8(output.stdout).expect("clock trajectory output is UTF-8");
+    let samples = stdout
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            let [sample, monotonic, uptime] = fields.as_slice() else {
+                panic!("{backend}: malformed clock sample {line:?}\n{stdout}");
+            };
+            assert_eq!(
+                *sample,
+                format!("sample={index}"),
+                "{backend}: out-of-order sample\n{stdout}"
+            );
+            let monotonic_ns = monotonic
+                .strip_prefix("monotonic_ns=")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("{backend}: bad monotonic field {line:?}"));
+            let uptime = uptime
+                .strip_prefix("uptime=")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("{backend}: bad uptime field {line:?}"));
+            ClockSample {
+                monotonic_ns,
+                uptime,
+            }
+        })
+        .collect::<Vec<_>>();
+    // Five samples before the fixture execs itself and five after it.
+    assert_eq!(
+        samples.len(),
+        CLOCK_TRAJECTORY_SAMPLES,
+        "{backend}: expected ten samples\n{stdout}"
+    );
+    for pair in samples.windows(2) {
+        assert!(
+            pair[1].monotonic_ns > pair[0].monotonic_ns,
+            "{backend}: CLOCK_MONOTONIC must strictly increase: {samples:?}"
+        );
+    }
+    samples
+}
+
+/// Upper bound on how much later, in virtual nanoseconds, each LiteInst image
+/// reaches main than the same image under ptrace.
+///
+/// The fix for https://github.com/rrnewton/hermit/issues/3338 stops charging the
+/// runtime's preload constructor, which cost about 2.1 s per image here. It does
+/// not make the backends reach main at the same instant. Before the runtime's
+/// begin trap, the dynamic loader maps the preloaded runtime and its libgcc_s
+/// dependency as ordinary guest syscalls, and those stay charged. Scheduler
+/// turns inside the bootstrap window also still advance global time. Measured
+/// with these flags, LiteInst reaches main 151,137,500 ns after ptrace in the
+/// first image, and the exec adds 136,137,500 ns more. Both values are exact and
+/// repeat across runs; they depend on the fixture binary that the host's cc
+/// produces and on the runtime's library set, so the test bounds them instead of
+/// asserting them. 200 ms per image leaves about 50 ms of headroom and fails if
+/// even a tenth of the runtime constructor is charged again. This residual is
+/// not parity: it grows with every exec, and after enough execs sysinfo uptime
+/// differs between the backends again. The follow-up is tracked from
+/// https://github.com/rrnewton/hermit/issues/3338.
+const LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS: u128 = 200_000_000;
+
+#[test]
+fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
+    let liteinst = clock_trajectory("liteinst");
+    let ptrace = clock_trajectory("ptrace");
+
+    // The fixture's last read is about 0.92 s past the epoch under LiteInst,
+    // below the next uptime boundary, so both backends read the same uptime.
+    // This is not a general guarantee; see LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS.
+    let liteinst_uptime = liteinst.iter().map(|s| s.uptime).collect::<Vec<_>>();
+    let ptrace_uptime = ptrace.iter().map(|s| s.uptime).collect::<Vec<_>>();
+    assert_eq!(
+        liteinst_uptime, ptrace_uptime,
+        "LiteInst and ptrace must agree on sysinfo uptime\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
+
+    // Inside one image, after main starts, the guest runs identical code under
+    // both backends, so the time between consecutive samples must be identical
+    // (6,500,000 ns with these flags). A difference means the backend charges
+    // guest code differently, not just the bootstrap.
+    for index in 1..CLOCK_TRAJECTORY_SAMPLES {
+        if index == CLOCK_TRAJECTORY_FIRST_AFTER_EXEC {
+            continue;
+        }
+        let liteinst_delta = liteinst[index].monotonic_ns - liteinst[index - 1].monotonic_ns;
+        let ptrace_delta = ptrace[index].monotonic_ns - ptrace[index - 1].monotonic_ns;
+        assert_eq!(
+            liteinst_delta,
+            ptrace_delta,
+            "samples {} and {index} must be the same distance apart under both backends\nliteinst={liteinst:?}\nptrace={ptrace:?}",
+            index - 1
+        );
+    }
+
+    // LiteInst reaches main later than ptrace in each image, by the loader and
+    // scheduler residual only. Bound the first image's gap, and the growth of
+    // the gap across the exec, by the per-image residual bound.
+    let gap_before_exec = liteinst[0]
+        .monotonic_ns
+        .checked_sub(ptrace[0].monotonic_ns)
+        .unwrap_or_else(|| {
+            panic!("LiteInst reached main before ptrace\nliteinst={liteinst:?}\nptrace={ptrace:?}")
+        });
+    let gap_after_exec = liteinst[CLOCK_TRAJECTORY_FIRST_AFTER_EXEC]
+        .monotonic_ns
+        .checked_sub(ptrace[CLOCK_TRAJECTORY_FIRST_AFTER_EXEC].monotonic_ns)
+        .unwrap_or_else(|| {
+            panic!(
+                "LiteInst reached the exec'd main before ptrace\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+            )
+        });
+    assert!(
+        gap_before_exec < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
+        "LiteInst reaches main {gap_before_exec} ns after ptrace in the first image\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
+    let exec_growth = gap_after_exec
+        .checked_sub(gap_before_exec)
+        .unwrap_or_else(|| {
+            panic!(
+                "the LiteInst gap shrank across the exec\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+            )
+        });
+    assert!(
+        exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
+        "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+    );
+}
