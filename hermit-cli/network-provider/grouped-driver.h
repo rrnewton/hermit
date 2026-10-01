@@ -155,6 +155,29 @@ static int grouped_retirement_ready(struct ap_session *s) {
 #endif
 static int grouped_stream_ready(struct ap_session *s) {
     if(grouped_observer_ready(s))return -1;
+#ifdef AP_FTRACE_PROVIDER
+    /* Both new objects remain in the complete owned inventory and are queried
+     * again at every copy drain. Observer-induced recursion is disqualifying,
+     * never treated as evidence that no terminal fault happened. */
+    for(unsigned which=0;which<2;which++) {
+        const int fd=s->fault_program[which];const u32 at=s->fault_link[which];
+        if(fd<0 || at>=s->links_count || !s->links[at])return unavailable();
+        struct bpf_prog_info program={0};struct bpf_link_info link={0};
+        u32 ps=sizeof(program),ls=sizeof(link);
+        if(bpf_obj_get_info_by_fd(fd,&program,&ps) ||
+           bpf_obj_get_info_by_fd(bpf_link__fd(s->links[at]),&link,&ls))return -1;
+        const struct ap_link_identity *bound=&s->link_identity[at];
+        if(ps<offsetof(struct bpf_prog_info,recursion_misses)+sizeof(program.recursion_misses) ||
+           ls<offsetof(struct bpf_link_info,tracing.cookie)+sizeof(link.tracing.cookie) ||
+           program.type!=BPF_PROG_TYPE_TRACING || !program.id || program.recursion_misses ||
+           program.attach_btf_id!=AP_STREAM_FAULT_BTF_ID ||
+           program.id!=bound->program_id || link.id!=bound->id || link.type!=bound->type ||
+           link.type!=BPF_LINK_TYPE_TRACING || link.prog_id!=program.id ||
+           link.tracing.target_obj_id!=program.attach_btf_obj_id ||
+           link.tracing.target_btf_id!=AP_STREAM_FAULT_BTF_ID || link.tracing.cookie ||
+           link.tracing.attach_type!=(which?BPF_TRACE_FEXIT:BPF_TRACE_FENTRY))return unavailable();
+    }
+#endif
     for(unsigned which=0;which<2;which++) {
         int fd=s->stream_program[which];u32 at=s->stream_link[which];
         if(fd<0 || at>=s->links_count || !s->links[at])return unavailable();

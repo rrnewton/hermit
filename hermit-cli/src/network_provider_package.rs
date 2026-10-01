@@ -169,7 +169,7 @@ fn package_metadata(
                 || known.get("btf_sha256").and_then(serde_json::Value::as_str)
                     != Some(contract.btf_sha256.as_str())
                 || (contract.maps, contract.programs, contract.links)
-                    != if ftrace { (23, 47, 47) } else { (23, 44, 44) }
+                    != if ftrace { (24, 49, 49) } else { (23, 44, 44) }
             {
                 return Err(io::Error::other(
                     "unsupported grouped provider schema or physical sites",
@@ -603,6 +603,31 @@ mod tests {
             digest_hex("a3ef4954a0045105be33d82d58d70dafe9d70df33e948f427aedb898987a80f1").unwrap()
         );
         serde_json::from_str(GROUPED_V1_CONTRACT).unwrap()
+    }
+    #[test]
+    fn current_ftrace_manifest_requires_exact_122_shape() {
+        let contract: serde_json::Value = serde_json::from_str(ACCEPTED_CONTRACT).unwrap();
+        let manifest = manifest_for(&contract);
+        assert_eq!((manifest["maps"].as_u64(), manifest["programs"].as_u64(),
+            manifest["links"].as_u64()), (Some(24), Some(49), Some(49)));
+        assert!(metadata(&contract, &manifest).is_ok());
+        eprintln!("current Ftrace122 qualifying neighbor accepted");
+        for counts in [[23,47,47], [23,49,49], [25,49,49], [24,48,49],
+            [24,50,49], [24,49,48], [24,49,50]] {
+            let mut wrong = manifest.clone();
+            for (key, count) in ["maps","programs","links"].into_iter().zip(counts) {
+                wrong[key] = serde_json::json!(count);
+            }
+            assert!(metadata(&contract, &wrong).is_err(), "{counts:?}");
+            let mut paired_contract=contract.clone();
+            for key in ["maps","programs","links"] {
+                paired_contract[key]=wrong[key].clone();
+            }
+            // Internal compiled-contract shape control, not a runtime API for
+            // replacing the trusted compiled contract or its hook declaration.
+            assert!(metadata(&paired_contract, &wrong).is_err(),
+                "hard Ftrace topology predicate accepted paired {counts:?}");
+        }
     }
     #[test]
     fn package_topology_preserves_absence_and_rejects_crossed_or_unknown_contracts() {

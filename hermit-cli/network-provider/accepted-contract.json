@@ -2,9 +2,9 @@
   "schema": 1,
   "abi_version": "4150525553540008",
   "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
-  "maps": 23,
-  "programs": 47,
-  "links": 47,
+  "maps": 24,
+  "programs": 49,
+  "links": 49,
   "shared_links": [],
   "ftrace_only": true,
   "source_files": [
@@ -46,9 +46,17 @@
     "accepted-grouped-v4-contract.json",
     "fd-call-shared.bpf.h",
     "fd-journal.bpf.h",
-    "stream-frontier.h"
+    "stream-frontier.h",
+    "stream-copy-custody.inc",
+    "stream-copy-problem.inc",
+    "stream-copy-unit-enter.inc",
+    "stream-copy-emit.inc",
+    "stream-copy-unit-exit.inc",
+    "stream-copy-fault.h",
+    "stream-copy-fault.inc"
   ],
   "hooks": {
+    "fixup_exception": [[8, 4, 8, 8], 4, 4],
     "fdget": [
       [
         4

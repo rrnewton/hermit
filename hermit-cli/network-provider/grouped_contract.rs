@@ -129,6 +129,13 @@ const FTRACE_SOURCES: &[&str] = &[
     "fd-call-shared.bpf.h",
     "fd-journal.bpf.h",
     "stream-frontier.h",
+    "stream-copy-custody.inc",
+    "stream-copy-problem.inc",
+    "stream-copy-unit-enter.inc",
+    "stream-copy-emit.inc",
+    "stream-copy-unit-exit.inc",
+    "stream-copy-fault.h",
+    "stream-copy-fault.inc",
 ];
 
 pub fn validate(contract: &Contract) -> Result<()> {
@@ -139,9 +146,9 @@ pub fn validate(contract: &Contract) -> Result<()> {
         } else {
             matches!(contract.accepted_copy_version(), Ok(4 | 5))
         })
-            && contract.maps == 23
-            && contract.programs == if contract.ftrace_only { 47 } else { 44 }
-            && contract.links == if contract.ftrace_only { 47 } else { 44 }
+            && contract.maps == if contract.ftrace_only { 24 } else { 23 }
+            && contract.programs == if contract.ftrace_only { 49 } else { 44 }
+            && contract.links == if contract.ftrace_only { 49 } else { 44 }
             && contract.shared_links.is_empty(),
         "unsupported grouped inventory or ABI"
     );
@@ -193,6 +200,9 @@ pub fn validate(contract: &Contract) -> Result<()> {
         "grouped source closure differs"
     );
     let mut hooks = legacy.hooks;
+    if contract.ftrace_only {
+        hooks.insert("fixup_exception".to_owned(), (vec![8, 4, 8, 8], 4, 4));
+    }
     hooks.insert("tcp_recvmsg".to_owned(), (vec![8, 8, 8, 4], 4, 4));
     hooks.insert("unix_stream_read_generic".to_owned(), (vec![8, 1], 2, 4));
     hooks.insert("tcp_splice_read".to_owned(), (vec![8, 8, 8, 8, 4], 5, 8));
@@ -240,8 +250,8 @@ mod tests {
     fn ftrace_topology_retains_role_coverage_without_group_runtime_sources() {
         let parsed=Contract::parse(include_bytes!("accepted-contract.json")).unwrap();
         assert!(parsed.ftrace_only);
-        assert_eq!((parsed.maps,parsed.programs,parsed.links),(23,47,47));
-        assert_eq!(parsed.maps+parsed.programs+parsed.links,117);
+        assert_eq!((parsed.maps,parsed.programs,parsed.links),(24,49,49));
+        assert_eq!(parsed.maps+parsed.programs+parsed.links,122);
         let group=parsed.grouped_event.unwrap();
         assert_eq!((group.version,group.program.as_str(),group.cookie),
             (2,"ftrace-replacements-v1",0));
@@ -382,6 +392,32 @@ mod tests {
     }
 
     #[test]
+    fn ftrace_fault_witness_requires_exact_inventory_and_hook() {
+        let selected = current();
+        for (field, exact) in [("maps", 24), ("programs", 49), ("links", 49)] {
+            for replacement in [exact - 1, exact + 1] {
+                let mut changed = selected.clone();
+                changed[field] = json!(replacement);
+                refuses(&changed);
+            }
+        }
+        let mut old_shape = selected.clone();
+        old_shape["maps"] = json!(23);
+        old_shape["programs"] = json!(47);
+        old_shape["links"] = json!(47);
+        refuses(&old_shape);
+        let mut missing = selected.clone();
+        missing["hooks"].as_object_mut().unwrap().remove("fixup_exception");
+        refuses(&missing);
+        for replacement in [json!([[8, 4, 8], 4, 4]), json!([[8, 4, 8, 8], 8, 4]), json!([[8, 4, 8, 8], 4, 3])] {
+            let mut changed = selected.clone();
+            changed["hooks"]["fixup_exception"] = replacement;
+            refuses(&changed);
+        }
+        assert!(Contract::parse(&serde_json::to_vec(&selected).unwrap()).is_ok());
+    }
+
+    #[test]
     fn ftrace_contract_preserves_role_coverage_and_exact_source_population() {
         let historical = value();
         let selected = current();
@@ -389,11 +425,16 @@ mod tests {
         assert_eq!(parsed.accepted_copy_version().unwrap(), 5);
         assert_eq!(parsed.abi_version, "4150525553540008");
         assert!(parsed.ftrace_only);
-        assert_eq!((parsed.maps, parsed.programs, parsed.links), (23, 47, 47));
+        assert_eq!((parsed.maps, parsed.programs, parsed.links), (24, 49, 49));
         assert_eq!((historical["programs"].as_u64(),historical["links"].as_u64()),(Some(44),Some(44)));
-        for field in ["schema", "btf_sha256", "maps", "shared_links", "hooks"] {
+        for field in ["schema", "btf_sha256", "shared_links"] {
             assert_eq!(selected[field], historical[field], "{field}");
         }
+        assert_eq!(selected["maps"], json!(24));
+        assert_eq!(historical["maps"], json!(23));
+        let mut exact_hooks = historical["hooks"].clone();
+        exact_hooks["fixup_exception"] = json!([[8, 4, 8, 8], 4, 4]);
+        assert_eq!(selected["hooks"], exact_hooks);
         for field in ["anchor_symbol","anchor_address","sites","receive_entry","receive_return"] {
             assert_eq!(selected["grouped_event"][field],historical["grouped_event"][field],"{field}");
         }
@@ -404,7 +445,7 @@ mod tests {
         let classic_sources = classic["source_files"].as_array().unwrap();
         let selected_sources = selected["source_files"].as_array().unwrap();
         assert_eq!(classic_sources.len(), 23);
-        assert_eq!(selected_sources.len(), 39);
+        assert_eq!(selected_sources.len(), 46);
         assert_eq!(&selected_sources[..23], classic_sources);
         assert_eq!(&selected_sources[23..], &[
             json!("ftrace-coverage.h"),json!("driver-grouped.c"),json!("grouped-driver.h"),
@@ -413,8 +454,15 @@ mod tests {
             json!("stream-membership.bpf.h"),json!("grouped_contract.rs"),
             json!("accepted-classic-v40-contract.json"),json!("accepted-grouped-v4-contract.json"),
             json!("fd-call-shared.bpf.h"),json!("fd-journal.bpf.h"),json!("stream-frontier.h"),
+            json!("stream-copy-custody.inc"),
+            json!("stream-copy-problem.inc"),
+            json!("stream-copy-unit-enter.inc"),
+            json!("stream-copy-emit.inc"),
+            json!("stream-copy-unit-exit.inc"),
+            json!("stream-copy-fault.h"),
+            json!("stream-copy-fault.inc"),
         ]);
-        assert_eq!(parsed.source_files.len(), 39);
+        assert_eq!(parsed.source_files.len(), 46);
     }
 
     #[test]
@@ -437,7 +485,7 @@ mod tests {
             refuses(&changed);
         }
         let count=selected["source_files"].as_array().unwrap().len();
-        assert_eq!(count,39);
+        assert_eq!(count,46);
         for index in 0..count {
             let mut changed = selected.clone();
             changed["source_files"].as_array_mut().unwrap().remove(index);

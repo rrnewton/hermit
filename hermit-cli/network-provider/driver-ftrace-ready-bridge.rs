@@ -92,6 +92,7 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../hermit-cli/network-provider").canonicalize().unwrap();
     check_compiled_sources(&source);
+    assert_eq!(driver_ftrace_inputs::C_INPUTS.len(), 23);
     let scratch = tempfile::Builder::new().prefix("hermit-driver-ftrace-").tempdir().unwrap();
     let inputs = scratch.path().join("sources");
     fs::create_dir(&inputs).unwrap();
@@ -114,6 +115,28 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
         .arg("-I").arg(&inputs).arg(inputs.join("driver-ftrace-test.c"))
         .arg("-o").arg(&object).current_dir(scratch.path());
     stage(&mut compile, "compile", started, &stdout, &stderr);
+    let incomplete=scratch.path().join("missing-fault-header");
+    fs::create_dir(&incomplete).unwrap();
+    for (name,bytes) in driver_ftrace_inputs::C_INPUTS {
+        if *name!="stream-copy-fault.h" {fs::write(incomplete.join(name),bytes).unwrap();}
+    }
+    let missing=driver_ftrace_process::execute_stage(
+        Command::new("clang").args(["-std=gnu11","-fno-builtin","-DAP_FTRACE_PROVIDER=1",
+            "-DAP_NATIVE_COPY_VERSION=5ULL","-O2","-Wall","-Wextra","-Werror","-UNDEBUG","-c"])
+            .arg("-I").arg(&incomplete).arg(incomplete.join("driver-ftrace-test.c"))
+            .arg("-o").arg(scratch.path().join("missing.o")),
+        started,&stdout,&stderr);
+    assert_eq!(missing["raw_status"],1,"missing header must be a compiler failure: {missing}");
+    assert_eq!(missing["passed"],false);
+    assert_eq!(missing["timed_out"],false);
+    assert_eq!(missing["log_overflow"],false);
+    assert_eq!(missing["primary_error"],serde_json::Value::Null);
+    assert_eq!(missing["terminal_bounds_error"],serde_json::Value::Null);
+    assert_eq!(missing["cleanup_complete"],true);
+    assert_eq!(missing["final_group_absent"],true);
+    assert_eq!(missing["cleanup_errors"],serde_json::json!([]));
+    assert!(String::from_utf8_lossy(&bounded_read(&stderr,LIMITS.logs))
+        .contains("'stream-copy-fault.h' file not found"));
     let mut fence = Command::new("python3");
     fence.arg("-c").arg(DRIVER_FTRACE_IMPORT_FENCE).arg(&object);
     stage(&mut fence, "closed-import-fence", started, &stdout, &stderr);
@@ -136,9 +159,9 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
 
     let contract: serde_json::Value =
         serde_json::from_slice(include_bytes!("accepted-contract.json")).unwrap();
-    assert_eq!(contract["maps"], 23);
-    assert_eq!(contract["programs"], 47);
-    assert_eq!(contract["links"], 47);
+    assert_eq!(contract["maps"], 24);
+    assert_eq!(contract["programs"], 49);
+    assert_eq!(contract["links"], 49);
     assert_eq!(contract["shared_links"], serde_json::json!([]));
     assert_eq!(contract["ftrace_only"], true);
     let contract_sha256: [u8; 32] =
@@ -153,9 +176,9 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
         object_sha256: Sha256::digest(b"modeled ftrace BPF object only").into(),
         library_sha256: Sha256::digest(b"modeled actual-driver facade only").into(),
         btf_sha256: Sha256::digest(b"modeled target BTF only").into(),
-        maps: 23, programs: 47, links: 47,
+        maps: 24, programs: 49, links: 49,
     };
-    assert_eq!(artifact.inventory_capacity().unwrap().get(), 117);
+    assert_eq!(artifact.inventory_capacity().unwrap().get(), 122);
     let mut run = [0u8; 16];
     run[..8].copy_from_slice(&exported.provider_incarnation.to_le_bytes());
     let mut accepted = 0;
@@ -165,7 +188,7 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
         // errno after successful ap_open may retain its modeled anchor EBADF;
         // only the original failed return makes errno an error result.
         assert!(case.open_errno >= 0);
-        assert_eq!(case.capacity, 117);
+        assert_eq!(case.capacity, 122);
         assert_eq!(case.ids.len(), case.written as usize);
         let mut ready = ProviderReady {
             incarnation: run, provider_incarnation: exported.provider_incarnation,
@@ -182,23 +205,43 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
         // This is the existing product verifier, including its exact counts,
         // nonzero/unique IDs, artifact and incarnation rules. Do not recreate it.
         let validated = ready.validate(run, &artifact);
+        if case.name == "good" {
+            // Target every new object identity, not merely total population.
+            for (kind, index) in [(0,23),(1,47),(1,48),(2,47),(2,48)] {
+                for mutation in 0..3 {
+                    let mut wrong = ready.clone();
+                    let ids = match kind {0 => &mut wrong.maps, 1 => &mut wrong.programs,
+                        _ => &mut wrong.links};
+                    match mutation {
+                        0 => { ids.remove(index); }
+                        1 => ids[index]=ids[0],
+                        _ => ids[index]=0,
+                    }
+                    assert!(wrong.validate(run, &artifact).is_err(), "new object {kind}:{index} mutation {mutation}");
+                }
+            }
+            let mut historical = ready.clone();
+            historical.maps.truncate(23); historical.programs.truncate(47);
+            historical.links.truncate(47);
+            assert!(historical.validate(run, &artifact).is_err());
+        }
         let accepted_case = case.inventory_result == 0 && validated.is_ok();
         // Evaluate every original inventory before the outcome assertion: a
-        // permissive map-count mutant must expose BOTH 22-map cases, not stop
+        // permissive map-count mutant must expose BOTH 23-map cases, not stop
         // after missing-map and accidentally mask duplicate-map sensitivity.
         outcomes.push((case.name.as_str(), case.inventory_result, validated.is_ok(), accepted_case));
         accepted += usize::from(accepted_case);
         if case.name == "extra-map" {
             assert_eq!(case.inventory_result, -1);
             assert_eq!(case.inventory_errno, libc::EOVERFLOW);
-            assert_eq!(case.written, 117);
-            assert_eq!((ready.maps.len(), ready.programs.len(), ready.links.len()), (24, 47, 46));
+            assert_eq!(case.written, 122);
+            assert_eq!((ready.maps.len(), ready.programs.len(), ready.links.len()), (25, 49, 48));
         } else {
             assert_eq!(case.inventory_result, 0);
             assert_eq!(case.inventory_errno, 0);
-            let maps = if case.name == "good" {23} else {22};
-            assert_eq!((ready.maps.len(), ready.programs.len(), ready.links.len()), (maps, 47, 47));
-            assert_eq!(case.written as usize, maps + 47 + 47);
+            let maps = if case.name == "good" {24} else {23};
+            assert_eq!((ready.maps.len(), ready.programs.len(), ready.links.len()), (maps, 49, 49));
+            assert_eq!(case.written as usize, maps + 49 + 49);
         }
     }
     eprintln!("actual ProviderReady inventory outcomes: {outcomes:?}");

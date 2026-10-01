@@ -63,6 +63,9 @@ int main(void) {
     }
     struct copy_image_fixture fixture={.corrupt=-1,.truncate=-1};
     FILE *input=copy_image_fixture_open(&fixture);assert(input);assert(!ap_check_grouped_image(input));assert(!fclose(input));controls++;
-    assert(bytes==23504 && controls==23532);
-    printf("GROUPED_IMAGE bytes=%u slices=27 mutations_truncations_positive=%u\n",bytes,controls);return 0;
+    /* Original 23,504 bytes plus complete fixup (1,128), copy helper
+     * (1,690), and this REP's exact exception-table entry (12). Every new
+     * byte is independently corrupted, and each of all 30 slices truncated. */
+    assert(bytes==26334 && controls==26365);
+    printf("GROUPED_IMAGE bytes=%u slices=30 mutations_truncations_positive=%u\n",bytes,controls);return 0;
 }

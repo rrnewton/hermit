@@ -71,8 +71,9 @@ extern int bpf_map_lookup_elem(int,const void *,void *);
 extern int bpf_map_delete_elem(int,const void *);
 extern int bpf_obj_get_info_by_fd(int,void *,unsigned int *);
 #ifdef AP_FTRACE_PROVIDER
-#define AP_PROGRAMS 47
-#define AP_LINKS 47
+#include "stream-copy-fault.h"
+#define AP_PROGRAMS 49
+#define AP_LINKS 49
 #elif defined(AP_GROUPED_PROVIDER)
 #include "grouped-io.h"
 #define AP_PROGRAMS 44
@@ -133,6 +134,8 @@ struct ap_session {
 #ifdef AP_FTRACE_PROVIDER
     int retirement_program[2];
     u32 retirement_link[2];
+    int fault_program[2];
+    u32 fault_link[2];
 #endif
     int copy_program[2],copy_link[2];
     int stream_program[6];u32 stream_link[6];
@@ -477,6 +480,7 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
     s->read_entry_program=s->read_entry_link=-1;
 #ifdef AP_FTRACE_PROVIDER
     for(unsigned i=0;i<2;i++) {s->retirement_program[i]=-1;s->retirement_link[i]=AP_LINKS;}
+    for(unsigned i=0;i<2;i++) {s->fault_program[i]=-1;s->fault_link[i]=AP_LINKS;}
 #endif
     for(unsigned i=0;i<6;i++) {s->stream_program[i]=-1;s->stream_link[i]=AP_LINKS;}
     for(unsigned i=0;i<2;i++) {
@@ -495,6 +499,15 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
     s->events=bpf_object__find_map_fd_by_name(s->object,"events");
     s->status=bpf_object__find_map_fd_by_name(s->object,"status");
     if(config<0 || s->tasks<0 || s->commands<0 || s->events<0 || s->status<0)return unavailable();
+#ifdef AP_FTRACE_PROVIDER
+    int fault_map=bpf_object__find_map_fd_by_name(s->object,"stream_copy_faults");
+    struct bpf_map_info fault_info={0};u32 fault_size=sizeof(fault_info);
+    if(fault_map<0 || bpf_obj_get_info_by_fd(fault_map,&fault_info,&fault_size))return unavailable();
+    if(fault_size<offsetof(struct bpf_map_info,max_entries)+sizeof(fault_info.max_entries) ||
+       !fault_info.id || fault_info.type!=BPF_MAP_TYPE_ARRAY ||
+       fault_info.key_size!=sizeof(u32) || fault_info.value_size!=sizeof(struct ap_stream_fault_state) ||
+       fault_info.max_entries!=AP_COMMANDS)return unavailable();
+#endif
     u32 zero=0;struct ap_config c={.provider=incarnation};
     if(bpf_map_update_elem(config,&zero,&c,BPF_ANY))return -1;
     int copy_map=bpf_object__find_map_fd_by_name(s->object,"stream_copy_records");
@@ -526,6 +539,8 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
 #ifdef AP_FTRACE_PROVIDER
         int retirement=!strcmp(bpf_program__name(p),"fd_file_retired")?0:
             !strcmp(bpf_program__name(p),"fd_exec_closed_file")?1:-1;
+        int fault=!strcmp(bpf_program__name(p),"fd_stream_fault_enter")?0:
+            !strcmp(bpf_program__name(p),"fd_stream_fault_exit")?1:-1;
 #endif
         int selection=!strcmp(bpf_program__name(p),"fd_connect_post_fdget")?1:-1;
         int stream=!strcmp(bpf_program__name(p),"fd_stream_copy_protocol_enter")?0:
@@ -670,6 +685,11 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
             s->retirement_program[retirement]=bpf_program__fd(p);
             s->retirement_link[retirement]=s->links_count-1;
         }
+        if(fault>=0) {
+            if(s->fault_program[fault]!=-1 || s->fault_link[fault]!=AP_LINKS)return unavailable();
+            s->fault_program[fault]=bpf_program__fd(p);
+            s->fault_link[fault]=s->links_count-1;
+        }
 #endif
         if(stream>=0) {
             if(s->stream_program[stream]!=-1)return unavailable();
@@ -687,7 +707,7 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
          * Do this per pair so the additional perf/link never raises FD128. */
         if(!fdget && fdget_shared<0 && !read_entry && selection<0 && stream<0
 #ifdef AP_FTRACE_PROVIDER
-           && retirement<0
+           && retirement<0 && fault<0
 #endif
           )bpf_program__unload(p);
     }

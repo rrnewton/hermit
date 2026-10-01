@@ -85,9 +85,10 @@ mod process_group;
 mod driver_ftrace_process;
 use driver_ftrace_process::{DRIVER_FTRACE_IMPORT_FENCE, execute_stage};
 
-// Only independent role executions use this fixed bound. Each worker owns its
+// Independent role executions use this fixed bound. Each worker owns its
 // Command/Child and calls the unchanged stage supervisor with the action's
-// original start and aggregate append-only logs. Compilers remain serial.
+// original start and aggregate append-only logs. New failed-prefix sequences
+// use the same join/failure discipline with a stricter two-compiler bound.
 const ROLE_MUTANT_CONCURRENCY: usize = 4;
 
 fn role_worker_failure(error: String) -> Value {
@@ -100,9 +101,17 @@ fn role_batches(
     roles: std::ops::RangeInclusive<u32>,
     execute: impl Fn(u32) -> Value + Sync,
 ) -> Vec<(u32, Value)> {
+    bounded_batches(roles, ROLE_MUTANT_CONCURRENCY, execute)
+}
+
+fn bounded_batches(
+    roles: std::ops::RangeInclusive<u32>,
+    concurrency: usize,
+    execute: impl Fn(u32) -> Value + Sync,
+) -> Vec<(u32, Value)> {
     let roles: Vec<_> = roles.collect();
     let mut results = Vec::new();
-    for batch in roles.chunks(ROLE_MUTANT_CONCURRENCY) {
+    for batch in roles.chunks(concurrency) {
         let completed = std::thread::scope(|scope| {
             let mut workers = Vec::new();
             let mut admission_failure = None;
@@ -194,6 +203,7 @@ const ACCEPTED_CONTROLS: &[&str] = &[
     "grouped-target-test.c",
     "stream-frontier-test.c",
     "stream-copy-v5-driver-test.c",
+    "stream-copy-fault-producer-test.c",
     "stream-membership-v5-test.c",
     "fd-journal-publish-test.c",
     "fd-shared-predicate-test.c",
@@ -524,6 +534,65 @@ fn run() -> Result<()> {
         } else {receipt=compiled;}
     }
     if receipt["passed"] == true && accepted {
+        let baseline=output.join("stream-copy-fault-producer-test");
+        let mutants=[
+            ("DROP_DATA", "fault"), ("DROP_PRIOR", "two-fragment"),
+            ("CX", "fault"), ("SOURCE", "fault"), ("WINDOW", "fault"), ("FRONTIER", "fault"),
+        ];
+        // Independent controls share the ORIGINAL aggregate timer and logs.
+        // At most two compiler/test sequences run concurrently; no extra
+        // timeout, stage, missing receipt or cleanup exemption is introduced.
+        for (_, completed) in bounded_batches(0..=5, 2, |index| {
+            let (label,selector)=mutants[index as usize];
+            let mut local=Vec::new();
+            let executable=output.join(format!("failed-prefix-mutant-{label}"));
+            let mut compile=Command::new("clang");
+            compile.args(["-O2","-Wall","-Wextra","-Werror","-UNDEBUG"])
+                .arg(format!("-DAP_STREAM_FAULT_MUTATE_{label}=1"))
+                .arg("-I").arg(&source).arg(source.join("stream-copy-fault-producer-test.c"))
+                .arg("-o").arg(&executable);
+            let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
+            local.push(json!({"name":format!("compile:failed-prefix-{label}"),"receipt":compiled}));
+            if compiled["passed"]==true {
+                let mut command=Command::new(&executable);command.arg(selector);
+                let refused=role_mutant_receipt(execute_stage(&mut command,started,&stdout_path,&stderr_path));
+                local.push(json!({"name":format!("test:failed-prefix-{label}"),"receipt":refused}));
+                if refused["passed"]==true {
+                    // SOURCE corrupts all bytes; its qualifying neighbor is
+                    // the unmutated build, never a relaxed byte comparator.
+                    let mut neighbor=Command::new(if label=="SOURCE" {&baseline} else {&executable});
+                    neighbor.arg("full");
+                    let tested=execute_stage(&mut neighbor,started,&stdout_path,&stderr_path);
+                    local.push(json!({"name":format!("neighbor:failed-prefix-{label}"),"receipt":tested}));
+                }
+            }
+            json!({"passed":local.len()==3 && local.iter().all(|s| s["receipt"]["passed"]==true),"stages":local})
+        }) {
+            if completed["passed"]!=true && receipt["passed"]==true {receipt=completed.clone();}
+            if let Some(local)=completed["stages"].as_array() {stages.extend(local.iter().cloned());}
+        }
+        if receipt["passed"] == true {
+            for (_,completed) in role_batches(12..=15, |role| {
+                let (selector,neighbor)=if role<14 {("linear","fault")} else {("fault","linear")};
+                let mut local=Vec::new();
+                let mut command=Command::new(&baseline);
+                command.arg(selector).env("AP_FTRACE_MUTATE_ROLE",role.to_string());
+                let refused=role_mutant_receipt(execute_stage(&mut command,started,&stdout_path,&stderr_path));
+                local.push(json!({"name":format!("test:failed-prefix-role-{role}"),"receipt":refused}));
+                if refused["passed"]==true {
+                    let mut command=Command::new(&baseline);
+                    command.arg(neighbor).env("AP_FTRACE_MUTATE_ROLE",role.to_string());
+                    let tested=execute_stage(&mut command,started,&stdout_path,&stderr_path);
+                    local.push(json!({"name":format!("neighbor:failed-prefix-role-{role}"),"receipt":tested}));
+                }
+                json!({"passed":local.len()==2 && local.iter().all(|s| s["receipt"]["passed"]==true),"stages":local})
+            }) {
+                if completed["passed"]!=true && receipt["passed"]==true {receipt=completed.clone();}
+                if let Some(local)=completed["stages"].as_array() {stages.extend(local.iter().cloned());}
+            }
+        }
+    }
+    if receipt["passed"] == true && accepted {
         for (label, source_name, roles) in [
             ("fd", "fd-effects-test.c", 1..=11),
             ("stream-copy", "stream-copy-v5-driver-test.c", 12..=15),
@@ -552,7 +621,7 @@ fn run() -> Result<()> {
         }
     }
     let expected_stages = 1 + if accepted {
-        2 * ACCEPTED_CONTROLS.len()+32 // actual driver closed-import fence and link
+        2 * ACCEPTED_CONTROLS.len()+32+26 // unchanged old stages plus six mutant triplets and four role pairs
     } else {
         2 * UNIX_CONTROLS.len()
     };
@@ -713,8 +782,8 @@ mod tests {
             fs::write(case.path.join(name), name).unwrap();
         }
         let before = control_sources(&case.path, true).unwrap();
-        assert_eq!(ACCEPTED_CONTROLS.len(), 22);
-        assert_eq!(before.len(), 25);
+        assert_eq!(ACCEPTED_CONTROLS.len(), 23);
+        assert_eq!(before.len(), 26);
         assert_eq!(
             before.keys().map(String::as_str).collect::<Vec<_>>(),
             [
@@ -738,6 +807,7 @@ mod tests {
                 "remove-test.c",
                 "retirement-target-test.c",
                 "stream-copy-driver-test.c",
+                "stream-copy-fault-producer-test.c",
                 "stream-copy-v5-driver-test.c",
                 "stream-frontier-test.c",
                 "stream-membership-test.c",
@@ -775,7 +845,7 @@ mod tests {
             fs::write(case.path.join(name), name).unwrap();
             assert_eq!(before, control_sources(&case.path, true).unwrap());
         }
-        for name in ["stream-frontier-test.c", "stream-copy-v5-driver-test.c", "stream-membership-v5-test.c"] {
+        for name in ["stream-frontier-test.c", "stream-copy-v5-driver-test.c", "stream-copy-fault-producer-test.c", "stream-membership-v5-test.c"] {
             fs::write(case.path.join(name), "changed frontier or copy-version assertion").unwrap();
             assert_ne!(before, control_sources(&case.path, true).unwrap());
             fs::remove_file(case.path.join(name)).unwrap();

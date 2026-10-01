@@ -1769,7 +1769,7 @@ fn validate_startup(started: &StartupReceipt, artifact: &ProviderArtifact) -> io
     let expected_counts = match artifact.topology {
         detcore::network_runtime::ProviderTopology::ClassicV40 => [23, 46, 58],
         detcore::network_runtime::ProviderTopology::GroupedV1 { .. } => [23, 44, 44],
-        detcore::network_runtime::ProviderTopology::FtraceV1 { .. } => [23, 47, 47],
+        detcore::network_runtime::ProviderTopology::FtraceV1 { .. } => [24, 49, 49],
     };
     if [artifact.maps, artifact.programs, artifact.links] != expected_counts
         || artifact.object_sha256 == [0; 32]
@@ -3137,6 +3137,25 @@ mod recovery_receipt_tests {
         assert_eq!(got.counts, [23, 44, 44]);
         assert_eq!(got.original_ids.len(), 111);
         assert!(r.finish(serde_json::json!({})).is_err());
+    }
+    #[test]
+    fn current_ftrace_startup_requires_exact_122_shape() {
+        let (_temp, _recovery, mut startup, _terminal) = fixture();
+        let mut selected = artifact();
+        selected.topology = detcore::network_runtime::ProviderTopology::FtraceV1 {
+            contract_sha256: [9;32],
+        };
+        selected.maps=24; selected.programs=49; selected.links=49;
+        startup.artifact=selected.clone();
+        validate_startup(&startup, &selected).unwrap();
+        for counts in [[23,47,47], [23,49,49], [25,49,49], [24,48,49],
+            [24,50,49], [24,49,48], [24,49,50]] {
+            let mut wrong=selected.clone();
+            [wrong.maps, wrong.programs, wrong.links]=counts;
+            startup.artifact=wrong.clone();
+            // Both sides agree: the product topology gate itself must refuse.
+            assert!(validate_startup(&startup, &wrong).is_err(), "{counts:?}");
+        }
     }
     #[test]
     fn strict_accepted_receipt_refuses_missing_phase_wrong_actor_log_inventory_and_deadline() {

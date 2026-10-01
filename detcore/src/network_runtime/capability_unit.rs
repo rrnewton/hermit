@@ -25,18 +25,19 @@ pub const CAPABILITY_ENVIRONMENT: &[(&str, &str)] = &[
     ("LANG", "C"),
     ("LC_ALL", "C"),
 ];
-/// Descriptor limit for every capability unit. The grouped accepted provider
-/// holds its 23 maps, 47 programs and 47 links (117 original IDs) at once, plus
-/// perf events, tracefs leaves, pidfds and journals, and libbpf opens transient
-/// descriptors for feature probes during attach. At 128 the probe for kernel
-/// perf links failed with EMFILE, so libbpf reported cookie attach as
-/// unsupported and startup refused with EOPNOTSUPP.
+/// Descriptor limit for every capability unit. The selected Ftrace provider
+/// has 24 maps, 49 programs and 49 links (122 original IDs), plus pidfds and
+/// journals; libbpf also opens transient descriptors while attaching. The
+/// historical 117-ID provider hit EMFILE at 128 during its perf-link feature
+/// probe. That history motivated 256; it is not load evidence for the new
+/// 122-ID artifact, which must qualify under this unchanged limit.
 pub const CAPABILITY_UNIT_NOFILE: u64 = 256;
-/// The accepted loader verifies and attaches all 47 programs before it can
-/// drop libbpf's transient state. FtraceV1 hit the former 256 MiB cgroup cap
+/// The accepted loader now verifies and attaches all 49 programs before it can
+/// drop libbpf's transient state. The earlier FtraceV1 hit the former 256 MiB cgroup cap
 /// exactly (MemoryPeak=268435456, Result=oom-kill) before publishing READY.
 /// Keep one additional former-cap of bounded verifier/load headroom; the
 /// metadata-only readers and Unix keeper retain their smaller existing cap.
+/// The 49-program successor still needs load qualification under this cap.
 pub const ACCEPTED_UNIT_MEMORY_MAX: u64 = 512 * 1024 * 1024;
 /// Existing cap retained for keepers and metadata-only readback helpers.
 pub const OTHER_CAPABILITY_UNIT_MEMORY_MAX: u64 = 256 * 1024 * 1024;

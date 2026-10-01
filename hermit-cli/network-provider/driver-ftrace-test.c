@@ -12,10 +12,10 @@
 #define DF_PIDFD 900
 #define DF_PROVIDER UINT64_C(0x123456789)
 #define DF_ANCHOR (AP_GROUPED_CONNECT_IMAGE+UINT64_C(0x200000))
-#define DF_MAPS 23U
+#define DF_MAPS 24U
 #define DF_TOTAL (DF_MAPS+AP_PROGRAMS+AP_LINKS)
-_Static_assert(AP_PROGRAMS==47 && AP_LINKS==47,"accepted-contract.json FtraceV1");
-_Static_assert(DF_TOTAL==117,"three separate identifier namespaces");
+_Static_assert(AP_PROGRAMS==49 && AP_LINKS==49,"accepted-contract.json FtraceV1");
+_Static_assert(DF_TOTAL==122,"three separate identifier namespaces");
 
 static _Noreturn void df_unexpected(const char *what) {
     fprintf(stderr,"unmocked or out-of-contract driver effect: %s\n",what);
@@ -27,7 +27,8 @@ enum df_fault {
     DF_PERF_LINK, DF_COOKIE, DF_ADDRESS, DF_COUNT_BAD, DF_FLAGS, DF_SHORT_INFO,
     DF_MISSING_REQUIRED_MAP, DF_MISSING_MAP, DF_EXTRA_MAP, DF_DUP_MAP,
     DF_ATTACH_FAIL, DF_LOAD_FAIL, DF_CONFIG_FAIL, DF_RING_FAIL, DF_READ_LINK,
-    DF_ANCHOR_FAIL, DF_WRONG_PROGRAM_KIND, DF_LEGACY_PROGRAM
+    DF_ANCHOR_FAIL, DF_WRONG_PROGRAM_KIND, DF_LEGACY_PROGRAM,
+    DF_FAULT_TARGET, DF_FAULT_MISS, DF_FAULT_SHORT, DF_FAULT_MAP, DF_FAULT_MAP_MISSING
 };
 static enum df_fault df_fault;
 static unsigned df_bad_at;
@@ -59,7 +60,7 @@ static unsigned df_destroy_order[AP_LINKS];
 static int df_destroy_failure;
 
 /* Explicit metadata inventory transcribed from the active Ftrace object:
- * 36 fentry/fexit + 3 tp_btf + 8 multi/session programs. Names are fixture
+ * 38 fentry/fexit + 3 tp_btf + 8 multi/session programs. Names are fixture
  * inputs, not reconstructed from the driver's admission decisions. */
 static const struct { const char *name;unsigned type;bool raw; } df_inventory[]={
 #define T(n) {#n,BPF_PROG_TYPE_TRACING,false}
@@ -79,7 +80,8 @@ static const struct { const char *name;unsigned type;bool raw; } df_inventory[]=
     T(fd_copy_enter),T(fd_copy_returned),T(fd_table_put_enter),
     T(fd_table_put_returned),T(fd_table_retired),T(fd_enrollment_enter),
     T(fd_enrollment_returned),R(fd_epoll_ctl_syscall_entered),
-    K(fd_stream_copy_protocol_enter),K(fd_stream_copy_protocol_exit)
+    K(fd_stream_copy_protocol_enter),K(fd_stream_copy_protocol_exit),
+    T(fd_stream_fault_enter),T(fd_stream_fault_exit)
 #undef T
 #undef R
 #undef K
@@ -89,10 +91,11 @@ static const char *const df_map_names[]={
     "ap_config_map","status","listeners","events","commands","objects","clones","setters","tasks",
     "fd_accepts","fd_enrollments","fd_status","fd_journal","fd_files","fd_tables","fd_calls",
     "fd_replacements","fd_install_calls","fd_removals","fd_puts","fd_copies","fd_execs",
-    "stream_copy_records"
+    "stream_copy_records","stream_copy_faults"
 };
 _Static_assert(DF_COUNT(df_map_names)==DF_MAPS,"actual BPF map declarations");
 static unsigned df_map_type(const char *name) {
+    if(!strcmp(name,"stream_copy_faults"))return BPF_MAP_TYPE_ARRAY;
     if(!strcmp(name,"tasks"))return BPF_MAP_TYPE_TASK_STORAGE;
     if(!strcmp(name,"stream_copy_records"))return BPF_MAP_TYPE_RINGBUF;
     for(unsigned i=0;i<5;i++)if(!strcmp(name,df_map_names[i]))return BPF_MAP_TYPE_ARRAY;
@@ -293,6 +296,7 @@ void bpf_program__unload(struct bpf_program *p) {
 }
 int bpf_object__find_map_fd_by_name(const struct bpf_object *o,const char *name) {
     assert(o==&df_object && o->loaded);
+    if(df_fault==DF_FAULT_MAP_MISSING && !strcmp(name,"stream_copy_faults")) {errno=ENOENT;return -1;}
     for(unsigned i=0;i<o->maps;i++)if(!strcmp(name,df_maps[i].name))return df_maps[i].fd;
     errno=ENOENT;return -1;
 }
@@ -376,12 +380,22 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
     df_info_queries++;
     for(unsigned at=0;at<df_object.maps;at++)if(df_maps[at].fd==fd) {
         assert(*size==sizeof(struct bpf_map_info));
-        struct bpf_map_info *m=out;m->id=df_maps[at].id;m->type=df_maps[at].type;return 0;
+        struct bpf_map_info *m=out;m->id=df_maps[at].id;m->type=df_maps[at].type;
+        if(!strcmp(df_maps[at].name,"stream_copy_faults")) {
+            m->key_size=sizeof(u32);m->value_size=sizeof(struct ap_stream_fault_state);m->max_entries=AP_COMMANDS;
+            if(df_fault==DF_FAULT_MAP)m->value_size--;
+        }
+        return 0;
     }
     if(fd>=2000 && fd<2000+(int)df_object.programs) {
         unsigned at=(unsigned)(fd-2000);assert(df_programs[at].fd==fd && *size==sizeof(struct bpf_prog_info));
         struct bpf_prog_info *p=out;p->id=df_programs[at].id;p->type=df_programs[at].type;
         if(!strcmp(df_programs[at].name,"fd_original_read_entered")) {p->attach_btf_obj_id=11;p->attach_btf_id=19;}
+        if(!strcmp(df_programs[at].name,"fd_stream_fault_enter") || !strcmp(df_programs[at].name,"fd_stream_fault_exit")) {
+            p->attach_btf_obj_id=11;p->attach_btf_id=108812;
+            if(at==df_bad_at && df_fault==DF_FAULT_MISS)p->recursion_misses=1;
+            if(at==df_bad_at && df_fault==DF_FAULT_SHORT)*size=offsetof(struct bpf_prog_info,recursion_misses);
+        }
         return 0;
     }
     if(fd>=3000 && fd<3000+(int)df_attached) {
@@ -415,6 +429,13 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
         if(l->at==df_index("fd_original_read_entered")) {
             v->tracing.attach_type=BPF_TRACE_FENTRY;v->tracing.target_obj_id=11;v->tracing.target_btf_id=19;
             if(df_fault==DF_READ_LINK)v->tracing.cookie=1;
+        }
+        if(!strcmp(df_programs[l->at].name,"fd_stream_fault_enter") ||
+           !strcmp(df_programs[l->at].name,"fd_stream_fault_exit")) {
+            v->tracing.attach_type=!strcmp(df_programs[l->at].name,"fd_stream_fault_enter")?
+                BPF_TRACE_FENTRY:BPF_TRACE_FEXIT;
+            v->tracing.target_obj_id=11;v->tracing.target_btf_id=108812;
+            if(l->at==df_bad_at && df_fault==DF_FAULT_TARGET)v->tracing.target_btf_id++;
         }
         v->type=l->type;v->id=l->id;v->prog_id=l->program_id;return 0;
     }
@@ -452,7 +473,8 @@ static void df_reset(enum df_fault fault,unsigned at) {
     /* Remove an unconsulted map, preserving the real config/ring prerequisites. */
     if(fault==DF_MISSING_MAP) {
         for(unsigned i=2;i<DF_MAPS-1;i++)df_maps[i].name=df_map_names[i+1];
-        df_maps[DF_MAPS-2].fd=1022;
+        df_maps[DF_MAPS-3].fd=1022; /* retained ring keeps its independently fixed FD */
+        df_maps[DF_MAPS-2].fd=1023; /* new witness map also remains present */
     }
     if(fault==DF_MISSING_REQUIRED_MAP)df_maps[0].name="missing-config";
     for(unsigned i=0;i<df_object.maps;i++)df_maps[i].type=df_map_type(df_maps[i].name);
@@ -488,11 +510,11 @@ static void df_inventory_exact(struct ap_session *s) {
 static void df_positive(void) {
     df_reset(DF_OK,0);struct ap_session *s=NULL;
     assert(ap_open("fixture-object-only",DF_PROVIDER,&s)==0 && s==&df_session && s->ready);
-    assert(ap_provider_topology_version()==2 && df_attached==47 && df_attach_calls==47);
+    assert(ap_provider_topology_version()==2 && df_attached==49 && df_attach_calls==49);
     assert(df_page_queries==1 && df_btf_queries==1 && df_image_opens==2);
     assert(df_anchor_calls==1 && df_owner_closes==1 && df_updates==3 && df_lookups==2);
-    assert(df_unloads==38); /* 39 tracing programs minus retained Read entry. */
-    for(unsigned i=0;i<47;i++) {
+    assert(df_unloads==38); /* 41 tracing programs minus retained Read entry and two fault hooks. */
+    for(unsigned i=0;i<49;i++) {
         assert(s->links[i]==&df_links[i] && s->link_identity[i].id==201+i &&
             s->link_identity[i].program_id==101+i);
         if(df_inventory[i].type==BPF_PROG_TYPE_KPROBE)assert(df_links[i].shape_queries>0);
@@ -509,7 +531,7 @@ static void df_refusal(enum df_fault fault,unsigned at,int expected_errno) {
     if(fault==DF_PERF_LINK || fault==DF_DUP_LINK || fault==DF_DUP_PROGRAM)
         assert(s && df_attached==at+1 && !df_anchor_calls);
     if(fault==DF_COOKIE || fault==DF_ADDRESS || fault==DF_COUNT_BAD || fault==DF_FLAGS || fault==DF_SHORT_INFO)
-        assert(s && df_attached==47 && df_anchor_calls==1 && df_links[at].shape_queries>0);
+        assert(s && df_attached==49 && df_anchor_calls==1 && df_links[at].shape_queries>0);
     df_closed(s,0);
     /* Capture before cleanup, as the real FFI does; errno after successful
      * cleanup alone is not the primary. No success is substituted here. */
@@ -529,7 +551,7 @@ static void df_partial(void) {
         assert(primary==-1 && saved==EIO); /* EUCLEAN is secondary, never success. */
         df_partial_prefixes++;
     }
-    assert(df_partial_prefixes==47);
+    assert(df_partial_prefixes==49);
 }
 static void df_map_census(enum df_fault fault) {
     df_reset(fault,0);struct ap_session *s=NULL;
@@ -546,7 +568,7 @@ static void df_map_census(enum df_fault fault) {
         assert(rc==0 && n==DF_TOTAL-1);
         unsigned maps=0;
         for(unsigned i=0;i<n;i++)maps+=ids[i].kind==0;
-        assert(maps==22);
+        assert(maps==23);
     }
     df_closed(s,0);
 }
@@ -619,7 +641,10 @@ static const char *const df_selectors[]={
     "shared-cookie","shared-flags","membership-address","membership-count","retirement-cookie",
     "read-link","anchor","wrong-program-kind","legacy-program","required-map",
     "missing-map-census","extra-map-census","duplicate-map-census","partial-attach",
-    "load-failure","config-failure","ring-failure","program-reuse","link-census"
+    "load-failure","config-failure","ring-failure","program-reuse","link-census",
+    "fault-entry-target","fault-exit-target","fault-entry-miss","fault-exit-miss",
+    "fault-entry-short","fault-exit-short","fault-map-shape","fault-map-missing",
+    "fault-runtime-miss"
 };
 static void df_case(unsigned n) {
     switch(n) {
@@ -658,6 +683,24 @@ static void df_case(unsigned n) {
     case 32:df_refusal(DF_RING_FAIL,0,ENOMEM);break;
     case 33:df_reused_program();break;
     case 34:df_link_census();break;
+    case 35:df_refusal(DF_FAULT_TARGET,df_index("fd_stream_fault_enter"),ENODATA);break;
+    case 36:df_refusal(DF_FAULT_TARGET,df_index("fd_stream_fault_exit"),ENODATA);break;
+    case 37:df_refusal(DF_FAULT_MISS,df_index("fd_stream_fault_enter"),ENODATA);break;
+    case 38:df_refusal(DF_FAULT_MISS,df_index("fd_stream_fault_exit"),ENODATA);break;
+    case 39:df_refusal(DF_FAULT_SHORT,df_index("fd_stream_fault_enter"),ENODATA);break;
+    case 40:df_refusal(DF_FAULT_SHORT,df_index("fd_stream_fault_exit"),ENODATA);break;
+    case 41:df_refusal(DF_FAULT_MAP,0,ENODATA);break;
+    case 42:df_refusal(DF_FAULT_MAP_MISSING,0,ENODATA);break;
+    case 43:
+        for(unsigned i=0;i<2;i++) {
+            df_reset(DF_OK,0);struct ap_session *s=NULL;
+            assert(!ap_open("fixture-object-only",DF_PROVIDER,&s) && s->ready);
+            assert(!stream_copy_observer_ready(s));
+            df_bad_at=df_index(i?"fd_stream_fault_exit":"fd_stream_fault_enter");df_fault=DF_FAULT_MISS;
+            assert(stream_copy_observer_ready(s)==-1 && errno==ENODATA);
+            df_closed(s,0);
+        }
+        break;
     default:df_unexpected("selector index");
     }
     df_cases++;printf("driver-ftrace fixture case passed: %s\n",df_selectors[n]);
@@ -670,7 +713,7 @@ int main(int argc,char **argv) {
     }
     if(argc==1 || !strcmp(argv[1],"all")) {
         for(unsigned i=0;i<DF_COUNT(df_selectors);i++)df_case(i);
-        assert(df_cases==35 && df_partial_prefixes==47);
+        assert(df_cases==44 && df_partial_prefixes==49);
     } else {
         bool found=false;
         for(unsigned i=0;i<DF_COUNT(df_selectors);i++)if(!strcmp(argv[1],df_selectors[i])) {df_case(i);found=true;break;}

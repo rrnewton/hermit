@@ -810,6 +810,10 @@ impl Capture {
 }
 
 #[cfg(test)]
+#[path = "../../../hermit-cli/network-provider/stream-copy-rust-bridge.rs"]
+mod producer_bridge;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::network_runtime::accepted_provider_ffi as ffi;

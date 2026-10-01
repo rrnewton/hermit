@@ -315,6 +315,14 @@ fn run() -> Result<()> {
     ensure!(!grouped_build || accepted, "nonclassic topology requires accepted component");
     ensure!(!ftrace || grouped_build, "ftrace topology requires compatibility coverage");
     let mut names = contract.source_files.clone();
+    // Historical contract fixtures remain byte-identical. Their compiled
+    // implementation now includes these shared bodies; bind the extra inputs
+    // even when producing the separately named legacy topology.
+    if accepted && !ftrace {
+        names.extend(["stream-copy-custody.inc", "stream-copy-problem.inc",
+            "stream-copy-unit-enter.inc", "stream-copy-emit.inc",
+            "stream-copy-unit-exit.inc"].map(str::to_owned));
+    }
     names.extend([
         contract_name,
         "package.rs".to_owned(),
