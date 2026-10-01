@@ -164,6 +164,8 @@ An enabled `verify` cell is green only when its typed report records canonical
 strictness, log comparison, positive INFO counts on both runs, bitwise parity,
 and a matched verdict. Output-only, stripped, empty-log, malformed, or
 contradictory reports are infrastructure errors rather than product results.
+The one exception is a cell that declares `comparator: stripped` (below): it
+requires a stripped report instead, and is never L2.
 
 A `verify` guest on any backend except dbt finds its home, XDG configuration
 and fixture directories at `/tmp/e2e/home`, `/tmp/e2e/xdg-config` and

@@ -5726,6 +5726,15 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             "{id}: {mode} declares hermit_args, env or comparator, which only a verify mode accepts"
         ));
     }
+    // Each flag at most once: a repeated or contradictory value-taking flag
+    // would also repeat a relaxation identity, which the scorecard refuses.
+    let mut seen_flags = BTreeSet::new();
+    for arg in &recipe.hermit_args {
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if !seen_flags.insert(flag) {
+            return Err(format!("{id}: hermit_args repeats `{flag}`"));
+        }
+    }
     for arg in &recipe.hermit_args {
         let allowed = ALLOWED_HERMIT_ARGS
             .iter()
@@ -6447,6 +6456,26 @@ mod tests {
                 "is not one of",
             );
         }
+        refused(
+            &|r| {
+                r.hermit_args = vec![
+                    "--no-virtualize-cpuid".into(),
+                    "--no-virtualize-cpuid".into(),
+                ]
+            },
+            "verify",
+            "repeats `--no-virtualize-cpuid`",
+        );
+        refused(
+            &|r| {
+                r.hermit_args = vec![
+                    "--max-timeslice=1".into(),
+                    "--max-timeslice=disabled".into(),
+                ]
+            },
+            "verify",
+            "repeats `--max-timeslice`",
+        );
         refused(
             &|r| r.hermit_args_reason = None,
             "verify",
