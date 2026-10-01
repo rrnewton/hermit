@@ -132,6 +132,15 @@ pub struct Config {
     #[clap(skip)]
     pub backend_reports_physical_process_exits: bool,
 
+    /// The execution backend's kernel raises a child's exit signal (`SIGCHLD`) itself and
+    /// reports it to the Tool's signal hook before delivering it, so Detcore must not synthesize
+    /// one at a group exit. Detcore then grants no turn while a process's final physical exit is
+    /// pending, which requires `backend_reports_physical_process_exits`: the signal is pending in
+    /// the parent before anything else runs, whether or not the parent waits.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_delivers_child_exit_signals: bool,
+
     // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
     /// The execution backend completes forked process children before returning to the parent.
     #[serde(default)]
@@ -799,6 +808,11 @@ impl Config {
                 .is_none_or(|timeslice| u64::from(timeslice) >= minimum_max_timeslice),
             "max_timeslice must be at least one RCB ({} virtual nanoseconds)",
             minimum_max_timeslice
+        );
+        assert!(
+            !self.backend_delivers_child_exit_signals
+                || self.backend_reports_physical_process_exits,
+            "backend_delivers_child_exit_signals requires backend_reports_physical_process_exits"
         );
     }
 
@@ -1495,6 +1509,7 @@ mod tests {
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
         assert!(!config.backend_reports_physical_process_exits);
+        assert!(!config.backend_delivers_child_exit_signals);
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
         assert!(config.backend_tracks_process_children);

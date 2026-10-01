@@ -709,6 +709,10 @@ pub struct Scheduler {
     /// Whether the backend will report final physical process exits after logical cleanup.
     backend_reports_physical_process_exits: bool,
 
+    /// Whether the backend's kernel raises child-exit signals itself and reports them through
+    /// the signal hook. See [`Config::backend_delivers_child_exit_signals`].
+    backend_delivers_child_exit_signals: bool,
+
     /// SaBRe process leaders whose tool exit hook ran before the ptrace supervisor observed the
     /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
     /// overtaking a child exit that is not physically waitable yet.
@@ -1987,6 +1991,7 @@ impl Scheduler {
             exec_teardowns: Default::default(),
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
+            backend_delivers_child_exit_signals: cfg.backend_delivers_child_exit_signals,
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
@@ -2083,7 +2088,9 @@ impl Scheduler {
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
-        !self.physical_thread_pidfds.contains_key(&parent)
+        // A backend whose kernel raises the signal itself would make the parent see two.
+        !self.backend_delivers_child_exit_signals
+            && !self.physical_thread_pidfds.contains_key(&parent)
     }
 
     /// Handle a happens-before checkpoint issued by `dettid` after its `count`th
@@ -3126,6 +3133,16 @@ impl Scheduler {
             // Do not let runnable siblings advance while the backend catches
             // up to physical waitability; completion admits the waiter through
             // the next deterministic drain.
+            yield_host_thread();
+            return Err(SkipTurn);
+        }
+        if self.backend_delivers_child_exit_signals
+            && !self.pending_physical_process_exits.is_empty()
+        {
+            // The backend's kernel sets the parent's child-exit signal pending
+            // before it reports the exit. Grant no turn until then, waiting or
+            // not, so whether the signal is pending at the parent's next
+            // delivery point does not depend on host timing.
             yield_host_thread();
             return Err(SkipTurn);
         }
@@ -6214,6 +6231,17 @@ mod test {
             .register_physical_thread(parent, mm, physical_pid, physical_tid)
             .expect("PIDFD_THREAD must bind the current test thread");
         assert!(!scheduler.should_synthesize_child_exit_signal(parent));
+    }
+
+    #[test]
+    fn backend_child_exit_signals_are_not_synthesized() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            backend_delivers_child_exit_signals: true,
+            ..Config::default()
+        };
+        let scheduler = Scheduler::new(&config);
+        assert!(!scheduler.should_synthesize_child_exit_signal(DetTid::from_raw(37)));
     }
 
     #[test]
@@ -9379,6 +9407,24 @@ mod test {
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    #[test]
+    fn backend_child_exit_signals_hold_every_turn_until_the_exit_is_reported() {
+        let child = DetPid::from_raw(200);
+        for delivers in [false, true] {
+            let config = Config {
+                backend_reports_physical_process_exits: true,
+                backend_delivers_child_exit_signals: delivers,
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            assert!(scheduler.begin_physical_process_exit(child));
+            // No thread waits for the child, so only the child-exit signal barrier holds.
+            assert_eq!(scheduler.step2_drain_prefix().is_err(), delivers);
+            assert!(scheduler.complete_physical_process_exit(child));
+            assert!(scheduler.step2_drain_prefix().is_ok());
+        }
     }
 
     type LoopProbe = Box<dyn FnMut(SchedLoopPoint, &mut Scheduler)>;
