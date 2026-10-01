@@ -169,7 +169,11 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
 /// of `ldd` output in parentheses): 315 for `tests/c/host_identity.c` and for
 /// each image of `hermit-cli/tests/fixtures/clock_trajectory.c`; 401 for
 /// `python3` (5); 1,589 for `curl` (28); 3,588 for `gdb` (58); 4,752 for
-/// `qemu-system-x86_64` (72); 6,970 for `emacs` (95). Beyond a fixed cost the
+/// `qemu-system-x86_64` (72); 6,970 for `emacs` (95). The counts vary slightly
+/// with the environment: in another build directory the same commit measured
+/// 316 for `host_identity.c` and 318 for each `clock_trajectory.c` image,
+/// probably because the `/proc/self/maps` lines the runtime rereads name the
+/// mapped paths. Beyond a fixed cost the
 /// count grows faster than the number of libraries, because each reread of
 /// `/proc/self/maps` is longer: about 57 syscalls per `ldd` line for `curl` and
 /// 73 for `emacs`. So the margin below shrinks as images grow. The cap must
