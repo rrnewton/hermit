@@ -5839,7 +5839,9 @@ fn repeated_result_description(
 /// FAILING. Only product failures decide those two. A repetition that produced
 /// no product verdict (infrastructure, prerequisite, no-result, mixed or
 /// missing) never makes a cell FLAKY; if it is the only non-pass, the cell is
-/// INCOMPLETE rather than CLEAN.
+/// INCOMPLETE rather than CLEAN. CLEAN also requires every repetition to have
+/// been observed with an intact result history: a pass whose retained
+/// evidence contradicts itself (`unknown_history_repetitions`) is not clean.
 fn flake_verdict(counts: RepeatedOutcomeCounts) -> &'static str {
     let passes_after_retry = counts.terminal_passes.saturating_sub(counts.clean_passes);
     if counts.product_failures > 0 || passes_after_retry > 0 {
@@ -5850,7 +5852,10 @@ fn flake_verdict(counts: RepeatedOutcomeCounts) -> &'static str {
         }
     } else if counts.expected_repetitions > 0
         && counts.clean_passes == counts.expected_repetitions
+        && counts.observed_repetitions == counts.expected_repetitions
         && counts.retried_repetitions == 0
+        && counts.missing_repetitions == 0
+        && counts.unknown_history_repetitions == 0
     {
         "CLEAN"
     } else {
@@ -7783,9 +7788,11 @@ fn summarize(
         );
         println!();
         println!(
-            "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Result | Verdict |"
+            "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
         );
-        println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |");
+        println!(
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
+        );
         let mut verdicts = BTreeMap::<&'static str, usize>::new();
         for cell in &metadata.cells {
             let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
@@ -7807,13 +7814,15 @@ fn summarize(
             let verdict = flake_verdict(counts);
             *verdicts.entry(verdict).or_default() += 1;
             println!(
-                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {result} | {verdict} |",
+                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
                 display_id(cell),
                 counts.product_failures,
                 counts.infrastructure_failures,
                 counts.prerequisite_failures,
                 counts.no_results,
                 counts.mixed_repetitions + counts.missing_repetitions,
+                counts.unknown_history_repetitions,
+                classify_pressure_sample(counts).as_str(),
             );
             repeated_cells.push(repeated_cell_summary(cell, counts, result));
         }
@@ -10227,6 +10236,27 @@ fn flake_verdict_self_test() -> Result<(), String> {
             "FLAKY",
         ),
         (RepeatedOutcomeCounts::default(), "INCOMPLETE"),
+        // Ten passes whose retained evidence contradicts itself are not clean.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 10,
+                terminal_passes: 10,
+                unknown_history_repetitions: 10,
+                ..base
+            },
+            "INCOMPLETE",
+        ),
+        // A repetition with no retained evidence at all is not clean either.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 10,
+                terminal_passes: 10,
+                observed_repetitions: 9,
+                missing_repetitions: 1,
+                ..base
+            },
+            "INCOMPLETE",
+        ),
     ];
     for (counts, expected) in cases {
         let observed = flake_verdict(counts);
