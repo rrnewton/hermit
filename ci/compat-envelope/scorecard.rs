@@ -620,24 +620,31 @@ impl ObservationProvenance {
 /// than a second source of truth that can drift from the first.
 ///
 /// The WORDS are the ones `ci-hub/series/series.py`'s `measurement_state`
-/// uses, but the DEFINITIONS NO LONGER AGREE on one kind of evidence: a
-/// retired ptrace-rerun `parity-failure`. As of dev-hermit ca0cf3785e3f,
-/// series.py projects `("parity-failure", "product_failure")` to the outcome
-/// `diverged` (series.py:4678), and its `measurement_state` (series.py:720)
-/// calls a row with that outcome diverged. [`derive_measurement`] does not
-/// count a parity failure as a determinism divergence
+/// uses, but the DEFINITIONS DO NOT AGREE. First, on a retired ptrace-rerun
+/// `parity-failure`: as of dev-hermit ca0cf3785e3f, series.py projects
+/// `("parity-failure", "product_failure")` to the outcome `diverged`
+/// (series.py:4678), and its `measurement_state` (series.py:720) calls a row
+/// with that outcome diverged. [`derive_measurement`] does not count a parity
+/// failure as a determinism divergence
 /// (<https://github.com/rrnewton/hermit/issues/3301>), so a cell whose only
 /// failures are parity failures is `measured-and-passed` or
-/// `measured-no-verdict` here and `diverged` there. On every other kind of
-/// evidence the two agree. Until series.py changes, do not treat its state
-/// as a second copy of this one.
+/// `measured-no-verdict` here and `diverged` there. Second, on how results
+/// combine when neither side sees a divergence: here one pass makes a cell
+/// `measured-and-passed`, while `measurement_state` requires every row to be
+/// `passed` (series.py:730) and otherwise says `measured-no-verdict`. Until
+/// series.py changes, do not treat its state as a second copy of this one.
+/// Aligning the two definitions is tracked in
+/// <https://github.com/rrnewton/dev-hermit/issues/469>.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MeasurementState {
     /// No observation has been imported. NOT the same as never run, and NOT the
     /// same as passing.
     NeverMeasured,
-    /// Measured, and every recorded result was a pass.
+    /// Measured: at least one recorded result was a pass, and none was a
+    /// determinism or replay failure. Non-verdicts such as a crash, timeout or
+    /// retired ptrace-rerun parity failure may sit beside the pass (see
+    /// [`derive_measurement`]).
     MeasuredAndPassed,
     /// Measured, nothing passed, but nothing diverged either -- every result was
     /// a crash, timeout or OOM, or a retired ptrace-rerun parity failure (see
