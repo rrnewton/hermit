@@ -352,7 +352,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // accepts_the_verify_extensions_in_a_verify_mode,
     // rejects_the_verify_extensions_outside_verify, accepts_test_labels and
     // rejects_a_misspelled_labels_key retain all 736 prior identities.
-    ("test.regular_crates", 746),
+    // The validation inventory's four validation_inventory::tests
+    // (labels_select_the_closure_and_groups_follow_dependency_order,
+    // a_shared_paragraph_is_printed_once_per_group,
+    // ascii_prepends_the_group_graph, arguments_are_parsed_strictly) retain
+    // all 746 prior identities.
+    ("test.regular_crates", 750),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -503,7 +508,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 746),
+    ("test.regular_crates_on_host", 750),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -679,6 +684,7 @@ impl StaticStepSpec {
             hint: self.hint.materialize(),
             networkonly: self.networkonly,
             engine_only: self.engine_only,
+            delegated_children: false,
             timeout: self.timeout,
             cpu_timeout: self.cpu_timeout,
             jobs_flag: self.jobs_flag.map(Into::into),

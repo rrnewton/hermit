@@ -1218,7 +1218,11 @@ fn usage() -> &'static str {
      --probe-host-capability <name> reports this machine's verdict for one\n\
      capability as PRESENT|ABSENT plus the observation behind it, and exits.\n\
      It runs no gate. target/debug/test-harness calls it so a withheld manifest CELL\n\
-     and a withheld DAG node are decided by the same probe."
+     and a withheld DAG node are decided by the same probe.\n\
+     \n\
+     --inventory [--labels LABEL[,LABEL...]] [--ascii], given first, prints every\n\
+     node of ci/dag/validate.json with its title and paragraph and exits; see\n\
+     `--inventory --help`. It runs no gate."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
@@ -6019,6 +6023,7 @@ fn super_plan_bracket() -> Result<(), String> {
             hint: Default::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,
@@ -12558,6 +12563,7 @@ fn step_with_caps(
         },
         networkonly: false,
         engine_only: false,
+        delegated_children: false,
         timeout,
         cpu_timeout,
         jobs_flag: None,
@@ -13793,6 +13799,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         hint: dagrun::model::ResourceHint::default(),
         networkonly: false,
         engine_only: false,
+        delegated_children: false,
         timeout: 10,
         cpu_timeout: 10,
         jobs_flag: None,
@@ -22733,6 +22740,43 @@ fn publish_validation_service_result_or_refuse(
     }
 }
 
+/// `--inventory [--labels L[,L]] [--ascii]`: print what the committed graph
+/// runs, node by node, and exit. Like the capability probe it is a question
+/// about the repository, not a validation run: no lock, log, plan or gate.
+fn inventory_query() -> Option<u8> {
+    let argv = std::env::args().skip(1).collect::<Vec<_>>();
+    if argv.first().map(String::as_str) != Some("--inventory") {
+        return None;
+    }
+    use hermit_manifest_plan::validation_inventory;
+    if argv[1..].iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{}", validation_inventory::USAGE);
+        return Some(0);
+    }
+    let options = match validation_inventory::parse(&argv[1..]) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("validate: {error}\n{}", validation_inventory::USAGE);
+            return Some(2);
+        }
+    };
+    let path = repo_root().join("ci/dag/validate.json");
+    let rendered = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        .and_then(|text| dagrun::io::dag_from_json(&text).map_err(|e| e.to_string()))
+        .and_then(|cfg| validation_inventory::render(&cfg, &options));
+    match rendered {
+        Ok(text) => {
+            print!("{text}");
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("validate: inventory: {error}");
+            Some(1)
+        }
+    }
+}
+
 /// `--probe-host-capability <name>`: report THIS machine's verdict for one
 /// capability and exit, printing `PRESENT\t<evidence>` or `ABSENT\t<evidence>`.
 ///
@@ -23059,6 +23103,9 @@ fn main() -> ExitCode {
     // Answered before anything else because it is a question ABOUT THE MACHINE,
     // not a validation run: no handlers, no log, no plan, no gate.
     if let Some(code) = probe_host_capability_query() {
+        return ExitCode::from(code);
+    }
+    if let Some(code) = inventory_query() {
         return ExitCode::from(code);
     }
     // This belongs to the one process admitted by ci-hub. Nested validator

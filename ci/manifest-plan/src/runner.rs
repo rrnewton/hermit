@@ -5726,8 +5726,9 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             "{id}: {mode} declares hermit_args, env or comparator, which only a verify mode accepts"
         ));
     }
-    // Each flag at most once: a repeated or contradictory value-taking flag
-    // would also repeat a relaxation identity, which the scorecard refuses.
+    // Each flag at most once. An exact repeat would repeat a relaxation
+    // identity, which the scorecard refuses; two values for one flag would
+    // leave the effective configuration to Hermit's argument order.
     let mut seen_flags = BTreeSet::new();
     for arg in &recipe.hermit_args {
         let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);

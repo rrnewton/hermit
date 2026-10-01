@@ -12,6 +12,25 @@ can also box each node for memory limits and full process-subtree teardown.
   `hosted-privileged` labels; dagrun selects the requested label and its
   dependency ancestry without rewriting the graph.
 
+Print what the graph runs, node by node, with each node's title and
+paragraph:
+
+```sh
+./scripts/validate.rs --inventory                    # the whole superset
+./scripts/validate.rs --inventory --labels full      # what `full` runs
+./scripts/validate.rs --inventory --labels full --ascii   # plus the group graph
+```
+
+The title and paragraph are each node's `desc` and `description`, written once
+where the node is defined (`ci/manifest-plan/src/validation_dag_static.rs` for
+authored nodes, the generating code for generated ones) and copied into this
+file by the generator; the inventory reads only this file. `--labels` selects
+exactly what `dagrun run --labels` would run. A paragraph shared by a family of
+generated nodes is printed once per group. Groups appear in order of their
+earliest node's dependency layer, nodes within a group in dependency order. The same group view is available as
+a graph image with `dagrun dot --dag ci/dag/validate.json --labels full
+--group-by group | dot -Tpng`.
+
 Run a lane with the wrapper:
 
 ```sh

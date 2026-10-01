@@ -4975,6 +4975,7 @@ fn dbt_matrix_step(
         hint: envelope.hint.clone(),
         networkonly: envelope.networkonly,
         engine_only: envelope.engine_only,
+        delegated_children: false,
         timeout: envelope.timeout,
         cpu_timeout: envelope.cpu_timeout,
         jobs_flag: envelope.jobs_flag.clone(),

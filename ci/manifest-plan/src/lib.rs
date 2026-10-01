@@ -28,3 +28,4 @@ pub mod stress_series;
 pub mod timeouts;
 pub mod validation_dag;
 mod validation_dag_static;
+pub mod validation_inventory;
