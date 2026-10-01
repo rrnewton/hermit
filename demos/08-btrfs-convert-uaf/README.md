@@ -67,6 +67,21 @@ crashes it again identically, and leaves the fixed build clean. It records that
 seed in `ignored/demo08-btrfs/.crash-seed`. Running it again only rechecks the
 recorded seed.
 
+A run that Hermit refuses with exit status 122 (the overshoot refusal described
+under [What to notice](#what-to-notice)) did not test its seed, so the seed
+search does not count it as a seed that failed to crash. It runs that seed
+again, up to `DEMO08_REFUSAL_RETRIES` more times (default 2, so 3 attempts in
+all); this applies to the first run of a seed, its repeat, and the fixed
+build's run. The one exception is a refused fixed-build run that printed a
+use-after-free report: that report stops the search as a regression, as it
+would with any other exit status. When a refused attempt is followed by another
+one, its output is kept in a file ending in `-refused-1.out`, `-refused-2.out`,
+and so on, and every refused attempt gets a row in `calibration.tsv` whose
+`qualifies` column says `refused`. A seed that is refused on every attempt is
+reported as refused and skipped. The summary line counts such seeds as
+`refused=` and all refused attempts as `refused_runs=`, and the script fails,
+saying that no seed was tested, if every seed it tried was refused.
+
 To run one chaos trial yourself, with the seed that `prepare-assets.sh`
 recorded (the tool rewrites its input, so give it a fresh copy each time):
 
@@ -220,23 +235,29 @@ one whose environment carried 3,000 extra bytes.
   00:19 UTC on 2026-10-01: one seed search and six rechecks by
   `prepare-assets.sh`, 11 runs of `run.sh`, and 8 single trials. One recheck
   and one `run.sh` run had 3,000 extra bytes in their environment.
-- Those 44 runs were on a 316-thread host with a load average of 10 to 20,
-  lightly loaded for its size (see the timing notes below). On a shared or
+- The host's load was not recorded during those 44 runs. Three later runs of
+  `run.sh` on 2026-10-01, at 19:59, 20:10, and 20:52 UTC, all passed with seed
+  7 on the same 316-thread host. They used Hermit built from hermit main
+  `1139c661ede3` plus commits that change no Hermit source, took 9.1, 9.3, and
+  8.9 seconds, and the host's 1-minute load average, read from `/proc/loadavg`
+  at the start and end of each run, was between 18.18 and 38.72. On a shared or
   heavily loaded machine the crash may not reproduce reliably, even with the
   same build, seed, and command line. Chaos mode places each thread switch by
   counting the CPU's retired branches. This demo's command does not pass
   `--imprecise-timers`, so Hermit uses precise timers: it arms the counter's
-  interrupt a safety margin of branches early and single-steps the rest of
-  the way to the exact switch point. If the interrupt arrives later than that
+  interrupt a safety margin of branches early and single-steps the rest of the
+  way to the exact switch point. If the interrupt arrives later than that
   margin, which is more likely under heavy host load, Reverie prints a line
   starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run instead of
   treating it as deterministic: it prints a line starting with
   `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=` and
-  exits with status 122, whether or not the program crashed. `run.sh` then
-  reports rc=122 instead of the expected crash and exits 1. It saves each
-  Hermit run's standard error with its output in its artifacts directory,
-  `target/demos/08-btrfs-convert-uaf/` by default, so when step 2 reports
-  rc=122, look in `chaos-buggy.out` for both lines.
+  exits with status 122, whether or not the program crashed. Steps 2, 3, and 4
+  then report rc=122 instead of the result they expected, add a line that
+  begins `rc=122 means Hermit refused the run` and names the file to look in,
+  and exit 1. `run.sh` saves each Hermit run's standard error with its output
+  in its artifacts directory, `target/demos/08-btrfs-convert-uaf/` by default.
+  Both lines are in `chaos-buggy.out` when step 2 reports rc=122, in
+  `chaos-fixed.out` for step 3, and in `chaos-buggy-replay.out` for step 4.
 - The program no longer reads the mount table. Under Hermit,
   `/proc/self/mounts` lists mounts that come from the host at the time of the
   run, and Hermit passes it through unchanged
@@ -331,11 +352,13 @@ Controls (environment variables):
 | `DEMO08_TIMEOUT` | `90` | Seconds allowed per run. `prepare-assets.sh` applies the same limit, so it only records a seed that fits. |
 | `DEMO08_REQUIRE_ASSETS` | `0` | Set to `1` to fail instead of skipping when the assets are missing. |
 | `DEMO08_CALIBRATION_SEEDS` | `64` | How many seeds `prepare-assets.sh` tries. |
+| `DEMO08_REFUSAL_RETRIES` | `2` | How many more times `prepare-assets.sh` runs a seed after Hermit refuses a run with exit status 122. A seed refused on every attempt is reported as refused, not as one that did not crash. |
 | `DEMO08_BUILD_ROOT`, `DEMO08_BUILD_JOBS`, `DEMO08_BTRFS_REPO` | `ignored/demo08-build`, all CPUs, the GitHub URL | Where and how the btrfs-progs build runs. |
 
 How long it takes, measured on 2026-09-30 and 2026-10-01 (UTC) with Hermit
-`dc92644f96f4` on a 316-thread AMD EPYC 9D85 host with a load average of 10 to
-20:
+`dc92644f96f4` on a 316-thread AMD EPYC 9D85 host. The host's load was not
+recorded during these measurements; the load during three later runs of
+`run.sh` is given under [What to notice](#what-to-notice).
 
 | Step | Time |
 | --- | --- |
