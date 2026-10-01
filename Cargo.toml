@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "common/cli-refusal-fixture",
   "common/test-allocator",
   "common/test-workdir",
   "ci/manifest-plan",

@@ -73,6 +73,8 @@ tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "
 uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 
 [dev-dependencies]
+# Cargo-only maintained fixture; never a production Hermit dependency.
+hermit-cli-refusal-fixture = { path = "../common/cli-refusal-fixture" }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"
