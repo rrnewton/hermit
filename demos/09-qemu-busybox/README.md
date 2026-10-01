@@ -67,10 +67,13 @@ hermit run --strict --epoch=2026-01-01T00:00:00Z -- demos/09-qemu-busybox/boot_q
 Observed on 2026-10-01 in one run of the `VERIFY=1` command above, with the
 cached kernel, QEMU 10.1.2, `/usr/sbin/busybox` from the `busybox-1.35.0-2.el9`
 package, and Hermit built from hermit main `1139c661ede3` plus commits that
-change no Hermit source, on a 316-thread AMD EPYC 9D85 host. Every number and
-hash in this section comes from that one run, which took 335 seconds. It
-printed the following, apart from Hermit's comparison summary on standard
-error, which is shown after it:
+change no Hermit source, on a 316-thread AMD EPYC 9D85 host. That run took
+335 seconds. Every number and hash in the two example blocks below, in the
+note on what the first one leaves out, and in the paragraph on its
+`verify.json` comes from it. The paragraph on the by-hand launcher at the end
+of this section describes a different run, made on 2026-09-30. The run printed
+the following, apart from Hermit's comparison summary on standard error, which
+is shown after it:
 
 ```text
 kernel ready: .../target/qemu-busybox/bzImage (cached)
@@ -174,7 +177,9 @@ Standard error and standard output reach the terminal separately, so Hermit's
 last two summary lines can land inside the console output. In one earlier run
 `:: comparison=BitwiseInfoV1 relaxations=none` came out in the middle of the
 kernel's `Calibrating delay loop` message; where the lines land varies from run
-to run. The same run's `verify.json` reported `"verdict": "matched"` and
+to run.
+
+The same run's `verify.json` reported `"verdict": "matched"` and
 `"bitwise_parity": true`, `compared_log_messages` of 714,635 on both sides, and
 identical values for its two boots, `runtime.run1` and `runtime.run2`:
 `scheduler_turns` 40,383, `syscalls` 257,606, and `virtual_nanoseconds`
@@ -303,15 +308,19 @@ README, on 2026-09-30:
   [What you will see](#what-you-will-see) took 40,383 turns; that count
   depends on the checkout's path and the Hermit build.
 
-On 2026-10-01 the default margin did produce late interrupts on the same host.
-A `VERIFY=1` run started six and a half minutes before the one shown under
-[What you will see](#what-you-will-see) printed two `HERMIT_SKID_OVERSHOOT`
-lines, its two boots' event logs differed, and Hermit refused the result with
-exit status 122, so `run.sh` failed; Hermit's `HERMIT_POLICY_REFUSAL` line
-counted two late interrupts. The next run, the one shown, passed. The host's
-1-minute load average, read from `/proc/loadavg`, was 49.06 when the refused
-run started and 41.02 when it ended, and 40.16 and 26.86 for the run that
-passed.
+On 2026-10-01 the default margin did produce a late interrupt on the same host.
+In a `VERIFY=1` run started six and a half minutes before the one shown under
+[What you will see](#what-you-will-see), one interrupt in the second boot
+arrived 864 branches past its target. Hermit reported that one interrupt twice:
+once on standard error, as a line starting `HERMIT_SKID_OVERSHOOT`, and once in
+the second boot's event log. Both reports give the same branch count,
+12,163,249,089, and the first boot's event log has no such report. Hermit
+counted 2 reports (`HERMIT_POLICY_REFUSAL class=policy-refusal
+cause=skid-overshoot count=2`), the two boots' event logs differed, and Hermit
+refused the result with exit status 122, so `run.sh` failed. The next run, the
+one shown, passed. The host's 1-minute load average, read from `/proc/loadavg`,
+was 49.06 when the refused run started and 41.02 when it ended, and 40.16 and
+26.86 for the run that passed.
 
 So a run in which the default margin produces `HERMIT_SKID_OVERSHOOT` fails,
 and on a host where that happens often this demo is not known to work. Demo 9

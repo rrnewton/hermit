@@ -7,19 +7,20 @@
 # joined it, so task_deinit() could free(info) while the thread was still
 # reading it. Whether that happens depends only on the teardown interleaving,
 # which an ordinary run cannot choose. Hermit's chaos scheduler reaches the
-# crashing interleaving on specific seeds and, on a lightly loaded host,
-# reproduces it exactly.
+# crashing interleaving on specific seeds and reproduced the crash in every run
+# counted in README.md.
 #
 # The demo runs AddressSanitizer builds of two btrfs-convert variants: `buggy`
 # (before 73e211a7) and `fixed` (73e211a7). It reports what one native buggy run
 # showed, then shows that the chaos buggy run crashes on a known seed, the chaos
 # fixed run on the same seed is clean, and the crash reproduces byte-for-byte
-# when run again. That held on a lightly loaded host. If a performance-counter
-# interrupt arrives later than Hermit's safety margin, which heavy host load
-# makes more likely, Reverie prints a HERMIT_SKID_OVERSHOOT line and Hermit
-# refuses the run: it prints "HERMIT_POLICY_REFUSAL class=policy-refusal
-# cause=skid-overshoot count=N" and exits 122, so this script reports rc=122
-# instead of the expected crash. README.md explains this.
+# when run again. That held on the host described in README.md, which gives the
+# host's load where it was recorded. If a performance-counter interrupt arrives
+# later than Hermit's safety margin, which heavy host load makes more likely,
+# Reverie prints a HERMIT_SKID_OVERSHOOT line and Hermit refuses the run: it
+# prints "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot
+# count=N" and exits 122, so this script reports rc=122 instead of the expected
+# crash. README.md explains this.
 # prepare-assets.sh builds the binaries and the input image; WRITEUP.md tells
 # the story of the bug.
 
@@ -35,11 +36,11 @@ usage() {
 Usage: demos/08-btrfs-convert-uaf/run.sh
 
 Show a schedule-dependent btrfs-convert use-after-free that native execution
-cannot reproduce on demand and `hermit run --chaos` finds and, on a lightly
-loaded host, reproduces. Under heavy host load a late performance-counter
-interrupt makes Hermit refuse a run (HERMIT_POLICY_REFUSAL ...
-cause=skid-overshoot, exit 122), and this script then reports rc=122; see
-demos/08-btrfs-convert-uaf/README.md.
+cannot reproduce on demand and `hermit run --chaos` finds and reproduces; the
+README counts the runs in which it did and gives the host's load where it was
+recorded. Under heavy host load a late performance-counter interrupt makes
+Hermit refuse a run (HERMIT_POLICY_REFUSAL ... cause=skid-overshoot, exit 122),
+and this script then reports rc=122; see demos/08-btrfs-convert-uaf/README.md.
 
 Needs AddressSanitizer btrfs-convert binaries and a populated ext4 image, which
 demos/08-btrfs-convert-uaf/prepare-assets.sh builds:
@@ -196,7 +197,7 @@ echo
 # SUMMARY: the main thread finished and exited while the progress thread was
 # still reporting. The demo reports which outcome this run had and continues;
 # its point is that the chaos run below crashes on a chosen seed, which it did
-# every time on a lightly loaded host.
+# in every run counted in README.md.
 echo "--- Step 1: native buggy btrfs-convert ---"
 NATIVE_IMG="$ARTIFACTS/native-buggy.img"
 fresh_image "$NATIVE_IMG"

@@ -2,16 +2,18 @@
 
 This is the story behind [demo 8](README.md): a real, historical concurrency
 bug in btrfs-progs that an ordinary run cannot reproduce on demand, and that
-Hermit reproduced every time from a recorded seed on a lightly loaded host. On
-a shared or heavily loaded machine it may not reproduce reliably. Chaos mode
-places each thread switch by counting retired branches: Hermit arms the
-counter's interrupt a safety margin of branches early and single-steps the
-rest of the way to the exact switch point. If the interrupt arrives later than
-that margin, which is more likely under heavy host load, Reverie, the library
-Hermit uses to trace the program, prints a line starting with
-`HERMIT_SKID_OVERSHOOT` and Hermit refuses the run: it prints a line starting
-with `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot` and
-exits with status 122 instead of reporting the crash.
+Hermit reproduced with one seed, seed 7, in every run counted on one 316-thread
+host: all 44 runs of the demo's command, during which the host's load was not
+recorded, and three later runs of `run.sh`, with the 1-minute load average
+between 18.18 and 38.72 at their starts and ends. On a shared or heavily loaded
+machine it may not reproduce reliably. Chaos mode places each thread switch by
+counting retired branches: Hermit arms the counter's interrupt a safety margin
+of branches early and single-steps the rest of the way to the exact switch
+point. If the interrupt arrives later than that margin, which is more likely
+under heavy host load, Reverie, the library Hermit uses to trace the program,
+prints a line starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run:
+it prints a line starting with `HERMIT_POLICY_REFUSAL class=policy-refusal
+cause=skid-overshoot` and exits with status 122 instead of reporting the crash.
 
 ## The bug
 
@@ -177,9 +179,9 @@ bytes inside the 56-byte `task_info` that `task_init` allocated, after
   of 32 seeds gave a complete report.
 - **The fix holds on the same schedules.** The fixed build ran every seed
   without a use-after-free.
-- **A crash becomes a repeatable test case.** On a lightly loaded host, the
-  same seed on the same build and command line gave the same interleaving and
-  the same report.
+- **A crash becomes a repeatable test case.** On the 316-thread host used for
+  the demo, the same seed on the same build and command line gave the same
+  interleaving and the same report; the last limit below gives the host's load.
 
 Three limits are worth knowing:
 
