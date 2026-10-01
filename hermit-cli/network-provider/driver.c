@@ -1052,6 +1052,18 @@ int ap_identifiers(struct ap_session *s,struct ap_program_id *out,u32 capacity,u
 int ap_close(struct ap_session *s) {
     if(!s)return 0;
     int failed=0;
+#ifdef AP_FTRACE_PROVIDER
+    /* Terminal only: active metadata readers retain their load FDs until here.
+     * Drop those references before detaching links, while all original links,
+     * maps and the ring remain owned. Failed load/attach may leave programs
+     * without FDs or without links; unload only still-owned load handles.
+     * This ordering is not a kernel object-absence or deferred-free barrier. */
+    if(s->object) {
+        struct bpf_program *p=NULL;
+        while((p=bpf_object__next_program(s->object,p)))
+            if(bpf_program__fd(p)>=0)bpf_program__unload(p);
+    }
+#endif
     for(u32 i=s->links_count;i>0;i--)if(bpf_link__destroy(s->links[i-1]))failed=1;
     if(s->stream_copy_ring)ring_buffer__free(s->stream_copy_ring);
     for(u32 i=0;i<AP_COMMANDS;i++)free(s->pending[i].stream_copy.records);

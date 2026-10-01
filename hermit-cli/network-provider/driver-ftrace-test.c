@@ -28,7 +28,8 @@ enum df_fault {
     DF_MISSING_REQUIRED_MAP, DF_MISSING_MAP, DF_EXTRA_MAP, DF_DUP_MAP,
     DF_ATTACH_FAIL, DF_LOAD_FAIL, DF_CONFIG_FAIL, DF_RING_FAIL, DF_READ_LINK,
     DF_ANCHOR_FAIL, DF_WRONG_PROGRAM_KIND, DF_LEGACY_PROGRAM,
-    DF_FAULT_TARGET, DF_FAULT_MISS, DF_FAULT_SHORT, DF_FAULT_MAP, DF_FAULT_MAP_MISSING
+    DF_FAULT_TARGET, DF_FAULT_MISS, DF_FAULT_SHORT, DF_FAULT_MAP, DF_FAULT_MAP_MISSING,
+    DF_OPEN_FAIL
 };
 static enum df_fault df_fault;
 static unsigned df_bad_at;
@@ -58,6 +59,8 @@ static unsigned df_file_opens,df_file_closes,df_image_opens,df_page_queries,df_b
 static unsigned df_anchor_calls,df_owner_closes,df_info_queries,df_cases;
 static unsigned df_destroy_order[AP_LINKS];
 static int df_destroy_failure;
+static bool df_terminal;
+static unsigned df_terminal_unloads;
 static struct ap_stream_fault_state dm_fault;
 static unsigned dm_fault_reads;
 static bool dm_unstable,dm_info_short,dm_info_error;
@@ -267,6 +270,7 @@ long libbpf_get_error(const void *p) {
 }
 struct bpf_object *bpf_object__open_file(const char *path,const void *opts) {
     assert(!strcmp(path,"fixture-object-only") && !opts && !df_object.open);
+    if(df_fault==DF_OPEN_FAIL)return (struct bpf_object *)(intptr_t)-EACCES;
     df_object.open=true;return &df_object;
 }
 int bpf_object__load(struct bpf_object *o) {
@@ -276,6 +280,8 @@ int bpf_object__load(struct bpf_object *o) {
 }
 void bpf_object__close(struct bpf_object *o) {
     assert(o==&df_object && o->open);
+    assert(df_terminal && df_destroyed==df_attached && !df_ring.alive);
+    for(unsigned i=0;i<o->programs;i++)assert(df_programs[i].fd<0);
     for(unsigned i=0;i<o->programs;i++)if(df_programs[i].fd>=0) {
         df_programs[i].fd=-1;df_program_closes++;
     }
@@ -299,8 +305,19 @@ int bpf_program__fd(const struct bpf_program *p) {return p->fd;}
 int bpf_map__fd(const struct bpf_map *p) {return p->fd;}
 int bpf_link__fd(const struct bpf_link *p) {assert(p->alive);return p->fd;}
 void bpf_program__unload(struct bpf_program *p) {
-    assert(p->fd>=0 && !p->unloaded && df_links[p->at].alive);
-    assert(df_session.link_identity[p->at].program_id==p->id);
+    if(df_terminal) {
+        /* Only the actual ap_close caller enters this modeled terminal phase.
+         * No link, ring or map may have been released yet. An unlinked program
+         * is legitimate only here, after failed load/partial attachment. */
+        assert(p->fd>=0 && !p->unloaded && df_object.open);
+        assert(!df_destroyed && !df_ring_closes && !df_object_closes);
+        for(unsigned i=0;i<df_attached;i++)assert(df_links[i].alive);
+        for(unsigned i=0;i<df_object.maps;i++)assert(df_maps[i].fd>=0);
+        df_terminal_unloads++;
+    } else {
+        assert(p->fd>=0 && !p->unloaded && df_links[p->at].alive);
+        assert(df_session.link_identity[p->at].program_id==p->id);
+    }
     p->fd=-1;p->unloaded=true;df_unloads++;
 }
 int bpf_object__find_map_fd_by_name(const struct bpf_object *o,const char *name) {
@@ -352,6 +369,10 @@ struct bpf_link *bpf_program__attach_kprobe_opts(const struct bpf_program *p,con
 }
 int bpf_link__destroy(struct bpf_link *l) {
     assert(l->alive && df_destroyed<df_attached);
+    assert(df_terminal);
+    for(unsigned i=0;i<df_object.programs;i++)assert(df_programs[i].fd<0);
+    assert(df_object.open && !df_ring_closes && !df_object_closes);
+    for(unsigned i=0;i<df_object.maps;i++)assert(df_maps[i].fd>=0);
     df_destroy_order[df_destroyed++]=l->at;l->alive=false;l->fd=-1;
     if(df_destroy_failure==(int)l->at) {errno=EUCLEAN;return -1;}
     return 0;
@@ -462,6 +483,7 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
 
 static void df_reset(enum df_fault fault,unsigned at) {
     assert(!df_session_alive && !df_object.open && !df_ring.alive && !df_btf.alive && !df_file.alive && !df_owner_alive);
+    assert(!df_terminal);df_terminal_unloads=0;
     df_fault=fault;df_bad_at=at;df_destroy_failure=-1;
     df_attached=df_attach_calls=df_unloads=df_destroyed=df_map_closes=0;
     df_program_closes=df_object_closes=df_ring_closes=df_updates=df_lookups=0;
@@ -504,10 +526,15 @@ static void df_reset(enum df_fault fault,unsigned at) {
     if(fault==DF_LEGACY_PROGRAM)df_programs[at].name="fd_stream_copy_enter";
     errno=0;
 }
+static int df_terminal_close(struct ap_session *s) {
+    assert(!df_terminal);df_terminal=true;
+    int result=ap_close(s);
+    df_terminal=false;return result;
+}
 static void df_closed(struct ap_session *s,int expected_close) {
     unsigned attached=df_attached,programs=df_object.programs,maps=df_object.maps;
     bool object=df_object.open,ring=df_ring.alive;
-    assert(ap_close(s)==expected_close);
+    assert(df_terminal_close(s)==expected_close);
     assert(df_destroyed==attached && df_ring_closes==(unsigned)ring && df_object_closes==(unsigned)object);
     if(object)assert(df_program_closes+df_unloads==programs && df_map_closes==maps);
     for(unsigned i=0;i<attached;i++)assert(df_destroy_order[i]==attached-1-i && !df_links[i].alive);
@@ -742,6 +769,85 @@ static int inherited_main(int argc,char **argv) {
     return 0;
 }
 
+/* Additional terminal-order controls. Keep the original 44 selectors and all
+ * 49 partial-attachment prefixes above intact. These premises model libbpf FD
+ * ownership only; neither an unload nor a destroy proves kernel map absence. */
+static void df_terminal_ready(bool destroy_failure) {
+    static const char *const retained[]={
+        "fd_original_read_entered","fd_so","fd_si","fd_s20e","fd_s20x",
+        "fd_file_retired","fd_exec_closed_file","fd_stream_copy_protocol_enter",
+        "fd_stream_copy_protocol_exit","fd_stream_fault_enter","fd_stream_fault_exit"
+    };
+    _Static_assert(DF_COUNT(retained)==11,"active Ftrace metadata readers");
+    df_reset(DF_OK,0);struct ap_session *s=NULL;
+    assert(!ap_open("fixture-object-only",DF_PROVIDER,&s) && s && s->ready);
+    assert(df_unloads==38 && df_terminal_unloads==0 && df_destroyed==0);
+    for(unsigned i=0;i<AP_PROGRAMS;i++) {
+        bool expected=false;
+        for(unsigned j=0;j<DF_COUNT(retained);j++)expected|=!strcmp(df_programs[i].name,retained[j]);
+        assert((df_programs[i].fd>=0)==expected);
+    }
+    df_inventory_exact(s); /* The active readers still use the original FDs. */
+    if(destroy_failure)df_destroy_failure=23;
+    df_closed(s,destroy_failure?-1:0);
+    assert(df_terminal_unloads==11 && df_unloads==49 && df_program_closes==0);
+    if(destroy_failure)assert(errno==EUCLEAN);
+}
+static void df_terminal_unattached(void) {
+    df_reset(DF_CONFIG_FAIL,0);struct ap_session *s=NULL;
+    int primary=ap_open("fixture-object-only",DF_PROVIDER,&s),saved=errno;
+    assert(primary==-1 && saved==EIO && s && !s->ready && df_object.loaded);
+    assert(!df_attached && !df_unloads && !df_ring.alive);
+    df_closed(s,0);
+    assert(df_terminal_unloads==49 && df_program_closes==0);
+    assert(primary==-1 && saved==EIO);
+}
+static void df_terminal_unloaded(void) {
+    for(unsigned mixed=0;mixed<2;mixed++) {
+        df_reset(DF_LOAD_FAIL,0);struct ap_session *s=NULL;
+        int primary=ap_open("fixture-object-only",DF_PROVIDER,&s),saved=errno;
+        assert(primary==-1 && saved==EIO && s && !s->ready && !df_object.loaded);
+        /* Explicit failed-load premises: first no load FDs, then a mixture of
+         * valid and absent FDs. Never manufacture a successful kernel load. */
+        unsigned remaining=0;
+        for(unsigned i=0;i<df_object.programs;i++) {
+            if(!mixed || i%2==0)df_programs[i].fd=-1;
+            else remaining++;
+        }
+        assert(df_terminal_close(s)==0);
+        assert(df_terminal_unloads==remaining && df_unloads==remaining && !df_program_closes);
+        assert(!df_destroyed && !df_ring_closes && df_map_closes==DF_MAPS && df_object_closes==1);
+        assert(!df_session_alive && !df_object.open && !df_ring.alive && !df_owner_alive);
+        assert(!df_btf.alive && !df_file.alive && df_file_opens==df_file_closes);
+        assert(primary==-1 && saved==EIO);
+    }
+}
+static void df_terminal_null(void) {
+    df_reset(DF_OPEN_FAIL,0);struct ap_session *s=NULL;
+    assert(ap_open(NULL,DF_PROVIDER,&s)==-1 && errno==EINVAL && !s);
+    df_closed(NULL,0);
+    int primary=ap_open("fixture-object-only",DF_PROVIDER,&s),saved=errno;
+    assert(primary==-1 && saved==EACCES && s && !s->object && !s->ready);
+    df_closed(s,0);
+    assert(!df_unloads && !df_terminal_unloads && !df_destroyed && !df_object_closes);
+    assert(primary==-1 && saved==EACCES);
+}
+static void df_terminal_cases(const char *selector) {
+    static const char *const names[]={"ready","unattached","unloaded","null","destroy-error"};
+    unsigned ran=0;
+    for(unsigned i=0;i<DF_COUNT(names);i++)if(!strcmp(selector,"all") || !strcmp(selector,names[i])) {
+        switch(i) {
+        case 0:df_terminal_ready(false);break;
+        case 1:df_terminal_unattached();break;
+        case 2:df_terminal_unloaded();break;
+        case 3:df_terminal_null();break;
+        case 4:df_terminal_ready(true);break;
+        }
+        ran++;printf("driver-ftrace terminal order case passed: %s\n",names[i]);
+    }
+    assert(ran==(!strcmp(selector,"all")?5U:1U));
+}
+
 #include "provider-open-observation.h"
 static int refuse(void) {errno=EPROTO;return -1;}
 #include "legacy-id-probe.h"
@@ -837,6 +943,13 @@ static void dm_gate(void) {
     CHECK(nr_open_timely(0,200,2000)==-1);
 }
 int main(int argc,char **argv) {
+    if(argc==1 || (argc==2 && !strcmp(argv[1],"all"))) {
+        int result=inherited_main(argc,argv);
+        assert(!result);df_terminal_cases("all");return result;
+    }
+    if(argc==2 && !strncmp(argv[1],"terminal-",9)) {
+        df_terminal_cases(argv[1]+9);return 0;
+    }
     if(argc==1 || (argc==2 && strncmp(argv[1],"owned-",6)))return inherited_main(argc,argv);
     assert(argc==2);const char *selector=argv[1]+6;
     if(!strcmp(selector,"old-id")) {
