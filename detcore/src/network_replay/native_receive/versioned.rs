@@ -1557,6 +1557,10 @@ impl NetworkReplayEngine {
             entry_cut,
             prerequisites,
             submitted: false,
+            timing_identity: None,
+            timing_claimed: false,
+            timing_normal_epoch: None,
+            timing_receipt: None,
         });
         Ok(lease)
     }
@@ -1611,6 +1615,14 @@ impl NetworkReplayEngine {
         pending: NativeTransmitPending,
         observed: &crate::network_runtime::native_peer::Observation,
     ) -> Result<(), NetworkReplayError> {
+        // Scheduler timing is not original-task return provenance, and an
+        // output-only V4 row cannot carry entry/completion/handback authority.
+        // Never silently fall back to the old writer after enrollment.
+        if pending.timing_claimed {
+            return Err(invalid(
+                "timed original send requires a versioned attempt writer",
+            ));
+        }
         let control = self.owned_socket_control(owner, lease)?;
         if !pending.submitted {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));

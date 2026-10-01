@@ -29,6 +29,7 @@ mod helper_copy;
 pub(crate) mod lifetime;
 mod native_receive;
 pub(crate) mod original_connect;
+pub(crate) mod send_timing;
 pub(crate) use native_receive::CompletedNoStore;
 pub(crate) use native_receive::CompletedRecordEmptyAttempt;
 pub(crate) use native_receive::ForegroundStore;
@@ -1479,6 +1480,10 @@ struct NativeTransmitPending {
     entry_cut: detcore_model::network_trace::NetworkReceiveEntryCutV4,
     prerequisites: Vec<detcore_model::network_trace::NetworkReleaseNodeIdV4>,
     submitted: bool,
+    timing_identity: Option<std::sync::Arc<()>>,
+    timing_claimed: bool,
+    timing_normal_epoch: Option<u64>,
+    timing_receipt: Option<std::sync::Arc<crate::scheduler::send_handback::SendHandbackReceipt>>,
 }
 
 impl SocketControlPhysical {

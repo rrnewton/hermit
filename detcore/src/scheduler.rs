@@ -16,6 +16,7 @@ mod parked_tests;
 pub(crate) mod real_timer;
 mod replayer;
 pub mod runqueue;
+pub(crate) mod send_handback;
 pub(crate) mod signal_control;
 pub mod timed_waiters;
 
@@ -628,6 +629,7 @@ pub struct Scheduler {
     /// Typed subset of `blocked.external_io_blockers`. Only live network
     /// capture introduces host elapsed time; replay and ordinary IO do not.
     network_capture_blockers: BTreeMap<DetTid, ExternalOpId>,
+    send_timing: send_handback::SendTimingBook,
 
     /// Last monotonic sample while no guest was runnable and network capture
     /// remained in the kernel. Closed before admitting runnable guest work.
@@ -3184,6 +3186,7 @@ impl Scheduler {
             #[cfg(test)]
             fd_read_test_cut: Default::default(),
             network_capture_blockers: BTreeMap::new(),
+            send_timing: Default::default(),
             network_capture_idle_since: None,
             vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
@@ -4151,6 +4154,7 @@ impl Scheduler {
 
     /// Remove entries from everywhere that non-runnable threads lurk.
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
+        self.cancel_send_timing(*dtid);
         self.blocked.timed_waiters.remove(*dtid);
         let external = self.blocked.external_io_blockers.remove(dtid);
         if let Some(capture) = self.network_capture_blockers.remove(dtid) {
@@ -5276,6 +5280,7 @@ impl Scheduler {
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
                     if let Some(capture) = scheduler.network_capture_blockers.remove(ready_dtid) {
                         assert_eq!(external, Some(capture));
+                        scheduler.observe_send_completion(*ready_dtid, capture);
                     }
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
                     assert!(
@@ -6753,6 +6758,7 @@ impl Scheduler {
                 self.committed_time = snapshot;
             }
         }
+        self.publish_send_clock();
     }
 
     /// Step 4: unblock enabled actions to actually, physically run.
@@ -6831,6 +6837,7 @@ impl Scheduler {
             &resp, &dtid
         );
         let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
+        self.observe_send_grant(dtid, signals.is_empty());
         let fd_grant_mm = self.ordinary_fd_grant_mm(dtid);
         if signals.is_empty() {
             let record_wait = self.next_turns.get(&dtid).and_then(|turn| {
