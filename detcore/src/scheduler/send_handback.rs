@@ -355,3 +355,61 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl Scheduler {
+    /// Engine components publish through the existing clock operation. This
+    /// does not construct a publication number, grant, handle or receipt.
+    pub(crate) fn controlled_publish_send_clock(
+        &mut self,
+        global: &std::sync::Mutex<crate::types::GlobalTime>,
+    ) {
+        self.bump_global_time(global, &Err(super::SkipTurn));
+    }
+
+    /// Drive the existing external pair and actual queue/harvest/Normal
+    /// transitions. The component supplies no physical send or backend EXIT.
+    /// Only take_send_handback may subsequently produce the one-use receipt.
+    pub(crate) fn controlled_complete_engine_send(
+        &mut self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        operation: ExternalOpId,
+        global: &std::sync::Arc<std::sync::Mutex<crate::types::GlobalTime>>,
+    ) {
+        use super::parked::ControlCapability;
+        use super::parked::ResourceOrigin;
+        use super::parked::RpcOrigin;
+        use crate::resources::Permission;
+        use crate::resources::Resources;
+        self.controlled_selected_network_capture(owner, operation);
+        self.install_resource_origin(
+            owner.thread,
+            ResourceOrigin {
+                rpc: RpcOrigin::DirectRequestResources,
+                mm: owner.mm,
+                control: ControlCapability::None,
+            },
+        )
+        .unwrap();
+        let mut request = Resources::new(owner.thread);
+        request.insert(
+            ResourceID::BlockedExternalContinue(operation),
+            Permission::RW,
+        );
+        let req = self.next_turns[&owner.thread].req.clone();
+        self.request_put(&req, request, global);
+        self.step2c_process_io_blockers().unwrap();
+        self.bump_global_time(global, &Err(super::SkipTurn));
+        let (tid, request, response) = self.step3_peek().unwrap();
+        assert_eq!(tid, owner.thread);
+        let request = request.try_read().unwrap().unwrap();
+        self.step4_resource_block(tid, &request, &response).unwrap();
+        self.step5_guest_unblock(tid, &request, &response).unwrap();
+        self.step6_reenquue(tid, false);
+        assert!(matches!(
+            response.try_read(),
+            Some(super::SchedResponse::Go(_))
+        ));
+        assert!(self.ordinary_fd_observation(owner).is_ok());
+    }
+}

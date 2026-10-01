@@ -1878,6 +1878,10 @@ mod tests;
 mod policy_tests;
 
 #[cfg(test)]
+#[path = "versioned/send_timing_tests.rs"]
+mod send_timing_tests;
+
+#[cfg(test)]
 impl NetworkReplayEngine {
     /// The prior Connected row and original socket origin are controlled
     /// premises. Entry/Store/Drain/publication use their real local issuers;
