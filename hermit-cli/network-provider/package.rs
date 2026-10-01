@@ -67,6 +67,15 @@ fn emit(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn create_new_package_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("package output has no parent directory")?;
+    fs::create_dir_all(parent).context("create package output parent directories")?;
+    fs::create_dir(path).context("create new package output directory")?;
+    Ok(())
+}
+
 struct Arguments {
     component: String,
     output: PathBuf,
@@ -407,7 +416,7 @@ fn run() -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    fs::create_dir(&out)?;
+    create_new_package_directory(&out)?;
     let work = out.join("build");
     fs::create_dir(&work)?;
     emit(&work.join("btf-contract.json"), &checked_btf)?;
@@ -656,6 +665,14 @@ mod compiler_supervision_tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+    #[test]
+    fn cold_package_output_creates_missing_parent_directories() {
+        let root = evidence();
+        let output = root.join("target/triple/debug/network-provider/accepted");
+        create_new_package_directory(&output).unwrap();
+        assert!(output.is_dir());
+        assert!(create_new_package_directory(&output).is_err());
     }
     #[test]
     fn actual_compiler_step_retains_leader_until_group_signal_then_reaps() {
