@@ -27,7 +27,7 @@ const PATH: &CStr = c"/dev/null";
 
 /// What lies directly below the writable stack bytes.
 #[derive(Clone, Copy, Debug)]
-enum BelowStack {
+pub(super) enum BelowStack {
     /// A `PROT_NONE` guard page, as below a thread or fiber stack.
     GuardPage,
     /// Nothing mapped, as below the lowest page of the main-thread stack VMA,
@@ -78,7 +78,10 @@ fn fstat(fd: i32) -> libc::stat {
 
 /// Map two pages, leave only the upper one writable, and return the address
 /// `writable_bytes` above its lower end together with the mapping to release.
-fn tight_stack(below: BelowStack, writable_bytes: usize) -> (*mut u8, *mut libc::c_void, usize) {
+pub(super) fn tight_stack(
+    below: BelowStack,
+    writable_bytes: usize,
+) -> (*mut u8, *mut libc::c_void, usize) {
     let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
     assert!(writable_bytes <= page);
     let region = unsafe {
