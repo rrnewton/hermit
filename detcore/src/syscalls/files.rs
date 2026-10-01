@@ -5662,9 +5662,10 @@ mod test {
 /// for real on host memory and a real descriptor or path. Regression coverage
 /// for <https://github.com/rrnewton/hermit/issues/3328>; the traced end-to-end
 /// cases are `tests_misc::tight_stack_openat` and
-/// `tests_misc::tight_stack_maps`.
+/// `tests_misc::tight_stack_maps`. The scripted guest is shared with the
+/// `/proc/<pid>/fd` link tests in `namespace`.
 #[cfg(test)]
-mod inject_fstat_scratch {
+pub(crate) mod inject_fstat_scratch {
     use std::os::fd::IntoRawFd;
     use std::os::fd::RawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -5700,7 +5701,7 @@ mod inject_fstat_scratch {
     /// written. `reserve` hands out `arena` in order. The arena belongs to the
     /// guest and outlives every guard, so an early guard drop is reported by
     /// `guard_live` rather than by a write into freed memory.
-    struct ScriptedStack {
+    pub(crate) struct ScriptedStack {
         commit_error: Option<Errno>,
         arena: usize,
         arena_len: usize,
@@ -5712,7 +5713,7 @@ mod inject_fstat_scratch {
         commits: Arc<AtomicUsize>,
     }
 
-    struct ScriptedStackGuard {
+    pub(crate) struct ScriptedStackGuard {
         guard_live: Arc<AtomicBool>,
     }
 
@@ -5762,7 +5763,7 @@ mod inject_fstat_scratch {
 
     /// This process's memory as `LocalMemory` reaches it, except that every
     /// write fails with `write_error` when one is set.
-    struct ScriptedMemory {
+    pub(crate) struct ScriptedMemory {
         write_error: Option<Errno>,
     }
 
@@ -5808,9 +5809,9 @@ mod inject_fstat_scratch {
         }
     }
 
-    struct ScriptedGuest {
-        config: Config,
-        thread: ThreadState<()>,
+    pub(crate) struct ScriptedGuest {
+        pub(crate) config: Config,
+        pub(crate) thread: ThreadState<()>,
         commit_error: Option<Errno>,
         /// (address, length) of the stack scratch when the test supplies one;
         /// otherwise the scratch is `arena` and does not report its size.
@@ -5821,7 +5822,7 @@ mod inject_fstat_scratch {
         guard_live: Arc<AtomicBool>,
         /// How many times a stack scratch was committed, successfully or not.
         commits: Arc<AtomicUsize>,
-        injected: Vec<Sysno>,
+        pub(crate) injected: Vec<Sysno>,
         /// Whether a stack guard was live when each fstat was injected.
         fstat_guard_live: Vec<bool>,
         /// Buffer address of each injected fstat.
@@ -5829,7 +5830,7 @@ mod inject_fstat_scratch {
         /// Whether a stack guard was live when each fstatat was injected.
         fstatat_guard_live: Vec<bool>,
         /// Path each injected fstatat named, as the kernel reads it.
-        fstatat_paths: Vec<Vec<u8>>,
+        pub(crate) fstatat_paths: Vec<Vec<u8>>,
         /// Buffer address of each injected fstatat.
         fstatat_buffers: Vec<usize>,
         /// (address, length) of each page the guest mapped.
@@ -5838,10 +5839,21 @@ mod inject_fstat_scratch {
         unmapped: Vec<(usize, usize)>,
         /// Descriptors closed through injection.
         closed: Vec<RawFd>,
+        /// Whether `send_rpc` answers `DeterminizeInode`. Off by default, so
+        /// a test that expects no RPC still fails on one.
+        pub(crate) answers_determinize_inode: bool,
+        /// Raw identity of each `DeterminizeInode` request, in order. The
+        /// `n`th (from 0) is answered with deterministic inode
+        /// `FIRST_SCRIPTED_INODE + n`.
+        pub(crate) determinized: std::sync::Mutex<Vec<RawFileId>>,
     }
 
+    /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
+    /// request.
+    pub(crate) const FIRST_SCRIPTED_INODE: u64 = 7000;
+
     impl ScriptedGuest {
-        fn new(stack_writable: bool, mmap_fails: bool) -> (Detcore, Self) {
+        pub(crate) fn new(stack_writable: bool, mmap_fails: bool) -> (Detcore, Self) {
             let config = Config {
                 virtualize_metadata: true,
                 ..Config::default()
@@ -5869,13 +5881,15 @@ mod inject_fstat_scratch {
                 mapped: Vec::new(),
                 unmapped: Vec::new(),
                 closed: Vec::new(),
+                answers_determinize_inode: false,
+                determinized: std::sync::Mutex::new(Vec::new()),
             };
             (tool, guest)
         }
 
         /// A guest whose stack scratch is the `len` bytes at `address`, and
         /// whose commit fails with `commit_error` when one is given.
-        fn with_scratch(
+        pub(crate) fn with_scratch(
             address: usize,
             len: usize,
             commit_error: Option<Errno>,
@@ -5893,7 +5907,21 @@ mod inject_fstat_scratch {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            panic!("fd registration must not send an RPC: {:?}", message.2)
+            match message.2 {
+                GlobalRequest::DeterminizeInode(raw) if self.answers_determinize_inode => {
+                    let mut determinized = self.determinized.lock().unwrap();
+                    determinized.push(raw);
+                    let inode = FIRST_SCRIPTED_INODE + determinized.len() as u64 - 1;
+                    (
+                        None,
+                        GlobalResponse::DeterminizeInode((
+                            DetInode::mint(inode),
+                            LogicalTime::ZERO,
+                        )),
+                    )
+                }
+                request => panic!("fd registration must not send an RPC: {request:?}"),
+            }
         }
         fn config(&self) -> &Config {
             &self.config
@@ -6161,13 +6189,13 @@ mod inject_fstat_scratch {
 
     /// Fresh zero-filled pages of this process, of which only the first
     /// `writable` can be accessed; unmapped on drop.
-    struct Pages {
-        address: usize,
-        len: usize,
+    pub(crate) struct Pages {
+        pub(crate) address: usize,
+        pub(crate) len: usize,
     }
 
     impl Pages {
-        fn map(count: usize, writable: usize) -> Self {
+        pub(crate) fn map(count: usize, writable: usize) -> Self {
             let len = count * page_size();
             let address = unsafe {
                 libc::mmap(
