@@ -1261,6 +1261,334 @@ pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
     }
 }
 
+/// The one Cargo selection that compiles every prepared selection of a profile.
+///
+/// Separate Cargo invocations resolve dependency features separately, so each
+/// one rebuilt the shared crates it resolved differently and relinked the
+/// unhashed `hermit` executable, and every later selection whose tests depend on
+/// that executable then rebuilt too. At d44bbbb79acd the sixteen `full`
+/// selections took about 520 of the producer's 830 seconds that way. One
+/// selection is its own union. Several are compiled as the whole workspace with
+/// all targets and the union of their package-qualified features, which is also
+/// exactly the workspace build the validate-profile producers run first (see
+/// [`unifies`]), so preparation then compiles nothing new.
+/// Whether `prepare` compiles this profile's selections as one unified listing.
+///
+/// Only the validate-profile graph profiles do: their producers build the whole
+/// workspace with the unified features first, so the listing compiles nothing.
+/// The other profiles' producers build far less (a dev `-p hermit --bin hermit`
+/// in the privileged lane, under a 120-second cap), and a whole-workspace
+/// listing there would compile every test target of every member; they keep
+/// one listing per selection.
+pub fn unifies(graph_profile: &str) -> bool {
+    cargo_profile_for(graph_profile).is_some()
+}
+
+/// One Cargo listing `prepare` runs: its selectors, and the keys of the
+/// selections whose metadata is taken from it.
+type Listing = (Vec<String>, Vec<String>);
+
+/// The Cargo listings `prepare` runs for a profile.
+fn listings(
+    graph_profile: &str,
+    selections: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<Listing>, String> {
+    if unifies(graph_profile) {
+        return Ok(vec![(
+            unified_selection(selections)?,
+            selections.keys().cloned().collect(),
+        )]);
+    }
+    Ok(selections
+        .iter()
+        .map(|(key, args)| (args.clone(), vec![key.clone()]))
+        .collect())
+}
+
+pub fn unified_selection(
+    selections: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<String>, String> {
+    let mut values = selections.values();
+    match (values.next(), values.next()) {
+        (None, _) => return Err("there is no prepared selection to unify".into()),
+        (Some(only), None) => return Ok(only.clone()),
+        _ => {}
+    }
+    let mut features = BTreeSet::new();
+    for selection in selections.values() {
+        let parsed = CargoSelection::parse(selection)?;
+        if parsed.unqualified_features.is_empty() {
+            continue;
+        }
+        let [package] = parsed.packages.as_slice() else {
+            return Err(format!(
+                "{selection:?} names features without naming exactly one package, so the union cannot qualify them"
+            ));
+        };
+        features.extend(
+            parsed
+                .unqualified_features
+                .iter()
+                .map(|feature| format!("{package}/{feature}")),
+        );
+    }
+    let mut union = vec!["--workspace".to_string(), "--all-targets".to_string()];
+    if !features.is_empty() {
+        union.push("--features".into());
+        union.push(features.into_iter().collect::<Vec<_>>().join(","));
+    }
+    Ok(union)
+}
+
+/// The workspace build a producer of a unifying profile runs immediately before
+/// preparing it: exactly the profile's unified selection, so preparation
+/// compiles nothing it did not already build (see [`unified_selection`]).
+pub fn unified_prebuild_command(
+    cfg: &dagrun::model::DagConfig,
+    profile: &str,
+) -> Result<String, String> {
+    if !unifies(profile) {
+        return Err(format!(
+            "profile {profile} lists each selection separately and has no unified workspace build"
+        ));
+    }
+    let unified = unified_selection(&config_selections(cfg, profile)?)?;
+    let cargo_profile = cargo_profile_for(profile)
+        .map(|name| format!(" --profile {name}"))
+        .unwrap_or_default();
+    Ok(format!(
+        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}",
+        unified.join(" ")
+    ))
+}
+
+/// The Cargo package and target selectors of one prepared selection. Only the
+/// selectors the committed graph uses are accepted; anything else is refused
+/// rather than approximated, because a wrong membership would run a different
+/// set of test executables under an unchanged name.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct CargoSelection {
+    workspace: bool,
+    packages: Vec<String>,
+    excluded: Vec<String>,
+    unqualified_features: Vec<String>,
+    lib: bool,
+    bins: bool,
+    tests: bool,
+    all_targets: bool,
+    named_tests: Vec<String>,
+}
+
+impl CargoSelection {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        let mut index = 0;
+        while index < args.len() {
+            let value = || {
+                args.get(index + 1)
+                    .cloned()
+                    .ok_or_else(|| format!("{args:?}: {} has no value", args[index]))
+            };
+            match args[index].as_str() {
+                "--workspace" | "--all" => parsed.workspace = true,
+                "--lib" => parsed.lib = true,
+                "--bins" => parsed.bins = true,
+                "--tests" => parsed.tests = true,
+                "--all-targets" => parsed.all_targets = true,
+                "-p" | "--package" => {
+                    parsed.packages.push(value()?);
+                    index += 1;
+                }
+                "--exclude" => {
+                    parsed.excluded.push(value()?);
+                    index += 1;
+                }
+                "--test" => {
+                    parsed.named_tests.push(value()?);
+                    index += 1;
+                }
+                "-F" | "--features" => {
+                    for feature in value()?.split([',', ' ']).filter(|f| !f.is_empty()) {
+                        if feature.contains('/') {
+                            return Err(format!(
+                                "{args:?}: package-qualified feature {feature} is not a supported prepared selector"
+                            ));
+                        }
+                        parsed.unqualified_features.push(feature.into());
+                    }
+                    index += 1;
+                }
+                other => {
+                    return Err(format!(
+                        "{args:?}: {other} is not a supported prepared Cargo selector"
+                    ));
+                }
+            }
+            index += 1;
+        }
+        if parsed.workspace == !parsed.packages.is_empty() {
+            return Err(format!(
+                "{args:?}: a prepared selection names either --workspace or packages, not both or neither"
+            ));
+        }
+        if !parsed.workspace && !parsed.excluded.is_empty() {
+            return Err(format!("{args:?}: --exclude requires --workspace"));
+        }
+        Ok(parsed)
+    }
+
+    fn selects_package(&self, name: &str) -> bool {
+        if self.workspace {
+            !self.excluded.iter().any(|excluded| excluded == name)
+        } else {
+            self.packages.iter().any(|package| package == name)
+        }
+    }
+
+    /// Cargo's target selection for `cargo test`: with no target selector,
+    /// every target whose manifest `test` flag is set; `--tests` means the same
+    /// set explicitly; `--lib`, `--bins` and `--test NAME` add their kinds.
+    fn selects_target(&self, kind: &str, name: &str, tested_by_default: bool) -> bool {
+        let explicit =
+            self.lib || self.bins || self.tests || self.all_targets || !self.named_tests.is_empty();
+        if (!explicit || self.tests) && tested_by_default {
+            return true;
+        }
+        self.all_targets
+            || (self.lib && matches!(kind, "lib" | "proc-macro"))
+            || (self.bins && kind == "bin")
+            || (kind == "test" && self.named_tests.iter().any(|test| test == name))
+    }
+}
+
+/// The nextest kind of a Cargo target: every library crate type is `lib`.
+fn target_kind(target: &Value) -> Result<&'static str, String> {
+    let kinds = target
+        .get("kind")
+        .and_then(Value::as_array)
+        .ok_or("Cargo target has no kind")?;
+    let has = |wanted: &str| kinds.iter().any(|kind| kind.as_str() == Some(wanted));
+    Ok(if has("bin") {
+        "bin"
+    } else if has("test") {
+        "test"
+    } else if has("bench") {
+        "bench"
+    } else if has("example") {
+        "example"
+    } else if has("custom-build") {
+        "custom-build"
+    } else {
+        "lib"
+    })
+}
+
+/// The binaries-metadata of one selection, taken from the unified build's.
+///
+/// Every executable of the unified listing whose package and target the
+/// selection names is kept; runtime files are kept for the selected packages.
+/// A selection that would receive no executable, or a named test target that no
+/// selected package has, is refused: Cargo refuses the second, and a prepared
+/// record never holds an empty selection.
+fn selection_metadata(unified: &Value, cargo: &Value, args: &[String]) -> Result<Value, String> {
+    let selection = CargoSelection::parse(args)?;
+    let members = cargo
+        .get("workspace_members")
+        .and_then(Value::as_array)
+        .ok_or("Cargo metadata has no workspace members")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut selected_packages = BTreeMap::new();
+    for package in cargo
+        .get("packages")
+        .and_then(Value::as_array)
+        .ok_or("Cargo metadata has no package list")?
+    {
+        let id = string(package, "id")?;
+        if members.contains(id) && selection.selects_package(string(package, "name")?) {
+            selected_packages.insert(id.to_string(), package);
+        }
+    }
+    let member_names = cargo["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|package| {
+            package["id"]
+                .as_str()
+                .is_some_and(|id| members.contains(id))
+        })
+        .map(|package| string(package, "name"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    // Cargo refuses an unknown `-p` package; an unknown `--exclude` is only a
+    // warning there, so it is accepted here too.
+    if let Some(name) = selection
+        .packages
+        .iter()
+        .find(|name| !member_names.contains(name.as_str()))
+    {
+        return Err(format!(
+            "{args:?}: package {name} is not a workspace member"
+        ));
+    }
+    let mut result = unified.clone();
+    let binaries = result
+        .get_mut("rust-binaries")
+        .and_then(Value::as_object_mut)
+        .ok_or("unified Nextest metadata has no rust-binaries")?;
+    let mut matched_tests = BTreeSet::new();
+    let mut kept = serde_json::Map::new();
+    for (id, binary) in std::mem::take(binaries) {
+        let Some(package) = selected_packages.get(string(&binary, "package-id")?) else {
+            continue;
+        };
+        let name = string(&binary, "binary-name")?;
+        let kind = string(&binary, "kind")?;
+        let target = package
+            .get("targets")
+            .and_then(Value::as_array)
+            .ok_or("Cargo package has no targets")?
+            .iter()
+            .find(|target| {
+                target.get("name").and_then(Value::as_str) == Some(name)
+                    && target_kind(target).is_ok_and(|candidate| {
+                        candidate == kind || (candidate == "lib" && kind == "proc-macro")
+                    })
+            })
+            .ok_or_else(|| format!("unified executable {id} has no Cargo target"))?;
+        let tested = target.get("test").and_then(Value::as_bool).unwrap_or(false);
+        if selection.selects_target(kind, name, tested) {
+            if kind == "test" {
+                matched_tests.insert(name.to_string());
+            }
+            kept.insert(id, binary);
+        }
+    }
+    if let Some(missing) = selection
+        .named_tests
+        .iter()
+        .find(|test| !matched_tests.contains(test.as_str()))
+    {
+        return Err(format!(
+            "{args:?}: no selected package has test target {missing}"
+        ));
+    }
+    if kept.is_empty() {
+        return Err(format!(
+            "{args:?} selects no executable of the unified build"
+        ));
+    }
+    *binaries = kept;
+    let runtime = result
+        .get_mut("rust-build-meta")
+        .and_then(|build| build.get_mut("non-test-binaries"))
+        .and_then(Value::as_object_mut)
+        .ok_or("unified Nextest metadata has no non-test-binaries map")?;
+    runtime.retain(|package, _| selected_packages.contains_key(package));
+    Ok(result)
+}
+
 pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let selections = profile_selections(&root, profile)?;
@@ -1296,7 +1624,12 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     if !target.is_absolute() || target.canonicalize().map_err(|e| e.to_string())? != target {
         return Err("Cargo reported a noncanonical target directory".into());
     }
-    for (key, selection) in &selections {
+    // A validate-profile profile compiles every selection in ONE listing; the
+    // others list each selection by itself. Either way each selection's
+    // binaries-metadata is the part of its listing that its Cargo selectors
+    // name, and a listing of one selection must keep every executable Cargo
+    // listed for it, which checks the matcher against Cargo on every run.
+    for (index, (listing, keys)) in listings(profile, &selections)?.into_iter().enumerate() {
         let mut args = vec![
             "nextest".into(),
             "list".into(),
@@ -1309,8 +1642,27 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         if let Some(cargo_profile) = cargo_profile {
             args.extend(["--cargo-profile".into(), cargo_profile.into()]);
         }
-        args.extend(selection.iter().cloned());
-        cargo_output(&root, &args, &generation.join(format!("{key}.json")))?;
+        args.extend(listing.iter().cloned());
+        let listing_path = generation.join(format!("listing-{index}.json"));
+        cargo_output(&root, &args, &listing_path)?;
+        let listed = read_json(&listing_path)?;
+        for key in keys {
+            let metadata = selection_metadata(&listed, &cargo, &selections[&key])?;
+            if selections[&key] == listing
+                && metadata["rust-binaries"].as_object().map(|b| b.len())
+                    != listed["rust-binaries"].as_object().map(|b| b.len())
+            {
+                return Err(format!(
+                    "the prepared subset of {listing:?} drops executables Cargo listed for it"
+                )
+                .into());
+            }
+            fs::write(
+                generation.join(format!("{key}.json")),
+                serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
     let needs_guests = has_test_selection(selections.values(), "hermit_modes");
     let needs_record_workloads = has_test_selection(selections.values(), "record_replay");
@@ -1594,6 +1946,210 @@ mod tests {
 
     use super::*;
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn args(text: &str) -> Vec<String> {
+        text.split_whitespace().map(String::from).collect()
+    }
+
+    fn selections(texts: &[&str]) -> BTreeMap<String, Vec<String>> {
+        texts
+            .iter()
+            .map(|text| (selection_key(&args(text)), args(text)))
+            .collect()
+    }
+
+    #[test]
+    fn one_selection_is_its_own_union() {
+        let only = selections(&["-p hermit-detcore --lib"]);
+        assert_eq!(
+            unified_selection(&only).unwrap(),
+            args("-p hermit-detcore --lib")
+        );
+    }
+
+    #[test]
+    fn several_selections_unify_to_the_workspace_with_qualified_features() {
+        let several = selections(&[
+            "-p hermit --features third-party-backends,kvm-native-test-support --lib --bins",
+            "-p hermit-detcore --test tests_misc",
+            "-p hermit --features third-party-backends,kvm-execution-tests --lib --test cli",
+            "--workspace --exclude hermit",
+        ]);
+        assert_eq!(
+            unified_selection(&several).unwrap(),
+            args(
+                "--workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends"
+            )
+        );
+        let unfeatured = selections(&["-p a --lib", "-p b --test t"]);
+        assert_eq!(
+            unified_selection(&unfeatured).unwrap(),
+            args("--workspace --all-targets")
+        );
+    }
+
+    #[test]
+    fn only_validate_profile_profiles_unify_their_listing() {
+        let several = selections(&[
+            "-p hermit-detcore --test tests_misc",
+            "-p hermit --features third-party-backends --test hermit_modes",
+        ]);
+        for profile in ["full", "hosted-portable"] {
+            let plan = listings(profile, &several).unwrap();
+            assert_eq!(plan.len(), 1, "{profile}");
+            assert_eq!(plan[0].0, unified_selection(&several).unwrap());
+            assert_eq!(plan[0].1.len(), 2);
+        }
+        // The dev-profile producers build far less than the workspace, so
+        // each of their selections keeps a listing of its own.
+        for profile in ["privileged", "super", "quick", "liteinst-compat-only"] {
+            let plan = listings(profile, &several).unwrap();
+            assert_eq!(plan.len(), 2, "{profile}");
+            for (listing, keys) in plan {
+                assert_eq!(keys, [selection_key(&listing)]);
+            }
+            assert!(!unifies(profile));
+        }
+    }
+
+    #[test]
+    fn a_union_refuses_what_it_cannot_reproduce_exactly() {
+        for refused in [
+            "--workspace --features third-party-backends",
+            "-p a -p b --features f",
+            "-p a --features b/f",
+            "-p a --release",
+            "-p a --bin one",
+            "-p a --all-features",
+            "--lib",
+            "-p a --workspace",
+            "-p a --exclude b",
+        ] {
+            let pair = selections(&[refused, "-p z --lib"]);
+            assert!(unified_selection(&pair).is_err(), "{refused} was unified");
+        }
+        assert!(unified_selection(&BTreeMap::new()).is_err());
+    }
+
+    /// Two members: `a` has a library, a tested and an untested binary and two
+    /// integration tests; `b` has a library and an integration test named like
+    /// one of `a`'s. The unified listing names every one of them.
+    fn membership_fixture() -> (Value, Value) {
+        let target = |name: &str, kind: &str, test: bool| serde_json::json!({"name": name, "kind": [kind], "test": test});
+        let cargo = serde_json::json!({
+            "workspace_members": ["id-a", "id-b"],
+            "packages": [
+                {"name": "a", "id": "id-a", "targets": [
+                    target("a", "lib", true), target("tool", "bin", true),
+                    target("guest", "bin", false), target("t1", "test", true),
+                    target("t2", "test", true), target("build-script-build", "custom-build", false)
+                ]},
+                {"name": "b", "id": "id-b", "targets": [
+                    target("b", "lib", true), target("t1", "test", true)
+                ]},
+                {"name": "dep", "id": "id-dep", "targets": [target("dep", "lib", true)]}
+            ]
+        });
+        let binary = |id: &str, package: &str, name: &str, kind: &str| {
+            (
+                id.to_string(),
+                serde_json::json!({"binary-id": id, "package-id": package,
+                    "binary-name": name, "kind": kind, "build-platform": "target",
+                    "binary-path": format!("/target/{id}")}),
+            )
+        };
+        let binaries = [
+            binary("a", "id-a", "a", "lib"),
+            binary("a::bin/tool", "id-a", "tool", "bin"),
+            binary("a::bin/guest", "id-a", "guest", "bin"),
+            binary("a::t1", "id-a", "t1", "test"),
+            binary("a::t2", "id-a", "t2", "test"),
+            binary("b", "id-b", "b", "lib"),
+            binary("b::t1", "id-b", "t1", "test"),
+        ]
+        .into_iter()
+        .collect::<serde_json::Map<_, _>>();
+        let unified = serde_json::json!({
+            "rust-build-meta": {"target-directory": "/target",
+                "non-test-binaries": {"id-a": [{"name": "tool", "path": "/target/tool"}],
+                                      "id-b": [{"name": "bb", "path": "/target/bb"}]}},
+            "rust-binaries": binaries
+        });
+        (unified, cargo)
+    }
+
+    fn members(unified: &Value, cargo: &Value, selection: &str) -> Result<Vec<String>, String> {
+        let metadata = selection_metadata(unified, cargo, &args(selection))?;
+        Ok(metadata["rust-binaries"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    #[test]
+    fn selection_membership_follows_cargo_target_selection() {
+        let (unified, cargo) = membership_fixture();
+        let cases: &[(&str, &[&str])] = &[
+            ("-p a --lib", &["a"]),
+            ("-p a --test t1", &["a::t1"]),
+            ("-p a -p b --test t1", &["a::t1", "b::t1"]),
+            ("-p a --bins", &["a::bin/guest", "a::bin/tool"]),
+            ("-p a --lib --bins", &["a", "a::bin/guest", "a::bin/tool"]),
+            // No target selector: every target whose manifest `test` flag is
+            // set, so the untested guest binary is not a member.
+            (
+                "--workspace --exclude b",
+                &["a", "a::bin/tool", "a::t1", "a::t2"],
+            ),
+            ("-p a --tests", &["a", "a::bin/tool", "a::t1", "a::t2"]),
+            (
+                "--workspace --all-targets",
+                &[
+                    "a",
+                    "a::bin/guest",
+                    "a::bin/tool",
+                    "a::t1",
+                    "a::t2",
+                    "b",
+                    "b::t1",
+                ],
+            ),
+        ];
+        for (selection, expected) in cases {
+            assert_eq!(
+                members(&unified, &cargo, selection).unwrap(),
+                expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{selection}"
+            );
+        }
+        let runtime = selection_metadata(&unified, &cargo, &args("-p a --lib")).unwrap();
+        assert_eq!(
+            runtime["rust-build-meta"]["non-test-binaries"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["id-a"]
+        );
+    }
+
+    #[test]
+    fn selection_membership_refuses_an_empty_or_unknown_selection() {
+        let (unified, cargo) = membership_fixture();
+        for refused in [
+            "-p a --test missing",
+            "-p b --bins",
+            "-p dep --lib",
+            "-p nonexistent --lib",
+        ] {
+            assert!(
+                members(&unified, &cargo, refused).is_err(),
+                "{refused} was accepted"
+            );
+        }
+    }
 
     struct Fixture {
         root: PathBuf,

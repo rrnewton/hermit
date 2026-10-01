@@ -446,11 +446,13 @@ mod tests {
                 7200,
                 Some(6_442_450_944),
             ),
+            // 4 GiB since its width went from one core to 8 on 2026-09-30:
+            // a cold 8-core build peaked at 2.53 GiB.
             (
                 "setup.manifest_plan".to_string(),
                 300,
                 7200,
-                Some(2_147_483_648),
+                Some(4_294_967_296),
             ),
             ("gate.manifest".to_string(), 900, 120, Some(5_368_709_120)),
         ];

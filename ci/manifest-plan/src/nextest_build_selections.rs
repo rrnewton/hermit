@@ -472,6 +472,43 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
     Ok(())
 }
 
+/// A producer of a unifying profile (`nextest_binaries::unifies`) must end
+/// with that profile's unified workspace build followed by `prepare`. Any other
+/// build -- different features, or a second `-p hermit --bin hermit` link --
+/// makes preparation re-resolve features, recompile, and relink the unhashed
+/// executable the tests run. That build also links the Hermit the E2E cells
+/// run, so its features must keep every third-party backend.
+pub(super) fn assert_producers_build_the_unified_selection(
+    cfg: &dagrun::model::DagConfig,
+) -> Result<(), String> {
+    for step in &cfg.steps {
+        let command = execution_command(step)?;
+        let Some((_, profile)) = command.split_once("./ci/nextest-binaries.rs prepare ") else {
+            continue;
+        };
+        if !crate::nextest_binaries::unifies(profile) {
+            continue;
+        }
+        let expected = crate::nextest_binaries::unified_prebuild_command(cfg, profile)?;
+        if command.matches("--workspace --all-targets").count() != 1
+            || !command.ends_with(&expected)
+            || command.contains("--bin hermit")
+        {
+            return Err(format!(
+                "{} must end with its unified workspace build `{expected}` and build nothing else in between",
+                step.tag()
+            ));
+        }
+        if !expected.contains("hermit/third-party-backends") {
+            return Err(format!(
+                "{} links the E2E Hermit without hermit/third-party-backends: `{expected}`",
+                step.tag()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn assert_preparation_dependencies(
     cfg: &dagrun::model::DagConfig,
 ) -> Result<(), String> {
@@ -593,7 +630,7 @@ mod tests {
         // The local profiles have no host workspace producer since the
         // one-build change of 2026-09-30; the hosted variant is the host-root
         // producer, and its command differs from the pinned payload only in
-        // the graph profile it prepares.
+        // the graph profile it prepares and that profile's unified build.
         let hosted = graph
             .steps
             .iter()
@@ -605,11 +642,12 @@ mod tests {
             .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
         let payload = execution_command(image).unwrap();
+        let unified = |profile| crate::nextest_binaries::unified_prebuild_command(&graph, profile);
         assert_eq!(
             payload,
             hosted.cmd.replace(
-                "./ci/nextest-binaries.rs prepare hosted-portable",
-                "./ci/nextest-binaries.rs prepare full"
+                &unified(crate::validation_dag::HOSTED_PORTABLE_LABEL).unwrap(),
+                &unified("full").unwrap()
             )
         );
         for (consumer, producer, wrong_command) in [

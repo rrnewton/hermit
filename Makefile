@@ -43,7 +43,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
-	validate-self-test validate-timeout-layers-test lint lint-parent-checks \
+	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -154,7 +154,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # a checker added to lint-checks is exercised by local validation automatically, whereas the previous
 # arrangement required someone to also hand-write a DAG node and six of the ten
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
-lint: lint-checks lint-cargo lint-parent-checks ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
+lint: lint-checks lint-script-tests lint-cargo lint-parent-checks ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, rust-script unit tests, Reverie pin policy, nested lockfiles, record-version floor)
 
 # The one checker that needs the dev-hermit PARENT repository: the accept arm of the
 # canonical ledger adapter contract drives the parent's real ci-hub/ledger/validate_rows.py.
@@ -190,7 +190,6 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
-	./scripts/run-script-tests.sh
 	./scripts/bisect-probe.rs --self-test
 	./ci/lint-checks-node.sh --self-test
 	./ci/liteinst-strict-node.sh --self-test
@@ -221,6 +220,14 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/core-review-protocol-lint-test.sh
 	python3 ./ci/test_audit_test_binary_registration.py
 	./ci/run-with-reverie-dbt-budget-test.sh
+
+# The unit tests carried by rust-script entrypoints are their own CI node,
+# check.script_unit_tests, so they run beside lint-checks instead of inside its
+# serial recipe: at d44bbbb79acd they were 890 of that node's 1194 seconds under
+# its one-core CPU cap. The node runs this script directly, which is what keeps
+# it reachable for scripts/check-checker-scheduling.rs.
+lint-script-tests: ## Run the unit tests carried by rust-script entrypoints (CI node check.script_unit_tests)
+	./scripts/run-script-tests.sh
 
 lint-cargo: ## The two compile-heavy lint passes; CI runs these as lint.rustfmt and lint.clippy
 	$(CARGO) fmt --all -- --check

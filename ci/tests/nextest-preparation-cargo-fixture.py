@@ -59,13 +59,18 @@ for selection in selections:
         targets[name] = {
             "name": name,
             "kind": ["lib" if name == "library-fixture" else "test"],
+            "test": True,
         }
 packages["hermetic_infra_hermit_tests"] = {
-    name: {"name": name, "kind": ["bin"]} for name in guest_names
+    name: {"name": name, "kind": ["bin"], "test": False} for name in guest_names
 }
 
 packages["hermit-manifest-plan"] = {
-    "nextest-cpu-wrapper": {"name": "nextest-cpu-wrapper", "kind": ["bin"]}
+    "nextest-cpu-wrapper": {
+        "name": "nextest-cpu-wrapper",
+        "kind": ["bin"],
+        "test": False,
+    }
 }
 
 if args[:1] == ["metadata"]:
@@ -74,6 +79,7 @@ if args[:1] == ["metadata"]:
             {
                 "workspace_root": str(root),
                 "target_directory": str(target),
+                "workspace_members": [package_id(name) for name in packages],
                 "packages": [
                     {
                         "name": name,
@@ -88,9 +94,21 @@ if args[:1] == ["metadata"]:
         )
     )
 elif args[:2] == ["nextest", "list"] and "--binaries-metadata" not in args:
-    package, names = selectors(args)
+    # A profile with several selections lists them all in one unified
+    # `--workspace --all-targets` call; one selection is listed by itself.
+    # Guest and wrapper binaries are built by their own calls below.
+    if "--workspace" in args and "--all-targets" in args:
+        listed = [
+            (package, target["name"])
+            for package, targets in packages.items()
+            for target in targets.values()
+            if target["kind"] != ["bin"]
+        ]
+    else:
+        package, names = selectors(args)
+        listed = [(package, name) for name in names]
     binaries = {}
-    for name in names:
+    for package, name in listed:
         path = target / "debug" / "build" / package / "out" / name
         mode = (
             os.environ.get("CARGO_ARTIFACT_MODE", "current")

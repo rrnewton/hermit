@@ -330,7 +330,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit-manifest-plan's hermit_backend_is_passed_before_the_run_subcommand
     // (https://github.com/rrnewton/hermit/pull/3439) retains all 727 prior
     // identities.
-    ("test.regular_crates", 728),
+    // Six nextest_binaries::tests for the unified Nextest preparation
+    // (one_selection_is_its_own_union,
+    // several_selections_unify_to_the_workspace_with_qualified_features,
+    // only_validate_profile_profiles_unify_their_listing,
+    // a_union_refuses_what_it_cannot_reproduce_exactly,
+    // selection_membership_follows_cargo_target_selection,
+    // selection_membership_refuses_an_empty_or_unknown_selection) retain all
+    // 728 prior identities.
+    ("test.regular_crates", 734),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -481,7 +489,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 728),
+    ("test.regular_crates_on_host", 734),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -930,7 +938,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"setup"########,
         job: r########"manifest_plan"########,
         desc: r########"Build the manifest-plan binaries the metadata validation runs"########,
-        description: r########"WALL CAP 300 s SINCE 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): setup.manifest_plan_in_pinned_root is generated from this node and inherits this wall cap. Under the previous 180 s cap, the pinned-root build was killed at 187 s at load average about 212 in the run logged at ignored/validate/validate-liteinst-lane-claude-20260927-rdoracle-44252f8d32f0-1790710654679141973-2158741-ed87d855.log. Counting each retained dev-hermit ignored/validate run once, for logs dated 2026-08-27 to 2026-09-29: the pinned-root node took p50 70 s, p90 143 s and p99 157 s over 340 runs, with a largest pass of 167 s and the single 187 s timeout; this host node took p50 25 s and p90 104 s over 1123 runs, with one 180 s timeout and passes at 179 s and 178 s. 300 s is 1.60 times the 187 s timeout, which is only a lower bound because the cap stopped the build. The 7200 CPU seconds are unchanged."########,
+        description: r########"Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -947,10 +955,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
-            rss_baseline_bytes: Some(2147483648),
-            hard_mem_max_bytes: Some(2147483648),
+            rss_baseline_bytes: Some(3221225472),
+            hard_mem_max_bytes: Some(4294967296),
             classification: StepClass::CpuBound,
-            preferred_inner_jobs: None,
+            preferred_inner_jobs: Some(8),
             measured_effective_cores: None,
             measured_cpu_utilization: None,
         },
@@ -958,7 +966,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 300,
         cpu_timeout: 7200,
-        jobs_flag: None,
+        jobs_flag: Some(""),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
@@ -1400,8 +1408,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"check"########,
         job: r########"lint_checks"########,
-        desc: r########"Run `make lint-checks`: every checker in the lint target except the two cargo passes"########,
-        description: r########"THIS NODE IS DELIBERATELY A TARGET, NOT A LIST OF SCRIPTS, and that is the entire point. check_outcome_consumers above records the same gap being closed by hand for two scripts on 2026-08-23; wiring those two individually is precisely what let the rest persist. Measured 2026-08-25 at main a5fef7ff7623: `make lint` invoked ten checkers and SIX had no DAG node at all (ci/verify-submodules.sh both arms, scripts/check-nested-lockfiles.rs, test-configure-merge-gate-ruleset.sh, test_pr_status.py, test-required-check-outcomes.sh, test_validate_stop_paths.py), while four more checkers were reachable from nothing whatsoever, not even the lint target. GitHub workflows are not local gate reachability: the portable workflow runs automatically only after an integration-branch push as supplemental evidence, and all other workflows are manual. Pointing one node at the target makes a checker added to lint-checks gated by construction instead of by someone remembering to hand-write a node here. TRIAGED BEFORE WIRING: all ten checkers plus shellcheck (188 tracked scripts at --severity=error), `git diff --check`, and the 84 previously-unrun rust-script unit tests were run at that commit and every one passed, so this node starts green and adds no standing red. The two cargo passes stay OUT of the target's CI node: lint.clippy is a measured 300s and this would be a second, duplicate run of it outside ci/run-with-reverie-dbt-budget.sh, which that node wraps it in. TIMEOUT: the target is dominated by test_validate_stop_paths.py, which compiles scripts/validate.rs as a rust-script and then spawns it once per signal case. Measured on 2026-08-25 with a full validate holding the box: that script alone ran 8m54s at load 42.8 and 31s at load 35.7, and a third run at load 42.8 FAILED on its own internal 120s readiness deadline with the validate log at 0 bytes -- which is why that deadline is raised to 600s in the same change. A 31s-to-8m54s spread on one commit is contention, not a defect. 2400s is roughly 4x the slowest observed loaded run, so a real hang stays loud while ordinary contention on a shared box cannot trip it."########,
+        desc: r########"Run `make lint-checks`: every checker in the lint target except the cargo passes and the rust-script unit tests"########,
+        description: r########"Runs `make lint-checks` through ci/lint-checks-node.sh: every repository checker in the Makefile's lint-checks recipe, including shellcheck, `git diff --check`, submodule and Reverie-pin policy, nested lockfiles, merge-gate and workflow-trigger policy, checker scheduling, and the tool self-tests listed there. The node points at the target rather than at scripts, so a checker added to the recipe is gated without a DAG edit, and scripts/check-checker-scheduling.rs refuses a checker that neither the recipe nor a DAG command reaches. The two cargo passes run as lint.rustfmt and lint.clippy, the rust-script unit tests as check.script_unit_tests, and the parent-only canonical-adapter accept arm as check.canonical_adapter_accept. Exit 75 means a checker could not be evaluated from this checkout, for example uninitialized submodules, and is a no-result, never a pass. The 2400-second wall bound is about four times the slowest run observed under load."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -1429,6 +1437,39 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"check"########,
+        job: r########"script_unit_tests"########,
+        desc: r########"Run the unit tests carried by every test-bearing rust-script entrypoint"########,
+        description: r########"Runs scripts/run-script-tests.sh: the #[cfg(test)] unit tests of every tracked rust-script entrypoint that has them (discovered from the tree, not listed), using the test harnesses build.rust_scripts compiled, so nothing is compiled here. The harnesses are independent processes; up to HERMIT_SCRIPT_TEST_JOBS of them run at once, which dagrun sets to this node's 8-core width, and each harness's output is printed whole in discovery order. Until 2026-09-30 they ran serially inside check.lint_checks under that node's one-core CPU cap, where they took about 890 of its 1,194 seconds at d44bbbb79acd. The slowest harness, ci/compat-envelope/scorecard.rs, bounds this node's wall time."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/run-script-tests.sh"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"build.rust_scripts"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 180.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 900,
+        cpu_timeout: 7200,
+        jobs_flag: Some(""),
+        jobs_env: Some("HERMIT_SCRIPT_TEST_JOBS"),
     },
     StaticStepSpec {
         group: r########"check"########,
@@ -1564,13 +1605,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"workspace"########,
         desc: r########"Prepare DBT native resources, then build every workspace target, the backend plugins and the one Hermit binary in the validate profile"########,
-        description: r########"ONE BUILD SINCE 2026-09-30: this node is the only Cargo compilation of Hermit in the full and portable validations. It builds the [profile.validate] profile (Cargo.toml): release optimisation with debug assertions and overflow checks ON, so the E2E and compatibility cells run an optimised Hermit while detcore's debug_assert invariants, the run-queue duplicate check and the determinism-log hash lines that --verify compares stay compiled in. Before this change a full validation compiled Hermit four times, {host, pinned root} x {debug workspace, release runtime}; measured in run 79fd2469 (31m25s) those build nodes took 9,702 of 14,285 step CPU-seconds. The validate profile inherits release, so Cargo gives build scripts PROFILE=release and hermit-install stages the DBT client, DynamoRIO, SaBRe, e9patch and the LiteInst runtime into target/install_pkg with its symlinks pointing into target/validate; the separate release runtime build and the duplicate LiteInst runtime build are gone. CLEAN-TARGET PREPARATION 2026-08-28 (kept): hermit-install reads the DynamoRIO installation produced by reverie-dbt, but Cargo may run their unrelated build scripts concurrently inside the combined workspace build, so the first detcore-dbt build establishes that resource through the same pinned budget wrapper; cleaning only reverie-dbt's and detcore-sabre's validate-profile artifacts forces reverie-dbt's build script to check or recreate a native cache that a restored target may lack. The nextest preparation builds every counted selection in the same validate profile. The explicit bin build completes the third-party-backends Hermit before the preparation selections reuse it; build.e2e_artifact repeats that fresh bin build before it publishes, so target/validate/hermit is that binary even if a preparation selection relinked it with another feature set. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca."########,
+        description: r########"The one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first cleans and builds detcore-dbt alone, so reverie-dbt's DynamoRIO cache exists before hermit-install stages the DBT client, DynamoRIO, SaBRe, e9patch and the LiteInst runtime into target/install_pkg. It then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names, and `nextest-binaries.rs prepare` lists every test executable from that one build and records each selection's subset, so no selection recompiles anything or relinks target/validate/hermit. Until 2026-09-30 sixteen per-selection Cargo invocations each re-resolved features and relinked Hermit, about 620 of this node's 830 seconds at d44bbbb79acd. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo clean --profile validate -p reverie-dbt -p detcore-sabre && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features third-party-backends && cargo build --locked --profile validate -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare full"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo clean --profile validate -p reverie-dbt -p detcore-sabre && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare full"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -2462,13 +2503,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"hermit_unit"########,
         desc: r########"Test Hermit unit and binary targets (-p hermit --lib --bins)"########,
-        description: r########"MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 1130741760 bytes; the larger width-8 historical calibration of 4.6 GiB governs. The 5-GiB scheduling baseline rounds above that floor and the 7-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 for the build phase while nextest execution remains -j1. See ai_docs/dag-memory-caps-recalibration-20260825.md. TEST CONCURRENCY -j1 EXPLAINED 2026-08-26 (task goal-5-build-the-validate-parallel-scaling-model-1-to-316-threads): the -j1 is DELIBERATE, not a default. It preserves a --test-threads=1 introduced 2026-07-27 in 6044c2d39a and carried to nextest -j1 on 2026-08-10 in 3dc3a08a79, whose message says 'Preserve serial execution where Hermit tests require it'. The sibling test.detcore_unit (-p hermit-detcore --lib --bins) has never carried it, so the choice is selective. Hermit's INTEGRATION tests get the same serialization by a different route -- .config/nextest.toml caps the test-group hermit-serialized at max-threads 1 over filter package(=hermit) & kind(=test); --lib and --bins are NOT kind(=test), which is why this node needs the flag instead. That file states the reason at lines 30-32: the hermit test binaries 'use process-local mutexes to serialize Hermit executions', and several tests here do execute Hermit (for example run::detects_symlink_resolution_through_implicit_mounts and the verify::tests::* family). MEASURED COST OF THE PIN: 1.93x. Two replicates each at a6b0c37648df on the host recorded for this measurement in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, -j1 gave 27.0s and 27.3s against -j16 at 14.4s and 13.7s. WARNING FOR WHOEVER MEASURES THIS NEXT -- TWO DISTINCT KNOBS, DO NOT PUT THEM ON ONE AXIS. CARGO_BUILD_JOBS=8 bounds BUILD width; nextest -j bounds TEST concurrency. The 1.93x is attributable to -j alone; the wrapper's build width was unchanged throughout. Plotting a build width and a test concurrency on one axis produces a smooth curve that means nothing. Those figures are WARM-REPEAT times, not node times: this node takes 57.6s in a full validate. The SPEEDUP transfers, the absolute seconds do not. NOT ESTABLISHED: whether the serialization is still necessary. No commit or comment names which lib/bin test requires it. Two -j16 runs returned rc=0 and that is NOT evidence of safety, because a race that only appears under concurrency is exactly what two green runs cannot rule out. Raising this needs someone to confirm Hermit's lib and bin targets are free of the process-local mutex constraint; until then the 1.93x is not claimable."########,
+        description: r########"MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 1130741760 bytes; the larger width-8 historical calibration of 4.6 GiB governs. The 5-GiB scheduling baseline rounds above that floor and the 7-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 for the build phase while nextest execution remains -j1. See ai_docs/dag-memory-caps-recalibration-20260825.md. TEST CONCURRENCY -j1 EXPLAINED 2026-08-26 (task goal-5-build-the-validate-parallel-scaling-model-1-to-316-threads): the -j1 is DELIBERATE, not a default. It preserves a --test-threads=1 introduced 2026-07-27 in 6044c2d39a and carried to nextest -j1 on 2026-08-10 in 3dc3a08a79, whose message says 'Preserve serial execution where Hermit tests require it'. The sibling test.detcore_unit (-p hermit-detcore --lib --bins) has never carried it, so the choice is selective. Hermit's INTEGRATION tests get the same serialization by a different route -- .config/nextest.toml caps the test-group hermit-serialized at max-threads 1 over filter package(=hermit) & kind(=test); --lib and --bins are NOT kind(=test), which is why this node needs the flag instead. That file states the reason at lines 30-32: the hermit test binaries 'use process-local mutexes to serialize Hermit executions', and several tests here do execute Hermit (for example run::detects_symlink_resolution_through_implicit_mounts and the verify::tests::* family). MEASURED COST OF THE PIN: 1.93x. Two replicates each at a6b0c37648df on the host recorded for this measurement in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, -j1 gave 27.0s and 27.3s against -j16 at 14.4s and 13.7s. WARNING FOR WHOEVER MEASURES THIS NEXT -- TWO DISTINCT KNOBS, DO NOT PUT THEM ON ONE AXIS. CARGO_BUILD_JOBS=8 bounds BUILD width; nextest -j bounds TEST concurrency. The 1.93x is attributable to -j alone; the wrapper's build width was unchanged throughout. Plotting a build width and a test concurrency on one axis produces a smooth curve that means nothing. Those figures are WARM-REPEAT times, not node times: this node takes 57.6s in a full validate. The SPEEDUP transfers, the absolute seconds do not. NOT ESTABLISHED: whether the serialization is still necessary. No commit or comment names which lib/bin test requires it. Two -j16 runs returned rc=0 and that is NOT evidence of safety, because a race that only appears under concurrency is exactly what two green runs cannot rule out. Raising this needs someone to confirm Hermit's lib and bin targets are free of the process-local mutex constraint; until then the 1.93x is not claimable. KVM EXECUTION TEST SKIPPED HERE 2026-09-30: the full profile's unified Nextest build compiles the hermit library tests with kvm-execution-tests, which adds kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution to this binary; --skip kvm_execution_tests:: keeps this node's population exactly what it ran before, and privileged-test.cli_kvm still runs that test and requires it by name."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -- --skip ptrace_completion::tests::real_random_"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

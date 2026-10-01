@@ -67,7 +67,15 @@ the same committed superset on demand.
 ### Prepared Nextest executables
 
 The workspace producers prepare each distinct Cargo test selection before its
-Nextest consumers run. The committed graph records the exact Cargo selectors
+Nextest consumers run. For the validate-profile graph profiles (`full` and
+`hosted-portable`) one Cargo invocation compiles all of the profile's
+selections, as `--workspace --all-targets` with the union of their
+package-qualified features. That union is also the workspace build their
+producers run first, so preparation compiles nothing new and never relinks
+`target/validate/hermit`; the generator refuses such a producer unless it ends
+with exactly that build and keeps `hermit/third-party-backends`. The other
+profiles, whose producers build much less, list each selection by itself. Either
+way each selection's record is the part of its listing its Cargo selectors name. The committed graph records the exact Cargo selectors
 for every counted runner, the embedded KVM inventory commands, and the direct
 CPUID `tests_misc` lookup. The generator
 checks those declarations against the command arguments and requires a producer

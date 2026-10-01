@@ -433,7 +433,10 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             ));
         }
     }
-    for tag in ["build.workspace_in_pinned_root", "build.workspace_on_host"] {
+    for (tag, profile) in [
+        ("build.workspace_in_pinned_root", "full"),
+        ("build.workspace_on_host", "hosted-portable"),
+    ] {
         let Some(producer) = cfg.steps.iter().find(|step| step.tag() == tag) else {
             if tag == "build.workspace_on_host" {
                 continue;
@@ -441,8 +444,15 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             return Err(format!("release-artifact bracket: missing {tag}"));
         };
         let source = guarded_command_source(&producer.tag(), &producer.cmd)?;
-        if !source.contains("cargo build --locked --profile validate --workspace --all-targets --features third-party-backends")
-            || !source.contains("cargo build --locked --profile validate -p hermit --features third-party-backends --bin hermit")
+        // The unified workspace build links the one Hermit binary; a second
+        // `-p hermit --bin hermit` build would relink it with other features.
+        let unified =
+            hermit_manifest_plan::nextest_binaries::unified_prebuild_command(cfg, profile)
+                .map_err(|error| format!("release-artifact bracket: {tag}: {error}"))?;
+        if !source.ends_with(&unified)
+            || !unified.contains("--profile validate --workspace --all-targets")
+            || !unified.contains("hermit/third-party-backends")
+            || source.contains("--bin hermit")
             || !source.contains("cargo clean --profile validate -p reverie-dbt -p detcore-sabre")
             || source.contains("--release")
         {
@@ -4459,13 +4469,12 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "build.workspace_in_pinned_root")
             .ok_or("full-plan bracket: workspace fat build disappeared")?;
+        // The unified workspace build is the validate-profile Hermit producer:
+        // it links target/validate/hermit once, and preparation relinks nothing.
         if !workspace_build
             .cmd
             .contains("cargo build --locked --profile validate --workspace --all-targets")
-            || !workspace_build
-                .cmd
-                .contains("cargo build --locked --profile validate -p hermit")
-            || !workspace_build.cmd.contains("--bin hermit")
+            || workspace_build.cmd.contains("--bin hermit")
         {
             return Err(
                 "full-plan bracket: fat build does not finish the validate-profile Hermit producer"
@@ -26074,6 +26083,9 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany all 189 cases: {stdout}"
                 );
             } else {
+                // 255 since check.script_unit_tests took the rust-script
+                // unit tests out of check.lint_checks, assigned to the checks
+                // job in ci/portable-shards.json.
                 // 254 since the one-build change of 2026-09-30 retired the
                 // hosted build.runtime_release and
                 // build.liteinst_runtime_release_on_host and gave
@@ -26091,7 +26103,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "254 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "255 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -26748,19 +26760,35 @@ mod fused_privileged_build_tests {
                     && !args.iter().any(|arg| arg == "--binaries-metadata")
             })
             .collect::<Vec<_>>();
+        // ONE Cargo listing compiles every selection: the profile's unified
+        // selection. Each selection's own metadata is then the matching part
+        // of that listing, and Nextest must accept every one of them exactly
+        // once before the record is published.
+        let unified = hermit_manifest_plan::nextest_binaries::unified_selection(&expected).unwrap();
         assert_eq!(
             builds.len(),
-            expected.len(),
-            "each distinct selection is prepared once"
+            1,
+            "every selection is compiled by one listing"
         );
-        for selection in expected.values() {
+        assert!(builds[0].ends_with(&unified), "{:?}", builds[0]);
+        let accepted = calls
+            .iter()
+            .filter(|args| {
+                args.first().map(String::as_str) == Some("nextest")
+                    && args.iter().any(|arg| arg == "--binaries-metadata")
+            })
+            .collect::<Vec<_>>();
+        for key in expected.keys() {
             assert_eq!(
-                builds
+                accepted
                     .iter()
-                    .filter(|args| args.ends_with(selection))
+                    .filter(|args| args
+                        .iter()
+                        .any(|arg| arg.ends_with(&format!("/{key}.json"))))
                     .count(),
                 1,
-                "missing or duplicated selection {selection:?}"
+                "missing or duplicated selection metadata for {:?}",
+                expected[key]
             );
         }
         assert_eq!(

@@ -372,16 +372,18 @@ struct Profile {
 // use: 12/20 before. hosted-portable lost
 // build.runtime_release and build.liteinst_runtime_release_on_host, and
 // check.dbt_runtime_abi became check.dbt_runtime_abi_on_host: 256/256 before.
+// full, portable and hosted-portable then gained check.script_unit_tests, split
+// out of check.lint_checks: 273/274, 260/261 and 254/254 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 273,
-        selected_steps: 274,
+        direct_steps: 274,
+        selected_steps: 275,
     },
     Profile {
         label: "portable",
-        direct_steps: 260,
-        selected_steps: 261,
+        direct_steps: 261,
+        selected_steps: 262,
     },
     Profile {
         label: "quick",
@@ -400,8 +402,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 254,
-        selected_steps: 254,
+        direct_steps: 255,
+        selected_steps: 255,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1061,6 +1063,26 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         local_prepare,
         "./ci/nextest-binaries.rs prepare hosted-portable",
     );
+    // The hosted profile has its own selections, so its workspace build
+    // compiles their union rather than the local full profile's.
+    let local_prebuild = crate::nextest_binaries::unified_prebuild_command(cfg, "full")?;
+    let hosted_prebuild =
+        crate::nextest_binaries::unified_prebuild_command(cfg, HOSTED_PORTABLE_LABEL)?;
+    let hosted_workspace = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.workspace_on_host")
+        .ok_or("hosted workspace producer is absent")?;
+    let local_prebuild = local_prebuild.replace(
+        "./ci/nextest-binaries.rs prepare full",
+        "./ci/nextest-binaries.rs prepare hosted-portable",
+    );
+    if hosted_workspace.cmd.matches(&local_prebuild).count() != 1 {
+        return Err("hosted workspace producer lost the local unified workspace build".into());
+    }
+    hosted_workspace.cmd = hosted_workspace
+        .cmd
+        .replace(&local_prebuild, &hosted_prebuild);
     // The publisher verifies the binary it publishes against the preparation
     // record of the profile its workspace producer prepared.
     let hosted_publisher = cfg
@@ -2179,6 +2201,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     }
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
+    crate::nextest_build_selections::assert_producers_build_the_unified_selection(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_tool_self_test_nodes(cfg)?;
@@ -2196,10 +2219,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // hosted copies of the last two, and the unconsumed host copy of
     // privileged-only-build.privileged_tests -- and added
     // build.host_hermit_link, the hosted check.dbt_runtime_abi_on_host and the
-    // e9patch lane's e9patchcompatprep.release_resources.
-    if cfg.steps.len() != 1615 {
+    // e9patch lane's e9patchcompatprep.release_resources. 1616 since
+    // check.script_unit_tests took the rust-script unit tests out of
+    // check.lint_checks.
+    if cfg.steps.len() != 1616 {
         return Err(format!(
-            "superset has {} steps, expected 1615",
+            "superset has {} steps, expected 1616",
             cfg.steps.len()
         ));
     }
@@ -2998,8 +3023,16 @@ mod tests {
                     );
                     assert_eq!(
                         fs::read_to_string(&capture).unwrap(),
+                        // The local node's empty jobs_flag leaves CARGO_BUILD_JOBS
+                        // alone to carry the width; the hosted-privileged copy
+                        // keeps dagrun's default `-j` as well.
                         format!(
-                            "cargo:{width}\n<build>\n<-p>\n<hermit-manifest-plan>\n<--bins>\n<-j>\n<{width}>\n"
+                            "cargo:{width}\n<build>\n<-p>\n<hermit-manifest-plan>\n<--bins>\n{}",
+                            if tag.ends_with("_on_host") {
+                                format!("<-j>\n<{width}>\n")
+                            } else {
+                                String::new()
+                            }
                         ),
                         "{tag}"
                     );
@@ -3736,6 +3769,7 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 255 since check.script_unit_tests left check.lint_checks;
         // 254 since the one-build change of 2026-09-30 retired the hosted
         // copies of build.runtime_release and build.liteinst_runtime_release
         // (check.dbt_runtime_abi became check.dbt_runtime_abi_on_host);
@@ -3744,7 +3778,7 @@ sys.exit(37)
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 254);
+        assert_eq!(selected.steps.len(), 255);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3905,13 +3939,14 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 253 = the 254 hosted-portable direct steps since the one-build
-            // change of 2026-09-30 (256 before it, since the five
+            // 254 = the 255 hosted-portable direct steps since
+            // check.script_unit_tests left check.lint_checks (254 after the
+            // one-build change of 2026-09-30; 256 before it, since the five
             // selftest.<name> nodes left gate.manifest and
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 253 direct steps"),
+            error.contains("hosted-portable label has 254 direct steps"),
             "{error}"
         );
     }
