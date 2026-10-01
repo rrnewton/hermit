@@ -438,3 +438,105 @@ fn only_an_explicit_opt_in_embeds_a_revision() {
         assert!(error.contains("must be 1"), "{error}");
     }
 }
+
+fn write_reverie_pin(tree: &Path, rev: &str) {
+    fs::write(
+        tree.join("detcore/Cargo.toml"),
+        format!(
+            "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie\", rev = \"{rev}\" }}\n"
+        ),
+    )
+    .expect("failed to write fixture pin");
+}
+
+/// Two checkouts that share a target directory share hermit-cli's compiled
+/// build script. The pin it embeds must still be the pin of the checkout being
+/// built (https://github.com/rrnewton/hermit/issues/3454).
+///
+/// The second checkout is a `cp -a` copy, so its build script is no newer than
+/// the compiled one and Cargo reuses it; the changed pin manifest only makes
+/// Cargo rerun it. Measured with `reverie_pin` reading `env!("CARGO_MANIFEST_DIR")`
+/// as before the fix: the second build embedded the first checkout's pin.
+#[test]
+fn a_build_script_shared_through_a_target_dir_embeds_the_building_trees_pin() {
+    // No git runs here, but the call keeps this binary's environment removal
+    // ahead of every spawned process (see without_inherited_repository_location).
+    without_inherited_repository_location();
+    const FIRST: &str = "1111111111111111111111111111111111111111";
+    const SECOND: &str = "2222222222222222222222222222222222222222";
+    const THIRD: &str = "3333333333333333333333333333333333333333";
+
+    let scratch = tempfile::tempdir().expect("failed to create scratch directory");
+    let first = scratch.path().join("first");
+    let crate_dir = first.join("hermit-cli");
+    fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
+    fs::create_dir_all(first.join("detcore")).expect("failed to create fixture detcore");
+    for source in ["build_support.rs", "reverie_pin.rs"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
+            crate_dir.join(source),
+        )
+        .expect("failed to copy build support source");
+    }
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        r#"[package]
+name = "reverie-pin-fixture"
+version = "0.0.0"
+edition = "2021"
+build = "build.rs"
+"#,
+    )
+    .expect("failed to write fixture manifest");
+    // The same two lines as hermit-cli/build.rs.
+    fs::write(
+        crate_dir.join("build.rs"),
+        r#"#[allow(dead_code)]
+#[path = "build_support.rs"]
+mod build_support;
+
+fn main() {
+    let reverie_pin = build_support::reverie_pin();
+    println!("cargo:rustc-env=FIXTURE_REVERIE_PIN={reverie_pin}");
+    println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
+}
+"#,
+    )
+    .expect("failed to write fixture build script");
+    fs::write(
+        crate_dir.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"FIXTURE_REVERIE_PIN\")); }\n",
+    )
+    .expect("failed to write fixture binary");
+    write_reverie_pin(&first, FIRST);
+
+    let target = scratch.path().join("target");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let build_and_run = |tree: &Path| {
+        checked_output(
+            Command::new(&cargo)
+                .current_dir(tree.join("hermit-cli"))
+                .env("CARGO_TARGET_DIR", &target)
+                .args(["build", "--quiet"]),
+        );
+        checked_output(&mut Command::new(target.join("debug/reverie-pin-fixture")))
+    };
+    assert_eq!(build_and_run(&first), FIRST);
+
+    let second = scratch.path().join("second");
+    checked_output(Command::new("cp").arg("-a").arg(&first).arg(&second));
+    write_reverie_pin(&second, SECOND);
+    assert_eq!(
+        build_and_run(&second),
+        SECOND,
+        "the second checkout's build embedded another checkout's pin"
+    );
+
+    fs::remove_dir_all(&first).expect("failed to delete the first checkout");
+    write_reverie_pin(&second, THIRD);
+    assert_eq!(
+        build_and_run(&second),
+        THIRD,
+        "the build read the deleted first checkout's pin manifest"
+    );
+}

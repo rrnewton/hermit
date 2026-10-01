@@ -184,14 +184,26 @@ include!("reverie_pin.rs");
 /// site restates it. Returns `unknown` rather than failing the build, because a
 /// missing pin must not stop a developer compiling -- the loader treats
 /// `unknown` as "cannot verify" and says so instead of asserting a match.
+///
+/// The crate directory comes from `CARGO_MANIFEST_DIR` as the build script
+/// runs, not as it was compiled (`env!`). Checkouts that share a target
+/// directory share one compiled build script, so a compile-time path names
+/// whichever checkout compiled it: the binary then embeds that checkout's pin,
+/// or `unknown` once it is deleted
+/// (https://github.com/rrnewton/hermit/issues/3454).
 pub fn reverie_pin() -> String {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|root| root.join("detcore/Cargo.toml"));
-    let Some(manifest) = manifest else {
+    match std::env::var_os("CARGO_MANIFEST_DIR") {
+        Some(crate_dir) => reverie_pin_in(Path::new(&crate_dir)),
+        None => "unknown".into(),
+    }
+}
+
+/// The Reverie revision pinned by the tree containing the crate at `crate_dir`.
+pub fn reverie_pin_in(crate_dir: &Path) -> String {
+    let Some(root) = crate_dir.parent() else {
         return "unknown".into();
     };
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
+    let Ok(text) = std::fs::read_to_string(root.join("detcore/Cargo.toml")) else {
         return "unknown".into();
     };
     parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
