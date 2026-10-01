@@ -698,6 +698,20 @@ impl GlobalState {
         sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
     }
 
+    /// Why the scheduler stopped the run, if it did: a `--stop-after-*` limit, a
+    /// terminal deadlock report, or a replay stop. Only the Narf kernel build of
+    /// Detcore records one, after [`Self::run_external_scheduler`] returns for
+    /// it; the std build exits the process at that point instead, so this is
+    /// always `None` there. A backend that sees a reason must stop the guest
+    /// with it: no further turn will be granted.
+    pub fn fatal_exit_reason(&self) -> Option<String> {
+        self.sched
+            .lock()
+            .unwrap()
+            .fatal_exit_reason()
+            .map(String::from)
+    }
+
     /// Reports that a backend supervisor received a process's final kernel exit status.
     ///
     /// This only records a barrier observation when the backend advertises physical-exit

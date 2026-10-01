@@ -637,6 +637,12 @@ pub struct Scheduler {
     /// poison the scheduler mutex on the way out.
     terminal_deadlock: Option<String>,
 
+    /// Why the Narf kernel build's scheduler loop stopped the run, if it did
+    /// (see [`Scheduler::fatal_exit`]). Always `None` in the std build, which
+    /// exits the process instead.
+    #[cfg(target_os = "none")]
+    fatal_exit_reason: Option<String>,
+
     /// The scheduler turn at which `step2d_handle_empty_queue` last logged
     /// "zero threads left anywhere, fizzling.", while that empty state lasts.
     ///
@@ -1312,7 +1318,7 @@ async fn sched_loop_inner(
     let mut observed_turn = false;
 
     loop {
-        if sched.lock().unwrap().backend_failed() {
+        if sched.lock().unwrap().run_stopped() {
             return;
         }
         // TODO (T137183027, T137184765): as part of the current strategy for blocking IO ops (see
@@ -1326,13 +1332,16 @@ async fn sched_loop_inner(
 
         trace!("[scheduler] loop iteration {}", iter);
         if stop_after_iter.is_some() && iter > stop_after_iter.unwrap() {
-            let sched = sched.lock().unwrap();
+            let mut sched = sched.lock().unwrap();
             tracing::warn!(
                 "[scheduler] Early exit during sched loop iteration {} due to --stop-after-iter.  Summary:\n\n{}",
                 iter,
                 sched.full_summary()
             );
-            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+            sched.fatal_exit(format!(
+                "--stop-after-iter: early exit during scheduler loop iteration {iter}"
+            ));
+            return;
         }
         iter += 1;
 
@@ -1363,7 +1372,11 @@ async fn sched_loop_inner(
                     sched.turn,
                     sched.full_summary()
                 );
-                immediate_fatal_exit(); // We don't want a backtrace of this thread.
+                let turn = sched.turn;
+                sched.fatal_exit(format!(
+                    "--stop-after-turn: early exit during scheduler turn {turn}"
+                ));
+                return;
             }
         }
 
@@ -1378,9 +1391,16 @@ async fn sched_loop_inner(
         // Printed with `eprintln!` rather than `tracing::error!` on purpose: the
         // tracing writer prefixes a real wall-clock timestamp, and this report
         // is required to be byte-identical across runs of the same program.
-        if let Some(report) = sched.lock().unwrap().take_terminal_deadlock() {
-            eprintln!("{}", report);
-            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+        //
+        // The scheduler lock is held from the take until the exit, as it is
+        // for the two exits above.
+        {
+            let mut guard = sched.lock().unwrap();
+            if let Some(report) = guard.take_terminal_deadlock() {
+                eprintln!("{}", report);
+                guard.fatal_exit(report);
+                return;
+            }
         }
 
         if last_res.is_ok() && !observed_turn {
@@ -1757,14 +1777,11 @@ fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
 }
 
 /// Until panics are escalated properly, this encapsulates a way to exit the hermit container
-/// entirely.
+/// entirely. The Narf kernel build has no process to exit; it stops the run through
+/// [`Scheduler::fatal_exit`] instead.
+#[cfg(not(target_os = "none"))]
 pub fn immediate_fatal_exit() {
-    #[cfg(not(target_os = "none"))]
     std::process::exit(1);
-    // The Narf kernel build of Detcore has no process to exit. Until Narf
-    // gives it a way to end the run with a status, it stops the run here.
-    #[cfg(target_os = "none")]
-    panic!("Fatal exit with status 1: the Narf kernel build of Detcore has no process to exit");
 }
 
 /// The Narf kernel build of Detcore opens no pidfds (see `open_thread_pidfd`),
@@ -1944,6 +1961,8 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
+            #[cfg(target_os = "none")]
+            fatal_exit_reason: None,
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
@@ -2298,8 +2317,12 @@ impl Scheduler {
                         timeslice_remaining,
                     };
                 }
-                replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
-                replayer::ReplayAction::Stop(StopReason::ReplayExausted) => immediate_fatal_exit(),
+                replayer::ReplayAction::Stop(StopReason::FatalDesync) => {
+                    self.fatal_exit(String::from("replay stopped: fatal desync"))
+                }
+                replayer::ReplayAction::Stop(StopReason::ReplayExausted) => {
+                    self.fatal_exit(String::from("replay stopped: replay exhausted"))
+                }
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
@@ -4140,6 +4163,45 @@ impl Scheduler {
     /// Take the pending terminal-deadlock report, if the scheduler produced one.
     fn take_terminal_deadlock(&mut self) -> Option<String> {
         self.terminal_deadlock.take()
+    }
+
+    /// End the run for a fatal scheduler condition: a `--stop-after-*` limit, a
+    /// terminal deadlock, or a replay stop.
+    ///
+    /// The std build exits the process with status 1, as it always has. The
+    /// Narf kernel build has no process to exit: it keeps the first `reason`
+    /// for [`crate::GlobalState::fatal_exit_reason`], and the scheduler loop
+    /// returns at its next check, so the backend stops the guest with that
+    /// named error rather than a kernel panic.
+    fn fatal_exit(&mut self, reason: String) {
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = reason;
+            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+        }
+        #[cfg(target_os = "none")]
+        {
+            self.fatal_exit_reason.get_or_insert(reason);
+        }
+    }
+
+    /// Why [`Self::fatal_exit`] stopped the run, if it did. Always `None` in
+    /// the std build, where it exits the process instead.
+    pub(crate) fn fatal_exit_reason(&self) -> Option<&str> {
+        #[cfg(not(target_os = "none"))]
+        {
+            None
+        }
+        #[cfg(target_os = "none")]
+        {
+            self.fatal_exit_reason.as_deref()
+        }
+    }
+
+    /// Whether the scheduler loop must stop: the backend failed, or (in the
+    /// Narf kernel build) [`Self::fatal_exit`] ended the run.
+    fn run_stopped(&self) -> bool {
+        self.backend_failed() || self.fatal_exit_reason().is_some()
     }
 
     /// Test seam: see [`SchedLoopPoint`].
