@@ -5,6 +5,7 @@
 mod process;
 use std::ffi::CString;
 use std::io;
+use std::num::NonZeroU64;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -17,6 +18,7 @@ pub use process::run_accepted_provider_process;
 use super::accepted_parent::BootstrapFailure;
 use super::accepted_parent::BootstrapReply;
 use super::accepted_parent::ProviderArtifact;
+use super::accepted_provider::PidfdIdentity;
 use super::accepted_provider::Provider;
 use super::accepted_provider::Reply;
 use super::accepted_provider::Request;
@@ -32,6 +34,101 @@ fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Created only with the original empty service. Candidate aliases and queued
+/// SCM remain ordinary custody. Consumed only after authentication, run import,
+/// liveness and the original cutoff, before the first native attempt.
+struct NeverAuthorized {
+    startup_cutoff_ns: NonZeroU64,
+}
+
+struct Authorized {
+    controller: PidfdIdentity,
+}
+
+fn bind_controller(
+    controller: &mut Option<OwnedFd>,
+    never_authorized: &mut Option<NeverAuthorized>,
+    original: &OwnedFd,
+    duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
+) -> io::Result<()> {
+    if controller.is_some() || never_authorized.is_none() {
+        return Err(io::Error::other(
+            "accepted controller binding already attempted",
+        ));
+    }
+    let cutoff = never_authorized.as_ref().unwrap().startup_cutoff_ns.get();
+    if !process::monotonic_ns().is_some_and(|now| now < cutoff) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original accepted startup cutoff elapsed before controller binding",
+        ));
+    }
+    // Duplication does not authenticate a PIDFD or authorize provider work.
+    // Keep even a wrong-type alias through dedicated PF_EXITING refusal.
+    let alias = duplicate(original)?;
+    *controller = Some(alias);
+    PidfdIdentity::read(controller.as_ref().unwrap())?;
+    Ok(())
+}
+
+fn import_run(
+    candidate: &mut Option<OwnedFd>,
+    session: &mut Option<AcceptedSession>,
+    original: &OwnedFd,
+    run: [u8; 16],
+    wire: super::ProviderWireFormat,
+) -> io::Result<()> {
+    if candidate.is_some() || session.is_some() {
+        return Err(io::Error::other("accepted run binding already attempted"));
+    }
+    *candidate = Some(duplicate(original)?);
+    match AcceptedSession::from_wire(candidate.take().unwrap(), run, wire) {
+        Ok(owned) => *session = Some(owned),
+        Err((error, owned)) => {
+            *candidate = Some(owned);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// The only permission transition. No fallible native operation may precede it.
+fn authorize_provider(
+    never: &mut Option<NeverAuthorized>,
+    authorized: &mut Option<Authorized>,
+    controller: &Option<OwnedFd>,
+    run: &Option<AcceptedSession>,
+) -> io::Result<()> {
+    let pending = never
+        .as_ref()
+        .ok_or_else(|| io::Error::other("provider permission already spent"))?;
+    if authorized.is_some() || run.is_none() {
+        return Err(io::Error::other(
+            "provider permission lacks original run session",
+        ));
+    }
+    let pin = controller
+        .as_ref()
+        .ok_or_else(|| io::Error::other("original controller absent"))?;
+    let identity = PidfdIdentity::read(pin)?;
+    if controller_exited(pin.as_fd())? {
+        return Err(io::Error::other(
+            "controller exited before provider startup",
+        ));
+    }
+    if !process::monotonic_ns().is_some_and(|now| now < pending.startup_cutoff_ns.get()) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "original accepted startup cutoff elapsed before provider permission",
+        ));
+    }
+    *authorized = Some(Authorized {
+        controller: identity,
+    });
+    never.take();
+    Ok(())
 }
 
 fn command_preparation(
@@ -290,8 +387,11 @@ impl PendingObservation {
 
 #[must_use = "retain this service owner until actual controller exit and explicit provider drain"]
 pub(super) struct AcceptedProviderService {
+    never_authorized: Option<NeverAuthorized>,
+    authorized: Option<Authorized>,
     bootstrap: AcceptedSession,
     run: Option<AcceptedSession>,
+    run_candidate: Option<OwnedFd>,
     controller: Option<OwnedFd>,
     provider: Provider,
     incarnation: [u8; 16],
@@ -348,11 +448,15 @@ impl AcceptedProviderService {
         run: [u8; 16],
         library: CString,
         object: CString,
+        startup_cutoff_ns: NonZeroU64,
     ) -> Result<Self, (io::Error, OwnedFd)> {
         let bootstrap = AcceptedSession::new(stdin, run)?;
         Ok(Self {
+            never_authorized: Some(NeverAuthorized { startup_cutoff_ns }),
+            authorized: None,
             bootstrap,
             run: None,
+            run_candidate: None,
             controller: None,
             provider: Provider::empty(),
             incarnation: run,
@@ -385,6 +489,7 @@ impl AcceptedProviderService {
     /// Error borrows rather than consumes this owner. The caller must continue
     /// recovery with its retained controller/endpoint/provider capabilities.
     pub(super) fn step(&mut self) -> io::Result<()> {
+        self.check_startup_cutoff();
         if let Some(error) = &self.failure {
             return Err(io::Error::other(error.clone()));
         }
@@ -393,6 +498,37 @@ impl AcceptedProviderService {
             self.failure = Some(error.to_string());
         }
         outcome
+    }
+
+    fn check_startup_cutoff(&mut self) {
+        let Some(never) = &self.never_authorized else {
+            return; // An admitted controller has no guest-lifetime deadline.
+        };
+        let error = match process::monotonic_ns() {
+            Some(now) if now < never.startup_cutoff_ns.get() => return,
+            Some(_) => "original accepted startup cutoff elapsed before authorization",
+            None => "original accepted startup clock unavailable before authorization",
+        };
+        self.failure.get_or_insert_with(|| error.into());
+    }
+
+    fn take_pre_authorization_refusal(&mut self) -> Option<NeverAuthorized> {
+        self.failure.as_ref()?;
+        self.never_authorized.as_ref()?;
+        // Do not turn a contradictory/partially installed native owner into
+        // exit authority. The one-way state is the proof; these are defenses.
+        if self.authorized.is_some()
+            || self.grouped_bridge.is_some()
+            || self.grouped_pending.is_some()
+            || self.grouped_owner.is_some()
+            || !self.grouped_leaves.is_empty()
+            || self.grouped_installed
+            || self.bootstrap_reply.is_some()
+            || self.bootstrap_sent
+        {
+            return None;
+        }
+        self.never_authorized.take()
     }
 
     /// Failure notification is independent of the failed provider effect. Only
@@ -438,7 +574,10 @@ impl AcceptedProviderService {
             let run = self.incarnation;
             let provider = &mut self.provider;
             let controller = &mut self.controller;
+            let never_authorized = &mut self.never_authorized;
+            let authorized = &mut self.authorized;
             let run_session = &mut self.run;
+            let run_candidate = &mut self.run_candidate;
             let library = &self.library;
             let object = &self.object;
             let grouped_library = &mut self.grouped_library;
@@ -461,16 +600,15 @@ impl AcceptedProviderService {
                 let expected: ProviderArtifact = serde_json::from_slice(&envelope.body)?;
                 // Original rights are already durable in bootstrap.incoming.
                 // These retained aliases establish the long-lived service path.
-                *controller = Some(duplicate(&rights[0])?);
-                *run_session = Some(
-                    AcceptedSession::from_wire(duplicate(&rights[1])?, run, expected.wire_format)
-                        .map_err(|(error, _)| error)?,
-                );
-                if controller_exited(controller.as_ref().unwrap().as_fd())? {
-                    return Err(io::Error::other(
-                        "controller exited before provider startup",
-                    ));
-                }
+                bind_controller(controller, never_authorized, &rights[0], duplicate)?;
+                import_run(
+                    run_candidate,
+                    run_session,
+                    &rights[1],
+                    run,
+                    expected.wire_format,
+                )?;
+                authorize_provider(never_authorized, authorized, controller, run_session)?;
                 if envelope.operation == Operation::GroupedBootstrap {
                     // Retain every acquired owner before fallible import. The
                     // exact original request/three rights stay Submitted until
@@ -1312,9 +1450,17 @@ impl AcceptedProviderService {
     }
 
     pub(super) fn controller_has_exited(&self) -> io::Result<bool> {
-        self.controller.as_ref().map_or(Ok(false), |controller| {
-            controller_exited(controller.as_fd())
-        })
+        let Some(authorized) = &self.authorized else {
+            return Ok(false); // A candidate pipe/file is never terminal authority.
+        };
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| io::Error::other("authorized controller custody missing"))?;
+        if PidfdIdentity::read(controller)? != authorized.controller {
+            return Err(io::Error::other("authorized controller identity changed"));
+        }
+        controller_exited(controller.as_fd())
     }
 
     pub(super) fn wait_transport(&self, deadline: Instant) -> io::Result<()> {

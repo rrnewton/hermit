@@ -3,6 +3,7 @@
 //! inferred from Config or from an ordinary tracer's credentials.
 
 use std::io;
+use std::num::NonZeroU64;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -168,6 +169,7 @@ fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
 fn helper_arguments(
     launch: &AcceptedProviderLaunch,
     run: [u8; 16],
+    startup_cutoff_ns: NonZeroU64,
 ) -> io::Result<Vec<std::ffi::OsString>> {
     if !launch.helper.is_absolute()
         || !launch.object.is_absolute()
@@ -198,7 +200,42 @@ fn helper_arguments(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
             .into(),
+        "--startup-cutoff-ns".into(),
+        startup_cutoff_ns.to_string().into(),
     ])
+}
+
+// Sample CLOCK_MONOTONIC before Instant: sampling latency can only shorten
+// the caller's original deadline. Neither spawn nor helper receipt renews it.
+fn startup_cutoff_ns(deadline: Instant) -> io::Result<NonZeroU64> {
+    let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "accepted startup expired before spawn",
+            )
+        })?;
+    let observed = u64::try_from(clock.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|ns| {
+            u64::try_from(clock.tv_nsec)
+                .ok()
+                .and_then(|part| ns.checked_add(part))
+        });
+    observed
+        .and_then(|ns| {
+            u64::try_from(remaining.as_nanos())
+                .ok()
+                .and_then(|part| ns.checked_add(part))
+        })
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| io::Error::other("accepted startup cutoff overflow"))
 }
 
 /// Borrow of the actual retained wrapper before the first bootstrap request.
@@ -324,7 +361,8 @@ impl ParentAcceptedService {
     }
 
     fn start(&mut self, deadline: Instant, hook: &mut dyn AcceptedPostSpawn) -> io::Result<()> {
-        let arguments = helper_arguments(&self.launch, self.incarnation)?;
+        let cutoff = startup_cutoff_ns(deadline)?;
+        let arguments = helper_arguments(&self.launch, self.incarnation, cutoff)?;
         let mut raw = [-1; 2];
         if unsafe {
             libc::socketpair(
@@ -495,6 +533,13 @@ impl ParentAcceptedService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prebootstrap_expired_parent_deadline_is_rejected_before_spawn() {
+        let expired = Instant::now() - std::time::Duration::from_millis(1);
+        let error = startup_cutoff_ns(expired).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn accepted_inventory_capacity_is_the_exact_artifact_sum() {

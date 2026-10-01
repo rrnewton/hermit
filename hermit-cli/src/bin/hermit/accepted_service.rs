@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -21,15 +22,17 @@ struct Arguments {
     object: PathBuf,
     library: PathBuf,
     run: [u8; 16],
+    startup_cutoff_ns: NonZeroU64,
 }
 
 impl Arguments {
     fn parse(args: &[OsString]) -> io::Result<Self> {
-        if args.len() != 7
+        if args.len() != 9
             || args[0] != FLAG
             || args[1] != "--object"
             || args[3] != "--library"
             || args[5] != "--run"
+            || args[7] != "--startup-cutoff-ns"
         {
             return Err(io::Error::other(
                 "malformed private accepted-provider arguments",
@@ -60,10 +63,17 @@ impl Arguments {
         if !object.is_absolute() || !library.is_absolute() {
             return Err(io::Error::other("private artifact paths must be absolute"));
         }
+        let startup_cutoff_ns = args[8]
+            .to_str()
+            .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|text| text.parse::<u64>().ok())
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| io::Error::other("missing original accepted startup cutoff"))?;
         Ok(Self {
             object,
             library,
             run,
+            startup_cutoff_ns,
         })
     }
 }
@@ -559,6 +569,7 @@ pub(super) fn run(input: io::Result<Option<File>>) -> ! {
                     library,
                     object,
                     library_file,
+                    args.startup_cutoff_ns,
                 )
             }
         }
@@ -583,6 +594,8 @@ mod tests {
             "/package/library",
             "--run",
             "01000000000000000000000000000000",
+            "--startup-cutoff-ns",
+            "123456789",
         ]
         .iter()
         .map(OsString::from)
@@ -593,6 +606,7 @@ mod tests {
         let parsed = Arguments::parse(&valid()).unwrap();
         assert_eq!(parsed.run[0], 1);
         assert_eq!(parsed.object, PathBuf::from("/package/object"));
+        assert_eq!(parsed.startup_cutoff_ns.get(), 123456789);
         for case in 0..7 {
             let mut args = valid();
             match case {
@@ -620,5 +634,25 @@ mod tests {
             }
             assert!(Arguments::parse(&args).is_err(), "case {case}");
         }
+    }
+
+    #[test]
+    fn private_startup_cutoff_is_required_absolute_and_not_renewed() {
+        for value in ["", "0", "-1", "+1", " 1", "1x", "18446744073709551616"] {
+            let mut args = valid();
+            args[8] = value.into();
+            assert!(Arguments::parse(&args).is_err(), "{value}");
+        }
+        let mut args = valid();
+        args.truncate(7);
+        assert!(Arguments::parse(&args).is_err());
+        let mut args = valid();
+        args[7] = "--deadline-ns".into();
+        assert!(Arguments::parse(&args).is_err());
+        let mut args = valid();
+        args[8] = "1".into();
+        // An old cutoff stays old. Only the service decides refusal, without
+        // a new relative second at argv parsing or artifact receipt.
+        assert_eq!(Arguments::parse(&args).unwrap().startup_cutoff_ns.get(), 1);
     }
 }

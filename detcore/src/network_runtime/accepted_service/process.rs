@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::io;
 use std::io::Write;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
@@ -69,7 +70,7 @@ fn report(value: &Value) -> io::Result<()> {
 
 struct ControllerTerminal;
 
-fn monotonic_ns() -> Option<u64> {
+pub(super) fn monotonic_ns() -> Option<u64> {
     let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } != 0 {
         return None;
@@ -216,30 +217,92 @@ fn exit_after_controller(
     unsafe { libc::_exit(if successful { 0 } else { 125 }) }
 }
 
+enum ServiceExit {
+    Controller(ControllerTerminal),
+    NeverAuthorized(super::NeverAuthorized),
+}
+
+// One iteration of the actual process owner, also exercised without calling
+// _exit by the socketpair/state controls below. It never releases custody.
+fn advance_service(
+    service: &mut AcceptedProviderService,
+    live_before: &mut Option<u64>,
+) -> Option<ServiceExit> {
+    let sampled = monotonic_ns();
+    match service.controller_has_exited() {
+        Ok(true) => return Some(ServiceExit::Controller(ControllerTerminal)),
+        Ok(false) => *live_before = sampled.or(*live_before),
+        Err(error) => {
+            service.failure.get_or_insert_with(|| error.to_string());
+        }
+    }
+    if service.failure.is_none() && !service.run_peer_ended() {
+        match catch_unwind(AssertUnwindSafe(|| service.step())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                service.failure.get_or_insert_with(|| error.to_string());
+            }
+            Err(_) => {
+                service.failure.get_or_insert_with(|| {
+                    "accepted service callback panicked; effect remains unknown".into()
+                });
+            }
+        }
+    }
+    // A received malformed packet or failed alias duplication is a failed
+    // startup, not an empty/terminal/successful session. All retained SCM
+    // remains owned by the dedicated process until PF_EXITING.
+    service
+        .take_pre_authorization_refusal()
+        .map(ServiceExit::NeverAuthorized)
+}
+
+// State snapshot used by assertions, not an emitted terminal/durability receipt.
+#[cfg(test)]
+fn pre_authorization_report(
+    service: &AcceptedProviderService,
+    never: &super::NeverAuthorized,
+) -> Value {
+    serde_json::json!({
+        "schema": "hermit-accepted-provider-startup-failure-v1",
+        "phase": "never_authorized",
+        "run": service.incarnation,
+        "startup_cutoff_ns": never.startup_cutoff_ns.get(),
+        "failure": service.failure,
+        "bootstrap": service.bootstrap.terminal_custody(),
+        "controller_terminal": false,
+        "provider_authorized": false,
+        "service_status": 125,
+        "socket_release": "pending_process_exit",
+    })
+}
+
+fn exit_before_authorization(
+    service: &mut AcceptedProviderService,
+    _never: super::NeverAuthorized,
+) -> ! {
+    // The existing private endpoint attempts at most one MSG_DONTWAIT send.
+    // Missing/malformed request, EOF, full queue or send error may lose this
+    // diagnostic. Never retry, write/flush stdout or fsync before this exit.
+    // Status125, not delivery/durability, is the failure outcome. The first
+    // error and all candidate aliases remain owned until PF_EXITING.
+    service.notify_bootstrap_failure();
+    // No close_for_process_exit, ControllerTerminal, successful inventory or
+    // grant is constructed. The service is already ManuallyDrop; even queued
+    // and quarantined rights are released only by this dedicated process exit.
+    unsafe { libc::_exit(125) }
+}
+
 fn run_service(service: &mut AcceptedProviderService) -> ! {
     let mut failure_reported = false;
     let mut live_before = None;
     loop {
-        let sampled = monotonic_ns();
-        match service.controller_has_exited() {
-            Ok(true) => exit_after_controller(service, ControllerTerminal, live_before),
-            Ok(false) => live_before = sampled.or(live_before),
-            Err(error) => {
-                service.failure.get_or_insert_with(|| error.to_string());
+        match advance_service(service, &mut live_before) {
+            Some(ServiceExit::Controller(proof)) => {
+                exit_after_controller(service, proof, live_before)
             }
-        }
-        if service.failure.is_none() && !service.run_peer_ended() {
-            match catch_unwind(AssertUnwindSafe(|| service.step())) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    service.failure.get_or_insert_with(|| error.to_string());
-                }
-                Err(_) => {
-                    service.failure.get_or_insert_with(|| {
-                        "accepted service callback panicked; effect remains unknown".into()
-                    });
-                }
-            }
+            Some(ServiceExit::NeverAuthorized(proof)) => exit_before_authorization(service, proof),
+            None => {}
         }
         let maintenance = service.maintenance_interval();
         if service.failure.is_some() {
@@ -298,12 +361,20 @@ pub unsafe fn run_accepted_provider_process(
     library: CString,
     object: CString,
     library_file: OwnedFd,
+    startup_cutoff_ns: NonZeroU64,
 ) -> ! {
     // Retain the exact sealed artifact before even endpoint validation. An
     // early refusal releases it only through this dedicated process exit.
     let mut library_file = ManuallyDrop::new(Some(library_file));
-    let service =
-        unsafe { AcceptedProviderService::from_private_stdin(stdin, incarnation, library, object) };
+    let service = unsafe {
+        AcceptedProviderService::from_private_stdin(
+            stdin,
+            incarnation,
+            library,
+            object,
+            startup_cutoff_ns,
+        )
+    };
     match service {
         Ok(mut service) => {
             service.grouped_library = library_file.take();
@@ -322,32 +393,19 @@ pub unsafe fn run_accepted_provider_process(
             })();
             if let Err(error) = protected {
                 service.failure.get_or_insert_with(|| error.to_string());
-                let _ = report(&serde_json::json!({
-                    "schema": "hermit-accepted-provider-terminal-v1",
-                    "phase": "process_protection_failure",
-                    "run": incarnation,
-                    "failure": service.failure,
-                    "controller_terminal": false,
-                    "service_status": 125,
-                }));
                 // The retained service has received no message and created no
-                // BPF owner. Release all original custody only at process exit.
+                // BPF owner. There is no request to notify. Do not let stdout
+                // backpressure delay process-exit release of original custody.
                 unsafe { libc::_exit(125) }
             }
             run_service(&mut service)
         }
-        Err((error, endpoint)) => {
+        Err((_error, endpoint)) => {
             // No message or BPF operation occurred. Retain even this original
             // endpoint through process exit; do not claim a controller drain.
             let _endpoint = ManuallyDrop::new(endpoint);
-            let _ = report(&serde_json::json!({
-                "schema": "hermit-accepted-provider-terminal-v1",
-                "phase": "invalid_private_endpoint",
-                "run": incarnation,
-                "failure": error.to_string(),
-                "controller_terminal": false,
-                "service_status": 125,
-            }));
+            // An invalid endpoint cannot carry a trusted diagnostic. Status125
+            // survives; no blocking stdout fallback is permitted before exit.
             unsafe { libc::_exit(125) }
         }
     }
@@ -355,7 +413,486 @@ pub unsafe fn run_accepted_provider_process(
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+
     use super::*;
+
+    fn unopened(cutoff: NonZeroU64) -> (OwnedFd, AcceptedProviderService) {
+        let (peer, service, _reply_alias) = unopened_with_reply_alias(cutoff);
+        (peer, service)
+    }
+
+    fn unopened_with_reply_alias(
+        cutoff: NonZeroU64,
+    ) -> (OwnedFd, AcceptedProviderService, OwnedFd) {
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let peer = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let input = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        let reply_alias = super::super::duplicate(&input).unwrap();
+        // No provider operation is reachable in these pre-authorization cases.
+        let service = unsafe {
+            AcceptedProviderService::from_private_stdin(
+                input,
+                [7; 16],
+                CString::new("/never-opened/library").unwrap(),
+                CString::new("/never-opened/object").unwrap(),
+                cutoff,
+            )
+        }
+        .map_err(|(error, _)| error)
+        .unwrap();
+        (peer, service, reply_alias)
+    }
+
+    fn future_cutoff() -> NonZeroU64 {
+        NonZeroU64::new(monotonic_ns().unwrap().checked_add(1_000_000_000).unwrap()).unwrap()
+    }
+
+    fn regular_right() -> OwnedFd {
+        let raw = unsafe { libc::memfd_create(c"prebootstrap-state".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    fn original_self_pidfd() -> OwnedFd {
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        assert!(raw >= 0);
+        let pin = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        super::super::super::accepted_provider::PidfdIdentity::read(&pin).unwrap();
+        pin
+    }
+
+    fn send_bootstrap(
+        peer: OwnedFd,
+        controller: OwnedFd,
+        run: OwnedFd,
+    ) -> super::super::AcceptedSession {
+        use super::super::super::accepted_parent::ProviderArtifact;
+        use super::super::super::accepted_transport::AcceptedSession;
+        use super::super::super::accepted_transport::Envelope;
+        use super::super::super::accepted_transport::Operation;
+        let expected = ProviderArtifact {
+            topology: super::super::super::ProviderTopology::ClassicV40,
+            wire_format: super::super::super::ProviderWireFormat::Abi7Copy4,
+            object_sha256: [1; 32],
+            library_sha256: [2; 32],
+            btf_sha256: [4; 32],
+            maps: 17,
+            programs: 25,
+            links: 25,
+        };
+        let mut parent = AcceptedSession::new(peer, [7; 16]).unwrap();
+        let sequence = parent
+            .prepare(
+                Envelope {
+                    run: [7; 16],
+                    sequence: 0,
+                    owner: None,
+                    accept: None,
+                    operation: Operation::Bootstrap,
+                    body: serde_json::to_vec(&expected).unwrap(),
+                },
+                vec![controller, run],
+            )
+            .unwrap();
+        assert_eq!(sequence, 1);
+        assert!(parent.try_send(sequence).unwrap());
+        parent
+    }
+
+    fn require_wrong_rights_refusal(controller: OwnedFd) {
+        let (peer, mut service) = unopened(future_cutoff());
+        let _parent = send_bootstrap(peer, controller, regular_right());
+        let decision = advance_service(&mut service, &mut None);
+        assert!(
+            matches!(decision, Some(ServiceExit::NeverAuthorized(_))),
+            "valid framed wrong-type SCM must terminate before provider permission"
+        );
+        let first = service.failure.clone().unwrap();
+        assert!(
+            service.controller.is_some(),
+            "candidate controller must remain owned"
+        );
+        assert_eq!(service.bootstrap.terminal_custody().retained_rights, 2);
+        assert_eq!(service.bootstrap.terminal_custody().incoming_unfinished, 1);
+        assert!(!service.bootstrap_sent);
+        assert_eq!(service.provider.terminal_state()["close_started"], false);
+        assert!(
+            !service.controller_has_exited().unwrap(),
+            "candidate must not dispatch terminal"
+        );
+        assert!(advance_service(&mut service, &mut None).is_none());
+        assert_eq!(service.failure.as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn prebootstrap_valid_scm_empty_pipe_and_regular_file_refused() {
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pair.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let _writer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        require_wrong_rights_refusal(read);
+    }
+
+    #[test]
+    fn prebootstrap_valid_scm_readable_file_is_not_terminal() {
+        require_wrong_rights_refusal(regular_right());
+    }
+
+    #[test]
+    fn prebootstrap_authenticated_pidfd_invalid_run_retains_refusal() {
+        require_wrong_rights_refusal(original_self_pidfd());
+    }
+
+    #[test]
+    fn prebootstrap_rightless_eof_terminates_original_service_iteration() {
+        let (peer, mut service) = unopened(future_cutoff());
+        assert_eq!(
+            unsafe { libc::shutdown(peer.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
+        let decision = advance_service(&mut service, &mut None);
+        assert!(
+            matches!(decision, Some(ServiceExit::NeverAuthorized(_))),
+            "original service iteration must terminate unopened EOF, not retain forever"
+        );
+        let Some(ServiceExit::NeverAuthorized(proof)) = decision else {
+            unreachable!()
+        };
+        let failure = pre_authorization_report(&service, &proof);
+        assert_eq!(failure["service_status"], 125);
+        assert_eq!(failure["controller_terminal"], false);
+        assert_eq!(failure["provider_authorized"], false);
+        assert_eq!(
+            failure["schema"],
+            "hermit-accepted-provider-startup-failure-v1"
+        );
+        assert!(failure.get("close_receipts").is_none());
+        assert!(failure.get("grant").is_none());
+        assert!(service.failure.as_ref().unwrap().contains("end-of-stream"));
+        assert!(service.controller.is_none());
+        assert!(!service.bootstrap_sent);
+        assert_eq!(service.bootstrap.terminal_custody().retained_rights, 0);
+        assert_eq!(service.provider.terminal_state()["close_started"], false);
+    }
+
+    #[test]
+    fn prebootstrap_silent_peer_uses_original_cutoff() {
+        let cutoff = NonZeroU64::new(monotonic_ns().unwrap() + 20_000_000).unwrap();
+        let (_peer, mut service) = unopened(cutoff);
+        assert!(advance_service(&mut service, &mut None).is_none());
+        std::thread::sleep(Duration::from_millis(25));
+        let decision = advance_service(&mut service, &mut None);
+        let Some(ServiceExit::NeverAuthorized(proof)) = decision else {
+            panic!("original service iteration must terminate at the original silent-peer cutoff");
+        };
+        assert_eq!(proof.startup_cutoff_ns, cutoff);
+        assert_eq!(
+            service.failure.as_deref(),
+            Some("original accepted startup cutoff elapsed before authorization")
+        );
+        assert!(service.controller.is_none());
+        assert_eq!(service.provider.terminal_state()["close_started"], false);
+    }
+
+    #[test]
+    fn prebootstrap_malformed_scm_is_retained_failure_not_empty_success() {
+        let (peer, mut service) = unopened(future_cutoff());
+        let (right, _right_peer) = unopened(future_cutoff());
+        let mut byte = b'x';
+        let mut iov = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        let mut control = [0usize; 8];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+            libc::CMSG_DATA(header)
+                .cast::<i32>()
+                .write(right.as_raw_fd());
+            assert_eq!(libc::sendmsg(peer.as_raw_fd(), &msg, libc::MSG_NOSIGNAL), 1);
+        }
+        assert!(matches!(
+            advance_service(&mut service, &mut None),
+            Some(ServiceExit::NeverAuthorized(_))
+        ));
+        let custody = service.bootstrap.terminal_custody();
+        assert_eq!(custody.quarantined_messages, 1);
+        assert_eq!(custody.quarantined_rights, 1);
+        assert!(
+            service
+                .failure
+                .as_ref()
+                .unwrap()
+                .contains("retained with its received rights")
+        );
+        assert!(!service.bootstrap_sent);
+        assert!(service.controller.is_none());
+        assert_eq!(service.provider.terminal_state()["close_started"], false);
+    }
+
+    #[test]
+    fn prebootstrap_failed_controller_duplicate_preserves_inbox_and_first_error() {
+        use super::super::super::accepted_transport::AcceptedSession;
+        use super::super::super::accepted_transport::Envelope;
+        use super::super::super::accepted_transport::Operation;
+        use super::super::super::accepted_transport::Received;
+        let (peer, mut service) = unopened(future_cutoff());
+        let mut parent = AcceptedSession::new(peer, [7; 16]).unwrap();
+        let (a, _a_peer) = unopened(future_cutoff());
+        let (b, _b_peer) = unopened(future_cutoff());
+        let request = parent
+            .prepare(
+                Envelope {
+                    run: [7; 16],
+                    sequence: 0,
+                    owner: None,
+                    accept: None,
+                    operation: Operation::Bootstrap,
+                    body: vec![],
+                },
+                vec![a, b],
+            )
+            .unwrap();
+        assert!(parent.try_send(request).unwrap());
+        assert_eq!(
+            service.bootstrap.try_receive().unwrap(),
+            Some(Received::Request(request))
+        );
+        let (_, rights, _) = service.bootstrap.retained_request(request).unwrap();
+        // The real binding transition receives an explicit syscall failure;
+        // no process-wide FD limit or fabricated successful controller is used.
+        let error = super::super::bind_controller(
+            &mut service.controller,
+            &mut service.never_authorized,
+            &rights[0],
+            |_| Err(io::Error::from_raw_os_error(libc::EMFILE)),
+        )
+        .unwrap_err();
+        let first = error.to_string();
+        service.failure = Some(first.clone());
+        assert!(matches!(
+            advance_service(&mut service, &mut None),
+            Some(ServiceExit::NeverAuthorized(_))
+        ));
+        let custody = service.bootstrap.terminal_custody();
+        assert_eq!(custody.incoming, 1);
+        assert_eq!(custody.retained_rights, 2);
+        assert_eq!(custody.incoming_unfinished, 1);
+        assert_eq!(service.failure.as_ref(), Some(&first));
+        assert!(service.controller.is_none());
+        assert!(!service.bootstrap_sent);
+    }
+
+    #[test]
+    fn prebootstrap_binding_permanently_spends_startup_exit_authority() {
+        let cutoff = future_cutoff();
+        let (_peer, mut service) = unopened(cutoff);
+        let original = original_self_pidfd();
+        super::super::bind_controller(
+            &mut service.controller,
+            &mut service.never_authorized,
+            &original,
+            super::super::duplicate,
+        )
+        .unwrap();
+        assert!(
+            service.never_authorized.is_some(),
+            "authenticated alias alone is not permission"
+        );
+        let (run, _run_peer) = unopened(future_cutoff());
+        super::super::import_run(
+            &mut service.run_candidate,
+            &mut service.run,
+            &run,
+            service.incarnation,
+            super::super::super::ProviderWireFormat::Abi7Copy4,
+        )
+        .unwrap();
+        super::super::authorize_provider(
+            &mut service.never_authorized,
+            &mut service.authorized,
+            &service.controller,
+            &service.run,
+        )
+        .unwrap();
+        assert!(service.authorized.is_some());
+        assert!(!service.controller_has_exited().unwrap());
+        let remaining = cutoff.get().saturating_sub(monotonic_ns().unwrap());
+        std::thread::sleep(Duration::from_nanos(remaining + 1));
+        service.check_startup_cutoff();
+        assert!(
+            service.failure.is_none(),
+            "startup cutoff must not become a guest-lifetime limit"
+        );
+        // No native attempt is executed by this control. Model its failure at
+        // the actual already-spent production boundary; it cannot restore exit.
+        service.failure = Some("failed native attempt after permission".into());
+        assert!(service.take_pre_authorization_refusal().is_none());
+        assert!(advance_service(&mut service, &mut None).is_none());
+        assert!(service.controller.is_some());
+        // Even loss of a field cannot recreate spent authority from emptiness.
+        let retained = service.controller.take();
+        assert!(service.take_pre_authorization_refusal().is_none());
+        assert!(retained.is_some());
+    }
+
+    #[test]
+    fn prebootstrap_unknown_partial_binding_never_uses_new_exit() {
+        let (peer, mut service) = unopened(NonZeroU64::new(1).unwrap());
+        service.controller = Some(super::super::duplicate(&peer).unwrap());
+        // Candidate aliases alone are safe preauthorization custody. An actual
+        // contradictory native-install marker must still refuse early exit.
+        service.grouped_installed = true;
+        service.failure = Some("original unknown binding".into());
+        service.check_startup_cutoff();
+        assert!(service.take_pre_authorization_refusal().is_none());
+        assert_eq!(service.failure.as_deref(), Some("original unknown binding"));
+        assert!(service.never_authorized.is_some());
+        assert!(service.controller.is_some());
+        assert!(!service.controller_has_exited().unwrap());
+    }
+
+    #[test]
+    fn prebootstrap_original_cutoff_after_partial_acquisition_is_final() {
+        let cutoff = NonZeroU64::new(monotonic_ns().unwrap() + 20_000_000).unwrap();
+        let (_peer, mut service) = unopened(cutoff);
+        let pin = original_self_pidfd();
+        super::super::bind_controller(
+            &mut service.controller,
+            &mut service.never_authorized,
+            &pin,
+            super::super::duplicate,
+        )
+        .unwrap();
+        let (run, _run_peer) = unopened(future_cutoff());
+        super::super::import_run(
+            &mut service.run_candidate,
+            &mut service.run,
+            &run,
+            service.incarnation,
+            super::super::super::ProviderWireFormat::Abi7Copy4,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        let error = super::super::authorize_provider(
+            &mut service.never_authorized,
+            &mut service.authorized,
+            &service.controller,
+            &service.run,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let first = error.to_string();
+        service.failure = Some(first.clone());
+        let Some(ServiceExit::NeverAuthorized(proof)) = advance_service(&mut service, &mut None)
+        else {
+            panic!("partial aliases must not spend original-cutoff refusal");
+        };
+        assert_eq!(proof.startup_cutoff_ns, cutoff);
+        assert!(service.controller.is_some() && service.run.is_some());
+        assert!(service.authorized.is_none());
+        assert_eq!(service.failure.as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn prebootstrap_invalid_run_alias_and_failure_reply_remain_owned() {
+        let (peer, mut service) = unopened(future_cutoff());
+        let mut parent = send_bootstrap(peer, original_self_pidfd(), regular_right());
+        assert!(matches!(
+            advance_service(&mut service, &mut None),
+            Some(ServiceExit::NeverAuthorized(_))
+        ));
+        assert!(
+            service.run_candidate.is_some(),
+            "failed run import must retain its alias"
+        );
+        let first = service.failure.clone();
+        service.notify_bootstrap_failure();
+        assert!(service.bootstrap_failure_sent);
+        assert_eq!(service.failure, first);
+        assert_eq!(service.bootstrap.terminal_custody().retained_rights, 2);
+        assert_eq!(service.bootstrap.terminal_custody().incoming_unfinished, 1);
+        parent.try_receive().unwrap().unwrap();
+        let response: super::super::super::accepted_parent::BootstrapReply =
+            serde_json::from_slice(parent.response(1).unwrap().unwrap()).unwrap();
+        let super::super::super::accepted_parent::BootstrapReply::Failed(failure) = response else {
+            panic!("preauthorization failure must never be READY");
+        };
+        assert_eq!(Some(failure.error), first);
+        assert!(!service.bootstrap_sent);
+        assert!(service.authorized.is_none());
+    }
+
+    #[test]
+    fn prebootstrap_full_diagnostic_queue_does_not_delay_refusal() {
+        let (peer, mut service, reply) = unopened_with_reply_alias(future_cutoff());
+        let _parent = send_bootstrap(peer, original_self_pidfd(), regular_right());
+        assert!(matches!(
+            advance_service(&mut service, &mut None),
+            Some(ServiceExit::NeverAuthorized(_))
+        ));
+        let first = service.failure.clone();
+        let bytes = [0u8; 4096];
+        let mut full = false;
+        for _ in 0..4096 {
+            let n = unsafe {
+                libc::send(
+                    reply.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if n < 0 {
+                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                full = true;
+                break;
+            }
+            assert_eq!(n as usize, bytes.len());
+        }
+        assert!(full, "fixture must actually saturate the owned transport");
+        let begin = Instant::now();
+        service.notify_bootstrap_failure();
+        assert!(begin.elapsed() < Duration::from_secs(1));
+        assert!(
+            !service.bootstrap_failure_sent,
+            "a full queue is not delivered"
+        );
+        assert!(service.bootstrap_failure_send_error.is_none());
+        assert_eq!(service.failure, first);
+        assert_eq!(
+            Some(&service.bootstrap_failure.as_ref().unwrap().error),
+            first.as_ref()
+        );
+        assert!(service.controller.is_some() && service.run_candidate.is_some());
+        assert_eq!(service.bootstrap.terminal_custody().retained_rights, 2);
+        assert!(!service.bootstrap_sent);
+    }
 
     #[test]
     fn grouped_cutoff_never_extends_any_later_controller_exit_observation() {
