@@ -222,6 +222,16 @@ struct AnonymousObjectDevices {
 /// `stat` of the link is tried first, and this probe runs only when that
 /// cannot confirm the object. A failed probe does not fail the guest's
 /// readlink either; see `unconfirmed_anonymous_raw_file_id`.
+///
+/// ⚠️ ON EVERY BACKEND THE PROBE CAN ALSO FAIL FOR HOST-GLOBAL REASONS.
+/// Creating the pipe or the socket fails with `ENFILE` when the host's
+/// open-file table (`fs.file-max`) is full, and with `ENOMEM` under host
+/// memory pressure. Neither is a function of guest state, so whether the
+/// probe succeeds -- and with it whether an unconfirmed link is keyed on the
+/// probed device or on device 0 by `unconfirmed_anonymous_raw_file_id`, and
+/// so which deterministic inode it names -- can differ between runs of the
+/// same guest. Only a success is cached, so a later probe in the same run
+/// can succeed where an earlier one failed.
 fn anonymous_object_devices() -> Result<AnonymousObjectDevices, Error> {
     static DEVICES: OnceLock<AnonymousObjectDevices> = OnceLock::new();
     if let Some(devices) = DEVICES.get() {
@@ -359,6 +369,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             .then(|| RawFileId::new(stat.st_dev, stat.st_ino)))
     }
 
+    /// Rewrite another process's `pipe:[N]` or `socket:[N]` link target to
+    /// name the object's deterministic inode; `None` for any other target.
+    ///
+    /// The object is keyed on its device and inode, as an `fstat` of it is:
+    /// the device comes from the guest's `stat` of the link
+    /// (`other_proc_fd_link_identity`), or from `anonymous_object_devices`
+    /// when that cannot confirm the object.
+    ///
+    /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
+    /// -- neither is consulted, and the object is keyed on its inode alone,
+    /// on device 0, with a stdio descriptor matched by inode alone. There the
+    /// replayer returns the RECORDED target, so the inode is the recording
+    /// host's, while a `stat` of the link at replay time follows whatever the
+    /// replay host has at that descriptor (nothing, under the replayer's
+    /// chroot without `/proc`) and the probe reports the replay host's
+    /// devices. Keying on either would make the replayed name depend on the
+    /// replay environment rather than on the recording. Device 0 is no
+    /// filesystem's (see `unconfirmed_anonymous_raw_file_id`), so the key
+    /// cannot alias a file, and keying on the inode alone is what this
+    /// rewrite did before the pool was keyed on devices
+    /// (<https://github.com/rrnewton/hermit/issues/3307>).
+    ///
+    /// ⚠️ THE STDIO MATCH IS STILL AGAINST THE RUNNING TRACER'S STDIN. The
+    /// cached stdio stat is the tracer's `fstat(0)`, taken in each run, so a
+    /// recorded link to the recording's stdin object names the stdio inode
+    /// only when the replayer's stdin has the same inode number. This is
+    /// unchanged from before the pool was keyed on devices.
     async fn canonicalize_other_proc_fd_target<G>(
         &self,
         guest: &mut G,
@@ -373,23 +410,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(identity) = anonymous_proc_fd_identity(raw_target) else {
             return Ok(None);
         };
+        let virtualize_metadata = guest.config().virtualize_metadata;
         let mut stdio_raw_inodes = [None; 3];
         for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
             stdio_raw_inodes[fd as usize] = guest
                 .thread_state()
                 .with_detfd(fd, |detfd| {
                     deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                    detfd.stat().map(|stat| stat.raw_file_id())
+                    detfd.stat().map(|stat| {
+                        if virtualize_metadata {
+                            stat.raw_file_id()
+                        } else {
+                            RawFileId::new(0, stat.inode)
+                        }
+                    })
                 })
                 .ok()
                 .flatten();
         }
-        let raw_file = match self
-            .other_proc_fd_link_identity(guest, link, &identity)
-            .await?
-        {
-            Some(raw_file) => raw_file,
-            None => unconfirmed_anonymous_raw_file_id(&identity, anonymous_object_devices()),
+        let raw_file = if virtualize_metadata {
+            match self
+                .other_proc_fd_link_identity(guest, link, &identity)
+                .await?
+            {
+                Some(raw_file) => raw_file,
+                None => unconfirmed_anonymous_raw_file_id(&identity, anonymous_object_devices()),
+            }
+        } else {
+            RawFileId::new(0, identity.raw_inode)
         };
         let inode = match deterministic_stdio_inode_for_raw(raw_file, &stdio_raw_inodes) {
             Some(inode) => inode,
@@ -958,5 +1006,152 @@ mod tests {
             canonical_anonymous_proc_fd_target(&long_raw, DetInode::mint(1001), 8),
             b"pipe:[10"
         );
+    }
+
+    /// `canonicalize_other_proc_fd_target` against the scripted guest of
+    /// `files::inject_fstat_scratch`, whose injected syscalls run in this
+    /// process. Each case resolves a link of this process's own descriptor,
+    /// as a guest's readlink of another process's link would have returned.
+    mod other_proc_fd_target {
+        use std::os::fd::AsRawFd;
+
+        use reverie::syscalls::Sysno;
+
+        use super::*;
+        use crate::syscalls::files::inject_fstat_scratch::FIRST_SCRIPTED_INODE;
+        use crate::syscalls::files::inject_fstat_scratch::Pages;
+        use crate::syscalls::files::inject_fstat_scratch::ScriptedGuest;
+
+        /// A fresh pipe's read end, kept open by the caller, and its
+        /// `(device, inode)`.
+        fn pipe_reader() -> (File, u64, u64) {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            let reader = File::from(OwnedFd::from(reader));
+            let metadata = reader.metadata().unwrap();
+            (reader, metadata.dev(), metadata.ino())
+        }
+
+        /// The inode the guest's cached stat of its stdin reports: the
+        /// tracer's `fstat(0)`, which this test process stands in for.
+        fn cached_stdin_inode(guest: &ScriptedGuest) -> u64 {
+            guest
+                .thread
+                .with_detfd(libc::STDIN_FILENO, |detfd| {
+                    detfd.stat().map(|stat| stat.inode)
+                })
+                .unwrap()
+                .expect("the scripted guest's stdin has a cached stat")
+        }
+
+        /// Rewrite `raw_target` as the target of `/proc/<this
+        /// process>/fd/<fd>`, returning the rewritten bytes.
+        async fn rewrite(
+            tool: &Detcore,
+            guest: &mut ScriptedGuest,
+            fd: i32,
+            raw_target: &[u8],
+        ) -> Vec<u8> {
+            let mut buffer = vec![0u8; 64];
+            let address = AddrMut::<libc::c_char>::from_raw(buffer.as_mut_ptr() as usize);
+            let link = OtherProcFdLink {
+                subject: std::process::id(),
+                fd,
+            };
+            let written = tool
+                .canonicalize_other_proc_fd_target(guest, link, raw_target, address, buffer.len())
+                .await
+                .unwrap()
+                .expect("a pipe target is rewritten");
+            buffer.truncate(usize::try_from(written).unwrap());
+            buffer
+        }
+
+        #[tokio::test]
+        async fn with_virtualized_metadata_a_link_is_keyed_on_the_guest_stat_of_it() {
+            let (reader, device, inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            assert!(guest.config.virtualize_metadata);
+
+            let target = format!("pipe:[{inode}]");
+            let rewritten = rewrite(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes()).await;
+
+            assert_eq!(guest.injected, [Sysno::newfstatat]);
+            assert_eq!(
+                guest.fstatat_paths,
+                [format!("/proc/{}/fd/{}", std::process::id(), reader.as_raw_fd()).into_bytes()]
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawFileId::new(device, inode)],
+                "the link must be keyed on the device and inode the guest's stat reports"
+            );
+            assert_eq!(
+                rewritten,
+                format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes()
+            );
+        }
+
+        #[tokio::test]
+        async fn without_virtualized_metadata_a_link_is_keyed_on_its_inode_alone() {
+            let (reader, _, inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            assert_ne!(
+                inode,
+                cached_stdin_inode(&guest),
+                "precondition: the pipe must not share the cached stdio inode number"
+            );
+
+            let target = format!("pipe:[{inode}]");
+            let rewritten = rewrite(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes()).await;
+
+            assert_eq!(
+                guest.injected,
+                [],
+                "record and replay must not stat the link: at replay time it names the \
+                 replay host's descriptor, not the recorded one"
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawFileId::new(0, inode)],
+                "record and replay must key the link on its inode alone, on device 0"
+            );
+            assert_eq!(
+                rewritten,
+                format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes()
+            );
+        }
+
+        #[tokio::test]
+        async fn without_virtualized_metadata_a_link_matches_stdio_by_inode_alone() {
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            // The cached stdin stat carries its own device; a pipe link
+            // carries none, so only the inode can match.
+            let target = format!("pipe:[{}]", cached_stdin_inode(&guest));
+
+            let rewritten = rewrite(&tool, &mut guest, libc::STDIN_FILENO, target.as_bytes()).await;
+
+            assert_eq!(
+                guest.injected,
+                [],
+                "record and replay must not stat the link"
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [],
+                "a stdio match must not draw an inode from the pool"
+            );
+            assert_eq!(
+                rewritten,
+                format!("pipe:[{}]", deterministic_stdio_inode(0).unwrap()).into_bytes()
+            );
+        }
     }
 }
