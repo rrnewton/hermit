@@ -1172,7 +1172,6 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
         emit_diagnostic,
         b"detcore-dbt: background scheduler ready\n",
     );
-    READY_IMAGE.store(image_generation, Ordering::SeqCst);
     let log_scheduler = info_logging_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
         if log_scheduler {
@@ -1180,10 +1179,13 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
             unsafe { emit_diagnostic(line.as_ptr(), line.len()) };
         }
     });
-    run_cooperative(
-        runtime.global.run_external_scheduler(observer),
-        callbacks.idle,
-    );
+    // Creating the scheduler future logs its startup announcement, and
+    // publishing READY_IMAGE releases the root guest thread to log its
+    // seeding lines. Doing them in this order keeps the INFO log identical
+    // between runs: https://github.com/rrnewton/hermit/issues/3463.
+    let scheduler = runtime.global.run_external_scheduler(observer);
+    READY_IMAGE.store(image_generation, Ordering::SeqCst);
+    run_cooperative(scheduler, callbacks.idle);
     emit_lifecycle_marker(
         emit_diagnostic,
         b"detcore-dbt: background scheduler completed\n",
