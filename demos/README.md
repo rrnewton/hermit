@@ -43,9 +43,12 @@ file system or network deterministic.
   kernel state on every run ([demo 7](07-drgn-kernel/README.md)).
 - **Catch a real use-after-free that normal runs expose only by chance**, and
   reproduce it on request ([demo 8](08-btrfs-convert-uaf/README.md)). On a
-  shared or heavily loaded machine the crash may not reproduce reliably,
-  because chaos mode's thread switches land at retired-branch counter
-  interrupts, which can arrive late under host load.
+  shared or heavily loaded machine the crash may not reproduce reliably:
+  Hermit arms the retired-branch counter interrupt for each chaos-mode thread
+  switch a safety margin early and single-steps to the exact point, and if the
+  interrupt arrives later than that margin, which is more likely under heavy
+  host load (Hermit then prints `HERMIT_SKID_OVERSHOOT`), the switch lands past
+  its planned point and the seed may miss.
 - **Build Debian packages bit for bit reproducibly**: in a 58-package sample
   measured with Hermit commit `1fadc03779f2`, 52 built byte-identically from two
   different root directories and none differed; an earlier, larger run found
@@ -88,9 +91,9 @@ file system or network deterministic.
 > load average of 10 to 20; the writeup has the full table. On a shared or
 > heavily loaded machine the crash may not reproduce reliably; see demo 8's
 > README.)
-> A crash that native runs showed only in part, and never on request, becomes
-> one command you can hand to a colleague. Both binaries carry the same small
-> test harness. Among other things it skips
+> On a lightly loaded machine, a crash that native runs showed only in part,
+> and never on request, becomes one command you can hand to a colleague. Both
+> binaries carry the same small test harness. Among other things it skips
 > btrfs-convert's check that its target is not mounted, because the mount
 > table it reads under Hermit comes from the host's current mounts
 > (<https://github.com/rrnewton/hermit/issues/1820>), and that check made the
@@ -196,10 +199,10 @@ boot. The groups are not balanced in length:
 
 Measured on 2026-09-30 by running `make -C demos group1`, `group2`, and
 `group3` one after another, with Hermit 0.2.0 `dc92644f96f4`, QEMU 10.1.2, and
-demo 8's assets prepared, on a shared 316-CPU AMD EPYC host. All nine demos
-passed. The group times are wall-clock times of the `make` commands; the
-per-demo times are the whole seconds that `demos/run-all.sh` writes to
-`summary.tsv`.
+demo 8's assets prepared, on a lightly loaded 316-CPU AMD EPYC host (load
+average 10 to 20). All nine demos passed. The group times are wall-clock times
+of the `make` commands; the per-demo times are the whole seconds that
+`demos/run-all.sh` writes to `summary.tsv`.
 
 The demo scripts have unit tests that need no QEMU and no Hermit run:
 

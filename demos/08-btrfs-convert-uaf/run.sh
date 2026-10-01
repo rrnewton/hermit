@@ -7,13 +7,17 @@
 # joined it, so task_deinit() could free(info) while the thread was still
 # reading it. Whether that happens depends only on the teardown interleaving,
 # which an ordinary run cannot choose. Hermit's chaos scheduler reaches the
-# crashing interleaving on specific seeds and reproduces it exactly.
+# crashing interleaving on specific seeds and, on a lightly loaded host,
+# reproduces it exactly.
 #
 # The demo runs AddressSanitizer builds of two btrfs-convert variants: `buggy`
 # (before 73e211a7) and `fixed` (73e211a7). It reports what one native buggy run
 # showed, then shows that the chaos buggy run crashes on a known seed, the chaos
 # fixed run on the same seed is clean, and the crash reproduces byte-for-byte
-# when run again.
+# when run again. That held on a lightly loaded host. Under heavy host load a
+# performance-counter interrupt can arrive later than Hermit's safety margin
+# (Hermit prints HERMIT_SKID_OVERSHOOT), a thread switch can land past its
+# planned point, and the seed may miss; README.md explains this.
 # prepare-assets.sh builds the binaries and the input image; WRITEUP.md tells
 # the story of the bug.
 
@@ -29,7 +33,9 @@ usage() {
 Usage: demos/08-btrfs-convert-uaf/run.sh
 
 Show a schedule-dependent btrfs-convert use-after-free that native execution
-cannot reproduce on demand and `hermit run --chaos` finds and reproduces.
+cannot reproduce on demand and `hermit run --chaos` finds and, on a lightly
+loaded host, reproduces. Under heavy host load the recorded seed may miss; see
+demos/08-btrfs-convert-uaf/README.md.
 
 Needs AddressSanitizer btrfs-convert binaries and a populated ext4 image, which
 demos/08-btrfs-convert-uaf/prepare-assets.sh builds:
@@ -138,8 +144,10 @@ complete_asan_uaf() {
     && grep -qa 'SUMMARY: AddressSanitizer' "$output"
 }
 
-# One chaos run. --sched-seed selects the interleaving; --no-virtualize-cpuid
-# lets the demo run on hosts without CPUID faulting.
+# One chaos run. --sched-seed selects the interleaving. --no-virtualize-cpuid
+# lets the demo also run on hosts without CPUID faulting; with it the guest
+# sees the host's real CPUID results on every host, so CPUID is a host input
+# in this command.
 #
 # A seed names one interleaving only for one set of guest inputs, so two more
 # host inputs are pinned here, exactly as in prepare-assets.sh:
@@ -171,7 +179,8 @@ echo
 # 11 printed the first lines of an ASAN report, then exited 0 without its
 # SUMMARY: the main thread finished and exited while the progress thread was
 # still reporting. The demo reports which outcome this run had and continues;
-# its point is that the chaos run below crashes on a chosen seed every time.
+# its point is that the chaos run below crashes on a chosen seed, which it did
+# every time on a lightly loaded host.
 echo "--- Step 1: native buggy btrfs-convert ---"
 NATIVE_IMG="$ARTIFACTS/native-buggy.img"
 fresh_image "$NATIVE_IMG"
