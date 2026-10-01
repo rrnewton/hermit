@@ -746,6 +746,9 @@ fn validate_args(command: &str, args: &Args) {
     if command != "run" && args.diagnostic_results {
         fail("--diagnostic-results is accepted by run only");
     }
+    if command != "run" && args.retries == Retries::Off {
+        fail("--no-retry is accepted by run only");
+    }
     if !matches!(command, "build" | "run") && args.jobs.is_some() {
         fail("--jobs is accepted by build and run only");
     }
@@ -5643,6 +5646,7 @@ sys.exit(1 if failed else 0)
 
         const CHILD_FIXTURE: &str = "HERMIT_HARNESS_RETRY_TEST_FIXTURE";
         const CHILD_DIAGNOSTIC: &str = "HERMIT_HARNESS_RETRY_TEST_DIAGNOSTIC_RESULTS";
+        const CHILD_NO_RETRY: &str = "HERMIT_HARNESS_RETRY_TEST_NO_RETRY";
         const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
@@ -5663,6 +5667,9 @@ sys.exit(1 if failed else 0)
             ];
             if std::env::var_os(CHILD_DIAGNOSTIC).is_some() {
                 argv.push("--diagnostic-results".into());
+            }
+            if std::env::var_os(CHILD_NO_RETRY).is_some() {
+                argv.push("--no-retry".into());
             }
             let args = parse(argv.into_iter());
             super::validate_args("run", &args);
@@ -5745,7 +5752,7 @@ sys.exit(1 if failed else 0)
         // Only the isolated child receives execution environment changes. A
         // missing Hermit path makes the optional metadata/help probes inert;
         // all five cells use the actual native execution path.
-        let run_child = |fixture: &Path, diagnostic_results: bool| {
+        let run_child = |fixture: &Path, diagnostic_results: bool, no_retry: bool| {
             let mut command = Command::new("timeout");
             command
                 .args(["--kill-after=2s", "25s"])
@@ -5764,9 +5771,12 @@ sys.exit(1 if failed else 0)
             if diagnostic_results {
                 command.env(CHILD_DIAGNOSTIC, "1");
             }
+            if no_retry {
+                command.env(CHILD_NO_RETRY, "1");
+            }
             command.output().unwrap()
         };
-        let output = run_child(&fixture, false);
+        let output = run_child(&fixture, false, false);
         fs::write(fixture.join("child.stdout"), &output.stdout).unwrap();
         fs::write(fixture.join("child.stderr"), &output.stderr).unwrap();
         assert!(
@@ -5869,7 +5879,7 @@ sys.exit(1 if failed else 0)
             )
             .unwrap();
         }
-        let diagnostic_output = run_child(&diagnostic_fixture, true);
+        let diagnostic_output = run_child(&diagnostic_fixture, true, false);
         assert!(
             diagnostic_output.status.success(),
             "native diagnostic-results run control failed: {}\n{}\n{}",
@@ -5938,6 +5948,44 @@ sys.exit(1 if failed else 0)
         let junit = fs::read_to_string(fixture.join("junit.xml")).unwrap();
         assert!(junit.contains("tests=\"5\" failures=\"2\" errors=\"1\" skipped=\"0\""));
         assert_eq!(junit.matches("<testcase ").count(), 5);
+        // The same cells with --no-retry, through the real run(): every cell is
+        // exactly one attempt, so the product failure is not retried and the
+        // cell that recovers on its retry stays failed.
+        let no_retry_fixture = fixture.join("no-retry");
+        fs::create_dir_all(no_retry_fixture.join("tests/e2e/manifests")).unwrap();
+        for name in ["defaults.yaml", "retry.yaml"] {
+            fs::copy(
+                manifests.join(name),
+                no_retry_fixture.join("tests/e2e/manifests").join(name),
+            )
+            .unwrap();
+        }
+        let no_retry_output = run_child(&no_retry_fixture, false, true);
+        assert!(
+            no_retry_output.status.success(),
+            "native --no-retry run control failed: {}\n{}\n{}",
+            no_retry_fixture.display(),
+            String::from_utf8_lossy(&no_retry_output.stdout),
+            String::from_utf8_lossy(&no_retry_output.stderr)
+        );
+        let counts: serde_json::Value =
+            serde_json::from_slice(&fs::read(no_retry_fixture.join("counts.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            counts,
+            json!({
+                "schema": 2,
+                "executed_tests": 5,
+                "filtered_tests": 0,
+                "results": [
+                    {"id": "retry/infra [native/naked]", "result": "fail", "attempts": 1},
+                    {"id": "retry/pass [native/naked]", "result": "pass", "attempts": 1},
+                    {"id": "retry/product [native/naked]", "result": "fail", "attempts": 1},
+                    {"id": "retry/recovers [native/naked]", "result": "fail", "attempts": 1},
+                    {"id": "retry/timeout [native/naked]", "result": "fail", "attempts": 1}
+                ]
+            })
+        );
         fs::remove_dir_all(fixture).unwrap();
     }
 

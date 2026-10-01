@@ -116,17 +116,19 @@ def classify(failure):
 tests = {}
 iterations = set()
 for suite in root.iter("testsuite"):
-    iterations.add(suite.get("name"))
+    # Nextest names each suite <binary>@stress-<i>; count iterations, not
+    # binaries x iterations.
+    stress = re.search(r"@stress-(\d+)$", suite.get("name") or "")
+    iterations.add(stress.group(1) if stress else suite.get("name"))
     for case in suite.iter("testcase"):
+        if any(c.tag == "skipped" for c in case):
+            continue
         test = f"{case.get('classname')}::{case.get('name')}"
         row = tests.setdefault(test, {"test": test, "runs": 0, "passes": 0,
                                       "product_failures": 0, "no_results": 0,
                                       "signatures": {}})
         row["runs"] += 1
         failures = [c for c in case if c.tag in ("failure", "error")]
-        if any(c.tag == "skipped" for c in case):
-            row["runs"] -= 1
-            continue
         if not failures:
             row["passes"] += 1
             continue
@@ -135,10 +137,11 @@ for suite in root.iter("testsuite"):
         row["signatures"][signature] = row["signatures"].get(signature, 0) + 1
 
 def verdict(row):
-    # Same rule as flake_verdict in ci/compat-envelope/pressure-test.rs.
+    # Same rule as flake_verdict in ci/compat-envelope/pressure-test.rs: a
+    # test is CLEAN only if every requested run was observed and passed.
     if row["product_failures"] > 0:
         return "FLAKY" if row["passes"] > 0 else "FAILING"
-    if row["runs"] > 0 and row["passes"] == row["runs"]:
+    if row["runs"] == runs and row["passes"] == runs:
         return "CLEAN"
     return "INCOMPLETE"
 
