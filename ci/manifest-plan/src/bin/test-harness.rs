@@ -82,6 +82,7 @@ Selection options:
   --backend <ptrace|dbt|kvm|sabre|liteinst>
   --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
                                    Omit that backend's cells; may repeat
+  --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat
   --ci-only                        Select required CI cells
   --include-occasional             Include occasional cells
   --include-manual                 Include manual cells; requires exact test and mode
@@ -146,7 +147,8 @@ const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --mode <verify|chaos|replay|naked|custom>
   --backend <ptrace|dbt|kvm|sabre|liteinst>
   --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
-                                   Omit that backend's cells; may repeat";
+                                   Omit that backend's cells; may repeat
+  --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -361,6 +363,14 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             "--test" => set_once(&mut args.selection.test, &mut values, "--test"),
             "--mode" => set_once(&mut args.selection.mode, &mut values, "--mode"),
             "--backend" => set_once(&mut args.selection.backend, &mut values, "--backend"),
+            "--label" => {
+                for label in required_value(&mut values, "--label").split(',') {
+                    if label.is_empty() || args.selection.labels.iter().any(|l| l == label) {
+                        fail(format!("--label {label:?} is empty or was given twice"));
+                    }
+                    args.selection.labels.push(label.to_string());
+                }
+            }
             "--exclude-backend" => {
                 let backend = required_value(&mut values, "--exclude-backend");
                 if args.selection.exclude_backends.contains(&backend) {
@@ -838,6 +848,7 @@ fn audit_cli_brackets(root: &Path) {
         "--mode",
         "--backend",
         "--exclude-backend",
+        "--label",
         "--results",
         "--junit",
         "--format",

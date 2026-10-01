@@ -1052,6 +1052,7 @@ fn validate_and_expand(
             "build",
             "modes",
             "preprocessors",
+            "labels",
         ],
         &id,
     );
@@ -1270,6 +1271,11 @@ fn validate_mode_with_cpu(
             "expected_guest_exit",
             "expected_stdout",
             "expected_stdout_contains",
+            "hermit_args",
+            "hermit_args_reason",
+            "env",
+            "comparator",
+            "comparator_reason",
         ]),
         _ => {}
     }
@@ -1907,6 +1913,85 @@ mod tests {
                 "c-programs/cpuid-probe".to_string()
             )]
         );
+    }
+
+    const VERIFY_EXTENSIONS: &str = r#"
+ci = true
+backends_enabled = ["ptrace"]
+hermit_args = ["--no-virtualize-cpuid"]
+hermit_args_reason = "the corpus records this configuration"
+comparator = "stripped"
+comparator_reason = "the corpus verdict policy is the stripped comparison"
+
+[env]
+TMPDIR = "/tmp"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#;
+
+    #[test]
+    fn accepts_the_verify_extensions_in_a_verify_mode() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &parse_mode(VERIFY_EXTENSIONS),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket/test.modes.custom: unknown keys")]
+    fn rejects_the_verify_extensions_outside_verify() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "custom",
+            90,
+            &parse_mode(VERIFY_EXTENSIONS),
+            &mut Vec::new(),
+        );
+    }
+
+    /// The first committed util-c test with `labels` added, through the
+    /// front door's own test validation.
+    fn expand_util_c_with(extra: &str) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("tests/e2e/manifests/util-c.yaml")).unwrap();
+        let (head, tail) = text.split_once("\n    lane: ").unwrap();
+        let document: Value = format!("{head}\n    {extra}\n    lane: {tail}")
+            .parse()
+            .unwrap();
+        let test = &document.get("test").unwrap().as_array().unwrap()[0];
+        validate_and_expand(
+            test,
+            "util-c",
+            90,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS as i64,
+            "util-c.yaml",
+            &root,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn accepts_test_labels() {
+        expand_util_c_with("labels: [strict-compat, full]");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown keys: [\"label\"]")]
+    fn rejects_a_misspelled_labels_key() {
+        expand_util_c_with("label: [strict-compat]");
     }
 
     #[test]

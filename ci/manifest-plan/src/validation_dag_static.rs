@@ -341,7 +341,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest_binaries::tests::a_one_selection_listing_must_keep_every_executable_cargo_listed
     // and nextest_build_selections::tests::a_unifying_producer_must_end_with_exactly_its_union_build
     // retain all 734 prior identities.
-    ("test.regular_crates", 736),
+    // The manifest-runner extensions' runner::tests
+    // (verify_extensions_are_verify_only_reasoned_and_allowlisted,
+    // declared_relaxations_are_recorded_on_the_cell,
+    // labels_are_lowercase_dashed_words_and_unique,
+    // labels_select_only_the_tests_that_carry_them,
+    // a_verify_cell_carries_its_hermit_args_env_and_comparator,
+    // a_stripped_cell_passes_only_a_matched_report_and_a_strict_one_still_needs_canonical)
+    // and the manifest front door's
+    // accepts_the_verify_extensions_in_a_verify_mode,
+    // rejects_the_verify_extensions_outside_verify, accepts_test_labels and
+    // rejects_a_misspelled_labels_key retain all 736 prior identities.
+    ("test.regular_crates", 746),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -492,7 +503,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 736),
+    ("test.regular_crates_on_host", 746),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

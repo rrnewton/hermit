@@ -646,16 +646,31 @@ mod tests {
             );
             assert_producers_build_the_unified_selection(&changed).unwrap_err()
         };
-        // A second Hermit link between the union build and preparation.
+        // A second Hermit link before the union build: the producer still
+        // ends with the union, so only the --bin hermit refusal catches it.
         let relinked = mutated(&|cmd| {
-            cmd.replace(
-                " && ./ci/nextest-binaries.rs prepare full",
-                " && cargo build --locked --profile validate -p hermit --bin hermit && ./ci/nextest-binaries.rs prepare full",
+            cmd.replacen(
+                "cargo build --locked --profile validate --workspace",
+                "cargo build --locked --profile validate -p hermit --bin hermit && cargo build --locked --profile validate --workspace",
+                1,
             )
         });
         assert!(
             relinked.contains("must end with its unified workspace build"),
             "{relinked}"
+        );
+        // A second whole-workspace build before the union build: caught only
+        // by the one-workspace-build count.
+        let doubled = mutated(&|cmd| {
+            cmd.replacen(
+                "cargo build --locked --profile validate --workspace",
+                "cargo build --locked --profile validate --workspace --all-targets && cargo build --locked --profile validate --workspace",
+                1,
+            )
+        });
+        assert!(
+            doubled.contains("must end with its unified workspace build"),
+            "{doubled}"
         );
         // A workspace build whose features are not the union.
         let narrowed = mutated(&|cmd| cmd.replace("hermit/kvm-execution-tests,", ""));

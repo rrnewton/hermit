@@ -319,6 +319,42 @@ runs, their stdout and their recorded event streams, and like every manifest
 cell a failed attempt is retried once; a passing retry passes the cell and the
 failed attempt's row is kept in the results.
 
+A `verify` mode may also declare, for a test whose recorded policy runs one
+specific configuration:
+
+```yaml
+      verify:
+        hermit_args: [--no-virtualize-cpuid, --max-timeslice=disabled]
+        hermit_args_reason: The corpus records this configuration
+        env: {TMPDIR: /tmp}
+        comparator: stripped
+        comparator_reason: The corpus verdict policy is Hermit's default --verify
+```
+
+- `hermit_args` are Hermit `run` flags added after the runner's own. Only
+  `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
+  relaxes determinism, so a non-empty `hermit_args_reason` is required and
+  every flag is recorded, with that reason, in the result row's
+  `relaxations`.
+- `env` adds guest variables as `--env NAME=VALUE` after the runner's fixed
+  guest environment; a name the runner sets (`HOME`, `TZ`, `LC_ALL`, ...) is
+  refused.
+- `comparator: stripped` runs Hermit's default `--verify` comparison instead of
+  `--verify-strict`. It is below L2. The cell passes only on a verified,
+  matched report that compared a non-empty stripped event stream on both
+  runs, never counts as bitwise parity, and cannot anchor a backend-parity
+  verdict. It requires a non-empty `comparator_reason`, is recorded in
+  `relaxations` as `comparator=stripped`, and is refused together with
+  `assert.bitwise_parity: true`. `strict` is the default. The scorecard's
+  verify-results gate still refuses any non-canonical PASS, so a stripped cell
+  cannot yet run in a lane whose results the scorecard admits.
+
+A test may carry `labels` (lowercase words joined by `-`, unique), naming the
+run types it belongs to. `test-harness run --label LABEL[,LABEL...]` keeps only
+the tests carrying at least one named label, so one bucket node can serve
+several run types. A label that no test carries is refused, so a typo cannot
+select nothing and pass.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;

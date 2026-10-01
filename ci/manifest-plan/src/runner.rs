@@ -263,6 +263,12 @@ pub struct TestRecipe {
     pub modes: BTreeMap<String, ModeRecipe>,
     #[serde(default)]
     pub preprocessors: Vec<String>,
+    /// The run types this test belongs to, such as `strict-compat`. A bucket
+    /// node selects with `test-harness run --label LABEL` the tests carrying
+    /// any of its labels, so one bucket serves several run types and each run
+    /// type keeps only its own tests.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -337,6 +343,61 @@ pub struct ModeRecipe {
     /// prints, so two runs that agree on output lacking it do not pass.
     #[serde(default)]
     pub expected_stdout_contains: BTreeMap<String, String>,
+    /// Hermit `run` flags a verify cell adds after the runner's own, for a test
+    /// whose recorded policy runs a specific configuration. Only the flags in
+    /// ALLOWED_HERMIT_ARGS are accepted, each relaxes determinism, so
+    /// `hermit_args_reason` is required and both are recorded as relaxations.
+    #[serde(default)]
+    pub hermit_args: Vec<String>,
+    pub hermit_args_reason: Option<String>,
+    /// Guest environment variables a verify cell adds, as `--env NAME=VALUE`,
+    /// after the runner's fixed guest environment. A name the runner sets is
+    /// refused rather than silently overridden.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// The comparison a verify cell's two runs must pass. `strict` (the
+    /// default) is the canonical full-observation comparison that can
+    /// establish L2. `stripped` is Hermit's default `--verify` comparison:
+    /// below L2, kept only for corpora whose recorded verdict policy is that
+    /// comparison, never counted as bitwise parity, and a relaxation that
+    /// requires `comparator_reason` and is recorded.
+    pub comparator: Option<Comparator>,
+    pub comparator_reason: Option<String>,
+}
+
+/// A stripped cell's report must hold the comparison it declared: Hermit's
+/// stripped log comparison over a non-empty event stream on both runs. A
+/// report without one is incomplete evidence, never a pass.
+fn require_stripped_comparison(report: &VerificationReport) -> Result<(), String> {
+    let counts = report.compared_log_messages.as_ref();
+    let Some(comparison) = report.comparison.as_ref() else {
+        return Err(format!(
+            "stripped verification recorded no comparison at all (verdict={})",
+            report.verdict
+        ));
+    };
+    if comparison.strictness == crate::canonical_verdict::LogCompareStrictness::Stripped
+        && comparison.compare_logs
+        && counts.is_some_and(|counts| counts.left > 0 && counts.right > 0)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "stripped verification did not compare non-vacuous stripped evidence: strictness={} compare_logs={} messages={}/{}",
+            comparison.strictness,
+            comparison.compare_logs,
+            counts.map_or(0, |counts| counts.left),
+            counts.map_or(0, |counts| counts.right),
+        ))
+    }
+}
+
+/// The comparison a verify cell requires; see [`ModeRecipe::comparator`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Comparator {
+    Strict,
+    Stripped,
 }
 
 /// The one nonzero guest disposition a verify cell requires.
@@ -999,6 +1060,8 @@ pub struct Selection {
     pub exclude_backends: Vec<String>,
     pub include_occasional: bool,
     pub include_manual: bool,
+    /// When non-empty, only tests carrying at least one of these labels.
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1157,6 +1220,16 @@ impl ManifestSet {
     }
 
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
+        // A label no test carries is a typo, not an empty run type: with
+        // --allow-empty it would otherwise select nothing and pass.
+        if let Some(label) = selection.labels.iter().find(|label| {
+            !self
+                .tests
+                .values()
+                .any(|(_, _, _, test)| test.labels.contains(label))
+        }) {
+            return Err(format!("--label {label} names no test in any manifest"));
+        }
         let population = selection.population.unwrap_or(Population::Enabled);
         let mut cells = Vec::new();
         for (id, (category, bucket_timeout_seconds, default_cpu_timeout_seconds, test)) in
@@ -1172,6 +1245,11 @@ impl ManifestSet {
                     .is_some_and(|value| value != category)
                 || selection.test.as_deref().is_some_and(|value| value != id)
                 || (!selection.include_occasional && test.occasional)
+                || (!selection.labels.is_empty()
+                    && !test
+                        .labels
+                        .iter()
+                        .any(|label| selection.labels.contains(label)))
             {
                 continue;
             }
@@ -1382,6 +1460,7 @@ fn validate_document_with_cpu(
         if actual != expected {
             return Err(format!("{}: modes must be exactly {expected:?}", test.id));
         }
+        validate_labels(&test.id, &test.labels)?;
         for (mode, recipe) in &test.modes {
             validate_mode_with_cpu(
                 &test.id,
@@ -1390,6 +1469,7 @@ fn validate_document_with_cpu(
                 bucket_timeout_seconds,
                 global_cpu_timeout_seconds,
             )?;
+            validate_mode_extensions(&test.id, mode, recipe)?;
         }
     }
     Ok(())
@@ -1645,6 +1725,17 @@ fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
                 .unwrap_or("reason missing")
         ));
     }
+    let reason =
+        |reason: &Option<String>| reason.as_deref().unwrap_or("reason missing").to_string();
+    for arg in &recipe.hermit_args {
+        relaxations.push(format!("{arg}: {}", reason(&recipe.hermit_args_reason)));
+    }
+    if recipe.comparator == Some(Comparator::Stripped) {
+        relaxations.push(format!(
+            "comparator=stripped: {}",
+            reason(&recipe.comparator_reason)
+        ));
+    }
     relaxations
 }
 
@@ -1679,6 +1770,9 @@ pub struct CellRunSpec {
     /// Text the captured verify stdout must contain, if declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_stdout_contains: Option<String>,
+    /// The comparison a verify cell's report must pass; always `Strict` for
+    /// every other mode.
+    pub comparator: Comparator,
     #[serde(skip)]
     attempt: String,
     #[serde(skip)]
@@ -2949,9 +3043,10 @@ pub fn build_spec(
                 "--base-env=minimal".into(),
                 "--strict".into(),
             ];
-            if context.run_verify_strict {
+            if context.run_verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
                 argv.push("--verify-strict".into());
             }
+            argv.extend(mode_recipe.hermit_args.iter().cloned());
             if mode_recipe.compare_io_buffers == Some(false) {
                 argv.push("--no-detlog-io-buffers".into());
             }
@@ -2990,6 +3085,9 @@ pub fn build_spec(
                 append_guest_env_args(&mut argv, &equalized_guest_env(&env), isolated);
             } else {
                 append_guest_env_args(&mut argv, &env, isolated);
+            }
+            for (name, value) in &mode_recipe.env {
+                argv.extend(["--env".into(), format!("{name}={value}")]);
             }
             argv.push("--".into());
             argv.extend(guest_argv.clone());
@@ -3114,6 +3212,11 @@ pub fn build_spec(
         expected_guest_exit: cell_expected_guest_exit(cell),
         expected_stdout: cell_expected_stdout(cell),
         expected_stdout_contains: cell_expected_stdout_contains(cell),
+        comparator: if cell.id.mode == "verify" {
+            mode_recipe.comparator.unwrap_or(Comparator::Strict)
+        } else {
+            Comparator::Strict
+        },
         attempt: attempt.into(),
         fixed_workdir_source,
         normalize_ptrace_golden: context.keep_logs,
@@ -3420,10 +3523,13 @@ fn execute_spec_until(
                                 }
                             }
                         } else if report.verdict == Verdict::InfrastructureError {
-                            let comparison_error = report
-                                .comparison
-                                .as_ref()
-                                .and_then(|_| report.require_canonical_comparison().err());
+                            let comparison_error = report.comparison.as_ref().and_then(|_| {
+                                match spec.comparator {
+                                    Comparator::Strict => report.require_canonical_comparison(),
+                                    Comparator::Stripped => require_stripped_comparison(&report),
+                                }
+                                .err()
+                            });
                             if let Some(error) = comparison_error {
                                 outcome = "ERROR".into();
                                 error_kind = Some("incomplete-verification-evidence".into());
@@ -3478,11 +3584,43 @@ fn execute_spec_until(
                                 spec.id.mode,
                                 output.status.code().unwrap()
                             ));
-                        } else if let Err(error) = report.require_canonical_comparison() {
+                        } else if let Some(error) = (spec.comparator == Comparator::Stripped)
+                            .then(|| require_stripped_comparison(&report).err())
+                            .flatten()
+                        {
                             outcome = "ERROR".into();
                             error_kind = Some("incomplete-verification-evidence".into());
                             reason = Some(error);
-                        } else if let Err(error) = report.require_canonical_match() {
+                        } else if spec.comparator == Comparator::Stripped
+                            && !(report.verified && report.verdict == Verdict::Matched)
+                        {
+                            // Hermit's default --verify comparison, declared by
+                            // the cell: it still requires a terminal matched
+                            // verdict, but it is below L2 and never canonical.
+                            outcome = "FAIL".into();
+                            reason = Some(format!(
+                                "stripped verification did not match: verified={} verdict={}",
+                                report.verified, report.verdict
+                            ));
+                        } else if let Some(error) = (spec.comparator == Comparator::Stripped)
+                            .then(|| report.require_exact_output_match().err())
+                            .flatten()
+                        {
+                            // The two runs' exact outputs must agree as well;
+                            // this does not depend on the log comparison.
+                            outcome = "FAIL".into();
+                            reason = Some(format!("stripped verification outputs: {error}"));
+                        } else if let Some(error) = (spec.comparator == Comparator::Strict)
+                            .then(|| report.require_canonical_comparison().err())
+                            .flatten()
+                        {
+                            outcome = "ERROR".into();
+                            error_kind = Some("incomplete-verification-evidence".into());
+                            reason = Some(error);
+                        } else if let Some(error) = (spec.comparator == Comparator::Strict)
+                            .then(|| report.require_canonical_match().err())
+                            .flatten()
+                        {
                             outcome = "FAIL".into();
                             reason = Some(error);
                         } else if let Some(Err(error)) = spec
@@ -5559,6 +5697,136 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+/// The guest environment the runner forwards to every Hermit cell. A
+/// manifest's `env` may add variables but never set one of these.
+const RUNNER_GUEST_ENV: [&str; 7] = [
+    "LC_ALL",
+    "TZ",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "E2E_TMPDIR",
+    "E2E_FIXTURE_DIR",
+    SCHEDULED_JOBS_ENV,
+];
+
+/// The Hermit `run` flags a manifest's `hermit_args` may add: exactly those a
+/// recorded test policy needs. Each relaxes determinism; an entry ending in `=`
+/// takes a value.
+const ALLOWED_HERMIT_ARGS: &[&str] = &["--no-virtualize-cpuid", "--max-timeslice="];
+
+/// Validate a mode's `hermit_args`, `env` and `comparator`.
+fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
+    let extends = !recipe.hermit_args.is_empty()
+        || recipe.hermit_args_reason.is_some()
+        || !recipe.env.is_empty()
+        || recipe.comparator.is_some()
+        || recipe.comparator_reason.is_some();
+    if extends && mode != "verify" {
+        return Err(format!(
+            "{id}: {mode} declares hermit_args, env or comparator, which only a verify mode accepts"
+        ));
+    }
+    for arg in &recipe.hermit_args {
+        let allowed = ALLOWED_HERMIT_ARGS
+            .iter()
+            .any(|flag| match flag.strip_suffix('=') {
+                Some(_) => arg
+                    .strip_prefix(flag)
+                    .is_some_and(|value| !value.is_empty()),
+                None => arg == flag,
+            });
+        if !allowed {
+            return Err(format!(
+                "{id}: hermit_args entry `{arg}` is not one of {ALLOWED_HERMIT_ARGS:?}"
+            ));
+        }
+    }
+    match (
+        recipe.hermit_args.is_empty(),
+        recipe.hermit_args_reason.as_deref().map(str::trim),
+    ) {
+        (true, None) => {}
+        (false, Some(reason)) if !reason.is_empty() => {}
+        (false, _) => {
+            return Err(format!(
+                "{id}: hermit_args relax determinism and require a substantive hermit_args_reason"
+            ));
+        }
+        (true, Some(_)) => {
+            return Err(format!("{id}: hermit_args_reason without hermit_args"));
+        }
+    }
+    for (name, value) in &recipe.env {
+        let well_formed = name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if !well_formed || value.contains('\0') {
+            return Err(format!(
+                "{id}: env entry `{name}` is not a valid NAME=VALUE"
+            ));
+        }
+        if RUNNER_GUEST_ENV.contains(&name.as_str()) {
+            return Err(format!(
+                "{id}: env entry `{name}` is a variable the runner sets itself"
+            ));
+        }
+    }
+    let stripped = recipe.comparator == Some(Comparator::Stripped);
+    match (stripped, recipe.comparator_reason.as_deref().map(str::trim)) {
+        (false, None) => {}
+        (true, Some(reason)) if !reason.is_empty() => {}
+        (true, _) => {
+            return Err(format!(
+                "{id}: comparator stripped is below L2 and requires a substantive comparator_reason"
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(format!(
+                "{id}: comparator_reason without comparator stripped"
+            ));
+        }
+    }
+    if stripped
+        && recipe
+            .assert
+            .as_ref()
+            .and_then(|assert| assert.bitwise_parity)
+            == Some(true)
+    {
+        return Err(format!(
+            "{id}: comparator stripped cannot establish the bitwise_parity it asserts"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a test's run-type labels: lowercase words joined by `-`, unique.
+fn validate_labels(id: &str, labels: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for label in labels {
+        let well_formed = !label.is_empty()
+            && label.split('-').all(|word| {
+                !word.is_empty()
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            });
+        if !well_formed {
+            return Err(format!(
+                "{id}: label `{label}` is not lowercase-words-with-dashes"
+            ));
+        }
+        if !seen.insert(label.as_str()) {
+            return Err(format!("{id}: label `{label}` is repeated"));
+        }
+    }
+    Ok(())
+}
+
 fn append_guest_env_args(
     argv: &mut Vec<String>,
     env: &BTreeMap<String, String>,
@@ -5567,15 +5835,7 @@ fn append_guest_env_args(
     // Every forwarded value is harness-authored, never inherited ambient state.
     // PWD and OLDPWD remain absent; E2E_TMPDIR joins the fresh /test mount while
     // HOME/XDG retain their unique per-cell directories and seeded config.
-    for name in [
-        "LC_ALL",
-        "TZ",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "E2E_TMPDIR",
-        "E2E_FIXTURE_DIR",
-        SCHEDULED_JOBS_ENV,
-    ] {
+    for name in RUNNER_GUEST_ENV {
         let value = if uses_test_workdir && name == "E2E_TMPDIR" {
             HERMETIC_TEST_WORKDIR
         } else {
@@ -6140,7 +6400,440 @@ mod tests {
             build: None,
             modes: BTreeMap::from([("verify".into(), mode)]),
             preprocessors: Vec::new(),
+            labels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn verify_extensions_are_verify_only_reasoned_and_allowlisted() {
+        let accepted = ModeRecipe {
+            backends_enabled: vec!["ptrace".into()],
+            hermit_args: vec![
+                "--no-virtualize-cpuid".into(),
+                "--max-timeslice=disabled".into(),
+            ],
+            hermit_args_reason: Some("the corpus records this configuration".into()),
+            env: BTreeMap::from([("TMPDIR".into(), "/tmp".into())]),
+            comparator: Some(Comparator::Stripped),
+            comparator_reason: Some("the corpus verdict policy is the stripped comparison".into()),
+            ..ModeRecipe::default()
+        };
+        validate_mode_extensions("fixture/test", "verify", &accepted).unwrap();
+        let refused = |change: &dyn Fn(&mut ModeRecipe), mode: &str, needle: &str| {
+            let mut recipe = accepted.clone();
+            change(&mut recipe);
+            let error = validate_mode_extensions("fixture/test", mode, &recipe).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        };
+        refused(&|_| {}, "replay", "only a verify mode accepts");
+        // Anything outside the allowlist, including every flag that would
+        // weaken the comparison or determinism by another route.
+        for flag in [
+            "--no-detlog-io-buffers",
+            "--no-rcb-time",
+            "--no-strict",
+            "--verify-allow=failure",
+            "--verify-verbose",
+            "--no-virtualize-time",
+            "--chaos",
+            "--epoch=1",
+            "--max-timeslice=",
+            "--no-virtualize-cpuid=1",
+            "true",
+        ] {
+            refused(
+                &|r| r.hermit_args = vec![flag.into()],
+                "verify",
+                "is not one of",
+            );
+        }
+        refused(
+            &|r| r.hermit_args_reason = None,
+            "verify",
+            "require a substantive hermit_args_reason",
+        );
+        refused(
+            &|r| r.hermit_args_reason = Some(" ".into()),
+            "verify",
+            "require a substantive hermit_args_reason",
+        );
+        refused(
+            &|r| r.hermit_args.clear(),
+            "verify",
+            "hermit_args_reason without hermit_args",
+        );
+        refused(
+            &|r| r.comparator_reason = None,
+            "verify",
+            "requires a substantive comparator_reason",
+        );
+        refused(
+            &|r| r.comparator = None,
+            "verify",
+            "comparator_reason without comparator stripped",
+        );
+        refused(
+            &|r| {
+                r.assert = Some(Assertions {
+                    bitwise_parity: Some(true),
+                    ..Assertions::default()
+                })
+            },
+            "verify",
+            "cannot establish the bitwise_parity",
+        );
+        for owned in RUNNER_GUEST_ENV {
+            refused(
+                &|r| r.env = BTreeMap::from([(owned.into(), "x".into())]),
+                "verify",
+                "a variable the runner sets itself",
+            );
+        }
+        refused(
+            &|r| r.env = BTreeMap::from([("lower".into(), "x".into())]),
+            "verify",
+            "not a valid NAME=VALUE",
+        );
+        // The validation is wired into document loading, not only callable.
+        let five_modes = || {
+            let mut test = recipe(true);
+            for mode in ["naked", "replay", "chaos", "custom"] {
+                let backends: &[&str] = if mode == "naked" {
+                    &["native"]
+                } else {
+                    &["ptrace", "dbt", "kvm", "sabre", "liteinst"]
+                };
+                test.modes.insert(
+                    mode.into(),
+                    ModeRecipe {
+                        ci: CiSelectionSpec::Uniform(false),
+                        ci_disabled_reason: Some(CiDisabledReasonSpec::Uniform(
+                            "fixture cell: only the verify mode is measured here".into(),
+                        )),
+                        backends_disabled: backends
+                            .iter()
+                            .map(|backend| ((*backend).into(), "fixture mode is not run".into()))
+                            .collect(),
+                        ..ModeRecipe::default()
+                    },
+                );
+            }
+            test
+        };
+        let document = ManifestDocument {
+            schema: MANIFEST_SCHEMA,
+            bucket: "fixture".into(),
+            timeout_seconds: None,
+            slow_reason: None,
+            test: vec![five_modes()],
+        };
+        validate_document_with_cpu(
+            &document,
+            "fixture",
+            Path::new("/"),
+            15,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        )
+        .unwrap();
+        let mut test = five_modes();
+        test.modes.get_mut("verify").unwrap().hermit_args = vec!["--chaos".into()];
+        let document = ManifestDocument {
+            test: vec![test],
+            ..document
+        };
+        let error = validate_document_with_cpu(
+            &document,
+            "fixture",
+            Path::new("/"),
+            15,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        )
+        .unwrap_err();
+        assert!(error.contains("is not one of"), "{error}");
+        let mut labelled = five_modes();
+        labelled.labels = vec!["Bad".into()];
+        let error = validate_document_with_cpu(
+            &ManifestDocument {
+                test: vec![labelled],
+                ..document
+            },
+            "fixture",
+            Path::new("/"),
+            15,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("is not lowercase-words-with-dashes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn declared_relaxations_are_recorded_on_the_cell() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.hermit_args = vec!["--no-virtualize-cpuid".into()];
+        mode.hermit_args_reason = Some("corpus configuration".into());
+        mode.comparator = Some(Comparator::Stripped);
+        mode.comparator_reason = Some("corpus verdict policy".into());
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
+        };
+        assert_eq!(
+            cell_relaxations(&cell),
+            [
+                "--no-virtualize-cpuid: corpus configuration",
+                "comparator=stripped: corpus verdict policy"
+            ]
+        );
+    }
+
+    #[test]
+    fn labels_are_lowercase_dashed_words_and_unique() {
+        validate_labels("t", &["strict-compat".into(), "full".into(), "rr2".into()]).unwrap();
+        for bad in [
+            vec!["Full"],
+            vec!["a--b"],
+            vec!["-a"],
+            vec![""],
+            vec!["a b"],
+            vec!["x", "x"],
+        ] {
+            let labels = bad.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+            assert!(validate_labels("t", &labels).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn labels_select_only_the_tests_that_carry_them() {
+        let mut strict = recipe(true);
+        strict.id = "fixture/strict".into();
+        strict.labels = vec!["strict-compat".into(), "full".into()];
+        let mut plain = recipe(true);
+        plain.id = "fixture/plain".into();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: [strict, plain]
+                .into_iter()
+                .map(|test| {
+                    (
+                        test.id.clone(),
+                        ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+                    )
+                })
+                .collect(),
+        };
+        let selected = |labels: &[&str]| {
+            set.select(&Selection {
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.test)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(&[]), ["fixture/plain", "fixture/strict"]);
+        assert_eq!(selected(&["full"]), ["fixture/strict"]);
+        assert_eq!(selected(&["strict-compat", "full"]), ["fixture/strict"]);
+        let error = set
+            .select(&Selection {
+                labels: vec!["full".into(), "super".into()],
+                ..Selection::default()
+            })
+            .unwrap_err();
+        assert_eq!(error, "--label super names no test in any manifest");
+    }
+
+    fn extended_verify_spec(comparator: Option<Comparator>) -> CellRunSpec {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.hermit_args = vec!["--no-virtualize-cpuid".into()];
+        mode.hermit_args_reason = Some("fixture configuration".into());
+        mode.env = BTreeMap::from([("TMPDIR".into(), "/tmp".into())]);
+        mode.comparator = comparator;
+        mode.comparator_reason = comparator.map(|_| "fixture policy".into());
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
+        };
+        let context = RunContext {
+            root: PathBuf::from("/repo"),
+            hermit_bin: PathBuf::from("/repo/hermit"),
+            result_root: PathBuf::from("/repo/results"),
+            build_root: PathBuf::from("/repo/build"),
+            run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
+            attempt: 1,
+            run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            parity_retained: BTreeSet::new(),
+            run_verify_strict: true,
+            record_verify_strict: true,
+            timeout_multipliers: TimeoutMultipliers::default(),
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            cell.timeout_seconds,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_verify_cell_carries_its_hermit_args_env_and_comparator() {
+        let strict = extended_verify_spec(None);
+        let at = |argv: &[String], arg: &str| argv.iter().position(|a| a == arg);
+        let separator = at(&strict.argv, "--").unwrap();
+        let flag = at(&strict.argv, "--no-virtualize-cpuid").unwrap();
+        assert!(
+            at(&strict.argv, "--strict").unwrap() < flag
+                && flag < at(&strict.argv, "--verify").unwrap()
+        );
+        let env = strict
+            .argv
+            .windows(2)
+            .position(|w| w == ["--env", "TMPDIR=/tmp"])
+            .unwrap();
+        let home = strict
+            .argv
+            .iter()
+            .position(|a| a.starts_with("HOME="))
+            .unwrap();
+        assert!(home < env && env < separator, "{:?}", strict.argv);
+        assert!(at(&strict.argv, "--verify-strict").is_some());
+        assert_eq!(strict.comparator, Comparator::Strict);
+
+        let stripped = extended_verify_spec(Some(Comparator::Stripped));
+        assert!(
+            at(&stripped.argv, "--verify-strict").is_none(),
+            "{:?}",
+            stripped.argv
+        );
+        assert!(at(&stripped.argv, "--verify").is_some());
+        assert_eq!(stripped.comparator, Comparator::Stripped);
+    }
+
+    /// The report the real Hermit wrote for `run --strict --verify
+    /// --base-env=minimal -- /bin/echo hermit-compat` at hermit d44bbbb79acd
+    /// (validate profile): its default, stripped comparison.
+    const PRODUCER_STRIPPED_REPORT: &str = r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","no_result_reason":null,"infrastructure_error":null,"comparison":{"strictness":"stripped","display_name":"Stripped","compare_logs":true,"compare_io_buffers":true,"log_scope":"deterministic","record_envelope":"all_records_v1","virtualize_time":true,"strip_lines":true,"canonicalize_addresses":false,"full_trace":false,"exact_remainder":false,"stripped_prefixes":["real-wall-clock-prefix/v1","unsafe-numeric-address-and-path-normalization/v1"],"canonicalizations":[],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":243,"right":243},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0},"right":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0}},"runtime":{"run1":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40},"run2":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40}},"guest_exit_code":0,"guest_signal":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_left_message":null,"first_divergent_right_message":null}"#;
+
+    #[test]
+    fn a_stripped_cell_passes_only_a_matched_report_and_a_strict_one_still_needs_canonical() {
+        let matched: VerificationReport = serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        assert_eq!(
+            matched.comparison.as_ref().unwrap().strictness,
+            crate::canonical_verdict::LogCompareStrictness::Stripped
+        );
+        let pass = attempt_with_report(None, Comparator::Stripped, matched.clone(), "exit 0", 5);
+        assert_eq!(pass.outcome, "PASS", "{:?}", pass.reason);
+        // The same below-L2 report never passes a strict cell.
+        let strict = attempt_with_report(None, Comparator::Strict, matched.clone(), "exit 0", 5);
+        assert_ne!(strict.outcome, "PASS", "{:?}", strict.reason);
+
+        // A report without the declared, non-empty stripped comparison is
+        // incomplete evidence, not a pass.
+        for vacuous in [
+            {
+                let mut report = matched.clone();
+                report.compared_log_messages.as_mut().unwrap().left = 0;
+                report
+            },
+            {
+                let mut report = matched.clone();
+                report.comparison.as_mut().unwrap().compare_logs = false;
+                report
+            },
+            {
+                let mut report = matched.clone();
+                report.comparison.as_mut().unwrap().strictness =
+                    crate::canonical_verdict::LogCompareStrictness::Canonical;
+                report
+            },
+            {
+                let mut report = matched.clone();
+                report.compared_log_messages.as_mut().unwrap().right = 0;
+                report
+            },
+        ] {
+            let result = attempt_with_report(None, Comparator::Stripped, vacuous, "exit 0", 5);
+            assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+            assert!(
+                result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("non-vacuous stripped evidence")),
+                "{:?}",
+                result.reason
+            );
+        }
+
+        let mut uncompared = matched.clone();
+        uncompared.comparison = None;
+        let result = attempt_with_report(None, Comparator::Stripped, uncompared, "exit 0", 5);
+        assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+
+        // Matched logs with different outputs is not a pass either: the
+        // report reader already refuses such a report as unreadable evidence.
+        let mut outputs_differ = matched.clone();
+        outputs_differ
+            .compared_outputs
+            .as_mut()
+            .unwrap()
+            .right
+            .stdout_bytes += 1;
+        let result = attempt_with_report(None, Comparator::Stripped, outputs_differ, "exit 0", 5);
+        assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("operands differ")),
+            "{:?}",
+            result.reason
+        );
+
+        let mut diverged = matched;
+        diverged.verified = false;
+        diverged.verdict = Verdict::Diverged;
+        let fail = attempt_with_report(None, Comparator::Stripped, diverged, "exit 1", 5);
+        assert_eq!(fail.outcome, "FAIL");
+        assert_eq!(
+            fail.reason.as_deref(),
+            Some("stripped verification did not match: verified=false verdict=diverged")
+        );
     }
 
     /// ⚠️ "NO CELLS" AND "NO SUCH TEST" ARE DIFFERENT ANSWERS, AND `select` GIVES
@@ -6957,6 +7650,7 @@ mod tests {
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -7687,6 +8381,7 @@ mod tests {
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -11062,6 +11757,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -11110,6 +11806,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -11491,6 +12188,23 @@ exit "$(cat "$PWD/exit-status")"
         ending: &str,
         timeout_seconds: u64,
     ) -> AttemptResult {
+        attempt_with_report(
+            Some(expected),
+            Comparator::Strict,
+            report,
+            ending,
+            timeout_seconds,
+        )
+    }
+
+    /// [`attempt_with_expected_exit_report`] for any declared exit and comparator.
+    fn attempt_with_report(
+        expected: Option<ExpectedGuestExit>,
+        comparator: Comparator,
+        report: VerificationReport,
+        ending: &str,
+        timeout_seconds: u64,
+    ) -> AttemptResult {
         let dir = std::env::temp_dir().join(format!(
             "hermit-runner-expected-exit-{}-{:?}",
             std::process::id(),
@@ -11523,9 +12237,10 @@ exit "$(cat "$PWD/exit-status")"
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
-            expected_guest_exit: Some(expected),
+            expected_guest_exit: expected,
             expected_stdout: None,
             expected_stdout_contains: None,
+            comparator,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -11915,6 +12630,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             expected_stdout: exact.map(str::to_string),
             expected_stdout_contains: contains.map(str::to_string),
+            comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -12552,6 +13268,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,

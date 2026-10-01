@@ -2261,6 +2261,21 @@ fn retained_operand(
             .to_string()
     };
     match row.outcome.as_str() {
+        // A stripped-comparator PASS is below L2: it does not establish the
+        // same-backend canonical determinism a parity comparison stands on.
+        "PASS"
+            if row
+                .relaxations
+                .iter()
+                .any(|relaxation| relaxation.starts_with("comparator=stripped")) =>
+        {
+            return Err(unusable(
+                ParityVerdict::Unavailable,
+                format!(
+                    "the {role} verify cell of {test} passed only the stripped comparison, which is below L2"
+                ),
+            ));
+        }
         "PASS" => {}
         "HOST-INAPPLICABLE" => {
             return Err(unusable(
@@ -3969,6 +3984,13 @@ mod tests {
             fixture.row("fx/nolog", "kvm", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/failed", "ptrace", 1, "FAIL", Some(REFERENCE)),
             fixture.row("fx/failed", "kvm", 1, "PASS", Some(REFERENCE)),
+            {
+                // A stripped-comparator pass is below L2 and anchors nothing.
+                let mut stripped = fixture.row("fx/stripped", "ptrace", 1, "PASS", Some(REFERENCE));
+                stripped.relaxations = vec!["comparator=stripped: fixture policy".into()];
+                stripped
+            },
+            fixture.row("fx/stripped", "kvm", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/inapplicable", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/inapplicable", "kvm", 1, "HOST-INAPPLICABLE", None),
             fixture.row("fx/candidate-failed", "ptrace", 1, "PASS", Some(REFERENCE)),
@@ -4000,6 +4022,7 @@ mod tests {
             parity_cell("fx/same", ParityBackend::Dbt),
             parity_cell("fx/nolog", ParityBackend::Kvm),
             parity_cell("fx/failed", ParityBackend::Kvm),
+            parity_cell("fx/stripped", ParityBackend::Kvm),
             parity_cell("fx/inapplicable", ParityBackend::Kvm),
             parity_cell("fx/candidate-failed", ParityBackend::Kvm),
             parity_cell("fx/not-retained", ParityBackend::Kvm),
@@ -4109,6 +4132,12 @@ mod tests {
                 "ptrace reference verify cell of fx/failed failed determinism: fixture FAIL",
             ),
             (
+                "fx/stripped",
+                ParityBackend::Kvm,
+                ParityVerdict::Unavailable,
+                "passed only the stripped comparison, which is below L2",
+            ),
+            (
                 "fx/inapplicable",
                 ParityBackend::Kvm,
                 ParityVerdict::CandidateMissing,
@@ -4209,8 +4238,8 @@ mod tests {
         );
         let summary = report.summary_line();
         for part in [
-            "9 cell(s)",
-            "matched 1, diverged 1, reference-missing 1, candidate-missing 3, unavailable 2, inputs-not-equalized 1",
+            "10 cell(s)",
+            "matched 1, diverged 1, reference-missing 1, candidate-missing 3, unavailable 3, inputs-not-equalized 1",
             "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
             "2 log-diff comparison(s), 0 guest runs",
         ] {
