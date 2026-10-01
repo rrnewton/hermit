@@ -193,6 +193,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "e2e.manifest_system_utils_on_host",
     "e2e.manifest_util_c",
     "e2e.manifest_util_c_on_host",
+    "portablecompat.manifest_compat",
     "privileged-e2e.manifest_applications",
     "privileged-e2e.manifest_c_programs",
     "privileged-e2e.manifest_system_utils",
@@ -396,7 +397,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and test-harness a_no_retry_cell_is_not_retried_after_a_product_failure)
     // retain all 757 prior identities.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
-    ("test.regular_crates", 764),
+    // runner::tests::a_relative_hermit_bin_names_a_checkout_path, added when the
+    // portable-strict-compat-only lane became one manifest bucket (fold 2 of
+    // https://github.com/rrnewton/hermit/issues/3448), retains all 764 prior
+    // identities.
+    ("test.regular_crates", 765),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -578,7 +583,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.liteinst_strict_on_host", 27),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
-    ("test.regular_crates_on_host", 764),
+    // The fold-2 resolver test retains all 764 prior identities.
+    ("test.regular_crates_on_host", 765),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -2095,6 +2101,54 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"HERMIT_E2E_EMPTY_WORKDIR"########,
             r########"/test"########,
         )],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 120.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(6442450944),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
+        cpu_timeout: 1800,
+        jobs_flag: Some(r########"--jobs"########),
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"portablecompat"########,
+        job: r########"manifest_compat"########,
+        desc: r########"The strict compatibility corpus against this lane's release Hermit"########,
+        description: r########"The portable-strict-compat-only run type: the same compat.yaml bucket and selector as e2e.manifest_compat, run on the host against the release Hermit that compatprep.hermit_release_in_pinned_root builds, which the pinned root writes under ignored/hermetic/split/target (HERMIT_BIN=ignored/hermetic/split/target/release/hermit, resolved under the checkout; the harness probes the binary before any cell, so one that cannot run on the host fails every cell rather than passing) and the fixtures portablecompatprep.fixtures writes under $VALIDATE_RUN_STATE/strict-compat, so a corpus-only check needs one release build instead of the full profile's workspace build and test barrier. Each row is one ptrace verify cell under the corpus's portable flags and stripped comparison, and the bucket's diagnostic rows report through dagrun schema 4. A program that diverges or fails under the release Hermit turns it red; until 2026-10-01 these rows were 189 separate portablecompat.<program> nodes."########,
+        labels: &[r########"portable-strict-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmdtype: CmdType::Unknown,
+        manifest: Some(ManifestSpec {
+            lane: r########"portable"########,
+            category: r########"compat"########,
+            test: None,
+            mode: None,
+            backend: None,
+        }),
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.rust_scripts"########,
+            r########"gate.manifest"########,
+            r########"portablecompatprep.fixtures"########,
+        ],
+        env: &[
+            (
+                r########"HERMIT_BIN"########,
+                r########"ignored/hermetic/split/target/release/hermit"########,
+            ),
+            (
+                r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+                r########"/test"########,
+            ),
+        ],
         hint: HintSpec {
             resources: &[(r########"manifest_guest"########, 8)],
             est_duration_s: 120.0,

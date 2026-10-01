@@ -1165,7 +1165,7 @@ fn usage() -> &'static str {
      \n\
      Focused gates (run one matrix/lane and exit):\n\
      \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
-     \x20 --portable-strict-compat-only Portable legacy stripped matrix with bounded diagnostics.\n\
+     \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
@@ -7148,13 +7148,41 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         } else {
             ""
         };
+        // The second admitted launcher. The portable-strict-compat-only run
+        // type's one bucket runs the pinned-root release Hermit on the host,
+        // named by exactly PORTABLE_FOCUSED_HERMIT_BIN, so it has no
+        // e2e-artifact wrapper. Only a step labelled exactly with that run type
+        // takes this form, and no other publisher may set HERMIT_BIN, which
+        // the wrapper owns.
+        let hermit_bin = step.env.get("HERMIT_BIN").map(String::as_str);
+        let launcher = if step
+            .labels
+            .iter()
+            .map(String::as_str)
+            .eq(["portable-strict-compat-only"])
+        {
+            if hermit_bin
+                != Some(hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_HERMIT_BIN)
+            {
+                return Err(format!(
+                    "{tag} must run HERMIT_BIN={}",
+                    hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_HERMIT_BIN
+                ));
+            }
+            String::new()
+        } else {
+            if hermit_bin.is_some() {
+                return Err(format!("{tag} overrides the e2e artifact's HERMIT_BIN"));
+            }
+            format!("./ci/run-with-hermit-e2e-artifact.sh {install}")
+        };
         // A fail-closed bucket omits --allow-empty; the generator and this
         // check read the one list in hermit_manifest_plan.
         let selector =
             hermit_manifest_plan::validation_dag::manifest_selector_flags(&manifest.category);
         (
             format!(
-                "./ci/run-with-hermit-e2e-artifact.sh {install}target/debug/test-harness run \
+                "{launcher}target/debug/test-harness run \
             --lane {} --category {} {selector}{exclusions}{jobs} \
             --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
             --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
@@ -11005,9 +11033,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         }
         let (compat, compat_prefix) = match label {
             "strict-compat-only" => (Some(CompatMode::Strict), Some("strictcompat.")),
-            "portable-strict-compat-only" => {
-                (Some(CompatMode::PortableStrict), Some("portablecompat."))
-            }
             "rr-compat-only" => (Some(CompatMode::Rr), Some("rrcompat.")),
             "sabre-compat-only" => (Some(CompatMode::Sabre), Some("sabrecompat.")),
             "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
@@ -11093,7 +11118,13 @@ fn generated_focused_compat_partition(
     namespace: &str,
     label: &str,
 ) -> Result<Vec<Step>, String> {
-    let run_root = tmp.join(namespace);
+    // The portable focused lane runs the compat.yaml bucket, whose rows read
+    // their fixtures under $VALIDATE_RUN_STATE/strict-compat.
+    let run_root = if mode == CompatMode::PortableStrict {
+        tmp.join("strict-compat")
+    } else {
+        tmp.join(namespace)
+    };
     let fixtures = run_root.join("real-compat-fixtures");
     let shell_build = run_root.join("shell-build");
     let nsswitch = run_root.join("nsswitch.conf");
@@ -11107,6 +11138,13 @@ fn generated_focused_compat_partition(
     let mut prep = prepare_fixtures_node_dep(&prep_tag, &fixtures, "compatprep.hermit_release");
     prep.group = format!("{namespace}prep");
     prep.labels = vec![label.into()];
+    if mode == CompatMode::PortableStrict {
+        prep.desc = "Prepare the fixture files the corpus-only lane's compat bucket reads".into();
+        prep.description = format!(
+            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
+            fixtures.display()
+        );
+    }
 
     let mut steps = Vec::new();
     if mode == CompatMode::E9patch {
@@ -11137,6 +11175,11 @@ fn generated_focused_compat_partition(
         steps.push(nss);
     }
     steps.push(prep);
+    if mode == CompatMode::PortableStrict {
+        // The rows themselves are tests/e2e/manifests/compat.yaml, run by the
+        // static bucket node portablecompat.manifest_compat.
+        return Ok(steps);
+    }
     let mut probes = validate_plan::compat_nodes(
         root,
         mode,
@@ -11222,12 +11265,10 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     portable_prep.desc =
         "Prepare the fixture files the portable strict compatibility corpus reads".into();
     portable_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {}: a copy of README.md, \
-         compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's \
-         mount fixture, and cargo/rustc links into the active toolchain, so the corpus \
-         rows of e2e.manifest_compat read run-owned files instead of the checkout. It \
-         starts after every non-guest Cargo node so the corpus's shell-build row cannot \
-         observe a concurrent target or cache mutation.",
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {}: {REAL_COMPAT_FIXTURE_CONTENTS}, \
+         so the corpus rows of e2e.manifest_compat read run-owned files instead of the \
+         checkout. It starts after every non-guest Cargo node so the corpus's shell-build \
+         row cannot observe a concurrent target or cache mutation.",
         portable_fixtures.display()
     );
     portable_prep.labels = vec!["full".into(), "portable".into()];
@@ -11460,6 +11501,10 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     }
     step
 }
+
+/// What tests/compat/prepare_real_compat_fixtures.sh writes, for the paragraphs
+/// of the nodes that run it.
+const REAL_COMPAT_FIXTURE_CONTENTS: &str = "a copy of README.md, compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's mount fixture, and cargo/rustc links into the active toolchain";
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
@@ -16030,8 +16075,11 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // (https://github.com/rrnewton/hermit/actions/runs/36485831200). 36
         // since e2e.manifest_compat and e2e.manifest_compat_on_host replaced
         // the per-program compat nodes (fold 1 of
-        // https://github.com/rrnewton/hermit/issues/3448).
-        assert_eq!(steps.len(), 36);
+        // https://github.com/rrnewton/hermit/issues/3448). 37 since
+        // portablecompat.manifest_compat replaced the 189 generated
+        // portablecompat.<program> probes of the portable-strict-compat-only
+        // run type (fold 2 of the same issue).
+        assert_eq!(steps.len(), 37);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -19645,13 +19693,14 @@ fn compat_test_results(
 }
 
 /// Add a focused compatibility lane's direct rows (`strictcompat.*`,
-/// `portablecompat.*`, ...) to the exact test denominator.
+/// `sabrecompat.*`, ...) to the exact test denominator.
 ///
 /// Before those lanes were flattened, a nested validate published a single
 /// structured-count file to one outer step. The direct steps already carry
 /// stronger typed terminal outcomes and attempts, so the outer producer now
-/// consumes those facts itself. (The portable strict corpus in the full and
-/// portable profiles reports through e2e.manifest_compat instead.) A failed
+/// consumes those facts itself. (The portable strict corpus reports through
+/// its manifest bucket instead: e2e.manifest_compat, and
+/// portablecompat.manifest_compat in the corpus-only lane.) A failed
 /// count-bearing non-compatibility node still leaves the passed count unknown;
 /// flattening must not turn an inexact base count into an exact-looking total.
 fn run_test_counts(
@@ -29390,8 +29439,11 @@ mod raw_census_publication_tests {
         // (https://github.com/rrnewton/hermit/actions/runs/36485831200). 36
         // since e2e.manifest_compat and e2e.manifest_compat_on_host replaced
         // the per-program compat nodes (fold 1 of
-        // https://github.com/rrnewton/hermit/issues/3448).
-        assert_eq!(publishers.len(), 36);
+        // https://github.com/rrnewton/hermit/issues/3448). 37 since
+        // portablecompat.manifest_compat replaced the 189 generated
+        // portablecompat.<program> probes of the portable-strict-compat-only
+        // run type (fold 2 of the same issue).
+        assert_eq!(publishers.len(), 37);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(
@@ -29499,6 +29551,35 @@ mod raw_census_publication_tests {
                 );
             }
         }
+        // The wrapper-less launcher belongs only to the focused run type's
+        // bucket, and only with the pinned-root HERMIT_BIN.
+        let focused = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "portablecompat.manifest_compat")
+            .unwrap();
+        let mut wrong_bin = focused.clone();
+        wrong_bin
+            .env
+            .insert("HERMIT_BIN".into(), "target/release/hermit".into());
+        assert!(normal_raw_result_path(&wrong_bin, "fixture-run").is_err());
+        let mut no_bin = focused.clone();
+        no_bin.env.remove("HERMIT_BIN");
+        assert!(normal_raw_result_path(&no_bin, "fixture-run").is_err());
+        let mut relabelled = focused.clone();
+        relabelled.labels = vec!["full".into()];
+        assert!(normal_raw_result_path(&relabelled, "fixture-run").is_err());
+        let mut overridden = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_compat")
+            .unwrap()
+            .clone();
+        overridden.env.insert(
+            "HERMIT_BIN".into(),
+            hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_HERMIT_BIN.into(),
+        );
+        assert!(normal_raw_result_path(&overridden, "fixture-run").is_err());
         let mut wrong_tag = cfg
             .steps
             .iter()

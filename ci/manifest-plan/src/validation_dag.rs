@@ -378,7 +378,7 @@ struct Profile {
 // full, portable and hosted-portable then replaced 189 compat.<program> nodes
 // with one e2e.manifest_compat bucket (its hosted twin for hosted-portable):
 // 274/275, 261/262 and 255/255 before.
-const PROFILES: [Profile; 7] = [
+const PROFILES: [Profile; 8] = [
     Profile {
         label: "full",
         direct_steps: 86,
@@ -413,6 +413,13 @@ const PROFILES: [Profile; 7] = [
         label: HOSTED_PRIVILEGED_LABEL,
         direct_steps: 13,
         selected_steps: 13,
+    },
+    // The corpus-only run type: its release build, fixtures and bucket, plus
+    // the gate and producers they need.
+    Profile {
+        label: "portable-strict-compat-only",
+        direct_steps: 3,
+        selected_steps: 10,
     },
 ];
 
@@ -686,14 +693,16 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 /// Manifest bucket nodes that run on the validation host rather than in the
 /// pinned root: the compatibility corpus exercises programs installed on the
 /// host, 31 of which the pinned image does not carry.
-pub const HOST_MANIFEST_RUNS: &[&str] = &["e2e.manifest_compat"];
+pub const HOST_MANIFEST_RUNS: &[&str] = &["e2e.manifest_compat", "portablecompat.manifest_compat"];
+
+/// The release Hermit compatprep.hermit_release_in_pinned_root builds, as the
+/// host sees it: the pinned root's /src/target is ignored/hermetic/split/target.
+pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/release/hermit";
 
 fn runs_in_pinned_root(step: &Step) -> bool {
     !is_hosted_variant(step)
         && !HOST_MANIFEST_RUNS.contains(&step.tag().as_str())
-        && (is_manifest_run(step)
-            || PINNED_ROOT_EXECUTION_STEPS.contains(&step.tag().as_str())
-            || matches!(step.group.as_str(), "portablecompat" | "portablecompatprep"))
+        && (is_manifest_run(step) || PINNED_ROOT_EXECUTION_STEPS.contains(&step.tag().as_str()))
 }
 
 /// The host-side name of the one Hermit binary that build.e2e_artifact publishes
@@ -729,6 +738,13 @@ fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), Strin
                 return Err(format!(
                     "local host step {tag} depends on build.workspace; only the pinned root builds Hermit"
                 ));
+            }
+            // The corpus-only lane builds its release Hermit in the pinned
+            // root; the host producer drops that lane's label.
+            if dependency == "compatprep.hermit_release"
+                && step.labels == ["portable-strict-compat-only"]
+            {
+                *dependency = pinned_root_twin_tag("compatprep.hermit_release");
             }
             if dependency == "build.e2e_artifact" {
                 *dependency = if tag == HOST_HERMIT_LINK_TAG {
@@ -1467,7 +1483,9 @@ enum GeneratedPartition {
 
 fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
     match step.group.as_str() {
-        "portablecompat" | "portablecompatprep" => {
+        // The focused lane's corpus is the static bucket node
+        // portablecompat.manifest_compat; only its fixtures are generated.
+        "portablecompatprep" => {
             return Some(GeneratedPartition::PortableFocusedCompat);
         }
         "strictcompat" | "strictcompatprep" => return Some(GeneratedPartition::StrictCompat),
@@ -1520,7 +1538,9 @@ fn refresh_generated_partitions(
         // 1 since the portable strict corpus became the manifest bucket
         // e2e.manifest_compat on 2026-10-01: only compatprep.fixtures remains.
         (GeneratedPartition::PortableCompat, 1usize),
-        (GeneratedPartition::PortableFocusedCompat, 190usize),
+        // 1 since the focused portable lane runs the same bucket through the
+        // static node portablecompat.manifest_compat: only its fixtures remain.
+        (GeneratedPartition::PortableFocusedCompat, 1usize),
         (GeneratedPartition::StrictCompat, 194usize),
         (GeneratedPartition::SabreCompat, 213usize),
         // 175 since the one-build change of 2026-09-30 added
@@ -1630,11 +1650,12 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    // 109 since e2e.manifest_compat and its hosted twin joined the
-    // test-harness producers (2026-10-01).
-    if expected.len() != 109 {
+    // 110 since portablecompat.manifest_compat, the focused lane's corpus
+    // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
+    // joined the test-harness producers (2026-10-01).
+    if expected.len() != 110 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 109",
+            "structured result producer registry has {} entries, expected 110",
             expected.len()
         ));
     }
@@ -1769,8 +1790,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    // TestHarness 34 -> 36 with the compat bucket and its hosted twin.
-    if actual_group_counts != [69, 36, 2, 2] {
+    // TestHarness 34 -> 36 with the compat bucket and its hosted twin, and
+    // 37 with the focused lane's portablecompat.manifest_compat.
+    if actual_group_counts != [69, 37, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1829,6 +1851,8 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
             HOSTED_PRIVILEGED_LABEL => cell.lane == "privileged",
             "privileged" => cell.lane == "privileged",
             "quick" => quick_verify_cell(cell),
+            // The corpus-only run type runs exactly the strict compatibility bucket.
+            "portable-strict-compat-only" => cell.lane == "portable" && cell.category == "compat",
             "super" => false,
             _ => false,
         })
@@ -2270,9 +2294,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // check.lint_checks. 1240 since the 189 compat.<program> nodes and their
     // 189 hosted twins became e2e.manifest_compat and its hosted twin
     // (2026-10-01).
-    if cfg.steps.len() != 1240 {
+    // 1052 since the 189 portablecompat.<program> nodes became the one
+    // bucket portablecompat.manifest_compat (1240 - 189 + 1).
+    if cfg.steps.len() != 1052 {
         return Err(format!(
-            "superset has {} steps, expected 1240",
+            "superset has {} steps, expected 1052",
             cfg.steps.len()
         ));
     }
@@ -2586,6 +2612,25 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         })
         .map(Step::tag)
         .collect::<Vec<_>>();
+    // The corpus-only bucket runs the release Hermit its own lane builds in the
+    // pinned root, which writes under ignored/hermetic/split/target; a host
+    // target/ path would run whatever stale binary the checkout holds.
+    if let Some(step) = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "portablecompat.manifest_compat")
+    {
+        if step.env.get("HERMIT_BIN").map(String::as_str) != Some(PORTABLE_FOCUSED_HERMIT_BIN)
+            || !step
+                .deps
+                .iter()
+                .any(|dep| dep == "portablecompatprep.fixtures")
+        {
+            return Err(format!(
+                "portablecompat.manifest_compat must run HERMIT_BIN={PORTABLE_FOCUSED_HERMIT_BIN}, the pinned-root release build, after portablecompatprep.fixtures"
+            ));
+        }
+    }
     if !missing_rust_script_dep.is_empty() {
         return Err(format!(
             "local manifest nodes lost their direct rust-script producer dependency: {}",
@@ -4029,6 +4074,20 @@ sys.exit(37)
             error.ends_with(
                 "lost their direct rust-script producer dependency: e2e.manifest_compat"
             ),
+            "{error}"
+        );
+
+        let mut planted_stale_release = committed.clone();
+        planted_stale_release
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "portablecompat.manifest_compat")
+            .unwrap()
+            .env
+            .insert("HERMIT_BIN".into(), "target/release/hermit".into());
+        let error = assert_invariants(&planted_stale_release, &cells).unwrap_err();
+        assert!(
+            error.starts_with("portablecompat.manifest_compat must run HERMIT_BIN="),
             "{error}"
         );
 
