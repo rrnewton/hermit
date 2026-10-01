@@ -794,7 +794,7 @@ static void reset(struct ap_session *s,int returned) {
         metadata_stream_links[i]=(struct bpf_link){i,(int)link};
         s->links[i]=&metadata_stream_links[i];s->stream_link[i]=i;s->stream_program[i]=(int)program;
         s->link_identity[i]=(struct ap_link_identity){i<2?BPF_LINK_TYPE_KPROBE_MULTI:BPF_LINK_TYPE_PERF_EVENT,
-            link,program};
+            link,program,BPF_PROG_TYPE_KPROBE};
     }
     info_bad=info_fail_at=0;
     s->tasks=TASKS;s->commands=COMMANDS;s->status=STATUS;

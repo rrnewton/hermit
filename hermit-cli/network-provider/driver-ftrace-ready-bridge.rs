@@ -92,7 +92,7 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../hermit-cli/network-provider").canonicalize().unwrap();
     check_compiled_sources(&source);
-    assert_eq!(driver_ftrace_inputs::C_INPUTS.len(), 23);
+    assert_eq!(driver_ftrace_inputs::C_INPUTS.len(), 27);
     let scratch = tempfile::Builder::new().prefix("hermit-driver-ftrace-").tempdir().unwrap();
     let inputs = scratch.path().join("sources");
     fs::create_dir(&inputs).unwrap();
@@ -137,6 +137,34 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
     assert_eq!(missing["cleanup_errors"],serde_json::json!([]));
     assert!(String::from_utf8_lossy(&bounded_read(&stderr,LIMITS.logs))
         .contains("'stream-copy-fault.h' file not found"));
+    // Each new production include must belong to this closed source set. Keep
+    // the older missing-fault-header negative above and the same original clock.
+    for header in ["owned-metadata.h", "owned-metadata-driver.h"] {
+        let incomplete = scratch.path().join(format!("missing-{header}"));
+        fs::create_dir(&incomplete).unwrap();
+        for (name, bytes) in driver_ftrace_inputs::C_INPUTS {
+            if *name != header {
+                fs::write(incomplete.join(name), bytes).unwrap();
+            }
+        }
+        let missing = driver_ftrace_process::execute_stage(
+            Command::new("clang").args(["-std=gnu11", "-fno-builtin", "-DAP_FTRACE_PROVIDER=1",
+                "-DAP_NATIVE_COPY_VERSION=5ULL", "-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG", "-c"])
+                .arg("-I").arg(&incomplete).arg(incomplete.join("driver-ftrace-test.c"))
+                .arg("-o").arg(incomplete.join("missing.o")),
+            started, &stdout, &stderr);
+        assert_eq!(missing["raw_status"], 1, "missing {header} must be a compiler failure: {missing}");
+        assert_eq!(missing["passed"], false);
+        assert_eq!(missing["timed_out"], false);
+        assert_eq!(missing["log_overflow"], false);
+        assert_eq!(missing["primary_error"], serde_json::Value::Null);
+        assert_eq!(missing["terminal_bounds_error"], serde_json::Value::Null);
+        assert_eq!(missing["cleanup_complete"], true);
+        assert_eq!(missing["final_group_absent"], true);
+        assert_eq!(missing["cleanup_errors"], serde_json::json!([]));
+        assert!(String::from_utf8_lossy(&bounded_read(&stderr, LIMITS.logs))
+            .contains(&format!("'{header}' file not found")));
+    }
     let mut fence = Command::new("python3");
     fence.arg("-c").arg(DRIVER_FTRACE_IMPORT_FENCE).arg(&object);
     stage(&mut fence, "closed-import-fence", started, &stdout, &stderr);

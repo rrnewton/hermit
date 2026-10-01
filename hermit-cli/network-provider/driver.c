@@ -111,7 +111,7 @@ static int fd_ack_enrollment(struct ap_session *,struct ap_pending_command *);
 static int fd_ack_original(struct ap_session *,struct ap_pending_command *);
 static int fd_ack_epoll_ctl_copy(struct ap_session *,struct ap_pending_command *);
 static int fd_ack_birth(struct ap_session *,struct ap_pending_command *);
-struct ap_link_identity { u32 type,id,program_id; };
+struct ap_link_identity { u32 type,id,program_id,program_type; };
 struct ap_session {
 #ifdef AP_GROUPED_PROVIDER
     struct ap_grouped_io *group_io;
@@ -352,7 +352,7 @@ static int bind_observer_link(struct ap_session *s,u32 at,const struct bpf_progr
         prior_programs+=s->link_identity[i].program_id==program.id;
     }
     if(prior_programs!=expected_prior)return unavailable();
-    s->link_identity[at]=(struct ap_link_identity){link.type,link.id,program.id};return 0;
+    s->link_identity[at]=(struct ap_link_identity){link.type,link.id,program.id,program.type};return 0;
 }
 /* A completed copy sequence is mandatory evidence. Fresh loss counters only
  * disqualify it; zero misses cannot establish bytes, ordering or immutability. */
@@ -1131,3 +1131,5 @@ int ap_close_grouped_startup_terminal(struct ap_session **owned,struct ap_groupe
 #include "epoll-ctl-copy-driver.h"
 
 #include "fd-enrollment-driver.h"
+
+#include "owned-metadata-driver.h"

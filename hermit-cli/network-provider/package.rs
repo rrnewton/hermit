@@ -315,6 +315,10 @@ fn run() -> Result<()> {
     ensure!(!grouped_build || accepted, "nonclassic topology requires accepted component");
     ensure!(!ftrace || grouped_build, "ftrace topology requires compatibility coverage");
     let mut names = contract.source_files.clone();
+    if accepted {
+        names.extend(["owned-metadata.h", "owned-metadata-driver.h",
+            "stream-copy-fault.h"].map(str::to_owned));
+    }
     // Historical contract fixtures remain byte-identical. Their compiled
     // implementation now includes these shared bodies; bind the extra inputs
     // even when producing the separately named legacy topology.

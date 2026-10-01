@@ -58,6 +58,10 @@ static unsigned df_file_opens,df_file_closes,df_image_opens,df_page_queries,df_b
 static unsigned df_anchor_calls,df_owner_closes,df_info_queries,df_cases;
 static unsigned df_destroy_order[AP_LINKS];
 static int df_destroy_failure;
+static struct ap_stream_fault_state dm_fault;
+static unsigned dm_fault_reads;
+static bool dm_unstable,dm_info_short,dm_info_error;
+static unsigned dm_global_id_queries;
 
 /* Explicit metadata inventory transcribed from the active Ftrace object:
  * 38 fentry/fexit + 3 tp_btf + 8 multi/session programs. Names are fixture
@@ -226,6 +230,11 @@ static int df_getsockopt(int fd,int level,int option,void *out,socklen_t *n) {
 static pid_t df_getpid(void) {return DF_PID;}
 static long df_syscall(long nr,...) {
     va_list args;va_start(args,nr);
+    if(nr==SYS_bpf) {
+        int command=va_arg(args,int);
+        assert(command==BPF_MAP_GET_FD_BY_ID || command==BPF_PROG_GET_FD_BY_ID || command==BPF_LINK_GET_FD_BY_ID);
+        dm_global_id_queries++;va_end(args);errno=EPERM;return -1;
+    }
     if(nr==SYS_gettid) {va_end(args);return DF_PID;}
     if(nr==SYS_pidfd_open) {
         assert(va_arg(args,int)==DF_PID && va_arg(args,int)==0 && !df_owner_alive);
@@ -360,6 +369,12 @@ int bpf_map_update_elem(int fd,const void *key,const void *value,unsigned long l
     df_config=*c;return 0;
 }
 int bpf_map_lookup_elem(int fd,const void *key,void *out) {
+    if(fd==1023) {
+        assert(*(const u32 *)key==1);
+        memcpy(out,&dm_fault,sizeof(dm_fault));dm_fault_reads++;
+        if(dm_unstable && dm_fault_reads%2==0)((struct ap_stream_fault_state *)out)->attempt++;
+        return 0;
+    }
     assert(fd==1000 && *(const u32 *)key==0 && df_owner_alive);
     df_lookups++;memcpy(out,&df_config,sizeof(df_config));return 0;
 }
@@ -378,9 +393,12 @@ int ring_buffer__epoll_fd(const struct ring_buffer *r) {(void)r;df_unexpected("r
 
 int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
     df_info_queries++;
+    if(dm_info_error){errno=EIO;return -1;}
     for(unsigned at=0;at<df_object.maps;at++)if(df_maps[at].fd==fd) {
         assert(*size==sizeof(struct bpf_map_info));
         struct bpf_map_info *m=out;m->id=df_maps[at].id;m->type=df_maps[at].type;
+        memcpy(m->name,df_maps[at].name,strlen(df_maps[at].name)<15?strlen(df_maps[at].name):15);
+        if(dm_info_short)*size=0;
         if(!strcmp(df_maps[at].name,"stream_copy_faults")) {
             m->key_size=sizeof(u32);m->value_size=sizeof(struct ap_stream_fault_state);m->max_entries=AP_COMMANDS;
             if(df_fault==DF_FAULT_MAP)m->value_size--;
@@ -705,7 +723,7 @@ static void df_case(unsigned n) {
     }
     df_cases++;printf("driver-ftrace fixture case passed: %s\n",df_selectors[n]);
 }
-int main(int argc,char **argv) {
+static int inherited_main(int argc,char **argv) {
     assert(argc<=2);
     if(argc==2 && !strcmp(argv[1],"inventory-export")) {
         df_export_inventory();
@@ -722,4 +740,114 @@ int main(int argc,char **argv) {
     printf("driver-ftrace: %u selector cases; %u partial prefixes; modeled boundaries, no kernel qualification\n",
         df_cases,df_partial_prefixes);
     return 0;
+}
+
+#include "provider-open-observation.h"
+static int refuse(void) {errno=EPROTO;return -1;}
+#include "legacy-id-probe.h"
+static unsigned dm_checks;
+#define CHECK(x) do {assert(x);dm_checks++;}while(0)
+static void dm_ready(struct ap_session **s) {
+    dm_fault_reads=0;dm_unstable=dm_info_short=dm_info_error=false;
+    df_reset(DF_OK,0);assert(!ap_open("fixture-object-only",DF_PROVIDER,s));
+}
+static void dm_prepare(struct ap_session *s) {
+    struct ap_pending_command *p=&s->pending[ap_command_slot(1)];
+    p->state=AP_SLOT_COLLECTED;p->original_selected=true;p->original_collected=true;
+    p->submitted=(struct ap_task_command){.provider=DF_PROVIDER,.command=1,.operation=AP_ORIGINAL_READ,
+        .expected_object=4,.generation_before=4096,.generation_after=1,.expected_level=7,.original_count=512};
+    p->original_selection=(struct ap_original_selection){.provider=DF_PROVIDER,.command=1,.call=4,
+        .owner_mm=1,.task=100,.task_start=200,.table=300,.file=400,.user_address=4096,
+        .ready=1,.requested_fd=7,.original_count=512};
+    p->original_receipt.command=1;p->original_receipt.operation=AP_ORIGINAL_READ;
+    p->original_receipt.original.selection=p->original_selection;p->original_receipt.selected_file=400;
+    p->original_receipt.selection.word=0xffff800000000400ULL;
+    dm_fault=(struct ap_stream_fault_state){.provider=DF_PROVIDER,.command=1,.call=4,
+        .task=100,.start=200,.file=400,.pointer=0xffff800000000400ULL,.ubuf=4096,.attempt=1};
+}
+static void dm_inventory(void) {
+    struct ap_session *s=NULL;dm_ready(&s);
+    struct ap_program_id ids[122];u32 n=0;assert(!ap_identifiers(s,ids,122,&n) && n==122);
+    unsigned counts[3]={0},linked=0;
+    for(u32 i=0;i<n;i++) {
+        struct ap_owned_metadata m={0};
+        assert(!ap_owned_object_info(s,ids[i],&m));
+        assert(m.version==1 && !memcmp(&m.identity,&ids[i],sizeof(ids[i])));
+        counts[ids[i].kind]++;
+        if(m.source==AP_OWNED_PROGRAM_LINK) {
+            assert(ids[i].kind==1 && m.value.linked_program.link.prog_id==ids[i].id);
+            assert(ap_ftrace_program_link_pair_allowed(m.value.linked_program.program_type,
+                m.value.linked_program.link.type,BPF_LINK_TYPE_PERF_EVENT));linked++;
+        } else assert(m.source==AP_OWNED_DIRECT_FD);
+    }
+    CHECK(counts[0]==24 && counts[1]==49 && counts[2]==49 && linked==38 && dm_global_id_queries==0);
+    df_closed(s,0);
+}
+static void dm_identity(void) {
+    struct ap_session *s=NULL;dm_ready(&s);struct ap_owned_metadata m,prior;
+    memset(&m,0xa5,sizeof(m));prior=m;
+    CHECK(ap_owned_object_info(s,(struct ap_program_id){0,999},&m)==-1 && !memcmp(&m,&prior,sizeof(m)));
+    dm_info_short=true;CHECK(ap_owned_object_info(s,(struct ap_program_id){0,301},&m)==-1);dm_info_short=false;
+    dm_info_error=true;CHECK(ap_owned_object_info(s,(struct ap_program_id){0,301},&m)==-1 && errno==EIO);dm_info_error=false;
+    u32 saved=df_links[0].program_id;df_links[0].program_id++;
+    CHECK(ap_owned_object_info(s,(struct ap_program_id){1,101},&m)==-1);df_links[0].program_id=saved;
+    saved=s->link_identity[0].program_type;s->link_identity[0].program_type=0;
+    CHECK(ap_owned_object_info(s,(struct ap_program_id){1,101},&m)==-1);s->link_identity[0].program_type=saved;
+    atomic_flag_test_and_set(&s->command_busy);
+    CHECK(ap_owned_object_info(s,(struct ap_program_id){0,301},&m)==-1 && errno==EBUSY);leave_commands(s);
+    df_closed(s,0);
+    df_reset(DF_ATTACH_FAIL,5);s=NULL;CHECK(ap_open("fixture-object-only",DF_PROVIDER,&s)==-1 && s && !s->ready);
+    CHECK(ap_owned_object_info(s,(struct ap_program_id){1,101},&m)==0 && m.source==AP_OWNED_PROGRAM_LINK);
+    CHECK(ap_owned_object_info(s,(struct ap_program_id){1,106},&m)==0 && m.source==AP_OWNED_DIRECT_FD);
+    df_closed(s,0);
+}
+static void dm_faults(void) {
+    struct ap_session *s=NULL;dm_ready(&s);dm_prepare(s);struct ap_stream_fault_state out={0};
+    CHECK(!ap_original_read_fault_snapshot(s,1,324,&out) && dm_fault_reads==2 && !memcmp(&out,&dm_fault,sizeof(out)));
+    CHECK(ap_original_read_fault_snapshot(s,1,323,&out)==-1);
+    df_fault=DF_FAULT_MAP;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);df_fault=DF_OK;
+    dm_unstable=true;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);dm_unstable=false;
+    struct ap_pending_command *p=&s->pending[ap_command_slot(1)];
+    p->submitted.command+=AP_COMMAND_SLOTS;
+    CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);p->submitted.command=1;
+    p->original_collected=false;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);p->original_collected=true;
+    p->original_receipt.selected_file++;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);p->original_receipt.selected_file--;
+    p->state=AP_SLOT_FREE;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);p->state=AP_SLOT_COLLECTED;
+    p->original_selected=false;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);p->original_selected=true;
+    u64 *fields[]={&dm_fault.provider,&dm_fault.command,&dm_fault.call,&dm_fault.task,&dm_fault.start,&dm_fault.file,&dm_fault.pointer,&dm_fault.ubuf};
+    for(unsigned i=0;i<sizeof(fields)/sizeof(fields[0]);i++) {
+        (*fields[i])++;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);(*fields[i])--;
+    }
+    dm_info_short=true;CHECK(ap_original_read_fault_snapshot(s,1,324,&out)==-1);dm_info_short=false;
+    CHECK(!ap_original_read_fault_snapshot(s,1,324,&out));
+    df_closed(s,0);
+}
+static void dm_gate(void) {
+    struct nr_open_observation v={.start=100,.deadline=200,.run_deadline=2000,.returned=150};
+    CHECK(!nr_open_observation_result(&v,190,1));
+    CHECK(nr_open_timely(200,200,2000)==-1 && errno==ETIMEDOUT);
+    CHECK(nr_open_observation_result(&v,200,1)==-1 && errno==ETIMEDOUT);
+    v.returned=201;CHECK(nr_open_observation_result(&v,210,1)==-1 && errno==ETIMEDOUT);
+    v.open_rc=-1;v.open_error=EACCES;
+    CHECK(nr_open_observation_result(&v,210,1)==-1 && errno==EACCES && v.gate_error==ETIMEDOUT);
+    v.open_rc=0;v.open_error=0;v.returned=150;v.inventory_rc=-1;v.inventory_error=EIO;
+    CHECK(nr_open_observation_result(&v,190,1)==-1 && errno==EIO);
+    v.inventory_rc=0;v.inventory_error=0;
+    CHECK(nr_open_observation_result(&v,190,0)==-1 && errno==EPROTO);
+    CHECK(nr_open_timely(0,200,2000)==-1);
+}
+int main(int argc,char **argv) {
+    if(argc==1 || (argc==2 && strncmp(argv[1],"owned-",6)))return inherited_main(argc,argv);
+    assert(argc==2);const char *selector=argv[1]+6;
+    if(!strcmp(selector,"old-id")) {
+        int result=object_fd((struct ap_program_id){0,301});
+        assert(dm_global_id_queries==1 && errno==EPERM);
+        assert(result>=0); /* unchanged required old inventory lookup success */
+        return 0;
+    }
+    if(!strcmp(selector,"inventory") || !strcmp(selector,"all"))dm_inventory();
+    if(!strcmp(selector,"identity") || !strcmp(selector,"all"))dm_identity();
+    if(!strcmp(selector,"fault") || !strcmp(selector,"all"))dm_faults();
+    if(!strcmp(selector,"gate") || !strcmp(selector,"all"))dm_gate();
+    assert(dm_checks);printf("owned metadata: %u checks, real driver / modeled kernel, native UNRUN\n",dm_checks);return 0;
 }
