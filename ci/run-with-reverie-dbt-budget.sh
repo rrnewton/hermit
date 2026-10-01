@@ -494,7 +494,18 @@ fi
 # b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
 # source-identity carry, not a new timing sample or runtime qualification.
-expected_pin=5ef758608c92aca7a7bde71acc38ec184cc3d297
+# CARRY TO dbf2b5c8880bac5fd6a06fa1f296b3eec3590569 (2026-10-01): from
+# 5ef758608c92aca7a7bde71acc38ec184cc3d297, the 26-commit range does not touch
+# reverie-dbt: its tree stays a58869784a49b28fe187f955585bf3cf0597455a. The range
+# changes reverie-ptrace, reverie-liteinst, reverie-kvm/src and the SaBRe loader.
+# build.rs remains blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0; DynamoRIO remains
+# tree 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains blob
+# 4168dea2771f18a00fb1afdfd2218efba415ecbb; rust-toolchain.toml remains blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
+# source-identity carry, not a new timing sample or runtime qualification.
+expected_pin=dbf2b5c8880bac5fd6a06fa1f296b3eec3590569
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
