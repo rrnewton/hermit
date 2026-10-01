@@ -1,0 +1,13 @@
+:: Run1...
+:: Run2...
+:: SaBRe syscall DETLOG records included: run1=105, run2=105
+:: Comparing logs... /tmp/run1_log_l9CkF and /tmp/run2_log_p7G3Y
+Logs contain 147 | 147 messages total
+Logs contain 144 | 144 detcore-specific messages
+Logs contain 123 | 123 INFO messages
+Logs contain 117 | 117 DETLOG & scheduler COMMIT messages
+Normalizing known nondeterministic numerical data before comparison...
+  Comparing DETLOG messages...
+
+Done processing logs, no substantive differences found (117 | 117 DETLOG messages compared).
+:: Success: deterministic. Determinism verified.

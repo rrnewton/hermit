@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -pie -rdynamic "CMakeFiles/process-vdso.dir/process-vdso.c.o" -o ../../tools/process-vdso  ../libloader.a ../libloader.a -ldl ../../arch/libbackend.a -lelf ../../plugin_api/libplugin_api.a

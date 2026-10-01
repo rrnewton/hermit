@@ -1,0 +1,20 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/arch/x86_64/handle_rdtsc.s
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/arch/x86_64/handle_syscall.S
+asm/prctl.h
+-
+sys/syscall.h
+-
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/arch/x86_64/handle_syscall_loader.s
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/arch/x86_64/handle_vdso.s
+

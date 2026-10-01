@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -pie -rdynamic "CMakeFiles/dump-vdso.dir/dump-vdso.c.o" -o ../../tools/dump-vdso  ../libloader.a ../libloader.a -ldl ../../arch/libbackend.a -lelf ../../plugin_api/libplugin_api.a

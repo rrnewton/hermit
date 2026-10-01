@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -pie -rdynamic CMakeFiles/sabre.dir/main.s.o -o ../sabre   -L/usr/lib/gcc/x86_64-redhat-linux/11  ../loader/libloader.a -ldl libbackend.a -lelf ../plugin_api/libplugin_api.a -lgcc -lgcc_s -lc -lgcc -lgcc_s

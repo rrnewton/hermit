@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -O3 -shared  -o libsbr-trace.so "CMakeFiles/sbr-trace.dir/__/__/plugin_api/recursion_protector.c.o" "CMakeFiles/sbr-trace.dir/strace.c.o"  ../../plugin_api/libplugin_api.a ../../arch/libbackend.a

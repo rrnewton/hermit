@@ -1,0 +1,122 @@
+2026-08-07T01:27:20.980060Z  INFO detcore::scheduler::runqueue: DETLOG SCHEDRAND: seeding scheduler runqueue with seed 0
+2026-08-07T01:27:20.980916Z  INFO detcore::scheduler: [scheduler] daemon task starting up, waiting for guest thread start..
+2026-08-07T01:27:20.980970Z  INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0
+2026-08-07T01:27:20.980971Z  INFO detcore::tool_local: DETLOG CHAOSRAND: seeding chaos scheduler with seed 0
+2026-08-07T01:27:20.981065Z ERROR reverie_ptrace::perf: PMU validation failed; RCB timers may be unreliable error=AmdSpecLockMapShouldBeDisabled
+2026-08-07T01:27:20.981608Z ERROR reverie_ptrace::task: ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception initial_state=1
+2026-08-07T01:27:20.981662Z  INFO detcore::scheduler: [scheduler] guest in queue, scheduler proceeding..
+2026-08-07T01:27:20.981671Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 0, dettid 3 using resources {ParentContinue { parent: DetPid(3), child: DetPid(3) }: W}, on previously committed 1_767_225_600.000_000_000s
+2026-08-07T01:27:20.981699Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 1, dettid 3 using resources {MemAddrSpace(DetPid(3)): RW}, on previously committed 1_767_225_600.000_500_000s
+2026-08-07T01:27:20.981703Z  INFO detcore::tool_global: [detcore, dtid 3] New thread given go-ahead to proceed via <ivar Go(None)>
+2026-08-07T01:27:20.982725Z ERROR reverie_ptrace::task: ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception initial_state=1
+2026-08-07T01:27:20.982761Z  INFO detcore: DETLOG [post_exec, dtid 3] init auxv AT_RANDOM value to [162, 205, 24, 211, 0, 83, 122, 92, 176, 131, 220, 72, 219, 250, 14, 242]
+2026-08-07T01:27:20.982831Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 1, syscall_nanos: Some(250000), rcbs: 49, weighted_rcbs: None, nondet_instrs: 1, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.982863Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 1, syscall_nanos: Some(250000), rcbs: 408, weighted_rcbs: None, nondet_instrs: 2, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.982899Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: brk(NULL) = ?
+2026-08-07T01:27:20.982923Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #2: brk(NULL) = Ok(4214784)
+2026-08-07T01:27:20.982955Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: arch_prctl(12289, 0x7fffffffafd0) = ?
+2026-08-07T01:27:20.982963Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #3: arch_prctl(12289, 0x7fffffffafd0) = Err(Errno(EINVAL))
+2026-08-07T01:27:20.983018Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(NULL, 8192, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_ANON), -1, 0) = ?
+2026-08-07T01:27:20.983045Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #4: mmap(NULL, 8192, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_ANON), -1, 0) = Ok(140737353850880)
+2026-08-07T01:27:20.983074Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: access(0x7ffff7ff2e50 -> "/etc/ld.so.preload", Mode(S_IROTH)) = ?
+2026-08-07T01:27:20.983106Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #5: access(0x7ffff7ff2e50 -> "/etc/ld.so.preload", Mode(S_IROTH)) = Err(Errno(ENOENT))
+2026-08-07T01:27:20.983133Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 5, syscall_nanos: Some(273250), rcbs: 32269, weighted_rcbs: None, nondet_instrs: 3, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.983157Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: openat(-100, 0x7ffff7ff1266 -> "/etc/ld.so.cache", OFlag(O_CLOEXEC)) = ?
+2026-08-07T01:27:20.983176Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 2, dettid 3 using resources {Path("/etc/ld.so.cache"): R}, on previously committed 1_767_225_600.001_622_095s
+2026-08-07T01:27:20.983233Z  INFO detcore::syscalls::files: Injecting additional fstat to retrieve file metadata on fd 3.
+2026-08-07T01:27:20.983312Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #6: openat(-100, 0x7ffff7ff1266 -> "/etc/ld.so.cache", OFlag(O_CLOEXEC)) = Ok(3)
+2026-08-07T01:27:20.983342Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: fstat(3, 0x7fffffffa200) = ?
+2026-08-07T01:27:20.983376Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #7: fstat(3, 0x7fffffffa200) = Ok(0)
+2026-08-07T01:27:20.983398Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(NULL, 37951, ProtFlags(PROT_READ), MapFlags(MAP_PRIVATE), 3, 0) = ?
+2026-08-07T01:27:20.983419Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #8: mmap(NULL, 37951, ProtFlags(PROT_READ), MapFlags(MAP_PRIVATE), 3, 0) = Ok(140737353809920)
+2026-08-07T01:27:20.983445Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: close(3) = ?
+2026-08-07T01:27:20.983472Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #9: close(3) = Ok(0)
+2026-08-07T01:27:20.983501Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: openat(-100, 0x7ffff7fba810 -> "/lib64/libc.so.6", OFlag(O_CLOEXEC)) = ?
+2026-08-07T01:27:20.983511Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 3, dettid 3 using resources {Path("/lib64/libc.so.6"): R}, on previously committed 1_767_225_600.002_187_495s
+2026-08-07T01:27:20.983553Z  INFO detcore::syscalls::files: Injecting additional fstat to retrieve file metadata on fd 3.
+2026-08-07T01:27:20.983611Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #10: openat(-100, 0x7ffff7fba810 -> "/lib64/libc.so.6", OFlag(O_CLOEXEC)) = Ok(3)
+2026-08-07T01:27:20.983659Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: read(3, 0x7fffffffa368, 832) = ?
+2026-08-07T01:27:20.983691Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #11: read(3, 0x7fffffffa368, 832) = Ok(832)
+2026-08-07T01:27:20.983716Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: pread64(3, 0x7fffffff9f60, 784, 64) = ?
+2026-08-07T01:27:20.983740Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #12: pread64(3, 0x7fffffff9f60, 784, 64) = Ok(784)
+2026-08-07T01:27:20.983763Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: pread64(3, 0x7fffffff9f20, 48, 848) = ?
+2026-08-07T01:27:20.983781Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #13: pread64(3, 0x7fffffff9f20, 48, 848) = Ok(48)
+2026-08-07T01:27:20.983801Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: pread64(3, 0x7fffffff9ed0, 68, 896) = ?
+2026-08-07T01:27:20.983819Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #14: pread64(3, 0x7fffffff9ed0, 68, 896) = Ok(68)
+2026-08-07T01:27:20.983843Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: fstat(3, 0x7fffffffa200) = ?
+2026-08-07T01:27:20.983866Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #15: fstat(3, 0x7fffffffa200) = Ok(0)
+2026-08-07T01:27:20.983886Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: pread64(3, 0x7fffffff9e50, 784, 64) = ?
+2026-08-07T01:27:20.983904Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #16: pread64(3, 0x7fffffff9e50, 784, 64) = Ok(784)
+2026-08-07T01:27:20.983925Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(NULL, 2138064, ProtFlags(PROT_READ), MapFlags(MAP_PRIVATE | MAP_DENYWRITE), 3, 0) = ?
+2026-08-07T01:27:20.983950Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #17: mmap(NULL, 2138064, ProtFlags(PROT_READ), MapFlags(MAP_PRIVATE | MAP_DENYWRITE), 3, 0) = Ok(140737349943296)
+2026-08-07T01:27:20.983971Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(0x7ffff7c29000, 1527808, ProtFlags(PROT_READ | PROT_EXEC), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE), 3, 167936) = ?
+2026-08-07T01:27:20.983996Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #18: mmap(0x7ffff7c29000, 1527808, ProtFlags(PROT_READ | PROT_EXEC), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE), 3, 167936) = Ok(140737350111232)
+2026-08-07T01:27:20.984016Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(0x7ffff7d9e000, 364544, ProtFlags(PROT_READ), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE), 3, 1695744) = ?
+2026-08-07T01:27:20.984041Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #19: mmap(0x7ffff7d9e000, 364544, ProtFlags(PROT_READ), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE), 3, 1695744) = Ok(140737351639040)
+2026-08-07T01:27:20.984064Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(0x7ffff7df7000, 24576, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE), 3, 2056192) = ?
+2026-08-07T01:27:20.984088Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #20: mmap(0x7ffff7df7000, 24576, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE), 3, 2056192) = Ok(140737352003584)
+2026-08-07T01:27:20.984113Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(0x7ffff7dfd000, 53200, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_ANON), -1, 0) = ?
+2026-08-07T01:27:20.984132Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #21: mmap(0x7ffff7dfd000, 53200, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_FIXED | MAP_ANON), -1, 0) = Ok(140737352028160)
+2026-08-07T01:27:20.984164Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: close(3) = ?
+2026-08-07T01:27:20.984184Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #22: close(3) = Ok(0)
+2026-08-07T01:27:20.984208Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 22, syscall_nanos: Some(489250), rcbs: 33404, weighted_rcbs: None, nondet_instrs: 4, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984236Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mmap(NULL, 12288, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_ANON), -1, 0) = ?
+2026-08-07T01:27:20.984254Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #23: mmap(NULL, 12288, ProtFlags(PROT_READ | PROT_WRITE), MapFlags(MAP_PRIVATE | MAP_ANON), -1, 0) = Ok(140737353797632)
+2026-08-07T01:27:20.984284Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: arch_prctl(ARCH_SET_FS, 140737353799488) = ?
+2026-08-07T01:27:20.984305Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #24: arch_prctl(ARCH_SET_FS, 140737353799488) = Ok(0)
+2026-08-07T01:27:20.984330Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: set_tid_address(0x7ffff7fada10) = ?
+2026-08-07T01:27:20.984350Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #25: set_tid_address(0x7ffff7fada10) = Ok(3)
+2026-08-07T01:27:20.984372Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: set_robust_list(0x7ffff7fada20, 24) = ?
+2026-08-07T01:27:20.984392Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #26: set_robust_list(0x7ffff7fada20, 24) = Ok(0)
+2026-08-07T01:27:20.984414Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: rseq(140737353801952, 32, 0, 1392848979, 0, 0) = ?
+2026-08-07T01:27:20.984452Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #27: rseq(140737353801952, 32, 0, 1392848979, 0, 0) = Ok(0)
+2026-08-07T01:27:20.984484Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 27, syscall_nanos: Some(505000), rcbs: 34172, weighted_rcbs: None, nondet_instrs: 5, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984540Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mprotect(0x7ffff7df7000, 16384, ProtFlags(PROT_READ)) = ?
+2026-08-07T01:27:20.984569Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #28: mprotect(0x7ffff7df7000, 16384, ProtFlags(PROT_READ)) = Ok(0)
+2026-08-07T01:27:20.984591Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 28, syscall_nanos: Some(515000), rcbs: 46133, weighted_rcbs: None, nondet_instrs: 6, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984610Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 28, syscall_nanos: Some(515000), rcbs: 46133, weighted_rcbs: None, nondet_instrs: 7, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984631Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mprotect(0x403000, 4096, ProtFlags(PROT_READ)) = ?
+2026-08-07T01:27:20.984649Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #29: mprotect(0x403000, 4096, ProtFlags(PROT_READ)) = Ok(0)
+2026-08-07T01:27:20.984667Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 29, syscall_nanos: Some(525000), rcbs: 46502, weighted_rcbs: None, nondet_instrs: 8, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984692Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 29, syscall_nanos: Some(525000), rcbs: 46671, weighted_rcbs: None, nondet_instrs: 9, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984713Z  INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 29, syscall_nanos: Some(525000), rcbs: 46706, weighted_rcbs: None, nondet_instrs: 10, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0 }
+2026-08-07T01:27:20.984733Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: mprotect(0x7ffff7ffb000, 8192, ProtFlags(PROT_READ)) = ?
+2026-08-07T01:27:20.984756Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #30: mprotect(0x7ffff7ffb000, 8192, ProtFlags(PROT_READ)) = Ok(0)
+2026-08-07T01:27:20.984786Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: prlimit64(0, 3, NULL, 0x7fffffffad40) = ?
+2026-08-07T01:27:20.984796Z  INFO detcore::syscalls::sysinfo: DETLOG prlimit64: pid=0, resource=3, mutation=false, old=8388608:18446744073709551615
+2026-08-07T01:27:20.984799Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #31: prlimit64(0, 3, NULL, 0x7fffffffad40) = Ok(0)
+2026-08-07T01:27:20.984840Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: munmap(0x7ffff7fb0000, 37951) = ?
+2026-08-07T01:27:20.984862Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #32: munmap(0x7ffff7fb0000, 37951) = Ok(0)
+2026-08-07T01:27:20.984892Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: write(1, 0x402010, 3) = ?
+2026-08-07T01:27:20.984901Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 4, dettid 3 using resources {Device(ContainerStdout): W}, on previously committed 1_767_225_600.003_031_080s
+2026-08-07T01:27:20.984935Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #33: write(1, 0x402010, 3) = Ok(3)
+2026-08-07T01:27:20.984962Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: exit_group(0) = ?
+2026-08-07T01:27:20.984967Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 5, dettid 3 using resources {Exit { group: true, process: DetPid(3), mm: MmId { creator: DetPid(3), generation: 1 } }: RW}, on previously committed 1_767_225_600.003_783_250s
+2026-08-07T01:27:20.984973Z  INFO detcore::tool_global: Scheduler authorized an exit-group scenario, from dettid 3 / detpid 3
+2026-08-07T01:27:20.984977Z  INFO reverie_ptrace::task: [tool] (tid 3) beginning tail_inject of syscall: exit_group
+2026-08-07T01:27:20.985096Z  INFO detcore::scheduler: logically_kill: Scheduler removing all knowledge of [det]tid 3 in pid 3..
+2026-08-07T01:27:20.985133Z  INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.
+2026-08-07T01:27:20.985136Z  INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.
+2026-08-07T01:27:20.985145Z  INFO detcore::tool_global: detcore shut down, destroying global state
+2026-08-07T01:27:20.985150Z  INFO detcore::tool_global: 
+  ------------------------------ hermit run report ------------------------------
+Final thread-tree was: [3]
+There were 1 group leaders of 1 thread(s) total.
+Internally, the hermit scheduler ran 6 turns, recorded 0 events, replayed 0 events (0 desynced)
+Final virtual global (cpu) time: 1_767_225_600.004_283_250s
+Elapsed virtual global (cpu) time: 4_283_250ns
+Timeslice stats: min=1283250ns max=1283250ns mean=1283250ns count=1
+
+2026-08-07T01:27:20.985159Z  INFO hermit::backend_stats: backend run complete backend=ptrace stats=metrics=none

@@ -1,0 +1,26 @@
+2026-08-07T01:39:40.353560Z  INFO detcore::scheduler::runqueue: DETLOG SCHEDRAND: seeding scheduler runqueue with seed 0
+2026-08-07T01:39:40.353753Z  INFO hermit::sabre: launching Detcore guest through SaBRe with coordinator RPC guest=/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/scratch/s176/hello_nostdlib plugin=/home/newton/working_copies/dev-hermit/worktrees/sabre-nostdlib176/hermit/target/install_pkg/rsrcs/libdetcore_sabre.so socket=/tmp/hermit-sabre-rpc-K3ouZN/coordinator.sock
+2026-08-07T01:39:40.354678Z  INFO detcore::scheduler: [scheduler] daemon task starting up, waiting for guest thread start..
+2026-08-07T01:39:40.737100Z ERROR hermit::sabre::fallback: SaBRe tracee terminated by a fatal signal tid=3 signal=SIGSEGV si_code=1 si_errno=0 rip="0x7ffff776f8bc" rsp="0x7fffffffa658" fault_address="0x1" mapping="7ffff7629000-7ffff779e000 r-xp 00029000 00:1f 2409272948                 /usr/lib64/libc.so.6" file_offset="0x16f8bc" relative_offset="0x1468bc" instruction_bytes="62 f3 7d 20 3f 07 00 c5 fb 93 c0 85 c0 74 55 f3" rax="0x1" rbx="0x1" rcx="0x7fffffffa6e0" rdx="0x3aa40f002a0" rsi="0x60" rdi="0x1" rbp="0x7fffffffa6c0" r8="0x3aa40f002a0" r9="0x8" r10="0x60" r11="0x202" r12="0x4" r13="0x1" r14="0x5" r15="0x1" orig_rax="0xffffffffffffffff" eflags="0x10287" cs="0x33" ss="0x2b" fs_base="0x7ffff7e5dd80" gs_base="0x0"
+2026-08-07T01:39:40.737185Z  INFO detcore::tool_global: Scheduler state at exit:
+  Run queue, size=0, last_back_turn=0, last_front_turn=0:
+
+  Futex-waiters, 0 blocked on 0 futexes:
+
+  Timed-waiters, 0:
+
+  External-IO-blocked, 0:
+
+  Next_turns: 
+
+2026-08-07T01:39:40.737188Z  INFO hermit::sabre::fallback: SaBRe ptrace fallback completed ptrace_fallback_sites=0 trusted_shared_object_sites=0 guest_rpc_observed=false
+2026-08-07T01:39:40.737293Z  INFO detcore::tool_global: detcore shut down, destroying global state
+2026-08-07T01:39:40.737303Z  INFO detcore::tool_global: 
+  ------------------------------ hermit run report ------------------------------
+Final thread-tree was: []
+There were 0 group leaders of 0 thread(s) total.
+Internally, the hermit scheduler ran 0 turns, recorded 0 events, replayed 0 events (0 desynced)
+Final virtual global (cpu) time: 1_767_225_600.000_000_000s
+Elapsed virtual global (cpu) time: 0ns
+Timeslice stats: none recorded
+

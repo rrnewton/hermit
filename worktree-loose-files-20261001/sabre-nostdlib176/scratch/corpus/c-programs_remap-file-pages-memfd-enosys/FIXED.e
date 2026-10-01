@@ -1,0 +1,1 @@
+Error: backend `sabre` is unavailable: SaBRe executable was not found in the Hermit installation, beside /home/newton/working_copies/dev-hermit/worktrees/sabre-nostdlib176/scratch/hermit-fixed, or in PATH; set HERMIT_INSTALL_DIR or HERMIT_SABRE_BINARY

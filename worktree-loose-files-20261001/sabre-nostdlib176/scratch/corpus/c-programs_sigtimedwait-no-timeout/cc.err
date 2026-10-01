@@ -1,0 +1,26 @@
+In file included from /home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:42:
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/util/assert.h: In function 'abort_if_failed':
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/util/assert.h:50:9: warning: unused parameter 'error' [-Wunused-parameter]
+   50 |     int error,
+      |     ~~~~^~~~~
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c: In function 'thread_exit':
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:46:29: warning: unused parameter 'signum' [-Wunused-parameter]
+   46 | static void thread_exit(int signum, siginfo_t* info, void* uctxt) {
+      |                         ~~~~^~~~~~
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:46:48: warning: unused parameter 'info' [-Wunused-parameter]
+   46 | static void thread_exit(int signum, siginfo_t* info, void* uctxt) {
+      |                                     ~~~~~~~~~~~^~~~
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:46:60: warning: unused parameter 'uctxt' [-Wunused-parameter]
+   46 | static void thread_exit(int signum, siginfo_t* info, void* uctxt) {
+      |                                                      ~~~~~~^~~~~
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c: In function 'first_thread':
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:60:33: warning: unused parameter 'param' [-Wunused-parameter]
+   60 | static void* first_thread(void* param) {
+      |                           ~~~~~~^~~~~
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c: In function 'main':
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:74:14: warning: unused parameter 'argc' [-Wunused-parameter]
+   74 | int main(int argc, char* argv[]) {
+      |          ~~~~^~~~
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigtimedwait-no-timeout.c:74:26: warning: unused parameter 'argv' [-Wunused-parameter]
+   74 | int main(int argc, char* argv[]) {
+      |                    ~~~~~~^~~~~~

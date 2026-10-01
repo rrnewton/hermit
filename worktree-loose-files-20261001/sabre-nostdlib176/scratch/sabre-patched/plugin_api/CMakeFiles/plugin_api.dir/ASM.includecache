@@ -1,0 +1,18 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/plugin_api/arch/x86_64/clone3_syscall.s
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/plugin_api/arch/x86_64/clone_syscall.s
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/plugin_api/arch/x86_64/real_syscall.s
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/plugin_api/arch/x86_64/vfork_return_from_child.s
+
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/reverie/third-party/sabre/plugin_api/arch/x86_64/vfork_syscall.s
+

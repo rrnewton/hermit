@@ -1,0 +1,4 @@
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigpipe_siginfo.c: In function 'check_siginfo':
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/sigpipe_siginfo.c:37:46: warning: comparison of integer expressions of different signedness: 'sig_atomic_t' {aka 'int'} and '__uid_t' {aka 'unsigned int'} [-Wsign-compare]
+   37 |       sigpipe_pid == getpid() && sigpipe_uid == getuid()) {
+      |                                              ^~

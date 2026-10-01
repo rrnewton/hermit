@@ -1,0 +1,2 @@
+timer armed (getitimer remaining>0 or interval set): 1
+SIGALRM deliveries: 21

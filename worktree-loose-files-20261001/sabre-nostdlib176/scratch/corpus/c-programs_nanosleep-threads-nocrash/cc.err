@@ -1,0 +1,4 @@
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/simple/nanosleep-threads-nocrash.c: In function 'myThreadFun':
+/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/tests/c/simple/nanosleep-threads-nocrash.c:23:25: warning: unused parameter 'vargp' [-Wunused-parameter]
+   23 | void* myThreadFun(void* vargp) {
+      |                   ~~~~~~^~~~~

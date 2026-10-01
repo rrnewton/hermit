@@ -1,0 +1,4 @@
+2026-08-07T01:27:21.967325Z  INFO detcore::scheduler::runqueue: DETLOG SCHEDRAND: seeding scheduler runqueue with seed 0
+2026-08-07T01:27:21.967570Z  INFO hermit::sabre: launching Detcore guest through SaBRe with coordinator RPC guest=/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/scratch/s176/hello_nostdlib plugin=/home/newton/working_copies/dev-hermit/worktrees/sabre-nostdlib176/hermit/target/install_pkg/rsrcs/libdetcore_sabre.so socket=/tmp/hermit-sabre-rpc-VOiNC8/coordinator.sock
+2026-08-07T01:27:21.968373Z  INFO detcore::scheduler: [scheduler] daemon task starting up, waiting for guest thread start..
+2026-08-07T01:27:21.981987Z  INFO hermit::sabre::fallback: SaBRe ptrace fallback completed ptrace_fallback_sites=0 trusted_shared_object_sites=0 guest_rpc_observed=false

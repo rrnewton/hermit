@@ -1,0 +1,77 @@
+diff --git a/detcore/src/syscalls/files.rs b/detcore/src/syscalls/files.rs
+index ea5ae353..32875c31 100644
+--- a/detcore/src/syscalls/files.rs
++++ b/detcore/src/syscalls/files.rs
+@@ -124,6 +124,57 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
+     link.is_absolute().then_some(link)
+ }
+ 
++// AUTONOMOUS-BOT-IMPLEMENTED
++// TODO-HUMAN-REVIEW(#1850): Classify a freshly opened descriptor by what the
++// kernel says it IS, not by how it was spelled.
++//
++// `handle_openat` used to derive `FdType` purely from the pathname string, with
++// only `/dev/random` and `/dev/urandom` special-cased; everything else became
++// `FdType::Regular`. A pathname is a PROXY for the object's type, and the two
++// come apart exactly where it matters: bash process substitution opens
++// `/dev/fd/63`, which is a PIPE, and got typed `Regular`. `handle_read` then
++// took the `record_or_replay` branch -- a genuinely blocking inject -- instead
++// of `execute_nonblockable_fd_syscall`, so the reader blocked in the kernel
++// while holding the scheduler turn and the writer, queued behind it, never ran.
++// That is the stdenv `fixupPhase` deadlock in #1850.
++//
++// `stat(2)` on `/proc/<pid>/fd/<n>` follows the magic link and returns the mode
++// of the underlying object, which is the authority. This is deliberately done
++// on the HOST rather than through `inject_fstat`: it adds no guest syscall, so
++// it perturbs neither the guest's syscall sequence nor its logical clock. The
++// object's type is a function of the object, so the classification is stable
++// across runs and identical under `--verify` and record/replay.
++//
++// Detcore already classifies this way on the SaBRe fallback path
++// (`discover_fd_from_current_process` in tool_local.rs, via `S_IFIFO`/`S_IFSOCK`);
++// this brings `openat` in line with it.
++fn opened_fd_type(pid: i32, fd: RawFd, path: &std::path::Path) -> FdType {
++    // A spelling that classifies by itself keeps priority: /dev/urandom is a
++    // character device, so the kernel mode below would call it Regular and
++    // silently drop RNG virtualization.
++    if let Some(name) = path.to_str() {
++        if name == "/dev/random" || name == "/dev/urandom" {
++            return FdType::Rng;
++        }
++    }
++    match std::fs::metadata(format!("/proc/{pid}/fd/{fd}")) {
++        Ok(md) => {
++            use std::os::unix::fs::FileTypeExt as _;
++            let ft = md.file_type();
++            if ft.is_fifo() {
++                FdType::Pipe
++            } else if ft.is_socket() {
++                FdType::Socket
++            } else {
++                FdType::Regular
++            }
++        }
++        // Unreadable procfs must not change behavior: fall back to the previous
++        // path-derived answer rather than guessing.
++        Err(_) => FdType::Regular,
++    }
++}
++
+ impl<T: RecordOrReplay> Detcore<T> {
+     /// Inject an extra fstat to retrieve file metadata.
+     pub(crate) async fn inject_fstat<G: Guest<Self>>(
+@@ -232,13 +283,7 @@ impl<T: RecordOrReplay> Detcore<T> {
+         match res {
+             Ok(fd) => {
+                 let fd = fd as RawFd;
+-                let fd_type = path.to_str().map_or(FdType::Regular, |fname| {
+-                    if fname == "/dev/random" || fname == "/dev/urandom" {
+-                        FdType::Rng
+-                    } else {
+-                        FdType::Regular
+-                    }
+-                });
++                let fd_type = opened_fd_type(guest.pid().as_raw(), fd, &path);
+                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
+                 // Classify the spelling the guest used FIRST. Several kinds are
+                 // defined by that spelling and MUST keep it: `/proc/self/...`,

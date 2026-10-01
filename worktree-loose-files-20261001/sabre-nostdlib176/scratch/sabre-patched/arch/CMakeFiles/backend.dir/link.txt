@@ -1,0 +1,2 @@
+/usr/bin/ar qc libbackend.a CMakeFiles/backend.dir/handle_syscall.S.o CMakeFiles/backend.dir/handle_syscall_loader.s.o CMakeFiles/backend.dir/handle_vdso.s.o CMakeFiles/backend.dir/rewriter.c.o CMakeFiles/backend.dir/syscall_stackframe.c.o CMakeFiles/backend.dir/x86_decoder.c.o CMakeFiles/backend.dir/handle_rdtsc.s.o
+/usr/bin/ranlib libbackend.a

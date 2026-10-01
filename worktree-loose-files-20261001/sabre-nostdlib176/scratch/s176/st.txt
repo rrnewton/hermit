@@ -1,0 +1,5 @@
+2578195 execve("/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/hermit/target/install_pkg/rsrcs/sabre", ["/home/newton/work/dev-hermit/wor"..., "/home/newton/work/dev-hermit/wor"..., "--", "/home/newton/work/dev-hermit/wor"...], 0x7ffc3d2bbfb0 /* 168 vars */) = 0
+2578195 execve("/lib64/ld-linux-x86-64.so.2", ["/lib64/ld-linux-x86-64.so.2", "--preload", "/home/newton/working_copies/dev-"..., "/home/newton/working_copies/dev-"..., "/home/newton/work/dev-hermit/wor"..., "--", "/home/newton/work/dev-hermit/wor"...], 0x7fff2a731970 /* 168 vars */) = 0
+2578195 --- SIGABRT {si_signo=SIGABRT, si_code=SI_TKILL, si_pid=2578195, si_uid=212630} ---
+2578195 --- SIGABRT {si_signo=SIGABRT, si_code=SI_TKILL, si_pid=2578195, si_uid=212630} ---
+2578195 +++ killed by SIGABRT (core dumped) +++

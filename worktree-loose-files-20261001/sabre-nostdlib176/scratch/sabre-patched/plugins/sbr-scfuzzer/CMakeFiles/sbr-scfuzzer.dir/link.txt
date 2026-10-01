@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -O3 -shared  -o libsbr-scfuzzer.so "CMakeFiles/sbr-scfuzzer.dir/__/__/plugin_api/recursion_protector.c.o" "CMakeFiles/sbr-scfuzzer.dir/sc-fuzzer.c.o"  ../../plugin_api/libplugin_api.a ../../arch/libbackend.a

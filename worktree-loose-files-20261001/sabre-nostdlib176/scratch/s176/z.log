@@ -1,0 +1,31 @@
+2026-08-07T01:39:24.279755Z  INFO detcore::scheduler::runqueue: DETLOG SCHEDRAND: seeding scheduler runqueue with seed 0
+2026-08-07T01:39:24.279958Z  INFO hermit::sabre: launching Detcore guest through SaBRe with coordinator RPC guest=/home/newton/work/dev-hermit/worktrees/sabre-nostdlib176/scratch/s176/hi_dynamic plugin=/home/newton/working_copies/dev-hermit/worktrees/sabre-nostdlib176/hermit/target/install_pkg/rsrcs/libdetcore_sabre.so socket=/tmp/hermit-sabre-rpc-pGAVaw/coordinator.sock
+2026-08-07T01:39:24.280845Z  INFO detcore::scheduler: [scheduler] daemon task starting up, waiting for guest thread start..
+2026-08-07T01:39:24.415841Z  INFO detcore::scheduler: [scheduler] guest in queue, scheduler proceeding..
+2026-08-07T01:39:24.415878Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 0, dettid 3 using resources {ParentContinue { parent: DetPid(3), child: DetPid(3) }: W}, on previously committed 1_767_225_600.000_000_000s
+2026-08-07T01:39:24.416051Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 1, dettid 3 using resources {MemAddrSpace(DetPid(3)): RW}, on previously committed 1_767_225_600.000_500_000s
+2026-08-07T01:39:24.416057Z  INFO detcore::tool_global: [detcore, dtid 3] New thread given go-ahead to proceed via <ivar Go(None)>
+2026-08-07T01:39:24.417338Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 2, dettid 3 using resources {Device(ContainerStdout): W}, on previously committed 1_767_225_600.001_010_000s
+2026-08-07T01:39:24.435321Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 3, dettid 3 using resources {Exit { group: true, process: DetPid(3), mm: MmId { creator: DetPid(3), generation: 0 } }: RW}, on previously committed 1_767_225_600.002_130_000s
+2026-08-07T01:39:24.435341Z  INFO detcore::tool_global: Scheduler authorized an exit-group scenario, from dettid 3 / detpid 3
+2026-08-07T01:39:24.435443Z  INFO detcore::scheduler: logically_kill: Scheduler removing all knowledge of [det]tid 3 in pid 3..
+2026-08-07T01:39:24.437270Z  INFO hermit::sabre::fallback: SaBRe ptrace fallback completed ptrace_fallback_sites=0 trusted_shared_object_sites=0 guest_rpc_observed=true
+2026-08-07T01:39:24.437278Z  INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.
+2026-08-07T01:39:24.437384Z  INFO detcore::tool_global: detcore shut down, destroying global state
+2026-08-07T01:39:24.437391Z  INFO detcore::tool_global: 
+  ------------------------------ hermit run report ------------------------------
+Final thread-tree was: [3]
+There were 1 group leaders of 1 thread(s) total.
+Internally, the hermit scheduler ran 4 turns, recorded 0 events, replayed 0 events (0 desynced)
+Final virtual global (cpu) time: 1_767_225_600.002_630_000s
+Elapsed virtual global (cpu) time: 2_630_000ns
+Timeslice stats: min=630000ns max=630000ns mean=630000ns count=1
+

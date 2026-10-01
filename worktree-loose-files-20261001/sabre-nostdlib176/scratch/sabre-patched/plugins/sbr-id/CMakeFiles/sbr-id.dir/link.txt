@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -O3 -shared  -o libsbr-id.so "CMakeFiles/sbr-id.dir/__/__/plugin_api/recursion_protector.c.o" "CMakeFiles/sbr-id.dir/identity.c.o"  ../../plugin_api/libplugin_api.a ../../arch/libbackend.a

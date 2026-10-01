@@ -1,0 +1,2 @@
+/usr/bin/ar cr libplugin_api.a CMakeFiles/plugin_api.dir/vfork_syscall.s.o CMakeFiles/plugin_api.dir/vfork_return_from_child.s.o CMakeFiles/plugin_api.dir/clone3_syscall.s.o CMakeFiles/plugin_api.dir/clone_syscall.s.o CMakeFiles/plugin_api.dir/real_syscall.s.o
+/usr/bin/ranlib libplugin_api.a

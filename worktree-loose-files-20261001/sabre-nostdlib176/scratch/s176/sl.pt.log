@@ -1,0 +1,54 @@
+2026-08-07T01:32:38.072534Z  INFO detcore::scheduler::runqueue: DETLOG SCHEDRAND: seeding scheduler runqueue with seed 0
+2026-08-07T01:32:38.073337Z  INFO detcore::scheduler: [scheduler] daemon task starting up, waiting for guest thread start..
+2026-08-07T01:32:38.073391Z  INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0
+2026-08-07T01:32:38.073393Z  INFO detcore::tool_local: DETLOG CHAOSRAND: seeding chaos scheduler with seed 0
+2026-08-07T01:32:38.073496Z ERROR reverie_ptrace::perf: PMU validation failed; RCB timers may be unreliable error=AmdSpecLockMapShouldBeDisabled
+2026-08-07T01:32:38.074090Z ERROR reverie_ptrace::task: ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception initial_state=1
+2026-08-07T01:32:38.074150Z  INFO detcore::scheduler: [scheduler] guest in queue, scheduler proceeding..
+2026-08-07T01:32:38.074158Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 0, dettid 3 using resources {ParentContinue { parent: DetPid(3), child: DetPid(3) }: W}, on previously committed 1_767_225_600.000_000_000s
+2026-08-07T01:32:38.074189Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 1, dettid 3 using resources {MemAddrSpace(DetPid(3)): RW}, on previously committed 1_767_225_600.000_500_000s
+2026-08-07T01:32:38.074194Z  INFO detcore::tool_global: [detcore, dtid 3] New thread given go-ahead to proceed via <ivar Go(None)>
+2026-08-07T01:32:38.075315Z ERROR reverie_ptrace::task: ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception initial_state=1
+2026-08-07T01:32:38.075351Z  INFO detcore: DETLOG [post_exec, dtid 3] init auxv AT_RANDOM value to [162, 205, 24, 211, 0, 83, 122, 92, 176, 131, 220, 72, 219, 250, 14, 242]
+2026-08-07T01:32:38.075430Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: write(1, 0x402000, 9) = ?
+2026-08-07T01:32:38.075464Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 2, dettid 3 using resources {Device(ContainerStdout): W}, on previously committed 1_767_225_600.001_260_490s
+2026-08-07T01:32:38.075511Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #2: write(1, 0x402000, 9) = Ok(9)
+2026-08-07T01:32:38.075544Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: nanosleep(0x7fffffffb0c8, NULL) = ?
+2026-08-07T01:32:38.076180Z  INFO detcore::scheduler: [scheduler] >>>>>>>
+
+ NONCOMMIT turn 3, SKIP dettid 3 which wanted resource SleepUntil(LogicalTime(1767225630001265490)) (blocking)
+2026-08-07T01:32:38.076195Z  INFO detcore::scheduler: [scheduler] Skipping global time ahead to 1_767_225_630.001_265_490s.
+2026-08-07T01:32:38.076199Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 4, dettid 3 using resources {SleepUntil(LogicalTime(1767225630001265490)): W}, on previously committed 1_767_225_630.001_265_490s
+2026-08-07T01:32:38.076209Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #3: nanosleep(0x7fffffffb0c8, NULL) = Ok(0)
+2026-08-07T01:32:38.076303Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: write(1, 0x402000, 9) = ?
+2026-08-07T01:32:38.076311Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 5, dettid 3 using resources {Device(ContainerStdout): W}, on previously committed 1_767_225_630.001_775_490s
+2026-08-07T01:32:38.076355Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #4: write(1, 0x402000, 9) = Ok(9)
+2026-08-07T01:32:38.076385Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: exit(0) = ?
+2026-08-07T01:32:38.076394Z  INFO detcore::scheduler: [sched-step5] >>>>>>>
+
+ COMMIT turn 6, dettid 3 using resources {Exit { group: false, process: DetPid(3), mm: MmId { creator: DetPid(3), generation: 1 } }: RW}, on previously committed 1_767_225_630.002_525_490s
+2026-08-07T01:32:38.076401Z  INFO reverie_ptrace::task: [tool] (tid 3) beginning tail_inject of syscall: exit
+2026-08-07T01:32:38.076563Z  INFO detcore::scheduler: logically_kill: Scheduler removing all knowledge of [det]tid 3 in pid 3..
+2026-08-07T01:32:38.076600Z  INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.
+2026-08-07T01:32:38.076603Z  INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.
+2026-08-07T01:32:38.076614Z  INFO detcore::tool_global: detcore shut down, destroying global state
+2026-08-07T01:32:38.076619Z  INFO detcore::tool_global: 
+  ------------------------------ hermit run report ------------------------------
+Final thread-tree was: [3]
+There were 1 group leaders of 1 thread(s) total.
+Internally, the hermit scheduler ran 7 turns, recorded 0 events, replayed 0 events (0 desynced)
+Final virtual global (cpu) time: 1_767_225_630.003_025_490s
+Elapsed virtual global (cpu) time: 30.003_025_490s
+Timeslice stats: min=525490ns max=525490ns mean=525490ns count=1
+
+2026-08-07T01:32:38.076628Z  INFO hermit::backend_stats: backend run complete backend=ptrace stats=metrics=none
