@@ -1619,6 +1619,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     thread_logical_time: child_logical_time,
                     // A new thread gets a new clock, so we've committed 0 ticks
                     committed_clock_value: 0,
+                    // A new thread or process is never the backend runtime's
+                    // bootstrapping thread, so it starts outside any window.
+                    uncharged_bootstrap_syscalls: 0,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -1931,34 +1934,66 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         let syscall_cost_ns = syscall_time::cost_ns(call.number());
-        // A backend-resident runtime (the LiteInst preload constructor) issues
-        // several hundred syscalls on one thread between its validated begin
-        // trap and the trap that ends its bootstrap: the ready report, or the
-        // report that preparation failed. Reverie reports that window only for
-        // the bootstrapping thread; every other thread and forked process is
-        // charged as usual. The syscalls are still counted and fully handled
-        // below, so Detcore keeps tracking the fds, mappings and inodes they
-        // create. They are not guest work, though: charging them would make
-        // guest-visible virtual time (uptime, CLOCK_MONOTONIC, CPU time) depend
-        // on which backend ran the program. The clock is not stopped or reset;
-        // it simply does not advance for work the guest did not do, and resumes
-        // from the same value at the first guest syscall after the window. See
-        // https://github.com/rrnewton/hermit/issues/3338.
-        let charge_guest_time = !guest.is_backend_runtime_bootstrap();
+        // The backend-runtime bootstrap window. A backend-resident runtime (the
+        // LiteInst preload constructor) issues a few hundred syscalls on one
+        // thread between its validated begin trap and the trap that ends its
+        // bootstrap: the ready report, or the report that preparation failed.
+        // Reverie reports that window only for the bootstrapping thread; every
+        // other thread and every forked process sees no window.
+        //
+        // What is withheld: the per-syscall cost below, for the bootstrapping
+        // thread only, for each syscall it makes inside the window that does not
+        // observe virtual time, up to
+        // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS` per window. That
+        // includes syscalls made by guest code the runtime calls into, such as
+        // an interposed malloc or open64. Charging the runtime's own syscalls
+        // would make guest-visible virtual time (uptime, CLOCK_MONOTONIC, CPU
+        // time) depend on which backend ran the program. Every withheld syscall
+        // is still counted and fully handled below, so Detcore keeps tracking
+        // the fds, mappings and inodes it creates.
+        //
+        // What is always charged, inside the window too: syscalls that observe
+        // virtual time (`syscall_time::observes_virtual_time`), so two clock
+        // reads on the bootstrapping thread differ by at least one syscall cost
+        // exactly as outside the window; and every syscall past the cap, so a
+        // loop inside the window, or a runtime that never reports ready, again
+        // advances the clock at each syscall.
+        //
+        // When it matters: with a syscall-driven clock (no PMU, or
+        // --max-timeslice=disabled, which Hermit selects when perf counters are
+        // unavailable, or --no-rcb-time) these charges are the thread's only
+        // per-syscall progress, and with sequentialized threads the 500x no-RCB
+        // multiplier makes each one large. With RCB time on a PMU host, retired
+        // branches still advance the thread's clock inside the window and only
+        // the syscall costs are withheld.
+        //
+        // The decision depends only on the window the backend reports (opened
+        // and closed by trap instructions the runtime executes), the syscall
+        // number and the count of earlier uncharged syscalls in the same
+        // window: all functions of the guest's own execution. Record/replay and
+        // both --verify runs therefore make the same decisions. The clock is
+        // never reset: the first syscall after the window continues from the
+        // value the window left. See https://github.com/rrnewton/hermit/issues/3338
+        // and https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696.
+        let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
         let new_count = {
             // which results from not being able to borrow guest twice.
             let thread_state = guest.thread_state_mut();
             thread_state.stats.count_syscall();
 
-            // Every intercepted guest syscall advances logical time, including configurations
-            // that do not serialize threads. This keeps virtual clocks productive during syscall
-            // loops.
-            if charge_guest_time {
+            // Every intercepted syscall advances logical time, including configurations that do
+            // not serialize threads. This keeps virtual clocks productive during syscall loops.
+            // The one exception is the bootstrap window described above: on the bootstrapping
+            // thread, up to MAX_UNCHARGED_BOOTSTRAP_SYSCALLS syscalls per window that do not
+            // observe virtual time are left uncharged.
+            if thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number()) {
                 thread_state
                     .thread_logical_time
                     .add_syscall_with_cost(syscall_cost_ns);
-                thread_state.account_process_cpu_time();
             }
+            // This only folds the thread's new user and system time into the process total.
+            // An uncharged syscall added none, so it needs no guard.
+            thread_state.account_process_cpu_time();
             thread_state.stats.syscall_count
         };
 
