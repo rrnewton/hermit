@@ -573,8 +573,9 @@ pub(super) fn run(input: io::Result<Option<File>>) -> ! {
                 )
             }
         }
-        Err(error) => {
-            eprintln!("accepted provider startup unavailable: {error}");
+        Err(_error) => {
+            // Inherited stderr may block forever. Refuse without diagnostics so
+            // the owned input reaches kernel retirement even in that case.
             // No service/BPF was constructed. The still-owned input and any
             // queued SCM references are released by process exit, not Drop.
             unsafe { libc::_exit(125) }
