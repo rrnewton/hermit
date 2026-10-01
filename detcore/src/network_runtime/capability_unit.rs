@@ -163,6 +163,12 @@ impl CapabilityUnitLaunch<'_> {
         .iter()
         .map(OsString::from)
         .collect();
+        // Failed transient Accepted helpers must be collected too. --wait still
+        // returns their failure; this never resets an existing unit or widens
+        // successful exit codes. Unix keeper/readback retention is unchanged.
+        if self.kind == CapabilityServiceKind::Accepted {
+            args.push("--collect".into());
+        }
         args.push(format!("--unit={}", self.unit).into());
         let memory_max = match self.kind {
             CapabilityServiceKind::Accepted => ACCEPTED_UNIT_MEMORY_MAX,
@@ -269,6 +275,73 @@ impl CapabilityUnitLaunch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_collection_preserves_failure_status_policy() {
+        for lifetime in [
+            CapabilityServiceLifetime::Bounded(20),
+            CapabilityServiceLifetime::ControllerOwned,
+        ] {
+            let args = CapabilityUnitLaunch {
+                kind: CapabilityServiceKind::Accepted,
+                unit: "hermit-accepted-01000000000000000000000000000000.service",
+                executable: Path::new("/product/helper"),
+                arguments: &[],
+                lifetime,
+                writable_directories: &[],
+            }
+            .arguments()
+            .unwrap();
+            assert_eq!(args.iter().filter(|arg| *arg == "--collect").count(), 1);
+            assert!(args.contains(&OsString::from("--wait")));
+            assert!(args.contains(&OsString::from("--property=RemainAfterExit=no")));
+            assert!(!args.iter().any(|arg| {
+                arg == "--ignore-failure"
+                    || arg.to_string_lossy().contains("SuccessExitStatus")
+                    || arg.to_string_lossy().contains("reset-failed")
+            }));
+            assert_eq!(
+                args.contains(&OsString::from("--property=RuntimeMaxSec=20s")),
+                lifetime == CapabilityServiceLifetime::Bounded(20)
+            );
+        }
+    }
+
+    #[test]
+    fn collection_is_not_added_to_other_service_purposes() {
+        for (kind, prefix) in [
+            (CapabilityServiceKind::AcceptedKeeper, "hermit-accepted-"),
+            (
+                CapabilityServiceKind::AcceptedReadback,
+                "hermit-accepted-readback-",
+            ),
+            (CapabilityServiceKind::UnixReadback, "hermit-unix-readback-"),
+            (CapabilityServiceKind::UnixGuard, "hermit-unix-"),
+        ] {
+            let paths = [
+                PathBuf::from("/owned/bpf"),
+                PathBuf::from("/owned/recovery"),
+            ];
+            let unit = format!("{prefix}01000000000000000000000000000000.service");
+            let args = CapabilityUnitLaunch {
+                kind,
+                unit: &unit,
+                executable: Path::new("/product/helper"),
+                arguments: &[],
+                lifetime: CapabilityServiceLifetime::Bounded(20),
+                writable_directories: if kind == CapabilityServiceKind::UnixGuard {
+                    &paths
+                } else {
+                    &[]
+                },
+            }
+            .arguments()
+            .unwrap();
+            assert!(!args.contains(&OsString::from("--collect")), "{kind:?}");
+            assert!(args.contains(&OsString::from("--wait")), "{kind:?}");
+        }
+    }
+
     #[test]
     fn unix_readback_is_bounded_readonly_and_has_only_query_privilege() {
         let mut spec = CapabilityUnitLaunch {
