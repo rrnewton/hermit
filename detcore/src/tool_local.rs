@@ -2470,6 +2470,25 @@ impl<T> ThreadState<T> {
             .map_object(start, len, object, object_offset);
     }
 
+    /// Record a file mapping made through a tracked descriptor, whose `fstat`
+    /// reported the raw identity `file`.
+    pub(crate) fn map_file(&self, start: usize, len: usize, file: RawFileId) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .map_file(start, len, file);
+    }
+
+    /// The raw identity `fstat` reported for the file the guest mapped at
+    /// `address` through a tracked descriptor; see
+    /// `MemoryMetadata::mapped_file_at`.
+    pub(crate) fn mapped_file_at(&self, address: usize) -> Option<RawFileId> {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .mapped_file_at(address)
+    }
+
     /// Remove a range from the shared mapping model.
     pub(crate) fn unmap_memory(&self, start: usize, len: usize) {
         self.memory_metadata
