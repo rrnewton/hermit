@@ -1691,3 +1691,118 @@ fn sysfs_hwmon_input_is_deterministic_when_available() {
     let path = path.to_str().expect("hwmon path should be UTF-8");
     assert_deterministic(path, |contents| assert_eq!(contents, b"0\n"));
 }
+
+fn compile_cross_device_inode_identity_guest() -> PathBuf {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+        .to_path_buf();
+    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cross-device-inode-identity");
+    let compile = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/fixtures/cross_device_inode_identity.c"))
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("compile cross-device inode identity guest");
+    assert!(
+        compile.status.success(),
+        "failed to compile cross-device inode identity guest:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    output
+}
+
+/// Run the guest with a fresh tmpfs mounted on each of `dir_a` and `dir_b`.
+fn run_cross_device_inode_identity(
+    guest: &Path,
+    mode: &str,
+    dir_a: &Path,
+    dir_b: &Path,
+    no_virtualize_metadata: bool,
+) -> std::process::Output {
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
+    command.arg(format!("--mount=type=tmpfs,target={}", dir_a.display()));
+    command.arg(format!("--mount=type=tmpfs,target={}", dir_b.display()));
+    if no_virtualize_metadata {
+        command.arg("--no-virtualize-metadata");
+    }
+    command.arg("--").arg(guest).arg(mode).arg(dir_a).arg(dir_b);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "cross-device inode identity guest ({mode}) failed: {rendered}\nstatus: {}\nstdout:\n{}\n\
+         stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+/// Parse one `NAME dev=MAJ:MIN ino=N` line printed by the guest's probe mode.
+fn raw_identity(text: &str, name: &str) -> (String, u64) {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("probe output has no line for {name}:\n{text}"));
+    let (dev, ino) = line
+        .strip_prefix("dev=")
+        .and_then(|rest| rest.split_once(" ino="))
+        .unwrap_or_else(|| panic!("malformed probe line for {name}: {line}"));
+    let ino = ino
+        .parse()
+        .unwrap_or_else(|error| panic!("probe inode for {name} is not decimal ({error}): {line}"));
+    (dev.to_owned(), ino)
+}
+
+// A file identity is a device and an inode. Detcore keyed deterministic inodes
+// on the raw inode alone (https://github.com/rrnewton/hermit/issues/3307), so
+// two files that share a raw inode number on different filesystems became one
+// object: a write to one changed the mtime `stat` reported for the other, and
+// whether host counters happened to coincide changed the deterministic inodes
+// in every later /proc/self/maps line.
+#[test]
+fn files_sharing_a_raw_inode_on_two_devices_keep_separate_identities() {
+    let _guard = hermit_run_lock();
+    let guest = compile_cross_device_inode_identity_guest();
+    // Mount targets must exist and must be visible inside the guest; the guest
+    // binary already lives under CARGO_TARGET_TMPDIR, so the targets do too.
+    let mounts = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("mount target parent");
+    let dir_a = mounts.path().join("a");
+    let dir_b = mounts.path().join("b");
+    fs::create_dir(&dir_a).expect("create first mount target");
+    fs::create_dir(&dir_b).expect("create second mount target");
+
+    // Precondition, read without metadata virtualization: the two files really
+    // do share a raw inode number on two devices. Without it the check below
+    // would pass without having exercised the collision, so refuse instead.
+    let probe = run_cross_device_inode_identity(&guest, "probe", &dir_a, &dir_b, true);
+    let probe = String::from_utf8(probe.stdout).expect("probe output should be UTF-8");
+    let (f_dev, f_ino) = raw_identity(&probe, "f");
+    let (g_dev, g_ino) = raw_identity(&probe, "g");
+    assert!(
+        f_ino == g_ino && f_dev != g_dev,
+        "the first file on two fresh tmpfs mounts must share a raw inode number on two devices \
+         (per-superblock tmpfs inode numbering, Linux 5.9 and later); this host reported:\n{probe}"
+    );
+
+    let check = run_cross_device_inode_identity(&guest, "check", &dir_a, &dir_b, false);
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "cross-device files keep separate identities\n",
+        "stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
