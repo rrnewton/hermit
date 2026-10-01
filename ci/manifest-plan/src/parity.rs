@@ -2205,7 +2205,7 @@ struct Comparison {
 /// that is not `matched` or `diverged` carries the typed
 /// [`UnavailableClass`] of the step that decided it:
 /// - a) the ptrace reference left no deterministic golden
-///   ([`UnavailableGroup::NoGolden`], see [`evaluate_history`]). A
+///   ([`UnavailableGroup::NoGolden`], see `evaluate_history`). A
 ///   determinism failure on any attempt, or one the caller reports in
 ///   [`PostPassConfig::nondeterministic`], is
 ///   [`ParityVerdict::Nondeterministic`]; no golden is written for it;
@@ -3747,8 +3747,8 @@ fn shown_operand(operand: Option<ParityOperand>) -> &'static str {
 /// measured verdict and no unmeasured class, and no other backend has an
 /// `inputs-not-equalized` verdict. The reason text is never read. dev-hermit's
 /// `ci-hub/series/parity_ledger.py` `check_class`, added by slice D5 of
-/// https://github.com/rrnewton/hermit/issues/3301, makes the same checks with
-/// the same messages.
+/// <https://github.com/rrnewton/hermit/issues/3301>, makes the same checks
+/// with the same messages.
 pub fn check_class(
     at: &str,
     backend: ParityBackend,
@@ -4801,7 +4801,7 @@ pub fn ledger_row_counts(rows: &[ParityLedgerSource]) -> String {
 ///   moment a writer exited before reading them.
 /// - Each call is bounded by [`AppendBounds`]; a writer still running at its
 ///   bound is killed with its process group, and the line says so.
-/// - At most [`APPEND_OUTPUT_LIMIT_BYTES`] of each of its outputs is kept.
+/// - At most `APPEND_OUTPUT_LIMIT_BYTES` of each of its outputs is kept.
 /// - Exit status 0 is the writer's acceptance, and the line says only that:
 ///   dev-hermit's writer exits 0 both when it wrote the rows to the parent's
 ///   unpublished spool and when it had already recorded them identically,
