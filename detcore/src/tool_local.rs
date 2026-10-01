@@ -2773,8 +2773,17 @@ impl<T> ThreadState<T> {
                         let exact_deadline_is_now =
                             replay_rcb_end.is_some_and(|target| target == current_rcbs);
                         if end_time <= current_ns && !exact_deadline_is_now {
+                            // Records that store their epoch are reconciled with
+                            // this run's epoch before any guest starts (see
+                            // `adopt_replayed_schedule_epoch` in hermit-cli), so
+                            // reaching this with such a record means the replay
+                            // really diverged. A record without an epoch cannot
+                            // be checked up front; say what usually causes it.
                             panic!(
-                                "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}.",
+                                "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
+                                 The replayed preemption record's timeslice ends are absolute virtual times; if it was \
+                                 recorded under a different virtual-time epoch, replay it with that --epoch \
+                                 (https://github.com/rrnewton/hermit/issues/3413).",
                                 end_time, self.dettid, current_ns
                             )
                         }

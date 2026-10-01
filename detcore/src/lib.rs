@@ -1126,7 +1126,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if !config.passthru_opt {
             // Fail closed by default in every build profile. Besides allowing syscall-specific
             // handlers to run, interception is what charges generic syscall logical time.
-            Subscription::all()
+            //
+            // `cpuid` is the one exception. With CPUID virtualization off the handler only
+            // re-executes the host instruction, so trapping does not change what the guest
+            // sees, but the subscription makes Reverie probe and enable CPUID faulting and log
+            // an ERROR for each exec on hosts that lack it
+            // (https://github.com/rrnewton/hermit/issues/3460). A backend that installs its
+            // own CPUID table (KVM) still needs the trap for the guest to see host values.
+            let mut subscription = Subscription::all_syscalls();
+            subscription.rdtsc();
+            if config.virtualize_cpuid || config.cpuid_virtualized_by_backend {
+                subscription.cpuid();
+            }
+            subscription
         } else {
             // Explicit performance opt-in: unlisted syscalls bypass Detcore entirely. Keep this
             // path separate so its allow-list can be tightened without weakening the default.
@@ -3301,6 +3313,43 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::ppoll)
+        );
+
+        // On a backend without its own CPUID table (ptrace), `--no-virtualize-cpuid`
+        // must not subscribe to `cpuid` in either mode. The
+        // subscription is what makes Reverie probe and enable CPUID faulting, and
+        // a host without faulting then logs an ERROR for each traced exec
+        // (https://github.com/rrnewton/hermit/issues/3460). Everything else stays
+        // as intercepted as it is with CPUID virtualization on.
+        for passthru_opt in [false, true] {
+            let virtualized = <Detcore as Tool>::subscriptions(&strict_config(passthru_opt));
+            let config = Config {
+                virtualize_cpuid: false,
+                ..strict_config(passthru_opt)
+            };
+            let subscriptions = <Detcore as Tool>::subscriptions(&config);
+
+            assert!(virtualized.has_cpuid(), "passthru_opt={passthru_opt}");
+            assert!(!subscriptions.has_cpuid(), "passthru_opt={passthru_opt}");
+            assert!(subscriptions.has_rdtsc(), "passthru_opt={passthru_opt}");
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .eq(virtualized.iter_syscalls()),
+                "passthru_opt={passthru_opt}: the syscall set must not depend on CPUID virtualization"
+            );
+        }
+
+        // KVM installs its own CPUID table, so with virtualization off the guest
+        // sees host values only through the trap: keep subscribing there.
+        let kvm_host_cpuid = Config {
+            virtualize_cpuid: false,
+            cpuid_virtualized_by_backend: true,
+            ..strict_config(false)
+        };
+        assert_eq!(
+            <Detcore as Tool>::subscriptions(&kvm_host_cpuid),
+            Subscription::all()
         );
     }
 

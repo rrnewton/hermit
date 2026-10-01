@@ -15,6 +15,8 @@ use std::iter::FromIterator;
 use std::path::Path;
 use std::path::PathBuf;
 
+use chrono::DateTime;
+use chrono::Utc;
 use detcore_model::collections::ReplayCursor;
 use serde::Deserialize;
 use serde::Serialize;
@@ -37,6 +39,15 @@ pub struct PreemptionRecord {
     /// A sorted list of end-of-timeslice preemption times for each thread.
     per_thread: BTreeMap<DetTid, ThreadHistory>,
     global: Vec<SchedEvent>,
+    /// The virtual-time epoch of the run that produced this record.
+    ///
+    /// Every `LogicalTime` above is an absolute virtual instant, i.e. an offset
+    /// from this epoch, so the record only describes a run whose clock starts
+    /// here. A replay started from any other epoch would see every recorded
+    /// timeslice end shifted by the difference. `None` for records written
+    /// before the epoch was stored, and for records synthesized in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -52,7 +63,13 @@ impl PreemptionRecord {
         Self {
             per_thread: Default::default(),
             global: events,
+            epoch: None,
         }
+    }
+
+    /// The virtual-time epoch this record was produced under, if it was stored.
+    pub fn epoch(&self) -> Option<DateTime<Utc>> {
+        self.epoch
     }
 
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
@@ -114,6 +131,7 @@ impl PreemptionRecord {
         PreemptionRecord {
             per_thread: self.per_thread.clone(),
             global: Vec::new(),
+            epoch: self.epoch,
         }
     }
 
@@ -170,6 +188,7 @@ impl PreemptionRecord {
         PreemptionRecord {
             per_thread: bt2,
             global: Vec::new(),
+            epoch: None,
         }
     }
 
@@ -614,6 +633,58 @@ mod tests {
         assert_eq!(history.advance_chaos_epoch(LogicalTime::MAX), None);
     }
 
+    /// <https://github.com/rrnewton/hermit/issues/3411>: the epoch a record was
+    /// made under survives serialization, the preemptions-only copy, and the
+    /// non-panicking CLI reader; records written before it was stored read as
+    /// `None`, and a malformed file is an error rather than a panic.
+    #[test]
+    fn recorded_epoch_round_trips_and_legacy_records_have_none() {
+        let epoch: DateTime<Utc> = "2000-12-31T23:59:59.123456789Z".parse().unwrap();
+        let tid = DetTid::from_raw(3);
+        let mut writer = PreemptionWriter::new(None).with_epoch(epoch);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(978_307_199_223_456_789),
+            7,
+            DEFAULT_PRIORITY,
+            5,
+        );
+        let encoded = writer.into_string();
+
+        let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.epoch(), Some(epoch));
+        assert_eq!(decoded.clone_preemptions_only().epoch(), Some(epoch));
+
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current.json");
+        std::fs::write(&current, &encoded).unwrap();
+        assert_eq!(read_recorded_epoch(&current), Ok(Some(epoch)));
+
+        let mut legacy_value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("epoch")
+            .unwrap();
+        let legacy = directory.path().join("legacy.json");
+        std::fs::write(&legacy, legacy_value.to_string()).unwrap();
+        assert_eq!(read_recorded_epoch(&legacy), Ok(None));
+        let legacy_record: PreemptionRecord = serde_json::from_value(legacy_value.clone()).unwrap();
+        assert_eq!(legacy_record.epoch(), None);
+        assert!(
+            !serde_json::to_string(&legacy_record)
+                .unwrap()
+                .contains("\"epoch\"")
+        );
+
+        let malformed = directory.path().join("malformed.json");
+        std::fs::write(&malformed, "{\"epoch\": 7}").unwrap();
+        assert!(read_recorded_epoch(&malformed).is_err());
+        assert!(read_recorded_epoch(&directory.path().join("absent.json")).is_err());
+    }
+
     #[test]
     fn print_preemptionrecord() {
         let (file, path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
@@ -876,6 +947,13 @@ impl PreemptionWriter {
         }
     }
 
+    /// Store the virtual-time epoch the recorded logical times are measured
+    /// from, so a replay can start its clock at the same instant.
+    pub fn with_epoch(mut self, epoch: DateTime<Utc>) -> Self {
+        self.inner.epoch = Some(epoch);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1063,6 +1141,35 @@ fn read_preemption_record(path: &Path) -> PreemptionRecord {
         );
     }
     pr
+}
+
+/// Read only the virtual-time epoch stored in a preemption record file.
+///
+/// Unlike [`PreemptionReader::new`], this reports an unreadable or malformed
+/// file as an error instead of panicking, because the CLI consults it before
+/// any guest starts. `Ok(None)` means the record predates stored epochs.
+#[cfg(not(target_os = "none"))]
+pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String> {
+    #[derive(Deserialize)]
+    struct EpochOnly {
+        #[serde(default)]
+        epoch: Option<DateTime<Utc>>,
+    }
+    let file = File::open(path)
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let record: EpochOnly = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
+    Ok(record.epoch)
+}
+
+/// Without std there is no file system to read the record from, so this
+/// fails as the host version does when the file cannot be opened.
+#[cfg(target_os = "none")]
+pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String> {
+    Err(format!(
+        "cannot read preemption record {}: the Narf kernel build of Detcore has no file system",
+        path.display()
+    ))
 }
 
 // TODO: eventually this should do streaming IO, and abstract it behind this interface.
