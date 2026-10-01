@@ -4105,8 +4105,8 @@ const MANIFEST_PLAN_DATA_FILES: [&str; 4] = [
 ///
 /// The helper reads the `*.yaml` files in `tests/e2e/manifests` (defaults
 /// included), [`MANIFEST_PLAN_DATA_FILES`], and the output of `git ls-files
-/// --cached --others --exclude-standard -- tests`, run here exactly as the
-/// helper runs it, so that the index, ignore rules and Git environment are
+/// --cached --others --exclude-standard -- tests`, run here as the helper
+/// runs it, so that the index, ignore rules and Git environment are
 /// covered. It also checks that each manifest program is a file or a symlink,
 /// and whether its target is a file. A successful plan requires every program
 /// to appear in that listing, so the digest records both facts for every
@@ -4115,8 +4115,33 @@ const MANIFEST_PLAN_DATA_FILES: [&str; 4] = [
 /// does not name ROOT; ROOT must be absolute because the helper runs inside
 /// it. The helper itself is identified by its file metadata, not its bytes:
 /// hashing the 120 MB debug build would cost about as much as running it.
+///
+/// The listing must come from ROOT's own repository, so Git may look for one
+/// only at ROOT: `GIT_CEILING_DIRECTORIES` names ROOT's parent. Git checks
+/// ROOT before it consults the ceiling, so for a ROOT with its own repository
+/// the listing is exactly the helper's. Without the ceiling, Git would walk up
+/// from a plain directory inside another checkout and list `tests` from that
+/// checkout, an empty listing when the checkout ignores the directory, so the
+/// directory would have a key there and none elsewhere. That is the hosted
+/// case: the hosted preflight job starts `ci/run-node.sh` with TMPDIR unset,
+/// so `scripts/validate.rs` points it at `target/validation/run-*/tmp` inside
+/// the Hermit checkout, while a local validate's TMPDIR is a fresh directory
+/// outside any checkout.
 fn manifest_plan_cache_key(program: &Path, root: &Path) -> Result<Option<String>, String> {
+    use std::os::unix::ffi::OsStrExt;
+
     if !root.is_absolute() {
+        return Ok(None);
+    }
+    // Git resolves symlinks in the working directory, so the ceiling must be
+    // the parent of ROOT's real path. Git splits the variable at colons and
+    // has no escape for one, so a parent containing a colon cannot bound the
+    // search.
+    let Ok(real_root) = fs::canonicalize(root) else {
+        return Ok(None);
+    };
+    let ceiling = real_root.parent().unwrap_or(real_root.as_path());
+    if ceiling.as_os_str().as_bytes().contains(&b':') {
         return Ok(None);
     }
     let Ok(listing) = Command::new("git")
@@ -4131,6 +4156,7 @@ fn manifest_plan_cache_key(program: &Path, root: &Path) -> Result<Option<String>
             "tests",
         ])
         .current_dir(root)
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
         .output()
     else {
         return Ok(None);
@@ -15570,6 +15596,40 @@ mod prepared_manifest_plan_tests {
         let memory = PlanMemory(Default::default());
         assert!(plan(&memory).1);
         assert!(plan(&memory).1, "an input with no key is planned again");
+
+        // The same holds inside another checkout, which Git would otherwise
+        // find by walking up and list the directory from. Build that case
+        // explicitly, so it is covered wherever TMPDIR puts these fixtures.
+        let enclosing = tempfile::tempdir().unwrap();
+        let status = fixture_git()
+            .args(["init", "--quiet"])
+            .current_dir(enclosing.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let nested = enclosing.path().join("nested");
+        fs::rename(root, &nested).unwrap();
+        let enclosing_listing = fixture_git()
+            .args([
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                "tests",
+            ])
+            .current_dir(&nested)
+            .output()
+            .unwrap();
+        assert!(
+            enclosing_listing.status.success() && !enclosing_listing.stdout.is_empty(),
+            "the enclosing checkout lists the nested inputs"
+        );
+        assert_eq!(
+            manifest_plan_cache_key(&nested.join("stub-manifest-plan"), &nested).unwrap(),
+            None,
+            "a directory inside another checkout has no key"
+        );
     }
 
     #[test]
