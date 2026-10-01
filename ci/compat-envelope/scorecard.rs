@@ -5803,6 +5803,10 @@ impl ParityCommitFacts {
 /// The request is handed to Git as a file rather than a pipe: this process
 /// exits on `SIGPIPE` ([`rust_script_prelude::init`]), so writing to a Git
 /// that stopped reading must not be possible.
+///
+/// Git answers from this clone's object store alone, as in
+/// [`git_local_rev_parse`]: with a promisor remote it would otherwise fetch a
+/// missing name before it reported the name missing.
 fn git_cat_file_batch(
     root: &Path,
     names: &[String],
@@ -5816,6 +5820,7 @@ fn git_cat_file_batch(
     let output = Command::new("git")
         .arg("--no-replace-objects")
         .args(["cat-file", "--batch"])
+        .env("GIT_NO_LAZY_FETCH", "1")
         .current_dir(root)
         .stdin(Stdio::from(request))
         .output()
@@ -5868,7 +5873,9 @@ fn parse_cat_file_batch(
 /// commits reachable from each one (itself included), `first_parent` the
 /// length of its first-parent chain, exactly as `rev-list --count` and
 /// `rev-list --count --first-parent` count them. A commit whose history cannot
-/// be read has no depth.
+/// be read has no depth. The history is read from this clone's object store
+/// alone, as in [`git_local_rev_parse`], so a missing commit is never fetched
+/// from a promisor remote.
 fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDepth> {
     if commits.is_empty() {
         return BTreeMap::new();
@@ -5877,6 +5884,7 @@ fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDe
         .arg("--no-replace-objects")
         .args(["rev-list", "--parents"])
         .args(commits)
+        .env("GIT_NO_LAZY_FETCH", "1")
         .current_dir(root)
         .output()
     else {
@@ -15986,6 +15994,13 @@ mod local_rev_parse_tests {
         let revision = format!("{promised}^{{commit}}");
 
         assert!(git_local_rev_parse(clone.path(), &revision).is_err());
+        // The batch object reader and the history reader ask the same
+        // local-only question: the commit is missing and has no depth.
+        assert_eq!(
+            git_cat_file_batch(clone.path(), std::slice::from_ref(&promised)),
+            Ok(Some(vec![None]))
+        );
+        assert!(git_commit_depths(clone.path(), &[promised.as_str()]).is_empty());
         let still_missing = fixture_git()
             .args(["cat-file", "-e", &promised])
             .env("GIT_NO_LAZY_FETCH", "1")
