@@ -117,7 +117,8 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
   E2E_RUN_INDEX=<N>                      Non-negative run index recorded in results
   E2E_MACHINE_SHORTNAME=<NAME>           Machine name recorded in results
   E2E_KERNEL_VERSION=<VERSION>           Kernel version recorded in results
-  HERMIT_BIN=<PATH>                      Hermit executable (default: target/debug/hermit)
+  HERMIT_BIN=<PATH>                      Hermit executable; a relative path is under the
+                                         repository root (default: target/debug/hermit)
   HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
   E2E_KEEP_VERIFY_LOGS=1                 Retain successful verification logs
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
@@ -152,7 +153,8 @@ Options:
   -h, --help                       Print this help
 
 Environment:
-  HERMIT_BIN=<PATH>                      Hermit executable (default: target/debug/hermit)";
+  HERMIT_BIN=<PATH>                      Hermit executable; a relative path is under the
+                                         repository root (default: target/debug/hermit)";
 
 const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
@@ -3048,9 +3050,8 @@ fn parity_compare(
         rows.iter().map(|row| row.hermit_sha.as_str()).collect(),
         "hermit_sha",
     );
-    let hermit_bin = std::env::var_os("HERMIT_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target/debug/hermit"));
+    let hermit_bin =
+        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"));
     let mut config =
         parity::PostPassConfig::new(&request.artifacts, &hermit_bin, &run_id, &hermit_sha)
             .writing_below(&request.artifacts.join(PARITY_COMPARE_DIR));
@@ -4467,7 +4468,9 @@ sys.exit(1 if failed else 0)
         // for e2e.manifest_compat and its _on_host twin, which run on the host
         // because the corpus's programs are host-installed (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448).
-        assert_eq!((pinned, direct), (19, 17));
+        // +1 direct for portablecompat.manifest_compat, the corpus-only run
+        // type's bucket, which also runs on the host.
+        assert_eq!((pinned, direct), (19, 18));
     }
 
     /// With the committed parity selection, the full profile's harness

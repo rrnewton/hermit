@@ -16938,8 +16938,13 @@ mod pressure_sample_tests {
                 )
             })
             .collect();
+        // A floor, so the per-header checks below cannot pass vacuously over an
+        // empty or truncated selection. It was 100 while the
+        // portable-strict-compat-only run type emitted 189 generated pinned-root
+        // probes; one host-run manifest bucket replaced them (fold 2 of
+        // https://github.com/rrnewton/hermit/issues/3448), which leaves 72.
         assert!(
-            headers.len() > 100,
+            headers.len() >= 72,
             "{} pinned-root commands",
             headers.len()
         );

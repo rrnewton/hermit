@@ -381,6 +381,17 @@ pub struct ModeRecipe {
     pub no_retry_reason: Option<String>,
 }
 
+/// The Hermit the harness runs: `HERMIT_BIN`, else target/debug/hermit. A
+/// relative path names a checkout path, like the default, because cells start
+/// Hermit from their own working directories; an absolute path is kept.
+pub fn resolve_hermit_bin(root: &Path, hermit_bin: Option<std::ffi::OsString>) -> PathBuf {
+    root.join(
+        hermit_bin
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/debug/hermit")),
+    )
+}
+
 /// Whether a product failure of `cell` earns the runner's one retry: false
 /// for a verify cell that declares `no_retry_reason`.
 pub fn retries_product_failures(cell: &SelectedCell) -> bool {
@@ -2616,9 +2627,7 @@ impl RunContext {
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
-        let hermit_bin = std::env::var_os("HERMIT_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("target/debug/hermit"));
+        let hermit_bin = resolve_hermit_bin(&root, std::env::var_os("HERMIT_BIN"));
         // Ask the binary where it came from, the same way this function already
         // asks it what flags it supports. `source_sha` above describes the
         // checkout; only the binary can describe the binary.
@@ -7008,6 +7017,26 @@ mod tests {
         );
         assert!(at(&stripped.argv, "--verify").is_some());
         assert_eq!(stripped.comparator, Comparator::Stripped);
+    }
+
+    #[test]
+    fn a_relative_hermit_bin_names_a_checkout_path() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            resolve_hermit_bin(root, None),
+            Path::new("/repo/target/debug/hermit")
+        );
+        assert_eq!(
+            resolve_hermit_bin(
+                root,
+                Some("ignored/hermetic/split/target/release/hermit".into())
+            ),
+            Path::new("/repo/ignored/hermetic/split/target/release/hermit")
+        );
+        assert_eq!(
+            resolve_hermit_bin(root, Some("/opt/hermit".into())),
+            Path::new("/opt/hermit")
+        );
     }
 
     /// The strict compatibility corpus ran each program as its own validation
