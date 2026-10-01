@@ -270,6 +270,67 @@ workflow_step_body() {
     ' <<<"$workflow_text"
 }
 
+# A step name is not unique across jobs (strict-compat and e2e both have
+# "Unpack prebuilt trees"), so consumer checks read the step inside its job.
+workflow_job_step_body() {
+    local job=$1 step_name=$2 workflow_text=$3 body step
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    step=$(workflow_step_body "$step_name" "$body")
+    [[ -n $step ]] || return 1
+    printf '%s\n' "$step"
+}
+
+# Every step that checks its inputs with `require` uses one counted gate:
+#
+#   missing=0
+#   require() { if ! test "$1" "$2"; then <name it>; missing+1; fi; }
+#   require -x <path>          (one or more, comments allowed between)
+#   if ((missing > 0)); then <report>; exit 1; fi
+#
+# Pinning the `require` lines alone does not hold that gate. Deleting the
+# gate's `exit 1`, turning it into `exit 0`, or weakening the helper to
+# `if false` or `test -e "$2"` keeps every pinned line while nothing is
+# enforced. This reads the whole block in order, and refuses a `require` call
+# or a `missing` use anywhere else in the step, so a `require` placed after
+# the gate cannot report a missing input without failing the step.
+require_gate_contract() {
+    local step_text=$1
+    awk '
+        { line[++n] = $0 }
+        END {
+            for (i = 1; i <= n; i++) {
+                if (line[i] == "          missing=0") {
+                    if (start) exit 1
+                    start = i
+                }
+            }
+            if (!start) exit 1
+            i = start + 1
+            if (line[i++] != "          require() {") exit 1
+            if (line[i++] != "            if ! test \"$1\" \"$2\"; then") exit 1
+            if (line[i++] !~ /^              echo "::error::[^"$`\\]*: missing: \$2 \(test \$1 failed\)" >&2$/) exit 1
+            if (line[i++] != "              missing=$((missing + 1))") exit 1
+            if (line[i++] != "            fi") exit 1
+            if (line[i++] != "          }") exit 1
+            calls = 0
+            while (i <= n && (line[i] ~ /^          require -[efsx] [^ ;&|$`]+$/ || line[i] ~ /^          #/)) {
+                if (line[i] !~ /^          #/) calls++
+                i++
+            }
+            if (!calls) exit 1
+            if (line[i++] != "          if ((missing > 0)); then") exit 1
+            if (line[i++] !~ /^            echo "[^"$`\\]*: \$missing required input\(s\) missing[^"$`\\]*" >&2$/) exit 1
+            if (line[i++] != "            exit 1") exit 1
+            if (line[i++] != "          fi") exit 1
+            for (j = 1; j <= n; j++) {
+                if (j >= start && j < i) continue
+                if (line[j] ~ /^[[:space:]]*#/) continue
+                if (line[j] ~ /(^|[^[:alnum:]_])(require|missing)([^[:alnum:]_]|$)/) exit 1
+            }
+        }
+    ' <<<"$step_text"
+}
+
 # build.workspace_on_host builds Hermit in the validate profile (d44bbbb79ac),
 # so hermit, verification-report and the DBT runtime must be packed from
 # target/validate. Run 36836745615 failed when this step still named the
@@ -305,7 +366,8 @@ debug_artifact_contract() {
         grep -Fqx '              missing=$((missing + 1))' <<<"$pack_step" &&
         grep -Fqx '          if ((missing > 0)); then' <<<"$pack_step" &&
         grep -Fqx '            exit 1' <<<"$pack_step" || return 1
-    debug_install_resources_contract "$pack_step"
+    require_gate_contract "$pack_step" &&
+        debug_install_resources_contract "$pack_step"
 }
 
 # No release-profile producer exists since d44bbbb79ac
@@ -314,9 +376,28 @@ debug_artifact_contract() {
 # the release shards read, and of the profile-staged LiteInst runtime that
 # test.liteinst_strict stages. hermit-install links three of those resources
 # into target/validate, which the tree does not carry whole, so the pack step
-# must replace every link with a regular copy and refuse a leftover one.
+# must replace every link with a regular copy and refuse a leftover one. The
+# replacement loop is pinned whole and must precede the tar: its dangling-link
+# refusal and the leftover refusal are each the part that acts, and a line
+# pinned without its consequence (`leftover=` without the `exit 1` after it)
+# accepted a tree that still linked into target/validate.
 debug_install_resources_contract() {
-    local pack_step=$1 required
+    local pack_step=$1 required symlink_block before_tar
+    symlink_block=$(cat <<'EOF'
+          while IFS= read -r -d '' link; do
+            if ! resolved=$(readlink -e -- "$link") || ! test -f "$resolved"; then
+              echo "::error::Pack debug prebuilt tree: dangling or non-file symlink: $link" >&2
+              exit 1
+            fi
+            rm -f -- "$link"
+            cp -p -- "$resolved" "$link"
+          done < <(find target/install_pkg -type l -print0)
+          leftover=$(find target/install_pkg -type l -print -quit)
+          if [[ -n $leftover ]]; then echo "::error::Pack debug prebuilt tree: symlink left in target/install_pkg: $leftover" >&2; exit 1; fi
+EOF
+)
+    before_tar=${pack_step%%'          tar --zstd -cf "$DEBUG_TARBALL" \'*}
+    [[ $before_tar != "$pack_step" && $before_tar == *"$symlink_block"* ]] || return 1
     for required in \
         '          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' \
         '          require -x target/install_pkg/rsrcs/sabre' \
@@ -330,11 +411,7 @@ debug_install_resources_contract() {
         '          require -s target/validate/libreverie_liteinst.so.revision' \
         '            target/install_pkg \' \
         '            target/validate/libreverie_liteinst.so \' \
-        '            target/validate/libreverie_liteinst.so.revision \' \
-        '            rm -f -- "$link"' \
-        '            cp -p -- "$resolved" "$link"' \
-        '          done < <(find target/install_pkg -type l -print0)' \
-        '          leftover=$(find target/install_pkg -type l -print -quit)'
+        '            target/validate/libreverie_liteinst.so.revision \'
     do
         grep -Fqx -- "$required" <<<"$pack_step" || return 1
     done
@@ -378,7 +455,9 @@ completed_build_contract() {
     unpack_step=$(workflow_step_body "Unpack prerequisite trees" "$workflow_text")
     pack_step=$(workflow_step_body "Pack full release prebuilt tree (artifact + resources + liteinst)" "$workflow_text")
     grep -Fqx -- "        run: ./ci/run-node.sh portable \"\$(jq -r '(.build_dbt_nodes + .build_aux_nodes)|join(\",\")' ci/portable-shards.json)\"" <<<"$body" &&
-        grep -Fqx '        run: cargo fetch --locked' <<<"$body" || return 1
+        grep -Fqx '        run: cargo fetch --locked' <<<"$body" &&
+        require_gate_contract "$unpack_step" &&
+        require_gate_contract "$pack_step" || return 1
     for required in \
         '          tar --zstd -xf "$DEBUG_TARBALL"' \
         '          require -x target/validate/hermit' \
@@ -396,6 +475,8 @@ completed_build_contract() {
     done
     for required in \
         '          require -x target/ci/hermit' \
+        '          require -s target/ci/libdetcore_sabre.so' \
+        '          require -s target/ci/hermit-e2e-artifact.path' \
         '          require -s target/install_pkg/rsrcs/libdetcore_dbt.so' \
         '          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so' \
         '          require -s target/validate/libreverie_liteinst.so' \
@@ -416,22 +497,36 @@ completed_build_contract() {
 # exists only in Buck mode, so every executable line that named either was a
 # dangling input (https://github.com/rrnewton/hermit/issues/3458). Each
 # release-tree consumer must instead require target/ci/hermit, the one path
-# build.e2e_artifact installs, and fail closed when it is absent.
+# build.e2e_artifact installs, behind the counted gate that exits 1 when it is
+# absent.
+release_tree_consumers=(
+    'build-complete|Pack full release prebuilt tree (artifact + resources + liteinst)'
+    'test-debug|Unpack completed release tree'
+    'strict-compat|Unpack prebuilt trees'
+    'test-release|Unpack full release prebuilt tree'
+    'e2e|Unpack prebuilt trees'
+    'sabre_non_gated_parity|Unpack product and runner trees'
+)
 release_tree_consumer_contract() {
-    local workflow_text=$1 job body
+    local workflow_text=$1 consumer step body required
     if grep -v '^[[:space:]]*#' <<<"$workflow_text" | grep -Eq 'target/release|hermit-strict'; then
         return 1
     fi
-    for job in build-complete test-debug strict-compat test-release e2e sabre_non_gated_parity; do
-        body=$(workflow_job_body "$job" "$workflow_text") || return 1
-        grep -Fqx '          require -x target/ci/hermit' <<<"$body" &&
-            grep -Fqx '              missing=$((missing + 1))' <<<"$body" &&
-            grep -Fqx '          if ((missing > 0)); then' <<<"$body" || return 1
+    for consumer in "${release_tree_consumers[@]}"; do
+        step=$(workflow_job_step_body "${consumer%%|*}" "${consumer#*|}" "$workflow_text") || return 1
+        require_gate_contract "$step" &&
+            grep -Fqx '          require -x target/ci/hermit' <<<"$step" || return 1
     done
-    body=$(workflow_job_body test-release "$workflow_text") || return 1
-    grep -Fqx '          require -x target/install_pkg/rsrcs/sabre' <<<"$body" &&
-        grep -Fqx '          require -s target/validate/libreverie_liteinst.so' <<<"$body" &&
-        grep -Fqx '          require -s target/validate/libreverie_liteinst.so.revision' <<<"$body" || return 1
+    step=$(workflow_job_step_body test-release 'Unpack full release prebuilt tree' "$workflow_text") || return 1
+    for required in \
+        '          require -x target/install_pkg/rsrcs/sabre' \
+        '          require -f target/install_pkg/rsrcs/libreverie_dbt_client.so' \
+        '          require -f target/install_pkg/rsrcs/libdetcore_dbt.so' \
+        '          require -s target/validate/libreverie_liteinst.so' \
+        '          require -s target/validate/libreverie_liteinst.so.revision'
+    do
+        grep -Fqx -- "$required" <<<"$step" || return 1
+    done
     body=$(workflow_job_body sabre_non_gated_parity "$workflow_text") || return 1
     grep -Fqx '      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit' <<<"$body"
 }
@@ -734,7 +829,9 @@ mutate_step() {
 for omitted_resource_line in \
     $'            target/install_pkg \\\n' \
     $'            cp -p -- "$resolved" "$link"\n' \
-    $'          require -s target/validate/libreverie_liteinst.so\n'
+    $'          require -s target/validate/libreverie_liteinst.so\n' \
+    $'          if [[ -n $leftover ]]; then echo "::error::Pack debug prebuilt tree: symlink left in target/install_pkg: $leftover" >&2; exit 1; fi\n' \
+    $'              exit 1\n'
 do
     if ! omitted_resource=$(mutate_step "Pack debug prebuilt tree" "$omitted_resource_line" '' "$workflow_text") ||
         [[ $omitted_resource == "$workflow_text" ]]; then
@@ -742,6 +839,27 @@ do
         status=1
     elif debug_artifact_contract "$omitted_resource"; then
         echo "check-shard-coverage.sh: FAIL — artifact guard accepted a debug tree without: ${omitted_resource_line%$'\n'}" >&2
+        status=1
+    fi
+done
+# Keeping every pinned line while defeating the loop must also be refused:
+# relinking after the copy, or a dangling-link test that can never fire.
+symlink_loop_from=(
+    $'            cp -p -- "$resolved" "$link"\n'
+    '            if ! resolved=$(readlink -e -- "$link") || ! test -f "$resolved"; then'
+)
+symlink_loop_to=(
+    $'            cp -p -- "$resolved" "$link"\n            ln -sfr -- "$resolved" "$link"\n'
+    '            if false; then'
+)
+for index in "${!symlink_loop_from[@]}"; do
+    if ! defeated_loop=$(mutate_step "Pack debug prebuilt tree" \
+        "${symlink_loop_from[index]}" "${symlink_loop_to[index]}" "$workflow_text") ||
+        [[ $defeated_loop == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — debug symlink-loop mutation $index did not change the pack step" >&2
+        status=1
+    elif debug_artifact_contract "$defeated_loop"; then
+        echo "check-shard-coverage.sh: FAIL — artifact guard accepted a debug tree whose symlink loop was defeated (mutation $index)" >&2
         status=1
     fi
 done
@@ -766,7 +884,7 @@ elif completed_build_contract "$unfetched_sources"; then
     status=1
 fi
 if ! release_tree_consumer_contract "$workflow_text"; then
-    echo "check-shard-coverage.sh: FAIL — no executable workflow line may name target/release or target/ci/hermit-strict, and every release-tree consumer must require target/ci/hermit" >&2
+    echo "check-shard-coverage.sh: FAIL — no executable workflow line may name target/release or target/ci/hermit-strict, and every release-tree consumer must require target/ci/hermit behind a counted gate that exits 1" >&2
     status=1
 fi
 stale_release_bin=${workflow_text/'      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit'/'      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit'}
@@ -785,6 +903,51 @@ elif release_tree_consumer_contract "$unchecked_consumer"; then
     echo "check-shard-coverage.sh: FAIL — release-tree guard accepted test-debug without its target/ci/hermit check" >&2
     status=1
 fi
+# Every counted input gate (https://github.com/rrnewton/hermit/issues/3458).
+# Each mutation keeps every pinned `require` line, so only the gate structure
+# can refuse it: the gate's `exit 1` deleted or made `exit 0`, the helper
+# weakened to `if false` or to `test -e`, and a `require` after the gate.
+mutate_job_step() {
+    local job=$1 step_name=$2 from=$3 to=$4 workflow_text=$5 body step mutated
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    step=$(workflow_step_body "$step_name" "$body")
+    mutated=${step/"$from"/"$to"}
+    [[ -n $step && $mutated != "$step" ]] || return 1
+    mutated=${body/"$step"/"$mutated"}
+    printf '%s' "${workflow_text/"$body"/"$mutated"}"
+}
+gate_from=(
+    $'\n            exit 1\n'
+    $'\n            exit 1\n'
+    '            if ! test "$1" "$2"; then'
+    '            if ! test "$1" "$2"; then'
+    $'\n            exit 1\n          fi'
+)
+gate_to=(
+    $'\n'
+    $'\n            exit 0\n'
+    '            if false; then'
+    '            if ! test -e "$2"; then'
+    $'\n            exit 1\n          fi\n          require -x target/ci/late'
+)
+for gate in \
+    'build-debug|Pack debug prebuilt tree|debug_artifact_contract' \
+    'build-complete|Unpack prerequisite trees|completed_build_contract' \
+    "${release_tree_consumers[@]/%/|release_tree_consumer_contract}"
+do
+    IFS='|' read -r gate_job gate_step gate_contract <<<"$gate"
+    for index in "${!gate_from[@]}"; do
+        if ! open_gate=$(mutate_job_step "$gate_job" "$gate_step" \
+            "${gate_from[index]}" "${gate_to[index]}" "$workflow_text") ||
+            [[ $open_gate == "$workflow_text" ]]; then
+            echo "check-shard-coverage.sh: FAIL — input-gate mutation $index did not change $gate_job: $gate_step" >&2
+            status=1
+        elif "$gate_contract" "$open_gate"; then
+            echo "check-shard-coverage.sh: FAIL — $gate_contract accepted an open input gate (mutation $index) in $gate_job: $gate_step" >&2
+            status=1
+        fi
+    done
+done
 if ! prepared_nextest_producer_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — build-debug must re-assert the prepared Nextest record after its last Cargo build and before packing" >&2
     status=1
