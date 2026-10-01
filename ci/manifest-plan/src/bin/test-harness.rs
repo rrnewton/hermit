@@ -100,6 +100,10 @@ Execution and output options:
                                    reports a diagnostic cell's failure without
                                    failing the node (run only)
   --allow-empty                    Permit an empty explicit CI selection
+  --no-retry                       Run each selected cell exactly once: a product
+                                   failure is final instead of earning the one
+                                   framework retry. For flake measurement, where
+                                   a retry would hide the failure rate (run only)
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
   --format <text|json>             Plan output format (default: text)
@@ -314,6 +318,7 @@ struct Args {
     prebuilt: bool,
     diagnostic_results: bool,
     allow_empty: bool,
+    retries: Retries,
     ci_only: bool,
     probe_disabled: bool,
     results: Option<PathBuf>,
@@ -410,6 +415,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             "--prebuilt" => args.prebuilt = true,
             "--diagnostic-results" => args.diagnostic_results = true,
             "--allow-empty" => args.allow_empty = true,
+            "--no-retry" => args.retries = Retries::Off,
             "--results" => {
                 args.results = Some(PathBuf::from(required_value(&mut values, "--results")))
             }
@@ -2476,10 +2482,26 @@ fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) 
     }
 }
 
+/// Whether `run` may retry a product failure at all.
+///
+/// `Off` is the flake-measurement setting (`--no-retry`): every selected cell
+/// runs exactly once, so N repeated runs yield N first-attempt observations
+/// instead of a pass rate that the retry has already rounded up. It changes
+/// only whether a retry is launched; each row's outcome and failure class are
+/// unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Retries {
+    #[default]
+    Framework,
+    Off,
+}
+
 /// Whether this finished attempt of `cell` is retried: a retryable product
-/// failure of a cell that has not declared `no_retry_reason`.
-fn attempt_earns_retry(cell: &SelectedCell, result: &CellResult) -> bool {
-    retries_product_failures(cell)
+/// failure of a cell that has not declared `no_retry_reason`, in a run that
+/// has not turned retries off.
+fn attempt_earns_retry(retries: Retries, cell: &SelectedCell, result: &CellResult) -> bool {
+    retries == Retries::Framework
+        && retries_product_failures(cell)
         && cell_result_is_retryable(result.outcome.as_str(), result.failure_class)
 }
 
@@ -2590,7 +2612,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => error.into_result(&attempt_context, cell),
                     }
                 },
-                |result| attempt_earns_retry(cell, result),
+                |result| attempt_earns_retry(args.retries, cell, result),
                 emit,
             );
         },
@@ -5966,11 +5988,34 @@ sys.exit(1 if failed else 0)
             &[],
             None,
         );
-        assert!(!super::attempt_earns_retry(&cell("compat/cat"), &failed));
+        assert!(!super::attempt_earns_retry(
+            super::Retries::Framework,
+            &cell("compat/cat"),
+            &failed
+        ));
         assert!(super::attempt_earns_retry(
+            super::Retries::Framework,
             &cell("c-programs/random-readv-stream"),
             &failed
         ));
+        // --no-retry: the same retryable product failure is final.
+        assert!(!super::attempt_earns_retry(
+            super::Retries::Off,
+            &cell("c-programs/random-readv-stream"),
+            &failed
+        ));
+    }
+
+    #[test]
+    fn no_retry_flag_turns_framework_retries_off() {
+        assert_eq!(
+            super::parse(std::iter::empty()).retries,
+            super::Retries::Framework
+        );
+        assert_eq!(
+            super::parse(["--no-retry".to_string()].into_iter()).retries,
+            super::Retries::Off
+        );
     }
 
     #[test]

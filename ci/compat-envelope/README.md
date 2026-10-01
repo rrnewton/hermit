@@ -442,6 +442,45 @@ See the complete command contract with:
 ./ci/compat-envelope/pressure-test.rs --help
 ```
 
+### Flake census
+
+Validation retries a retryable product failure once, so a flaky cell can
+still finish green. A flake census turns retries off and repeats each selection
+N times. It has two halves, one per test population, and they share the same
+verdicts:
+
+| Verdict | Meaning |
+| --- | --- |
+| `CLEAN` | every run passed |
+| `FLAKY` | some runs passed and some failed, including a pass that needed a retry |
+| `FAILING` | no run passed, and at least one failed |
+| `INCOMPLETE` | no product failure, but some run produced no product verdict (infrastructure, prerequisite, timeout or OOM no-result, missing evidence) |
+
+Only product failures decide `FLAKY` or `FAILING`. A run that gave no product
+verdict is counted in its own column and never reported as a flake.
+
+End-to-end manifest cells (every cell selected by full, with one shared build).
+Each repetition is one harness attempt (`test-harness run --no-retry`). The
+classes are the harness's own `failure_class` values:
+
+```console
+./ci/compat-envelope/pressure-test.rs run --green --repetitions 10 --no-retry \
+  --run-timeout 86400 --jobs 316 --manifest-guest-cap 40 --kvm-guest-cap 8
+```
+
+`--manifest-guest-cap` must fit the memory check that the plan prints. `plan`
+with the same options shows the step count and the highest safe caps without
+running anything. Explicit `custom` commands are outside the comparable
+population and are not repeated.
+
+Rust tests (one validate `test.*` node's nextest selection). Nextest repeats
+the selection itself with `--stress-count`, retries are off, and each failure is
+classified from the typed `type` on the JUnit `<failure>` that nextest writes:
+
+```console
+scripts/stress-test.sh -n 500 -- -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
+```
+
 This ports the useful one-box-per-red-cell shape from the old parent-workspace
 `compat-envelope/expansion-dag.rs`. It deliberately does not port the parent
 CSV dependency, invented fallback backend multipliers, or evidence-directory
