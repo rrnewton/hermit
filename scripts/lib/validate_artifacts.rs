@@ -199,6 +199,10 @@ fn publish_file_noclobber_with_sync(
 /// Publish one immutable run artifact without replacing existing evidence.
 /// Publication syncs the file and its directory; a failed directory sync
 /// removes the published file and syncs the cleanup before returning failure.
+///
+/// The bytes go to the parent's physical state directory; the returned
+/// parent-relative name is the logical `ignored/validate/artifacts/...`
+/// spelling that ledger rows record.
 pub(crate) fn publish_run_artifact_noclobber(
     parent: &Path,
     run_id: &str,
@@ -208,8 +212,8 @@ pub(crate) fn publish_run_artifact_noclobber(
 ) -> Result<String, String> {
     require_normal_component(run_id, "retained validation run_id")?;
     require_normal_component(name, "retained validation artifact name")?;
-    let relative_directory = PathBuf::from("ignored")
-        .join("validate")
+    let layout = crate::validation_state::Layout::detect(parent);
+    let relative_directory = PathBuf::from(layout.prefix())
         .join("artifacts")
         .join(run_id);
     let artifact_dir = create_plain_directory_path_below(
@@ -229,7 +233,7 @@ pub(crate) fn publish_run_artifact_noclobber(
     artifact
         .strip_prefix(parent)
         .map_err(|_| "retained validation artifact is outside parent root".to_string())
-        .map(|relative| relative.to_string_lossy().into_owned())
+        .map(|relative| layout.logical(&relative.to_string_lossy()))
 }
 
 #[cfg(test)]
@@ -337,6 +341,88 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("already exists"), "{error}");
         assert_eq!(fs::read(original).unwrap(), b"original");
+    }
+
+    #[test]
+    fn artifact_publication_on_a_migrated_root_writes_physically_and_names_logically() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("validate_tmp")).unwrap();
+        fs::create_dir(root.path().join("ignored")).unwrap();
+        symlink("../validate_tmp", root.path().join("ignored/validate")).unwrap();
+        let relative = publish_run_artifact_noclobber(
+            root.path(),
+            "fixture-run",
+            "results.jsonl",
+            b"original\n",
+            "fixture artifact",
+        )
+        .unwrap();
+        assert_eq!(
+            relative,
+            "ignored/validate/artifacts/fixture-run/results.jsonl"
+        );
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("validate_tmp/artifacts/fixture-run/results.jsonl")
+            )
+            .unwrap(),
+            b"original\n"
+        );
+        // The recorded name still opens the same bytes through the link.
+        assert_eq!(
+            fs::read(root.path().join(&relative)).unwrap(),
+            b"original\n"
+        );
+        let error = publish_run_artifact_noclobber(
+            root.path(),
+            "fixture-run",
+            "results.jsonl",
+            b"replacement\n",
+            "fixture artifact",
+        )
+        .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+
+        // A link to anywhere else is not the migrated layout: the old walk
+        // runs and refuses it, and nothing is written outside.
+        let foreign = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(foreign.path().join("validate_tmp")).unwrap();
+        fs::create_dir(foreign.path().join("ignored")).unwrap();
+        symlink(outside.path(), foreign.path().join("ignored/validate")).unwrap();
+        let error = publish_run_artifact_noclobber(
+            foreign.path(),
+            "fixture-run",
+            "results.jsonl",
+            b"new",
+            "fixture artifact",
+        )
+        .unwrap_err();
+        assert!(error.contains("non-symlink directory"), "{error}");
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert!(
+            fs::read_dir(foreign.path().join("validate_tmp"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        // A symlinked validate_tmp is refused rather than followed.
+        let linked = tempfile::tempdir().unwrap();
+        fs::create_dir(linked.path().join("ignored")).unwrap();
+        symlink(outside.path(), linked.path().join("validate_tmp")).unwrap();
+        symlink("../validate_tmp", linked.path().join("ignored/validate")).unwrap();
+        let error = publish_run_artifact_noclobber(
+            linked.path(),
+            "fixture-run",
+            "results.jsonl",
+            b"new",
+            "fixture artifact",
+        )
+        .unwrap_err();
+        assert!(error.contains("non-symlink directory"), "{error}");
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     #[test]

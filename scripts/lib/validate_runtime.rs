@@ -1028,12 +1028,17 @@ impl Drop for RunRecord {
     }
 }
 
-/// Where live-run records go. The parent workspace when one is resolvable (every
-/// slot on this box resolves to the same parent, which is what makes the count
-/// box-wide), else a per-uid directory.
+/// Where live-run records go. The parent workspace's validation state
+/// directory when one is resolvable (every slot on this box resolves to the
+/// same parent, which is what makes the count box-wide), else a per-uid
+/// directory. On a migrated parent that is `validate_tmp/runs`, which is the
+/// same directory `ignored/validate/runs` reaches through the compatibility
+/// symlink, so old and new drivers still count each other.
 pub fn registry_dir(parent: Option<&Path>) -> PathBuf {
     match parent {
-        Some(p) => p.join("ignored").join("validate").join("runs"),
+        Some(p) => crate::validation_state::Layout::detect(p)
+            .state_dir(p)
+            .join("runs"),
         None => {
             let uid = unsafe { libc::getuid() };
             PathBuf::from(format!("/tmp/hermit-validate-runs-{uid}"))
