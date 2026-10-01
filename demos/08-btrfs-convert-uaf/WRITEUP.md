@@ -7,9 +7,11 @@ a shared or heavily loaded machine it may not reproduce reliably. Chaos mode
 places each thread switch by counting retired branches: Hermit arms the
 counter's interrupt a safety margin of branches early and single-steps the
 rest of the way to the exact switch point. If the interrupt arrives later than
-that margin, which is more likely under heavy host load (Hermit then prints a
-line starting with `HERMIT_SKID_OVERSHOOT`), the switch lands past its planned
-point and the seed may miss the race.
+that margin, which is more likely under heavy host load, Reverie, the library
+Hermit uses to trace the program, prints a line starting with
+`HERMIT_SKID_OVERSHOOT` and Hermit refuses the run: it prints a line starting
+with `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot` and
+exits with status 122 instead of reporting the crash.
 
 ## The bug
 
@@ -221,13 +223,15 @@ Three limits are worth knowing:
   astray at the reviewer's rate of 7 in 96, the chance that none of 110 would
   is (89/96)^110, about 1 in 4,100. The evidence is consistent with the mount
   table being the whole cause, and does not exclude a rarer one.
-- **Heavy host load can make a recorded seed miss.** Hermit arms the counter
+- **Heavy host load can make Hermit refuse a run.** Hermit arms the counter
   interrupt for each chaos-mode thread switch a safety margin of branches
   early and single-steps the rest of the way. An interrupt that arrives later
-  than that margin, which is more likely when the host is busy, makes Hermit
-  print a line starting with `HERMIT_SKID_OVERSHOOT`, and the switch lands
-  past its planned point, so the same seed can give a different schedule that
-  misses the race. All 44 seed-7 runs counted in the
+  than that margin, which is more likely when the host is busy, makes Reverie
+  print a line starting with `HERMIT_SKID_OVERSHOOT`. Hermit then refuses the
+  run instead of treating it as deterministic: it prints a line starting with
+  `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot` and exits
+  with status 122, and `run.sh` reports rc=122 instead of the expected crash.
+  All 44 seed-7 runs counted in the
   [demo's README](README.md#what-to-notice) crashed; they ran on a 316-thread
   host at a load average of 10 to 20.
 

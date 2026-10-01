@@ -16,9 +16,12 @@ not reproduce reliably. Chaos mode places each thread switch by counting the
 CPU's retired branches: Hermit arms the counter's interrupt a safety margin of
 branches early and single-steps the rest of the way to the exact switch point.
 If the interrupt arrives later than that margin, which is more likely under
-heavy host load (Hermit then prints a line starting with
-`HERMIT_SKID_OVERSHOOT`), the switch lands past its planned point and the seed
-may miss the race. The story of the bug is in [WRITEUP.md](WRITEUP.md).
+heavy host load, Reverie, the library Hermit uses to trace the program, prints
+a line starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run: it
+prints a line starting with `HERMIT_POLICY_REFUSAL class=policy-refusal
+cause=skid-overshoot` and exits with status 122, so `run.sh` reports rc=122
+instead of the expected crash. The story of the bug is in
+[WRITEUP.md](WRITEUP.md).
 
 ## Prerequisites
 
@@ -225,12 +228,15 @@ one whose environment carried 3,000 extra bytes.
   `--imprecise-timers`, so Hermit uses precise timers: it arms the counter's
   interrupt a safety margin of branches early and single-steps the rest of
   the way to the exact switch point. If the interrupt arrives later than that
-  margin, which is more likely under heavy host load, Hermit prints a line
-  starting with `HERMIT_SKID_OVERSHOOT` and the switch lands past its planned
-  point, so the same seed can give a different schedule that misses the race.
-  `run.sh` saves each Hermit run's standard error with its output in its
-  artifacts directory, `target/demos/08-btrfs-convert-uaf/` by default (for
-  example `chaos-buggy.out`), so look there for that line if the seed misses.
+  margin, which is more likely under heavy host load, Reverie prints a line
+  starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run instead of
+  treating it as deterministic: it prints a line starting with
+  `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=` and
+  exits with status 122, whether or not the program crashed. `run.sh` then
+  reports rc=122 instead of the expected crash and exits 1. It saves each
+  Hermit run's standard error with its output in its artifacts directory,
+  `target/demos/08-btrfs-convert-uaf/` by default, so when step 2 reports
+  rc=122, look in `chaos-buggy.out` for both lines.
 - The program no longer reads the mount table. Under Hermit,
   `/proc/self/mounts` lists mounts that come from the host at the time of the
   run, and Hermit passes it through unchanged
@@ -274,8 +280,8 @@ let the main thread free the memory just before the progress thread's last
 read, and AddressSanitizer turns that read into an abort with exit status 134.
 Because the schedule is a function of the seed, running the same seed on the
 same input reproduced the same interleaving and the same report on a lightly
-loaded host. Under heavy host load a late counter interrupt can move a thread
-switch and the seed may miss; see [What to notice](#what-to-notice).
+loaded host. Under heavy host load a late counter interrupt makes Hermit refuse
+the run with exit status 122; see [What to notice](#what-to-notice).
 
 The two variants carry a small harness, applied identically to both, in
 [`fixtures/`](fixtures/):

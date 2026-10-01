@@ -161,23 +161,29 @@ Logs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps
 The script's own lines end with:
 
 ```text
-console_sha256=4b4aba392c399904f03eeb3700cd08a02151bc757f788e5963c03ed78b4c60db
-compared_info_messages=699685
+console_sha256=324712862e60da9b4fb27b977f550e824a3679ec240a927a752eb02721adb0e5
+compared_info_messages=714635
 PASS: two runs of the BusyBox boot produced identical output and event logs (ptrace backend)
 
 === Demo 9: QEMU BusyBox Boot: SUCCESS ===
 ```
 
 Standard error and standard output reach the terminal separately, so Hermit's
-last two summary lines can land inside the console output. In the observed run
-`:: comparison=BitwiseInfoV1 relaxations=none` came out in the middle of the
-kernel's `Calibrating delay loop` message, and
-`:: Success: deterministic. Determinism verified.` on the next line. In that run
-`verify.json` reported `"verdict": "matched"`, `"bitwise_parity": true`, and
-for each boot 37,385 scheduler turns and 251,622 system calls. Two fresh
-`VERIFY=1` boots with Hermit build `gca6afb1b3124` gave the same counts and
-193.051453375 seconds of virtual time, identically. This is an L2 result for
-the ptrace backend at log level `info` with no relaxations.
+last two summary lines can land inside the console output. In one observed
+run `:: comparison=BitwiseInfoV1 relaxations=none` came out in the middle of
+the kernel's `Calibrating delay loop` message, and
+`:: Success: deterministic. Determinism verified.` on the next line; where they
+land varies from run to run. One `VERIFY=1` run on 2026-10-01 with Hermit build
+`gf35595861a09` (hermit main `1139c661ede3` plus demo commits that change no
+Hermit source) printed the `console_sha256` and `compared_info_messages` lines
+shown above. Its `verify.json` reported `"verdict": "matched"` and
+`"bitwise_parity": true`, and its two boots, `runtime.run1` and
+`runtime.run2`, gave identical values: `scheduler_turns` 40,383, `syscalls`
+257,606, and `virtual_nanoseconds` 194,572,515,695, that is, 194.572515695
+seconds of virtual time. Earlier builds gave other values: two `VERIFY=1` boots
+with build `gca6afb1b3124` gave 37,385 turns, 251,622 system calls, and
+193.051453375 seconds. This is an L2 result for the ptrace backend at log level
+`info` with no relaxations.
 
 The by-hand launcher command above prints the same kernel messages and workload
 to the terminal, preceded by Hermit's
@@ -304,8 +310,9 @@ notes, on 2026-09-30:
   timeout expired before the guest kernel printed anything.
 - With `SKID_MARGIN=17288` and a longer timeout, the run had completed 552
   scheduler turns after 15 minutes (with a second Hermit run active on the same
-  host) and was stopped. A full boot takes about 37,000 turns: 36,893 with an
-  earlier version of the scripts, 37,385 with the current one.
+  host) and was stopped. A full boot takes about 37,000 to 40,000 turns:
+  36,893 with an earlier version of the scripts, 37,385 with Hermit build
+  `gca6afb1b3124`, and 40,383 with build `gf35595861a09`.
 
 So on a host where the default margin produces `HERMIT_SKID_OVERSHOOT`, this
 demo is not known to work. Demo 9 is therefore only partially verified: the
