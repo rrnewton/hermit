@@ -458,11 +458,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::external_scheduler_announces_before_its_future_is_polled
     // (https://github.com/rrnewton/hermit/issues/3463) retains all 849 prior
     // identities.
-    ("test.detcore_unit", 850),
+    // Forty-four unit tests (memory::tests 3, procfs::tests 7,
+    // syscalls::files::inject_fstat_scratch 18,
+    // syscalls::files::procfs_wiring_guard 2, syscalls::namespace::tests 4,
+    // syscalls::namespace::tests::other_proc_fd_target 3 and tool_global::tests 7;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 850 prior
+    // identities.
+    ("test.detcore_unit", 894),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
-    ("test.detcore_misc", 28),
+    // tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 28 prior selected
+    // identities under the unchanged skip filters (measured 29).
+    ("test.detcore_misc", 29),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -481,7 +490,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replay_without_virtual_time_adopts_the_recorded_epoch;
     // https://github.com/rrnewton/hermit/issues/3411) retain all 173 prior
     // identities.
-    ("test.hermit_integration", 177),
+    // Six procfs_determinism inode identity tests
+    // (files_sharing_a_raw_inode_on_two_devices_keep_separate_identities,
+    // another_process_maps_line_is_not_keyed_on_the_readers_mapping_record,
+    // untracked_directory_descriptor_lists_entries_with_stat_inodes,
+    // maps_inodes_equal_stat_inodes_for_every_mapped_file,
+    // other_process_pipe_and_socket_links_match_fstat and
+    // dbt_other_process_links_resolve_with_a_full_descriptor_table;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 177 prior
+    // identities.
+    ("test.hermit_integration", 183),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -512,8 +530,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3439) retain all 97 prior
     // selected CLI identities.
     ("test.cli", 99),
-    ("test.liteinst_strict", 25),
-    ("test.sabre_examples", 6),
+    // liteinst_strict_verify_untracked_directory_descriptor_lists_stat_inodes and
+    // liteinst_strict_verify_maps_inodes_equal_stat_inodes
+    // (https://github.com/rrnewton/hermit/pull/3255) retain all 25 prior
+    // identities.
+    ("test.liteinst_strict", 27),
+    // sabre_other_process_links_resolve_with_a_full_descriptor_table
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 6 prior
+    // identities.
+    ("test.sabre_examples", 7),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -540,20 +565,45 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 28),
+    // tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 28 prior selected
+    // identities under the unchanged skip filters (measured 29).
+    ("test.detcore_misc_on_host", 29),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
-    ("test.detcore_unit_on_host", 850),
+    // Forty-four unit tests (memory::tests 3, procfs::tests 7,
+    // syscalls::files::inject_fstat_scratch 18,
+    // syscalls::files::procfs_wiring_guard 2, syscalls::namespace::tests 4,
+    // syscalls::namespace::tests::other_proc_fd_target 3 and tool_global::tests 7;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 850 prior
+    // identities.
+    ("test.detcore_unit_on_host", 894),
     // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 177),
+    // Six procfs_determinism inode identity tests
+    // (files_sharing_a_raw_inode_on_two_devices_keep_separate_identities,
+    // another_process_maps_line_is_not_keyed_on_the_readers_mapping_record,
+    // untracked_directory_descriptor_lists_entries_with_stat_inodes,
+    // maps_inodes_equal_stat_inodes_for_every_mapped_file,
+    // other_process_pipe_and_socket_links_match_fstat and
+    // dbt_other_process_links_resolve_with_a_full_descriptor_table;
+    // https://github.com/rrnewton/hermit/pull/3255) retain all 177 prior
+    // identities.
+    ("test.hermit_integration_on_host", 183),
     ("test.hermit_unit_on_host", 763),
     ("test.ignored_syscall_regressions_on_host", 4),
-    ("test.liteinst_strict_on_host", 25),
+    // liteinst_strict_verify_untracked_directory_descriptor_lists_stat_inodes and
+    // liteinst_strict_verify_maps_inodes_equal_stat_inodes
+    // (https://github.com/rrnewton/hermit/pull/3255) retain all 25 prior
+    // identities.
+    ("test.liteinst_strict_on_host", 27),
     // The host node carries the identical selection.
     ("test.regular_crates_on_host", 763),
     ("test.rr_suite_contract_on_host", 1),
-    ("test.sabre_examples_on_host", 6),
+    // sabre_other_process_links_resolve_with_a_full_descriptor_table
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 6 prior
+    // identities.
+    ("test.sabre_examples_on_host", 7),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
