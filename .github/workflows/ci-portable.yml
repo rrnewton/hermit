@@ -19,10 +19,13 @@ name: CI (GitHub-managed portable)
 # assigned DAG nodes via ci/run-node.sh against the prebuilt tree. Wall time
 # becomes max(build stage, slowest single shard) instead of the serial sum.
 #
-# The debug and release producers run independently. A short follow-up job
-# downloads both trees, runs the constructed artifact publisher, and then runs
-# its dependent LiteInst producer. That preserves the local DAG edges without
-# rebuilding either predecessor in the workflow file.
+# One producer job, build-debug, compiles Hermit once in the validate profile
+# (build.workspace_on_host, since d44bbbb79ac) and packs every runtime file and
+# install resource its consumers need, with symlinks replaced by regular
+# copies. A short follow-up job, build-complete, downloads that tree and the
+# prepared-Nextest inputs, then runs the inert Cargo-mode Buck branch and the
+# constructed artifact publisher that installs target/ci/hermit. There is no
+# separate release-profile producer: target/release is never built.
 #
 # CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asks validate for its
 # constructed portable-only plan and asserts that ci/portable-shards.json assigns
@@ -79,7 +82,6 @@ env:
   DEBUG_TARBALL: hermit-portable-debug.tzst
   NEXTEST_ARTIFACT: hermit-nextest-${{ github.run_id }}
   NEXTEST_TARBALL: hermit-portable-nextest.tzst
-  RELEASE_DBT_ARTIFACT: hermit-release-dbt-${{ github.run_id }}
   RELEASE_ARTIFACT: hermit-release-${{ github.run_id }}
   RELEASE_TARBALL: hermit-portable-release.tzst
 
@@ -185,9 +187,10 @@ jobs:
           build_release=$(jq -r 'if (.build.dbt or .build.aux) then "true" else "false" end' <<<"$sel_json")
           if [[ -n "$backends" ]]; then run_e2e=true; else run_e2e=false; fi
           # Every selected test job that needs a release tree consumes the
-          # constructed build.e2e_artifact result. Producing it requires both
-          # initial build trees, so keep those predecessor jobs together for
-          # any test fan-out instead of letting selection cut the build edge.
+          # constructed build.e2e_artifact result, which build-complete
+          # (gated by build_release) produces from the build-debug tree. Keep
+          # both jobs together for any test fan-out instead of letting
+          # selection cut the build edge.
           if [[ "$run_dbg" == "true" || "$run_rel" == "true" || "$run_strict" == "true" || "$run_e2e" == "true" || "$build_release" == "true" ]]; then
             build_debug=true
             build_release=true
@@ -619,6 +622,25 @@ jobs:
           require -f target/validate/deps/libdetcore_dbt.so
           require -x target/ci/bin/cargo-nextest
           require -f target/ci/nextest-binaries/current.json
+          # No release-profile producer exists since d44bbbb79ac
+          # (https://github.com/rrnewton/hermit/issues/3458), so this tree is
+          # the only source of the install resources. The validate profile
+          # inherits release, so hermit-install's build script staged the
+          # complete target/install_pkg. build-complete's build.e2e_artifact
+          # publishes it with the resource set that
+          # ci/publish-hermit-e2e-artifact.sh requires, and test.liteinst_strict
+          # reads the profile-staged LiteInst runtime under target/validate.
+          # `test` follows symlinks, so a dangling resource link fails here.
+          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
+          require -x target/install_pkg/rsrcs/sabre
+          require -s target/install_pkg/rsrcs/sabre.revision
+          require -x target/install_pkg/rsrcs/e9patch
+          require -x target/install_pkg/rsrcs/e9tool
+          require -s target/install_pkg/rsrcs/libdetcore_sabre.so
+          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so
+          require -s target/install_pkg/rsrcs/libreverie_liteinst.so
+          require -s target/validate/libreverie_liteinst.so
+          require -s target/validate/libreverie_liteinst.so.revision
           if ((missing > 0)); then
             echo "Pack debug prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
             exit 1
@@ -631,6 +653,21 @@ jobs:
           rm -f target/install_pkg/rsrcs/libdetcore_dbt.so
           install -Dm755 target/validate/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
+          # hermit-install also links rsrcs/libdetcore_sabre.so and
+          # install_pkg/hermit into target/validate, which this tarball does
+          # not carry in full. Replace every remaining link with a regular copy
+          # of its resolved target, refusing a dangling or non-file link, so the
+          # packed target/install_pkg is self-contained in every consumer.
+          while IFS= read -r -d '' link; do
+            if ! resolved=$(readlink -e -- "$link") || ! test -f "$resolved"; then
+              echo "::error::Pack debug prebuilt tree: dangling or non-file symlink: $link" >&2
+              exit 1
+            fi
+            rm -f -- "$link"
+            cp -p -- "$resolved" "$link"
+          done < <(find target/install_pkg -type l -print0)
+          leftover=$(find target/install_pkg -type l -print -quit)
+          if [[ -n $leftover ]]; then echo "::error::Pack debug prebuilt tree: symlink left in target/install_pkg: $leftover" >&2; exit 1; fi
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/validate/hermit \
             target/debug/test-harness \
@@ -638,7 +675,9 @@ jobs:
             target/validate/verification-report \
             target/debug/nextest-cpu-wrapper \
             target/validate/deps/libdetcore_dbt.so \
-            target/install_pkg/rsrcs/libdetcore_dbt.so \
+            target/validate/libreverie_liteinst.so \
+            target/validate/libreverie_liteinst.so.revision \
+            target/install_pkg \
             target/ci/bin/cargo-nextest \
             target/ci/nextest-binaries \
             target/ci/rust-scripts \
@@ -687,15 +726,25 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ------------------------------------------ build (release DBT + SaBRe base)
-  # Run the constructed release producer independently of the debug producer.
-  # A later job downloads both outputs before running the constructed artifact
-  # publisher and its dependent LiteInst producer.
-  build-release:
-    name: Build release Hermit + DBT + SaBRe
-    needs: [select, preflight]
+  # ------------------------------------------- publish the one Hermit artifact
+  # This is the literal contraction of
+  #   build.buck_release_artifact + build.workspace -> build.e2e_artifact
+  # build.workspace runs in build-debug, whose tree and prepared-Nextest inputs
+  # arrive as artifacts. build.buck_release_artifact is an explicit no-op in the
+  # default Cargo mode; it runs here, beside its only consumer, so neither mode
+  # needs an artifact edge for it. Until the one-build change d44bbbb79ac a
+  # separate build-release job ran build.runtime_release, which compiled
+  # target/release. That change retired build.runtime_release, so the job ran
+  # only the inert Buck branch and then packed a target/release tree that
+  # nothing built (https://github.com/rrnewton/hermit/issues/3458).
+  build-complete:
+    name: Publish E2E artifact
+    needs: [select, build-debug]
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
+    # This job downloads the 2 GiB prepared-Nextest artifact, which alone
+    # consumed a 15-minute job bound in run 35390137055 (see test-debug).
+    # Keep that download plus setup and publication inside the bound.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -705,85 +754,11 @@ jobs:
         with:
           go-version: stable
           cache: false
+      # build-debug saves this cache; nothing saves a release-profile cache
+      # since build-release was removed.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: portable-parallel-release
-          cache-on-failure: true
-      - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
-      - name: Install rust-script
-        env:
-          RUSTFLAGS: ""
-        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      - name: Download rust-script binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
-          path: .
-      - name: Unpack rust-script binaries
-        run: |
-          set -euo pipefail
-          tar -xzf "$MANIFEST_PLAN_TARBALL"
-          rm -f "$MANIFEST_PLAN_TARBALL"
-          ./ci/prepare-rust-scripts.sh --check
-      - name: Run release build node
-        env:
-          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '.build_dbt_nodes|join(",")' ci/portable-shards.json)"
-      - name: Upload release-build node performance report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-node-perf-build-release
-          path: ${{ runner.temp }}/run-node-perf
-          if-no-files-found: warn
-          retention-days: 14
-      - name: Pack release prerequisite tree
-        run: |
-          set -euo pipefail
-          tar --zstd -cf "$RELEASE_TARBALL" \
-            --exclude='target/release/deps' \
-            --exclude='target/release/build' \
-            --exclude='target/release/incremental' \
-            --exclude='target/release/.fingerprint' \
-            --exclude='target/release/examples' \
-            target/release \
-            target/ci \
-            target/install_pkg
-          ls -lh "$RELEASE_TARBALL"
-      - name: Upload release prerequisite tree
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RELEASE_DBT_ARTIFACT }}
-          path: ${{ env.RELEASE_TARBALL }}
-          if-no-files-found: error
-          retention-days: 1
-
-  # ------------------------------------- publish artifact + build LiteInst
-  # This is the literal contraction of
-  #   build.workspace + build.runtime_release -> build.e2e_artifact
-  #   build.e2e_artifact -> build.liteinst_runtime_release
-  # The two predecessor trees arrive as artifacts; the selected constructed
-  # steps retain their internal edge and provide the final release tree.
-  build-complete:
-    name: Publish E2E artifact + build LiteInst runtime
-    needs: [select, build-debug, build-release]
-    if: needs.select.outputs.build_release != 'false'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: portable-parallel-release
+          shared-key: portable-parallel-debug
           save-if: false
       - name: Dependencies
         run: |
@@ -793,30 +768,57 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # build.e2e_artifact_on_host first runs `nextest-binaries.rs assert
+      # hosted-portable`, which recomputes the recorded source identity of
+      # every git dependency by running git inside its Cargo checkout.
+      # Materialize those checkouts even when the cache restore is partial.
+      - name: Fetch locked workspace dependencies
+        run: cargo fetch --locked
       - name: Download debug prerequisite tree
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
-      - name: Download release prerequisite tree
+      # The same assertion re-hashes every recorded test executable and
+      # runtime file, which only the prepared-Nextest artifact carries.
+      - name: Download prepared Nextest inputs
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.RELEASE_DBT_ARTIFACT }}
+          name: ${{ env.NEXTEST_ARTIFACT }}
           path: .
       - name: Unpack prerequisite trees
         run: |
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
-          tar --zstd -xf "$RELEASE_TARBALL"
-          rm -f "$RELEASE_TARBALL"
-          test -x target/validate/hermit
-          test -x target/release/hermit
-          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-      - name: Run artifact and LiteInst build nodes
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
+          # Report every absent input before failing; the publisher's own
+          # resource check would name only the first.
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Unpack prerequisite trees: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/validate/hermit
+          require -x target/debug/nextest-cpu-wrapper
+          require -f target/ci/nextest-binaries/current.json
+          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
+          require -x target/install_pkg/rsrcs/sabre
+          require -s target/install_pkg/rsrcs/sabre.revision
+          require -s target/install_pkg/rsrcs/libdetcore_sabre.so
+          require -s target/validate/libreverie_liteinst.so
+          require -s target/validate/libreverie_liteinst.so.revision
+          if ((missing > 0)); then
+            echo "Unpack prerequisite trees: $missing required input(s) missing" >&2
+            exit 1
+          fi
+      - name: Run Buck-branch and artifact build nodes
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '.build_aux_nodes|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-node.sh portable "$(jq -r '(.build_dbt_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
       - name: Verify constructed E2E artifact
         run: ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Upload completed-build node performance report
@@ -827,20 +829,37 @@ jobs:
           path: ${{ runner.temp }}/run-node-perf
           if-no-files-found: warn
           retention-days: 14
-      - name: Pack full release prebuilt tree (dbt + sabre + liteinst)
+      # target/ci carries the published artifact and target/ci/hermit; the
+      # resources resolve through target/install_pkg; test.liteinst_strict
+      # stages the LiteInst runtime from beside the validate-profile Hermit.
+      - name: Pack full release prebuilt tree (artifact + resources + liteinst)
         run: |
           set -euo pipefail
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Pack full release prebuilt tree: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/ci/hermit
+          require -s target/ci/libdetcore_sabre.so
+          require -s target/ci/hermit-e2e-artifact.path
+          require -s target/install_pkg/rsrcs/libdetcore_dbt.so
+          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so
+          require -s target/validate/libreverie_liteinst.so
+          require -s target/validate/libreverie_liteinst.so.revision
+          if ((missing > 0)); then
+            echo "Pack full release prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
+            exit 1
+          fi
           tar --zstd -cf "$RELEASE_TARBALL" \
-            --exclude='target/release/deps' \
-            --exclude='target/release/build' \
-            --exclude='target/release/incremental' \
-            --exclude='target/release/.fingerprint' \
-            --exclude='target/release/examples' \
-            target/release \
             target/ci \
-            target/install_pkg
+            target/install_pkg \
+            target/validate/libreverie_liteinst.so \
+            target/validate/libreverie_liteinst.so.revision
           ls -lh "$RELEASE_TARBALL"
-      - name: Upload full release prebuilt tree (release + e2e + sabre)
+      - name: Upload full release prebuilt tree (artifact + resources + liteinst)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RELEASE_ARTIFACT }}
@@ -851,15 +870,14 @@ jobs:
   # ------------------------------------------------- test shards (debug-backed)
   test-debug:
     name: "test: ${{ matrix.slug }}"
-    needs: [select, build-debug, build-release, build-complete]
-    # Selection forces all three producer jobs whenever any debug shard runs.
+    needs: [select, build-debug, build-complete]
+    # Selection forces both producer jobs whenever any debug shard runs.
     # State that contract here so a later condition drift cannot run a shard
     # without the completed constructed artifact.
     if: >-
       !cancelled()
       && needs.select.outputs.run_debug_shards != 'false'
       && needs.build-debug.result == 'success'
-      && needs.build-release.result == 'success'
       && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
     # Run 35390137055 spent the entire inherited 15-minute job bound downloading
@@ -977,7 +995,21 @@ jobs:
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
-          test -x target/ci/hermit-strict
+          # target/ci/hermit-strict exists only in Buck mode; the Cargo-mode
+          # build.e2e_artifact installs target/ci/hermit
+          # (https://github.com/rrnewton/hermit/issues/3458).
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Unpack completed release tree: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/ci/hermit
+          if ((missing > 0)); then
+            echo "Unpack completed release tree: $missing required input(s) missing" >&2
+            exit 1
+          fi
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbt_client.so
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
@@ -1051,7 +1083,20 @@ jobs:
           test -x target/debug/test-harness
           test -x target/debug/nextest-cpu-wrapper
           test -f target/ci/nextest-binaries/current.json
-          test -x target/ci/hermit-strict
+          # Cargo mode installs target/ci/hermit; target/ci/hermit-strict is
+          # Buck-only (https://github.com/rrnewton/hermit/issues/3458).
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Unpack prebuilt trees: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/ci/hermit
+          if ((missing > 0)); then
+            echo "Unpack prebuilt trees: $missing required input(s) missing" >&2
+            exit 1
+          fi
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run strict compatibility node
         env:
@@ -1080,9 +1125,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
+      # build-debug saves the only workspace cache; the release-profile cache
+      # lost its producer with build-release
+      # (https://github.com/rrnewton/hermit/issues/3458).
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: portable-parallel-release
+          shared-key: portable-parallel-debug
           save-if: false
       - name: Dependencies
         run: |
@@ -1139,7 +1187,28 @@ jobs:
           rm -f "$RELEASE_TARBALL"
           tar --zstd -xf "$NEXTEST_TARBALL"
           rm -f "$NEXTEST_TARBALL"
-          test -x target/release/hermit
+          # No target/release tree exists since d44bbbb79ac
+          # (https://github.com/rrnewton/hermit/issues/3458). The release shards
+          # run target/ci/hermit, read DBT and SaBRe resources from
+          # target/install_pkg, and test.liteinst_strict stages the LiteInst
+          # runtime from target/validate.
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Unpack full release prebuilt tree: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/ci/hermit
+          require -x target/install_pkg/rsrcs/sabre
+          require -f target/install_pkg/rsrcs/libreverie_dbt_client.so
+          require -f target/install_pkg/rsrcs/libdetcore_dbt.so
+          require -s target/validate/libreverie_liteinst.so
+          require -s target/validate/libreverie_liteinst.so.revision
+          if ((missing > 0)); then
+            echo "Unpack full release prebuilt tree: $missing required input(s) missing" >&2
+            exit 1
+          fi
           test -x target/debug/nextest-cpu-wrapper
           test -f target/ci/nextest-binaries/current.json
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
@@ -1229,7 +1298,21 @@ jobs:
           tar --zstd -xf "$DEBUG_TARBALL"; rm -f "$DEBUG_TARBALL"
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
           test -x target/validate/hermit
-          test -x target/release/hermit
+          # build.e2e_artifact installs target/ci/hermit; nothing builds
+          # target/release since d44bbbb79ac
+          # (https://github.com/rrnewton/hermit/issues/3458).
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Unpack prebuilt trees: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/ci/hermit
+          if ((missing > 0)); then
+            echo "Unpack prebuilt trees: $missing required input(s) missing" >&2
+            exit 1
+          fi
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run constructed E2E node (${{ matrix.node }})
         env:
@@ -1296,7 +1379,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit
+      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
@@ -1327,7 +1410,21 @@ jobs:
           rm -f "$RELEASE_TARBALL"
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
-          test -x target/release/hermit
+          # HERMIT_BIN names target/ci/hermit, which build.e2e_artifact
+          # installs; nothing builds target/release since d44bbbb79ac
+          # (https://github.com/rrnewton/hermit/issues/3458).
+          missing=0
+          require() {
+            if ! test "$1" "$2"; then
+              echo "::error::Unpack product and runner trees: missing: $2 (test $1 failed)" >&2
+              missing=$((missing + 1))
+            fi
+          }
+          require -x target/ci/hermit
+          if ((missing > 0)); then
+            echo "Unpack product and runner trees: $missing required input(s) missing" >&2
+            exit 1
+          fi
           test -x target/debug/test-harness
           test -x target/install_pkg/rsrcs/sabre
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
@@ -1377,7 +1474,6 @@ jobs:
       - preflight
       - checks
       - build-debug
-      - build-release
       - build-complete
       - test-debug
       - strict-compat
@@ -1570,7 +1666,6 @@ jobs:
             const names = new Set([
               `hermit-manifest-plan-${context.runId}`,
               `hermit-debug-${context.runId}`,
-              `hermit-release-dbt-${context.runId}`,
               `hermit-release-${context.runId}`,
             ]);
             const arts = await github.paginate(

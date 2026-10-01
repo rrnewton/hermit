@@ -13,10 +13,13 @@
 #   union(preflight, builds, test shards, e2e, final)
 #     == { steps selected from ci/dag/validate.json by the hosted-portable label }
 #
-# The immutable E2E artifact and the LiteInst producer are deliberately assigned
-# to one completed-build job after the debug and release producers. Keeping that
-# internal edge preserves the constructed ordering while later test jobs fetch
-# the resulting artifact instead of rerunning its command.
+# The immutable E2E artifact publisher and the inert Cargo-mode Buck branch it
+# depends on are deliberately assigned to one completed-build job after the
+# debug producer, the only job that compiles Hermit. There has been no
+# release-profile producer since d44bbbb79ac
+# (https://github.com/rrnewton/hermit/issues/3458). Keeping that internal edge
+# preserves the constructed ordering while later test jobs fetch the resulting
+# artifact instead of rerunning its command.
 #
 # Every hosted group must also preserve each constructed predecessor either in
 # the same selected group or in an earlier job whose artifacts/results it uses.
@@ -273,8 +276,9 @@ workflow_step_body() {
 # target/debug copies, while this contract, which pinned the same stale path,
 # stayed green. The pack step checks each input with `require`, which names a
 # missing path and counts it, then exits 1 once every input has been checked.
-# The last four lines below are that fail-closed gate: without them a missing
-# input is reported and the tree is packed anyway.
+# The four `require`/`missing` lines that end the first grep chain are that
+# fail-closed gate: without them a missing input is reported and the tree is
+# packed anyway.
 debug_artifact_contract() {
     local workflow_text=$1 pack_step unpack_step
     local archive_member='            target/validate/verification-report \'
@@ -300,7 +304,40 @@ debug_artifact_contract() {
         grep -Fqx '            if ! test "$1" "$2"; then' <<<"$pack_step" &&
         grep -Fqx '              missing=$((missing + 1))' <<<"$pack_step" &&
         grep -Fqx '          if ((missing > 0)); then' <<<"$pack_step" &&
-        grep -Fqx '            exit 1' <<<"$pack_step"
+        grep -Fqx '            exit 1' <<<"$pack_step" || return 1
+    debug_install_resources_contract "$pack_step"
+}
+
+# No release-profile producer exists since d44bbbb79ac
+# (https://github.com/rrnewton/hermit/issues/3458), so the debug tree is the
+# only carrier of the install resources that build.e2e_artifact publishes and
+# the release shards read, and of the profile-staged LiteInst runtime that
+# test.liteinst_strict stages. hermit-install links three of those resources
+# into target/validate, which the tree does not carry whole, so the pack step
+# must replace every link with a regular copy and refuse a leftover one.
+debug_install_resources_contract() {
+    local pack_step=$1 required
+    for required in \
+        '          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' \
+        '          require -x target/install_pkg/rsrcs/sabre' \
+        '          require -s target/install_pkg/rsrcs/sabre.revision' \
+        '          require -x target/install_pkg/rsrcs/e9patch' \
+        '          require -x target/install_pkg/rsrcs/e9tool' \
+        '          require -s target/install_pkg/rsrcs/libdetcore_sabre.so' \
+        '          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so' \
+        '          require -s target/install_pkg/rsrcs/libreverie_liteinst.so' \
+        '          require -s target/validate/libreverie_liteinst.so' \
+        '          require -s target/validate/libreverie_liteinst.so.revision' \
+        '            target/install_pkg \' \
+        '            target/validate/libreverie_liteinst.so \' \
+        '            target/validate/libreverie_liteinst.so.revision \' \
+        '            rm -f -- "$link"' \
+        '            cp -p -- "$resolved" "$link"' \
+        '          done < <(find target/install_pkg -type l -print0)' \
+        '          leftover=$(find target/install_pkg -type l -print -quit)'
+    do
+        grep -Fqx -- "$required" <<<"$pack_step" || return 1
+    done
 }
 
 prepared_nextest_artifact_contract() {
@@ -319,6 +356,84 @@ prepared_nextest_artifact_contract() {
             grep -Fqx '          test -x target/debug/nextest-cpu-wrapper' <<<"$body" &&
             grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$body" || return 1
     done
+
+    # build-complete runs build.e2e_artifact_on_host, whose first command,
+    # `nextest-binaries.rs assert hosted-portable`, re-hashes every recorded
+    # test executable and runtime file. Only this artifact carries them.
+    body=$(workflow_job_body build-complete "$workflow_text") || return 1
+    grep -Fqx '          name: ${{ env.NEXTEST_ARTIFACT }}' <<<"$body" &&
+        grep -Fqx '          tar --zstd -xf "$NEXTEST_TARBALL"' <<<"$body" &&
+        grep -Fqx '          require -x target/debug/nextest-cpu-wrapper' <<<"$body" &&
+        grep -Fqx '          require -f target/ci/nextest-binaries/current.json' <<<"$body"
+}
+
+# The completed-build job is the literal contraction
+#   build.buck_release_artifact + build.workspace -> build.e2e_artifact
+# with build.workspace supplied by build-debug's tree. It must run both shard
+# buckets, fail closed on a missing predecessor input, and hand target/ci,
+# target/install_pkg and the LiteInst runtime to the release-tree consumers.
+completed_build_contract() {
+    local workflow_text=$1 body unpack_step pack_step required
+    body=$(workflow_job_body build-complete "$workflow_text") || return 1
+    unpack_step=$(workflow_step_body "Unpack prerequisite trees" "$workflow_text")
+    pack_step=$(workflow_step_body "Pack full release prebuilt tree (artifact + resources + liteinst)" "$workflow_text")
+    grep -Fqx -- "        run: ./ci/run-node.sh portable \"\$(jq -r '(.build_dbt_nodes + .build_aux_nodes)|join(\",\")' ci/portable-shards.json)\"" <<<"$body" &&
+        grep -Fqx '        run: cargo fetch --locked' <<<"$body" || return 1
+    for required in \
+        '          tar --zstd -xf "$DEBUG_TARBALL"' \
+        '          require -x target/validate/hermit' \
+        '          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' \
+        '          require -x target/install_pkg/rsrcs/sabre' \
+        '          require -s target/install_pkg/rsrcs/sabre.revision' \
+        '          require -s target/install_pkg/rsrcs/libdetcore_sabre.so' \
+        '          require -s target/validate/libreverie_liteinst.so' \
+        '          require -s target/validate/libreverie_liteinst.so.revision' \
+        '              missing=$((missing + 1))' \
+        '          if ((missing > 0)); then' \
+        '            exit 1'
+    do
+        grep -Fqx -- "$required" <<<"$unpack_step" || return 1
+    done
+    for required in \
+        '          require -x target/ci/hermit' \
+        '          require -s target/install_pkg/rsrcs/libdetcore_dbt.so' \
+        '          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so' \
+        '          require -s target/validate/libreverie_liteinst.so' \
+        '          require -s target/validate/libreverie_liteinst.so.revision' \
+        '              missing=$((missing + 1))' \
+        '          if ((missing > 0)); then' \
+        '            exit 1' \
+        '            target/ci \' \
+        '            target/install_pkg \' \
+        '            target/validate/libreverie_liteinst.so \' \
+        '            target/validate/libreverie_liteinst.so.revision'
+    do
+        grep -Fqx -- "$required" <<<"$pack_step" || return 1
+    done
+}
+
+# Nothing builds target/release since d44bbbb79ac, and target/ci/hermit-strict
+# exists only in Buck mode, so every executable line that named either was a
+# dangling input (https://github.com/rrnewton/hermit/issues/3458). Each
+# release-tree consumer must instead require target/ci/hermit, the one path
+# build.e2e_artifact installs, and fail closed when it is absent.
+release_tree_consumer_contract() {
+    local workflow_text=$1 job body
+    if grep -v '^[[:space:]]*#' <<<"$workflow_text" | grep -Eq 'target/release|hermit-strict'; then
+        return 1
+    fi
+    for job in build-complete test-debug strict-compat test-release e2e sabre_non_gated_parity; do
+        body=$(workflow_job_body "$job" "$workflow_text") || return 1
+        grep -Fqx '          require -x target/ci/hermit' <<<"$body" &&
+            grep -Fqx '              missing=$((missing + 1))' <<<"$body" &&
+            grep -Fqx '          if ((missing > 0)); then' <<<"$body" || return 1
+    done
+    body=$(workflow_job_body test-release "$workflow_text") || return 1
+    grep -Fqx '          require -x target/install_pkg/rsrcs/sabre' <<<"$body" &&
+        grep -Fqx '          require -s target/validate/libreverie_liteinst.so' <<<"$body" &&
+        grep -Fqx '          require -s target/validate/libreverie_liteinst.so.revision' <<<"$body" || return 1
+    body=$(workflow_job_body sabre_non_gated_parity "$workflow_text") || return 1
+    grep -Fqx '      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit' <<<"$body"
 }
 
 # build-debug publishes the prepared-Nextest record inside build.workspace_on_host.
@@ -512,21 +627,20 @@ workflow_wiring_contract() {
         workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
         workflow_job_needs_exactly checks 'select,preflight' "$workflow_text" &&
         workflow_job_needs_exactly build-debug 'select,preflight' "$workflow_text" &&
-        workflow_job_needs_exactly build-release 'select,preflight' "$workflow_text" &&
-        workflow_job_needs_exactly build-complete 'select,build-debug,build-release' "$workflow_text" &&
-        workflow_job_needs_exactly test-debug 'select,build-debug,build-release,build-complete' "$workflow_text" &&
+        workflow_job_needs_exactly build-complete 'select,build-debug' "$workflow_text" &&
+        workflow_job_needs_exactly test-debug 'select,build-debug,build-complete' "$workflow_text" &&
         workflow_job_needs_exactly strict-compat 'select,build-debug,build-complete,test-debug' "$workflow_text" &&
         workflow_job_needs_exactly test-release 'select,build-complete' "$workflow_text" &&
         workflow_job_needs_exactly e2e 'select,build-debug,build-complete' "$workflow_text" &&
         workflow_job_needs_exactly regular \
-            'select,plan,preflight,checks,build-debug,build-release,build-complete,test-debug,strict-compat,test-release,e2e' \
+            'select,plan,preflight,checks,build-debug,build-complete,test-debug,strict-compat,test-release,e2e' \
             "$workflow_text" &&
         workflow_artifact_edge preflight name '${{ env.MANIFEST_PLAN_ARTIFACT }}' \
             build-debug name '${{ env.MANIFEST_PLAN_ARTIFACT }}' "$workflow_text" &&
         workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
             build-complete name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
-        workflow_artifact_edge build-release name '${{ env.RELEASE_DBT_ARTIFACT }}' \
-            build-complete name '${{ env.RELEASE_DBT_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-debug name '${{ env.NEXTEST_ARTIFACT }}' \
+            build-complete name '${{ env.NEXTEST_ARTIFACT }}' "$workflow_text" &&
         workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
             test-debug name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
         workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
@@ -554,7 +668,7 @@ workflow_wiring_contract() {
 # of passing merely because the binary is mentioned somewhere in the workflow.
 workflow_text=$(<"$workflow")
 if ! debug_artifact_contract "$workflow_text"; then
-    echo "check-shard-coverage.sh: FAIL — debug artifact must transport target/validate/{hermit,verification-report,deps/libdetcore_dbt.so} and fail closed on a missing input" >&2
+    echo "check-shard-coverage.sh: FAIL — debug artifact must transport target/validate/{hermit,verification-report,deps/libdetcore_dbt.so}, the symlink-free target/install_pkg resources and the target/validate LiteInst runtime, and fail closed on a missing input" >&2
     status=1
 fi
 if ! prepared_nextest_artifact_contract "$workflow_text"; then
@@ -603,6 +717,72 @@ if [[ $missing_prepared_download == "$workflow_text" ]]; then
     status=1
 elif prepared_nextest_artifact_contract "$missing_prepared_download"; then
     echo "check-shard-coverage.sh: FAIL — prepared-nextest guard accepted a consumer without its artifact download" >&2
+    status=1
+fi
+# Debug-tree install resources (https://github.com/rrnewton/hermit/issues/3458).
+# Each mutation edits only the named step and must be refused: dropping the
+# install tree, keeping a symlink into the uncarried target/validate, or
+# dropping the LiteInst runtime check would each leave build-complete or a
+# release shard reading a missing file.
+mutate_step() {
+    local step_name=$1 from=$2 to=$3 workflow_text=$4 step mutated
+    step=$(workflow_step_body "$step_name" "$workflow_text")
+    mutated=${step/"$from"/"$to"}
+    [[ -n $step && $mutated != "$step" ]] || return 1
+    printf '%s' "${workflow_text/"$step"/"$mutated"}"
+}
+for omitted_resource_line in \
+    $'            target/install_pkg \\\n' \
+    $'            cp -p -- "$resolved" "$link"\n' \
+    $'          require -s target/validate/libreverie_liteinst.so\n'
+do
+    if ! omitted_resource=$(mutate_step "Pack debug prebuilt tree" "$omitted_resource_line" '' "$workflow_text") ||
+        [[ $omitted_resource == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — debug install-resource mutation did not change the pack step: ${omitted_resource_line%$'\n'}" >&2
+        status=1
+    elif debug_artifact_contract "$omitted_resource"; then
+        echo "check-shard-coverage.sh: FAIL — artifact guard accepted a debug tree without: ${omitted_resource_line%$'\n'}" >&2
+        status=1
+    fi
+done
+if ! completed_build_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — build-complete must run build_dbt_nodes and build_aux_nodes from the build-debug tree, fail closed on a missing input, and pack target/ci, target/install_pkg and the LiteInst runtime" >&2
+    status=1
+fi
+dbt_bucket_dropped=${workflow_text/'(.build_dbt_nodes + .build_aux_nodes)|join'/'(.build_aux_nodes)|join'}
+if [[ $dbt_bucket_dropped == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — completed-build node-bucket mutation did not change the workflow" >&2
+    status=1
+elif completed_build_contract "$dbt_bucket_dropped"; then
+    echo "check-shard-coverage.sh: FAIL — completed-build guard accepted a job that skips build_dbt_nodes" >&2
+    status=1
+fi
+unfetched_sources=${workflow_text/$'      - name: Fetch locked workspace dependencies\n        run: cargo fetch --locked\n'/}
+if [[ $unfetched_sources == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — completed-build fetch mutation did not change the workflow" >&2
+    status=1
+elif completed_build_contract "$unfetched_sources"; then
+    echo "check-shard-coverage.sh: FAIL — completed-build guard accepted a job that cannot hash its git dependency checkouts" >&2
+    status=1
+fi
+if ! release_tree_consumer_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — no executable workflow line may name target/release or target/ci/hermit-strict, and every release-tree consumer must require target/ci/hermit" >&2
+    status=1
+fi
+stale_release_bin=${workflow_text/'      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit'/'      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit'}
+if [[ $stale_release_bin == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — release-binary mutation did not change the workflow" >&2
+    status=1
+elif release_tree_consumer_contract "$stale_release_bin"; then
+    echo "check-shard-coverage.sh: FAIL — release-tree guard accepted a consumer naming target/release/hermit" >&2
+    status=1
+fi
+if ! unchecked_consumer=$(mutate_step "Unpack completed release tree" $'          require -x target/ci/hermit\n' '' "$workflow_text") ||
+    [[ $unchecked_consumer == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — release-tree consumer mutation did not change test-debug" >&2
+    status=1
+elif release_tree_consumer_contract "$unchecked_consumer"; then
+    echo "check-shard-coverage.sh: FAIL — release-tree guard accepted test-debug without its target/ci/hermit check" >&2
     status=1
 fi
 if ! prepared_nextest_producer_contract "$workflow_text"; then
@@ -763,19 +943,20 @@ strict_compat_json=$(printf '%s\n' "${strict_compat_expansion[@]}" |
 through_preflight=$(jq -cn --argjson preflight "$preflight_json" '$preflight')
 through_checks=$(jq -cn --argjson preflight "$preflight_json" --argjson checks "$check_json" '$preflight + $checks')
 through_debug=$(jq -cn --argjson preflight "$preflight_json" --argjson debug "$build_debug_json" '$preflight + $debug')
-through_release=$(jq -cn --argjson preflight "$preflight_json" --argjson release "$build_dbt_json" '$preflight + $release')
 through_builds=$(jq -cn \
     --argjson preflight "$preflight_json" \
     --argjson debug "$build_debug_json" \
-    --argjson release "$build_dbt_json" \
+    --argjson dbt "$build_dbt_json" \
     --argjson aux "$build_aux_json" \
-    '$preflight + $debug + $release + $aux')
+    '$preflight + $debug + $dbt + $aux')
+# build-complete runs both the Buck-branch bucket and the publisher bucket after
+# build-debug; no separate release producer exists since d44bbbb79ac.
+build_complete_json=$(jq -cn --argjson dbt "$build_dbt_json" --argjson aux "$build_aux_json" '$dbt + $aux')
 
 check_dependencies "preflight" "$preflight_json" "$through_preflight"
 check_dependencies "check job" "$check_json" "$through_checks"
 check_dependencies "debug build job" "$build_debug_json" "$through_debug"
-check_dependencies "release build job" "$build_dbt_json" "$through_release"
-check_dependencies "completed build job" "$build_aux_json" "$through_builds"
+check_dependencies "completed build job" "$build_complete_json" "$through_builds"
 
 debug_test_json=$(jq -c '[.debug_shards[].nodes[]]' <<<"$shards_json")
 strict_compat_supplied=$(jq -cn \
