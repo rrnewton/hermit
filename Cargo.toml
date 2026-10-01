@@ -59,6 +59,26 @@ repository = "https://github.com/facebookexperimental/hermit"
 [profile.dev.package.sha2]
 opt-level = 3
 
+# iced-x86 1.21.0 (the latest release) computes every decoded instruction's
+# length as `end as u32 - start as u32` on host pointers (src/decoder.rs:1421
+# and 1468). The difference is exact under wrapping arithmetic, which is what a
+# release build uses, but with overflow checks on it panics whenever an
+# instruction ends at or past a 4 GiB-aligned host address. Where a buffer
+# lands is an allocator accident, so the panic is intermittent: the LiteInst
+# census decodes all of libc's text inside the tracer and failed full
+# validations with "attempt to subtract with overflow"
+# (https://github.com/rrnewton/hermit/issues/3462). Upstream fixed both lines
+# with wrapping_sub in icedland/iced 1e37b3d6 (issue
+# https://github.com/icedland/iced/issues/696), which no release contains yet.
+# Building only this crate without overflow checks restores the wrapping it
+# relies on; debug assertions stay on, including its own check that the length
+# is at most 15. Drop both stanzas once a release containing 1e37b3d6 is used.
+# instruction_map::tests::decodes_instructions_that_end_at_or_cross_a_4gib_host_address
+# places instructions at the boundary on every run, and scripts/validate.rs
+# cargo_identity_is_the_validate_profile admits exactly these two stanzas.
+[profile.dev.package.iced-x86]
+overflow-checks = false
+
 # The one profile a validation builds. It inherits release optimisation, so the
 # end-to-end and compatibility cells run an optimised Hermit, and keeps
 # debug-assertions and overflow-checks ON so detcore's debug_assert invariants,
@@ -81,3 +101,8 @@ overflow-checks = true
 # Their dependencies share the validate build above.
 [profile.validate.package.hermetic_infra_hermit_tests]
 opt-level = 0
+
+# Same reason as [profile.dev.package.iced-x86] above:
+# https://github.com/rrnewton/hermit/issues/3462
+[profile.validate.package.iced-x86]
+overflow-checks = false

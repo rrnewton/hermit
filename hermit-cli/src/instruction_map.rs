@@ -533,4 +533,127 @@ mod tests {
                 .any(|site| site.instruction == "rdtscp")
         );
     }
+
+    /// Two read-write pages that meet at a 4 GiB-aligned address.
+    struct FourGibBoundary {
+        base: *mut u8,
+    }
+
+    impl FourGibBoundary {
+        const PAGE: usize = 4096;
+
+        /// Maps the pages at the first free 4 GiB multiple. MAP_FIXED_NOREPLACE
+        /// never displaces an existing mapping; a kernel too old to know the
+        /// flag treats the address as a hint, so a placement elsewhere is
+        /// unmapped and the next multiple is tried.
+        fn map() -> Self {
+            for multiple in 1..=64usize {
+                let base = (multiple << 32) - Self::PAGE;
+                // SAFETY: an anonymous private mapping that cannot replace
+                // any existing mapping.
+                let mapped = unsafe {
+                    libc::mmap(
+                        base as *mut libc::c_void,
+                        2 * Self::PAGE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                        -1,
+                        0,
+                    )
+                };
+                if mapped == libc::MAP_FAILED {
+                    continue;
+                }
+                if mapped as usize == base {
+                    return Self {
+                        base: mapped.cast(),
+                    };
+                }
+                // SAFETY: unmaps only the mapping created just above.
+                unsafe { libc::munmap(mapped, 2 * Self::PAGE) };
+            }
+            panic!("no 4 GiB-aligned address below 256 GiB was free to map");
+        }
+
+        /// The bytes of both pages; index `PAGE` is the 4 GiB-aligned address.
+        fn bytes(&mut self) -> &mut [u8] {
+            // SAFETY: `map` created exactly these two read-write pages and
+            // `self` owns them until drop.
+            unsafe { std::slice::from_raw_parts_mut(self.base, 2 * Self::PAGE) }
+        }
+    }
+
+    impl Drop for FourGibBoundary {
+        fn drop(&mut self) {
+            // SAFETY: unmaps the two pages that `map` created.
+            unsafe { libc::munmap(self.base.cast(), 2 * Self::PAGE) };
+        }
+    }
+
+    /// iced-x86 1.21.0 computes an instruction's length as
+    /// `end as u32 - start as u32` on host pointers (decoder.rs:1421 and its
+    /// invalid-instruction twin at 1468). That difference is exact under
+    /// wrapping arithmetic but panics with "attempt to subtract with overflow"
+    /// when overflow checks are on and the instruction ends at or past a
+    /// 4 GiB-aligned host address. Where a buffer lands is an allocator
+    /// accident, so the panic was intermittent: the LiteInst census decodes
+    /// all of libc's text in the tracer, and it failed full validations as a
+    /// container-child panic
+    /// (https://github.com/rrnewton/hermit/issues/3462). The workspace
+    /// therefore builds iced-x86 without overflow checks; this places the
+    /// instructions at the boundary on purpose so that the setting is tested
+    /// on every run rather than once in a few thousand.
+    #[test]
+    fn decodes_instructions_that_end_at_or_cross_a_4gib_host_address() {
+        const NOP: u8 = 0x90;
+        const CPUID: [u8; 2] = [0x0f, 0xa2];
+        const RDTSC: [u8; 2] = [0x0f, 0x31];
+        // mov rax, [rip + 0x10]
+        const MOV_RIP_RELATIVE: [u8; 7] = [0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00];
+        let boundary = FourGibBoundary::PAGE;
+        let mut mapping = FourGibBoundary::map();
+        let bytes = mapping.bytes();
+        assert_eq!(bytes[boundary..].as_ptr() as usize & 0xffff_ffff, 0);
+
+        // `cpuid` ends exactly at the boundary, `rdtsc` crosses it, and both
+        // are sites the instruction map records with their encoded lengths.
+        for (instruction, start, name) in [
+            (CPUID, boundary - 2, "cpuid"),
+            (RDTSC, boundary - 1, "rdtsc"),
+        ] {
+            bytes.fill(NOP);
+            bytes[start..start + instruction.len()].copy_from_slice(&instruction);
+            let window = boundary - 16..boundary + 16;
+            let range = ExecutableRange {
+                file_offset: 0x1000,
+                address: CODE_ADDRESS,
+                size: window.len() as u64,
+            };
+            let mut sites = Vec::new();
+            scan_range(&bytes[window.clone()], range, 64, &mut sites).unwrap();
+            assert_eq!(
+                sites,
+                vec![InstructionSite {
+                    offset: range.file_offset + (start - window.start) as u64,
+                    instruction: name.into(),
+                    length: 2,
+                }]
+            );
+        }
+
+        // A longer instruction crossing the boundary decodes to its true
+        // length and next instruction pointer.
+        bytes.fill(NOP);
+        let start = boundary - 3;
+        bytes[start..start + MOV_RIP_RELATIVE.len()].copy_from_slice(&MOV_RIP_RELATIVE);
+        let mut decoder = Decoder::with_ip(64, &bytes[start..], CODE_ADDRESS, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        assert_eq!(instruction.mnemonic(), Mnemonic::Mov);
+        assert_eq!(instruction.len(), MOV_RIP_RELATIVE.len());
+        assert_eq!(
+            instruction.next_ip(),
+            CODE_ADDRESS + MOV_RIP_RELATIVE.len() as u64
+        );
+        assert_eq!(decoder.position(), MOV_RIP_RELATIVE.len());
+    }
 }

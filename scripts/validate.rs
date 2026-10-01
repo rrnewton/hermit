@@ -1018,10 +1018,28 @@ mod e2e_payload_identity_tests {
         // The validate profile inherits release and turns both classes back
         // on. Require exactly that stanza, and refuse every other place that
         // could set either class.
+        //
+        // One third-party exception, by exact section and exact setting:
+        // iced-x86 1.21.0 computes instruction lengths with wrapping pointer
+        // arithmetic that panics under overflow checks at a 4 GiB-aligned
+        // host address (https://github.com/rrnewton/hermit/issues/3462,
+        // fixed upstream in icedland/iced 1e37b3d6 but unreleased). Only
+        // `overflow-checks = false`, only for that crate, only while the lock
+        // file holds the affected 1.21.0, and only while the regression test
+        // that decodes across the boundary exists. debug-assertions is never
+        // exempt, and every Hermit crate keeps both classes on.
+        const ICED_EXEMPTION: [(&str, &str); 2] = [
+            ("[profile.dev.package.iced-x86]", "overflow-checks=false"),
+            (
+                "[profile.validate.package.iced-x86]",
+                "overflow-checks=false",
+            ),
+        ];
         let root = test_source_root();
         let manifest = read(&root, "Cargo.toml");
         let mut section = String::new();
         let mut validate_settings = Vec::new();
+        let mut iced_settings = Vec::new();
         for line in manifest.lines().map(str::trim) {
             if line.starts_with('[') {
                 section = line.to_string();
@@ -1039,6 +1057,10 @@ mod e2e_payload_identity_tests {
             // table sets the class just as well.
             let setting = line.split('#').next().unwrap_or_default().trim();
             if setting.contains("debug-assertions") || setting.contains("overflow-checks") {
+                if ICED_EXEMPTION.iter().any(|(exempt, _)| section == *exempt) {
+                    iced_settings.push((section.clone(), setting.replace(' ', "")));
+                    continue;
+                }
                 assert_eq!(
                     section, "[profile.validate]",
                     "Cargo.toml sets a check class outside [profile.validate]: {line}"
@@ -1052,6 +1074,23 @@ mod e2e_payload_identity_tests {
             ["debug-assertions=true", "overflow-checks=true"],
             "[profile.validate] must keep both check classes on"
         );
+        if !iced_settings.is_empty() {
+            assert_eq!(
+                iced_settings,
+                ICED_EXEMPTION.map(|(section, setting)| (section.to_string(), setting.to_string())),
+                "the iced-x86 exemption is exactly overflow-checks = false in both profiles"
+            );
+            assert!(
+                read(&root, "Cargo.lock").contains("name = \"iced-x86\"\nversion = \"1.21.0\"\n"),
+                "the iced-x86 overflow-checks exemption covers only 1.21.0: re-run the 4 GiB \
+                 boundary test without it and drop it once the release contains icedland/iced 1e37b3d6"
+            );
+            assert!(
+                read(&root, "hermit-cli/src/instruction_map.rs")
+                    .contains("fn decodes_instructions_that_end_at_or_cross_a_4gib_host_address()"),
+                "the iced-x86 exemption must keep the regression test that decodes across a 4 GiB boundary"
+            );
+        }
         assert!(manifest.contains("[profile.validate]\ninherits = \"release\"\n"));
         for config in [".cargo/config.toml", ".cargo/config"] {
             assert!(
