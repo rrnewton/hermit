@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -17,6 +18,8 @@ use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::consts::METADATA_NAME;
+use crate::error::Context;
 use crate::error::Error;
 
 /// Hermit record version. Recorded as part of hermit-record, hermit-replay
@@ -231,6 +234,14 @@ pub struct Metadata {
     /// Detcore first observed them.
     #[serde(default)]
     pub fdinfo_unlisted_mount_ids: Vec<u64>,
+    /// Whether the recording ran in an isolated network namespace with only
+    /// loopback (`record start --network local`). `None` means the recorder
+    /// did not say, which is every recording made before this field existed;
+    /// those recordings ran on the host network. An autopilot replay uses the
+    /// same network, so syscalls the replayer re-executes see the same
+    /// interfaces and ports they were recorded against.
+    #[serde(default)]
+    pub local_networking: Option<bool>,
 }
 
 impl Metadata {
@@ -284,7 +295,18 @@ impl Metadata {
             mountinfo_mount_ids: Vec::new(),
             mountinfo_mount_ids_captured: false,
             fdinfo_unlisted_mount_ids: Vec::new(),
+            local_networking: None,
         })
+    }
+
+    /// Reads the metadata of the recording stored in `dir`.
+    pub fn load(dir: &Path) -> Result<Self, Error> {
+        let metadata_path = dir.join(METADATA_NAME);
+        serde_json::from_reader(
+            fs::File::open(&metadata_path)
+                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
+        )
+        .with_context(|| format!("Failed to parse {:?}", metadata_path))
     }
 
     /// Constructs a command from the metadata.
@@ -604,5 +626,24 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+    }
+
+    /// A recording made before the network choice was stored ran on the host
+    /// network, and must still load, reporting no choice.
+    #[test]
+    fn metadata_without_a_network_choice_loads_as_unknown() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": RECORD_VERSION,
+        }))
+        .unwrap();
+        assert_eq!(metadata.local_networking, None);
     }
 }

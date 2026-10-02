@@ -3022,7 +3022,7 @@ impl HermitData {
         ptrace_completion::run(None, move |control| async move {
             let data = store.create_recording_dir()?;
             let exit_status =
-                record_to_async(command, data.path(), Vec::new(), None, control).await?;
+                record_to_async(command, data.path(), Vec::new(), None, None, control).await?;
             store.commit_recording(data, exit_status)
         })
     }
@@ -3044,6 +3044,7 @@ impl HermitData {
                 data.path(),
                 mountinfo_root_rewrites,
                 Some(mount_ids),
+                None,
                 control,
             )
             .await?;
@@ -3137,16 +3138,7 @@ impl HermitData {
 
     /// Returns the metadata of a recording.
     pub fn recording_metadata(&self, id: Id) -> Result<Metadata, Error> {
-        let mut metadata_path = self.data_dir.join(id.to_string());
-        metadata_path.push(METADATA_NAME);
-
-        let metadata: Metadata = serde_json::from_reader(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        Ok(metadata)
+        Metadata::load(&self.data_dir.join(id.to_string()))
     }
 
     /// Deletes a recording.
@@ -3223,16 +3215,18 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_to_async(command, &dir, Vec::new(), None, control).await
+        record_to_async(command, &dir, Vec::new(), None, None, control).await
     })
 }
 
 /// Records with producer-owned mountinfo provenance. The directory-lifetime
-/// obligation is the same as [`record_to`].
+/// obligation is the same as [`record_to`]. `local_networking` is stored in
+/// the recording metadata; see [`metadata::Metadata::local_networking`].
 pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    local_networking: bool,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -3242,6 +3236,7 @@ pub fn record_to_with_mountinfo(
             &dir,
             mountinfo_root_rewrites,
             Some(mount_ids),
+            Some(local_networking),
             control,
         )
         .await
@@ -3253,14 +3248,21 @@ async fn record_to_async(
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    local_networking: Option<bool>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
     let report = SkidOvershootReport::begin(true);
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait(control)
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            local_networking,
+        )
+        .await?
+        .wait(control)
+        .await
     }
     .await;
     report.finish(result)
@@ -3271,15 +3273,17 @@ async fn record_to_async(
 pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_with_output_async(command, &dir, Vec::new(), None, control).await
+        record_with_output_async(command, &dir, Vec::new(), None, None, control).await
     })
 }
 
 /// Records with captured output and exact mountinfo provenance.
+/// `local_networking` is as for [`record_to_with_mountinfo`].
 pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    local_networking: bool,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -3289,6 +3293,7 @@ pub fn record_with_output_with_mountinfo(
             &dir,
             mountinfo_root_rewrites,
             Some(mount_ids),
+            Some(local_networking),
             control,
         )
         .await
@@ -3300,6 +3305,7 @@ async fn record_with_output_async(
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    local_networking: Option<bool>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -3307,10 +3313,16 @@ async fn record_with_output_async(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait_with_output(control)
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            local_networking,
+        )
+        .await?
+        .wait_with_output(control)
+        .await
     }
     .await;
     report.finish(result)

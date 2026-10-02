@@ -13093,6 +13093,18 @@ exit "$(cat "$PWD/exit-status")"
         report: VerificationReport,
         ending: &str,
     ) -> (CellResult, serde_json::Value) {
+        expected_exit_row_in_mode("verify", expected, report, ending)
+    }
+
+    /// [`expected_exit_row`] for a `mode` cell. The declaration is always on
+    /// the verify recipe, the only place validation admits it; a replay cell
+    /// gets a verify recipe beside its own.
+    fn expected_exit_row_in_mode(
+        mode: &str,
+        expected: Option<ExpectedGuestExit>,
+        report: VerificationReport,
+        ending: &str,
+    ) -> (CellResult, serde_json::Value) {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-expected-exit-row-{}-{:?}",
             std::process::id(),
@@ -13133,7 +13145,11 @@ cp "{}" "$verdict"
         .unwrap();
         fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut cell = ptrace_cell("verify");
+        let mut cell = ptrace_cell(mode);
+        if mode != "verify" {
+            let verify = ptrace_cell("verify").test.modes["verify"].clone();
+            cell.test.modes.insert("verify".into(), verify);
+        }
         cell.test.id = "fixture/expected-exit-row".into();
         cell.id.test = cell.test.id.clone();
         cell.timeout_seconds = 10;
@@ -13246,6 +13262,57 @@ cp "{}" "$verdict"
     }
 
     /// A test with both a verify and a replay recipe, selected as its replay cell.
+    /// A replay cell passes on its verify cell's declared nonzero disposition
+    /// only through the same gate a verify cell does: a matched canonical
+    /// replay whose guest and Hermit both end that way. A wrong exit, a
+    /// diverged replay, or no declaration at all is still a failure.
+    #[test]
+    fn a_replay_cell_passes_on_the_inherited_exit_only_when_matched_and_exact() {
+        let (exact, _) = expected_exit_row_in_mode(
+            "replay",
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_eq!(exact.outcome, "PASS", "{:?}", exact.reason);
+        assert!(exact.attempts[0].argv.iter().any(|arg| arg == "record"));
+
+        let (wrong_exit, _) = expected_exit_row_in_mode(
+            "replay",
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(6), None),
+            "exit 6",
+        );
+        assert_eq!(wrong_exit.outcome, "FAIL", "{:?}", wrong_exit.reason);
+        assert_eq!(
+            wrong_exit.reason.as_deref(),
+            Some("guest ended with exit code 6, but the manifest expects exit code 7")
+        );
+
+        let mut diverged = expected_exit_report(Some(7), None);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        let (diverged, _) = expected_exit_row_in_mode(
+            "replay",
+            Some(expected_exit(Some(7), None)),
+            diverged,
+            "exit 7",
+        );
+        assert_eq!(diverged.outcome, "FAIL", "{:?}", diverged.reason);
+
+        let (undeclared, _) = expected_exit_row_in_mode(
+            "replay",
+            None,
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_ne!(undeclared.outcome, "PASS", "{:?}", undeclared.reason);
+    }
+
     fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
         let mut cell = ptrace_cell("replay");
         cell.test.modes.insert("verify".into(), verify);
@@ -13283,10 +13350,11 @@ cp "{}" "$verdict"
 
         let mut replay = base;
         replay.guest_args = BTreeMap::from([("ptrace".into(), vec!["--record".into()])]);
-        replay.workdir = Some("/own".into());
         let overridden = replay_cell_with_verify(verify.clone(), replay);
         assert_eq!(cell_guest_args(&overridden, "ptrace"), ["--record"]);
-        assert_eq!(cell_workdir(&overridden).as_deref(), Some("/own"));
+        // Validation refuses `workdir` on a replay recipe, so the inherited one
+        // is the only one a replay cell can have.
+        assert_eq!(cell_workdir(&overridden).as_deref(), Some("/srv"));
 
         // Chaos keeps reading only its own recipe.
         let mut chaos = ptrace_cell("chaos");
