@@ -11,9 +11,21 @@
 use std::cmp::Ordering;
 use std::ptr;
 
+#[cfg(not(target_os = "none"))]
 use libc::strlen;
 use serde::Deserialize;
 use serde::Serialize;
+
+/// `strlen` for the Narf kernel build of Detcore, which has no C library.
+///
+/// # Safety
+///
+/// `s` must point to a NUL-terminated string, as `libc::strlen` requires.
+#[cfg(target_os = "none")]
+unsafe fn strlen(s: *const i8) -> usize {
+    // SAFETY: the caller guarantees the terminating NUL.
+    unsafe { core::ffi::CStr::from_ptr(s) }.count_bytes()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Dirent64<'a> {

@@ -104,6 +104,25 @@ pub fn record_suffix(event: DetLogEvent) -> String {
     format!("{RECORD_SEPARATOR}{encoded}")
 }
 
+/// Wrap a host memory address so `canonicalize_addresses_in_line` will
+/// canonicalize it. Producers that print a genuinely host-specific pointer
+/// (one that varies run-to-run, e.g. a supervisor-side allocation) should emit
+/// it via this helper -- `<hostaddr 0x7fcfb7e7d450>` -- instead of a bare
+/// `0x...` literal. Only marked addresses are canonicalized, so reproducible hex
+/// (syscall arguments, guest memory ranges, digests) is compared exactly.
+///
+/// Command bootstrap logs use this marker for proven launcher-image pointers
+/// before the first successful exec. Guest pointers, syscall scalars, and
+/// addresses without that provenance remain exact. Marking an address preserves
+/// its identity and aliasing through the per-run ordinal mapping in `logdiff`.
+///
+/// It is defined here, beside the records it marks, and re-exported by
+/// `logdiff`, because the Narf kernel build of Detcore writes these logs but
+/// has no `logdiff`.
+pub fn host_addr(addr: usize) -> String {
+    format!("<hostaddr {addr:#x}>")
+}
+
 /// A process-local sink for deterministic INFO records.
 pub type DetlogForwarder = for<'a> fn(&str, fmt::Arguments<'a>);
 

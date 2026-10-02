@@ -16,6 +16,8 @@ mod parked_tests;
 pub(crate) mod real_timer;
 mod replayer;
 pub mod runqueue;
+#[cfg(any(test, target_os = "none"))]
+mod shared_receiver;
 pub(crate) mod signal_control;
 pub mod timed_waiters;
 
@@ -25,12 +27,16 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::iter::Peekable;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::AsRawFd;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::FromRawFd;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(not(target_os = "none"))]
 use std::time::Duration;
 use std::vec::IntoIter;
 
@@ -40,11 +46,14 @@ use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+#[cfg(not(target_os = "none"))]
 use futures::FutureExt;
 use futures::channel::oneshot;
+#[cfg(not(target_os = "none"))]
 use futures::future::Shared;
+#[cfg(not(target_os = "none"))]
 use nix::sys::signal;
-use nix::sys::signal::Signal;
+#[cfg(not(target_os = "none"))]
 use nix::unistd::Pid;
 use rand::RngExt as _;
 use rand::SeedableRng;
@@ -52,6 +61,7 @@ use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
+use reverie::Signal;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::DEFAULT_PRIORITY;
@@ -87,6 +97,8 @@ use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
+#[cfg(target_os = "none")]
+use crate::tool_global::yield_once;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -625,6 +637,12 @@ pub struct Scheduler {
     /// poison the scheduler mutex on the way out.
     terminal_deadlock: Option<String>,
 
+    /// Why the Narf kernel build's scheduler loop stopped the run, if it did
+    /// (see [`Scheduler::fatal_exit`]). Always `None` in the std build, which
+    /// exits the process instead.
+    #[cfg(target_os = "none")]
+    fatal_exit_reason: Option<String>,
+
     /// The scheduler turn at which `step2d_handle_empty_queue` last logged
     /// "zero threads left anywhere, fizzling.", while that empty state lasts.
     ///
@@ -648,7 +666,7 @@ pub struct Scheduler {
     // callback and daemon wait clones its own subscriber, unlike an Ivar.
     backend_failure: Option<BackendFailureLocation>,
     backend_failure_sender: Option<oneshot::Sender<()>>,
-    backend_failure_wake: Shared<oneshot::Receiver<()>>,
+    backend_failure_wake: BackendFailureWaiter,
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
@@ -690,6 +708,10 @@ pub struct Scheduler {
 
     /// Whether the backend will report final physical process exits after logical cleanup.
     backend_reports_physical_process_exits: bool,
+
+    /// Whether the backend's kernel raises child-exit signals itself and reports them through
+    /// the signal hook. See [`Config::backend_delivers_child_exit_signals`].
+    backend_delivers_child_exit_signals: bool,
 
     /// SaBRe process leaders whose tool exit hook ran before the ptrace supervisor observed the
     /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
@@ -838,7 +860,9 @@ struct ProcessWaitMetadata {
     session: DetPid,
 }
 
+#[cfg(not(target_os = "none"))]
 use pretty::Doc;
+#[cfg(not(target_os = "none"))]
 use pretty::RcDoc;
 
 use self::replayer::DesyncStats;
@@ -881,6 +905,7 @@ impl ThreadTree {
     ///   `[1 [2 [3] 4] (5 6 7)]`
     // TODO: it would also be nice to store a fixed prefix of the binary name and listing
     // that along with the thread ID.
+    #[cfg(not(target_os = "none"))]
     pub fn pretty_print(&self) -> String {
         fn walk<'a>(
             tt: &'a HashMap<DetTid, Vec<DetTid>>,
@@ -938,6 +963,52 @@ impl ThreadTree {
         let mut vec = Vec::new();
         doc.render(width, &mut vec).unwrap();
         String::from_utf8(vec).unwrap()
+    }
+
+    /// Render the tree as the host's `pretty_print` does, always on one line:
+    /// the Narf kernel build of Detcore has no `pretty` crate to wrap it. The
+    /// output is the host's whenever that fits in the host's 100 columns.
+    #[cfg(target_os = "none")]
+    pub fn pretty_print(&self) -> String {
+        self.render_flat()
+    }
+
+    /// The tree in `pretty_print`'s notation, on one line.
+    #[cfg(any(test, target_os = "none"))]
+    fn render_flat(&self) -> String {
+        fn walk(
+            tt: &HashMap<DetTid, Vec<DetTid>>,
+            tgl: &HashSet<DetTid>,
+            current: &DetTid,
+            out: &mut String,
+        ) {
+            let Some(children) = tt.get(current) else {
+                // This should be unreachable if the invariants are maintained:
+                let _ = write!(out, "<ThreadTree corrupt, missing tid: {current}>");
+                return;
+            };
+            let (open, close) = if tgl.contains(current) {
+                ("[", "]")
+            } else if children.is_empty() {
+                let _ = write!(out, "{current}");
+                return;
+            } else {
+                ("(", ")")
+            };
+            let _ = write!(out, "{open}{current}");
+            for child in children {
+                out.push(' ');
+                walk(tt, tgl, child, out);
+            }
+            out.push_str(close);
+        }
+
+        let Some(root) = self.root else {
+            return "[]".into();
+        };
+        let mut out = String::new();
+        walk(&self.tree, &self.thread_group_leaders, &root, &mut out);
+        out
     }
 
     #[allow(dead_code)]
@@ -1137,6 +1208,7 @@ impl Backoff {
         Backoff { count: 0 }
     }
 
+    #[cfg(not(target_os = "none"))]
     async fn further(&mut self, blocking: bool) {
         self.count += 1;
         const YIELDS_FIRST: u64 = 10;
@@ -1157,6 +1229,16 @@ impl Backoff {
         }
     }
 
+    /// The Narf kernel build of Detcore has no host threads to yield to and no
+    /// clock to sleep on. Whatever `blocking` asks, this is pending once, as
+    /// `yield_once` is, so the executor that polls the scheduler runs its
+    /// other tasks before it polls the scheduler again.
+    #[cfg(target_os = "none")]
+    async fn further(&mut self, _blocking: bool) {
+        self.count += 1;
+        yield_once().await;
+    }
+
     fn reset(&mut self) {
         self.count = 0;
     }
@@ -1168,8 +1250,19 @@ impl Default for Backoff {
     }
 }
 
+/// Let other host threads run before a busy-waiting scheduler step returns
+/// `SkipTurn`. The Narf kernel build of Detcore has no host threads, and here
+/// it holds the scheduler lock, a spin lock without std, so it waits only in
+/// `Backoff::further`, which the `SkipTurn` reaches after the lock is
+/// released.
+fn yield_host_thread() {
+    #[cfg(not(target_os = "none"))]
+    std::thread::yield_now();
+}
+
 pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
 
+#[cfg(not(target_os = "none"))]
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
     sched_loop_inner(sched, timer, false, None).await;
 }
@@ -1229,7 +1322,7 @@ async fn sched_loop_inner(
     let mut observed_turn = false;
 
     loop {
-        if sched.lock().unwrap().backend_failed() {
+        if sched.lock().unwrap().run_stopped() {
             return;
         }
         // TODO (T137183027, T137184765): as part of the current strategy for blocking IO ops (see
@@ -1243,13 +1336,16 @@ async fn sched_loop_inner(
 
         trace!("[scheduler] loop iteration {}", iter);
         if stop_after_iter.is_some() && iter > stop_after_iter.unwrap() {
-            let sched = sched.lock().unwrap();
+            let mut sched = sched.lock().unwrap();
             tracing::warn!(
                 "[scheduler] Early exit during sched loop iteration {} due to --stop-after-iter.  Summary:\n\n{}",
                 iter,
                 sched.full_summary()
             );
-            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+            sched.fatal_exit(format!(
+                "--stop-after-iter: early exit during scheduler loop iteration {iter}"
+            ));
+            return;
         }
         iter += 1;
 
@@ -1280,7 +1376,11 @@ async fn sched_loop_inner(
                     sched.turn,
                     sched.full_summary()
                 );
-                immediate_fatal_exit(); // We don't want a backtrace of this thread.
+                let turn = sched.turn;
+                sched.fatal_exit(format!(
+                    "--stop-after-turn: early exit during scheduler turn {turn}"
+                ));
+                return;
             }
         }
 
@@ -1295,9 +1395,16 @@ async fn sched_loop_inner(
         // Printed with `eprintln!` rather than `tracing::error!` on purpose: the
         // tracing writer prefixes a real wall-clock timestamp, and this report
         // is required to be byte-identical across runs of the same program.
-        if let Some(report) = sched.lock().unwrap().take_terminal_deadlock() {
-            eprintln!("{}", report);
-            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+        //
+        // The scheduler lock is held from the take until the exit, as it is
+        // for the two exits above.
+        {
+            let mut guard = sched.lock().unwrap();
+            if let Some(report) = guard.take_terminal_deadlock() {
+                eprintln!("{}", report);
+                guard.fatal_exit(report);
+                return;
+            }
         }
 
         if last_res.is_ok() && !observed_turn {
@@ -1344,6 +1451,14 @@ struct BackendFailureLocation {
     tid: Option<reverie::Tid>,
     phase: &'static str,
 }
+
+/// A wait for the backend-failure notice that every waiter can clone.
+#[cfg(not(target_os = "none"))]
+pub(crate) type BackendFailureWaiter = Shared<oneshot::Receiver<()>>;
+/// Without std, `futures` has no `Shared`; `SharedReceiver` does its job for
+/// this one receiver.
+#[cfg(target_os = "none")]
+pub(crate) type BackendFailureWaiter = shared_receiver::SharedReceiver;
 
 /// Wait without manufacturing a normal scheduler request or response. The
 /// caller must check the terminal state again under the mutex before mutation.
@@ -1666,9 +1781,91 @@ fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
 }
 
 /// Until panics are escalated properly, this encapsulates a way to exit the hermit container
-/// entirely.
+/// entirely. The Narf kernel build has no process to exit; it stops the run through
+/// [`Scheduler::fatal_exit`] instead.
+#[cfg(not(target_os = "none"))]
 pub fn immediate_fatal_exit() {
     std::process::exit(1);
+}
+
+/// The Narf kernel build of Detcore opens no pidfds (see `open_thread_pidfd`),
+/// so its map of them is always empty.
+#[cfg(target_os = "none")]
+#[derive(Debug)]
+enum OwnedFd {}
+
+/// Open a pidfd for a host thread, for `Scheduler::register_physical_thread`.
+#[cfg(not(target_os = "none"))]
+fn open_thread_pidfd(physical_tid: i32) -> std::io::Result<OwnedFd> {
+    let raw_fd = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            physical_tid,
+            libc::O_EXCL as libc::c_uint,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a new descriptor owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) })
+}
+
+/// The Narf kernel build of Detcore has no host threads, so it has no pidfds.
+#[cfg(target_os = "none")]
+fn open_thread_pidfd(physical_tid: i32) -> std::io::Result<OwnedFd> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "the Narf kernel build of Detcore has no pidfds, so it cannot bind host thread {physical_tid}"
+        ),
+    ))
+}
+
+/// The error of a failed host signal: nix's errno on the host. The Narf kernel
+/// build of Detcore sends no host signals and names it through Reverie.
+#[cfg(not(target_os = "none"))]
+type HostErrno = nix::errno::Errno;
+#[cfg(target_os = "none")]
+type HostErrno = reverie::Errno;
+
+/// Send a signal to a host thread through its pidfd.
+#[cfg(not(target_os = "none"))]
+fn send_signal_through_pidfd(pidfd: &OwnedFd, signal: Signal) -> Result<(), HostErrno> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal as libc::c_int,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        Err(nix::errno::Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
+/// The Narf kernel build of Detcore has no pidfds.
+#[cfg(target_os = "none")]
+fn send_signal_through_pidfd(pidfd: &OwnedFd, _signal: Signal) -> Result<(), HostErrno> {
+    match *pidfd {}
+}
+
+/// Send a signal to the host thread that a scheduler identity names.
+#[cfg(not(target_os = "none"))]
+fn kill_host_thread(dettid: DetTid, signal: Signal) -> Result<(), HostErrno> {
+    let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+    signal::kill(pid, signal)
+}
+
+/// The Narf kernel build of Detcore has no host threads; `Scheduler::signal_guest`
+/// does not call this there.
+#[cfg(target_os = "none")]
+fn kill_host_thread(_dettid: DetTid, _signal: Signal) -> Result<(), HostErrno> {
+    unreachable!("the Narf kernel build of Detcore has no host threads to signal")
 }
 
 /// The result of consuming a SchedEvent during --replay-preemptions-from.  This represents some
@@ -1768,10 +1965,15 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
+            #[cfg(target_os = "none")]
+            fatal_exit_reason: None,
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
+            #[cfg(not(target_os = "none"))]
             backend_failure_wake: backend_failure_wake.shared(),
+            #[cfg(target_os = "none")]
+            backend_failure_wake: shared_receiver::SharedReceiver::new(backend_failure_wake),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             backend_is_kvm: cfg.backend_is_kvm,
             #[cfg(test)]
@@ -1789,6 +1991,7 @@ impl Scheduler {
             exec_teardowns: Default::default(),
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
+            backend_delivers_child_exit_signals: cfg.backend_delivers_child_exit_signals,
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
@@ -1844,18 +2047,7 @@ impl Scheduler {
                 ));
             }
         }
-        let raw_fd = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_open,
-                physical_tid,
-                libc::O_EXCL as libc::c_uint,
-            )
-        };
-        if raw_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: pidfd_open returned a new descriptor owned by this process.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+        let pidfd = open_thread_pidfd(physical_tid)?;
         self.physical_thread_pidfds
             .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
         Ok(())
@@ -1896,7 +2088,9 @@ impl Scheduler {
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
-        !self.physical_thread_pidfds.contains_key(&parent)
+        // A backend whose kernel raises the signal itself would make the parent see two.
+        !self.backend_delivers_child_exit_signals
+            && !self.physical_thread_pidfds.contains_key(&parent)
     }
 
     /// Handle a happens-before checkpoint issued by `dettid` after its `count`th
@@ -2130,8 +2324,12 @@ impl Scheduler {
                         timeslice_remaining,
                     };
                 }
-                replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
-                replayer::ReplayAction::Stop(StopReason::ReplayExausted) => immediate_fatal_exit(),
+                replayer::ReplayAction::Stop(StopReason::FatalDesync) => {
+                    self.fatal_exit(String::from("replay stopped: fatal desync"))
+                }
+                replayer::ReplayAction::Stop(StopReason::ReplayExausted) => {
+                    self.fatal_exit(String::from("replay stopped: replay exhausted"))
+                }
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
@@ -2592,7 +2790,7 @@ impl Scheduler {
         self.backend_failure.is_some()
     }
 
-    pub(crate) fn backend_failure_waiter(&self) -> Shared<oneshot::Receiver<()>> {
+    pub(crate) fn backend_failure_waiter(&self) -> BackendFailureWaiter {
         self.backend_failure_wake.clone()
     }
 
@@ -2935,7 +3133,17 @@ impl Scheduler {
             // Do not let runnable siblings advance while the backend catches
             // up to physical waitability; completion admits the waiter through
             // the next deterministic drain.
-            std::thread::yield_now();
+            yield_host_thread();
+            return Err(SkipTurn);
+        }
+        if self.backend_delivers_child_exit_signals
+            && !self.pending_physical_process_exits.is_empty()
+        {
+            // The backend's kernel sets the parent's child-exit signal pending
+            // before it reports the exit. Grant no turn until then, waiting or
+            // not, so whether the signal is pending at the parent's next
+            // delivery point does not depend on host timing.
+            yield_host_thread();
             return Err(SkipTurn);
         }
         self.step2a_wait_for_vfork_barrier()?;
@@ -3306,21 +3514,11 @@ impl Scheduler {
             dettid, signal
         );
         let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    pidfd.as_raw_fd(),
-                    signal as libc::c_int,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            if rc < 0 {
-                Err(nix::errno::Errno::last())
-            } else {
-                Ok(())
-            }
-        } else if self.backend_requires_thread_directed_process_signals {
+            send_signal_through_pidfd(pidfd, signal)
+        } else if self.backend_requires_thread_directed_process_signals || cfg!(target_os = "none")
+        {
+            // The Narf kernel build of Detcore has no host threads to signal,
+            // so without a pidfd it always ends here.
             self.terminal_deadlock.get_or_insert_with(|| {
                 format!(
                     "HERMIT_DEADLOCK: scheduler cannot deliver signal {} to dettid {} without its host thread pidfd",
@@ -3329,8 +3527,7 @@ impl Scheduler {
             });
             return;
         } else {
-            let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
-            signal::kill(pid, signal)
+            kill_host_thread(dettid, signal)
         };
         match result {
             Ok(()) => {}
@@ -3355,7 +3552,7 @@ impl Scheduler {
             // stdout and never exited. The pipeline's short-lived subshells hit
             // this window repeatedly. Found only once the 22 `run_kvm_` cli
             // tests were scheduled; nothing had ever run them.
-            Err(nix::errno::Errno::ESRCH) => {
+            Err(HostErrno::ESRCH) => {
                 info!(
                     "[dtid {}] signal {} not delivered: the thread exited before it landed. \
                      Expected race; nothing to deliver and nothing to wake.",
@@ -3655,7 +3852,7 @@ impl Scheduler {
                     "[step2] eagerly waiting on external IO for dtids {:?}. spinning.",
                     &self.blocked.external_io_blockers
                 );
-                std::thread::yield_now();
+                yield_host_thread();
                 return Err(SkipTurn);
             } // End region which should be deleted.
 
@@ -3686,7 +3883,7 @@ impl Scheduler {
                     "[step2] TEMPORARY2: eagerly blocking on external IO for dtids {:?}.  SPINNING!",
                     &self.blocked.external_io_blockers
                 );
-                std::thread::yield_now();
+                yield_host_thread();
                 Err(SkipTurn)
             } else {
                 // Productive work to do, irrespcetive of what's blocked, so let's get to it.
@@ -3985,6 +4182,45 @@ impl Scheduler {
         self.terminal_deadlock.take()
     }
 
+    /// End the run for a fatal scheduler condition: a `--stop-after-*` limit, a
+    /// terminal deadlock, or a replay stop.
+    ///
+    /// The std build exits the process with status 1, as it always has. The
+    /// Narf kernel build has no process to exit: it keeps the first `reason`
+    /// for [`crate::GlobalState::fatal_exit_reason`], and the scheduler loop
+    /// returns at its next check, so the backend stops the guest with that
+    /// named error rather than a kernel panic.
+    fn fatal_exit(&mut self, reason: String) {
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = reason;
+            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+        }
+        #[cfg(target_os = "none")]
+        {
+            self.fatal_exit_reason.get_or_insert(reason);
+        }
+    }
+
+    /// Why [`Self::fatal_exit`] stopped the run, if it did. Always `None` in
+    /// the std build, where it exits the process instead.
+    pub(crate) fn fatal_exit_reason(&self) -> Option<&str> {
+        #[cfg(not(target_os = "none"))]
+        {
+            None
+        }
+        #[cfg(target_os = "none")]
+        {
+            self.fatal_exit_reason.as_deref()
+        }
+    }
+
+    /// Whether the scheduler loop must stop: the backend failed, or (in the
+    /// Narf kernel build) [`Self::fatal_exit`] ended the run.
+    fn run_stopped(&self) -> bool {
+        self.backend_failed() || self.fatal_exit_reason().is_some()
+    }
+
     /// Test seam: see [`SchedLoopPoint`].
     #[cfg(not(test))]
     #[inline(always)]
@@ -4103,7 +4339,7 @@ impl Scheduler {
                     "waiting for physical process exits before empty-queue timer fast-forward: {:?}",
                     self.pending_physical_process_exits
                 );
-                std::thread::yield_now();
+                yield_host_thread();
                 return Err(SkipTurn);
             }
             // When the run queue is empty, we sometimes need to give things a kick.
@@ -4136,7 +4372,7 @@ impl Scheduler {
                             "[scheduler] empty run-queue with only indefinite waiters, but external IO is outstanding for dtids {:?}. SPINNING!",
                             &self.blocked.external_io_blockers
                         );
-                        std::thread::yield_now();
+                        yield_host_thread();
                         return Err(SkipTurn);
                     }
                     return Err(self.report_terminal_deadlock());
@@ -5998,6 +6234,17 @@ mod test {
     }
 
     #[test]
+    fn backend_child_exit_signals_are_not_synthesized() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            backend_delivers_child_exit_signals: true,
+            ..Config::default()
+        };
+        let scheduler = Scheduler::new(&config);
+        assert!(!scheduler.should_synthesize_child_exit_signal(DetTid::from_raw(37)));
+    }
+
+    #[test]
     fn physical_thread_pidfd_rejects_invalid_host_identity() {
         let mut scheduler = Scheduler::new(&Config::default());
         let dettid = DetTid::from_raw(37);
@@ -7709,6 +7956,30 @@ mod test {
         assert!(!s.is_empty());
     }
 
+    /// The Narf kernel build renders the tree on one line with `render_flat`;
+    /// for a tree that fits in 100 columns that is the host's `pretty_print`.
+    #[test]
+    fn flat_render_matches_pretty_print() {
+        let mut tree: ThreadTree = Default::default();
+        assert_eq!(tree.render_flat(), "[]");
+        assert_eq!(tree.render_flat(), tree.pretty_print());
+
+        let p1 = DetPid::from_raw(100);
+        let p2 = DetPid::from_raw(200);
+        let p3 = DetPid::from_raw(300);
+        let p4 = DetPid::from_raw(400);
+        let p5 = DetPid::from_raw(500);
+        let p6 = DetPid::from_raw(600);
+        tree.add_child(p1, p1, true);
+        tree.add_child(p1, p2, false);
+        tree.add_child(p1, p3, true);
+        tree.add_child(p3, p4, false);
+        tree.add_child(p4, p5, false);
+        tree.add_child(p1, p6, true);
+        assert_eq!(tree.render_flat(), "[100 200 [300 (400 500)] [600]]");
+        assert_eq!(tree.render_flat(), tree.pretty_print());
+    }
+
     #[test]
     fn pending_signal_does_not_rewrite_other_internal_pollers() {
         let mut scheduler = Scheduler::new(&Config::default());
@@ -9136,6 +9407,24 @@ mod test {
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    #[test]
+    fn backend_child_exit_signals_hold_every_turn_until_the_exit_is_reported() {
+        let child = DetPid::from_raw(200);
+        for delivers in [false, true] {
+            let config = Config {
+                backend_reports_physical_process_exits: true,
+                backend_delivers_child_exit_signals: delivers,
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            assert!(scheduler.begin_physical_process_exit(child));
+            // No thread waits for the child, so only the child-exit signal barrier holds.
+            assert_eq!(scheduler.step2_drain_prefix().is_err(), delivers);
+            assert!(scheduler.complete_physical_process_exit(child));
+            assert!(scheduler.step2_drain_prefix().is_ok());
+        }
     }
 
     type LoopProbe = Box<dyn FnMut(SchedLoopPoint, &mut Scheduler)>;

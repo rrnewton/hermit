@@ -35,6 +35,23 @@
 #![deny(clippy::all)]
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
+// On the Narf kernel target (`x86_64-unknown-none`) Detcore is built without
+// std: detcore-std stands in for `std` and detcore-libc for `libc`, and what
+// needs an operating system is left out. scripts/check-detcore-nostd.sh
+// checks that build.
+#![cfg_attr(target_os = "none", no_std)]
+#![cfg_attr(target_os = "none", feature(if_let_guard, prelude_import))]
+#![cfg_attr(target_os = "none", allow(internal_features))]
+
+#[cfg(target_os = "none")]
+#[macro_use]
+extern crate detcore_std as std;
+#[cfg(target_os = "none")]
+extern crate detcore_libc as libc;
+#[cfg(target_os = "none")]
+#[prelude_import]
+#[allow(unused_imports)]
+use std::prelude::rust_2024::*;
 
 mod config;
 mod consts;
@@ -49,6 +66,8 @@ mod io_buffers;
 mod iovecs;
 #[allow(unused)]
 mod ivar;
+// The log comparison tool, for the host build only.
+#[cfg(not(target_os = "none"))]
 pub mod logdiff;
 mod memory;
 pub mod netlink_route;
@@ -70,6 +89,7 @@ pub mod util;
 pub mod detlog;
 pub mod preemptions;
 pub mod types;
+#[cfg(not(target_os = "none"))]
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::RawFd;
@@ -82,6 +102,7 @@ pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+#[cfg(not(target_os = "none"))]
 pub use config::config_wire_fingerprint;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
@@ -105,6 +126,7 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
+#[cfg(not(target_os = "none"))]
 pub use reverie::process::Namespace;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
@@ -957,6 +979,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(());
         }
+        self.detlog_proc_memory_maps(guest)
+    }
+
+    /// Without std there is no `/proc/<pid>/maps` to parse: the backend must
+    /// report the guest's memory regions.
+    #[cfg(target_os = "none")]
+    fn detlog_proc_memory_maps<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+    ) -> Result<(), reverie::Error> {
+        Err(reverie::Error::Tool(anyhow::anyhow!(
+            "--detlog-stack and --detlog-heap need the backend to report the guest's memory regions"
+        )))
+    }
+
+    /// The stack and heap records from the guest's `/proc/<pid>/maps`, for a
+    /// backend that does not report its memory regions.
+    #[cfg(not(target_os = "none"))]
+    fn detlog_proc_memory_maps<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
         let mut labelled_heap = false;
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
             procmaps::MMapPath::Stack if self.cfg.detlog_stack => true,
@@ -1008,6 +1049,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The labelled path above hashes its mapping directly, which is correct
     /// there because the kernel defines `[heap]` as exactly `[start_brk, brk)`.
     /// Both paths therefore report the same quantity.
+    #[cfg(not(target_os = "none"))]
     fn detlog_brk_heap<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
         let Some((start, end)) = guest
             .thread_state()
@@ -1810,6 +1852,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             "[detcore, dtid {}] inbound timer preemption event",
             guest.thread_state().dettid
         );
+        #[cfg(not(target_os = "none"))]
         if guest.config().preemption_stacktrace {
             let mut file_writer: Box<dyn Write> =
                 match &guest.config().preemption_stacktrace_log_file {
@@ -1832,6 +1875,29 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 } else {
                     writeln!(file_writer, "{}", backtrace).unwrap();
                 }
+            } else {
+                warn!("Could not read backtrace!");
+            }
+        }
+        // Without std there is no file system, no stderr handle and no
+        // symbolizer: a log file cannot be opened, and the stack trace goes,
+        // unsymbolized, to the kernel's `eprintln!` sink.
+        #[cfg(target_os = "none")]
+        if guest.config().preemption_stacktrace {
+            if let Some(path) = &guest.config().preemption_stacktrace_log_file {
+                panic!(
+                    "Failed to open preemption stacktrace log file {:?}: the Narf kernel build of Detcore has no file system",
+                    path
+                );
+            }
+            let ts = guest.thread_state();
+            eprintln!(
+                "\n>>> Guest tid {} preempted at thread time {} with stack trace:",
+                ts.dettid,
+                ts.thread_logical_time.as_nanos(),
+            );
+            if let Some(backtrace) = guest.backtrace() {
+                eprintln!("{}", backtrace);
             } else {
                 warn!("Could not read backtrace!");
             }

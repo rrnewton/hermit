@@ -559,12 +559,12 @@ impl Scheduler {
         now: LogicalTime,
         duration: LogicalTime,
         interval: LogicalTime,
-        signal: nix::sys::signal::Signal,
+        signal: reverie::Signal,
     ) -> Result<(LogicalTime, LogicalTime), TimerFailure> {
         if !self.backend_is_kvm {
             return Ok(self.register_alarm(pid, tid, now, duration, interval, signal));
         }
-        if !self.kvm_shared_dequeue_timers || signal != nix::sys::signal::Signal::SIGALRM {
+        if !self.kvm_shared_dequeue_timers || signal != reverie::Signal::SIGALRM {
             return Err(TimerFailure::Unsupported);
         }
         let (old, next) = self
@@ -621,7 +621,7 @@ impl Scheduler {
         deadline: LogicalTime,
         id: SignalTimerId,
         tid: DetTid,
-        signal: nix::sys::signal::Signal,
+        signal: reverie::Signal,
         normal_due: bool,
     ) {
         if self.kvm_shared_dequeue_timers && matches!(id, SignalTimerId::Alarm(_)) {

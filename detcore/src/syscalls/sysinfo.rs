@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(not(target_os = "none"))]
 use procfs::process::Process;
 use reverie::Error;
 use reverie::Guest;
@@ -387,6 +388,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Linux `getrusage`'s `ru_maxrss`. This reads host procfs through [`Guest::pid`], which only
     /// identifies the guest process on backends where it names a host process; always returns a
     /// positive value so guests can rely on a nonzero maximum RSS even if the read fails.
+    #[cfg(not(target_os = "none"))]
     fn guest_peak_rss_kb<G: Guest<Self>>(&self, guest: &G) -> u64 {
         Process::new(guest.pid().as_raw())
             .and_then(|process| process.status())
@@ -394,6 +396,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .and_then(|status| status.vmhwm.or(status.vmrss))
             .unwrap_or(0)
             .max(1)
+    }
+
+    /// The Narf kernel build of Detcore has no host procfs to read, so it
+    /// returns 1, the host's value when the read fails.
+    #[cfg(target_os = "none")]
+    fn guest_peak_rss_kb<G: Guest<Self>>(&self, _guest: &G) -> u64 {
+        1
     }
 
     /// handle sysinfo syscall

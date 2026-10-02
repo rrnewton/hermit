@@ -181,6 +181,21 @@
       ]
     },
     {
+      "_why": "@generated: Cargo package `detcore-clap`; reverse-dependent closure: detcore-clap.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.regular_crates_on_host"
+      ],
+      "paths": [
+        "detcore-clap/**/*.rs",
+        "detcore-clap/Cargo.toml"
+      ]
+    },
+    {
       "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, hermit.",
       "e2e_backends": [
         "dbt"
@@ -210,6 +225,21 @@
       "paths": [
         "detcore-dbt/**/*.rs",
         "detcore-dbt/Cargo.toml"
+      ]
+    },
+    {
+      "_why": "@generated: Cargo package `detcore-libc`; reverse-dependent closure: detcore-libc.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.regular_crates_on_host"
+      ],
+      "paths": [
+        "detcore-libc/**/*.rs",
+        "detcore-libc/Cargo.toml"
       ]
     },
     {
@@ -275,6 +305,21 @@
       "paths": [
         "detcore-sabre/**/*.rs",
         "detcore-sabre/Cargo.toml"
+      ]
+    },
+    {
+      "_why": "@generated: Cargo package `detcore-std`; reverse-dependent closure: detcore-std.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.regular_crates_on_host"
+      ],
+      "paths": [
+        "detcore-std/**/*.rs",
+        "detcore-std/Cargo.toml"
       ]
     },
     {

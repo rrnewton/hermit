@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+#[cfg(not(target_os = "none"))]
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,8 +21,9 @@ use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
-use nix::fcntl::OFlag;
+#[cfg(not(target_os = "none"))]
 use nix::sys::stat;
+#[cfg(not(target_os = "none"))]
 use nix::unistd::Pid;
 use rand::Rng as _;
 use rand::RngExt as _;
@@ -32,7 +34,11 @@ use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
+// Without std, reverie-process's look-alike of nix's type, as in detcore-model.
+#[cfg(target_os = "none")]
+use reverie::Pid;
 use reverie::syscalls::CloneFlags;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -650,9 +656,14 @@ impl FileMetadata {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
         // SAFETY: stating stdin is likely to always be safe
+        #[cfg(not(target_os = "none"))]
         let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
             .unwrap()
             .into();
+        // The Narf kernel build of Detcore has no stdin of its own to stat, so
+        // its dummy is the default stat.
+        #[cfg(target_os = "none")]
+        let stat = DetStat::default();
         let stdin = DetFd::new(
             0,
             OFlag::empty(),
@@ -691,8 +702,20 @@ impl FileMetadata {
         self
     }
 
+    /// The Narf kernel build of Detcore does not run in the guest's process, so
+    /// no descriptor it does not already know is open where it runs. It
+    /// returns EBADF, as the host does for a descriptor its process lacks.
+    #[cfg(target_os = "none")]
+    fn discover_fd_from_current_process(&mut self, _owner: DetTid, fd: RawFd) -> Result<(), Errno> {
+        if self.file_handles.contains_key(&fd) {
+            return Ok(());
+        }
+        Err(Errno::EBADF)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review SaBRe on-demand inherited descriptor discovery.
+    #[cfg(not(target_os = "none"))]
     fn discover_fd_from_current_process(&mut self, owner: DetTid, fd: RawFd) -> Result<(), Errno> {
         if self.file_handles.contains_key(&fd) {
             return Ok(());
@@ -848,6 +871,7 @@ impl FileMetadata {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
     match fd {
         0 => Some(ResourceID::Device(Device::ContainerStdin)),

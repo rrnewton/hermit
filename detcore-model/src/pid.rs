@@ -9,7 +9,11 @@
 use std::fmt;
 use std::str::FromStr;
 
-use nix::unistd;
+#[cfg(not(target_os = "none"))]
+use nix::unistd::Pid;
+// Without std, reverie-process's look-alike of nix's type.
+#[cfg(target_os = "none")]
+use reverie_process::Pid;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -45,17 +49,17 @@ impl From<reverie_syscalls::Pid> for DetPid {
     }
 }
 
-impl From<unistd::Pid> for DetPid {
-    fn from(p: unistd::Pid) -> Self {
+impl From<Pid> for DetPid {
+    fn from(p: Pid) -> Self {
         DetPid(p.into())
     }
 }
 
-// implementing From<DetPid> for unistd::Pid would violate foreign trait rules
+// implementing From<DetPid> for Pid would violate foreign trait rules
 #[allow(clippy::from_over_into)]
-impl Into<unistd::Pid> for DetPid {
-    fn into(self) -> unistd::Pid {
-        unistd::Pid::from_raw(self.0)
+impl Into<Pid> for DetPid {
+    fn into(self) -> Pid {
+        Pid::from_raw(self.0)
     }
 }
 

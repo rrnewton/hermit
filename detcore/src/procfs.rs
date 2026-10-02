@@ -318,8 +318,16 @@ fn module_refcnt_name(path: &Path) -> Option<String> {
 /// source yields a holder count of zero, which is the same conservative value
 /// the pre-existing behaviour emitted -- so an unreadable source degrades to
 /// the old answer instead of leaking the native counter.
+#[cfg(not(target_os = "none"))]
 fn read_host_modules() -> String {
     std::fs::read_to_string("/proc/modules").unwrap_or_default()
+}
+
+/// Without std there is no host `/proc/modules` to read: the empty source, as
+/// when the host's cannot be read.
+#[cfg(target_os = "none")]
+fn read_host_modules() -> String {
+    String::new()
 }
 
 /// The deterministic holder cardinality `sanitize_modules` publishes for

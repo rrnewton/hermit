@@ -6,9 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// Parsing `/proc/<pid>/maps` is for the host build only. Without std the
+// backend reports the guest's memory regions and only `compute_hash_range`
+// is used.
+#[cfg(not(target_os = "none"))]
 pub use procfs::process::MMapPath;
+#[cfg(not(target_os = "none"))]
 pub use procfs::process::MemoryMap;
 use reverie::Guest;
+#[cfg(not(target_os = "none"))]
 use reverie::Pid;
 use reverie::Tool;
 use reverie::syscalls::Addr;
@@ -16,6 +22,7 @@ use reverie::syscalls::MemoryAccess;
 
 use crate::Digest;
 
+#[cfg(not(target_os = "none"))]
 fn display_pathname(p: &MMapPath) -> String {
     match p {
         MMapPath::Vdso => String::from("[vsdo]"),
@@ -32,6 +39,7 @@ fn display_pathname(p: &MMapPath) -> String {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 pub fn display(map: &MemoryMap) -> String {
     display_as(map, &display_pathname(&map.pathname))
 }
@@ -42,6 +50,7 @@ pub fn display(map: &MemoryMap) -> String {
 /// not label `[heap]`, so the record is textually comparable with the labelled
 /// one another backend produces. Every other column is the mapping's real
 /// procfs data.
+#[cfg(not(target_os = "none"))]
 pub fn display_as(map: &MemoryMap, pathname: &str) -> String {
     display_range_as(map, map.address.0, map.address.1, pathname)
 }
@@ -53,6 +62,7 @@ pub fn display_as(map: &MemoryMap, pathname: &str) -> String {
 /// of the mapping that contains it -- the observed program break inside its
 /// enclosing anonymous mapping -- so the record's extent is the region actually
 /// hashed rather than the arena that happens to hold it.
+#[cfg(not(target_os = "none"))]
 pub fn display_range_as(map: &MemoryMap, start: u64, end: u64, pathname: &str) -> String {
     format!(
         "{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}",
@@ -60,6 +70,7 @@ pub fn display_range_as(map: &MemoryMap, start: u64, end: u64, pathname: &str) -
     )
 }
 
+#[cfg(not(target_os = "none"))]
 fn map_error(err: procfs::ProcError) -> reverie::Error {
     match err {
         procfs::ProcError::Io(err, _) => reverie::Error::Io(err),
@@ -67,6 +78,7 @@ fn map_error(err: procfs::ProcError) -> reverie::Error {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 pub fn from_pid<F>(pid: Pid, filter: F) -> Result<Vec<MemoryMap>, reverie::Error>
 where
     F: Fn(&MemoryMap) -> bool,
@@ -83,6 +95,7 @@ where
     }
 }
 
+#[cfg(not(target_os = "none"))]
 pub fn compute_hash<G, T: Tool>(guest: &mut G, map: &MemoryMap) -> Result<Digest, reverie::Error>
 where
     G: Guest<T>,
