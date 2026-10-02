@@ -154,6 +154,7 @@ use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use dagrun::scheduler::steps_violating_run_timeout;
+use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
@@ -9981,18 +9982,158 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     Ok("rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse".into())
 }
 
-fn require_host_capabilities(root: &Path, plan: &Plan) -> Result<(), String> {
+/// How the capability step asks the machine whether it has a capability.
+/// Production passes [`validate_plan::probe_host_capability`]; brackets plant
+/// verdicts so both sides of the decision are exercised on any machine.
+type CapabilityProbe<'a> = &'a dyn Fn(validate_plan::HostCapability) -> CapabilityVerdict;
+
+/// The host-capability step the run executes, between plan construction and
+/// scheduling. Every real run takes the committed branch: `build_plan` returns
+/// only through [`finish_committed_selection`].
+///
+/// A committed selection is byte-compared at the scheduler boundary, so it is
+/// never edited here: any capability a planned node OR a planned manifest
+/// cell needs and the probe proves ABSENT refuses the run. Cells matter as
+/// much as nodes because `target/debug/test-harness` withholds a cell whose
+/// capability is absent on its own probe, and a bucket node with runnable
+/// cells left would then exit 0 and read as covering the withheld ones.
+fn host_capability_step(
+    root: &Path,
+    plan: &mut Plan,
+    profile: &str,
+    probe: CapabilityProbe<'_>,
+) -> Result<(), Box<RunSummary>> {
+    let result = if plan.committed_selection.is_some() {
+        planned_cell_capability_needs(root, plan)
+            .and_then(|cells| require_host_capabilities(root, plan, &cells, probe))
+    } else {
+        withhold_host_inapplicable(root, plan, probe)
+    };
+    result.map_err(|e| {
+        eprintln!("validate: cannot resolve host-capability requirements: {e}");
+        Box::new(RunSummary::refused(
+            2,
+            profile,
+            "host-capability resolution",
+            vec![
+                e,
+                "no node was omitted and no substitute profile was run: an unevaluable capability \
+                 declaration is refused, never treated as a reason to skip work"
+                    .into(),
+            ],
+        ))
+    })
+}
+
+/// The cells of one planned manifest bucket node that need host capabilities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellCapabilityNeed {
+    tag: String,
+    lane: String,
+    category: String,
+    /// Cells the node selects, exactly as the required plan rows count them.
+    selected: usize,
+    /// Per capability, how many of those cells need it.
+    needing: BTreeMap<validate_plan::HostCapability, usize>,
+}
+
+/// Every planned manifest bucket node whose cells need a host capability.
+///
+/// Unlike [`planned_cell_capabilities`], an unreadable required plan REFUSES
+/// here when a bucket node is planned: this answer decides whether the run may
+/// start, and without it a capability only cells need could not be probed, so
+/// cells the harness withholds would vanish into a passing node.
+fn planned_cell_capability_needs(
+    root: &Path,
+    plan: &Plan,
+) -> Result<Vec<CellCapabilityNeed>, String> {
+    let nodes: Vec<(String, String, String)> = std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter())
+        .filter_map(|step| {
+            manifest_bucket_of(step).map(|(lane, category)| (step.tag(), lane, category))
+        })
+        .collect();
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cells = read_plan_cells(root).map_err(|why| {
+        format!(
+            "cannot account for the host capabilities of the manifest cells run by {}: {why}; \
+             the harness withholds such cells on its own probe, so an unaccounted capability \
+             could let withheld cells read as a pass",
+            nodes
+                .iter()
+                .map(|(tag, ..)| tag.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    Ok(cell_capability_needs(&nodes, &cells))
+}
+
+/// PURE: per planned `(tag, lane, category)` bucket node, count its selected
+/// cells and the cells needing each capability. Nodes none of whose cells need
+/// anything are omitted.
+fn cell_capability_needs(
+    nodes: &[(String, String, String)],
+    cells: &[PlanCell],
+) -> Vec<CellCapabilityNeed> {
+    let mut out = Vec::new();
+    for (tag, lane, category) in nodes {
+        let mut need = CellCapabilityNeed {
+            tag: tag.clone(),
+            lane: lane.clone(),
+            category: category.clone(),
+            selected: 0,
+            needing: BTreeMap::new(),
+        };
+        for cell in cells
+            .iter()
+            .filter(|cell| &cell.lane == lane && &cell.category == category)
+        {
+            need.selected += 1;
+            for capability in &cell.capabilities {
+                *need.needing.entry(*capability).or_default() += 1;
+            }
+        }
+        if !need.needing.is_empty() {
+            out.push(need);
+        }
+    }
+    out
+}
+
+fn require_host_capabilities(
+    root: &Path,
+    plan: &Plan,
+    cells: &[CellCapabilityNeed],
+    probe: CapabilityProbe<'_>,
+) -> Result<(), String> {
     let requirements = validate_plan::host_capability_requirements(root)?;
     let mut needed = BTreeMap::<validate_plan::HostCapability, Vec<String>>::new();
-    for step in &plan.cfg.steps {
+    for step in std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter())
+    {
         if let Some(capability) = requirements.get(&step.tag()) {
             needed.entry(*capability).or_default().push(step.tag());
         }
     }
+    let mut cells_needing = BTreeMap::<validate_plan::HostCapability, Vec<String>>::new();
+    for need in cells {
+        for (capability, count) in &need.needing {
+            cells_needing.entry(*capability).or_default().push(format!(
+                "{} ({count} of {} selected cell(s) of manifest bucket {}/{})",
+                need.tag, need.selected, need.lane, need.category
+            ));
+        }
+    }
+    let capabilities: BTreeSet<validate_plan::HostCapability> =
+        needed.keys().chain(cells_needing.keys()).copied().collect();
     let mut absent = Vec::new();
-    for (capability, mut steps) in needed {
-        steps.sort();
-        let verdict = validate_plan::probe_host_capability(capability);
+    for capability in capabilities {
+        let verdict = probe(capability);
         println!(
             "Host capability {}: {} — {}",
             capability.value(),
@@ -10000,10 +10141,22 @@ fn require_host_capabilities(root: &Path, plan: &Plan) -> Result<(), String> {
             verdict.evidence
         );
         if !verdict.present {
+            let mut required_by = Vec::new();
+            if let Some(steps) = needed.get_mut(&capability) {
+                steps.sort();
+                required_by.push(steps.join(", "));
+            }
+            if let Some(nodes) = cells_needing.get(&capability) {
+                required_by.push(format!(
+                    "manifest cells the harness would withhold as host-inapplicable while their \
+                     node still runs and exits 0: {}",
+                    nodes.join(", ")
+                ));
+            }
             absent.push(format!(
                 "{} required by {}: {}",
                 capability.value(),
-                steps.join(", "),
+                required_by.join("; and by "),
                 verdict.evidence
             ));
         }
@@ -10029,7 +10182,11 @@ fn require_host_capabilities(root: &Path, plan: &Plan) -> Result<(), String> {
 /// An unknown capability name, or a retained node depending on a withheld one,
 /// is an error that REFUSES the run. Substituting a different node set under the
 /// requested profile name would be worse than refusing.
-fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String> {
+fn withhold_host_inapplicable(
+    root: &Path,
+    plan: &mut Plan,
+    probe: CapabilityProbe<'_>,
+) -> Result<(), String> {
     let requirements = validate_plan::host_capability_requirements(root)?;
     // Probe only what this plan actually needs, once per capability: what its
     // nodes declare, and what the manifest cells its bucket nodes would run
@@ -10050,7 +10207,7 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
     }
     let mut absent: BTreeMap<validate_plan::HostCapability, String> = BTreeMap::new();
     for capability in needed {
-        let verdict = validate_plan::probe_host_capability(capability);
+        let verdict = probe(capability);
         // Print PRESENT verdicts too: a reader must be able to see that the
         // question was asked and how it was answered, not just its consequences.
         println!(
@@ -14507,6 +14664,292 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Two-sided bracket for the capability step a REAL run executes.
+///
+/// Every real run plans through `build_plan`, which returns a committed
+/// selection, so the run takes the committed branch of
+/// [`host_capability_step`] — not [`withhold_host_inapplicable`], whose cell
+/// accounting the bracket above drives directly. This bracket goes through
+/// `build_plan` and the step itself with planted probe verdicts.
+///
+/// VIOLATING: with KVM absent, every selection whose manifest bucket nodes run
+/// kvm cells is REFUSED (COULD_NOT_RUN, exit 75), naming the capability, the
+/// probe evidence and each node's exact cell counts, and the committed graph is
+/// left byte-identical. QUALIFYING: with every capability present the same
+/// plans pass the step unchanged, and kvm is still asked about. INERT: nodes
+/// that cannot run kvm cells (the hosted `--exclude-backend kvm` buckets and
+/// the diagnostic compat bucket) are not refused when KVM is absent.
+fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
+    use validate_plan::HostCapability;
+    const EVIDENCE: &str = "planted bracket verdict: /dev/kvm open failed with ENOENT";
+    let asked = std::cell::RefCell::new(BTreeSet::<HostCapability>::new());
+    let kvm_absent = |capability: HostCapability| {
+        asked.borrow_mut().insert(capability);
+        CapabilityVerdict {
+            present: capability != HostCapability::Kvm,
+            evidence: if capability == HostCapability::Kvm {
+                EVIDENCE.to_string()
+            } else {
+                "planted bracket verdict: present".to_string()
+            },
+        }
+    };
+    let all_present = |capability: HostCapability| {
+        asked.borrow_mut().insert(capability);
+        CapabilityVerdict {
+            present: true,
+            evidence: "planted bracket verdict: present".to_string(),
+        }
+    };
+    let plan_for = |argv: &[&str]| -> Result<Plan, String> {
+        let mut argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+        argv.push("--no-label-pr".into());
+        let args = parse_argv(&argv).map_err(|code| {
+            format!("committed cell capability: CLI refused {argv:?} with exit {code}")
+        })?;
+        let plan = build_plan(root, &args, &std::env::temp_dir())?;
+        if plan.committed_selection.is_none() {
+            return Err(format!(
+                "committed cell capability: {argv:?} did not plan a committed selection, so it \
+                 is not the branch a real run takes"
+            ));
+        }
+        Ok(plan)
+    };
+    // The committed graph is byte-compared at the scheduler boundary; the step
+    // must never edit it, refused or not.
+    let unchanged = |label: &str, plan: &Plan, before: &str| -> Result<(), String> {
+        if dag_to_json(&plan.cfg) != before
+            || plan.committed_selection.as_deref() != Some(before)
+            || !plan.host_inapplicable.is_empty()
+        {
+            return Err(format!(
+                "committed cell capability: {label}: the capability step changed the committed \
+                 selection or recorded host-inapplicable nodes {:?}",
+                plan.host_inapplicable
+            ));
+        }
+        require_committed_scheduler_input(plan)
+    };
+
+    // (tag, kvm cells, selected cells), measured from ci/expected-e2e-plan.json.
+    let portable: &[(&str, usize, usize)] = &[
+        ("e2e.manifest_applications", 1, 4),
+        ("e2e.manifest_c_programs", 195, 742),
+        ("e2e.manifest_data_handling", 1, 7),
+        ("e2e.manifest_debugger_c", 1, 4),
+        ("e2e.manifest_determinism_stress", 2, 8),
+        ("e2e.manifest_determinism_stress_c", 2, 14),
+        ("e2e.manifest_language_runtimes", 14, 33),
+        ("e2e.manifest_system_utils", 25, 74),
+    ];
+    let full_privileged: &[(&str, usize, usize)] = &[
+        ("privileged-e2e.manifest_applications", 1, 1),
+        ("privileged-e2e.manifest_c_programs", 1, 4),
+        ("privileged-e2e.manifest_system_utils", 1, 2),
+    ];
+    let privileged_only: &[(&str, usize, usize)] = &[
+        ("privileged-only-e2e.manifest_applications", 1, 1),
+        ("privileged-only-e2e.manifest_c_programs", 1, 4),
+        ("privileged-only-e2e.manifest_system_utils", 1, 2),
+    ];
+    let c_programs: &[(&str, usize, usize)] = &[("e2e.manifest_c_programs", 195, 742)];
+    // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
+    type RefusedCase<'a> = (
+        &'a str,
+        Vec<&'a str>,
+        Vec<&'a [(&'a str, usize, usize)]>,
+        Option<&'a str>,
+    );
+    let refused_cases: [RefusedCase<'_>; 5] = [
+        (
+            "portable profile",
+            vec!["portable-only"],
+            vec![portable],
+            None,
+        ),
+        (
+            "--only full e2e.manifest_c_programs",
+            vec!["--only", "full", "e2e.manifest_c_programs"],
+            vec![c_programs],
+            None,
+        ),
+        (
+            "--only portable e2e.manifest_c_programs",
+            vec!["--only", "portable", "e2e.manifest_c_programs"],
+            vec![c_programs],
+            None,
+        ),
+        (
+            "full profile",
+            vec!["full"],
+            vec![portable, full_privileged],
+            Some("privileged-test.cli_kvm"),
+        ),
+        (
+            "privileged profile",
+            vec!["--privileged-only"],
+            vec![privileged_only],
+            Some("privileged-only-test.cli_kvm"),
+        ),
+    ];
+    for (label, argv, rows, node_level) in refused_cases {
+        let expected: BTreeSet<(String, usize, usize)> = rows
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .map(|(tag, kvm, selected)| (tag.to_string(), *kvm, *selected))
+            .collect();
+
+        // The accounting the step consumes, exactly.
+        let plan = plan_for(&argv)?;
+        let needs = planned_cell_capability_needs(root, &plan)?;
+        let kvm_needs: BTreeSet<(String, usize, usize)> = needs
+            .iter()
+            .filter_map(|need| {
+                need.needing
+                    .get(&HostCapability::Kvm)
+                    .map(|kvm| (need.tag.clone(), *kvm, need.selected))
+            })
+            .collect();
+        if kvm_needs != expected {
+            return Err(format!(
+                "committed cell capability: {label}: kvm cell accounting must be exactly \
+                 {expected:?}; got {kvm_needs:?}"
+            ));
+        }
+
+        // QUALIFYING — every capability present: the step passes, changes
+        // nothing, and still asked about kvm.
+        let mut plan = plan_for(&argv)?;
+        let before = dag_to_json(&plan.cfg);
+        asked.borrow_mut().clear();
+        if let Err(refusal) = host_capability_step(root, &mut plan, label, &all_present) {
+            return Err(format!(
+                "committed cell capability: {label} with every capability present must not be \
+                 refused: {:?}",
+                refusal.detail
+            ));
+        }
+        unchanged(label, &plan, &before)?;
+        if !asked.borrow().contains(&HostCapability::Kvm) {
+            return Err(format!(
+                "committed cell capability: {label} runs kvm cells, so the step must probe kvm \
+                 even when every capability turns out present"
+            ));
+        }
+
+        // VIOLATING — KVM absent: refused, never PASSED, graph untouched.
+        let mut plan = plan_for(&argv)?;
+        let before = dag_to_json(&plan.cfg);
+        let refusal = match host_capability_step(root, &mut plan, label, &kvm_absent) {
+            Ok(()) => {
+                return Err(format!(
+                    "committed cell capability: {label} with KVM absent passed the capability \
+                     step, so the harness would withhold its kvm cells and the run could finish \
+                     PASSED without them"
+                ));
+            }
+            Err(refusal) => refusal,
+        };
+        unchanged(label, &plan, &before)?;
+        let detail = refusal.detail.join("\n");
+        if refusal.verdict != Verdict::Refused
+            || refusal.exit_code != COULD_NOT_RUN_EXIT_CODE
+            || final_validate_status(refusal.verdict) != Some(FinalValidateStatus::CouldNotRun)
+        {
+            return Err(format!(
+                "committed cell capability: {label} with KVM absent must be refused with exit \
+                 {COULD_NOT_RUN_EXIT_CODE} and COULD_NOT_RUN; got verdict={:?} exit={}",
+                refusal.verdict, refusal.exit_code
+            ));
+        }
+        let mut required: Vec<String> = vec![
+            "refused by: host-capability resolution".into(),
+            "requires unavailable host capability".into(),
+            "no nodes were removed".into(),
+            "kvm required by".into(),
+            EVIDENCE.into(),
+        ];
+        required.extend(expected.iter().map(|(tag, kvm, selected)| {
+            format!("{tag} ({kvm} of {selected} selected cell(s) of manifest bucket")
+        }));
+        required.extend(node_level.map(str::to_string));
+        let missing: Vec<&String> = required
+            .iter()
+            .filter(|needle| !detail.contains(needle.as_str()))
+            .collect();
+        if !missing.is_empty() || detail.contains("cpuid-faulting required by") {
+            return Err(format!(
+                "committed cell capability: {label} refusal must name kvm, its evidence and \
+                 every node's cell counts, and nothing that is present; missing {missing:?} in \
+                 {detail}"
+            ));
+        }
+    }
+
+    // INERT — selections whose bucket nodes cannot run kvm cells: KVM absence
+    // refuses nothing, and they carry no cell-level kvm need at all.
+    for (label, argv) in [
+        (
+            "hosted-portable profile",
+            vec![
+                "--hosted-portable-only",
+                ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+            ],
+        ),
+        (
+            "--only portable e2e.manifest_compat",
+            vec!["--only", "portable", "e2e.manifest_compat"],
+        ),
+        (
+            "--only portable e2e.manifest_bin_c",
+            vec!["--only", "portable", "e2e.manifest_bin_c"],
+        ),
+    ] {
+        let mut plan = plan_for(&argv)?;
+        if !planned_cell_capability_needs(root, &plan)?.is_empty() {
+            return Err(format!(
+                "committed cell capability: {label} plans no node that can run a \
+                 capability-gated cell, so it must carry no cell-level need"
+            ));
+        }
+        let before = dag_to_json(&plan.cfg);
+        if let Err(refusal) = host_capability_step(root, &mut plan, label, &kvm_absent) {
+            return Err(format!(
+                "committed cell capability: {label} cannot run kvm cells and must not be \
+                 refused when KVM is absent: {:?}",
+                refusal.detail
+            ));
+        }
+        unchanged(label, &plan, &before)?;
+    }
+
+    // An unreadable required plan cannot account for cells, so a planned
+    // bucket node refuses rather than letting the probe go unasked.
+    let plan = plan_for(&["--only", "full", "e2e.manifest_c_programs"])?;
+    let empty_root = std::env::temp_dir().join(format!(
+        "validate-committed-cell-capability-{}",
+        std::process::id()
+    ));
+    let unreadable = planned_cell_capability_needs(&empty_root, &plan)
+        .err()
+        .ok_or("committed cell capability: an unreadable required plan was accounted as no need")?;
+    if !unreadable.contains("e2e.manifest_c_programs") {
+        return Err(format!(
+            "committed cell capability: unreadable-plan refusal must name the bucket node: \
+             {unreadable}"
+        ));
+    }
+
+    println!(
+        "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 241 \
+         kvm cells, --only full and --only portable c-programs 195 of 742, full 11 nodes, \
+         privileged 3 nodes) with the graph unchanged; every capability present admits all 5 \
+         unchanged; 3 kvm-free selections admitted with KVM absent; unreadable plan refused"
+    );
+    Ok(())
+}
+
 /// Two-sided bracket for the host-capability withholding decision.
 ///
 /// Inert: it plants capability verdicts instead of probing, so it exercises the
@@ -14687,6 +15130,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
 
     node_vacuity_bracket(root)?;
     host_inapplicable_cells_bracket(root)?;
+    committed_cell_capability_bracket(root)?;
 
     // The one override can only force PRESENT; nothing forces ABSENT.
     let verdict = validate_plan::probe_host_capability(HostCapability::CpuidFaulting);
@@ -24764,24 +25208,13 @@ fn run(
     // A node this machine provably cannot run is withheld here, BEFORE anything
     // spawns, and recorded as host-inapplicable. Nothing a node DOES can reach
     // this decision, so a node that is merely broken still runs and still fails.
-    let capability_result = if plan.committed_selection.is_some() {
-        require_host_capabilities(&root, &plan)
-    } else {
-        withhold_host_inapplicable(&root, &mut plan)
-    };
-    if let Err(e) = capability_result {
-        eprintln!("validate: cannot resolve host-capability requirements: {e}");
-        return RunSummary::refused(
-            2,
-            &level_name,
-            "host-capability resolution",
-            vec![
-                e,
-                "no node was omitted and no substitute profile was run: an unevaluable capability \
-                 declaration is refused, never treated as a reason to skip work"
-                    .into(),
-            ],
-        );
+    if let Err(refusal) = host_capability_step(
+        &root,
+        &mut plan,
+        &level_name,
+        &validate_plan::probe_host_capability,
+    ) {
+        return *refusal;
     }
 
     // Per-gate budget overrides, preserved from validate.sh
