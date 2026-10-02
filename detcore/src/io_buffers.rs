@@ -624,6 +624,7 @@ where
 #[cfg(test)]
 mod event_tests {
     include!("io_buffers/user_access_event_tests.rs");
+    include!("io_buffers/time_callback_tests.rs");
     use std::io::IoSlice;
     use std::io::IoSliceMut;
     use std::sync::Arc;
@@ -840,6 +841,8 @@ mod event_tests {
         polls: Mutex<Vec<u32>>,
         releases: Mutex<usize>,
         retry_gate: Mutex<Option<RetryGate>>,
+        clock_result: Option<crate::types::LogicalTime>,
+        clock_observations: Mutex<usize>,
     }
 
     impl EventGuest {
@@ -893,6 +896,12 @@ mod event_tests {
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
             let response = match message.2 {
+                GlobalRequest::GlobalTimeLowerBound => {
+                    let time = self.clock_result
+                        .expect("only the explicit time callback fixture may request a clock");
+                    *self.clock_observations.lock().unwrap() += 1;
+                    GlobalResponse::GlobalTimeLowerBound(time)
+                }
                 GlobalRequest::RequestResources(request, _) => {
                     assert_eq!(request.resources.len(), 1);
                     assert_eq!(
@@ -1105,6 +1114,8 @@ mod event_tests {
             polls: Mutex::new(Vec::new()),
             releases: Mutex::new(0),
             retry_gate: Mutex::new(retry_gate),
+            clock_result: None,
+            clock_observations: Mutex::new(0),
         };
         (tool, guest)
     }

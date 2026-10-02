@@ -2234,8 +2234,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The authenticated initial census activates only this intercepted
         // original-operation set. No unjoined FD creator/alias/table mutation
         // may enter Linux and later be guessed from the resulting numeric FD.
+        // time is admitted only to its logical-clock handler, not the ordinary
+        // unsupported-syscall/native fallback when virtualization is disabled.
         if self.network_fd_tracking_active(guest)
-            && !crate::network_replay::initial_record_call_supported(call)
+            && (!crate::network_replay::initial_record_call_supported(call)
+                || (call.number() == Sysno::time && !guest.config().virtualize_time))
         {
             return Err(Error::Tool(anyhow::anyhow!(
                 "authenticated Record route has no original effect join for {}",

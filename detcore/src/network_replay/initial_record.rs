@@ -82,6 +82,12 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 | Sysno::getpid | Sysno::gettid | Sysno::getppid
                 | Sysno::getuid | Sysno::geteuid | Sysno::getgid | Sysno::getegid
                 | Sysno::getrandom | Sysno::clock_gettime | Sysno::gettimeofday
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-3464): time uses the existing logical
+                // clock and tloc copy, never a native time result. The Tool
+                // entry gate still refuses it when time virtualization is off.
+                // https://github.com/rrnewton/hermit/pull/3464
+                | Sysno::time
                 | Sysno::uname | Sysno::sched_getaffinity | Sysno::prlimit64
                 // Alarm is virtualized by the deterministic scheduler and has
                 // no native descriptor or network-provider side effect.
