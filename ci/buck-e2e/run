@@ -1,0 +1,72 @@
+#!/bin/bash
+# Run every e2e manifest cell as a Tpx test under Buck and write the e2e result files
+# (one results.jsonl + summary.json per bucket) that the cargo flow's e2e nodes write.
+#
+# usage: ci/buck-e2e/run --mode hybrid|local --out E2E_RESULT_ROOT --work DIR
+#            [--buck2 PATH] [-- EXTRA_BUCK2_TEST_ARGS...]
+#
+#   hybrid  RE-routed cells run on Meta RE and the rest locally (see defs.bzl). The two
+#           groups run as two concurrent `buck2 test` invocations: Buck stores RE test
+#           results for test-execution caching only from invocations whose tests are
+#           all remote, so an unchanged cell is answered from the cache next time.
+#   local   every cell runs locally (-c hermit_e2e.routing=local), one invocation.
+#
+# The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage). Tpx
+# retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
+# ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
+# every `buck2 test` before the `--` (e.g. @shim/modes/hybrid, -c hermit_release.*).
+# Each invocation's event log and test-run id are kept in --work.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+mode= out= work= buck2=${BUCK2:-buck2}
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --mode) mode=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        --work) work=$2; shift 2 ;;
+        --buck2) buck2=$2; shift 2 ;;
+        --) shift; break ;;
+        *) echo "ci/buck-e2e/run: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+[[ $mode == hybrid || $mode == local ]] || { echo "ci/buck-e2e/run: --mode hybrid|local is required" >&2; exit 2; }
+[[ -n $out && -n $work ]] || { echo "ci/buck-e2e/run: --out and --work are required" >&2; exit 2; }
+[[ -d $here/staged ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
+mkdir -p "$out" "$work"
+extra=("$@")
+tpx=(-- --retry 1 --no-retry-on-skip)
+
+invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
+    local name=$1 target=$2
+    shift 2
+    set +e
+    env -C "$root" "$buck2" test "${extra[@]}" "$@" \
+        --event-log "$work/$name.event-log.pb.zst" --write-test-id "$work/$name.test_id" \
+        "$target" "${tpx[@]}" >"$work/$name.log" 2>&1
+    echo $? >"$work/$name.rc"
+    set -e
+}
+
+if [[ $mode == hybrid ]]; then
+    invoke re //ci/buck-e2e:re &
+    invoke local //ci/buck-e2e:local &
+    wait
+    runs=(re local)
+else
+    invoke all //ci/buck-e2e:all -c hermit_e2e.routing=local
+    runs=(all)
+fi
+
+ids=()
+for r in "${runs[@]}"; do
+    # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
+    rc=$(cat "$work/$r.rc")
+    if [[ ! -s $work/$r.test_id ]] || { [[ $rc != 0 && $rc != 32 ]]; }; then
+        echo "ci/buck-e2e/run: buck2 test ($r) failed with exit $rc; see $work/$r.log" >&2
+        tail -20 "$work/$r.log" >&2
+        exit 1
+    fi
+    ids+=("$(cat "$work/$r.test_id")")
+done
+python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" "${ids[@]}"
