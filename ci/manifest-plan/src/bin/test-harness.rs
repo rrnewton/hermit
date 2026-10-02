@@ -18,6 +18,8 @@ use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
+use hermit_manifest_plan::imported_results;
+use hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV;
 use hermit_manifest_plan::parity;
 use hermit_manifest_plan::parity::ParityCellId;
 use hermit_manifest_plan::runner::CellId;
@@ -139,7 +141,10 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
 /// Read by `run` only: the parity post-pass after the determinism cells.
 const RUN_ENVIRONMENT: &str =
     "  E2E_PARITY_SELECT=<TEST@BACKEND,...>   Also measure these parity cells after the run
-  E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)";
+  E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)
+  E2E_IMPORT_RESULTS=<ROOT>              Run no cell: publish the rows another run left in
+                                         ROOT/<lane>/manifest_<category>/; a selected cell
+                                         with no row is an ERROR";
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
@@ -2665,13 +2670,23 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         fail(error);
     }
     let capacity = scheduled_worker_capacity(args);
+    let import_root = std::env::var_os(IMPORT_RESULTS_ENV).map(PathBuf::from);
     let planned_verify = planned_verify(&cells);
-    let parity_scope = parity_scope(root, manifests, &planned_verify);
-    let context = RunContext::from_env(
-        root.to_path_buf(),
-        args.prebuilt,
-        args.source_sha.as_deref(),
-    )
+    // An imported run has no verify logs of its own to compare.
+    let parity_scope = if import_root.is_some() {
+        BTreeSet::new()
+    } else {
+        parity_scope(root, manifests, &planned_verify)
+    };
+    let context = if import_root.is_some() {
+        RunContext::for_import(root.to_path_buf(), args.source_sha.as_deref())
+    } else {
+        RunContext::from_env(
+            root.to_path_buf(),
+            args.prebuilt,
+            args.source_sha.as_deref(),
+        )
+    }
     .unwrap_or_else(|e| fail(e))
     .with_scheduled_worker_capacity(capacity)
     .with_parity_retained(parity::retention_closure(&parity_scope, &planned_verify));
@@ -2700,6 +2715,18 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         ))
     });
     mark_parity_running(&parity_scope, &context, &results_path);
+    let imported = import_root.as_deref().map(|import_root| {
+        let imported = imported_results::load(import_root, &cells, &context, &results_path)
+            .unwrap_or_else(|error| fail(format!("{IMPORT_RESULTS_ENV}: {error}")));
+        eprintln!(
+            "test-harness: importing {} selected cell(s) from {} (rows of {} run(s)); {} have no result",
+            cells.len(),
+            import_root.display(),
+            imported.source_run_ids.len(),
+            imported.missing
+        );
+        imported
+    });
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
@@ -2714,6 +2741,15 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         capacity,
         |index, emit| {
             let cell = &cells[index];
+            if let Some(imported) = &imported {
+                let rows = &imported.cells[index].rows;
+                for (position, row) in rows.iter().enumerate() {
+                    if !emit(row.clone(), position + 1 < rows.len()) {
+                        break;
+                    }
+                }
+                return;
+            }
             if let Some((_, reason)) = host_inapplicable_reason(
                 &cell.test.requires,
                 cell.id.backend.as_deref(),
@@ -2933,7 +2969,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     }
     failed |= !run_failures.is_empty();
     write_junit(&junit, &results).unwrap();
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "schema": 1,
         "cells": results.len(),
         "passed": results.iter().filter(|result| result.outcome == "PASS").count(),
@@ -2956,6 +2992,13 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             }))
             .collect::<Vec<_>>(),
     });
+    if let (Some(import_root), Some(imported)) = (&import_root, &imported) {
+        summary["imported"] = serde_json::json!({
+            "root": import_root,
+            "source_run_ids": imported.source_run_ids,
+            "missing_cells": imported.missing,
+        });
+    }
     fs::write(
         results_path.parent().unwrap().join("summary.json"),
         serde_json::to_vec_pretty(&summary).unwrap(),
@@ -3702,6 +3745,243 @@ report.write_bytes((root/'verification.json').read_bytes())
                     .all(|call| call["kind"] != "normalize" && call["kind"] != "compare"),
                 "{scenario}: E2E_KEEP_VERIFY_LOGS launched a log-diff: {calls:#?}"
             );
+        }
+    }
+
+    /// `E2E_IMPORT_RESULTS` executes no cell: it re-publishes the rows a Buck
+    /// run left under `<root>/<lane>/manifest_<category>/`. A complete import
+    /// passes with every attempt rebound to this run; a selected cell with no
+    /// imported row, or with rows of another commit, becomes an ERROR row and
+    /// fails the run. That ERROR row is the executed-equals-plan gate of an
+    /// imported run.
+    #[test]
+    fn import_mode_republishes_rows_and_a_missing_cell_is_an_error() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::ObservedResult;
+        use hermit_manifest_plan::runner::RunContext;
+        use hermit_manifest_plan::runner::infrastructure_error_result;
+        use serde_json::json;
+
+        const CHILD: &str = "HERMIT_IMPORT_MODE_FIXTURE";
+        const TEST: &str = "tests::import_mode_republishes_rows_and_a_missing_cell_is_an_error";
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const STALE: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            let fixture = PathBuf::from(fixture);
+            let values = vec![
+                "--category".into(),
+                "imported".into(),
+                "--ci-only".into(),
+                "--prebuilt".into(),
+                "--repo-root".into(),
+                root.display().to_string(),
+                "--source-sha".into(),
+                SHA.into(),
+                "--results".into(),
+                fixture.join("out/results.jsonl").display().to_string(),
+                "--junit".into(),
+                fixture.join("out/junit.xml").display().to_string(),
+            ];
+            let args = parse(values.into_iter());
+            validate_args("run", &args);
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let code = super::run(&root, &manifests, &args);
+            std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+        }
+
+        for scenario in ["complete", "missing", "stale"] {
+            let fixture = std::env::temp_dir().join(format!(
+                "hermit-harness-import-{}-{:?}-{scenario}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir(&fixture).unwrap();
+            let path = fixture.as_path();
+            let manifests_dir = path.join("tests/e2e/manifests");
+            fs::create_dir_all(&manifests_dir).unwrap();
+            fs::write(
+                manifests_dir.join("defaults.yaml"),
+                "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+            )
+            .unwrap();
+            let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+                "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+                "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+                "liteinst": "Not selected by this control"
+            }});
+            fs::write(manifests_dir.join("imported.yaml"), serde_json::to_vec(&json!({
+                "schema": 3, "bucket": "imported", "test": [{
+                    "id": "imported/control", "description": "Import mode control",
+                    "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                    "observation": {"status": true, "stdout": true, "stderr": true},
+                    "modes": {
+                        "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
+                            "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                        "naked": {"ci": false, "backends_enabled": [],
+                            "backends_disabled": {"native": "Not selected by this CI control"}},
+                        "chaos": disabled, "replay": disabled,
+                        "custom": {"ci": true, "backends_enabled": ["kvm"],
+                            "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                            "assert": {"runs": 1}}
+                    }
+                }]
+            })).unwrap()).unwrap();
+
+            // The rows a Buck run would have left: each cell ran in its own
+            // harness process with its own run id; custom@kvm failed its first
+            // execution and passed its Tpx retry.
+            let manifests = ManifestSet::load(path).unwrap();
+            let selection = parse(
+                ["--category", "imported", "--ci-only"]
+                    .into_iter()
+                    .map(String::from),
+            );
+            let cells = run_cells(&manifests, &selection).unwrap();
+            assert_eq!(cells.len(), 3, "verify@ptrace, verify@kvm, custom@kvm");
+            let producer = RunContext::for_import(root.clone(), Some(SHA)).unwrap();
+            let mut rows = Vec::new();
+            for (index, cell) in cells.iter().enumerate() {
+                if scenario == "missing"
+                    && cell.id.mode == "verify"
+                    && cell.id.backend.as_deref() == Some("kvm")
+                {
+                    continue;
+                }
+                let attempts: &[&str] = if cell.id.mode == "custom" {
+                    &["FAIL", "PASS"]
+                } else {
+                    &["PASS"]
+                };
+                for (number, outcome) in attempts.iter().enumerate() {
+                    let mut context = producer.with_attempt(number as u64 + 1);
+                    context.run_id = format!("buck-producer-{index}-{number}");
+                    if scenario == "stale" && cell.id.backend.as_deref() == Some("ptrace") {
+                        context.source_sha = STALE.into();
+                    }
+                    let mut row = infrastructure_error_result(&context, cell, String::new());
+                    row.outcome = (*outcome).into();
+                    row.error_kind = None;
+                    row.reason = None;
+                    if *outcome == "PASS" {
+                        row.result = Some(ObservedResult::Pass);
+                        row.failure_class = None;
+                    } else {
+                        row.result = Some(ObservedResult::DeterminismFailure);
+                        row.failure_class = Some(FailureClass::ProductFailure);
+                    }
+                    row.require_current_classification().unwrap();
+                    row.require_cpu_observations().unwrap();
+                    rows.push(serde_json::to_string(&row).unwrap());
+                }
+            }
+            let import = path.join("import");
+            let bucket = bucket_dir(&import, "portable", "imported");
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+
+            let result = Command::new("timeout")
+                .args(["--kill-after=2s", "30s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD, path)
+                .env("E2E_IMPORT_RESULTS", &import)
+                .env("HERMIT_BIN", path.join("no-hermit-is-launched"))
+                .env("E2E_RESULT_ROOT", path.join("artifacts"))
+                .env("E2E_BUILD_ROOT", path.join("build"))
+                .env("E2E_RUN_ID", "import-consumer")
+                .env("E2E_MACHINE_SHORTNAME", "import-control")
+                .env("E2E_KERNEL_VERSION", "import-control")
+                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
+                .output()
+                .unwrap();
+            let context = format!(
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                result.status.code(),
+                Some(if scenario == "complete" { 0 } else { 1 }),
+                "{context}"
+            );
+            let published = fs::read_to_string(path.join("out/results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+                .collect::<Vec<_>>();
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("out/summary.json")).unwrap()).unwrap();
+            assert_eq!(summary["cells"], 3, "{context}");
+            for row in &published {
+                assert_eq!(row.run_id, "import-consumer", "{context}");
+                row.require_cpu_observations().unwrap();
+            }
+            let errors = published
+                .iter()
+                .filter(|row| row.outcome == "ERROR")
+                .map(|row| {
+                    (
+                        row.mode.as_str(),
+                        row.backend.as_deref(),
+                        row.error_kind.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            match scenario {
+                "complete" => {
+                    // Both custom@kvm attempts are published, in order.
+                    assert_eq!(published.len(), 4, "{context}");
+                    assert_eq!(
+                        published
+                            .iter()
+                            .filter(|row| row.mode == "custom")
+                            .map(|row| (row.attempt, row.outcome.as_str()))
+                            .collect::<Vec<_>>(),
+                        vec![(1, "FAIL"), (2, "PASS")],
+                        "{context}"
+                    );
+                    assert!(errors.is_empty(), "{context}");
+                    assert_eq!(summary["passed"], 3, "{context}");
+                    assert_eq!(summary["imported"]["missing_cells"], 0, "{context}");
+                    assert_eq!(
+                        summary["imported"]["source_run_ids"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        4,
+                        "{context}"
+                    );
+                }
+                "missing" => {
+                    assert_eq!(
+                        errors,
+                        vec![("verify", Some("kvm"), Some("import-missing"))],
+                        "{context}"
+                    );
+                    assert_eq!(summary["errors"], 1, "{context}");
+                    assert_eq!(summary["imported"]["missing_cells"], 1, "{context}");
+                }
+                "stale" => {
+                    assert_eq!(
+                        errors,
+                        vec![("verify", Some("ptrace"), Some("import-stale"))],
+                        "{context}"
+                    );
+                    assert_eq!(summary["errors"], 1, "{context}");
+                }
+                _ => unreachable!(),
+            }
+            fs::remove_dir_all(path).unwrap();
         }
     }
 
