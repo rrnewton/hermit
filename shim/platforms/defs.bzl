@@ -7,6 +7,7 @@ as an input directory. Selected by config; the default build is unchanged (local
 system rustc). See shim/modes/.
 """
 
+load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxPlatformInfo", "CxxToolchainInfo", "LinkerInfo")
 load("@prelude//rust:rust_toolchain.bzl", "PanicRuntime", "RustToolchainInfo")
 
 def _rust_toolchain_impl(ctx):
@@ -80,4 +81,31 @@ hermit_execution_platforms = rule(
         "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "use_case": attrs.string(),
     },
+)
+
+def _remote_linking_cxx_toolchain_impl(ctx):
+    """The base cxx toolchain, except that links and archives may run remotely.
+
+    prelude//toolchains:cxx.bzl's system_cxx_toolchain hard-codes
+    link_binaries_locally / link_libraries_locally / archive_objects_locally = True, so
+    under a remote execution platform every link (hermit itself, every build script)
+    ran locally, which downloads every rlib (1.8 GB per checkout for hermit)."""
+    base = ctx.attrs.base
+    cxx = base[CxxToolchainInfo]
+    overrides = {
+        "archive_objects_locally": False,
+        "link_binaries_locally": False,
+        "link_libraries_locally": False,
+    }
+    linker = cxx.linker_info
+    linker_info = LinkerInfo(**{f: overrides.get(f, getattr(linker, f)) for f in dir(linker)})
+    toolchain = CxxToolchainInfo(**{f: linker_info if f == "linker_info" else getattr(cxx, f) for f in dir(cxx)})
+    return [DefaultInfo(), toolchain, base[CxxPlatformInfo]]
+
+remote_linking_cxx_toolchain = rule(
+    impl = _remote_linking_cxx_toolchain_impl,
+    attrs = {
+        "base": attrs.toolchain_dep(providers = [CxxToolchainInfo, CxxPlatformInfo]),
+    },
+    is_toolchain_rule = True,
 )
