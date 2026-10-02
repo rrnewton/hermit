@@ -456,7 +456,13 @@ fi
 # fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-expected_pin=835eda06b501a66c47fd90d596b23cc1ea4ebade
+# CARRY TO 489e53e117c573f2e1c160a29d0e2adba528a2fc (2026-10-02): its
+# sole parent is835eda06; only Guest scalar-recvfrom inspection and ptrace
+# original-context code/tests change. The complete reverie-dbt tree, build.rs,
+# vendored DynamoRIO and third-party trees above remain byte-identical.
+# Compiler/generator selection and both measured limits are unchanged.
+# This is source-identity carry, not a new timing or backend qualification.
+expected_pin=489e53e117c573f2e1c160a29d0e2adba528a2fc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

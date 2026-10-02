@@ -503,8 +503,14 @@ fi
 # fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 835eda06b501a66c47fd90d596b23cc1ea4ebade ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 835eda06b501a66c47fd90d596b23cc1ea4ebade (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 489e53e117c573f2e1c160a29d0e2adba528a2fc (2026-10-02): its
+# sole parent is835eda06; only Guest scalar-recvfrom inspection and ptrace
+# original-context code/tests change. The complete reverie-dbt tree, build.rs,
+# vendored DynamoRIO and third-party trees above remain byte-identical.
+# Compiler/generator selection and both measured limits are unchanged.
+# This is source-identity carry, not a new timing or backend qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 489e53e117c573f2e1c160a29d0e2adba528a2fc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 489e53e117c573f2e1c160a29d0e2adba528a2fc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
