@@ -47,3 +47,4 @@ buck-out/
 /shim/third-party/rust/vendor/
 /shim/rust-sysroot/
 /.buck2
+/ci/buck-e2e/staged/

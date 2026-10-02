@@ -1,0 +1,41 @@
+# Hermit e2e manifest cells as Buck tests (one per cell of ci/expected-e2e-plan.json),
+# routed locally or to Meta RE and run by Tpx. See defs.bzl and README.md.
+load("//ci:expected-e2e-plan.json", _PLAN = "value")
+load(":defs.bzl", "hermit_e2e_bundle", "hermit_e2e_cells")
+load(":re_exclusions.json", _RE_EXCLUSIONS = "value")
+
+oncall("hermit")
+
+# Inputs not yet built by Buck are staged into staged/ (gitignored) by ./stage from a
+# cargo-built harness bundle: test-harness binaries, `test-harness build` fixtures, the
+# source snapshot cells read, compat run-state, and the backend install bundle.
+[
+    export_file(
+        name = "staged-" + part,
+        src = "staged/" + part,
+    )
+    for part in ["bin", "build", "hermit", "install", "run-state", "src", "SOURCE_SHA"]
+]
+
+# -c hermit_e2e.hermit=staged runs the cells with the staged (cargo-built) hermit instead
+# of //hermit-cli:hermit, e.g. to compare against a cargo validate profile build.
+_HERMIT = {
+    "buck": "//hermit-cli:hermit",
+    "staged": ":staged-hermit",
+}[read_root_config("hermit_e2e", "hermit", "buck")]
+
+hermit_e2e_bundle(
+    name = "bundle",
+    fixtures = ":staged-build",
+    harness_bin = ":staged-bin",
+    hermit = _HERMIT,
+    install = ":staged-install",
+    run_state = ":staged-run-state",
+    source_sha = ":staged-SOURCE_SHA",
+    src = ":staged-src",
+)
+
+hermit_e2e_cells(
+    plan = _PLAN,
+    re_exclusions = _RE_EXCLUSIONS,
+)
