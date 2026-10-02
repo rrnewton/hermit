@@ -766,6 +766,7 @@ fn populations_bracket() -> Result<(), String> {
         tag: "host.kvm".into(),
         capability: validate_plan::HostCapability::Kvm,
         evidence: "fixture host lacks /dev/kvm".into(),
+        cells: None,
     };
     let host_plan = BTreeSet::from([host.tag.clone()]);
     let unavailable = classify_run(&[], &[], &[], &host_plan, &[host]);
@@ -776,6 +777,48 @@ fn populations_bracket() -> Result<(), String> {
         return Err(
             "classification: host-inapplicable selection was lost or promoted to completion".into(),
         );
+    }
+    // A bucket node that RAN and passed while the harness withheld some of its
+    // cells keeps its product result, but the withheld cells still make the run
+    // incomplete; without the record the same PASS would read as full coverage.
+    let ran = fixture_outcome("e2e.cells", 0);
+    let ran_attempts = [reported_attempt(&ran, 1)];
+    let ran_plan = BTreeSet::from([ran.tag.clone()]);
+    let clean = classify_run(
+        std::slice::from_ref(&ran),
+        &ran_attempts,
+        &[],
+        &ran_plan,
+        &[],
+    );
+    if clean.no_results() != 0 || !validation_is_complete(true, &clean, &ran_plan) {
+        return Err("classification: a passing node with every cell run must be complete".into());
+    }
+    let partly = validate_plan::HostInapplicableNode {
+        tag: ran.tag.clone(),
+        capability: validate_plan::HostCapability::Kvm,
+        evidence: "fixture: 1 of 3 cells withheld".into(),
+        cells: Some(validate_plan::WithheldCells {
+            withheld: 1,
+            selected: 3,
+        }),
+    };
+    let withheld = classify_run(
+        std::slice::from_ref(&ran),
+        &ran_attempts,
+        &[],
+        &ran_plan,
+        &[partly],
+    );
+    if withheld.product_result_nodes != ran_plan
+        || withheld.understood_prerequisite_failure_nodes != ran_plan
+        || withheld.no_results() != 1
+        || validation_is_complete(true, &withheld, &ran_plan)
+    {
+        return Err(format!(
+            "classification: a node run with host-inapplicable cells withheld was promoted to \
+             completion: {withheld:?}"
+        ));
     }
     // Missing super repetitions keep the committed denominator and never become
     // measured failures. Both raw and classified rates agree for complete input.

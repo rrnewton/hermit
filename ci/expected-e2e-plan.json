@@ -6371,6 +6371,9 @@
         "ptrace",
         "python3"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/example-python-random",
       "timeout_seconds": 57
     },
@@ -6422,6 +6425,9 @@
         "ptrace",
         "hexdump"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/example-devrand",
       "timeout_seconds": 57
     },
@@ -6471,6 +6477,9 @@
         "x86_64",
         "kvm"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "applications/kvm-shell-environment",
       "timeout_seconds": 57
     },
@@ -6487,6 +6496,9 @@
         "userns",
         "ptrace",
         "python3"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "applications/timed-progress-bar",
       "timeout_seconds": 80
@@ -6505,6 +6517,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/acct-refusal-probe",
       "timeout_seconds": 57
     },
@@ -6521,6 +6536,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/add-key-enosys",
       "timeout_seconds": 57
@@ -6539,6 +6557,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/adjtimex-deterministic",
       "timeout_seconds": 57
     },
@@ -6555,6 +6576,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/arch-prctl-determinism",
       "timeout_seconds": 57
@@ -6573,6 +6597,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/bpf-enosys",
       "timeout_seconds": 57
     },
@@ -6589,6 +6616,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/cachestat-enosys",
       "timeout_seconds": 57
@@ -6607,6 +6637,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/clock-adjtime-deterministic",
       "timeout_seconds": 57
     },
@@ -6623,6 +6656,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/copy-file-range-refusal-probe",
       "timeout_seconds": 57
@@ -6641,6 +6677,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/dbt-exec-failure",
       "timeout_seconds": 57
     },
@@ -6657,6 +6696,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/dbt-execveat-unsupported",
       "timeout_seconds": 57
@@ -6675,6 +6717,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/dbt-mmap-exec",
       "timeout_seconds": 57
     },
@@ -6691,6 +6736,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/dbt-prlimit-self",
       "timeout_seconds": 57
@@ -6709,6 +6757,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/futex-requeue-enosys",
       "timeout_seconds": 57
     },
@@ -6725,6 +6776,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/futex-waitv-enosys",
       "timeout_seconds": 57
@@ -6743,6 +6797,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/futex-wake-enosys",
       "timeout_seconds": 57
     },
@@ -6759,6 +6816,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/get-robust-list-self",
       "timeout_seconds": 57
@@ -6777,6 +6837,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/getcpu",
       "timeout_seconds": 57
     },
@@ -6793,6 +6856,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/getitimer-determinism-probe",
       "timeout_seconds": 57
@@ -6811,6 +6877,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/getsockopt-null",
       "timeout_seconds": 57
     },
@@ -6827,6 +6896,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/hello-nostdlib",
       "timeout_seconds": 57
@@ -6845,6 +6917,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/io-uring-fallback",
       "timeout_seconds": 57
     },
@@ -6861,6 +6936,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/io-uring-ring-determinism",
       "timeout_seconds": 57
@@ -6879,6 +6957,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/ioctl-fioclex",
       "timeout_seconds": 57
     },
@@ -6895,6 +6976,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/ioctl-siocethtool",
       "timeout_seconds": 57
@@ -6913,6 +6997,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/kcmp-eperm",
       "timeout_seconds": 57
     },
@@ -6929,6 +7016,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/keyctl-enosys",
       "timeout_seconds": 57
@@ -6947,6 +7037,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/keyctl-passthrough",
       "timeout_seconds": 57
     },
@@ -6963,6 +7056,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/listmount-enosys",
       "timeout_seconds": 57
@@ -6981,6 +7077,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/lsm-get-self-attr-enosys",
       "timeout_seconds": 57
     },
@@ -6997,6 +7096,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/lsm-list-modules-enosys",
       "timeout_seconds": 57
@@ -7015,6 +7117,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/lsm-set-self-attr-enosys",
       "timeout_seconds": 57
     },
@@ -7031,6 +7136,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/map-shadow-stack-enosys",
       "timeout_seconds": 57
@@ -7049,6 +7157,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/memfd-secret-enosys",
       "timeout_seconds": 57
     },
@@ -7065,6 +7176,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/meminfo-available-deterministic",
       "timeout_seconds": 57
@@ -7083,6 +7197,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/meminfo-cached-deterministic",
       "timeout_seconds": 57
     },
@@ -7099,6 +7216,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/meminfo-free-deterministic",
       "timeout_seconds": 57
@@ -7117,6 +7237,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/memorypress",
       "timeout_seconds": 57
     },
@@ -7133,6 +7256,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/mmap-stress-determinism",
       "timeout_seconds": 57
@@ -7151,6 +7277,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/name-to-handle-at-eopnotsupp",
       "timeout_seconds": 57
     },
@@ -7167,6 +7296,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/name-to-handle-directory-eopnotsupp",
       "timeout_seconds": 57
@@ -7185,6 +7317,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/name-to-handle-empty-path-eopnotsupp",
       "timeout_seconds": 57
     },
@@ -7201,6 +7336,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/name-to-handle-regular-eopnotsupp",
       "timeout_seconds": 57
@@ -7219,6 +7357,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/nanosleep-par",
       "timeout_seconds": 57
     },
@@ -7235,6 +7376,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/netns-cookie-tcp4",
       "timeout_seconds": 57
@@ -7253,6 +7397,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/netns-cookie-tcp6",
       "timeout_seconds": 57
     },
@@ -7269,6 +7416,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/netns-cookie-udp4",
       "timeout_seconds": 57
@@ -7287,6 +7437,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/perf-event-hardware-enosys",
       "timeout_seconds": 57
     },
@@ -7303,6 +7456,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/perf-event-open-enosys",
       "timeout_seconds": 57
@@ -7321,6 +7477,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/perf-event-software-enosys",
       "timeout_seconds": 57
     },
@@ -7337,6 +7496,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/perf-event-watchpoint-enosys",
       "timeout_seconds": 57
@@ -7355,6 +7517,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/pidfd-open-self",
       "timeout_seconds": 57
     },
@@ -7371,6 +7536,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/pidfd-poll-self",
       "timeout_seconds": 57
@@ -7389,6 +7557,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/pipe2-errno-precedence",
       "timeout_seconds": 57
     },
@@ -7405,6 +7576,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/ppoll-readv",
       "timeout_seconds": 57
@@ -7423,6 +7597,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/prctl-dumpable",
       "timeout_seconds": 57
     },
@@ -7439,6 +7616,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/prctl-option-policy",
       "timeout_seconds": 57
@@ -7457,6 +7637,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/pread64-nostdlib",
       "timeout_seconds": 57
     },
@@ -7473,6 +7656,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/print-memaddrs",
       "timeout_seconds": 57
@@ -7491,6 +7677,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/proc-locks",
       "timeout_seconds": 57
     },
@@ -7507,6 +7696,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/process-mrelease-enosys",
       "timeout_seconds": 57
@@ -7525,6 +7717,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/process-vm-readv-refusal-probe",
       "timeout_seconds": 57
     },
@@ -7541,6 +7736,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/process-vm-writev-refusal-probe",
       "timeout_seconds": 57
@@ -7559,6 +7757,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/procfs-positioned-probe",
       "timeout_seconds": 57
     },
@@ -7575,6 +7776,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/ptrace-attach-eperm",
       "timeout_seconds": 57
@@ -7593,6 +7797,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/ptrace-eperm",
       "timeout_seconds": 57
     },
@@ -7609,6 +7816,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/ptrace-traceme-eperm",
       "timeout_seconds": 57
@@ -7627,6 +7837,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/racewrite-nostdlib",
       "timeout_seconds": 57
     },
@@ -7643,6 +7856,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/rcx-canonicalization",
       "timeout_seconds": 57
@@ -7661,6 +7877,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/record-replay-fd-close",
       "timeout_seconds": 57
     },
@@ -7677,6 +7896,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/record-replay-setsockopt",
       "timeout_seconds": 57
@@ -7695,6 +7917,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/recvmsg-scm-rights-mmap",
       "timeout_seconds": 57
     },
@@ -7711,6 +7936,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/remap-file-pages-anonymous-enosys",
       "timeout_seconds": 57
@@ -7729,6 +7957,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/remap-file-pages-memfd-enosys",
       "timeout_seconds": 57
     },
@@ -7745,6 +7976,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/remap-file-pages-tmpfile-enosys",
       "timeout_seconds": 57
@@ -7763,6 +7997,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/request-key-enosys",
       "timeout_seconds": 57
     },
@@ -7779,6 +8016,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/sched-setattr-batch",
       "timeout_seconds": 57
@@ -7797,6 +8037,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/sched-setattr-idle",
       "timeout_seconds": 57
     },
@@ -7813,6 +8056,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/sched-setattr-other",
       "timeout_seconds": 57
@@ -7831,6 +8077,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/scheduler-policy-queries",
       "timeout_seconds": 57
     },
@@ -7847,6 +8096,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/session-identity",
       "timeout_seconds": 57
@@ -7865,6 +8117,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/setitimer-determinism",
       "timeout_seconds": 57
     },
@@ -7881,6 +8136,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/so-incoming-cpu-tcp4",
       "timeout_seconds": 57
@@ -7899,6 +8157,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/so-incoming-cpu-tcp6",
       "timeout_seconds": 57
     },
@@ -7915,6 +8176,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/so-incoming-cpu-udp4",
       "timeout_seconds": 57
@@ -7933,6 +8197,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/socket-cookie-tcp",
       "timeout_seconds": 57
     },
@@ -7949,6 +8216,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/socket-cookie-udp",
       "timeout_seconds": 57
@@ -7967,6 +8237,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/socket-cookie-unix",
       "timeout_seconds": 57
     },
@@ -7983,6 +8256,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/socket-timestamp-timespec",
       "timeout_seconds": 57
@@ -8001,6 +8277,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/socket-timestamp-timeval",
       "timeout_seconds": 57
     },
@@ -8017,6 +8296,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/splice-enosys",
       "timeout_seconds": 57
@@ -8035,6 +8317,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/statmount-enosys",
       "timeout_seconds": 57
     },
@@ -8051,6 +8336,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/syscall-file-io",
       "timeout_seconds": 57
@@ -8069,6 +8357,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/syscall-quick-wins",
       "timeout_seconds": 57
     },
@@ -8085,6 +8376,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/sysfs-enosys",
       "timeout_seconds": 57
@@ -8103,6 +8397,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/syslog-deterministic",
       "timeout_seconds": 57
     },
@@ -8119,6 +8416,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/sysv-sem-enosys",
       "timeout_seconds": 57
@@ -8137,6 +8437,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/sysv-shm-enosys",
       "timeout_seconds": 57
     },
@@ -8153,6 +8456,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/tcp-info-accept4",
       "timeout_seconds": 57
@@ -8171,6 +8477,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/tcp-info-accept6",
       "timeout_seconds": 57
     },
@@ -8187,6 +8496,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/tcp-info-client4",
       "timeout_seconds": 57
@@ -8205,6 +8517,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/tee-enosys",
       "timeout_seconds": 57
     },
@@ -8221,6 +8536,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/timer-create-determinism",
       "timeout_seconds": 57
@@ -8239,6 +8557,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/uname",
       "timeout_seconds": 57
     },
@@ -8255,6 +8576,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/unix-autobind-dgram",
       "timeout_seconds": 57
@@ -8273,6 +8597,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/unix-autobind-seqpacket",
       "timeout_seconds": 57
     },
@@ -8289,6 +8616,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/unix-autobind-stream",
       "timeout_seconds": 57
@@ -8307,6 +8637,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/ustat-enosys",
       "timeout_seconds": 57
     },
@@ -8323,6 +8656,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/vforkexec",
       "timeout_seconds": 57
@@ -8341,6 +8677,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/vmsplice-enosys",
       "timeout_seconds": 57
     },
@@ -8357,6 +8696,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/epoll-determinism",
       "timeout_seconds": 57
@@ -8375,6 +8717,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/madvise-determinism",
       "timeout_seconds": 57
     },
@@ -8391,6 +8736,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/mmap-determinism",
       "timeout_seconds": 57
@@ -8409,6 +8757,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/netlink-autobind-generic",
       "timeout_seconds": 57
     },
@@ -8425,6 +8776,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/netlink-autobind-route",
       "timeout_seconds": 57
@@ -8443,6 +8797,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/netlink-autobind-usersock",
       "timeout_seconds": 57
     },
@@ -8459,6 +8816,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "debugger-c/debuggee",
       "timeout_seconds": 57
@@ -8477,6 +8837,9 @@
         "ptrace",
         "bash"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/bash-random",
       "timeout_seconds": 57
     },
@@ -8493,6 +8856,9 @@
         "userns",
         "ptrace",
         "cxx"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "language-runtimes/cpp-stl-determinism",
       "timeout_seconds": 57
@@ -8511,6 +8877,9 @@
         "ptrace",
         "gawk"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/gawk-random",
       "timeout_seconds": 57
     },
@@ -8527,6 +8896,9 @@
         "userns",
         "ptrace",
         "perl"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "language-runtimes/perl-hash-order",
       "timeout_seconds": 57
@@ -8545,6 +8917,9 @@
         "ptrace",
         "perl"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/perl-random",
       "timeout_seconds": 57
     },
@@ -8561,6 +8936,9 @@
         "userns",
         "ptrace",
         "python3"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "language-runtimes/python-hash-determinism",
       "timeout_seconds": 57
@@ -8579,6 +8957,9 @@
         "ptrace",
         "python3"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/python-random",
       "timeout_seconds": 57
     },
@@ -8595,6 +8976,9 @@
         "userns",
         "ptrace",
         "rustc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "language-runtimes/rust-hashmap-iteration",
       "timeout_seconds": 57
@@ -8613,6 +8997,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/clock-determinism",
       "timeout_seconds": 57
     },
@@ -8629,6 +9016,9 @@
         "userns",
         "ptrace",
         "du"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/du-tree-summary",
       "timeout_seconds": 57
@@ -8647,6 +9037,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/errno-path-identity",
       "timeout_seconds": 57
     },
@@ -8663,6 +9056,9 @@
         "userns",
         "ptrace",
         "date"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/example-date",
       "timeout_seconds": 57
@@ -8681,6 +9077,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/file-timestamp-identity",
       "timeout_seconds": 57
     },
@@ -8697,6 +9096,9 @@
         "userns",
         "ptrace",
         "find"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/find-tree-metadata",
       "timeout_seconds": 57
@@ -8715,6 +9117,9 @@
         "ptrace",
         "bash"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/harness-width-contract",
       "timeout_seconds": 57
     },
@@ -8731,6 +9136,9 @@
         "userns",
         "ptrace"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/mcookie-random",
       "timeout_seconds": 57
     },
@@ -8746,6 +9154,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/mktemp-name",
       "timeout_seconds": 57
@@ -8764,6 +9175,9 @@
         "ptrace",
         "openssl"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/openssl-genpkey",
       "timeout_seconds": 57
     },
@@ -8779,6 +9193,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/openssl-passwd",
       "timeout_seconds": 57
@@ -8797,6 +9214,9 @@
         "ptrace",
         "openssl"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/openssl-rand",
       "timeout_seconds": 57
     },
@@ -8812,6 +9232,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/openssl-x509",
       "timeout_seconds": 57
@@ -8829,6 +9252,9 @@
         "userns",
         "ptrace"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/proc-uptime",
       "timeout_seconds": 57
     },
@@ -8844,6 +9270,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/random-device",
       "timeout_seconds": 57
@@ -8862,6 +9291,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/record-getpid",
       "timeout_seconds": 57
     },
@@ -8877,6 +9309,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/shuf-permutation",
       "timeout_seconds": 57
@@ -8895,6 +9330,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/startup-surface-identity",
       "timeout_seconds": 57
     },
@@ -8912,6 +9350,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/startup-tls-guards",
       "timeout_seconds": 57
     },
@@ -8927,6 +9368,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/uuidgen-random",
       "timeout_seconds": 57
@@ -8979,6 +9423,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/dbt-copied-tiocgpgrp",
       "timeout_seconds": 57
     },
@@ -8995,6 +9442,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/get-robust-list-child",
       "timeout_seconds": 57
@@ -9013,6 +9463,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/ptrace-seize-eperm",
       "timeout_seconds": 57
     },
@@ -9029,6 +9482,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/wait-on-child",
       "timeout_seconds": 57
@@ -9047,6 +9503,9 @@
         "ptrace",
         "jq"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "data-handling/jq-json-transform",
       "timeout_seconds": 57
     },
@@ -9064,6 +9523,9 @@
         "ptrace",
         "bash"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "determinism-stress/example-race",
       "timeout_seconds": 57
     },
@@ -9079,6 +9541,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "determinism-stress/thread-output",
       "timeout_seconds": 57
@@ -9097,6 +9562,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "determinism-stress-c/pipe-chain",
       "timeout_seconds": 57
     },
@@ -9113,6 +9581,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "determinism-stress-c/pipe-prefill",
       "timeout_seconds": 57
@@ -9131,6 +9602,9 @@
         "ptrace",
         "m4"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/m4-macro-mkstemp",
       "timeout_seconds": 57
     },
@@ -9147,6 +9621,9 @@
         "userns",
         "ptrace",
         "perl"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "language-runtimes/perl-io-subprocess-time",
       "timeout_seconds": 57
@@ -9165,6 +9642,9 @@
         "ptrace",
         "python3"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/python-dict-hash-iteration",
       "timeout_seconds": 57
     },
@@ -9181,6 +9661,9 @@
         "userns",
         "ptrace",
         "python3"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "language-runtimes/python-io-subprocess-time",
       "timeout_seconds": 57
@@ -9199,6 +9682,9 @@
         "ptrace",
         "tclsh"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "language-runtimes/tcl-rand-clock",
       "timeout_seconds": 57
     },
@@ -9214,6 +9700,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/date-nanoseconds",
       "timeout_seconds": 57
@@ -9232,6 +9721,9 @@
         "ptrace",
         "openssl"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/openssl-enc",
       "timeout_seconds": 57
     },
@@ -9249,6 +9741,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "system-utils/shm-coherency-identity",
       "timeout_seconds": 57
     },
@@ -9264,6 +9759,9 @@
         "x86_64",
         "userns",
         "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/ssh-keygen-ed25519",
       "timeout_seconds": 57
@@ -9775,27 +10273,30 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/random-readv-stream",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/random-readv-stream",
       "timeout_seconds": 57
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/random-readv-stream",
+      "timeout_seconds": 57
+    },
+    {
       "backend": "kvm",
       "category": "c-programs",
       "classification": "required",
@@ -9808,6 +10309,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/aio-refusal",
       "timeout_seconds": 57
@@ -9860,6 +10364,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/append-pwrite",
       "timeout_seconds": 57
     },
@@ -9910,6 +10417,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/bind-getsockname",
       "timeout_seconds": 57
@@ -9962,6 +10472,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/cachestat-refusal",
       "timeout_seconds": 57
     },
@@ -10012,6 +10525,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/child-subreaper-refusal",
       "timeout_seconds": 57
@@ -10064,6 +10580,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/close-range-fds",
       "timeout_seconds": 57
     },
@@ -10114,6 +10633,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/copy-file-range-refusal",
       "timeout_seconds": 57
@@ -10166,6 +10688,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/cpu-virtualization",
       "timeout_seconds": 57
     },
@@ -10217,6 +10742,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/cwd-roundtrip",
       "timeout_seconds": 57
     },
@@ -10267,6 +10795,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/dup-shared-offset",
       "timeout_seconds": 57
@@ -10387,6 +10918,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/epoll-readiness",
       "timeout_seconds": 57
     },
@@ -10472,6 +11006,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/eventfd-semantics",
       "timeout_seconds": 57
     },
@@ -10522,6 +11059,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/faccessat2-flags",
       "timeout_seconds": 57
@@ -10574,6 +11114,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/fadvise-hints",
       "timeout_seconds": 57
     },
@@ -10625,6 +11168,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/fallocate-extents",
       "timeout_seconds": 57
     },
@@ -10675,6 +11221,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/fchmod-bits",
       "timeout_seconds": 57
@@ -10795,6 +11344,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/fd-duplication",
       "timeout_seconds": 57
     },
@@ -10845,6 +11397,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/file-backed-mmap",
       "timeout_seconds": 57
@@ -10897,6 +11452,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/file-io-roundtrip",
       "timeout_seconds": 57
     },
@@ -10948,6 +11506,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/flock-lifecycle",
       "timeout_seconds": 57
     },
@@ -10998,6 +11559,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/fork-exec-pipeline",
       "timeout_seconds": 57
@@ -11067,6 +11631,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/ftruncate-sparse",
       "timeout_seconds": 57
     },
@@ -11118,6 +11685,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/getcpu-identity",
       "timeout_seconds": 57
     },
@@ -11168,6 +11738,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/getpriority-identity",
       "timeout_seconds": 57
@@ -11305,6 +11878,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/inline-syscall-sites",
       "timeout_seconds": 57
     },
@@ -11424,6 +12000,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/kcmp-refusal",
       "timeout_seconds": 57
     },
@@ -11474,6 +12053,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/linkat-flags",
       "timeout_seconds": 57
@@ -11526,6 +12108,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/lseek-positioning",
       "timeout_seconds": 57
     },
@@ -11576,6 +12161,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/mce-kill-refusal",
       "timeout_seconds": 57
@@ -11628,6 +12216,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/membarrier-query",
       "timeout_seconds": 57
     },
@@ -11678,6 +12269,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/memfd-create",
       "timeout_seconds": 57
@@ -11730,6 +12324,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/mempolicy-default",
       "timeout_seconds": 57
     },
@@ -11780,6 +12377,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/mincore-residency",
       "timeout_seconds": 57
@@ -11832,6 +12432,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/mixed-inline-and-libc-syscalls",
       "timeout_seconds": 57
     },
@@ -11882,6 +12485,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/mkdir-rmdir",
       "timeout_seconds": 57
@@ -11934,6 +12540,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/mknod-special",
       "timeout_seconds": 57
     },
@@ -11984,6 +12593,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/mmap-layout-pointer-order",
       "timeout_seconds": 57
@@ -12070,6 +12682,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/name-to-handle-refusal",
       "timeout_seconds": 57
     },
@@ -12120,6 +12735,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/no-new-privs-refusal",
       "timeout_seconds": 57
@@ -12172,6 +12790,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/numa-node-identity",
       "timeout_seconds": 57
     },
@@ -12222,6 +12843,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/o-tmpfile-anon",
       "timeout_seconds": 57
@@ -12274,6 +12898,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/openat-flags",
       "timeout_seconds": 57
     },
@@ -12325,6 +12952,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/openat2-refusal",
       "timeout_seconds": 57
     },
@@ -12375,6 +13005,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/path-file-ops",
       "timeout_seconds": 57
@@ -12460,6 +13093,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/pid-probe",
       "timeout_seconds": 57
@@ -12529,6 +13165,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/pidfd-open-self-pair",
       "timeout_seconds": 57
     },
@@ -12579,6 +13218,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/pipe-capacity",
       "timeout_seconds": 57
@@ -12631,6 +13273,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/pipe-capacity-pin",
       "timeout_seconds": 57
     },
@@ -12681,6 +13326,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/pipe-ipc",
       "timeout_seconds": 57
@@ -12750,6 +13398,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/pipe2-flags",
       "timeout_seconds": 57
     },
@@ -12971,6 +13622,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/readdir-entries",
       "timeout_seconds": 57
     },
@@ -13021,6 +13675,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/readdir-order-identity",
       "timeout_seconds": 57
@@ -13107,6 +13764,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/rename-ops",
       "timeout_seconds": 57
     },
@@ -13157,6 +13817,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/renameat2-flags",
       "timeout_seconds": 57
@@ -13209,6 +13872,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/rlimit-identity",
       "timeout_seconds": 57
     },
@@ -13259,6 +13925,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/robust-list",
       "timeout_seconds": 57
@@ -13311,6 +13980,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/sched-getaffinity-identity",
       "timeout_seconds": 57
     },
@@ -13361,6 +14033,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/seccomp-refusal",
       "timeout_seconds": 57
@@ -13413,6 +14088,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/sendfile-copy",
       "timeout_seconds": 57
     },
@@ -13463,6 +14141,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/set-tid-address",
       "timeout_seconds": 57
@@ -13515,6 +14196,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/short-io-split-identity",
       "timeout_seconds": 57
     },
@@ -13565,6 +14249,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/shutdown-socketpair",
       "timeout_seconds": 57
@@ -13685,6 +14372,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/signalfd-create",
       "timeout_seconds": 57
     },
@@ -13735,6 +14425,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/socket-epoll-ordering",
       "timeout_seconds": 57
@@ -13889,6 +14582,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/stat-metadata-identity",
       "timeout_seconds": 57
     },
@@ -13940,6 +14636,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/statfs-free-determinism",
       "timeout_seconds": 57
     },
@@ -13990,6 +14689,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/static-nolibc-syscall-sites",
       "timeout_seconds": 57
@@ -14025,6 +14727,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/statx-metadata",
       "timeout_seconds": 57
     },
@@ -14075,6 +14780,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/symlink-ops",
       "timeout_seconds": 57
@@ -14127,6 +14835,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/sync-file-range",
       "timeout_seconds": 57
     },
@@ -14177,6 +14888,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/sysv-ipc-refusal",
       "timeout_seconds": 57
@@ -14263,6 +14977,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/umask-mode",
       "timeout_seconds": 57
     },
@@ -14314,6 +15031,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
       "test": "c-programs/uname-identity",
       "timeout_seconds": 57
     },
@@ -14364,6 +15084,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/utimensat-determinism",
       "timeout_seconds": 57
@@ -14449,6 +15172,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "c-programs/vectored-io",
       "timeout_seconds": 57
@@ -14503,7 +15229,8 @@
         "cc"
       ],
       "requires_host_capabilities": [
-        "cpuid-faulting"
+        "cpuid-faulting",
+        "kvm"
       ],
       "test": "c-programs/cpuid-probe",
       "timeout_seconds": 57
@@ -15256,6 +15983,9 @@
         "userns",
         "ptrace",
         "bash"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
       ],
       "test": "system-utils/sysfs-sanitized-prefixes",
       "timeout_seconds": 57

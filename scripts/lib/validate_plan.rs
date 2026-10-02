@@ -579,6 +579,25 @@ pub struct HostInapplicableNode {
     pub tag: String,
     pub capability: HostCapability,
     pub evidence: String,
+    /// `None`: the whole node is withheld and never spawns. `Some`: the node
+    /// RUNS, but `target/debug/test-harness` withholds some of its manifest
+    /// cells as host-inapplicable. Either way the run did not cover what those
+    /// cells verify, so both count against completeness alike.
+    pub cells: Option<WithheldCells>,
+}
+
+/// The cells of a RUNNING manifest bucket node that the harness withholds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithheldCells {
+    pub withheld: usize,
+    pub selected: usize,
+}
+
+impl HostInapplicableNode {
+    /// Whether the node itself still runs, with only some cells withheld.
+    pub fn runs(&self) -> bool {
+        self.cells.is_some()
+    }
 }
 
 /// The `requires_host_capability` declarations in one lane, keyed by runner tag.
@@ -644,6 +663,7 @@ pub fn partition_host_inapplicable(
                     tag,
                     capability: *capability,
                     evidence: absent[capability].clone(),
+                    cells: None,
                 })
             }
             _ => keep.push(step),

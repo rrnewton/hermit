@@ -1226,6 +1226,10 @@ fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
                 .requires
                 .iter()
                 .filter_map(|token| requires_capability(token).ok().flatten())
+                // The backend's own capability withholds the cell exactly as a
+                // `requires` token does (see `host_inapplicable_reason`), so a
+                // consumer routing from this file must see it too.
+                .chain(cell.id.backend.as_deref().and_then(backend_capability))
                 .collect::<BTreeSet<_>>();
             // `requires` and the base (unmultiplied) timeouts let a consumer that
             // cannot load the manifests, such as a Buck cell generator, route
@@ -4714,6 +4718,57 @@ sys.exit(1 if failed else 0)
             serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap())
                 .unwrap();
         assert_eq!(tracked, generated);
+    }
+
+    /// A kvm cell is withheld where KVM is proven absent whatever its
+    /// `requires` says, so the plan row a Buck generator or validate.rs routes
+    /// from must name `kvm`; a row that omitted it would schedule the cell on
+    /// a host that can only report it HOST-INAPPLICABLE.
+    #[test]
+    fn every_kvm_plan_row_requires_the_kvm_host_capability() {
+        let root = super::root(None);
+        let manifests = ManifestSet::load(&root).unwrap();
+        let (_, rows) = super::required_plan_rows(&manifests);
+        let capabilities = |row: &serde_json::Value| {
+            row.get("requires_host_capabilities")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let kvm = rows
+            .iter()
+            .filter(|row| row["backend"] == "kvm")
+            .collect::<Vec<_>>();
+        assert_eq!(kvm.len(), 244);
+        let missing = kvm
+            .iter()
+            .filter(|row| !capabilities(row).contains(&"kvm".to_string()))
+            .map(|row| format!("{}/{}@kvm", row["test"], row["mode"]))
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "{missing:?}");
+        let elsewhere = rows
+            .iter()
+            .filter(|row| row["backend"] != "kvm")
+            .filter(|row| capabilities(row).contains(&"kvm".to_string()))
+            .count();
+        assert_eq!(elsewhere, 0);
+        // The cpuid-probe kvm row keeps its `requires` capability as well.
+        let both = rows
+            .iter()
+            .filter(|row| capabilities(row) == ["cpuid-faulting", "kvm"])
+            .map(|row| {
+                (
+                    row["test"].as_str().unwrap(),
+                    row["backend"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(both, [("c-programs/cpuid-probe", "kvm")]);
     }
 
     fn duplicate_plan_fixture(mode: &str) -> Vec<serde_json::Value> {

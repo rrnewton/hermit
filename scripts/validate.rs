@@ -10031,10 +10031,11 @@ fn require_host_capabilities(root: &Path, plan: &Plan) -> Result<(), String> {
 /// requested profile name would be worse than refusing.
 fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String> {
     let requirements = validate_plan::host_capability_requirements(root)?;
-    if requirements.is_empty() {
-        return Ok(());
-    }
-    // Probe only what this plan actually needs, once per capability.
+    // Probe only what this plan actually needs, once per capability: what its
+    // nodes declare, and what the manifest cells its bucket nodes would run
+    // need. The harness withholds those cells on its own probe, so a capability
+    // only cells need must be asked here too, or their withholding is invisible
+    // to every record this driver writes.
     let mut needed: BTreeSet<validate_plan::HostCapability> = BTreeSet::new();
     for cfg in std::iter::once(&plan.cfg).chain(plan.second.iter()) {
         for step in &cfg.steps {
@@ -10042,6 +10043,10 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
                 needed.insert(*capability);
             }
         }
+    }
+    needed.extend(planned_cell_capabilities(root, plan));
+    if needed.is_empty() {
+        return Ok(());
     }
     let mut absent: BTreeMap<validate_plan::HostCapability, String> = BTreeMap::new();
     for capability in needed {
@@ -10081,6 +10086,18 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
     // [`withhold_vacuous_manifest_nodes`].
     withhold_vacuous_manifest_nodes(root, plan, &absent)?;
     for node in &plan.host_inapplicable {
+        if node.runs() {
+            println!(
+                "HOST-INAPPLICABLE: {} will RUN, but this machine lacks {} ({}). The withheld \
+                 cells are NOT a pass and carry NO coverage for what they verify; the node is \
+                 recorded in the ledger with reason '{}', so this run cannot be complete.",
+                node.tag,
+                node.capability.value(),
+                node.evidence,
+                validate_plan::HOST_INAPPLICABLE_REASON
+            );
+            continue;
+        }
         println!(
             "HOST-INAPPLICABLE: {} will NOT RUN — this machine lacks {} ({}). This is NOT a pass \
              and carries NO coverage for what that node verifies; it is recorded in the ledger as \
@@ -10092,6 +10109,36 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
         );
     }
     Ok(())
+}
+
+/// Every host capability the manifest cells of the planned bucket nodes need.
+///
+/// An unreadable required plan adds nothing here, toward running: the same
+/// file is audited by the mandatory manifest gate and by the retained cell
+/// evidence, so a run that cannot read it cannot qualify regardless.
+fn planned_cell_capabilities(root: &Path, plan: &Plan) -> BTreeSet<validate_plan::HostCapability> {
+    let buckets: BTreeSet<(String, String)> = std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter())
+        .filter_map(manifest_bucket_of)
+        .collect();
+    if buckets.is_empty() {
+        return BTreeSet::new();
+    }
+    match read_plan_cells(root) {
+        Ok(cells) => cells
+            .into_iter()
+            .filter(|cell| buckets.contains(&(cell.lane.clone(), cell.category.clone())))
+            .flat_map(|cell| cell.capabilities)
+            .collect(),
+        Err(why) => {
+            println!(
+                "Host capabilities of planned manifest cells UNAVAILABLE ({why}); only the \
+                 capabilities planned nodes declare will be probed."
+            );
+            BTreeSet::new()
+        }
+    }
 }
 
 // ------------------------------------------- a node whose whole bucket is gone
@@ -10135,6 +10182,12 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
 //     `plan.host_inapplicable` exactly like a declared one: added back into
 //     `gates_expected`, named in the plan header, the cost table, the verdict
 //     detail and the ledger row, and never written into `gates[]`.
+//  7. A PARTLY WITHHELD BUCKET IS RECORDED TOO. When some but not all of a
+//     bucket's cells are withheld, the node still runs and the harness reports
+//     the rest; its exit status alone would read as full coverage. The node is
+//     therefore ALSO entered into `plan.host_inapplicable`, marked as running,
+//     so the run is classified incomplete and the ledger row names the withheld
+//     cell count. This only adds a record; it never removes a node.
 
 /// One manifest bucket's cell accounting, exactly as `target/debug/test-harness`
 /// counts it for the run that bucket's node would perform.
@@ -10148,6 +10201,17 @@ struct BucketCells {
     withheld: usize,
     /// Which capabilities did the withholding, sorted and deduplicated.
     capabilities: Vec<String>,
+    /// The absent capabilities EVERY withheld cell needs, sorted. Any one of
+    /// them alone withholds all of those cells.
+    common: Vec<String>,
+}
+
+/// One row of the checked-in required cell population.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlanCell {
+    lane: String,
+    category: String,
+    capabilities: BTreeSet<validate_plan::HostCapability>,
 }
 
 /// Would this bucket's node have NOTHING to run?
@@ -10160,8 +10224,9 @@ struct BucketCells {
 ///
 /// `withheld == selected` rather than `withheld > 0`: one withheld cell in a
 /// bucket that still has runnable cells leaves the node running, with the
-/// withheld cell recorded by the harness. That is what makes adding a runnable
-/// cell back un-withhold the node automatically.
+/// withheld cell recorded by the harness and the node recorded as running
+/// host-inapplicable (item 7 above). That is what makes adding a runnable cell
+/// back un-withhold the node automatically.
 fn bucket_runs_nothing(bucket: &BucketCells) -> bool {
     bucket.selected > 0 && bucket.withheld == bucket.selected
 }
@@ -10235,6 +10300,19 @@ fn manifest_bucket_of(step: &Step) -> Option<(String, String)> {
             }
             // Tokens that change nothing about WHICH cells are selected.
             "--allow-empty" | "--prebuilt" => i += 1,
+            // How many cells run at once, never which: a bucket with `--jobs 1`
+            // selects the same cells, and leaving it out would hide its
+            // withheld cells from the accounting. The value must be a count.
+            "--jobs" => {
+                if !tokens
+                    .get(i + 1)?
+                    .parse::<usize>()
+                    .is_ok_and(|jobs| jobs > 0)
+                {
+                    return None;
+                }
+                i += 2;
+            }
             // Anything else: unmodelled, so unproven, so not a candidate.
             _ => return None,
         }
@@ -10260,6 +10338,11 @@ fn read_bucket_cells(
     root: &Path,
     absent: &BTreeMap<validate_plan::HostCapability, String>,
 ) -> Result<Vec<BucketCells>, String> {
+    Ok(bucket_cells(&read_plan_cells(root)?, absent))
+}
+
+/// Parse `ci/expected-e2e-plan.json` into its cells' buckets and capabilities.
+fn read_plan_cells(root: &Path) -> Result<Vec<PlanCell>, String> {
     let path = root.join("ci/expected-e2e-plan.json");
     let document: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&path)
@@ -10270,7 +10353,7 @@ fn read_bucket_cells(
         .get("cells")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| format!("{} has no cells array", path.display()))?;
-    let mut buckets: BTreeMap<(String, String), BucketCells> = BTreeMap::new();
+    let mut out = Vec::with_capacity(cells.len());
     for cell in cells {
         let lane = cell
             .get("lane")
@@ -10282,17 +10365,7 @@ fn read_bucket_cells(
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("{} contains a cell without a category", path.display()))?;
-        let bucket = buckets
-            .entry((lane.to_string(), category.to_string()))
-            .or_insert_with(|| BucketCells {
-                lane: lane.to_string(),
-                category: category.to_string(),
-                selected: 0,
-                withheld: 0,
-                capabilities: Vec::new(),
-            });
-        bucket.selected += 1;
-        let mut cell_absent = BTreeSet::new();
+        let mut capabilities = BTreeSet::new();
         if let Some(values) = cell.get("requires_host_capabilities") {
             let values = values.as_array().ok_or_else(|| {
                 format!(
@@ -10304,29 +10377,100 @@ fn read_bucket_cells(
                 let name = value.as_str().ok_or_else(|| {
                     format!("{} contains a non-string host capability", path.display())
                 })?;
-                let capability =
-                    validate_plan::HostCapability::from_value(name).ok_or_else(|| {
+                capabilities.insert(validate_plan::HostCapability::from_value(name).ok_or_else(
+                    || {
                         format!(
                             "{} contains unknown host capability {name:?}",
                             path.display()
                         )
-                    })?;
-                if absent.contains_key(&capability) {
-                    cell_absent.insert(name.to_string());
-                }
+                    },
+                )?);
             }
         }
-        if !cell_absent.is_empty() {
-            bucket.withheld += 1;
-            bucket.capabilities.extend(cell_absent);
-        }
-    }
-    let mut out = buckets.into_values().collect::<Vec<_>>();
-    for bucket in &mut out {
-        bucket.capabilities.sort();
-        bucket.capabilities.dedup();
+        out.push(PlanCell {
+            lane: lane.to_string(),
+            category: category.to_string(),
+            capabilities,
+        });
     }
     Ok(out)
+}
+
+/// Aggregate cells by bucket for the already-resolved absent capabilities.
+/// PURE, so both attribution directions are bracketed with planted cells.
+fn bucket_cells(
+    cells: &[PlanCell],
+    absent: &BTreeMap<validate_plan::HostCapability, String>,
+) -> Vec<BucketCells> {
+    let mut buckets: BTreeMap<(String, String), (BucketCells, Option<BTreeSet<String>>)> =
+        BTreeMap::new();
+    for cell in cells {
+        let (bucket, common) = buckets
+            .entry((cell.lane.clone(), cell.category.clone()))
+            .or_insert_with(|| {
+                (
+                    BucketCells {
+                        lane: cell.lane.clone(),
+                        category: cell.category.clone(),
+                        selected: 0,
+                        withheld: 0,
+                        capabilities: Vec::new(),
+                        common: Vec::new(),
+                    },
+                    None,
+                )
+            });
+        bucket.selected += 1;
+        let cell_absent: BTreeSet<String> = cell
+            .capabilities
+            .iter()
+            .filter(|capability| absent.contains_key(capability))
+            .map(|capability| capability.value().to_string())
+            .collect();
+        if !cell_absent.is_empty() {
+            bucket.withheld += 1;
+            bucket.capabilities.extend(cell_absent.iter().cloned());
+            *common = Some(match common.take() {
+                None => cell_absent,
+                Some(previous) => previous.intersection(&cell_absent).cloned().collect(),
+            });
+        }
+    }
+    buckets
+        .into_values()
+        .map(|(mut bucket, common)| {
+            bucket.capabilities.sort();
+            bucket.capabilities.dedup();
+            bucket.common = common.unwrap_or_default().into_iter().collect();
+            bucket
+        })
+        .collect()
+}
+
+/// The one capability a host-inapplicable record for this bucket names.
+///
+/// One typed record needs one capability: the only one that withheld anything,
+/// or else the only one every withheld cell lacks, which alone would withhold
+/// them all. The second case is real: `c-programs/cpuid-probe@kvm` needs both
+/// `cpuid-faulting` and `kvm`, its siblings only `cpuid-faulting`, so a host
+/// lacking both withholds the bucket for `cpuid-faulting`. Anything else means
+/// independent capabilities each withheld different cells, so REFUSE rather
+/// than pick: refusing is never the bar-lowering direction.
+fn bucket_capability(bucket: &BucketCells) -> Result<&str, String> {
+    match (bucket.capabilities.as_slice(), bucket.common.as_slice()) {
+        ([only], _) | (_, [only]) => Ok(only.as_str()),
+        _ => Err(format!(
+            "manifest bucket {}/{} has {} of {} cell(s) withheld by {} capabilities ({}) with no \
+             single capability shared by every withheld cell, and one host-inapplicable record \
+             names exactly one; extend the record before adding such a cell",
+            bucket.lane,
+            bucket.category,
+            bucket.withheld,
+            bucket.selected,
+            bucket.capabilities.len(),
+            bucket.capabilities.join(", ")
+        )),
+    }
 }
 
 /// Withhold every planned manifest bucket node whose entire cell population is
@@ -10370,29 +10514,17 @@ fn withhold_vacuous_manifest_nodes(
         .collect();
 
     let mut withheld: Vec<validate_plan::HostInapplicableNode> = Vec::new();
+    let mut partly: Vec<validate_plan::HostInapplicableNode> = Vec::new();
     for (tag, lane, category) in &candidates {
         // A bucket with no row selected NO cells at all. That is
         // `empty-manifest-bucket`, not host-inapplicable, and is left alone.
         let Some(bucket) = by_bucket.get(&(lane.as_str(), category.as_str())) else {
             continue;
         };
-        if !bucket_runs_nothing(bucket) {
+        if bucket.withheld == 0 {
             continue;
         }
-        // One typed record needs one capability. More than one means a second
-        // probeable token was added without extending this record, so REFUSE
-        // rather than pick: refusing is never the bar-lowering direction, and
-        // this is unreachable while exactly one token has an absence proof.
-        if bucket.capabilities.len() != 1 {
-            return Err(format!(
-                "manifest bucket {lane}/{category} has every cell withheld by {} capabilities \
-                 ({}), and one host-inapplicable record names exactly one; extend the record \
-                 before adding a second probeable `requires` token",
-                bucket.capabilities.len(),
-                bucket.capabilities.join(", ")
-            ));
-        }
-        let name = &bucket.capabilities[0];
+        let name = bucket_capability(bucket)?;
         let Some(capability) = validate_plan::HostCapability::from_value(name) else {
             return Err(format!(
                 "manifest bucket {lane}/{category} was withheld by capability '{name}', which \
@@ -10405,6 +10537,24 @@ fn withhold_vacuous_manifest_nodes(
                  verdict; refusing inconsistent host-capability accounting"
             )
         })?;
+        if !bucket_runs_nothing(bucket) {
+            // The node runs the remaining cells; the record makes the withheld
+            // ones count against completeness instead of vanishing into a PASS.
+            partly.push(validate_plan::HostInapplicableNode {
+                tag: tag.clone(),
+                capability,
+                evidence: format!(
+                    "{} of {} selected cell(s) of manifest bucket {lane}/{category} are \
+                     host-inapplicable and withheld by the harness: {evidence}",
+                    bucket.withheld, bucket.selected
+                ),
+                cells: Some(validate_plan::WithheldCells {
+                    withheld: bucket.withheld,
+                    selected: bucket.selected,
+                }),
+            });
+            continue;
+        }
         withheld.push(validate_plan::HostInapplicableNode {
             tag: tag.clone(),
             capability,
@@ -10413,9 +10563,11 @@ fn withhold_vacuous_manifest_nodes(
                  host-inapplicable: {evidence}",
                 bucket.selected
             ),
+            cells: None,
         });
     }
     if withheld.is_empty() {
+        plan.host_inapplicable.extend(partly);
         return Ok(());
     }
     let gone: BTreeSet<String> = withheld.iter().map(|n| n.tag.clone()).collect();
@@ -10453,6 +10605,7 @@ fn withhold_vacuous_manifest_nodes(
         );
     }
     plan.host_inapplicable.extend(withheld);
+    plan.host_inapplicable.extend(partly);
     Ok(())
 }
 
@@ -13355,6 +13508,35 @@ fn print_super_stress_verdict(
     blocking
 }
 
+/// The plan header's host-inapplicable clause, empty when there is none.
+fn host_inapplicable_plan_summary(nodes: &[validate_plan::HostInapplicableNode]) -> String {
+    let (partly, wholly): (Vec<_>, Vec<_>) = nodes.iter().partition(|n| n.runs());
+    let tags = |nodes: &[&validate_plan::HostInapplicableNode]| {
+        nodes
+            .iter()
+            .map(|n| n.tag.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = String::new();
+    if !wholly.is_empty() {
+        out.push_str(&format!(
+            "; {} planned node(s) withheld as host-inapplicable and NOT counted as passing: {}",
+            wholly.len(),
+            tags(&wholly)
+        ));
+    }
+    if !partly.is_empty() {
+        out.push_str(&format!(
+            "; {} node(s) run with host-inapplicable cells withheld, so the run cannot be \
+             complete: {}",
+            partly.len(),
+            tags(&partly)
+        ));
+    }
+    out
+}
+
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
 fn print_cost_table(
     outcomes: &[StepOutcome],
@@ -13408,8 +13590,12 @@ fn print_cost_table(
     // like one.
     for node in host_inapplicable {
         println!(
-            "\nhost-inapplicable (NOT RUN, NOT a pass, no coverage): {} — this machine lacks {} \
-             ({})",
+            "\nhost-inapplicable ({}): {} — this machine lacks {} ({})",
+            if node.runs() {
+                "node RAN; its withheld cells are NOT a pass, no coverage"
+            } else {
+                "NOT RUN, NOT a pass, no coverage"
+            },
             node.tag,
             node.capability.value(),
             node.evidence
@@ -13812,6 +13998,11 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         } else {
             Vec::new()
         },
+        common: if withheld > 0 {
+            vec!["cpuid-faulting".into()]
+        } else {
+            Vec::new()
+        },
     };
 
     // POSITIVE — the bucket's only cell is withheld, so its node has nothing at
@@ -13906,6 +14097,10 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results r --junit",
         // Unknown tokens remain fail-closed even with the required output pair.
         "target/debug/test-harness run --lane privileged --category c-programs --ci-only --future-selector value --results r --junit j",
+        // `--jobs` is modelled only with a positive count.
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --results r --junit j --jobs",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --jobs 0 --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category c-programs --ci-only --jobs --results r --junit j",
         // Not a bucket run at all.
         "target/debug/test-harness validate",
         "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
@@ -13921,6 +14116,19 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
                      equal to the bucket accounting and must NOT be a withholding candidate"
                 ));
             }
+        }
+        // Parallelism is not selection: the same bucket with `--jobs 1`, as
+        // the shipped system-utils buckets run, binds to the same accounting.
+        let mut serial = shipped.clone();
+        serial.cmd = "target/debug/test-harness run --lane privileged --category c-programs \
+                      --ci-only --allow-empty --prebuilt --jobs 1 --results r --junit j"
+            .to_string();
+        if manifest_bucket_of(&serial) != Some(("privileged".to_string(), "c-programs".to_string()))
+        {
+            return Err(format!(
+                "node vacuity: {:?} selects the bucket's cells and must bind to it",
+                serial.cmd
+            ));
         }
         let mut mismatched = shipped.clone();
         mismatched.manifest = Some(DagManifest {
@@ -14047,9 +14255,254 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
 
     println!(
         "  node vacuity: 2 withheld / 7 not-withheld (3 un-withholding, 3 nothing-withheld, \
-         1 empty-bucket), 1 transformed command bound / 15 refused, accounting parser 1 good / \
+         1 empty-bucket), 2 transformed commands bound / 18 refused, accounting parser 1 good / \
          3 malformed, dependents 1 edge-dropped / 1 refusal / 1 inert, actual plan 1 bucket \
          withheld / 1 scorecard edge dropped / 0 other changes"
+    );
+    Ok(())
+}
+
+/// Two-sided bracket for kvm cells inside buckets that also run other cells.
+///
+/// The harness withholds every kvm cell where KVM is proven absent, and most
+/// of them sit in buckets with runnable cells, so their nodes still run and
+/// pass. Inert like the bracket above: planted verdicts over the checked-in
+/// plan and the production plan construction. QUALIFYING: with KVM present
+/// every kvm cell is counted, nothing is recorded and a passing run is
+/// complete. VIOLATING: with KVM absent each such node is recorded as running
+/// host-inapplicable, with its exact cell counts, and the same passing run is
+/// incomplete and exits NO_RESULT.
+fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
+    use validate_plan::HostCapability;
+    let kvm_absent = BTreeMap::from([(HostCapability::Kvm, "planted absence".to_string())]);
+    let both_absent = BTreeMap::from([
+        (HostCapability::Kvm, "planted absence".to_string()),
+        (HostCapability::CpuidFaulting, "planted absence".to_string()),
+    ]);
+    // (tag, withheld, selected), measured from ci/expected-e2e-plan.json: the
+    // kvm-backend rows of each bucket against all of its rows.
+    let portable_partial: &[(&str, usize, usize)] = &[
+        ("e2e.manifest_applications", 1, 4),
+        ("e2e.manifest_c_programs", 195, 742),
+        ("e2e.manifest_data_handling", 1, 7),
+        ("e2e.manifest_debugger_c", 1, 4),
+        ("e2e.manifest_determinism_stress", 2, 8),
+        ("e2e.manifest_determinism_stress_c", 2, 14),
+        ("e2e.manifest_language_runtimes", 14, 33),
+        ("e2e.manifest_system_utils", 25, 74),
+    ];
+    let privileged_partial: &[(&str, usize, usize)] = &[
+        ("privileged-e2e.manifest_c_programs", 1, 4),
+        ("privileged-e2e.manifest_system_utils", 1, 2),
+    ];
+    let plan_for = |label: &str| -> Result<Plan, String> {
+        Ok(Plan {
+            cfg: DagConfig {
+                steps: validate_plan::lane_config(root, label)?.steps,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+    let tags = |plan: &Plan| {
+        plan.cfg
+            .steps
+            .iter()
+            .map(|s| s.tag())
+            .collect::<BTreeSet<_>>()
+    };
+    let recorded = |plan: &Plan, runs: bool| {
+        plan.host_inapplicable
+            .iter()
+            .filter(|n| n.runs() == runs)
+            .map(|n| {
+                let cells = n.cells.unwrap_or(validate_plan::WithheldCells {
+                    withheld: 0,
+                    selected: 0,
+                });
+                (n.tag.clone(), n.capability, cells.withheld, cells.selected)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let expect = |rows: &[&[(&str, usize, usize)]]| {
+        rows.iter()
+            .flat_map(|rows| rows.iter())
+            .map(|(tag, withheld, selected)| {
+                (tag.to_string(), HostCapability::Kvm, *withheld, *selected)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    // A node that ran and PASSED, judged with what the plan recorded.
+    let judge = |plan: &Plan, tag: &str| {
+        let ran = StepOutcome::passed(tag.into(), 1.0, String::new(), Some(0), Some(1), Some(0));
+        let attempts = [reported_attempt(&ran, 1)];
+        let planned = BTreeSet::from([tag.to_string()]);
+        let classified = classify_run(
+            std::slice::from_ref(&ran),
+            &attempts,
+            &[],
+            &planned,
+            &plan.host_inapplicable,
+        );
+        let complete = validation_is_complete(true, &classified, &planned);
+        let exit = completed_exit_code(0, classified.no_results(), false, false);
+        let (_, result) = ledger_run_results(exit, 0, classified.no_results(), false);
+        (complete, exit, result)
+    };
+
+    // The plan rows themselves: every kvm cell names kvm, so the accounting
+    // counts them in their buckets with KVM present and withholds them with it
+    // absent.
+    let present = read_bucket_cells(root, &BTreeMap::new())?;
+    let c_programs = present
+        .iter()
+        .find(|b| b.lane == "portable" && b.category == "c-programs")
+        .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
+    if c_programs.selected != 742 || c_programs.withheld != 0 {
+        return Err(format!(
+            "host-inapplicable cells: with KVM present all 742 portable/c-programs cells must be \
+             counted and none withheld: {c_programs:?}"
+        ));
+    }
+    let absent = read_bucket_cells(root, &kvm_absent)?;
+    let withheld: usize = absent.iter().map(|b| b.withheld).sum();
+    if withheld != 244
+        || absent
+            .iter()
+            .any(|b| b.withheld > 0 && b.capabilities != ["kvm"])
+    {
+        return Err(format!(
+            "host-inapplicable cells: with KVM absent exactly the 244 kvm cells must be withheld, \
+             by kvm alone; got {withheld}: {absent:?}"
+        ));
+    }
+
+    for (label, partial, whole) in [
+        ("portable", vec![portable_partial], Vec::<&str>::new()),
+        (
+            "full",
+            vec![portable_partial, privileged_partial],
+            vec!["privileged-e2e.manifest_applications"],
+        ),
+    ] {
+        // QUALIFYING — KVM present. The kvm cells must still be asked about,
+        // or a host without KVM would withhold them unprobed by this driver.
+        let mut plan = plan_for(label)?;
+        if !planned_cell_capabilities(root, &plan).contains(&HostCapability::Kvm) {
+            return Err(format!(
+                "host-inapplicable cells: the {label} plan runs kvm cells, so the driver must \
+                 probe kvm"
+            ));
+        }
+        let before = tags(&plan);
+        withhold_vacuous_manifest_nodes(root, &mut plan, &BTreeMap::new())?;
+        if tags(&plan) != before || !plan.host_inapplicable.is_empty() {
+            return Err(format!(
+                "host-inapplicable cells: {label} with every capability present must change \
+                 nothing; recorded {:?}",
+                plan.host_inapplicable
+            ));
+        }
+        let (complete, exit, result) = judge(&plan, "e2e.manifest_c_programs");
+        if !complete || exit != 0 || result != "pass" {
+            return Err(format!(
+                "host-inapplicable cells: a passing {label} bucket node with every cell run must \
+                 be complete; got complete={complete} exit={exit} result={result}"
+            ));
+        }
+
+        // VIOLATING — KVM absent. Every node with a kvm cell is recorded; the
+        // mixed ones keep running, the all-kvm one is withheld.
+        let mut plan = plan_for(label)?;
+        withhold_vacuous_manifest_nodes(root, &mut plan, &kvm_absent)?;
+        let running = recorded(&plan, true);
+        if running != expect(&partial) {
+            return Err(format!(
+                "host-inapplicable cells: {label} with KVM absent must record exactly the mixed \
+                 buckets' kvm cells as withheld; got {running:?}"
+            ));
+        }
+        let gone = before.difference(&tags(&plan)).cloned().collect::<Vec<_>>();
+        let wholly = recorded(&plan, false)
+            .into_iter()
+            .map(|(tag, ..)| tag)
+            .collect::<Vec<_>>();
+        if gone != whole || wholly != whole {
+            return Err(format!(
+                "host-inapplicable cells: {label} with KVM absent must withhold exactly {whole:?}; \
+                 removed {gone:?}, recorded {wholly:?}"
+            ));
+        }
+        let (complete, exit, result) = judge(&plan, "e2e.manifest_c_programs");
+        if complete || exit != NO_RESULT_EXIT_CODE as u8 || result != "no_result" {
+            return Err(format!(
+                "host-inapplicable cells: a passing {label} node whose 195 kvm cells were \
+                 withheld must leave the run incomplete; got complete={complete} exit={exit} \
+                 result={result}"
+            ));
+        }
+        let summary = host_inapplicable_plan_summary(&plan.host_inapplicable);
+        if !summary.contains("e2e.manifest_c_programs") || !summary.contains("cannot be complete") {
+            return Err(format!(
+                "host-inapplicable cells: the {label} plan header must name the running node: \
+                 {summary}"
+            ));
+        }
+    }
+
+    // ATTRIBUTION — cpuid-probe@kvm needs both capabilities and its siblings
+    // only cpuid-faulting. A host lacking both withholds the privileged bucket
+    // for the one capability every cell lacks, instead of refusing the run.
+    let mut plan = plan_for("full")?;
+    withhold_vacuous_manifest_nodes(root, &mut plan, &both_absent)?;
+    let c_programs = plan
+        .host_inapplicable
+        .iter()
+        .find(|n| n.tag == "privileged-e2e.manifest_c_programs")
+        .ok_or("host-inapplicable cells: both absent lost privileged/c-programs")?;
+    if c_programs.runs() || c_programs.capability != HostCapability::CpuidFaulting {
+        return Err(format!(
+            "host-inapplicable cells: privileged/c-programs with both capabilities absent must \
+             be withheld whole for cpuid-faulting: {c_programs:?}"
+        ));
+    }
+    // ...but cells withheld by DIFFERENT capabilities with none shared still
+    // refuse, whole or partial, rather than naming one of them.
+    let cell = |capabilities: &[HostCapability]| PlanCell {
+        lane: "planted".into(),
+        category: "mixed".into(),
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    for (label, cells) in [
+        (
+            "whole",
+            vec![
+                cell(&[HostCapability::CpuidFaulting]),
+                cell(&[HostCapability::Kvm]),
+            ],
+        ),
+        (
+            "partial",
+            vec![
+                cell(&[HostCapability::CpuidFaulting]),
+                cell(&[HostCapability::Kvm]),
+                cell(&[]),
+            ],
+        ),
+    ] {
+        let buckets = bucket_cells(&cells, &both_absent);
+        if buckets.len() != 1 || bucket_capability(&buckets[0]).is_ok() {
+            return Err(format!(
+                "host-inapplicable cells: a {label} bucket withheld by unshared capabilities must \
+                 refuse: {buckets:?}"
+            ));
+        }
+    }
+
+    println!(
+        "  host-inapplicable cells: plan rows 244 kvm withheld / 742 portable c-programs counted, \
+         portable 8 running recorded / 0 withheld, full 10 running recorded / 1 withheld, \
+         qualifying 2 complete / violating 2 NO_RESULT, attribution 1 shared / 2 refused"
     );
     Ok(())
 }
@@ -14233,6 +14686,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
     }
 
     node_vacuity_bracket(root)?;
+    host_inapplicable_cells_bracket(root)?;
 
     // The one override can only force PRESENT; nothing forces ABSENT.
     let verdict = validate_plan::probe_host_capability(HostCapability::CpuidFaulting);
@@ -21675,12 +22129,32 @@ fn write_ledger_with_snapshot(
     // judgement, so no reader can mistake absence for coverage.
     let intentional_skipped_nodes: Vec<serde_json::Value> = host_inapplicable
         .iter()
+        .filter(|n| !n.runs())
         .map(|n| {
             serde_json::json!({
                 "name": n.tag,
                 "reason": validate_plan::HOST_INAPPLICABLE_REASON,
                 "capability": n.capability.value(),
                 "evidence": n.evidence,
+            })
+        })
+        .collect();
+    // A node that RAN with host-inapplicable cells is in `gates` with its own
+    // verdict and is no skip, so it is named here instead. `classify_run` has
+    // already counted it as a prerequisite failure, which is what keeps the row
+    // from reading as complete coverage.
+    let host_inapplicable_cell_nodes: Vec<serde_json::Value> = host_inapplicable
+        .iter()
+        .filter_map(|n| {
+            n.cells.map(|cells| {
+                serde_json::json!({
+                    "name": n.tag,
+                    "reason": validate_plan::HOST_INAPPLICABLE_REASON,
+                    "capability": n.capability.value(),
+                    "withheld_cells": cells.withheld,
+                    "selected_cells": cells.selected,
+                    "evidence": n.evidence,
+                })
             })
         })
         .collect();
@@ -21825,6 +22299,7 @@ fn write_ledger_with_snapshot(
         // that reason in. Recording the omission honestly is what costs the
         // receipt; it is not a way to buy one.
         "intentional_skipped_nodes": intentional_skipped_nodes,
+        "host_inapplicable_cell_nodes": host_inapplicable_cell_nodes,
         // Nodes that never ran because something they depend on failed. Named,
         // not just counted, so a reader can tell the two kinds of absence apart.
         "dependency_skipped_nodes": skipped,
@@ -25050,19 +25525,7 @@ fn run(
         } else {
             ""
         },
-        if plan.host_inapplicable.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; {} planned node(s) withheld as host-inapplicable and NOT counted as passing: {}",
-                plan.host_inapplicable.len(),
-                plan.host_inapplicable
-                    .iter()
-                    .map(|n| n.tag.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
+        host_inapplicable_plan_summary(&plan.host_inapplicable)
     );
     // A measured estimate from THIS machine's own history, or an honest "not
     // enough history" (validate.sh:936). Printed after the durable log is
@@ -25454,7 +25917,7 @@ fn run(
         s.nodes_executed = completed_node_count(&outcomes, &attempts);
         s.nodes_failed = classification.product_failure_nodes.len();
         s.nodes_skipped = skipped.len();
-        s.nodes_host_inapplicable = plan.host_inapplicable.len();
+        s.nodes_host_inapplicable = plan.host_inapplicable.iter().filter(|n| !n.runs()).count();
         s.executed_tests = executed_tests;
         s.passed_tests = passed_tests;
         s.selection_mode = Some(plan.selection_mode.into());
@@ -26009,17 +26472,43 @@ fn run(
     detail.extend(execution_completeness_details(&skipped, execution_complete));
     // Named in the verdict itself, not only in the plan header. A green summary
     // that omitted this would let a reader take the run for full coverage.
-    if !plan.host_inapplicable.is_empty() {
+    let (partly, wholly): (Vec<_>, Vec<_>) = plan.host_inapplicable.iter().partition(|n| n.runs());
+    if !wholly.is_empty() {
         detail.push(format!(
             "{} planned node(s) were NOT RUN because this machine provably cannot run them, and \
              are recorded as '{}': {}. This is NOT a pass and NOT coverage — whatever those nodes \
              verify is UNVERIFIED by this run, and the ledger row carries the omission so the \
              parent's receipt gate can refuse it.",
-            plan.host_inapplicable.len(),
+            wholly.len(),
             validate_plan::HOST_INAPPLICABLE_REASON,
-            plan.host_inapplicable
+            wholly
                 .iter()
                 .map(|n| format!("{} (needs {})", n.tag, n.capability.value()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !partly.is_empty() {
+        detail.push(format!(
+            "{} node(s) RAN with manifest cells withheld because this machine provably cannot \
+             run them, and are recorded as '{}': {}. Those cells are NOT a pass and NOT coverage, \
+             so this run is not complete.",
+            partly.len(),
+            validate_plan::HOST_INAPPLICABLE_REASON,
+            partly
+                .iter()
+                .map(|n| {
+                    let cells = n
+                        .cells
+                        .expect("a running host-inapplicable node counts cells");
+                    format!(
+                        "{} ({} of {} cell(s) need {})",
+                        n.tag,
+                        cells.withheld,
+                        cells.selected,
+                        n.capability.value()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -26080,7 +26569,7 @@ fn run(
     s.retry_occurrences = test_summary.retry_occurrences;
     s.individual_test_results_complete = individual_test_results_complete;
     s.nodes_skipped = skipped.len();
-    s.nodes_host_inapplicable = plan.host_inapplicable.len();
+    s.nodes_host_inapplicable = plan.host_inapplicable.iter().filter(|n| !n.runs()).count();
     s.executed_tests = executed_tests;
     s.passed_tests = passed_tests;
     s.selection_mode = Some(plan.selection_mode.into());
