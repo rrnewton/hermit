@@ -1,8 +1,42 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <script>
+    // Resolve the saved choice before loading CSS, including when storage is blocked.
+    (() => {
+      const root = document.documentElement;
+      const dark = window.matchMedia?.("(prefers-color-scheme: dark)");
+      const light = window.matchMedia?.("(prefers-color-scheme: light)");
+      const validChoice = value => ["system", "dark", "light"].includes(value) ? value : "system";
+      let choice = "system";
+      try { choice = validChoice(localStorage.getItem("hermit-theme")); } catch {}
+      const applyTheme = () => {
+        root.dataset.theme = choice === "system"
+          ? (dark?.matches ? "dark" : light?.matches ? "light" : "dark") : choice;
+        root.style.colorScheme = root.dataset.theme;
+      };
+      applyTheme();
+      [dark, light].forEach(query => query?.addEventListener("change", applyTheme));
+      document.addEventListener("DOMContentLoaded", () => {
+        const control = document.getElementById("theme-choice");
+        control.value = choice;
+        control.addEventListener("change", () => {
+          choice = validChoice(control.value);
+          applyTheme();
+          try { localStorage.setItem("hermit-theme", choice); } catch {}
+        });
+        window.addEventListener("storage", event => {
+          if (event.key !== "hermit-theme" && event.key !== null) return;
+          choice = validChoice(event.newValue);
+          control.value = choice;
+          applyTheme();
+        });
+      });
+    })();
+  </script>
   <meta name="description" content="Hermit controls scheduling, time, and randomness to make Linux programs reproducible. Explore concurrency bugs, record and replay executions, and build instrumentation tools.">
   <title>Tools for Reproducible Linux Execution | Hermetic Infra</title>
   <link rel="stylesheet" href="site.css">
@@ -20,6 +54,11 @@
       <a href="#compatibility">Compatibility</a>
       <a href="#examples">Examples</a>
     </nav>
+    <select id="theme-choice" class="theme-control" aria-label="Color theme" title="Color theme: System follows your device settings">
+      <option value="system">System</option>
+      <option value="dark">Dark</option>
+      <option value="light">Light</option>
+    </select>
   </header>
 
   <main id="main">
