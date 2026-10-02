@@ -1,6 +1,63 @@
 schema: 3
 bucket: applications
 test:
+  - id: applications/network-only-curl-http
+    description: Numeric-IP curl records external HTTP once, then offline network replay reproduces stdout and the entire canonical INFO/DETLOG stream
+    lane: privileged
+    requires: [linux, x86_64, userns, ptrace, cc, curl]
+    occasional: false
+    program: tests/compat/localhost_http_server.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      custom:
+        ci: true
+        scenario: network-http-roundtrip
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: This cell exercises the ptrace network-only Record and offline Replay implementation
+          kvm: Network-only Record and offline Replay are not implemented by this backend
+          sabre: Network-only Record and offline Replay are not implemented by this backend
+          liteinst: Network-only Record and offline Replay are not implemented by this backend
+      verify:
+        ci: false
+        ci_disabled_reason: The custom scenario compares live Record against offline Replay; two verification runs do not implement that contract
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Two verification runs do not compare the live Record against offline Replay; custom owns that lifecycle
+          dbt: This lifecycle requires ptrace network-only Record and offline Replay
+          kvm: This lifecycle requires ptrace network-only Record and offline Replay
+          sabre: This lifecycle requires ptrace network-only Record and offline Replay
+          liteinst: This lifecycle requires ptrace network-only Record and offline Replay
+      replay:
+        ci: false
+        ci_disabled_reason: Full-process record replay is not the network-only lifecycle owned by this custom scenario
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Full-process record/replay is not the network-only contract tested here
+          dbt: Full-process record/replay is not the network-only contract tested here
+          kvm: Full-process record/replay is not the network-only contract tested here
+          sabre: Full-process record/replay is not the network-only contract tested here
+          liteinst: Full-process record/replay is not the network-only contract tested here
+      chaos:
+        ci: false
+        ci_disabled_reason: This scenario compares one ordinary Record Replay schedule rather than selecting seed-dependent outcomes
+        backends_enabled: []
+        backends_disabled:
+          ptrace: This cell compares one unselected Record/Replay schedule, not seed-dependent outcomes
+          dbt: This lifecycle requires ptrace network-only Record and offline Replay
+          kvm: This lifecycle requires ptrace network-only Record and offline Replay
+          sabre: This lifecycle requires ptrace network-only Record and offline Replay
+          liteinst: This lifecycle requires ptrace network-only Record and offline Replay
+      naked:
+        ci: false
+        ci_disabled_reason: Native execution cannot record or enforce the offline network replay contract
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution cannot record or enforce offline network replay
   - id: applications/timed-progress-bar
     description: A time-driven Python application completes identically under verification
     lane: portable

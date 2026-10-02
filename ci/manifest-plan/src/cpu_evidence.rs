@@ -86,6 +86,7 @@ pub struct InvocationCpuObservation {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvocationRole {
     Preparation,
+    NetworkHttpServer,
     Execution {
         attempt_index: String,
         backend: RequiredNullable<String>,
@@ -96,6 +97,10 @@ pub enum InvocationRole {
     ParityComparison {
         candidate_execution: u64,
         reference_execution: u64,
+    },
+    NetworkLogComparison {
+        record_execution: u64,
+        replay_execution: u64,
     },
 }
 
@@ -318,6 +323,8 @@ pub enum TerminationPath {
     CpuBudgetStop,
     WallBudgetStop,
     AccountingUnavailableStop,
+    /// A concurrent client's failure requested stop/reap of its host fixture.
+    HostServiceCancelled,
     WaitError,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -583,6 +590,10 @@ impl InvocationCpuObservation {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.termination == TerminationPath::HostServiceCancelled {
+            require(matches!(self.role, InvocationRole::NetworkHttpServer),
+                "host service cancellation belongs only to its server invocation")?;
+        }
         require(
             self.ordinal > 0
                 && self.command.argv.first().is_some_and(|p| nonempty(p))
@@ -635,6 +646,7 @@ impl InvocationCpuObservation {
                             TerminationPath::CpuBudgetStop
                                 | TerminationPath::WallBudgetStop
                                 | TerminationPath::AccountingUnavailableStop
+                                | TerminationPath::HostServiceCancelled
                         ),
                     },
                     "wait operation differs from initiating branch",
@@ -763,7 +775,7 @@ impl InvocationCpuObservation {
                 final_cpu.ok_or("completed wait has no valid CPU receipt")?,
                 ChargeBasis::FinalWait4,
             )),
-            TerminationPath::WallBudgetStop => final_cpu.map(|cpu| (cpu, ChargeBasis::FinalWait4)),
+            TerminationPath::WallBudgetStop | TerminationPath::HostServiceCancelled => final_cpu.map(|cpu| (cpu, ChargeBasis::FinalWait4)),
             TerminationPath::CpuBudgetStop => final_cpu.map(|cpu| {
                 (
                     cpu.max(trigger.expect("validated trigger").cpu_usec),
@@ -858,6 +870,7 @@ impl CellCpuObservationsV1 {
         let mut preparation = false;
         let mut normalizations = BTreeSet::new();
         let mut comparison = false;
+        let mut network_server = false;
         let mut verify_candidate: Option<&InvocationCpuObservation> = None;
         for (index, invocation) in self.invocations.iter().enumerate() {
             require(
@@ -868,10 +881,15 @@ impl CellCpuObservationsV1 {
             invocation.validate()?;
             if let Some(previous) = index.checked_sub(1).map(|i| &self.invocations[i]) {
                 require(
-                    previous.returned_without_timeout()
-                        && !matches!(previous.role, InvocationRole::ParityComparison { .. })
+                    // This service overlaps the following Record invocation.
+                    // Its final failure cannot erase the concurrently launched
+                    // client's observation. Replay still requires success below.
+                    (matches!(previous.role, InvocationRole::NetworkHttpServer)
+                        && matches!(&invocation.role, InvocationRole::Execution { attempt_index, .. } if attempt_index == "network-record"))
+                    || (previous.returned_without_timeout()
+                        && !matches!(previous.role, InvocationRole::ParityComparison { .. } | InvocationRole::NetworkLogComparison { .. })
                         && (!matches!(previous.role, InvocationRole::Preparation)
-                            || previous.completed_successfully()),
+                            || previous.completed_successfully())),
                     "invocation follows a stopped, failed preparation, or final comparison",
                 )?;
             }
@@ -893,10 +911,27 @@ impl CellCpuObservationsV1 {
                     require(!preparation && index == 0, "repeated or late preparation")?;
                     preparation = true;
                 }
+                InvocationRole::NetworkHttpServer => {
+                    require(!network_server && executions.is_empty()
+                        && b.mode == "custom"
+                        && nullable(&b.backend).map(String::as_str) == Some("ptrace"),
+                        "network server is repeated or outside custom/ptrace")?;
+                    network_server = true;
+                }
                 InvocationRole::Execution {
                     attempt_index,
                     backend,
                 } => {
+                    if attempt_index == "network-replay" {
+                        require(network_server && b.mode == "custom"
+                            && self.invocations[..index].iter().any(|prior|
+                                matches!(prior.role, InvocationRole::NetworkHttpServer)
+                                && prior.completed_successfully())
+                            && self.invocations[..index].iter().any(|prior|
+                                matches!(&prior.role, InvocationRole::Execution { attempt_index, .. } if attempt_index == "network-record")
+                                && prior.completed_successfully()),
+                            "offline Replay lacks a reaped successful server and successful Record")?;
+                    }
                     require(nonempty(attempt_index), "empty execution index")?;
                     let backend = nullable(backend).cloned();
                     require(
@@ -964,6 +999,20 @@ impl CellCpuObservationsV1 {
                         candidate.completed_successfully() && reference.completed_successfully(),
                         "comparison operand did not complete with exit zero",
                     )?;
+                    comparison = true;
+                }
+                InvocationRole::NetworkLogComparison { record_execution, replay_execution } => {
+                    require(network_server && !comparison && b.mode == "custom",
+                        "network comparison lacks its unique server/custom route")?;
+                    let record = execution(*record_execution)?;
+                    let replay = execution(*replay_execution)?;
+                    require(matches!(&record.role, InvocationRole::Execution { attempt_index, .. } if attempt_index == "network-record")
+                        && matches!(&replay.role, InvocationRole::Execution { attempt_index, .. } if attempt_index == "network-replay")
+                        && record.completed_successfully() && replay.completed_successfully(),
+                        "network comparison lacks completed Record and Replay operands")?;
+                    require(self.invocations.iter().find(|item| matches!(item.role, InvocationRole::NetworkHttpServer))
+                        .is_some_and(InvocationCpuObservation::completed_successfully),
+                        "network comparison lacks a successfully reaped server")?;
                     comparison = true;
                 }
             }
@@ -1046,6 +1095,9 @@ impl CellCpuObservationsV1 {
                 InvocationRole::ParityComparison {
                     candidate_execution,
                     reference_execution,
+                } | InvocationRole::NetworkLogComparison {
+                    record_execution: candidate_execution,
+                    replay_execution: reference_execution,
                 } => {
                     for ordinal in [candidate_execution, reference_execution] {
                         let operand = self

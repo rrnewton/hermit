@@ -9325,6 +9325,13 @@
           "backend": "kvm"
         },
         {
+          "lane": "privileged",
+          "category": "applications",
+          "test": "applications/network-only-curl-http",
+          "mode": "custom",
+          "backend": "ptrace"
+        },
+        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -13755,6 +13762,13 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "privileged",
+          "category": "applications",
+          "test": "applications/network-only-curl-http",
+          "mode": "custom",
+          "backend": "ptrace"
         },
         {
           "kind": "structured-test-results",
@@ -21685,6 +21699,13 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "privileged",
+          "category": "applications",
+          "test": "applications/network-only-curl-http",
+          "mode": "custom",
+          "backend": "ptrace"
         },
         {
           "kind": "structured-test-results",

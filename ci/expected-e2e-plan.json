@@ -6021,6 +6021,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/random-readv-stream"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "custom",
+      "test": "applications/network-only-curl-http"
     }
   ],
   "schema": 1

@@ -100,6 +100,51 @@ complete, disjoint partition and every disabled backend needs a nonempty WHY.
 For non-naked modes the axis is `ptrace`, `dbt`, `kvm`, `sabre`, and
 `liteinst`; naked partitions only `native`.
 
+### Network-only HTTP lifecycle
+
+`applications/network-only-curl-http` uses the closed
+`custom.scenario: network-http-roundtrip` variant, on ptrace only. Its `program`
+is the existing host `tests/compat/localhost_http_server.c`, compiled by the
+normal fixture preparation path. It is not run as the guest. The guest is
+`/usr/bin/curl --disable --proxy '' --ipv4 --max-time 15 --silent --show-error
+--fail --noproxy '*' --http1.1` against the server's published numeric loopback
+address. The first option disables user curl configuration; both runs use the
+same explicit no-proxy, IPv4, and transfer-timeout options.
+
+Before launching any process, the cell requires these existing deployment
+directories (the public CLI performs their normal validation):
+
+- `HERMIT_PREPARED_NETWORK_GUARD_BPFFS`
+- `HERMIT_PREPARED_NETWORK_GUARD_RECOVERY`
+- `HERMIT_PREPARED_NETWORK_ACCEPTED_RECOVERY`
+
+These are explicit inputs, not provisioning requests. The cell snapshots them
+once, passes the corresponding public `--network-guard-bpffs`,
+`--network-guard-recovery`, and `--network-accepted-recovery` flags, and never
+creates, mounts, rotates, or clears them. Repeated attempts must use the same
+deployment; unresolved recovery entries remain visible.
+
+The scenario starts the one-shot server, waits for its atomic post-listen port
+publication, then invokes `hermit run --network=record --network-trace PATH`.
+It requires the server to exit successfully and be reaped before a second
+normal `hermit run --network=replay --network-trace PATH`. Replay uses the
+product's offline policy, not live-network permission. It must leave the trace
+byte-identical and return the exact recorded HTTP stdout. Finally, the existing
+`hermit log-diff --json ... --record-envelope=all-records-v1` must report a
+complete positive-count canonical INFO match (BitwiseInfoV1), comparing the
+**Record log directly against the Replay log**. No log filters, `--verify`,
+full-process `record start`, or selected seeds are substituted.
+
+Server, Record, Replay, and comparator share the original cell CPU/wall limits;
+the server and Record monitors share the aggregate CPU budget during overlap.
+All process observations, both raw logs, the trace, and comparator report remain
+under the ordinary cell artifact directory. Run it through the official front
+door, with the prepared deployment environment set:
+
+```sh
+target/debug/test-harness run --test applications/network-only-curl-http --mode custom --backend ptrace
+```
+
 ```yaml
 test:
   - id: example/test

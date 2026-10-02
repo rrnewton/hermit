@@ -566,7 +566,8 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "172");
+            // dc9a59e17 added six cli_startup_stderr cases to both selections.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "178");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])

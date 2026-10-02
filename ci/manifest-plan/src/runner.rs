@@ -15,6 +15,10 @@ use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -136,6 +140,7 @@ pub const REQUIRES_VOCABULARY: &[(&str, Option<HostCapability>)] = &[
     ("cc", None),
     ("cpuid", Some(HostCapability::CpuidFaulting)),
     ("cxx", None),
+    ("curl", None),
     ("date", None),
     ("du", None),
     ("find", None),
@@ -249,6 +254,7 @@ pub struct Observation {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeRecipe {
+    pub scenario: Option<CustomScenario>,
     pub ci: CiSelectionSpec,
     pub ci_disabled_reason: Option<CiDisabledReasonSpec>,
     #[serde(default)]
@@ -275,6 +281,13 @@ pub struct ModeRecipe {
     #[serde(default)]
     pub slow_reason: BTreeMap<String, String>,
     pub expected_guest_exit: Option<ExpectedGuestExit>,
+}
+
+/// Host lifecycle orchestration, not a guest shell or full-process replay.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CustomScenario {
+    NetworkHttpRoundtrip,
 }
 
 /// The one nonzero guest disposition a verify cell requires.
@@ -836,6 +849,16 @@ fn validate_document_with_cpu(
             return Err(format!("{}: modes must be exactly {expected:?}", test.id));
         }
         for (mode, recipe) in &test.modes {
+            if recipe.scenario.is_some()
+                && (test.program.as_deref() != Some("tests/compat/localhost_http_server.c")
+                    || test.build.is_some()
+                    || !test.observation.status
+                    || !test.observation.stdout
+                    || test.observation.stderr
+                    || !test.observation.artifacts.is_empty())
+            {
+                return Err(format!("{}: network-http-roundtrip requires the original HTTP server and exact status/stdout observation", test.id));
+            }
             validate_mode_with_cpu(
                 &test.id,
                 mode,
@@ -871,6 +894,20 @@ fn validate_mode_with_cpu(
     bucket_timeout_seconds: u64,
     default_cpu_timeout_seconds: u64,
 ) -> Result<(), String> {
+    if recipe.scenario.is_some()
+        && (mode != "custom"
+            || recipe.backends_enabled != ["ptrace"]
+            || !recipe.args.is_empty()
+            || !recipe.guest_args.is_empty()
+            || recipe.runs.is_some()
+            || recipe.seeds.is_some()
+            || recipe.assert.is_some()
+            || recipe.workdir.is_some())
+    {
+        return Err(format!(
+            "{id}: network-http-roundtrip requires custom/ptrace and owns its two commands; no args, repeats, seeds, assertions, or workdir override"
+        ));
+    }
     validate_mode_workdir(
         id,
         mode,
@@ -2464,6 +2501,18 @@ pub fn build_spec(
                 backend.into(),
             ];
             argv.extend(cell.test.modes["custom"].args.clone());
+            if mode_recipe.scenario == Some(CustomScenario::NetworkHttpRoundtrip) {
+                let direction = match attempt {
+                    "network-record" => "record",
+                    "network-replay" => "replay",
+                    _ => return Err("network HTTP scenario has exactly Record and Replay attempts".into()),
+                };
+                argv.splice(3..3, ["--log-file".into(),
+                    dir.join(format!("{attempt}.log")).to_string_lossy().into_owned()]);
+                argv.extend(["--strict".into(), "--base-env=minimal".into(),
+                    format!("--network={direction}"), "--network-trace".into(),
+                    dir.join("network.trace").to_string_lossy().into_owned()]);
+            }
             if isolated {
                 require_minimal_base_env(&mut argv)?;
                 append_guest_env_args(&mut argv, &env, true);
@@ -2525,6 +2574,19 @@ fn execute_spec_until(
     wall_timeout_seconds: u64,
     remaining_cpu_usec: Option<u64>,
     observations: &mut Vec<InvocationCpuObservation>,
+) -> Result<AttemptResult, String> {
+    execute_spec_until_shared(spec, deadline, cpu_timeout_seconds, wall_timeout_seconds,
+        remaining_cpu_usec, observations, None)
+}
+
+fn execute_spec_until_shared(
+    spec: &CellRunSpec,
+    deadline: Instant,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
+    remaining_cpu_usec: Option<u64>,
+    observations: &mut Vec<InvocationCpuObservation>,
+    cpu_share: Option<ConcurrentCpu>,
 ) -> Result<AttemptResult, String> {
     // The attempt label comes from the spec rather than a parallel parameter.
     // `build_spec` already stored it, and every caller passed the same value to
@@ -2602,7 +2664,10 @@ fn execute_spec_until(
         ));
     }
     let execution_ordinal = observations.len() as u64 + 1;
-    let output = execute_process(request, (deadline, remaining_cpu_usec), observations)?;
+    let output = execute_process_with_cpu_poll_interval(request, ProcessLimits {
+        deadline, cpu_budget_usec: remaining_cpu_usec,
+        cpu_poll_interval: CELL_CPU_POLL_INTERVAL, cpu_share,
+    }, observations)?;
     let mut accounted_cpu_usage_usec = Some(output.cpu_usage_usec);
     let mut normalization_error = None;
     if output.timeout.is_none()
@@ -3089,6 +3154,33 @@ struct ProcessLimits {
     deadline: Instant,
     cpu_budget_usec: Option<u64>,
     cpu_poll_interval: Duration,
+    cpu_share: Option<ConcurrentCpu>,
+}
+
+/// Two existing process monitors share one cell budget during a host service
+/// and its client. Each observation still contains only that process group's
+/// own measurements and wait4 charge; final charges are added exactly once.
+#[derive(Clone)]
+struct ConcurrentCpu {
+    own: Arc<AtomicU64>,
+    other: Arc<AtomicU64>,
+    cancel_service: Arc<AtomicBool>,
+    is_service: bool,
+}
+
+impl ConcurrentCpu {
+    fn pair() -> (Self, Self) {
+        let left = Arc::new(AtomicU64::new(0));
+        let right = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        (Self { own: left.clone(), other: right.clone(), cancel_service: cancel.clone(), is_service: true },
+         Self { own: right, other: left, cancel_service: cancel, is_service: false })
+    }
+
+    fn publish_and_total(&self, own: u64) -> u64 {
+        self.own.fetch_max(own, Ordering::SeqCst);
+        self.own.load(Ordering::SeqCst).saturating_add(self.other.load(Ordering::SeqCst))
+    }
 }
 
 struct ExecutionBudget {
@@ -3269,6 +3361,7 @@ fn execute_process(
             deadline: limits.0,
             cpu_budget_usec: limits.1,
             cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            cpu_share: None,
         },
         observations,
     )
@@ -3374,6 +3467,7 @@ fn monitor_process<R>(
         deadline,
         cpu_budget_usec,
         cpu_poll_interval,
+        cpu_share,
     } = limits;
     let pid = child.id();
     // Authenticate once at spawn and retain this generation's owner through
@@ -3399,8 +3493,10 @@ fn monitor_process<R>(
             started,
             &mut observation.final_wait,
         )? {
+            let total_cpu = cpu_share.as_ref().map_or(cpu_usage_usec,
+                |share| share.publish_and_total(cpu_usage_usec));
             let timeout = cpu_budget_usec
-                .filter(|limit| cpu_usage_usec >= *limit)
+                .filter(|limit| total_cpu >= *limit)
                 .map(|_| ProcessTimeout::Cpu);
             observation.termination = if timeout.is_some() {
                 TerminationPath::FinalWaitCpuBudgetReturn
@@ -3420,6 +3516,17 @@ fn monitor_process<R>(
             });
         }
         let now = Instant::now();
+        if cpu_share.as_ref().is_some_and(|share| share.is_service
+            && share.cancel_service.load(Ordering::SeqCst))
+        {
+            observation.termination = TerminationPath::HostServiceCancelled;
+            let (status, cpu_usage_usec) = stop_process_group(pid, started, &mut observation.final_wait)?;
+            if let Some(share) = &cpu_share { share.publish_and_total(cpu_usage_usec); }
+            observation.returned_cpu_charge = ReturnedCpuCharge::Value {
+                cpu_usec: cpu_usage_usec, basis: ChargeBasis::FinalWait4,
+            };
+            return Ok(ProcessOutput { status, timeout: None, cpu_usage_usec });
+        }
         let (timeout, observed_cpu_usec) = if now >= deadline {
             (Some(ProcessTimeout::Wall), None)
         } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
@@ -3442,7 +3549,9 @@ fn monitor_process<R>(
                 }),
                 None => unreachable!("CPU budget has no invocation reader"),
             };
-            let triggered = sample_result.as_ref().is_ok_and(|used| *used >= limit);
+            let triggered = sample_result.as_ref().is_ok_and(|used| {
+                cpu_share.as_ref().map_or(*used, |share| share.publish_and_total(*used)) >= limit
+            });
             if let LiveCpuObservation::Enabled(live) = &mut observation.live {
                 live.record_poll(
                     now.duration_since(started),
@@ -3486,6 +3595,9 @@ fn monitor_process<R>(
             let cpu_usage_usec = observed_cpu_usec.map_or(final_cpu_usage_usec, |observed| {
                 observed.max(final_cpu_usage_usec)
             });
+            if let Some(share) = &cpu_share {
+                share.publish_and_total(cpu_usage_usec);
+            }
             observation.returned_cpu_charge = ReturnedCpuCharge::Value {
                 cpu_usec: cpu_usage_usec,
                 basis: if observed_cpu_usec.is_some() {
@@ -4176,6 +4288,258 @@ fn acquire_proc_locks_lease(
         .map_err(|error| format!("proc-locks snapshot lease: {error}"))
 }
 
+const NETWORK_HTTP_BODY: &str = "network-only HTTP roundtrip\n";
+
+struct NetworkHttpDeployment {
+    args: Vec<String>,
+}
+
+impl NetworkHttpDeployment {
+    const INPUTS: [(&'static str, &'static str); 3] = [
+        ("HERMIT_PREPARED_NETWORK_GUARD_BPFFS", "--network-guard-bpffs"),
+        ("HERMIT_PREPARED_NETWORK_GUARD_RECOVERY", "--network-guard-recovery"),
+        ("HERMIT_PREPARED_NETWORK_ACCEPTED_RECOVERY", "--network-accepted-recovery"),
+    ];
+
+    fn from_paths(paths: &[String; 3]) -> Result<Self, String> {
+        let mut args = Vec::new();
+        for ((name, option), path) in Self::INPUTS.iter().zip(paths) {
+            if !Path::new(path).is_absolute() || path.contains('\0') {
+                return Err(format!("{name} must name an existing absolute deployment directory"));
+            }
+            args.extend([(*option).to_owned(), path.clone()]);
+        }
+        Ok(Self { args })
+    }
+
+    fn from_env() -> Result<Self, String> {
+        let mut paths = [String::new(), String::new(), String::new()];
+        for (index, (name, _)) in Self::INPUTS.iter().enumerate() {
+            paths[index] = std::env::var(name).map_err(|error| format!("network HTTP scenario requires {name}: {error}"))?;
+            if !Path::new(&paths[index]).is_dir() {
+                return Err(format!("{name} is not an existing deployment directory"));
+            }
+        }
+        Self::from_paths(&paths)
+    }
+
+    fn apply(&self, spec: &mut CellRunSpec) -> Result<(), String> {
+        let end = spec.argv.iter().position(|arg| arg == "--").ok_or("network run lacks guest separator")?;
+        spec.argv.splice(end..end, self.args.clone());
+        Ok(())
+    }
+}
+
+struct NetworkRoundtripOutcome {
+    auxiliary_cpu_usec: u64,
+    failure: Option<String>,
+    comparison: Option<LogDiffReport>,
+}
+
+fn network_http_port(bytes: &[u8]) -> Result<u16, String> {
+    let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let digits = text.strip_suffix('\n').ok_or("HTTP server port lacks final newline")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("HTTP server port is not decimal".into());
+    }
+    digits.parse::<u16>().ok().filter(|port| *port != 0)
+        .ok_or_else(|| "HTTP server port is outside 1..=65535".into())
+}
+
+fn wait_network_http_ready(path: &Path, done: &AtomicBool, deadline: Instant) -> Result<u16, String> {
+    loop {
+        if done.load(Ordering::SeqCst) {
+            return Err("HTTP server exited before client launch".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("HTTP server readiness exceeded the cell wall deadline".into());
+        }
+        match fs::read(path) {
+            Ok(bytes) => return network_http_port(&bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("HTTP server readiness: {error}")),
+        }
+        // The fixture publishes this file atomically only after listen(). No
+        // probe connection consumes its sole accepted HTTP request.
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn network_http_guest(port: u16) -> Vec<String> {
+    ["/usr/bin/curl".to_owned(), "--disable".into(), "--proxy".into(), "".into(),
+        "--ipv4".into(), "--max-time".into(), "15".into(),
+        "--silent".into(), "--show-error".into(),
+        "--fail".into(), "--noproxy".into(), "*".into(), "--http1.1".into(),
+        format!("http://127.0.0.1:{port}/")].into()
+}
+
+fn require_network_log_policy(report: &LogDiffReport) -> Result<(), String> {
+    use crate::logdiff_report::{LOG_DIFF_REPORT_SCHEMA, RecordEnvelopePolicy};
+    let policy = &report.comparison;
+    if report.schema != LOG_DIFF_REPORT_SCHEMA
+        || !matches!(report.verdict, LogDiffVerdict::Matched | LogDiffVerdict::Diverged)
+        || report.refusal.is_some() || report.follow_stopped_because.is_some()
+        || report.records.withheld_incomplete_tail
+        || report.selected_messages.left == 0 || report.selected_messages.right == 0
+        || report.records.compared == 0
+        || report.records.compared != report.records.available_left.min(report.records.available_right)
+        || report.selected_messages.left > report.records.available_left
+        || report.selected_messages.right > report.records.available_right
+        || (report.verdict == LogDiffVerdict::Matched
+            && report.selected_messages.left != report.selected_messages.right)
+        || policy.stream != "info" || policy.record_envelope != RecordEnvelopePolicy::AllRecordsV1
+        || policy.unsafe_strip_lines || !policy.canonicalize_host_addresses
+        || policy.require_structured_events || !policy.ignored_line_substrings.is_empty()
+        || policy.skip_commit || policy.skip_detlog || policy.git_diff
+        || policy.included_detlog_kinds != ["syscall", "syscall_result", "other"]
+    {
+        return Err("network comparison requires complete, positive, unrelaxed all-records-v1 canonical INFO evidence".into());
+    }
+    Ok(())
+}
+
+fn run_network_http_roundtrip(
+    context: &RunContext,
+    cell: &SelectedCell,
+    fixture: (&[String], &NetworkHttpDeployment),
+    dir: &Path,
+    budget: ExecutionBudget,
+    observations: &mut Vec<InvocationCpuObservation>,
+    attempts: &mut Vec<AttemptResult>,
+) -> Result<NetworkRoundtripOutcome, String> {
+    let (server, deployment) = fixture;
+    let [server] = server else { return Err("HTTP scenario expects one compiled server program".into()); };
+    let limit = budget.remaining_cpu_usec.ok_or("HTTP scenario requires cell CPU accounting")?;
+    let port_path = dir.join("http.port");
+    let response_path = dir.join("fixtures/http.response");
+    let trace_path = dir.join("network.trace");
+    if port_path.exists() || trace_path.exists() {
+        return Err("HTTP scenario refuses an existing port publication or network trace".into());
+    }
+    fs::write(&response_path, format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{NETWORK_HTTP_BODY}", NETWORK_HTTP_BODY.len()))
+        .map_err(|error| error.to_string())?;
+    let captures = dir.join("captures");
+    let request = ProcessRequest::new(InvocationRole::NetworkHttpServer, &context.root,
+        server, &[port_path.display().to_string(), response_path.display().to_string()],
+        &execution_cell_env(context, dir, false), &captures.join("http-server.stdout"),
+        &captures.join("http-server.stderr"));
+    let server_index = observations.len();
+    let mut server_observation = InvocationCpuObservation::pending(server_index as u64 + 1,
+        request.role, request.command, true);
+    let started = Instant::now();
+    let child = spawn_process(&request.cwd, &request.stdout, &request.stderr, &mut server_observation);
+    observations.push(server_observation.clone());
+    let child = child?;
+    let (server_cpu, client_cpu) = ConcurrentCpu::pair();
+    let cancel = server_cpu.cancel_service.clone();
+    let done = AtomicBool::new(false);
+    let (record, server_output) = thread::scope(|scope| {
+        let finished = &done;
+        let monitor = scope.spawn(move || {
+            let result = monitor_process(child, ProcessLimits {
+                deadline: budget.deadline, cpu_budget_usec: Some(limit),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL, cpu_share: Some(server_cpu),
+            }, started, &mut server_observation,
+                |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
+                |reader| reader.seconds().map_err(|error| error.to_string()));
+            finished.store(true, Ordering::SeqCst);
+            (result, server_observation)
+        });
+        // Every early return is inside this closure: the original monitor is
+        // always asked to stop on failure and joined before we can return.
+        let record: Result<CellRunSpec, String> = (|| {
+            let port = wait_network_http_ready(&port_path, &done, budget.deadline)?;
+            let mut spec = build_spec(context, cell, dir.to_owned(), network_http_guest(port),
+                "network-record", None, remaining_cell_seconds(budget.deadline))?;
+            deployment.apply(&mut spec)?;
+            let mut attempt = execute_spec_until_shared(&spec, budget.deadline,
+                budget.cpu_timeout_seconds, budget.wall_timeout_seconds, Some(limit),
+                observations, Some(client_cpu))?;
+            attempt.observation_sha256 = Some(observation_hash(&cell.test.observation, &attempt, dir));
+            attempts.push(attempt);
+            Ok(spec)
+        })();
+        if record.is_err() || attempts.last().is_none_or(|attempt| attempt.outcome != "PASS") {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let (server_result, observation) = monitor.join().map_err(|_| "HTTP server monitor panicked")?;
+        observations[server_index] = observation;
+        Ok::<_, String>((record, server_result?))
+    })?;
+    let record: CellRunSpec = record?;
+    let mut result = NetworkRoundtripOutcome {
+        auxiliary_cpu_usec: server_output.cpu_usage_usec, failure: None, comparison: None,
+    };
+    if attempts.last().is_none_or(|attempt| attempt.outcome != "PASS") { return Ok(result); }
+    if server_output.timeout.is_some() || !server_output.status.success() {
+        result.failure = Some(format!("HTTP server did not complete successfully before Replay: {}", server_output.status));
+        return Ok(result);
+    }
+    let record_cpu = attempts[0].cpu_usage_usec.ok_or("Record lacks final CPU measurement")?;
+    let used = record_cpu.checked_add(server_output.cpu_usage_usec).ok_or("HTTP CPU sum overflow")?;
+    if used >= limit { result.failure = Some("HTTP Record and server exhausted the cell CPU budget".into()); return Ok(result); }
+    let trace = fs::read(&trace_path).map_err(|error| format!("Record trace: {error}"))?;
+    if trace.is_empty() { return Err("Record produced an empty network trace".into()); }
+    // Only the reaped one-shot server could serve this numeric address. Replay
+    // is a separate normal run with the product's network-offline policy, not
+    // full-process replay and not --verify's two offline runs.
+    let mut replay = build_spec(context, cell, dir.to_owned(), record.guest_argv.clone(),
+        "network-replay", None, remaining_cell_seconds(budget.deadline))?;
+    deployment.apply(&mut replay)?;
+    attempts.push(execute_observed_until(&replay, &cell.test.observation, dir, ExecutionBudget {
+        remaining_cpu_usec: Some(limit - used), ..budget
+    }, observations)?);
+    if fs::read(&trace_path).map_err(|error| error.to_string())? != trace {
+        result.failure = Some("offline Replay modified the recorded network trace".into());
+        return Ok(result);
+    }
+    if attempts.last().is_none_or(|attempt| attempt.outcome != "PASS") { return Ok(result); }
+    let record_stdout = fs::read(captures.join("custom-network-record.stdout")).map_err(|error| error.to_string())?;
+    let replay_stdout = fs::read(captures.join("custom-network-replay.stdout")).map_err(|error| error.to_string())?;
+    if record_stdout != NETWORK_HTTP_BODY.as_bytes() || replay_stdout != record_stdout {
+        result.failure = Some("Record/Replay stdout differs from the exact HTTP response or from each other".into());
+    }
+    let record_log = dir.join("network-record.log");
+    let replay_log = dir.join("network-replay.log");
+    let original_logs = [fs::read(&record_log), fs::read(&replay_log)];
+    let [left, right] = original_logs.map(|value| value.map_err(|error| error.to_string()));
+    let (left, right) = (left?, right?);
+    let comparison_path = dir.join("network-logdiff.json");
+    let request = ProcessRequest::new(InvocationRole::NetworkLogComparison {
+        record_execution: execution_ordinal(observations, "network-record")?,
+        replay_execution: execution_ordinal(observations, "network-replay")?,
+    }, &context.root, &context.hermit_bin.to_string_lossy(),
+        &["log-diff".into(), record_log.display().to_string(), replay_log.display().to_string(),
+          "--json".into(), comparison_path.display().to_string(), "--record-envelope=all-records-v1".into()],
+        &record.env, &captures.join("network-logdiff.stdout"), &captures.join("network-logdiff.stderr"));
+    let used = used.checked_add(attempts[1].cpu_usage_usec.ok_or("Replay lacks final CPU measurement")?)
+        .ok_or("HTTP CPU sum overflow")?;
+    if used >= limit || Instant::now() >= budget.deadline {
+        result.failure = Some("network log comparison has no remaining cell budget".into());
+        return Ok(result);
+    }
+    let comparison = execute_process(request, (budget.deadline, Some(limit - used)), observations)?;
+    result.auxiliary_cpu_usec = result.auxiliary_cpu_usec.checked_add(comparison.cpu_usage_usec)
+        .ok_or("HTTP auxiliary CPU sum overflow")?;
+    if comparison.timeout.is_some() { return Err("network log comparison exceeded the original cell budget".into()); }
+    let report: LogDiffReport = serde_json::from_slice(&fs::read(&comparison_path).map_err(|error| error.to_string())?)
+        .map_err(|error| format!("network log comparison report: {error}"))?;
+    require_network_log_policy(&report)?;
+    if fs::read(&record_log).map_err(|error| error.to_string())? != left
+        || fs::read(&replay_log).map_err(|error| error.to_string())? != right {
+        return Err("Record/Replay logs changed during comparison".into());
+    }
+    match (comparison.status.code(), report.verdict) {
+        (Some(0), LogDiffVerdict::Matched) => {}
+        (Some(1), LogDiffVerdict::Diverged) => {
+            result.failure = Some("Record and offline Replay canonical INFO/DETLOG streams diverged".into());
+        }
+        _ => return Err("network log comparison status contradicts its typed verdict".into()),
+    }
+    result.comparison = Some(report);
+    Ok(result)
+}
+
 fn run_cell_inner(
     context: &RunContext,
     cell: &SelectedCell,
@@ -4189,6 +4553,8 @@ fn run_cell_inner(
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let timeouts = cell_timeouts(context, cell)?;
+    let deployment = cell.test.modes[&cell.id.mode].scenario
+        .map(|_| NetworkHttpDeployment::from_env()).transpose()?;
     let preparation_deadline =
         execution_deadline_after_preparation(started, timeouts.wall_seconds)?;
     let binary_before = fs::read(&context.hermit_bin)
@@ -4224,7 +4590,15 @@ fn run_cell_inner(
     let mut backend_parity = None;
     let mut parity_error: Option<(&'static str, String)> = None;
     let mut parity_comparison_cpu_usage_usec = Some(0);
+    let mut network_result = None;
     match cell.id.mode.as_str() {
+        "custom" if mode.scenario == Some(CustomScenario::NetworkHttpRoundtrip) => {
+            network_result = Some(run_network_http_roundtrip(context, cell,
+                (&guest, deployment.as_ref().ok_or("network deployment was not captured")?), &dir,
+                ExecutionBudget { deadline, cpu_timeout_seconds: timeouts.cpu_seconds,
+                    wall_timeout_seconds: timeouts.wall_seconds,
+                    remaining_cpu_usec: Some(execution_cpu_budget_usec) }, observations, attempts)?);
+        }
         "naked" => {
             for index in 1..=mode.runs.unwrap_or(3) {
                 let spec = build_spec(
@@ -4508,6 +4882,20 @@ fn run_cell_inner(
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
+    if let Some(network) = &network_result {
+        if let Some(failure) = &network.failure {
+            outcome = "FAIL".into();
+            reason = Some(failure.clone());
+        }
+        if let Some(report) = &network.comparison {
+            first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+            first_divergent_virtual_nanoseconds = report.first_divergent_virtual_nanoseconds;
+            first_divergent_record = report.first_divergent_record.map(|record| record as u64);
+            first_divergent_syscall = report.first_divergent_syscall;
+            first_divergent_left_message = report.first_divergent_left_message.clone();
+            first_divergent_right_message = report.first_divergent_right_message.clone();
+        }
+    }
     if let Some((kind, error)) = parity_error {
         outcome = "ERROR".into();
         error_kind = Some(kind.into());
@@ -4674,7 +5062,8 @@ fn run_cell_inner(
         .try_fold(preparation_cpu_usage_usec, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
         })
-        .and_then(|total| checked_add_cpu_usage(Some(total), parity_comparison_cpu_usage_usec));
+        .and_then(|total| checked_add_cpu_usage(Some(total), parity_comparison_cpu_usage_usec))
+        .and_then(|total| total.checked_add(network_result.as_ref().map_or(0, |result| result.auxiliary_cpu_usec)));
     Ok(CellResult {
         cpu_observations: None,
         artifact_dir: dir.display().to_string(),
@@ -5597,6 +5986,153 @@ mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
 
+    #[test]
+    fn network_http_manifest_selects_only_the_original_two_run_route() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let set = ManifestSet::load(&root).unwrap();
+        let cells = set.select(&Selection {
+            test: Some("applications/network-only-curl-http".into()),
+            population: Some(Population::Enabled), ..Selection::default()
+        }).unwrap();
+        assert_eq!(cells.len(), 1);
+        let cell = &cells[0];
+        assert_eq!((cell.id.mode.as_str(), cell.id.backend.as_deref()), ("custom", Some("ptrace")));
+        assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+        let directory = tempfile::tempdir().unwrap();
+        let context = run_context(directory.path());
+        let guest = network_http_guest(12345);
+        assert_eq!(guest, ["/usr/bin/curl", "--disable", "--proxy", "", "--ipv4",
+            "--max-time", "15", "--silent", "--show-error", "--fail", "--noproxy", "*",
+            "--http1.1", "http://127.0.0.1:12345/"]);
+        let paths = ["/prepared/bpffs".into(), "/prepared/guard".into(), "/prepared/accepted".into()];
+        let deployment = NetworkHttpDeployment::from_paths(&paths).unwrap();
+        for (attempt, direction) in [("network-record", "record"), ("network-replay", "replay")] {
+            let mut spec = build_spec(&context, cell, directory.path().to_owned(), guest.clone(), attempt, None, 57).unwrap();
+            deployment.apply(&mut spec).unwrap();
+            assert_eq!(spec.guest_argv, guest);
+            assert!(spec.argv.contains(&format!("--network={direction}")));
+            assert!(!spec.argv.iter().any(|arg| arg.starts_with("--verify") || arg == "record" || arg == "start" || arg.contains("unsafe-live") || arg.starts_with("--seed")));
+            assert!(spec.argv.contains(&"--strict".into()));
+            assert!(spec.argv.contains(&"--base-env=minimal".into()));
+            for (index, (_, flag)) in NetworkHttpDeployment::INPUTS.iter().enumerate() {
+                let position = spec.argv.iter().position(|arg| arg == flag).unwrap();
+                assert_eq!(spec.argv[position + 1], paths[index]);
+            }
+        }
+        let mut mode = cell.test.modes["custom"].clone();
+        assert!(validate_mode(&cell.id.test, "verify", &mode, 57).is_err());
+        mode.args.push("--verify".into());
+        assert!(validate_mode(&cell.id.test, "custom", &mode, 57).is_err());
+        assert!(serde_yaml::from_str::<ModeRecipe>("scenario: arbitrary-shell\nci: true\n").is_err());
+    }
+
+    #[test]
+    fn network_http_readiness_and_deployment_inputs_refuse_missing_or_invalid_values() {
+        assert_eq!(network_http_port(b"12345\n").unwrap(), 12345);
+        for invalid in [&b"0\n"[..], b"65536\n", b" 80\n", b"80", b"80\nextra", b"+80\n"] {
+            assert!(network_http_port(invalid).is_err(), "{invalid:?}");
+        }
+        for bad in ["", "relative", "/bad\0path"] {
+            assert!(NetworkHttpDeployment::from_paths(&["/a".into(), bad.into(), "/c".into()]).is_err());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        assert!(wait_network_http_ready(&directory.path().join("missing"), &AtomicBool::new(true), Instant::now() + Duration::from_secs(1)).is_err());
+        assert!(wait_network_http_ready(&directory.path().join("missing"), &AtomicBool::new(false), Instant::now()).is_err());
+    }
+
+    fn network_log_report() -> LogDiffReport {
+        serde_json::from_value(serde_json::json!({
+            "schema":1,"verdict":"matched","selected_messages":{"left":2,"right":2},
+            "records":{"compared":2,"available_left":2,"available_right":2,"withheld_incomplete_tail":false},
+            "comparison":{"stream":"info","record_envelope":"all_records_v1","unsafe_strip_lines":false,
+                "canonicalize_host_addresses":true,"require_structured_events":false,"ignored_line_substrings":[],
+                "skip_commit":false,"skip_detlog":false,"included_detlog_kinds":["syscall","syscall_result","other"],"git_diff":false},
+            "first_divergent_syscall":null,"first_divergent_scheduler_turn":null,
+            "first_divergent_virtual_nanoseconds":null,"first_divergent_left_message":null,"first_divergent_right_message":null
+        })).unwrap()
+    }
+
+    #[test]
+    fn network_http_log_comparison_never_accepts_empty_relaxed_or_partial_evidence() {
+        let good = network_log_report();
+        require_network_log_policy(&good).unwrap();
+        let mut bad = good.clone(); bad.selected_messages.left = 0;
+        assert!(require_network_log_policy(&bad).is_err());
+        let mut bad = good.clone(); bad.records.withheld_incomplete_tail = true;
+        assert!(require_network_log_policy(&bad).is_err());
+        let mut bad = good.clone(); bad.comparison.skip_detlog = true;
+        assert!(require_network_log_policy(&bad).is_err());
+        let mut bad = good.clone(); bad.comparison.ignored_line_substrings.push("network".into());
+        assert!(require_network_log_policy(&bad).is_err());
+        let mut bad = good.clone(); bad.comparison.record_envelope = crate::logdiff_report::RecordEnvelopePolicy::CrossBackendDetcoreV1;
+        assert!(require_network_log_policy(&bad).is_err());
+        let mut bad = good.clone(); bad.verdict = LogDiffVerdict::IdenticalSoFar;
+        assert!(require_network_log_policy(&bad).is_err());
+        let mut bad = good; bad.selected_messages.right = 1;
+        assert!(require_network_log_policy(&bad).is_err());
+    }
+
+    #[test]
+    fn network_http_concurrent_cpu_shares_one_budget_without_resetting_high_water() {
+        let (server, record) = ConcurrentCpu::pair();
+        assert_eq!(server.publish_and_total(30), 30);
+        assert_eq!(record.publish_and_total(70), 100);
+        assert_eq!(server.publish_and_total(20), 100);
+        assert_eq!(record.publish_and_total(80), 110);
+        record.cancel_service.store(true, Ordering::SeqCst);
+        assert!(server.cancel_service.load(Ordering::SeqCst));
+        assert!(server.is_service);
+        assert!(!record.is_service);
+    }
+
+    #[test]
+    fn network_http_failed_record_reaps_its_server_without_launching_replay() {
+        // These shell stand-ins test the host lifecycle, not curl, provider
+        // admission, or the real canonical comparator. The manifest cell owns
+        // that separate end-to-end obligation.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let dir = root.join("cell");
+        prepare_dirs(root, &dir).unwrap();
+        let server = root.join("server");
+        fs::write(&server, r#"#!/bin/sh
+set -eu
+mkfifo "$PWD/server-hold"
+printf '12345\n' > "$1.tmp"
+mv "$1.tmp" "$1"
+read -r ignored < "$PWD/server-hold"
+"#).unwrap();
+        let context = run_context(root);
+        fs::write(&context.hermit_bin, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PWD/invocations\"\nexit 7\n").unwrap();
+        for path in [&server, &context.hermit_bin] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cell = ptrace_cell("custom");
+        cell.test.modes.get_mut("custom").unwrap().scenario = Some(CustomScenario::NetworkHttpRoundtrip);
+        let deployment = NetworkHttpDeployment::from_paths(&["/prepared/a".into(), "/prepared/b".into(), "/prepared/c".into()]).unwrap();
+        let mut observations = Vec::new();
+        let mut attempts = Vec::new();
+        let result = run_network_http_roundtrip(&context, &cell,
+            (&[server.display().to_string()], &deployment), &dir,
+            ExecutionBudget { deadline: Instant::now() + Duration::from_secs(5),
+                cpu_timeout_seconds: 5, wall_timeout_seconds: 5, remaining_cpu_usec: Some(5_000_000) },
+            &mut observations, &mut attempts).unwrap();
+        assert!(result.comparison.is_none());
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, Some(7));
+        assert_eq!(attempts[0].outcome, "FAIL");
+        assert_eq!(observations[0].termination, TerminationPath::HostServiceCancelled);
+        assert!(matches!(observations[0].final_wait, FinalWaitObservation::Reaped { .. }));
+        let mut recorded = empty_cpu_observations(&context, &cell);
+        recorded.invocations = observations;
+        recorded.validate().unwrap();
+        let invocations = fs::read_to_string(root.join("invocations")).unwrap();
+        assert!(invocations.contains("--network=record"));
+        assert!(!invocations.contains("--network=replay"));
+        assert!(!dir.join("network-logdiff.json").exists());
+    }
+
     /// The four outcomes of the verification-spelling probe.
     ///
     /// The first two are answers and must be reported as answers. The last two
@@ -6489,6 +7025,7 @@ mod tests {
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
                 + 3 // the exact RNG identities asserted above
+                + 1 // applications/network-only-curl-http custom/ptrace
         );
         assert_eq!(
             enabled.len() - required.len(),
@@ -7063,6 +7600,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(5),
                     cpu_budget_usec: Some(5_000_000),
                     cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                    cpu_share: None,
                 },
                 started,
                 &mut observation,
@@ -7129,6 +7667,7 @@ mod tests {
                     deadline: started + Duration::from_secs(5),
                     cpu_budget_usec: Some(5_000_000),
                     cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                    cpu_share: None,
                 },
                 started,
                 &mut observation,
@@ -7217,6 +7756,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(5),
                     cpu_budget_usec,
                     cpu_poll_interval: Duration::from_secs(5),
+                    cpu_share: None,
                 },
                 started,
                 &mut observation,
@@ -7271,6 +7811,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(5),
                 cpu_budget_usec: Some(5_000_000),
                 cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                cpu_share: None,
             },
             started,
             &mut observation,
@@ -7619,6 +8160,7 @@ int main(int argc, char **argv) {
                 deadline: started + Duration::from_secs(5),
                 cpu_budget_usec: Some(2_000_000),
                 cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                cpu_share: None,
             },
             started,
             &mut observation,
@@ -7786,6 +8328,7 @@ int main(int argc, char **argv) {
                 deadline: Instant::now() + Duration::from_secs(5),
                 cpu_budget_usec: Some(1),
                 cpu_poll_interval: Duration::from_secs(5),
+                cpu_share: None,
             },
             &mut observations,
         )

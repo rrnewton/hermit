@@ -24,6 +24,7 @@ use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
 use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
 use hermit_manifest_plan::cli_help::is_help_flag;
+use hermit_manifest_plan::runner::CustomScenario;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
 #[cfg(test)]
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
@@ -1240,7 +1241,7 @@ fn validate_mode_with_cpu(
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
-        "custom" => allowed.extend(["args", "assert"]),
+        "custom" => allowed.extend(["args", "assert", "scenario"]),
         // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
         // cell from the lossy default comparator to the L2 parity comparator and
         // requires the run's own verdict JSON to report parity. Without it a
@@ -1343,6 +1344,25 @@ fn validate_mode_with_cpu(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
     );
+    let scenario: Option<CustomScenario> = spec.get("scenario").map(|value| {
+        parse_schema_value(value, &format!("{id}: modes.{mode}.scenario"))
+    });
+    if scenario.is_some()
+        && (mode != "custom"
+            || enabled != ["ptrace"]
+            || spec.get("args").is_some_and(|value| {
+                !string_array(Some(value), &format!("{id}.modes.{mode}.args")).is_empty()
+            })
+            || spec.get("guest_args").is_some_and(|value| {
+                value.as_table().is_none_or(|arguments| !arguments.is_empty())
+            })
+            || spec.contains_key("assert")
+            || spec.contains_key("workdir"))
+    {
+        die(format!(
+            "{id}: network-http-roundtrip requires custom/ptrace and owns its two commands; no args, guest args, assertions, or workdir override"
+        ));
+    }
     let enabled_set = enabled.iter().cloned().collect::<BTreeSet<_>>();
     let timeout_overrides = cell_timeout_overrides(
         spec_value,
@@ -1575,7 +1595,7 @@ fn validate_mode_with_cpu(
             }
         }
     }
-    if mode == "custom" && !enabled.is_empty() {
+    if mode == "custom" && scenario.is_none() && !enabled.is_empty() {
         let args = string_array(spec.get("args"), &format!("{id}.modes.custom.args"));
         if args.is_empty() {
             die(format!("{id}: enabled custom mode requires args"));
@@ -1680,6 +1700,11 @@ fn mode_attempts(id: &str, mode: &str, spec_value: &Value) -> Option<i64> {
             None => Some(3),
         },
         "custom" => {
+            if let Some(value) = spec.get("scenario") {
+                let CustomScenario::NetworkHttpRoundtrip =
+                    parse_schema_value(value, &format!("{id}: modes.custom.scenario"));
+                return Some(2);
+            }
             let Some(assert_value) = spec.get("assert") else {
                 return Some(1);
             };
@@ -1860,6 +1885,52 @@ mod tests {
     fn rejects_unknown_schema_keys() {
         let value = parse_mode("known = true\nunknown = false\n");
         ensure_keys(&value, &["known"], "test");
+    }
+
+    #[test]
+    fn network_http_scenario_is_closed_and_has_exactly_two_ptrace_runs() {
+        let recipe = r#"
+ci = true
+scenario = "network-http-roundtrip"
+backends_enabled = ["ptrace"]
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#;
+        let mut rows = Vec::new();
+        validate_mode("bucket/test", "bucket", "privileged", "custom", 57,
+            &parse_mode(recipe), &mut rows);
+        let selected: Vec<_> = rows.iter().filter(|row| row.ci).collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].backend, "ptrace");
+        assert_eq!(selected[0].attempts, Some(2));
+        // The positive recipe intentionally omits args. A supplied value must
+        // still have the original array shape and cannot replace this scenario.
+        for (args, diagnostic) in [
+            ("false", "bucket/test.modes.custom.args: expected an array"),
+            ("[\"--verify\"]", "bucket/test: network-http-roundtrip requires custom/ptrace and owns its two commands; no args, guest args, assertions, or workdir override"),
+        ] {
+            let invalid = recipe.replace("ci = true", &format!("ci = true\nargs = {args}"));
+            let error = std::panic::catch_unwind(|| {
+                validate_mode("bucket/test", "bucket", "privileged", "custom", 57,
+                    &parse_mode(&invalid), &mut Vec::new());
+            }).expect_err("supplied invalid args must refuse");
+            assert_eq!(error.downcast_ref::<String>().unwrap(), &format!("manifest-plan: {diagnostic}"));
+        }
+        for (mode, invalid) in [
+            ("verify", recipe.to_owned()),
+            ("custom", recipe.replace("network-http-roundtrip", "arbitrary-shell")),
+            ("custom", recipe.replace("ci = true", "ci = true\nargs = [\"--verify\"]")),
+            ("custom", recipe.replace("ci = true", "ci = true\nworkdir = \"temporary\"")),
+            ("custom", recipe.replace("[\"ptrace\"]", "[\"kvm\"]")),
+        ] {
+            assert!(std::panic::catch_unwind(|| {
+                validate_mode("bucket/test", "bucket", "privileged", mode, 57,
+                    &parse_mode(&invalid), &mut Vec::new());
+            }).is_err(), "accepted {mode}: {invalid}");
+        }
     }
 
     #[test]
