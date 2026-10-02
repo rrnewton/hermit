@@ -428,7 +428,50 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3522 adds
     // runner::tests::a_passing_patching_backend_report_must_carry_a_consistent_dispatch_record,
     // which retains all 783 prior identities.
-    ("test.regular_crates", 784),
+    // Slice S12 of https://github.com/rrnewton/hermit/issues/3301 adds 31
+    // hermit-manifest-plan test identities and removes one, which S12
+    // replaced with a rewritten test under a new name: 784 - 1 + 31 = 814,
+    // and 783 of the 784 prior identities are retained. No other selected
+    // crate gains or loses a test. parity.rs goes from 36 lib tests to 64.
+    // The rewritten test,
+    // parity::tests::a_rejected_operand_takes_the_harness_class_with_the_callers_reason,
+    // replaces
+    // parity::tests::a_rejected_operand_is_unavailable_with_the_callers_reason,
+    // and these 28 are new:
+    // parity::tests::{
+    //   a_cell_the_expected_scope_owes_but_the_status_omits_is_record_missing,
+    //   a_comparison_no_record_can_carry_is_log_diff_failed_with_both_logs,
+    //   a_complete_status_with_a_count_mismatch_is_refused,
+    //   a_diverged_report_under_any_typed_result_leaves_its_side_without_a_log,
+    //   a_failed_status_owes_record_missing_rows_for_its_unrecorded_scope,
+    //   a_hanging_writer_is_killed_at_its_bound,
+    //   a_ledger_row_that_disagrees_with_its_record_is_refused,
+    //   a_ledger_row_with_a_malformed_emitted_at_is_refused,
+    //   a_log_diff_verdict_that_is_not_a_measurement_is_log_diff_failed,
+    //   a_mean_credit_below_one_never_prints_as_full_credit,
+    //   a_mismatched_operand_is_never_compared_even_with_both_logs_retained,
+    //   a_parity_record_breaking_a_credit_invariant_is_refused_by_that_invariant,
+    //   a_post_pass_failed_outside_post_pass_owes_its_scope,
+    //   a_real_post_pass_reads_back_through_ledger_sources,
+    //   a_refused_node_owes_record_missing_rows_for_its_expected_cells,
+    //   a_report_that_is_not_cross_backend_evidence_is_log_diff_failed,
+    //   a_result_root_is_removed_when_its_test_ends,
+    //   a_schema_one_status_is_accepted_by_its_count,
+    //   a_timeout_is_unavailable_with_its_own_class,
+    //   a_writer_that_cannot_append_is_named_and_leaves_the_rows,
+    //   an_absent_status_owes_its_expected_cells,
+    //   an_invalid_record_refuses_the_node,
+    //   appended_rows_reach_the_writer_with_the_runs_identity,
+    //   emitted_at_is_read_as_an_rfc3339_utc_instant,
+    //   every_class_a_post_pass_decides_is_typed_and_counted_once,
+    //   inputs_not_equalized_is_for_a_backend_that_cannot_be_equalized_only,
+    //   ledger_verdicts_order_from_most_to_least_adverse,
+    //   staging_input_never_removes_a_file_it_did_not_create};
+    // the new tests/parity_export.rs integration binary adds two:
+    // parity_export:
+    //   export_prints_one_row_per_owed_cell_and_passes_real_records_through,
+    //   export_refuses_an_inconsistent_node_and_prints_no_rows.
+    ("test.regular_crates", 814),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -747,7 +790,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its every-spelling companion retains all 779 prior identities.
     // The dispatch-record runner test retains all 783 prior identities
     // (https://github.com/rrnewton/hermit/pull/3522).
-    ("test.regular_crates_on_host", 784),
+    // The selection includes the S12 parity tests above: 31 identities
+    // added and one removed, whose test S12 rewrote under a new name, so 783
+    // of its 784 prior identities are retained.
+    ("test.regular_crates_on_host", 814),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
