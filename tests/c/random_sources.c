@@ -174,6 +174,11 @@ static int fill_device(const char* path, uint8_t buffer[BYTES]) {
  * the vDSO entry itself, not whatever libc decides to do. glibc only started
  * routing getrandom() through the vDSO in 2.41, so on an older libc a normal
  * call does not exercise this path at all.
+ *
+ * Under Hermit, every Reverie backend that patches the vDSO replaces
+ * `__vdso_getrandom` with a stub that refuses the parameter query, so this leg
+ * prints `vdso-getrandom unavailable` on every kernel. `vdso-getrandom[N]`
+ * lines under Hermit mean the stub is gone.
  */
 
 #ifndef MAP_DROPPABLE

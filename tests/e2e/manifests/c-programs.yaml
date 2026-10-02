@@ -17888,7 +17888,7 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this guest
           liteinst: No custom edge-case arguments have been calibrated for this guest
   - id: c-programs/random-sources-root-only
-    description: The root thread random stream of tests/c/random_sources.c is byte-identical across runs and backends; the golden includes the vDSO getrandom leg, so it needs a host kernel that exports __vdso_getrandom (Linux 6.11+), declared by the vdso-getrandom requirement
+    description: The root thread random stream of tests/c/random_sources.c is byte-identical across runs and backends; Reverie stubs __vdso_getrandom out of the vDSO in every backend that patches it, so the vDSO leg prints "vdso-getrandom unavailable" (measured on Linux 7.1); kernels before 6.11 have no __vdso_getrandom, so the leg finds no symbol and prints the same line (derived from the code, not measured)
     lane: portable
     requires:
       - linux
@@ -17896,7 +17896,6 @@ test:
       - userns
       - ptrace
       - cc
-      - vdso-getrandom
     occasional: false
     program: tests/c/random_sources_root_only.c
     observation:
@@ -17919,8 +17918,8 @@ test:
           sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
-          ptrace: "getrandom-flags ok\ngetrandom-faults ok\ngetrandom[0]=a29a84d693ecdf16982c841b1247d414\nurandom[0]=2972bb044d96df2871ba034c95de2770\nrandom[0]=2972bb044d96df2871ba034c95de2770\ngetrandom[1]=0492c3131e74468a52aed55683b922d2\nurandom[1]=2972bb044d96df2871ba034c95de2770\nrandom[1]=2972bb044d96df2871ba034c95de2770\ngetrandom[2]=9a03f0034d7fec17b6652c772ed91aa5\nurandom[2]=2972bb044d96df2871ba034c95de2770\nrandom[2]=2972bb044d96df2871ba034c95de2770\ngetrandom[3]=14c2214964e8609613fd9fd140d556fa\nurandom[3]=2972bb044d96df2871ba034c95de2770\nrandom[3]=2972bb044d96df2871ba034c95de2770\ngetrandom[4]=148888579099b4fe7f7b7d2c7f4f7225\nurandom[4]=2972bb044d96df2871ba034c95de2770\nrandom[4]=2972bb044d96df2871ba034c95de2770\nvdso-getrandom[0]=484814654d846314e6a44dddc7ff5922\nvdso-getrandom[1]=14281b93a8dfd552941eb3bebf701b3e\nvdso-getrandom[2]=6508606961f785fcf7b0da128afb85ff\nvdso-getrandom[3]=c24c2c49c65a9abf07bb98ac1960408e\nvdso-getrandom[4]=6a68617c9224f4dfa1d3907b09cfd3fe\n"
-          dbt: "getrandom-flags ok\ngetrandom-faults ok\ngetrandom[0]=a29a84d693ecdf16982c841b1247d414\nurandom[0]=2972bb044d96df2871ba034c95de2770\nrandom[0]=2972bb044d96df2871ba034c95de2770\ngetrandom[1]=0492c3131e74468a52aed55683b922d2\nurandom[1]=2972bb044d96df2871ba034c95de2770\nrandom[1]=2972bb044d96df2871ba034c95de2770\ngetrandom[2]=9a03f0034d7fec17b6652c772ed91aa5\nurandom[2]=2972bb044d96df2871ba034c95de2770\nrandom[2]=2972bb044d96df2871ba034c95de2770\ngetrandom[3]=14c2214964e8609613fd9fd140d556fa\nurandom[3]=2972bb044d96df2871ba034c95de2770\nrandom[3]=2972bb044d96df2871ba034c95de2770\ngetrandom[4]=148888579099b4fe7f7b7d2c7f4f7225\nurandom[4]=2972bb044d96df2871ba034c95de2770\nrandom[4]=2972bb044d96df2871ba034c95de2770\nvdso-getrandom[0]=484814654d846314e6a44dddc7ff5922\nvdso-getrandom[1]=14281b93a8dfd552941eb3bebf701b3e\nvdso-getrandom[2]=6508606961f785fcf7b0da128afb85ff\nvdso-getrandom[3]=c24c2c49c65a9abf07bb98ac1960408e\nvdso-getrandom[4]=6a68617c9224f4dfa1d3907b09cfd3fe\n"
+          ptrace: "getrandom-flags ok\ngetrandom-faults ok\ngetrandom[0]=1212b04c40f490d33b549b528fc5173a\nurandom[0]=2972bb044d96df2871ba034c95de2770\nrandom[0]=2972bb044d96df2871ba034c95de2770\ngetrandom[1]=d3c59830106052459f8535a9ba53cced\nurandom[1]=2972bb044d96df2871ba034c95de2770\nrandom[1]=2972bb044d96df2871ba034c95de2770\ngetrandom[2]=a29a84d693ecdf16982c841b1247d414\nurandom[2]=2972bb044d96df2871ba034c95de2770\nrandom[2]=2972bb044d96df2871ba034c95de2770\ngetrandom[3]=0492c3131e74468a52aed55683b922d2\nurandom[3]=2972bb044d96df2871ba034c95de2770\nrandom[3]=2972bb044d96df2871ba034c95de2770\ngetrandom[4]=9a03f0034d7fec17b6652c772ed91aa5\nurandom[4]=2972bb044d96df2871ba034c95de2770\nrandom[4]=2972bb044d96df2871ba034c95de2770\nvdso-getrandom unavailable\n"
+          dbt: "getrandom-flags ok\ngetrandom-faults ok\ngetrandom[0]=1212b04c40f490d33b549b528fc5173a\nurandom[0]=2972bb044d96df2871ba034c95de2770\nrandom[0]=2972bb044d96df2871ba034c95de2770\ngetrandom[1]=d3c59830106052459f8535a9ba53cced\nurandom[1]=2972bb044d96df2871ba034c95de2770\nrandom[1]=2972bb044d96df2871ba034c95de2770\ngetrandom[2]=a29a84d693ecdf16982c841b1247d414\nurandom[2]=2972bb044d96df2871ba034c95de2770\nrandom[2]=2972bb044d96df2871ba034c95de2770\ngetrandom[3]=0492c3131e74468a52aed55683b922d2\nurandom[3]=2972bb044d96df2871ba034c95de2770\nrandom[3]=2972bb044d96df2871ba034c95de2770\ngetrandom[4]=9a03f0034d7fec17b6652c772ed91aa5\nurandom[4]=2972bb044d96df2871ba034c95de2770\nrandom[4]=2972bb044d96df2871ba034c95de2770\nvdso-getrandom unavailable\n"
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): this entry asserts deterministic output under Hermit and nothing about native nondeterminism, so there is no naked oracle to run.'

@@ -701,9 +701,9 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "foreign-types"
@@ -898,18 +898,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "heapless"
@@ -974,7 +968,7 @@ dependencies = [
  "libc",
  "nix 0.30.1",
  "num_cpus",
- "object 0.36.7",
+ "object 0.40.0",
  "pretty_assertions",
  "proc-macro2",
  "quote",
@@ -1146,7 +1140,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -1377,7 +1371,7 @@ dependencies = [
 [[package]]
 name = "nostd-print"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "syscalls",
 ]
@@ -1428,20 +1422,6 @@ dependencies = [
 
 [[package]]
 name = "object"
-version = "0.36.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
-dependencies = [
- "crc32fast",
- "flate2",
- "hashbrown 0.15.5",
- "indexmap",
- "memchr",
- "ruzstd 0.7.3",
-]
-
-[[package]]
-name = "object"
 version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
@@ -1449,6 +1429,20 @@ dependencies = [
  "flate2",
  "memchr",
  "ruzstd 0.8.3",
+]
+
+[[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "hashbrown",
+ "indexmap",
+ "memchr",
+ "ruzstd 0.9.0",
 ]
 
 [[package]]
@@ -1715,7 +1709,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reverie-core"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1727,7 +1721,7 @@ dependencies = [
  "memmap2",
  "never-say-never",
  "nix 0.30.1",
- "object 0.36.7",
+ "object 0.40.0",
  "procfs",
  "raw-cpuid",
  "reverie-process",
@@ -1741,7 +1735,7 @@ dependencies = [
 [[package]]
 name = "reverie-dbt"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "bincode 2.0.1",
  "libc",
@@ -1759,7 +1753,7 @@ dependencies = [
 [[package]]
 name = "reverie-kvm"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "cc",
  "futures 0.3.33",
@@ -1775,7 +1769,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "bincode 2.0.1",
  "iced-x86",
@@ -1794,7 +1788,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "syscalls",
 ]
@@ -1802,7 +1796,7 @@ dependencies = [
 [[package]]
 name = "reverie-preload"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "bincode 2.0.1",
  "libc",
@@ -1813,7 +1807,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "bincode 2.0.1",
  "bitflags 2.13.1",
@@ -1830,7 +1824,7 @@ dependencies = [
 [[package]]
 name = "reverie-ptrace"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1861,7 +1855,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "async-trait",
  "bincode 1.3.3",
@@ -1872,7 +1866,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-macros"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "darling",
  "heck 0.3.3",
@@ -1884,7 +1878,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "async-trait",
  "bincode 2.0.1",
@@ -1898,7 +1892,7 @@ dependencies = [
 [[package]]
 name = "reverie-sabre"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "atomic 0.5.3",
  "cc",
@@ -1923,7 +1917,7 @@ dependencies = [
 [[package]]
 name = "reverie-sabre-macros"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "darling",
  "heck 0.3.3",
@@ -1935,7 +1929,7 @@ dependencies = [
 [[package]]
 name = "reverie-sabre-stats"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "libc",
  "reverie-core",
@@ -1944,7 +1938,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -1983,20 +1977,20 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ruzstd"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
-dependencies = [
- "twox-hash 1.6.3",
-]
-
-[[package]]
-name = "ruzstd"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
 dependencies = [
- "twox-hash 2.1.3",
+ "twox-hash",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -2008,7 +2002,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safeptrace"
 version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb#c2a7e9f2f17f64e8f0740fc76e0f6046ac13d3fb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359#b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359"
 dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",
@@ -2236,12 +2230,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strsim"
@@ -2617,16 +2605,6 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
-]
-
-[[package]]
-name = "twox-hash"
-version = "1.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
-dependencies = [
- "cfg-if",
- "static_assertions",
 ]
 
 [[package]]
