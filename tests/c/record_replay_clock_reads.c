@@ -47,7 +47,9 @@ int main(void) {
   for (int round = 0; round < 3; ++round) {
     struct timeval tv;
     struct timezone tz;
-    if (syscall(SYS_gettimeofday, &tv, &tz) != 0) {
+    struct timeval tv_only;
+    if (syscall(SYS_gettimeofday, &tv, &tz) != 0 ||
+        syscall(SYS_gettimeofday, &tv_only, NULL) != 0) {
       perror("gettimeofday");
       return EXIT_FAILURE;
     }
@@ -71,13 +73,15 @@ int main(void) {
       return EXIT_FAILURE;
     }
     printf(
-        "round %d gettimeofday=%lld.%06lld tz=%d/%d time=%ld "
+        "round %d gettimeofday=%lld.%06lld tz=%d/%d tv_only=%lld.%06lld time=%ld "
         "realtime=%lld.%09ld monotonic=%lld.%09ld cputime=%lld.%09ld\n",
         round,
         (long long)tv.tv_sec,
         (long long)tv.tv_usec,
         tz.tz_minuteswest,
         tz.tz_dsttime,
+        (long long)tv_only.tv_sec,
+        (long long)tv_only.tv_usec,
         via_ret,
         (long long)realtime.tv_sec,
         realtime.tv_nsec,
