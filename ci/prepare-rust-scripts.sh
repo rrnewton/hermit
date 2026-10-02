@@ -342,18 +342,24 @@ fi
 # Instead, seed the workspace lock with the committed Cargo.lock plus the
 # reviewed additions in ci/rust-script-lock-supplement.toml, let Cargo complete
 # it without moving any seeded version, and refuse unless every registry or git
-# package in the result is one of:
-#   - an exact entry of Cargo.lock, so scripts build with the product's versions;
-#   - an exact entry of the supplement, for crates only scripts use; or
-#   - an exact `=VERSION` requirement written in a script's own manifest
-#     (scripts/build-buck-release.rs pins flate2 this way for a deterministic
-#     archive writer).
+# package in the result is an exact entry of one of them:
+#   - Cargo.lock, so scripts build with the product's versions; or
+#   - the supplement, for crates only scripts use.
+# The supplement may not hold a version compatible with a different Cargo.lock
+# version, because that would move a crate the product pins. The one exception
+# is a version a script requires exactly with `=VERSION` in its own manifest
+# (scripts/build-buck-release.rs pins flate2 this way for a deterministic
+# archive writer); the script made that choice, and the entry still records it.
+# Every accepted version is a seeded lock entry, so Cargo keeps it even after
+# crates.io yanks that release.
 # Fetch mode and build mode both run this, and the build then uses --locked.
 # Every accepted version comes from a tracked file, so the offline build in the
 # pinned root reproduces the lock the online fetch produced.
 committed_lock=$ROOT_DIR/Cargo.lock
 supplement=$ROOT_DIR/ci/rust-script-lock-supplement.toml
-candidate=$parent/rust-script-lock-supplement.candidate.toml
+# Fetch mode and build mode hold different flocks above and may run at the same
+# time, so each writes its own candidate file, and only by rename.
+candidate=$parent/rust-script-lock-supplement.candidate-$mode.toml
 generated_lock=$packages/Cargo.lock
 for input in "$committed_lock" "$supplement"; do
     [[ -f $input ]] || {
@@ -387,26 +393,46 @@ semver_class_awk='
 
 # A supplement entry that is compatible with a different Cargo.lock version
 # would let the scripts move a crate the product pins, which is the failure this
-# check exists to stop. Refuse it before Cargo sees the seed.
+# check exists to stop. Refuse it before Cargo sees the seed, unless a script
+# requires exactly that version. Column 5 lists the compatible Cargo.lock
+# versions the entry would replace.
 awk -F '\t' "$semver_class_awk"'
-    FILENAME == ARGV[1] { committed[$0] = 1; remember(locked, $1 FS $3, $2); compatible[$1 FS $3 FS class($2)] = 1; next }
+    FILENAME == ARGV[1] { committed[$0] = 1; remember(compatible, $1 FS $3 FS class($2), $2); next }
+    FILENAME == ARGV[2] { pinned[$0] = 1; next }
     $0 in committed { printf "redundant\t%s\t%s\t%s\n", $1, $2, $3; next }
-    ($1 FS $3 FS class($2)) in compatible { printf "shadows\t%s\t%s\t%s\t%s\n", $1, $2, $3, locked[$1 FS $3] }
-' "$packages/committed.tsv" "$packages/supplement.tsv" >"$packages/supplement-verdicts.tsv"
+    ($1 FS $3 FS class($2)) in compatible {
+        printf "%s\t%s\t%s\t%s\t%s\n", ($0 in pinned) ? "exact-pin" : "shadows", $1, $2, $3,
+            compatible[$1 FS $3 FS class($2)]
+    }
+' "$packages/committed.tsv" "$packages/exact-pins.tsv" "$packages/supplement.tsv" \
+    >"$packages/supplement-verdicts.tsv"
 if grep -q '^shadows' "$packages/supplement-verdicts.tsv"; then
     printf 'prepare-rust-scripts: REFUSED — %s may only add crates Cargo.lock does not pin\n' "$supplement" >&2
     awk -F '\t' '$1 == "shadows" { printf "  %s: supplement %s; committed Cargo.lock %s; source %s\n", $2, $3, $5, $4 }' \
         "$packages/supplement-verdicts.tsv" >&2
     echo '  Remove these entries, or change the version in Cargo.lock so the product moves with the scripts.' >&2
+    echo '  An entry may differ from Cargo.lock only when a script requires exactly its version with =VERSION.' >&2
     exit 2
 fi
-awk -F '\t' '$1 == "redundant" {
-    printf "prepare-rust-scripts: note — supplement entry %s %s is already in Cargo.lock; it can be removed\n", $2, $3
-}' "$packages/supplement-verdicts.tsv"
+awk -F '\t' '
+    $1 == "redundant" {
+        printf "prepare-rust-scripts: note — supplement entry %s %s is already in Cargo.lock; it can be removed\n", $2, $3
+    }
+    $1 == "exact-pin" {
+        printf "prepare-rust-scripts: note — supplement entry %s %s replaces Cargo.lock %s in the generated workspace because a script requires =%s\n", $2, $3, $5, $3
+    }
+' "$packages/supplement-verdicts.tsv"
 
+# Cargo keeps a locked dependency on its locked version, so a Cargo.lock entry
+# that an exact-pin supplement entry replaces must leave the seed; otherwise the
+# product crates that use it stay on the old version and the resolution fails.
+awk -F '\t' '$1 == "exact-pin" {
+    count = split($5, replaced, ", ")
+    for (i = 1; i <= count; i++) print $2 FS replaced[i] FS $4
+}' "$packages/supplement-verdicts.tsv" >"$packages/replaced.tsv"
 {
-    cat -- "$committed_lock"
-    printf '\n'
+    awk '$0 == "[[package]]" { exit } { print }' "$committed_lock"
+    select_lock_blocks drop "$packages/replaced.tsv" "$committed_lock"
     select_lock_blocks drop "$packages/committed.tsv" "$supplement"
 } >"$generated_lock"
 output=$packages/workspace.output
@@ -428,12 +454,9 @@ awk -F '\t' "$semver_class_awk"'
     }
 ' "$packages/committed.tsv" "$packages/supplement.tsv" "$packages/exact-pins.tsv" "$packages/generated.tsv" \
     >"$packages/generated-verdicts.tsv"
-awk -F '\t' '$1 == "exact-pin" {
-    printf "prepare-rust-scripts: note — %s %s differs from Cargo.lock (%s) because a script requires =%s\n", $2, $3, $5, $3
-}' "$packages/generated-verdicts.tsv"
-if grep -q -e '^moved' -e '^unpinned' "$packages/generated-verdicts.tsv"; then
+if [[ -s $packages/generated-verdicts.tsv ]]; then
     printf 'prepare-rust-scripts: REFUSED — the generated rust-script workspace resolved versions that no tracked file pins\n' >&2
-    awk -F '\t' '$1 != "exact-pin" {
+    awk -F '\t' '{
         printf "  %s: generated %s; committed Cargo.lock %s; supplement %s; source %s\n", $2, $3, $5, $6, $4
     }' "$packages/generated-verdicts.tsv" >&2
     if grep -q '^moved' "$packages/generated-verdicts.tsv"; then
@@ -441,14 +464,19 @@ if grep -q -e '^moved' -e '^unpinned' "$packages/generated-verdicts.tsv"; then
         echo '  Cargo.lock does not have. Move Cargo.lock (cargo update -p NAME --precise VERSION) so the product' >&2
         echo '  builds with the same version, or relax the script requirement.' >&2
     fi
-    if grep -q '^unpinned' "$packages/generated-verdicts.tsv"; then
-        awk -F '\t' '$1 == "unpinned" { print $2 FS $3 FS $4 }' "$packages/generated-verdicts.tsv" \
-            >"$packages/unpinned.tsv"
+    if grep -q '^exact-pin' "$packages/generated-verdicts.tsv"; then
+        echo '  A script requires one of these versions exactly with =VERSION, but no tracked lock entry records it,' >&2
+        echo '  so a yank of that release on crates.io would break this build. Add its entry to the supplement.' >&2
+    fi
+    if grep -q -e '^unpinned' -e '^exact-pin' "$packages/generated-verdicts.tsv"; then
+        awk -F '\t' '$1 == "unpinned" || $1 == "exact-pin" { print $2 FS $3 FS $4 }' \
+            "$packages/generated-verdicts.tsv" >"$packages/candidate-keys.tsv"
         {
             printf '# Candidate additions for ci/rust-script-lock-supplement.toml, written by\n'
             printf '# ci/prepare-rust-scripts.sh. Review each version before copying it there.\n\n'
-            select_lock_blocks keep "$packages/unpinned.tsv" "$generated_lock"
-        } >"$candidate"
+            select_lock_blocks keep "$packages/candidate-keys.tsv" "$generated_lock"
+        } >"$packages/candidate.toml"
+        mv -f -- "$packages/candidate.toml" "$candidate"
         printf '  Crates only scripts use must be pinned by %s.\n' "$supplement" >&2
         printf '  Candidate entries, at the versions resolved today, are in %s.\n' "$candidate" >&2
     fi

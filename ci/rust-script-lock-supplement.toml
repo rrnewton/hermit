@@ -4,18 +4,21 @@
 # ci/prepare-rust-scripts.sh builds every rust-script entrypoint in one
 # generated Cargo workspace. That workspace cannot have a committed lockfile of
 # its own, so the script seeds its lock with the root Cargo.lock plus these
-# entries and refuses any registry or git package that neither file pins (an
-# exact `=VERSION` requirement in a script's own manifest also counts).
+# entries and refuses any registry or git package that neither file pins.
 #
 # Rules for this file:
 #   - Entries use the Cargo.lock [[package]] format: name, version, source,
 #     checksum and dependencies, copied from a lock Cargo produced.
 #   - Add only crates the root Cargo.lock does not pin. The script refuses an
 #     entry compatible with a different Cargo.lock version, because that would
-#     let the scripts build with a version the product does not use.
+#     let the scripts build with a version the product does not use. The one
+#     exception is a version a script requires exactly with `=VERSION`: that
+#     script already chose it, and the entry here keeps the build working even
+#     if crates.io yanks the release.
 #   - When the script refuses an unpinned crate it writes candidate entries to
-#     target/ci/rust-script-lock-supplement.candidate.toml. Review them before
-#     copying them here.
+#     target/ci/rust-script-lock-supplement.candidate-fetch.toml (fetch mode)
+#     or target/ci/rust-script-lock-supplement.candidate-build.toml (build
+#     mode). Review them before copying them here.
 
 [[package]]
 name = "csv"
@@ -46,6 +49,19 @@ checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
 dependencies = [
  "cfg-if",
  "libc",
+]
+
+# scripts/build-buck-release.rs requires flate2 =1.1.10 for a deterministic
+# archive writer; Cargo.lock has 1.1.9.
+[[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+ "zlib-rs",
 ]
 
 [[package]]

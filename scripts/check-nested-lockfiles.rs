@@ -616,6 +616,11 @@ case $command_name in
         # Cargo.lock and the supplement, never an empty or absent one.
         grep -qx 'name = "libc"' "$lock"
         grep -qx 'name = "fixture-script-only"' "$lock"
+        # Real Cargo cannot resolve a seed holding two libc versions of one
+        # semver class, so record exactly which ones the producer seeded.
+        awk -F '"' 'BEGIN { printf "seed-libc:" }
+            $0 == "name = \"libc\"" { getline; printf " %s", $2 }
+            END { printf "\n" }' "$lock" >>"${FIXTURE_JOURNAL:?}"
         if [[ -n ${FIXTURE_RESOLVED_LIBC:-} ]]; then
             sed -i "s/^version = \"0.2.189\"\$/version = \"$FIXTURE_RESOLVED_LIBC\"/" "$lock"
         fi
@@ -755,17 +760,23 @@ command_name=${1:?}
 shift
 manifest=
 locked=0
+version_probe=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --manifest-path) manifest=$2; shift 2 ;;
         --locked) locked=1; shift ;;
+        -V|--version) version_probe=1; shift ;;
         *) shift ;;
     esac
 done
 case $command_name in
     clippy|build|test)
-        # The build must use exactly the lock the producer verified.
-        [[ $locked -eq 1 ]] || { echo "fixture cargo: $command_name without --locked" >&2; exit 98; }
+        # The build must use exactly the lock the producer verified. The
+        # producer's toolchain probe, `cargo clippy -V`, builds nothing.
+        [[ $locked -eq 1 || $version_probe -eq 1 ]] || {
+            echo "fixture cargo: $command_name without --locked" >&2
+            exit 98
+        }
         ;;
 esac
 case $command_name in
@@ -881,7 +892,7 @@ esac
     fn candidate_supplement(fixture: &ProductionFixture) -> PathBuf {
         fixture
             .root
-            .join("target/ci/rust-script-lock-supplement.candidate.toml")
+            .join("target/ci/rust-script-lock-supplement.candidate-fetch.toml")
     }
 
     #[test]
@@ -895,6 +906,7 @@ esac
         let resolve = journal_position(&journal, "generated-resolve");
         let fetch = journal_position(&journal, "generated-locked-fetch");
         assert!(resolve < fetch, "{journal}");
+        journal_position(&journal, "seed-libc: 0.2.189");
         assert!(
             stdout.contains("pinned 2 registry and git packages"),
             "{stdout}"
@@ -954,9 +966,63 @@ esac
         assert!(!candidate.contains("name = \"libc\""), "{candidate}");
     }
 
+    /// The fixture supplement plus a libc entry that differs from the
+    /// fixture Cargo.lock's 0.2.189.
+    fn supplement_with_libc_0_2_190() -> String {
+        format!(
+            "{FIXTURE_SUPPLEMENT}\n[[package]]\nname = \"libc\"\nversion = \"0.2.190\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"fixture\"\n"
+        )
+    }
+
     #[test]
-    fn production_prepare_accepts_an_exact_version_a_script_requires() {
+    fn production_prepare_refuses_an_exact_script_pin_without_a_lock_entry() {
+        // A version only a script's `=VERSION` requirement names resolves from
+        // the live index, so a yank of that release would break every head.
         let fixture = production_fixture(FetchMutation::None);
+        let (output, journal) = run_prepare_fetch(
+            &fixture,
+            &[
+                ("FIXTURE_RESOLVED_LIBC", "0.2.190"),
+                ("FIXTURE_EXACT_LIBC_PIN", "0.2.190"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("prepare-rust-scripts: REFUSED"), "{stderr}");
+        assert!(
+            stderr.contains(
+                "libc: generated 0.2.190; committed Cargo.lock 0.2.189; supplement absent"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("requires one of these versions exactly"),
+            "{stderr}"
+        );
+        journal_position(&journal, "seed-libc: 0.2.189");
+        assert!(
+            !journal.lines().any(|line| line == "generated-locked-fetch"),
+            "a refused lock must not be fetched:\n{journal}"
+        );
+        let candidate =
+            fs::read_to_string(candidate_supplement(&fixture)).expect("candidate supplement");
+        assert!(
+            candidate.contains("name = \"libc\"\nversion = \"0.2.190\""),
+            "{candidate}"
+        );
+        assert!(!candidate.contains("fixture-script-only"), "{candidate}");
+    }
+
+    #[test]
+    fn production_prepare_accepts_a_supplement_entry_for_an_exact_script_pin() {
+        let fixture = production_fixture(FetchMutation::None);
+        fs::write(
+            fixture.root.join("ci/rust-script-lock-supplement.toml"),
+            supplement_with_libc_0_2_190(),
+        )
+        .expect("write supplement with an exact script pin");
         let (output, journal) = run_prepare_fetch(
             &fixture,
             &[
@@ -968,11 +1034,16 @@ esac
         assert!(output.status.success(), "{output:?}\n{journal}");
         assert!(
             stdout.contains(
-                "libc 0.2.190 differs from Cargo.lock (0.2.189) because a script requires =0.2.190"
+                "supplement entry libc 0.2.190 replaces Cargo.lock 0.2.189 in the generated \
+                 workspace because a script requires =0.2.190"
             ),
             "{stdout}"
         );
+        // Seeding both versions would leave Cargo.lock's dependents locked to
+        // 0.2.189 while the script requires =0.2.190, which Cargo refuses.
+        journal_position(&journal, "seed-libc: 0.2.190");
         journal_position(&journal, "generated-locked-fetch");
+        assert!(!candidate_supplement(&fixture).exists());
     }
 
     #[test]
@@ -980,11 +1051,7 @@ esac
         let fixture = production_fixture(FetchMutation::None);
         fs::write(
             fixture.root.join("ci/rust-script-lock-supplement.toml"),
-            format!(
-                "{FIXTURE_SUPPLEMENT}\n[[package]]\nname = \"libc\"\nversion = \"0.2.190\"\n\
-                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-                 checksum = \"fixture\"\n"
-            ),
+            supplement_with_libc_0_2_190(),
         )
         .expect("write shadowing supplement");
         let (output, journal) = run_prepare_fetch(&fixture, &[]);
@@ -996,6 +1063,10 @@ esac
         );
         assert!(
             stderr.contains("libc: supplement 0.2.190; committed Cargo.lock 0.2.189"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("only when a script requires exactly its version"),
             "{stderr}"
         );
         assert!(
