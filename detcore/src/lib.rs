@@ -2210,13 +2210,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose
-            // unmodeled pipe-buffer ownership or vmsplice page pinning. Return
-            // ENOSYS so callers use read/write fallbacks, but preserve host
-            // pass-through under the explicit compatibility opt-out used by the
-            // existing rr splice test.
+            // unmodeled pipe-buffer ownership or vmsplice page pinning, but
+            // preserve host pass-through under the explicit compatibility
+            // opt-out used by the existing rr splice test. splice and tee
+            // refuse with EINVAL, the errno Linux returns when a descriptor
+            // pair cannot be spliced and the one callers fall back to
+            // read/write on: GNU grep 3.12 drains a pipe into /dev/null with
+            // splice and falls back on EINVAL, but on ENOSYS it reports a read
+            // error and exits 2. vmsplice keeps ENOSYS.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
-                    Err(Error::Errno(Errno::ENOSYS))
+                    if call.number() == Sysno::vmsplice {
+                        Err(Error::Errno(Errno::ENOSYS))
+                    } else {
+                        Err(Error::Errno(Errno::EINVAL))
+                    }
                 } else {
                     self.passthrough(guest, call).await
                 }
