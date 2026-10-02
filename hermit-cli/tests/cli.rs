@@ -1408,7 +1408,8 @@ fn run_verify_uses_readonly_proc_after_permission_denial() {
 #[test]
 fn record_replay_uses_readonly_proc_after_permission_denial() {
     let _guard = hermit_run_guard();
-    let args = ["record", "--verify", "--", "/bin/true"];
+    // Local networking would require another flags-zero mount for sysfs.
+    let args = ["record", "--network=host", "--verify", "--", "/bin/true"];
     let output = readonly_proc_command(&args)
         .output()
         .expect("start record/replay with writable mounts denied");
@@ -1439,7 +1440,15 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     let _guard = hermit_run_guard();
     let data = tempfile::tempdir().unwrap();
     let directory = data.path().to_str().unwrap();
-    let record_args = ["record", "--data-dir", directory, "--", "/bin/true"];
+    // Local networking would require another flags-zero mount for sysfs.
+    let record_args = [
+        "record",
+        "--network=host",
+        "--data-dir",
+        directory,
+        "--",
+        "/bin/true",
+    ];
     let recording = readonly_proc_command(&record_args).output().unwrap();
     assert_success(&recording, &record_args);
     let id = fs::read_to_string(data.path().join("last")).unwrap();

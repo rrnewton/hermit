@@ -3221,7 +3221,7 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
 
 /// Records with producer-owned mountinfo provenance. The directory-lifetime
 /// obligation is the same as [`record_to`]. `local_networking` is stored in
-/// the recording metadata; see [`metadata::Metadata::local_networking`].
+/// the recording's `metadata.json`, and an autopilot replay uses that network.
 pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,

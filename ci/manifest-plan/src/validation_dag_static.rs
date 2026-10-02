@@ -416,7 +416,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tpx_json_reports_each_final_cell_with_the_run_verdict and
     // tpx_json_reports_missing_cells_and_run_failures_as_failed; and cli_help
     // test_harness_source_snapshot_flags_redirect_misuse.
-    ("test.regular_crates", 778),
+    // https://github.com/rrnewton/hermit/pull/3544 adds three runner tests
+    // (a_replay_cell_passes_on_the_inherited_exit_only_when_matched_and_exact,
+    // a_replay_cell_inherits_its_verify_guest_inputs_and_expectations and
+    // replay_argv_carries_the_inherited_verify_environment) that retain all
+    // 778 prior identities.
+    ("test.regular_crates", 781),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -452,7 +457,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // version::tests::fbcode_version_marks_missing_build_facts_unknown
     // (https://github.com/rrnewton/hermit/pull/3511) retain all 764 prior
     // identities.
-    ("test.hermit_unit", 766),
+    // https://github.com/rrnewton/hermit/pull/3544 adds
+    // record_start::tests::record_networking_defaults_to_local_like_run,
+    // record_start::tests::a_gdb_checked_recording_refuses_local_networking,
+    // replay::tests::only_an_autopilot_replay_of_a_local_recording_is_local and
+    // metadata::tests::metadata_without_a_network_choice_loads_as_unknown, which
+    // retain all 766 prior identities.
+    ("test.hermit_unit", 770),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -608,7 +619,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511).
-    ("test.hermit_unit_on_host", 766),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
+    ("test.hermit_unit_on_host", 770),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -620,7 +632,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The fold-2 resolver test retains all 764 prior identities.
     // The 13 Buck/RE harness tests (https://github.com/rrnewton/hermit/pull/3507)
     // retain all 765 prior identities.
-    ("test.regular_crates_on_host", 778),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
+    ("test.regular_crates_on_host", 781),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
