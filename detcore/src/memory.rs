@@ -22,6 +22,7 @@ pub(crate) use original_arena::OriginalArena;
 pub(crate) use original_arena::OriginalCopySpan;
 pub(crate) use original_arena::changes_foreground_lineage;
 pub(crate) use original_arena::invalidates_original_arena;
+pub(crate) use original_arena::preserves_foreground_terminal_query;
 
 const PAGE_SIZE: usize = 4096;
 

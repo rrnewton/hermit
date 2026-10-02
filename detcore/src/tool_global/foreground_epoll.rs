@@ -48,7 +48,25 @@ impl GlobalState {
                 .invalidate_original_arena();
             return;
         };
-        if event == Event::Prepared && crate::memory::changes_foreground_lineage(nr) {
+        let owner = NetworkStreamOwner {
+            thread: state.dettid,
+            mm: state.mm_id,
+        };
+        let terminal_query = event == Event::Prepared
+            && nr == reverie::syscalls::Sysno::ioctl
+            && runtime.foreground_root(owner).is_ok_and(|root| {
+                root.matches_metadata(&state.file_metadata)
+                    && crate::memory::preserves_foreground_terminal_query(
+                        nr,
+                        args,
+                        &root,
+                        &state.file_metadata.lock().unwrap(),
+                    )
+            });
+        if event == Event::Prepared
+            && crate::memory::changes_foreground_lineage(nr)
+            && !terminal_query
+        {
             state
                 .memory_metadata
                 .lock()
@@ -57,10 +75,6 @@ impl GlobalState {
             runtime.revoke_foreground_lineage();
             return;
         }
-        let owner = NetworkStreamOwner {
-            thread: state.dettid,
-            mm: state.mm_id,
-        };
         // Optional narrow capability: ordinary memory behavior still works
         // when this run has no positively established initial-root lineage.
         let Ok(root) = runtime.foreground_root(owner) else {

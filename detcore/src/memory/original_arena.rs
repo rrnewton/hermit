@@ -83,6 +83,62 @@ fn arguments(args: SyscallArgs) -> [usize; 6] {
     ]
 }
 
+/// The two already-admitted terminal queries do not change FD/process lineage
+/// on these supported inherited stdio objects. This does NOT preserve memory
+/// authority: every ioctl still invalidates the arena before a possible copy.
+pub(crate) fn preserves_foreground_terminal_query(
+    nr: Sysno,
+    args: SyscallArgs,
+    root: &ForegroundRoot,
+    metadata: &crate::tool_local::FileMetadata,
+) -> bool {
+    use crate::fd::FdType;
+    use crate::resources::ResourceID;
+    use reverie::syscalls::Syscall;
+    use reverie::syscalls::ioctl::Request;
+
+    let Syscall::Ioctl(call) = Syscall::from_raw(nr, args) else {
+        return false;
+    };
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3464): Preserve only typed output queries on live
+    // bound stdio OFDs; never infer authority from a reused numeric 0/1/2.
+    // https://github.com/rrnewton/hermit/pull/3464
+    if !matches!(call.request(), Request::TCGETS(_) | Request::TIOCGWINSZ(_))
+        || !root.is_sole_initial_root(root.owner())
+        || metadata.files_id != root.files()
+        || !metadata.network_lifetime_tracking()
+        || !metadata.pending_network_installations().is_empty()
+    {
+        return false;
+    }
+    let Some(fd) = metadata.file_handles.get(&call.fd()) else {
+        return false;
+    };
+    let (Some(stat), Some(identity)) = (fd.stat(), fd.native_file()) else {
+        return false;
+    };
+    let Ok(binding) = metadata.descriptor_binding(call.fd()) else {
+        return false;
+    };
+    if !matches!(fd.resource(), Some(ResourceID::Device(_)))
+        || metadata.native_binding_identity(binding) != Some(identity)
+    {
+        return false;
+    }
+    // The initial census attaches the stdio role, stat and native identity to
+    // the same OFD. All three follow aliases, not later reuse of its old slot.
+    // Character devices other than /dev/null (including ttys) remain outside
+    // this bounded route: a command number alone cannot classify a driver.
+    match (fd.ty(), stat.mode & libc::S_IFMT) {
+        (FdType::Pipe, libc::S_IFIFO) | (FdType::Regular, libc::S_IFREG) => true,
+        (FdType::Regular, libc::S_IFCHR) => {
+            libc::major(stat.rdev) == 1 && libc::minor(stat.rdev) == 3
+        }
+        _ => false,
+    }
+}
+
 /// Future admission of any of these operations must lose sole-root authority
 /// before native effects, even if that operation ultimately returns an error.
 pub(crate) fn changes_foreground_lineage(nr: Sysno) -> bool {
