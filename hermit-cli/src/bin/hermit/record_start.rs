@@ -47,6 +47,7 @@ use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
+use super::run::NetworkingMode;
 use super::run::apply_base_environment;
 use super::run::is_elf_file;
 use super::run::parse_assignment;
@@ -56,6 +57,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
+use super::verify::emit_compared_guest_output;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
 use super::verify::write_pending_verification_json;
@@ -188,7 +190,7 @@ pub struct StartOpts {
     /// Recording does NOT run under `run --strict`'s configuration: see
     /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
     /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
-    /// `panic_on_unsupported_syscalls: false`. A recorded guest therefore reads the REAL
+    /// `panic_on_unsupported_syscalls: true`. A recorded guest therefore reads the REAL
     /// host clock, and two independent recordings of the same program observe different
     /// times. What `--verify` establishes is that a recording REPLAYS faithfully, not that
     /// two independent recordings agree.
@@ -214,6 +216,17 @@ pub struct StartOpts {
     /// Mount a file, directory, or fresh filesystem for recording and an immediate verify replay.
     #[clap(long)]
     mount: Vec<Mount>,
+
+    /// Select guest networking, with the same contract as `hermit run --network`. `local`
+    /// (the default) gives the recording and its verify replay an isolated loopback
+    /// interface; `host` exposes the host network to the recording.
+    #[clap(
+        long,
+        alias = "net",
+        value_name = "local|host",
+        default_value = "local"
+    )]
+    network: NetworkingMode,
 
     /// Set the working directory for both recording and replay after mounts apply.
     #[clap(long, value_name = "path")]
@@ -395,8 +408,12 @@ impl StartOpts {
         )
     }
 
-    fn configured_container(&self) -> Result<(Container, IdentityGuard), Error> {
+    fn configured_container(
+        &self,
+        network: NetworkingMode,
+    ) -> Result<(Container, IdentityGuard), Error> {
         let mut container = default_container(true);
+        network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
         for mount in &self.mount {
             let user_target = mount.get_target();
@@ -415,7 +432,7 @@ impl StartOpts {
         global: &GlobalOpts,
     ) -> Result<(Container, IdentityGuard), Error> {
         let overlay = self.prepare_e9patch_overlay(global)?;
-        let (mut container, identity_guard) = self.configured_container()?;
+        let (mut container, identity_guard) = self.configured_container(self.network)?;
         if let Some(overlay) = overlay {
             container.mount(Mount::bind(&overlay.source, &overlay.target).readonly());
             container.mount(
@@ -545,7 +562,7 @@ impl StartOpts {
                 },
             )?;
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut replay_container, replay_identity) = self.configured_container()?;
+        let (mut replay_container, replay_identity) = self.configured_container(self.network)?;
         let mounts = self.mount.clone();
         let replay_global = global2.clone();
         let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
@@ -606,6 +623,7 @@ impl StartOpts {
             "Success: replay matched recording.",
             "Recording output did not match replay output!",
         );
+        emit_compared_guest_output(outcome.verified(), &recording, &replay)?;
 
         outcome.into_exit_status()
     }
@@ -687,7 +705,9 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        let (mut container, identity) = self.configured_container()?;
+        // The gdb client runs outside the container, so the replay's gdbserver
+        // port must live in the host network namespace.
+        let (mut container, identity) = self.configured_container(NetworkingMode::Host)?;
         let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
         let replay_global = global.clone();
         let mounts = self.mount.clone();
@@ -754,6 +774,7 @@ mod tests {
             env,
             base_env: BaseEnv::Host,
             mount: Vec::new(),
+            network: NetworkingMode::Local,
             workdir: None,
             data_dir: None,
             record_timeout: None,
@@ -762,6 +783,27 @@ mod tests {
             verify_strict: false,
             gdbex: Vec::new(),
         }
+    }
+
+    /// `record start` takes `run`'s networking contract, local by default.
+    #[test]
+    fn record_networking_defaults_to_local_like_run() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parse = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .network
+        };
+        assert_eq!(parse(&["start", "/bin/true"]), NetworkingMode::Local);
+        assert_eq!(
+            parse(&["start", "--network", "host", "/bin/true"]),
+            NetworkingMode::Host
+        );
     }
 
     #[test]
@@ -865,6 +907,7 @@ mod tests {
             env: Vec::new(),
             base_env: BaseEnv::Host,
             mount: Vec::new(),
+            network: NetworkingMode::Local,
             workdir: None,
             data_dir: None,
             record_timeout: None,

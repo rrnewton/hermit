@@ -77,6 +77,7 @@ use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::default_failed_verify_log_retention;
+use super::verify::emit_compared_guest_output;
 use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
@@ -888,6 +889,24 @@ pub enum NetworkingMode {
     Host,
     // None, // TODO: no network interface at all
     // Record, // TODO: record network traffic only, not other syscalls.
+}
+
+impl NetworkingMode {
+    /// Apply this networking mode to a container. `run` and `record start`
+    /// both build their containers through this one function, so a recording
+    /// sees the same network as the run it records. `analyze_networking`
+    /// forces an isolated namespace even under `host`.
+    pub(crate) fn configure(self, container: &mut Container, analyze_networking: bool) {
+        match self {
+            NetworkingMode::Local => {
+                container.local_networking_only();
+            }
+            NetworkingMode::Host if analyze_networking => {
+                container.local_networking_only();
+            }
+            NetworkingMode::Host => {}
+        }
+    }
 }
 
 // Upper case will work, but prefer lower case.
@@ -3759,8 +3778,8 @@ impl RunOpts {
         // gdb client, so `hermit run --gdbserver` silently hangs waiting for a
         // connection that can never arrive. Fall back to host networking so the
         // debugger can attach. This mirrors how replay-mode gdbserver already
-        // works: replay never unshares the network namespace, which is exactly why
-        // its gdbserver is reachable from the host.
+        // works: a gdb-served replay never unshares the network namespace, which
+        // is exactly why its gdbserver is reachable from the host.
         if self.det_opts.det_config.gdbserver && self.network == NetworkingMode::Local {
             if self.analyze_networking {
                 anyhow::bail!(
@@ -4988,10 +5007,7 @@ impl RunOpts {
         // result is unaffected; only the diagnostic gains the bytes it was
         // discarding.
         if !outcome.verified() {
-            if out1.stdout == out2.stdout && out1.stderr == out2.stderr {
-                std::io::stdout().write_all(&out1.stdout)?;
-                std::io::stderr().write_all(&out1.stderr)?;
-            }
+            emit_compared_guest_output(false, &out1, &out2)?;
             return outcome.into_exit_status();
         }
         let status = outcome.guest_status;
@@ -5006,8 +5022,7 @@ impl RunOpts {
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
         }
-        std::io::stdout().write_all(&out1.stdout)?;
-        std::io::stderr().write_all(&out1.stderr)?;
+        emit_compared_guest_output(true, &out1, &out2)?;
         Ok(status)
     }
 
@@ -5108,31 +5123,14 @@ impl RunOpts {
             let rootfs = crate::image::materialize_rootfs(image)?;
             let (mut container, identity_sources) =
                 image_container(&rootfs, tmpfs, self.pin_threads, self.tmp.is_none())?;
-            match &self.network {
-                NetworkingMode::Local => {
-                    container.local_networking_only();
-                }
-                NetworkingMode::Host if self.analyze_networking => {
-                    container.local_networking_only();
-                }
-                NetworkingMode::Host => {}
-            }
+            self.network
+                .configure(&mut container, self.analyze_networking);
             return Ok((container, identity_sources));
         }
 
         let mut container = default_container(self.pin_threads);
-
-        match &self.network {
-            NetworkingMode::Local => {
-                container.local_networking_only();
-            }
-            NetworkingMode::Host => {
-                // This conflict/invariant should could be resolved upstream:
-                if self.analyze_networking {
-                    container.local_networking_only();
-                }
-            }
-        }
+        self.network
+            .configure(&mut container, self.analyze_networking);
 
         let PreparedMounts {
             mounts,

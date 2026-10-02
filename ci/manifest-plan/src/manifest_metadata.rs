@@ -292,8 +292,8 @@ fn cell_metadata(cell: &SelectedCell, selected_by_full: bool) -> Result<CellMeta
         not_applicable_reason,
         timeout_seconds: cell.timeout_seconds,
         cpu_timeout_seconds: cell.cpu_timeout_seconds,
-        guest_args: recipe.guest_args.get(&backend).cloned().unwrap_or_default(),
-        workdir: recipe.workdir.clone(),
+        guest_args: crate::runner::cell_guest_args(cell, &backend),
+        workdir: crate::runner::cell_workdir(cell),
         current_reproducer,
         current_reproducer_unavailable_reason,
     })

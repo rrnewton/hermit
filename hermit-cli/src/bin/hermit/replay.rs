@@ -22,6 +22,7 @@ use super::container::deterministic_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
+use super::run::NetworkingMode;
 
 /// Command-line options for the "replay" subcommand.
 #[derive(Debug, Parser, Clone)]
@@ -67,6 +68,16 @@ impl ReplayOpts {
 
         if self.autopilot || self.serve_only {
             let (mut container, identity) = deterministic_container()?;
+            // An autopilot replay takes every network result from the recording,
+            // so it gets the same isolated loopback network as `run` and `record
+            // start`. A served replay keeps the host network: its gdbserver port
+            // must be reachable from a gdb client outside the container.
+            let network = if self.autopilot {
+                NetworkingMode::Local
+            } else {
+                NetworkingMode::Host
+            };
+            network.configure(&mut container, false);
             let options = self.clone();
             let global = global.clone();
             let resources = format!("replay {} and identity mounts", hermit.data_dir().display());

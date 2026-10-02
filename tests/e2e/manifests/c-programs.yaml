@@ -3367,6 +3367,9 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+        guest_args:
+          ptrace:
+            - --record
       chaos:
         ci: false
         backends_enabled: []
