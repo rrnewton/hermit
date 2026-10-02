@@ -942,9 +942,12 @@ fn generated_plan_populations_preserve_command_policy() {
     // https://github.com/rrnewton/hermit/issues/3448 adds the 189 portable
     // ptrace verify cells of the strict compatibility corpus, which ran as
     // generated compat.<label> nodes before; every plan below carries them on
-    // both sides, so only its count moves.
+    // both sides, so only its count moves. The LiteInst verify cells selected
+    // on 2026-09-27 are portable, non-KVM cells, so every population below
+    // gains each of them once.
     let compat = crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
-    let total = 900 + compat;
+    let liteinst = crate::timeouts::LITEINST_2026_09_27_SELECTED_CI_CELL_COUNT;
+    let total = 900 + compat + liteinst;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -983,7 +986,7 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(hosted_cells.len(), 893 + compat - 241);
+    assert_eq!(hosted_cells.len(), 893 + compat + liteinst - 241);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1030,7 +1033,7 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat,
+            893 + compat + liteinst,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();

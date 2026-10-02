@@ -90,10 +90,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT Bash qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Bash qualification is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -152,10 +152,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT C++ qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst C++ qualification is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -281,10 +281,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT awk support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst awk support is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -342,13 +342,14 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT m4 qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst m4 qualification is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -467,10 +468,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT Perl support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Perl support is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -529,10 +530,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT Python support is tracked by backend compatibility
           sabre: SaBRe and ptrace each reach L2, but consume different deterministic entropy positions at Python exec and produce different hash seeds and stdout
-          liteinst: LiteInst Python support is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -651,12 +652,12 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT Python support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Python support is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -715,10 +716,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT Rust qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Rust qualification is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -776,13 +777,14 @@ test:
         ci:
           ptrace: true
           kvm: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT Ruby support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Ruby support is tracked by backend compatibility
         ci_disabled_reason:
           kvm:
             result: timeout
@@ -846,10 +848,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT perl support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst perl support is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []
@@ -1097,13 +1099,14 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT Tcl qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Tcl qualification is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []

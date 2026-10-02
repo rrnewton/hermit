@@ -167,10 +167,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec /usr/bin/date`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           sabre: Required date/clock virtual-time support remains owner-gated for SaBRe
-          liteinst: The preload runtime cannot survive the date script's post-start exec
       replay:
         ci: false
         backends_enabled: []
@@ -225,13 +225,14 @@ test:
           ptrace: true
           kvm: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
+          - liteinst
         backends_disabled:
           dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
-          liteinst: The preload runtime cannot survive the hexdump script's post-start exec
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       replay:
@@ -291,10 +292,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -352,12 +353,12 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -415,13 +416,14 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -480,10 +482,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -541,10 +543,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -603,12 +605,12 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -666,10 +668,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -788,10 +790,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -849,9 +851,9 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
           sabre: Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support
       replay:
         ci: false
@@ -974,10 +976,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -1095,13 +1097,14 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -1159,12 +1162,12 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -1221,11 +1224,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -1354,10 +1357,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: Qualify recursive du independently against the new ptrace golden baseline
           sabre: Qualify recursive du independently against the new ptrace golden baseline
-          liteinst: Qualify recursive du independently against the new ptrace golden baseline
       replay:
         ci: false
         backends_enabled: []
@@ -1422,10 +1425,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: Qualify recursive find independently against the new ptrace golden baseline
           sabre: Qualify recursive find independently against the new ptrace golden baseline
-          liteinst: Qualify recursive find independently against the new ptrace golden baseline
       replay:
         ci: false
         backends_enabled: []
@@ -1479,9 +1482,9 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline
           sabre: Enable once measured on this backend; ptrace is the proven baseline
       naked:
         ci: false
@@ -1541,9 +1544,9 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
           sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
       naked:
         ci: false
@@ -1602,15 +1605,16 @@ test:
           ptrace: true
           kvm: true
           sabre: false
+          liteinst: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 117, 117, 117.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - kvm
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Qualify the DBT startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
-          liteinst: Qualify the LiteInst startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
       naked:
         ci: false
         ci_disabled_reason: Native execution intentionally receives fresh kernel AT_RANDOM bytes, so repeated TLS guards differ by design
@@ -1672,12 +1676,13 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
           sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
       naked:
         ci: false
@@ -1742,11 +1747,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Enable once the DBI post-exec clock path is qualified against the ptrace baseline
           kvm: Enable once the KVM post-exec clock path is qualified against the ptrace baseline
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
-          liteinst: The preload runtime does not survive the guest's own re-exec
       replay:
         ci: false
         backends_enabled: []
@@ -1800,9 +1805,9 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline
           sabre: Enable once measured on this backend; ptrace is the proven baseline
       naked:
         ci: false
@@ -1862,11 +1867,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Established on ptrace first; other backends ratchet against this shared entry
           kvm: KVM requires the privileged runner and does not start on the validation host
           sabre: Established on ptrace first; other backends ratchet against this shared entry
-          liteinst: Established on ptrace first; other backends ratchet against this shared entry
       replay:
         ci: false
         backends_enabled: []
