@@ -93,7 +93,11 @@ client. Hermit finds that directory from its invocation path or executable
 path. Set `HERMIT_INSTALL_DIR` only when the resources live under a different
 prefix. The staging `hermit` entry is a symlink to `target/release/hermit`; use
 a dereferencing copy such as `cp -aL target/install_pkg/ DESTINATION` when
-making a standalone installation or archive.
+making a standalone installation or archive. `make build` removes a
+`target/release/hermit` it cannot match to the current commit, including any
+unstamped build, which leaves that symlink dangling until you rebuild; build
+with `make release-core` or `HERMIT_STAMP_GIT_SHA=1` if you use `make build`
+alongside it.
 
 ## Quick Start
 

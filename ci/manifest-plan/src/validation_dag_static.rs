@@ -484,7 +484,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3598 adds
     // event_stream::tests::path_query_and_mutation_syscalls_have_kernel_arities,
     // which retains all 784 prior identities.
-    ("test.hermit_unit", 785),
+    // version::tests::cargo_version_names_a_stamped_revision and
+    // version::tests::cargo_version_of_an_unstamped_build_says_dev_build
+    // (https://github.com/rrnewton/hermit/pull/3547) retain all 785 prior
+    // identities.
+    ("test.hermit_unit", 787),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -587,7 +591,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_ptrace_backend_engagement_from_a_working_directory_under_host_tmp
     // (https://github.com/rrnewton/hermit/issues/3260) retain all 99 prior
     // selected CLI identities.
-    ("test.cli", 102),
+    // version_names_a_revision_only_when_the_build_was_stamped
+    // (https://github.com/rrnewton/hermit/pull/3547) retains all 102 prior
+    // selected CLI identities.
+    ("test.cli", 103),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -612,8 +619,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
-    // test.cli; all 99 prior identities retained.
-    ("test.cli_on_host", 102),
+    // test.cli; all 99 prior identities retained. The same
+    // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
+    // retains all 102.
+    ("test.cli_on_host", 103),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -643,8 +652,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3580 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/issues/3537 tests.
-    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3598 test.
-    ("test.hermit_unit_on_host", 785),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3598 test,
+    // and the two Cargo version-format tests
+    // (https://github.com/rrnewton/hermit/pull/3547).
+    ("test.hermit_unit_on_host", 787),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
