@@ -22,17 +22,25 @@
 //! Each scenario makes the writer wait first, so the reader is certain to reach
 //! an empty pipe. This asserts PROGRESS: the failure signal is `timeout`
 //! killing the run (exit 124).
+//!
+//! The converse is pinned too: a pipe whose writer is a HOST process (hermit's
+//! own stdin) is outside the scheduler, so reopening it must keep the
+//! deterministic fill-the-buffer read rather than return whatever the host had
+//! written so far.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+use std::io::Write;
 use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
 
 /// A healthy run finishes in about a second. A deadlocked run never finishes,
 /// so this bound only has to be generous enough to never fire on a loaded box.
 const TIMEOUT_SECONDS: u64 = 60;
 
-fn run_bash(extra: &[&str], script: &str, expected_stdout: &str) {
+fn hermit_bash(extra: &[&str], script: &str) -> Command {
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
@@ -41,13 +49,20 @@ fn run_bash(extra: &[&str], script: &str, expected_stdout: &str) {
         .args(["run", "--base-env=minimal", "--no-virtualize-cpuid"])
         .args(extra)
         .args(["--", "/bin/bash", "-c", script]);
-
     hermit_test::configure_guest_execution(&mut command);
+    command
+}
+
+fn run_bash(extra: &[&str], script: &str, expected_stdout: &str) {
+    let mut command = hermit_bash(extra, script);
     let rendered = format!("{command:?}");
     let output = command
         .output()
         .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    check_output(&rendered, &output, expected_stdout);
+}
 
+fn check_output(rendered: &str, output: &std::process::Output, expected_stdout: &str) {
     assert_ne!(
         output.status.code(),
         Some(124),
@@ -94,4 +109,46 @@ fn process_substitution_reads_a_pipe_whose_writer_is_late() {
 #[test]
 fn process_substitution_completes_under_strict() {
     run_bash(&["--strict"], PROCESS_SUBSTITUTION, "n=3\n");
+}
+
+#[test]
+fn process_substitution_passes_strict_verify() {
+    run_bash(
+        &["--strict", "--verify", "--verify-strict"],
+        PROCESS_SUBSTITUTION,
+        "n=3\n",
+    );
+}
+
+/// Hermit's stdin is a HOST pipe whose writer sends one byte, pauses, then
+/// sends the second. The guest reopens it as `/dev/stdin` and makes ONE
+/// 4096-byte read (`dd count=1`). Deterministic IO fills that read until the
+/// buffer is full or EOF, so the guest always sees both bytes. Typing the host
+/// pipe as a scheduler-managed pipe would instead return the first byte alone,
+/// a count that depends on host timing.
+#[test]
+fn reopened_host_pipe_keeps_the_deterministic_full_read() {
+    let mut command = hermit_bash(
+        &[],
+        "/bin/dd if=/dev/stdin bs=4096 count=1 2>/dev/null | /usr/bin/wc -c",
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let rendered = format!("{command:?}");
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin.write_all(b"a").expect("write the first byte");
+    stdin.flush().expect("flush the first byte");
+    std::thread::sleep(Duration::from_millis(500));
+    // The guest may already have exited if it returned the short read.
+    let _ = stdin.write_all(b"b");
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to wait for guest: {rendered}: {error}"));
+    check_output(&rendered, &output, "2\n");
 }

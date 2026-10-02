@@ -2567,6 +2567,27 @@ impl<T> ThreadState<T> {
         metadata.with_detfd(fd, f)
     }
 
+    /// Descriptors in this table that Detcore manages as internal pipes: typed
+    /// `Pipe`, physically nonblocking and logically blocking, which is how
+    /// `handle_pipe2` leaves a guest-created pipe (and how exec restores it).
+    /// A pipe inherited from the host is not in this set. Sorted, so callers
+    /// probe them in a deterministic order.
+    pub(crate) fn scheduler_managed_pipe_fds(&self) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| {
+                detfd.ty() == FdType::Pipe
+                    && detfd.physically_nonblocking()
+                    && !detfd.is_nonblocking()
+            })
+            .map(|(&fd, _)| fd)
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
     }

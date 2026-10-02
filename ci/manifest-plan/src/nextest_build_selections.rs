@@ -116,6 +116,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "python_stdlib",
             "--test",
+            "reopened_pipe_progress",
+            "--test",
             "robust_futex_owner_death",
             "--test",
             "run_evidence",
@@ -599,7 +601,18 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "183");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "189");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "reopened_pipe_progress"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "reopened_pipe_progress")
+            );
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])
