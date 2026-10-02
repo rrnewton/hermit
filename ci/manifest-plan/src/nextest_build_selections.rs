@@ -147,6 +147,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "thp_stats_determinism",
             "--test",
+            "utimensat_mtime",
+            "--test",
             "verification_report_cli",
             "--test",
             "verification_report_consumers",
@@ -608,7 +610,20 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "193");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "194");
+            // The explicit utimensat mtime regression
+            // (https://github.com/rrnewton/hermit/issues/3565).
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "utimensat_mtime"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "utimensat_mtime")
+            );
             // The canonical first-seen mtime regression
             // (https://github.com/rrnewton/hermit/issues/3639).
             assert!(
