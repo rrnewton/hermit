@@ -10,8 +10,8 @@ system by default, and changes to file contents can change a run. Complete
 reproducibility still requires fixed input files and no external network
 dependency.
 
-Hermit is in maintenance mode. Compatibility is substantial but incomplete,
-especially for less common Linux system calls.
+Compatibility is substantial but incomplete, especially for less common Linux
+system calls.
 
 ## Supported Environment
 
@@ -46,7 +46,20 @@ facilities. Nested containers commonly block namespaces, `ptrace`, seccomp, or
 
 ### Build And Install
 
-From the repository root, build the workspace:
+Clone the repository with its submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/rrnewton/hermit
+cd hermit
+```
+
+If you already cloned it, initialize the submodules from the repository root:
+
+```bash
+git submodule update --init --recursive
+```
+
+Then build the workspace:
 
 ```bash
 cargo build --workspace
@@ -56,7 +69,7 @@ cargo build --workspace
 The debug executable is `target/debug/hermit`. For an optimized build:
 
 ```bash
-cargo build --release
+cargo build --release --workspace
 ./target/install_pkg/hermit --version
 ```
 
@@ -67,7 +80,9 @@ runtime. Hermit discovers it beside the invoked executable and, for an in-tree
 release binary, under `target/install_pkg`. Set
 `HERMIT_INSTALL_DIR=/path/to/install` to select another installation root.
 Backend-specific environment variables remain compatibility overrides, but a
-complete package needs none of them.
+complete package needs none of them. The default CLI does not enable `dbt`,
+`sabre`, or `e9patch` just because these resources are present; see the
+[feature-enabled build](#backend-selection) below.
 
 `target/install_pkg/hermit` is a staging symlink to the release binary. Follow
 it when creating a standalone installation, for example:
@@ -81,7 +96,7 @@ To install the current checkout into Cargo's binary directory, normally
 `~/.cargo/bin`:
 
 ```bash
-cargo install --path hermit-cli
+cargo install --locked --path hermit-cli
 hermit --version
 ```
 
@@ -186,25 +201,34 @@ LiteInst uses the normal Hermit run and verification paths. A successful
 diagnostic evidence, but it is not strict determinism. Strict verification requires
 `--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
 compared-message counts. Verification snapshots guest stdin once and supplies
-the identical bytes to both runs. The supported execution scope is dynamically
-linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
-`fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
-unsupported because the patch runtime is not yet re-bootstrapped and
-revalidated after image replacement. PMU/RCB timer delivery, CPUID, RDTSC, and
-RDTSCP use the ptrace host path and therefore have the same host capability
-requirements as the normal ptrace backend.
+the identical bytes to both runs. LiteInst supports dynamically linked Linux
+x86-64 guests, including threads and child processes created with `clone`,
+`clone3`, and `fork`. Installation of new hooks stops at the first task-creating
+syscall, while existing hooks and tasks keep running. An activated process
+leader may `exec` a new dynamically linked program; the new image must retain
+the inherited runtime environment and activate the LiteInst runtime again.
+`vfork` and `exec` from a thread other than the process leader remain unsupported
+and are refused. PMU/RCB timer delivery, CPUID, RDTSC, and RDTSCP use the ptrace
+host path and therefore have the same host capability requirements as the
+normal ptrace backend.
 
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The preload
 runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
 patch-helper path is not a security boundary for intentionally hostile code.
-The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
-e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
-guest-kernel ABI.
+The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
+well as their runtime resources. Build and stage both with:
 
-SaBRe is available only in builds using the non-default
-`third-party-backends` feature. See
-[SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
+```bash
+cargo build --release --workspace --features hermit/third-party-backends
+./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
+```
+
+The same executable accepts `--backend=sabre` and `--backend=e9patch`.
+A default `cargo install` does not enable these selections. KVM requires
+read-write `/dev/kvm` access plus a guest-kernel ABI.
+
+See [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
 `Stripped` allowlist, build commands, and known gaps. An enabled probe is
 not a blanket support claim for every workload in its subsystem.
 
@@ -222,7 +246,8 @@ vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`, `RDSEED`,
 or TSX deterministic even when those sites are mapped, so those instructions
 remain unsupported. Privilege-bearing executables fail closed rather than
 losing set-ID or file-capability semantics. This first integration validates
-rewrite coverage; it does not yet remove ptrace overhead. Put
+rewrite coverage; it does not yet remove ptrace overhead. The workspace
+installation package includes `rsrcs/e9tool`. For a custom installation, put
 `e9tool` in `PATH` or set `HERMIT_E9TOOL=/path/to/e9tool`.
 Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
 through the ptrace correctness path.
@@ -614,8 +639,11 @@ CPU-bound threads may run until another intercepted event.
 ### Unsupported System Calls
 
 Hermit implements deterministic behavior for many, but not all, Linux system
-calls. By default, an unimplemented call is passed through to Linux. That can
-restore compatibility while introducing nondeterminism.
+calls. By default, a call classified as Unsupported is rejected instead of
+being forwarded to Linux. The run-only `--allow-unsupported-syscalls` option
+permits pass-through and prints a warning; it may restore compatibility but
+introduces uncontrolled behavior. A successful exit with this option does not
+establish reproducibility.
 
 To identify the first unsupported call during development:
 
