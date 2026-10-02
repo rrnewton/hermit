@@ -1695,19 +1695,23 @@ fn write_verification_announcement(
 /// predicate that sets `bitwise_parity` in `--verify-json`, so the console and
 /// the machine-readable report cannot disagree. Stdout and stderr are always
 /// compared byte for byte by [`compare_two_runs`]; the guest's log records are
-/// compared only when `compare_logs` is set, under the spec's strictness.
+/// compared only when `compare_logs` is set, under the spec's strictness and
+/// only within its `log_scope`. When time was not virtualized (record mode), a
+/// match shows only that the second run reproduced the first.
 fn matched_comparison_qualifier(outcome: &VerificationOutcome) -> String {
     let comparison = &outcome.comparison;
+    let scope = match comparison.log_scope {
+        ComparedLogScope::Deterministic => {
+            "only the DETLOG and scheduler COMMIT records of the guest's log"
+        }
+        ComparedLogScope::Info => "the INFO records of the guest's log",
+        ComparedLogScope::FullTrace => "every record of the guest's log",
+    };
     let records = outcome.compared_log_messages.map_or_else(
-        || "the guest's log records".to_owned(),
-        |counts| {
-            format!(
-                "the guest's log records ({} vs {})",
-                counts.left, counts.right
-            )
-        },
+        || scope.to_owned(),
+        |counts| format!("{scope} ({} vs {})", counts.left, counts.right),
     );
-    if verification_report(outcome).bitwise_parity {
+    let compared = if verification_report(outcome).bitwise_parity {
         format!(
             "Compared: stdout and stderr byte for byte, and {records} exactly apart from \
              the wall-clock prefix and canonicalized addresses, under {}: \
@@ -1732,8 +1736,20 @@ fn matched_comparison_qualifier(outcome: &VerificationOutcome) -> String {
              `bitwise_parity` in --verify-json). This is not a bitwise comparison.",
             comparison.display_name
         )
+    };
+    if comparison.virtualize_time {
+        compared
+    } else {
+        format!("{compared} {TIME_NOT_VIRTUALIZED_NOTE}")
     }
 }
+
+/// Appended to every match whose comparison ran without virtual time, which is
+/// what `hermit record start --verify` does (see
+/// [`ComparisonSpec::virtualize_time`]). Without it, a record-mode
+/// `bitwise parity established` would read as a determinism result.
+pub(crate) const TIME_NOT_VIRTUALIZED_NOTE: &str = "Time was not virtualized, so this shows \
+    that the second run reproduced the first, not that separate runs of the guest agree.";
 
 fn display_diff(left: &str, right: &str) {
     for result in diff::lines(left, right) {
@@ -2758,13 +2774,17 @@ mod tests {
         assert!(text.contains(SUCCESS), "{text}");
         assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
         assert!(
-            text.contains("the guest's log records (1 vs 1) under the lossy Stripped comparison"),
+            text.contains(
+                "only the DETLOG and scheduler COMMIT records of the guest's log (1 vs 1) \
+                 under the lossy Stripped comparison"
+            ),
             "{text}"
         );
         assert!(
             text.contains("This is not a bitwise comparison; add --verify-strict for one."),
             "{text}"
         );
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
 
         let (log1, log2) = empty_logs();
         fs::write(&log1, detlog_with_value(100)).unwrap();
@@ -2779,7 +2799,31 @@ mod tests {
             text.contains(&format!("under BitwiseInfoV1: {BITWISE_PARITY_CLAIM}.")),
             "{text}"
         );
+        assert!(
+            text.contains("the INFO records of the guest's log (1 vs 1) exactly"),
+            "{text}"
+        );
         assert!(!text.contains("not a bitwise comparison"), "{text}");
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+
+        // `record start --verify --verify-strict` compares with virtual time
+        // off. Parity can still hold, but the line must say that the match is
+        // replay fidelity, not agreement between separate runs.
+        let record_mode = VerificationOutcome {
+            comparison: ComparisonSpec {
+                virtualize_time: false,
+                ..canonical.comparison
+            },
+            ..canonical.clone()
+        };
+        assert!(verification_report(&record_mode).bitwise_parity);
+        let text = announce(&record_mode);
+        assert!(
+            text.contains(&format!(
+                "{BITWISE_PARITY_CLAIM}. {TIME_NOT_VIRTUALIZED_NOTE}"
+            )),
+            "{text}"
+        );
 
         // A canonical spec without the evidence parity needs (here, no
         // compared records) must not inherit the claim from its policy name.

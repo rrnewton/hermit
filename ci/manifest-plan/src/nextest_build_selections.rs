@@ -142,6 +142,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "verification_report_consumers",
             "--test",
+            "verify_claim_names_its_limit",
+            "--test",
             "writev_determinism",
             "--test",
             "zero_copy_pipe_fallback",
@@ -597,7 +599,7 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "179");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "183");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])
