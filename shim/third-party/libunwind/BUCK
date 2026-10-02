@@ -9,25 +9,43 @@ load("@//third-party:defs.bzl", "pkgconfig_system_library")
 
 oncall("open_source")
 
-pkgconfig_system_library(
-    name = "unwind",
-    packages = {
-        "//os:linux-fedora": ["libunwind-devel"],
-        "//os:linux-ubuntu": ["libunwind-dev"],
-        "//os:macos-homebrew": ["libunwind"],
-    },
-    pkgconfig_name = "libunwind",
-)
+# Under the RE modes (shim/modes/hybrid, remote: hermit.rust_sysroot is set), links run on
+# RE workers, which have no libunwind-devel. There the libraries are the host's
+# libunwind-devel files staged into ./staged by shim/modes/stage-re-inputs, passed to
+# the link as an input. Otherwise pkg-config describes the host, as before.
+_STAGED = read_config("hermit", "rust_sysroot", "") != ""
 
-# The ptrace flavour of libunwind, used for remote backtraces. It ships in the
-# same distribution packages as the library above and has its own pkg-config
-# name.
-pkgconfig_system_library(
-    name = "unwind-ptrace",
-    packages = {
-        "//os:linux-fedora": ["libunwind-devel"],
-        "//os:linux-ubuntu": ["libunwind-dev"],
-        "//os:macos-homebrew": ["libunwind"],
-    },
-    pkgconfig_name = "libunwind-ptrace",
-)
+[
+    export_file(
+        name = "staged",
+        src = "staged",
+    )
+    for _ in ([None] if _STAGED else [])
+]
+
+[
+    prebuilt_cxx_library(
+        name = name,
+        exported_linker_flags = ["-L$(location :staged)"] + libs,
+        visibility = ["PUBLIC"],
+    )
+    for name, libs in ({
+        "unwind": ["-lunwind"],
+        "unwind-ptrace": ["-l:libunwind-ptrace.a", "-lunwind-generic"],
+    }.items() if _STAGED else [])
+]
+
+[
+    pkgconfig_system_library(
+        name = name,
+        packages = {
+            "//os:linux-fedora": ["libunwind-devel"],
+            "//os:linux-ubuntu": ["libunwind-dev"],
+            "//os:macos-homebrew": ["libunwind"],
+        },
+        pkgconfig_name = pkgconfig_name,
+    )
+    # unwind-ptrace is the ptrace flavour of libunwind, used for remote backtraces. It
+    # ships in the same distribution packages and has its own pkg-config name.
+    for name, pkgconfig_name in ([] if _STAGED else [("unwind", "libunwind"), ("unwind-ptrace", "libunwind-ptrace")])
+]
