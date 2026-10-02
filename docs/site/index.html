@@ -194,21 +194,21 @@
         <p>Some of the larger workloads explored with Hermit.</p>
       </div>
       <div class="card-grid">
-        <article class="example-card">
+        <article class="example-card accent-coral">
           <h3>Boot and inspect Linux under QEMU</h3>
           <p>A minimal Linux guest boots under QEMU with Hermit's controlled thread scheduling and QEMU's instruction-based clock. Repeated boots matched after log normalization. Separate experiments with the drgn kernel debugger reproduced kernel task lists at chosen stopping points.</p>
           <div class="card-links">
             <a href="https://github.com/rrnewton/hermit/blob/main/docs/QEMU_BOOT.md">QEMU boot guide <span aria-hidden="true">&rarr;</span></a>
           </div>
         </article>
-        <article class="example-card">
+        <article class="example-card accent-blue">
           <h3>Reproduce a btrfs concurrency bug</h3>
           <p>With a historical bug restored in an instrumented btrfs-convert and its progress timer replaced by a pipe, Hermit's chaos scheduler triggered a use-after-free. Repeating the seed reproduced the same failure report; the fixed version had no such crashes in the same sweep.</p>
           <div class="card-links">
             <a href="https://github.com/rrnewton/hermit/blob/main/docs/USER_GUIDE.md#chaos-mode">Explore thread schedules <span aria-hidden="true">&rarr;</span></a>
           </div>
         </article>
-        <article class="example-card">
+        <article class="example-card accent-gold">
           <h3>Reproduce build outputs</h3>
           <p>Hermit has rebuilt Debian packages such as hello, hostname, and tree with byte-identical package files across independent build environments. A Nix builder prototype also made an example build that reads the clock and random bytes reproducible.</p>
         </article>

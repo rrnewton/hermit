@@ -107,7 +107,7 @@ code { font-family: ui-monospace, "Cascadia Code", "Source Code Pro", monospace;
 
 .card-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
 .tool-card, .example-card { display: flex; flex-direction: column; padding: 30px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.4); }
-.tool-card { border-top: 3px solid var(--accent); }
+.tool-card, .example-card { border-top: 3px solid var(--accent); }
 .accent-coral { --accent: var(--coral); }
 .accent-blue { --accent: var(--blue); }
 .accent-gold { --accent: var(--gold); }
@@ -119,6 +119,8 @@ code { font-family: ui-monospace, "Cascadia Code", "Source Code Pro", monospace;
 .compatibility .button { margin-top: 28px; }
 .compat-highlights { margin: 26px 0; padding-left: 22px; max-width: 850px; }
 .compat-highlights li { margin-bottom: 12px; }
+#examples .section-heading { max-width: none; }
+.example-card { background: color-mix(in srgb, var(--accent) 8%, var(--paper)); }
 .example-card h3 { font-size: 1.7rem; }
 footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 24px; padding: 34px 0 44px; border-top: 1px solid var(--line); }
 .footer-brand { font-weight: 750; text-decoration: none; }
