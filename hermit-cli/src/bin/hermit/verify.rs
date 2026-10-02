@@ -1610,27 +1610,110 @@ pub fn announce_verification_outcome(
     success_message: &str,
     failure_message: &str,
 ) {
+    // Console output is best-effort, as it was with `eprintln!`; the verdict
+    // itself travels through the exit status and the published report.
+    let _ = write_verification_announcement(
+        &mut io::stderr().lock(),
+        outcome,
+        success_message,
+        failure_message,
+    );
+}
+
+/// The phrase that claims bitwise parity on the console. It is printed only
+/// when the published report's `bitwise_parity` is true, so no weaker
+/// comparison can be read as that claim.
+pub(crate) const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
+
+/// Write the announcement for `outcome` to `out`.
+///
+/// On a match, the caller's success message is followed by a line that states
+/// what the match rests on. The success message is kept byte-for-byte as the
+/// callers pass it, because tests and harnesses in this repository and in the
+/// parent workspace match `Success: deterministic. Determinism verified.` as a
+/// substring and, in at least one place, as an exact line. That message is
+/// printed for the lossy `Stripped` comparison of a plain `--verify` as well as
+/// for the canonical comparison of `--verify-strict`, so on its own it cannot
+/// tell a reader which one ran.
+fn write_verification_announcement(
+    out: &mut impl io::Write,
+    outcome: &VerificationOutcome,
+    success_message: &str,
+    failure_message: &str,
+) -> io::Result<()> {
     // Announce the comparison only after any requested machine-readable report
     // has been durably published. Output-only fallbacks did not compare an
     // internal log and therefore must not claim a comparison policy.
     if let Some(evidence) = comparison_evidence_line(&outcome.comparison) {
-        eprintln!("{evidence}");
+        writeln!(out, "{evidence}")?;
     }
     match outcome.verdict {
-        Verdict::Matched => eprintln!(":: {}", success_message.green().bold()),
-        Verdict::Diverged => eprintln!(":: {}", failure_message.red().bold()),
-        Verdict::NoResult => eprintln!(
+        Verdict::Matched => {
+            writeln!(out, ":: {}", success_message.green().bold())?;
+            writeln!(out, ":: {}", matched_comparison_qualifier(outcome))?;
+        }
+        Verdict::Diverged => writeln!(out, ":: {}", failure_message.red().bold())?,
+        Verdict::NoResult => writeln!(
+            out,
             ":: {}",
             "No result: the comparison was refused, so this is neither a match nor a difference."
                 .red()
                 .bold()
-        ),
-        Verdict::InfrastructureError => eprintln!(
+        )?,
+        Verdict::InfrastructureError => writeln!(
+            out,
             ":: {}",
             "Infrastructure error: the result is neither a match nor a product difference."
                 .red()
                 .bold()
-        ),
+        )?,
+    }
+    Ok(())
+}
+
+/// Say, in plain words, what a `Matched` verdict compared.
+///
+/// The bitwise claim is derived from [`verification_report`], the same
+/// predicate that sets `bitwise_parity` in `--verify-json`, so the console and
+/// the machine-readable report cannot disagree. Stdout and stderr are always
+/// compared byte for byte by [`compare_two_runs`]; the guest's log records are
+/// compared only when `compare_logs` is set, under the spec's strictness.
+fn matched_comparison_qualifier(outcome: &VerificationOutcome) -> String {
+    let comparison = &outcome.comparison;
+    let records = outcome.compared_log_messages.map_or_else(
+        || "the guest's log records".to_owned(),
+        |counts| {
+            format!(
+                "the guest's log records ({} vs {})",
+                counts.left, counts.right
+            )
+        },
+    );
+    if verification_report(outcome).bitwise_parity {
+        format!(
+            "Compared: stdout and stderr byte for byte, and {records} exactly apart from \
+             the wall-clock prefix and canonicalized addresses, under {}: \
+             {BITWISE_PARITY_CLAIM}.",
+            comparison.display_name
+        )
+    } else if !comparison.compare_logs {
+        "Compared: stdout and stderr only. The guest's log records were not compared, \
+         so this is not a bitwise comparison."
+            .to_owned()
+    } else if comparison.strictness == LogCompareStrictness::Stripped {
+        format!(
+            "Compared: stdout and stderr byte for byte, and {records} under the lossy \
+             Stripped comparison, which erases numbers, addresses, paths and timestamps \
+             before comparing. This is not a bitwise comparison; add --verify-strict \
+             for one."
+        )
+    } else {
+        format!(
+            "Compared: stdout and stderr byte for byte, and {records} under {}, but \
+             without all the evidence the parity contract requires (see \
+             `bitwise_parity` in --verify-json). This is not a bitwise comparison.",
+            comparison.display_name
+        )
     }
 }
 
@@ -2623,6 +2706,94 @@ mod tests {
         assert!(path2.exists(), "divergent run-2 log must be retained");
         fs::remove_file(path1).unwrap();
         fs::remove_file(path2).unwrap();
+    }
+
+    // A plain `--verify` (Stripped) and `--verify-strict` (Canonical) print the
+    // same success sentence, which is kept verbatim for its many consumers. The
+    // line after it must say which comparison ran, and only a match whose
+    // published report has `bitwise_parity` may claim bitwise parity. This
+    // checks the bytes the announcement actually writes, not a helper alone.
+    #[test]
+    fn stripped_success_does_not_claim_bitwise_parity_but_strict_success_does() {
+        const SUCCESS: &str = "Success: deterministic. Determinism verified.";
+        let announce = |outcome: &VerificationOutcome| {
+            let mut bytes = Vec::new();
+            write_verification_announcement(
+                &mut bytes,
+                outcome,
+                SUCCESS,
+                "Failure: nondeterministic.",
+            )
+            .unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let out = output(0, b"hello\n", b"");
+
+        let (log1, log2) = empty_logs();
+        fs::write(&log1, detlog_with_value(100)).unwrap();
+        fs::write(&log2, detlog_with_value(100)).unwrap();
+        let stripped =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Stripped).unwrap();
+        assert_eq!(stripped.verdict, Verdict::Matched);
+        assert!(!verification_report(&stripped).bitwise_parity);
+        let text = announce(&stripped);
+        assert!(text.contains(SUCCESS), "{text}");
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+        assert!(
+            text.contains("the guest's log records (1 vs 1) under the lossy Stripped comparison"),
+            "{text}"
+        );
+        assert!(
+            text.contains("This is not a bitwise comparison; add --verify-strict for one."),
+            "{text}"
+        );
+
+        let (log1, log2) = empty_logs();
+        fs::write(&log1, detlog_with_value(100)).unwrap();
+        fs::write(&log2, detlog_with_value(100)).unwrap();
+        let canonical =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+        assert_eq!(canonical.verdict, Verdict::Matched);
+        assert!(verification_report(&canonical).bitwise_parity);
+        let text = announce(&canonical);
+        assert!(text.contains(SUCCESS), "{text}");
+        assert!(
+            text.contains(&format!("under BitwiseInfoV1: {BITWISE_PARITY_CLAIM}.")),
+            "{text}"
+        );
+        assert!(!text.contains("not a bitwise comparison"), "{text}");
+
+        // A canonical spec without the evidence parity needs (here, no
+        // compared records) must not inherit the claim from its policy name.
+        let no_evidence = VerificationOutcome {
+            compared_log_messages: Some(ComparedLogCounts { left: 0, right: 0 }),
+            ..canonical.clone()
+        };
+        let text = announce(&no_evidence);
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+        assert!(text.contains("This is not a bitwise comparison."), "{text}");
+
+        // An output-only fallback compared no log at all.
+        let output_only = VerificationOutcome {
+            comparison: ComparisonSpec {
+                compare_logs: false,
+                ..canonical.comparison
+            },
+            compared_log_messages: None,
+            ..canonical.clone()
+        };
+        let text = announce(&output_only);
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+        assert!(text.contains("Compared: stdout and stderr only."), "{text}");
+
+        // A divergence prints no qualifier and no claim.
+        let diverged = VerificationOutcome {
+            verdict: Verdict::Diverged,
+            ..canonical
+        };
+        let text = announce(&diverged);
+        assert!(!text.contains("Compared:"), "{text}");
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
     }
 
     #[test]

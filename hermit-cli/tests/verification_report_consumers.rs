@@ -74,14 +74,14 @@ const CONSUMERS: &[Consumer] = &[
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_test.sh",
-        requirement: "matched",
-        invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
+        requirement: "canonical-match",
+        invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_userspace_test.sh",
-        requirement: "matched",
-        invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
+        requirement: "canonical-match",
+        invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
     },
     Consumer {
@@ -396,6 +396,13 @@ fn every_named_consumer_delegates_to_the_shared_typed_reader() {
         assert!(
             source.contains("--verify-json"),
             "{} does not request the producer-owned report",
+            consumer.path
+        );
+        // A canonical-match reader can only be satisfied by a canonical
+        // comparison, which a plain `--verify` never runs.
+        assert!(
+            consumer.requirement != "canonical-match" || source.contains("--verify-strict"),
+            "{} requires canonical-match but never requests --verify-strict",
             consumer.path
         );
         assert!(
