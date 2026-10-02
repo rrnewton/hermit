@@ -111,13 +111,34 @@ fn process_substitution_completes_under_strict() {
     run_bash(&["--strict"], PROCESS_SUBSTITUTION, "n=3\n");
 }
 
+/// L2 on the ptrace backend: the canonical comparator must report bitwise
+/// parity over a nonzero number of compared INFO messages.
 #[test]
 fn process_substitution_passes_strict_verify() {
+    let report_directory = tempfile::tempdir().expect("failed to create verify report directory");
+    let report_path = report_directory.path().join("verify.json");
+    let verify_json = format!("--verify-json={}", report_path.display());
     run_bash(
-        &["--strict", "--verify", "--verify-strict"],
+        &["--strict", "--verify", "--verify-strict", &verify_json],
         PROCESS_SUBSTITUTION,
         "n=3\n",
     );
+    let report = std::fs::read_to_string(&report_path).expect("failed to read verify report");
+    let report: serde_json::Value =
+        serde_json::from_str(&report).expect("verify report is not JSON");
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::Value::Bool(true),
+        "process substitution did not meet canonical parity: {report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "verify compared no {side} INFO messages: {report}"
+        );
+    }
 }
 
 /// Hermit's stdin is a HOST pipe whose writer sends one byte, pauses, then
@@ -126,6 +147,11 @@ fn process_substitution_passes_strict_verify() {
 /// buffer is full or EOF, so the guest always sees both bytes. Typing the host
 /// pipe as a scheduler-managed pipe would instead return the first byte alone,
 /// a count that depends on host timing.
+///
+/// The test can only catch that regression if the guest's read starts during
+/// the pause, so the pause is long: a healthy run reaches the read in well
+/// under a second. It cannot fail falsely; a late read sees both bytes either
+/// way.
 #[test]
 fn reopened_host_pipe_keeps_the_deterministic_full_read() {
     let mut command = hermit_bash(
@@ -143,7 +169,7 @@ fn reopened_host_pipe_keeps_the_deterministic_full_read() {
     let mut stdin = child.stdin.take().expect("piped stdin");
     stdin.write_all(b"a").expect("write the first byte");
     stdin.flush().expect("flush the first byte");
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_secs(3));
     // The guest may already have exited if it returned the short read.
     let _ = stdin.write_all(b"b");
     drop(stdin);

@@ -2570,8 +2570,12 @@ impl<T> ThreadState<T> {
     /// Descriptors in this table that Detcore manages as internal pipes: typed
     /// `Pipe`, physically nonblocking and logically blocking, which is how
     /// `handle_pipe2` leaves a guest-created pipe (and how exec restores it).
-    /// A pipe inherited from the host is not in this set. Sorted, so callers
-    /// probe them in a deterministic order.
+    /// On ptrace, a pipe inherited from the host is not in this set: stdio is
+    /// typed `Regular`, and another inherited FIFO is physically nonblocking
+    /// only when it is logically nonblocking too. On SaBRe, stdio is discovered
+    /// as `Pipe` and a guest `F_SETFL` gives it the marker, so a host stdin pipe
+    /// can appear here (as its fd 0 already behaves like an internal pipe).
+    /// Sorted, so callers probe them in a deterministic order.
     pub(crate) fn scheduler_managed_pipe_fds(&self) -> Vec<RawFd> {
         let mut fds: Vec<RawFd> = self
             .metadata()

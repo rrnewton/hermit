@@ -395,9 +395,10 @@ const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 /// process already holds as a scheduler-managed pipe (`managed_pipe_fds`)?
 ///
 /// Both `/proc/<pid>/fd/<fd>` links read `pipe:[<inode>]` for the same pipe.
-/// A named FIFO links to its path and a host pipe is never in
-/// `managed_pipe_fds`, so neither matches: a host writer is outside the
-/// scheduler and must not be polled as if it were a guest
+/// A named FIFO links to its path, and on ptrace a host pipe is never in
+/// `managed_pipe_fds` (see `scheduler_managed_pipe_fds` for SaBRe), so neither
+/// matches: a host writer is outside the scheduler and must not be polled as if
+/// it were a guest
 /// (<https://github.com/rrnewton/hermit/pull/3534#issuecomment-5962369261>).
 fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd]) -> bool {
     let link = |fd: RawFd| std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok();
