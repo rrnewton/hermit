@@ -401,7 +401,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // portable-strict-compat-only lane became one manifest bucket (fold 2 of
     // https://github.com/rrnewton/hermit/issues/3448), retains all 764 prior
     // identities.
-    ("test.regular_crates", 765),
+    // The Buck/RE harness (https://github.com/rrnewton/hermit/pull/3507) adds 13
+    // tests that retain all 765 prior identities: detcore-model
+    // host_capability::tests::a_missing_kvm_device_is_proof_of_absence; runner::tests::
+    // a_source_sha_replaces_git_for_a_snapshot_root and
+    // source_sha_must_be_one_full_lowercase_commit; hermit-manifest-plan
+    // snapshot_population_lists_every_file_under_tests and
+    // source_snapshot_selects_the_filesystem_population; test-harness
+    // a_kvm_cell_is_withheld_where_kvm_is_proven_absent,
+    // a_lone_host_inapplicable_cell_fails_the_run_in_tpx_too,
+    // an_unwritable_count_file_fails_the_run_in_tpx_too,
+    // every_kvm_plan_row_requires_the_kvm_host_capability,
+    // source_snapshot_flags_parse_once,
+    // tpx_json_reports_each_final_cell_with_the_run_verdict and
+    // tpx_json_reports_missing_cells_and_run_failures_as_failed; and cli_help
+    // test_harness_source_snapshot_flags_redirect_misuse.
+    ("test.regular_crates", 778),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -596,7 +611,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
-    ("test.regular_crates_on_host", 765),
+    // The 13 Buck/RE harness tests (https://github.com/rrnewton/hermit/pull/3507)
+    // retain all 765 prior identities.
+    ("test.regular_crates_on_host", 778),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
