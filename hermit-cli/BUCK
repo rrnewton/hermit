@@ -22,7 +22,15 @@ hermit_build_env = {
 # using Buck config arguments (never shell-expanded source text). The supported
 # entrypoint is `scripts/build-buck-release.rs`, which derives and validates all
 # four values before selecting these shadow targets.
-release_build_env = {
+#
+# Regular builds and CI (ci/buck-e2e, `validate --build buck-*`) instead pass
+# -c hermit_release.unstamped=true: the same release feature set and linkage
+# with the ordinary build identity (no commit hash, no build date), so a commit
+# that changes no compiled source rebuilds nothing and stays cached. Without
+# that flag the release targets still refuse to compile unstamped.
+release_unstamped = read_root_config("hermit_release", "unstamped", "false") == "true"
+release_provenance_features = [] if release_unstamped else ["buck-release-provenance"]
+release_build_env = hermit_build_env if release_unstamped else {
     "CARGO_PKG_VERSION": read_root_config("hermit_release", "version", ""),
     "HERMIT_BUILD_DATE": read_root_config("hermit_release", "build_date", ""),
     "HERMIT_BUILD_GIT_SHA": read_root_config("hermit_release", "hermit_sha", ""),
@@ -141,8 +149,7 @@ rust_library(
     ),
     crate = "hermit",
     env = release_build_env,
-    features = [
-        "buck-release-provenance",
+    features = release_provenance_features + [
         "dbt",
         "e9patch",
         "sabre",
@@ -186,8 +193,7 @@ rust_binary(
     srcs = glob(["src/bin/**/*.rs"]),
     crate = "hermit",
     env = release_build_env,
-    features = [
-        "buck-release-provenance",
+    features = release_provenance_features + [
         "dbt",
         "e9patch",
         "sabre",

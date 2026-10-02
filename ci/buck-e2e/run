@@ -14,7 +14,10 @@
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage). Tpx
 # retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
 # ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
-# every `buck2 test` before the `--` (e.g. @shim/modes/hybrid, -c hermit_release.*).
+# every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
+# The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
+# hash or build date in the binary), so a commit that changes no compiled source
+# rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
 # Each invocation's event log and test-run id are kept in --work.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -42,7 +45,7 @@ invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit stat
     local name=$1 target=$2
     shift 2
     set +e
-    env -C "$root" "$buck2" test "${extra[@]}" "$@" \
+    env -C "$root" "$buck2" test -c hermit_release.unstamped=true "${extra[@]}" "$@" \
         --event-log "$work/$name.event-log.pb.zst" --write-test-id "$work/$name.test_id" \
         "$target" "${tpx[@]}" >"$work/$name.log" 2>&1
     echo $? >"$work/$name.rc"
