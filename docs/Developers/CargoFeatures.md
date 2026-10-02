@@ -50,13 +50,13 @@ the repeated name is intentional rather than a shared feature.
 | --- | --- | --- | --- |
 | `ptrace` | Yes | None | Host ptrace, namespaces, seccomp, and PMU when preemption is enabled. |
 | `kvm` | Yes | None | `/dev/kvm` and the KVM guest ABI. |
-| `liteinst` | Yes | None | Staged `libreverie_liteinst.so`; Hermit uses `reverie-liteinst` with its constructor default disabled. |
+| `liteinst` | No | `liteinst` | Staged `libreverie_liteinst.so`; Hermit uses `reverie-liteinst` with its constructor default disabled. |
 | `dbt` | No | `dbt` | Staged DynamoRIO, native client, and `libdetcore_dbt.so`. |
 | `sabre` | No | `sabre` | Staged SaBRe loader and `libdetcore_sabre.so`. |
 | `e9patch` | No | `e9patch` | Staged `e9tool` and `e9patch`; execution remains ptrace-backed preprocessing rather than a separate Detcore runtime. |
 
-The intended split is a core Cargo release containing ptrace, KVM, and LiteInst,
-and a developer build that explicitly enables and stages all third-party
+The intended split is a core Cargo release containing ptrace and KVM, and a
+developer build that explicitly enables and stages all third-party
 backends. Draft PR
 [#1433](https://github.com/rrnewton/hermit/pull/1433) makes plain `make` the
 all-backend developer build while keeping `make release-core` feature-free.
@@ -64,11 +64,11 @@ all-backend developer build while keeping `make release-core` feature-free.
 This matches the release plan only if "single static core binary" means one
 Hermit executable with no third-party backend features. It is not currently a
 literal static, single-file distribution: the executable dynamically links
-host libc/libunwind, and LiteInst needs the separately staged
-`libreverie_liteinst.so`. A clean `release-core` build compiles the LiteInst
-selection but does not by itself make that selection runnable. The release
-contract must either call this a lean core executable, ship the LiteInst runtime
-beside it, or change LiteInst to an embedded runtime.
+host libc/libunwind. LiteInst is no longer part of the core release: it sits
+behind the optional `liteinst` feature
+([#3516](https://github.com/rrnewton/hermit/pull/3516)), and `release-core`
+refuses `--backend=liteinst`. A build that enables `liteinst` still needs the
+separately staged `libreverie_liteinst.so` before that selection is runnable.
 
 ## Conditional Compilation Audit
 
@@ -95,8 +95,9 @@ behave differently.
 ## Recommendations
 
 1. Resolve the release-contract ambiguity: "single static binary" is not true
-   for a runnable LiteInst configuration today. Specify whether the deliverable
-   is the lean executable alone or an executable-plus-LiteInst-runtime package.
+   for a runnable LiteInst configuration today, because the `liteinst` feature
+   needs a staged runtime. Specify whether a LiteInst deliverable is a feature
+   build plus its runtime package or an embedded runtime.
 2. Keep `hermit`'s Cargo `default` feature set empty. Express the all-backend
    developer policy in `make`, not by changing the published crate defaults.
 3. Keep both no-feature and `third-party-backends` builds in CI. Also retain

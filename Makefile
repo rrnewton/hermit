@@ -81,7 +81,7 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin policy)
 	@./scripts/setup-hooks.sh
 
-release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
+release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm)
 	$(CARGO) build --release --locked -p hermit
 
 # `make build` produces target/debug/hermit but never rebuilds an existing
