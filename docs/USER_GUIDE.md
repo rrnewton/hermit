@@ -182,13 +182,14 @@ syscall at each site and installs a LiteInst trampoline for later invocations.
 There is no second in-guest Detcore instance or coordinator RPC Tool.
 
 Build and stage the constructor-enabled runtime with its locked standalone
-manifest before building Hermit:
+manifest before building Hermit with the optional `liteinst` feature, which
+`third-party-backends` includes; a build without it refuses `--backend=liteinst`:
 
 ```bash
 ./scripts/stage-liteinst-runtime.sh dev \
   "$PWD/target/debug/libreverie_liteinst.so" \
   "$PWD/target/liteinst-runtime-build"
-cargo build --locked -p hermit --bin hermit
+cargo build --locked -p hermit --features liteinst --bin hermit
 ```
 
 Hermit verifies the DSO architecture, required exports, and preload constructor

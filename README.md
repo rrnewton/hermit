@@ -134,13 +134,15 @@ hermit --backend=ptrace run -- /bin/echo hello
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
 explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
-dynamically linked Linux x86-64 guests:
+dynamically linked Linux x86-64 guests. It needs the optional `liteinst` CLI
+feature, which `third-party-backends` includes; a build without it refuses
+`--backend=liteinst`:
 
 ```bash
 ./scripts/stage-liteinst-runtime.sh dev \
   "$PWD/target/debug/libreverie_liteinst.so" \
   "$PWD/target/liteinst-runtime-build"
-cargo build --locked -p hermit --bin hermit
+cargo build --locked -p hermit --features liteinst --bin hermit
 ./target/debug/hermit --backend=liteinst run --strict --verify -- /bin/echo hello
 ```
 
