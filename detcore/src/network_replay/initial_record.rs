@@ -32,6 +32,13 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 | Sysno::getsockname | Sysno::getpeername
                 | Sysno::getsockopt | Sysno::setsockopt
                 | Sysno::fstat | Sysno::lseek
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-3464): Keep filesystem queries on the
+                // ordinary Detcore handlers, including statfs canonicalization
+                // and Linux errors. Neither call changes the descriptor table
+                // or consumes network data, so no installation join is needed.
+                // https://github.com/rrnewton/hermit/pull/3464
+                | Sysno::statfs | Sysno::fstatfs
                 | Sysno::brk | Sysno::mmap | Sysno::mprotect | Sysno::munmap
                 | Sysno::madvise | Sysno::arch_prctl
                 | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::rt_sigreturn
@@ -132,6 +139,19 @@ mod tests {
         // Negative controls: admitting the joined openat operation must not
         // admit sibling descriptor creators that lack its publication join.
         for number in [Sysno::open, Sysno::openat2, Sysno::creat] {
+            assert!(!initial_record_call_supported(raw(number)), "{number:?}");
+        }
+    }
+    #[test]
+    fn initial_record_admits_determinized_filesystem_queries() {
+        // curl probes filesystem geometry during initialization. These calls
+        // keep the ordinary deterministic handlers and cannot create, replace,
+        // or close a descriptor, nor consume or transmit a network stream.
+        for number in [Sysno::statfs, Sysno::fstatfs] {
+            assert!(initial_record_call_supported(raw(number)), "{number:?}");
+        }
+        // Filesystem observation does not authorize mount/namespace changes.
+        for number in [Sysno::mount, Sysno::umount2, Sysno::unshare, Sysno::setns] {
             assert!(!initial_record_call_supported(raw(number)), "{number:?}");
         }
     }

@@ -1392,6 +1392,43 @@ mod tests {
 
         use super::super::accepted_completion;
 
+        const CHILD: &str = "HERMIT_NETWORK_GUARD_EMIT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Other libtest threads fork real controllers. Create every
+            // fixture descriptor only after re-exec, so those forks cannot
+            // retain a SOCK_SEQPACKET writer and invalidate the exact EOF
+            // assertion below. Keep the original receiver checks unchanged.
+            struct NativeChild(std::process::Child);
+            impl Drop for NativeChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = NativeChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(std::thread::current().name().expect("named libtest thread"))
+                    .args(["--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "isolated guard emission fixture: {status}");
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "isolated guard emission fixture exceeded 10 seconds"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
         for fail_sync in [true, false] {
             let mut channel = accepted_completion::FixtureChannel::new().unwrap();
             channel.install_publisher_premise();
@@ -1414,9 +1451,20 @@ mod tests {
                     result.as_ref().unwrap_err().raw_os_error(),
                     Some(libc::EINVAL)
                 );
+                // CLOEXEC does not stop another test's concurrent fork from
+                // retaining a writer. This tests the synchronous emitted frame,
+                // not global pipe EOF: keep our writer alive and require the
+                // complete frame followed by an empty nonblocking queue.
+                let mut expected = serde_json::to_vec(&value).unwrap();
+                expected.push(b'\n');
+                let mut bytes = vec![0; expected.len()];
+                let read = reader.read_exact(&mut bytes);
+                let extra = reader.read(&mut [0; 1]);
                 drop(writer);
-                let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes).unwrap();
+                drop(reader);
+                read.unwrap();
+                assert_eq!(bytes, expected);
+                assert_eq!(extra.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
                 (result.map_err(Error::from), bytes)
             } else {
                 let mut file = tempfile::tempfile().unwrap();

@@ -481,18 +481,36 @@ pub struct RunOpts {
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
-    /// Select isolated guest networking. `none` creates a fresh network namespace whose
+    /// Select guest networking. `none` creates a fresh network namespace whose
     /// kernel-mandatory loopback interface remains down; `local` explicitly enables loopback.
+    /// `record` captures live external traffic and `replay` uses only captured traffic;
+    /// both require --network-trace.
     /// The legacy `host` value remains accepted, but prefer `--unsafe-live-network` because live
     /// host networking forfeits deterministic reproducibility.
     #[clap(
         long,
         alias = "net",
-        value_name = "none|local|host",
+        value_name = "none|local|host|record|replay",
         default_value = "none",
         conflicts_with = "unsafe_live_network"
     )]
     network: NetworkingMode,
+
+    /// Trace path for --network=record (a new trace) or --network=replay (an existing trace).
+    /// The older --record-networking and --replay-networking spellings remain supported.
+    #[clap(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = [
+            "record_networking",
+            "replay_networking",
+            "unsafe_live_network",
+            "analyze_networking",
+            "no_namespace",
+            "strace_only"
+        ]
+    )]
+    network_trace: Option<PathBuf>,
 
     /// Administrator-provisioned private bpffs directory for the default Unix
     /// network guard. Must be supplied together with --network-guard-recovery.
@@ -931,6 +949,10 @@ pub enum NetworkingMode {
     Local,
     /// Allow all access through the host network. This is intentionally unsafe.
     UnsafeHost,
+    /// CLI request normalized into the existing captured-input policy before launch.
+    Record,
+    /// CLI request normalized into the existing offline policy before launch.
+    Replay,
 }
 
 // Upper case will work, but prefer lower case.
@@ -940,6 +962,8 @@ impl fmt::Display for NetworkingMode {
             NetworkingMode::None => "none",
             NetworkingMode::Local => "local",
             NetworkingMode::UnsafeHost => "unsafe-live-network",
+            NetworkingMode::Record => "record",
+            NetworkingMode::Replay => "replay",
         };
         write!(f, "{}", s)
     }
@@ -951,6 +975,8 @@ impl FromStr for NetworkingMode {
         match s.to_lowercase().as_str() {
             "none" => Ok(NetworkingMode::None),
             "local" => Ok(NetworkingMode::Local),
+            "record" => Ok(NetworkingMode::Record),
+            "replay" => Ok(NetworkingMode::Replay),
             // Retain the old spelling for saved invocations, but always display
             // the explicit unsafe policy name.
             "host" | "unsafe-live-network" | "unsafe-allow-networking" => {
@@ -962,7 +988,10 @@ impl FromStr for NetworkingMode {
 }
 
 /// Apply the selected physical network namespace to a regular Reverie container.
-fn configure_container_network(container: &mut Container, mode: NetworkingMode) {
+fn configure_container_network(
+    container: &mut Container,
+    mode: NetworkingMode,
+) -> Result<(), Error> {
     match mode {
         NetworkingMode::None => {
             container
@@ -973,11 +1002,17 @@ fn configure_container_network(container: &mut Container, mode: NetworkingMode) 
             container.local_networking_only();
         }
         NetworkingMode::UnsafeHost => {}
+        NetworkingMode::Record | NetworkingMode::Replay => {
+            return Err(network_policy_refusal(
+                "network trace policy must be normalized before configuring a namespace",
+            ));
+        }
     }
+    Ok(())
 }
 
 /// Apply the same physical policy to the direct-command namespace-only path.
-fn configure_command_network(command: &mut Command, mode: NetworkingMode) {
+fn configure_command_network(command: &mut Command, mode: NetworkingMode) -> Result<(), Error> {
     match mode {
         NetworkingMode::None => {
             command
@@ -988,7 +1023,13 @@ fn configure_command_network(command: &mut Command, mode: NetworkingMode) {
             command.local_networking_only();
         }
         NetworkingMode::UnsafeHost => {}
+        NetworkingMode::Record | NetworkingMode::Replay => {
+            return Err(network_policy_refusal(
+                "network trace policy must be normalized before configuring a namespace",
+            ));
+        }
     }
+    Ok(())
 }
 
 fn trace_epoch(trace: &NetworkTrace) -> Epoch {
@@ -1150,7 +1191,25 @@ impl fmt::Display for RunOpts {
         if self.allow_unsupported_syscalls {
             write!(f, " --allow-unsupported-syscalls")?;
         }
-        let network = if self.record_networking.is_some() {
+        // Render either CLI spelling through the existing canonical trace flags,
+        // without mutating the request or opening its trace during formatting.
+        let record_networking =
+            self.record_networking
+                .as_ref()
+                .or(if self.network == NetworkingMode::Record {
+                    self.network_trace.as_ref()
+                } else {
+                    None
+                });
+        let replay_networking =
+            self.replay_networking
+                .as_ref()
+                .or(if self.network == NetworkingMode::Replay {
+                    self.network_trace.as_ref()
+                } else {
+                    None
+                });
+        let network = if record_networking.is_some() || replay_networking.is_some() {
             // Recording physically uses the host network, but the recorded
             // policy is canonicalized by its trace option, never as unsafe live.
             NetworkingMode::None
@@ -1164,7 +1223,19 @@ impl fmt::Display for RunOpts {
                 NetworkingMode::None => unreachable!("none is the default network policy"),
                 NetworkingMode::Local => write!(f, " --network=local")?,
                 NetworkingMode::UnsafeHost => write!(f, " --unsafe-live-network")?,
+                NetworkingMode::Record => write!(f, " --network=record")?,
+                NetworkingMode::Replay => write!(f, " --network=replay")?,
             }
+        }
+        if record_networking.is_none()
+            && replay_networking.is_none()
+            && let Some(path) = &self.network_trace
+        {
+            write!(
+                f,
+                " --network-trace={}",
+                shell_words::quote(&path.to_string_lossy())
+            )?;
         }
         if let Some(path) = &self.network_guard_bpffs {
             write!(
@@ -1187,14 +1258,14 @@ impl fmt::Display for RunOpts {
                 shell_words::quote(&path.display().to_string())
             )?;
         }
-        if let Some(path) = &self.record_networking {
+        if let Some(path) = record_networking {
             write!(
                 f,
                 " --record-networking={}",
                 shell_words::quote(&path.to_string_lossy())
             )?;
         }
-        if let Some(path) = &self.replay_networking {
+        if let Some(path) = replay_networking {
             write!(
                 f,
                 " --replay-networking={}",
@@ -2569,6 +2640,216 @@ fn network_policies_parse_validate_and_render_canonically() {
 }
 
 #[test]
+fn network_trace_spellings_normalize_idempotently_and_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let replay_path = directory.path().join("existing net trace");
+    detcore_model::network_trace::NetworkTraceV2 {
+        epoch: "2026-01-01T00:00:00Z".parse().unwrap(),
+        channels: Vec::new(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+    }
+    .write_framed(File::create(&replay_path).unwrap())
+    .unwrap();
+    let record_path = directory.path().join("new net trace");
+    for (mode, path, physical, legacy_flag) in [
+        (
+            "record",
+            &record_path,
+            NetworkingMode::UnsafeHost,
+            "record-networking",
+        ),
+        (
+            "replay",
+            &replay_path,
+            NetworkingMode::None,
+            "replay-networking",
+        ),
+    ] {
+        let mode_flag = format!("--network={mode}");
+        let mut opts = RunOpts::parse_from([
+            "fakehermit",
+            "--strict",
+            "--deterministic-io",
+            "--sequentialize-threads",
+            &mode_flag,
+            "--network-trace",
+            path.to_str().unwrap(),
+            "fakeprog",
+        ]);
+        use_fixed_test_epoch(&mut opts);
+        let requested_display = opts.to_string();
+        opts.normalize_network_trace_options().unwrap();
+        assert_eq!(opts.to_string(), requested_display);
+        assert_eq!(opts.network, physical);
+        assert!(opts.network_trace.is_none());
+        opts.validate_args_with_perf_support(true).unwrap();
+
+        let old_flag = format!("--{legacy_flag}={}", path.display());
+        let mut legacy = RunOpts::parse_from(["fakehermit", "--strict", &old_flag, "fakeprog"]);
+        use_fixed_test_epoch(&mut legacy);
+        legacy.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(
+            opts.det_opts.det_config.network_trace,
+            legacy.det_opts.det_config.network_trace
+        );
+        assert_eq!(
+            opts.det_opts.det_config.network_trace_input,
+            legacy.det_opts.det_config.network_trace_input
+        );
+        assert_eq!(opts.to_string(), legacy.to_string());
+
+        let rendered = opts.to_string();
+        let epoch = opts.det_opts.det_config.epoch;
+        opts.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(opts.to_string(), rendered);
+        assert_eq!(opts.det_opts.det_config.epoch, epoch);
+        assert_eq!(opts.network, physical);
+        let mut argv = vec!["fakehermit".to_owned()];
+        argv.extend(shell_words::split(&rendered).unwrap());
+        let mut reparsed = RunOpts::parse_from(argv);
+        reparsed.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(reparsed.to_string(), rendered);
+        assert_eq!(
+            reparsed.det_opts.det_config.network_trace,
+            opts.det_opts.det_config.network_trace
+        );
+        assert_eq!(reparsed.network, physical);
+
+        if mode == "replay" {
+            // A previously prepared clone must never carry host networking into replay.
+            opts.network = NetworkingMode::UnsafeHost;
+            opts.verify = true;
+            opts.validate_args_with_perf_support(true).unwrap();
+            assert_eq!(opts.network, NetworkingMode::None);
+        }
+    }
+    assert!(
+        !record_path.exists(),
+        "CLI preparation must not publish a recording"
+    );
+}
+
+#[test]
+fn network_trace_spelling_requires_exactly_one_matching_policy() {
+    for mode in ["record", "replay"] {
+        let flag = format!("--network={mode}");
+        let mut missing = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+        let error = missing.validate_args_with_perf_support(true).unwrap_err();
+        assert_network_policy_refusal(&error);
+        assert_eq!(
+            error.to_string(),
+            "--network=record/replay requires --network-trace PATH"
+        );
+        assert!(missing.record_networking.is_none());
+        assert!(missing.replay_networking.is_none());
+
+        for conflict in [
+            "--unsafe-live-network",
+            "--record-networking=other",
+            "--replay-networking=other",
+            "--analyze-networking",
+            "--no-namespace",
+            "--strace-only",
+        ] {
+            let error = RunOpts::try_parse_from([
+                "fakehermit",
+                &flag,
+                "--network-trace=trace",
+                conflict,
+                "fakeprog",
+            ])
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{mode} {conflict}: {error}"
+            );
+        }
+    }
+    for mode in ["none", "local", "host"] {
+        let flag = format!("--network={mode}");
+        let mut opts =
+            RunOpts::parse_from(["fakehermit", &flag, "--network-trace=trace", "fakeprog"]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        assert_network_policy_refusal(&error);
+        assert_eq!(
+            error.to_string(),
+            "--network-trace requires --network=record or --network=replay"
+        );
+    }
+    let mut record_verify = RunOpts::parse_from([
+        "fakehermit",
+        "--network=record",
+        "--network-trace=trace",
+        "--verify",
+        "fakeprog",
+    ]);
+    let error = record_verify
+        .validate_args_with_perf_support(true)
+        .unwrap_err();
+    assert_network_policy_refusal(&error);
+    assert_eq!(
+        error.to_string(),
+        "--network=record cannot be combined with --verify; record once, then verify with --network=replay"
+    );
+    assert_eq!(record_verify.network, NetworkingMode::Record);
+    assert!(record_verify.record_networking.is_none());
+    assert_eq!(
+        record_verify.network_trace.as_deref(),
+        Some(Path::new("trace"))
+    );
+}
+
+#[test]
+fn network_trace_spelling_keeps_early_runtime_refusals() {
+    let directory = tempfile::tempdir().unwrap();
+    let absent = directory.path().join("absent trace");
+    for mode in ["record", "replay"] {
+        let mode_flag = format!("--network={mode}");
+        for (conflict, expected) in [
+            ("--namespace-only", "--namespace-only does not load Detcore"),
+            ("--gdbserver", "--gdbserver cannot be combined"),
+            ("--backend=dbt", "backend `dbt`"),
+        ] {
+            let mut opts = RunOpts::parse_from([
+                "fakehermit",
+                &mode_flag,
+                "--network-trace",
+                absent.to_str().unwrap(),
+                conflict,
+                "fakeprog",
+            ]);
+            let error = opts.validate_args_with_perf_support(true).unwrap_err();
+            assert_network_policy_refusal(&error);
+            assert!(
+                error.to_string().contains(expected),
+                "{mode} {conflict}: {error:#}"
+            );
+            assert!(
+                !error
+                    .to_string()
+                    .contains("cannot read network replay trace"),
+                "{error:#}"
+            );
+        }
+    }
+    assert!(!absent.exists());
+}
+
+#[test]
+fn unnormalized_network_trace_policies_cannot_configure_physical_networking() {
+    for mode in [NetworkingMode::Record, NetworkingMode::Replay] {
+        let mut container = Container::new();
+        let error = configure_container_network(&mut container, mode).unwrap_err();
+        assert_network_policy_refusal(&error);
+        let mut command = Command::new("unused");
+        let error = configure_command_network(&mut command, mode).unwrap_err();
+        assert_network_policy_refusal(&error);
+    }
+}
+
+#[test]
 fn recorded_replayed_and_unsafe_live_policies_are_mutually_exclusive() {
     let error = RunOpts::try_parse_from([
         "fakehermit",
@@ -2612,7 +2893,8 @@ fn network_policy_help_is_available_in_short_and_long_forms() {
     let long = render("--help");
     for (form, help) in [("-h", short), ("--help", long)] {
         for expected in [
-            "--network <none|local|host>",
+            "--network <none|local|host|record|replay>",
+            "--network-trace <PATH>",
             "--unsafe-live-network",
             "--record-networking <NEW_TRACE>",
             "--replay-networking <TRACE>",
@@ -2656,7 +2938,7 @@ async fn denied_and_local_modes_differ_only_by_loopback_up_state() {
             "set -- /sys/class/net/*; printf '%s:%s:' \"$#\" \"${1##*/}\"; cat /sys/class/net/lo/flags",
         ]);
         command.map_root();
-        configure_command_network(&mut command, mode);
+        configure_command_network(&mut command, mode).unwrap();
         let output = command.output().await.unwrap();
         assert_eq!(output.status, ExitStatus::Exited(0), "{mode}: {output:?}");
         assert_eq!(output.stdout, expected, "{mode}: {output:?}");
@@ -3850,7 +4132,56 @@ impl RunOpts {
         self.validate_args_with_perf_support(perf_supported)
     }
 
+    fn normalize_network_trace_options(&mut self) -> Result<(), Error> {
+        match self.network {
+            NetworkingMode::Record | NetworkingMode::Replay => {
+                if self.record_networking.is_some() || self.replay_networking.is_some() {
+                    return Err(network_policy_refusal(
+                        "--network=record/replay cannot be combined with --record-networking or --replay-networking",
+                    ));
+                }
+                if self.network_trace.is_none() {
+                    return Err(network_policy_refusal(
+                        "--network=record/replay requires --network-trace PATH",
+                    ));
+                }
+                if self.unsafe_live_network
+                    || self.no_namespace
+                    || self.strace_only
+                    || self.analyze_networking
+                {
+                    return Err(network_policy_refusal(
+                        "network recording/replay cannot be combined with --unsafe-live-network, --no-namespace, --strace-only, or --analyze-networking",
+                    ));
+                }
+                if self.network == NetworkingMode::Record && self.verify {
+                    return Err(network_policy_refusal(
+                        "--network=record cannot be combined with --verify; record once, then verify with --network=replay",
+                    ));
+                }
+                // Only commit the rewrite after validating the complete new spelling.
+                // Later validation calls see the same legacy fields, not a second request.
+                if self.network == NetworkingMode::Record {
+                    self.record_networking = self.network_trace.take();
+                    self.network = NetworkingMode::UnsafeHost;
+                } else {
+                    self.replay_networking = self.network_trace.take();
+                    self.network = NetworkingMode::None;
+                }
+            }
+            NetworkingMode::None | NetworkingMode::Local | NetworkingMode::UnsafeHost => {
+                if self.network_trace.is_some() {
+                    return Err(network_policy_refusal(
+                        "--network-trace requires --network=record or --network=replay",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+        self.normalize_network_trace_options()?;
         let backend = self.selected_backend();
         let network_trace = if let Some(path) = &self.record_networking {
             NetworkTraceConfig::record(path.clone())
@@ -4948,7 +5279,7 @@ impl RunOpts {
             .mount(Mount::proc())
             .mounts(mounts);
 
-        configure_command_network(&mut command, self.network);
+        configure_command_network(&mut command, self.network)?;
 
         let mut child = command.spawn()?;
 
@@ -5440,12 +5771,12 @@ impl RunOpts {
             let rootfs = crate::image::materialize_rootfs(image)?;
             let (mut container, identity_sources) =
                 image_container(&rootfs, tmpfs, self.pin_threads, self.tmp.is_none())?;
-            configure_container_network(&mut container, self.network);
+            configure_container_network(&mut container, self.network)?;
             return Ok((container, identity_sources));
         }
 
         let mut container = default_container(self.pin_threads);
-        configure_container_network(&mut container, self.network);
+        configure_container_network(&mut container, self.network)?;
 
         let PreparedMounts {
             mounts,
