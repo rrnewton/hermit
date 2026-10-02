@@ -403,7 +403,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // ci/manifest-plan dagrun_pin every_dagrun_dependency_uses_the_agent_utils_gitlink
     // retains all 765 prior identities.
-    ("test.regular_crates", 766),
+    // ci/manifest-plan dagrun_pin every_spelling_of_a_dagrun_declaration_is_found_and_refused
+    // retains all 766 prior identities.
+    ("test.regular_crates", 767),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -599,7 +601,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
     // The dagrun pin guard retains all 765 prior identities.
-    ("test.regular_crates_on_host", 766),
+    // Its every-spelling companion retains all 766 prior identities.
+    ("test.regular_crates_on_host", 767),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
