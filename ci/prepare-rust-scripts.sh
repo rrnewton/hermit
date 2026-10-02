@@ -114,6 +114,51 @@ report_cargo_failure() {
     return 1
 }
 
+# Print `name<TAB>version<TAB>source` for each registry or git package of a
+# file in Cargo.lock format, sorted and unique. Path packages have no source
+# line; they are this checkout's own crates and the generated packages, so
+# they are left out.
+lock_entries() {
+    awk '
+        function value(line) { sub(/^[a-z]+ = "/, "", line); sub(/"$/, "", line); return line }
+        function flush() {
+            if (in_package && name != "" && source != "") print name "\t" version "\t" source
+            name = version = source = ""
+        }
+        /^\[/ { flush(); in_package = ($0 == "[[package]]"); next }
+        !in_package { next }
+        /^name = "/ { name = value($0); next }
+        /^version = "/ { version = value($0); next }
+        /^source = "/ { source = value($0); next }
+        END { flush() }
+    ' "$1" | LC_ALL=C sort -u
+}
+
+# Print the [[package]] blocks of LOCK whose `name<TAB>version<TAB>source` key
+# is listed in KEYS (ACTION keep) or is not listed there (ACTION drop), each
+# followed by one blank line. Comments and blank lines are not copied.
+select_lock_blocks() {
+    local action=$1 keys=$2 lock=$3
+    awk -v action="$action" '
+        function value(line) { sub(/^[a-z]+ = "/, "", line); sub(/"$/, "", line); return line }
+        function flush(   listed) {
+            if (block != "") {
+                listed = ((name "\t" version "\t" source) in keys)
+                if ((action == "keep") == listed) printf "%s\n", block
+            }
+            block = name = version = source = ""
+        }
+        FILENAME == ARGV[1] { keys[$0] = 1; next }
+        /^\[/ { flush(); if ($0 == "[[package]]") block = $0 "\n"; next }
+        block == "" || /^[[:space:]]*(#.*)?$/ { next }
+        { block = block $0 "\n" }
+        /^name = "/ { name = value($0) }
+        /^version = "/ { version = value($0) }
+        /^source = "/ { source = value($0) }
+        END { flush() }
+    ' "$keys" "$lock"
+}
+
 parent=$ROOT_DIR/target/ci
 published=$parent/rust-scripts
 build_target=$parent/rust-script-build
@@ -270,14 +315,6 @@ workspace_manifest=$packages/Cargo.toml
     printf '  "%s",\n' "${keys[@]}"
     printf ']\n\n[profile.release]\nstrip = true\n'
 } >"$workspace_manifest"
-# Seed the lockfile from the committed one. Scripts that path-depend on
-# workspace crates (hermit-detcore, hermit-manifest-plan) must compile them
-# against the same dependency versions the product build uses; resolving from
-# scratch takes the newest registry release instead. libc 0.2.190 made glibc
-# siginfo_t non-Send, so a fresh resolution stops hermit-detcore compiling.
-# Cargo keeps every seeded version the generated workspace still uses, adds
-# what only the scripts need, and drops the rest.
-cat -- "$ROOT_DIR/Cargo.lock" >"$packages/Cargo.lock"
 metadata=$packages/metadata.json
 output=$packages/workspace.output
 if ! cargo metadata --format-version 1 --no-deps --manifest-path "$workspace_manifest" \
@@ -293,21 +330,165 @@ if ((package_count != ${#entrypoints[@]})); then
     exit 2
 fi
 
-if [[ $mode == fetch ]]; then
-    # These packages are generated, so they have no committed lockfile. Resolve
-    # one while the network is available, then make the download itself obey
-    # that exact lock. The later pinned-root producer runs offline against this
-    # CARGO_HOME; it must never depend on an unrelated warm host cache.
-    # This resolution replaces the seeded lockfile with the newest releases,
-    # which only widens what is downloaded: the versions the seed pins are
-    # fetched from the committed root lockfile, and the offline build resolves
-    # from the seed again.
-    output=$packages/workspace.output
-    if ! cargo generate-lockfile --manifest-path "$workspace_manifest" >"$output" 2>&1; then
-        report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
-            'resolve dependencies for' || exit $?
+# Pin the generated workspace to the versions this checkout commits.
+#
+# The generated packages cannot have a committed lockfile of their own: their
+# names embed a hash of the checkout path. Resolving them from scratch takes
+# the newest release of every crate on the day the resolution runs, so a
+# validation of an unchanged commit could build against a crate version no
+# commit ever chose. libc 0.2.190 arrived that way, and its siginfo_t broke the
+# build of hermit-detcore inside a script.
+#
+# Instead, seed the workspace lock with the committed Cargo.lock plus the
+# reviewed additions in ci/rust-script-lock-supplement.toml, let Cargo complete
+# it without moving any seeded version, and refuse unless every registry or git
+# package in the result is an exact entry of one of them:
+#   - Cargo.lock, so scripts build with the product's versions; or
+#   - the supplement, for crates only scripts use.
+# The supplement may not hold a version compatible with a different Cargo.lock
+# version, because that would move a crate the product pins. The one exception
+# is a version a script requires exactly with `=VERSION` in its own manifest
+# (scripts/build-buck-release.rs pins flate2 this way for a deterministic
+# archive writer); the script made that choice, and the entry still records it.
+# Every accepted version is a seeded lock entry, so Cargo keeps it even after
+# crates.io yanks that release.
+# Fetch mode and build mode both run this, and the build then uses --locked.
+# Every accepted version comes from a tracked file, so the offline build in the
+# pinned root reproduces the lock the online fetch produced.
+committed_lock=$ROOT_DIR/Cargo.lock
+supplement=$ROOT_DIR/ci/rust-script-lock-supplement.toml
+# Fetch mode and build mode hold different flocks above and may run at the same
+# time, so each writes its own candidate file, and only by rename.
+candidate=$parent/rust-script-lock-supplement.candidate-$mode.toml
+generated_lock=$packages/Cargo.lock
+for input in "$committed_lock" "$supplement"; do
+    [[ -f $input ]] || {
+        printf 'prepare-rust-scripts: REFUSED — %s is missing, so the generated rust-script workspace cannot be pinned\n' \
+            "$input" >&2
+        exit 2
+    }
+done
+rm -f -- "$candidate"
+lock_entries "$committed_lock" >"$packages/committed.tsv"
+lock_entries "$supplement" >"$packages/supplement.tsv"
+jq -r '.packages[] | (.dependencies // [])[]
+    | select(.source != null and (.req | startswith("=")))
+    | [.name, (.req | ltrimstr("=")), .source] | @tsv' "$metadata" |
+    LC_ALL=C sort -u >"$packages/exact-pins.tsv"
+
+# Cargo treats two versions with the same leftmost nonzero component as
+# compatible, and a lock may hold only one of them per source. The verdicts
+# below rely on this class.
+semver_class_awk='
+    function class(version,   parts) {
+        sub(/[-+].*/, "", version)
+        split(version, parts, ".")
+        if (parts[1] + 0 > 0) return parts[1]
+        if (parts[2] + 0 > 0) return "0." parts[2]
+        return "0.0." parts[3]
+    }
+    function versions(list) { return list == "" ? "absent" : list }
+    function remember(table, key, version) { table[key] = table[key] == "" ? version : table[key] ", " version }
+'
+
+# A supplement entry that is compatible with a different Cargo.lock version
+# would let the scripts move a crate the product pins, which is the failure this
+# check exists to stop. Refuse it before Cargo sees the seed, unless a script
+# requires exactly that version. Column 5 lists the compatible Cargo.lock
+# versions the entry would replace.
+awk -F '\t' "$semver_class_awk"'
+    FILENAME == ARGV[1] { committed[$0] = 1; remember(compatible, $1 FS $3 FS class($2), $2); next }
+    FILENAME == ARGV[2] { pinned[$0] = 1; next }
+    $0 in committed { printf "redundant\t%s\t%s\t%s\n", $1, $2, $3; next }
+    ($1 FS $3 FS class($2)) in compatible {
+        printf "%s\t%s\t%s\t%s\t%s\n", ($0 in pinned) ? "exact-pin" : "shadows", $1, $2, $3,
+            compatible[$1 FS $3 FS class($2)]
+    }
+' "$packages/committed.tsv" "$packages/exact-pins.tsv" "$packages/supplement.tsv" \
+    >"$packages/supplement-verdicts.tsv"
+if grep -q '^shadows' "$packages/supplement-verdicts.tsv"; then
+    printf 'prepare-rust-scripts: REFUSED — %s may only add crates Cargo.lock does not pin\n' "$supplement" >&2
+    awk -F '\t' '$1 == "shadows" { printf "  %s: supplement %s; committed Cargo.lock %s; source %s\n", $2, $3, $5, $4 }' \
+        "$packages/supplement-verdicts.tsv" >&2
+    echo '  Remove these entries, or change the version in Cargo.lock so the product moves with the scripts.' >&2
+    echo '  An entry may differ from Cargo.lock only when a script requires exactly its version with =VERSION.' >&2
+    exit 2
+fi
+awk -F '\t' '
+    $1 == "redundant" {
+        printf "prepare-rust-scripts: note — supplement entry %s %s is already in Cargo.lock; it can be removed\n", $2, $3
+    }
+    $1 == "exact-pin" {
+        printf "prepare-rust-scripts: note — supplement entry %s %s replaces Cargo.lock %s in the generated workspace because a script requires =%s\n", $2, $3, $5, $3
+    }
+' "$packages/supplement-verdicts.tsv"
+
+# Cargo keeps a locked dependency on its locked version, so a Cargo.lock entry
+# that an exact-pin supplement entry replaces must leave the seed; otherwise the
+# product crates that use it stay on the old version and the resolution fails.
+awk -F '\t' '$1 == "exact-pin" {
+    count = split($5, replaced, ", ")
+    for (i = 1; i <= count; i++) print $2 FS replaced[i] FS $4
+}' "$packages/supplement-verdicts.tsv" >"$packages/replaced.tsv"
+{
+    awk '$0 == "[[package]]" { exit } { print }' "$committed_lock"
+    select_lock_blocks drop "$packages/replaced.tsv" "$committed_lock"
+    select_lock_blocks drop "$packages/committed.tsv" "$supplement"
+} >"$generated_lock"
+output=$packages/workspace.output
+if ! cargo update --workspace --manifest-path "$workspace_manifest" >"$output" 2>&1; then
+    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+        'resolve dependencies for' || exit $?
+fi
+cat "$output"
+
+lock_entries "$generated_lock" >"$packages/generated.tsv"
+awk -F '\t' "$semver_class_awk"'
+    FILENAME == ARGV[1] { committed[$0] = 1; remember(locked, $1 FS $3, $2); compatible[$1 FS $3 FS class($2)] = 1; next }
+    FILENAME == ARGV[2] { supplemented[$0] = 1; remember(added, $1 FS $3, $2); next }
+    FILENAME == ARGV[3] { pinned[$0] = 1; next }
+    $0 in committed || $0 in supplemented { next }
+    {
+        verdict = ($0 in pinned) ? "exact-pin" : (($1 FS $3 FS class($2)) in compatible) ? "moved" : "unpinned"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", verdict, $1, $2, $3, versions(locked[$1 FS $3]), versions(added[$1 FS $3])
+    }
+' "$packages/committed.tsv" "$packages/supplement.tsv" "$packages/exact-pins.tsv" "$packages/generated.tsv" \
+    >"$packages/generated-verdicts.tsv"
+if [[ -s $packages/generated-verdicts.tsv ]]; then
+    printf 'prepare-rust-scripts: REFUSED — the generated rust-script workspace resolved versions that no tracked file pins\n' >&2
+    awk -F '\t' '{
+        printf "  %s: generated %s; committed Cargo.lock %s; supplement %s; source %s\n", $2, $3, $5, $6, $4
+    }' "$packages/generated-verdicts.tsv" >&2
+    if grep -q '^moved' "$packages/generated-verdicts.tsv"; then
+        echo '  A crate Cargo.lock pins resolved to a different compatible version, so a script requires a version' >&2
+        echo '  Cargo.lock does not have. Move Cargo.lock (cargo update -p NAME --precise VERSION) so the product' >&2
+        echo '  builds with the same version, or relax the script requirement.' >&2
     fi
-    cat "$output"
+    if grep -q '^exact-pin' "$packages/generated-verdicts.tsv"; then
+        echo '  A script requires one of these versions exactly with =VERSION, but no tracked lock entry records it,' >&2
+        echo '  so a yank of that release on crates.io would break this build. Add its entry to the supplement.' >&2
+    fi
+    if grep -q -e '^unpinned' -e '^exact-pin' "$packages/generated-verdicts.tsv"; then
+        awk -F '\t' '$1 == "unpinned" || $1 == "exact-pin" { print $2 FS $3 FS $4 }' \
+            "$packages/generated-verdicts.tsv" >"$packages/candidate-keys.tsv"
+        {
+            printf '# Candidate additions for ci/rust-script-lock-supplement.toml, written by\n'
+            printf '# ci/prepare-rust-scripts.sh. Review each version before copying it there.\n\n'
+            select_lock_blocks keep "$packages/candidate-keys.tsv" "$generated_lock"
+        } >"$packages/candidate.toml"
+        mv -f -- "$packages/candidate.toml" "$candidate"
+        printf '  Crates only scripts use must be pinned by %s.\n' "$supplement" >&2
+        printf '  Candidate entries, at the versions resolved today, are in %s.\n' "$candidate" >&2
+    fi
+    exit 2
+fi
+printf 'prepare-rust-scripts: pinned %d registry and git packages of the generated workspace to tracked versions\n' \
+    "$(wc -l <"$packages/generated.tsv")"
+
+if [[ $mode == fetch ]]; then
+    # The later pinned-root producer runs offline against this CARGO_HOME and
+    # resolves the same lock from the same tracked files; it must never depend
+    # on an unrelated warm host cache.
     if ! cargo fetch --locked --manifest-path "$workspace_manifest" >"$output" 2>&1; then
         report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
             'fetch dependencies for' || exit $?
@@ -356,14 +537,14 @@ done
 # The outer flock still makes this the only writer to the persistent target and
 # published directories.
 output=$packages/workspace.output
-if ! cargo clippy --manifest-path "$workspace_manifest" --workspace \
+if ! cargo clippy --locked --manifest-path "$workspace_manifest" --workspace \
     --target-dir "$build_target" \
     -- -D warnings "${CLIPPY_WAIVERS[@]}" >"$output" 2>&1; then
     report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
         'check with clippy' || exit $?
 fi
 cat "$output"
-if ! cargo build --release --manifest-path "$workspace_manifest" --workspace \
+if ! cargo build --locked --release --manifest-path "$workspace_manifest" --workspace \
     --target-dir "$build_target" >"$output" 2>&1; then
     report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
         'build release executables for' || exit $?
@@ -371,7 +552,7 @@ fi
 cat "$output"
 
 test_json=$packages/tests.jsonl
-if ! cargo test --no-run --message-format=json \
+if ! cargo test --locked --no-run --message-format=json \
     --manifest-path "$workspace_manifest" "${test_package_args[@]}" \
     --target-dir "$build_target" >"$test_json" 2>"$output"; then
     # Cargo writes rendered compiler errors to JSON stdout in this mode, while
