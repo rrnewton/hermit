@@ -109,6 +109,7 @@ pub const SCORECARD_INPUTS: &[&str] = &[
     "scripts/lib/rust_script_prelude.rs",
     "ci/rust-script-bin/",
     "ci/prepare-rust-scripts.sh",
+    "ci/rust-script-lock-supplement.toml",
     "ci/prepare-scorecard-self-test-corpus.sh",
     "ci/expected-e2e-plan.json",
     "tests/e2e/manifests/",
@@ -135,8 +136,9 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
     // builds and runs, with that crate's path dependencies (detcore-model/,
     // and agent-utils, a gitlink that `git diff` lists without a trailing
     // slash, and .gitmodules, which says where it comes from) and Cargo.lock;
-    // the rust-script prelude it includes and the
-    // prepared rust-script launchers; the script that pins its ledger corpus;
+    // the rust-script prelude it includes, the
+    // prepared rust-script launchers, and the producer that builds them with
+    // the lock supplement it reads; the script that pins its ledger corpus;
     // and the E2E manifests its cells and its `system-utils/record-getpid`
     // command fixture come from.
     ToolSelfTest {
