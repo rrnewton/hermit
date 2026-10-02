@@ -5,7 +5,6 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@prelude//third-party:pkgconfig.bzl", "external_pkgconfig_library")
 
 HOMEBREW_CONSTRAINT = "//os:macos-homebrew"
 
@@ -27,6 +26,42 @@ def system_library(name: str, packages = None, visibility = ["PUBLIC"], deps = [
         })
 
     native.prebuilt_cxx_library(name = name, visibility = visibility, deps = deps, exported_deps = exported_deps, **kwargs)
+
+def external_pkgconfig_library(name, package = None, visibility = ["PUBLIC"], labels = [], default_target_platform = "prelude//platforms:default", deps = []):
+    """prelude//third-party:pkgconfig.bzl's external_pkgconfig_library, except that the
+    two `pkg-config` genrules are forced LOCAL. The prelude passes the buck1 attribute
+    `remote = False`, which buck2 ignores, so under a remote execution platform the
+    genrules ran on RE workers, which have no .pc files (libunwind-ptrace). pkg-config
+    describes the host, so it must run on the host; the "non_deterministic_build_info"
+    label is the prelude's way to require that."""
+    if package == None:
+        package = name
+    local = ["non_deterministic_build_info"]
+    pkg_config_cflags = name + "__pkg_config_cflags"
+    native.genrule(
+        name = pkg_config_cflags,
+        default_target_platform = default_target_platform,
+        out = "out",
+        cmd = "pkg-config --cflags {} > $OUT".format(package),
+        labels = local,
+    )
+    pkg_config_libs = name + "__pkg_config_libs"
+    native.genrule(
+        name = pkg_config_libs,
+        default_target_platform = default_target_platform,
+        out = "out",
+        cmd = "pkg-config --libs {} > $OUT".format(package),
+        labels = local,
+    )
+    native.prebuilt_cxx_library(
+        name = name,
+        default_target_platform = default_target_platform,
+        visibility = visibility,
+        exported_preprocessor_flags = ["@$(location :{})".format(pkg_config_cflags)],
+        exported_linker_flags = ["@$(location :{})".format(pkg_config_libs)],
+        exported_deps = deps,
+        labels = list(labels) + ["third-party:pkg-config:{}".format(package)],
+    )
 
 def pkgconfig_system_library(name: str, pkgconfig_name = None, packages = None, visibility = ["PUBLIC"], deps = [], exported_deps = [], unsupported = dict(), **kwargs):
     system_packages_target_name = "__{}_system_pkgs".format(name)

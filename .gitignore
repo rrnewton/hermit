@@ -45,3 +45,5 @@ buck-out/
 /shim/third-party/rust/.cargo/
 /shim/third-party/rust/BUCK
 /shim/third-party/rust/vendor/
+/shim/rust-sysroot/
+/.buck2

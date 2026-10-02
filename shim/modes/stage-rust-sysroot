@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stage hermit's pinned rust toolchain (the sysroot rustup resolves for this checkout
+# from rust-toolchain.toml) as shim/rust-sysroot, the action input the RE-capable rust
+# toolchain uses (shim/modes/hybrid, shim/modes/remote). Idempotent; reflinks if it can.
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+src=$(cd "$root" && rustc --print sysroot)
+want=$(cd "$root" && rustc --version)
+dst=$root/shim/rust-sysroot
+if [[ -f $dst/.version && $(cat "$dst/.version") == "$want" ]]; then
+    echo "$dst: $want (up to date)"
+    exit 0
+fi
+rm -rf "${dst:?}"
+cp -a --reflink=auto "$src" "$dst"
+# Documentation and std sources are never action inputs.
+rm -rf "${dst:?}/share/doc" "${dst:?}/lib/rustlib/src" "${dst:?}/lib/rustlib/rustc-src"
+echo "$want" >"$dst/.version"
+echo "$dst: $want"
