@@ -626,9 +626,14 @@ from the base.
   agree with each other, and with one, the guest's stdout must also equal the
   fixed string. All 80 census rows of these cells (ten repetitions each, in
   `qual10-batch1` to `qual10-batch4`) recorded exactly this stdout and
-  outcome PASS. Six other LiteInst-enabled cells carry `ptrace` or `dbt`
-  oracles without a `liteinst` one; they are outside the 162 and are left to a
-  separate change.
+  outcome PASS. Six other cells, already selected for LiteInst on `main`,
+  carry `ptrace` and `dbt` oracles without a `liteinst` one: an exact
+  `expected_stdout` for `c-programs/cpuid-probe` (privileged lane),
+  `c-programs/dbt-mmap-exec`, `c-programs/dbt-wait-lifecycle` and
+  `c-programs/pid-probe`, and an `expected_stdout_contains` for
+  `c-programs/mmap-determinism` and `system-utils/clock-determinism`. They are
+  outside the 162 and are left to a separate change,
+  https://github.com/rrnewton/hermit/issues/3506.
 
 
 ## What was measured and how
