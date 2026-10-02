@@ -650,7 +650,8 @@
     "scripts/lib/**",
     ".github/workflows/ci-portable.yml",
     ".github/workflows/merge-gate.yml",
-    ".github/workflows/ci-privileged.yml"
+    ".github/workflows/ci-privileged.yml",
+    ".github/actions/**"
   ],
   "groups": {},
   "version": 2
