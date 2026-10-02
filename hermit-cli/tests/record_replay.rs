@@ -844,6 +844,55 @@ fn record_strict_direct_cli_records_and_replays_echo() {
     );
 }
 
+/// The recording stores its network choice, and an autopilot replay of either
+/// choice reproduces the recording.
+#[test]
+fn record_network_choice_is_stored_and_autopilot_replays_it() {
+    let _guard = hermit_record_lock();
+    for (flag, expected) in [(None, true), (Some("host"), false), (Some("local"), true)] {
+        let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+        let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        record.args(["--log=off", "record", "start", "--record-timeout=30"]);
+        if let Some(flag) = flag {
+            record.args(["--network", flag]);
+        }
+        record
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .args(["--", "/bin/echo", "hello"]);
+        let record_output = command_output(record, "network-choice recording");
+        assert_eq!(
+            record_output.stdout, b"hello\n",
+            "recorded stdout ({flag:?})"
+        );
+
+        let recording = fs::read_dir(data_dir.path())
+            .expect("read recording directory")
+            .map(|entry| entry.expect("recording entry").path())
+            .find(|path| path.join("metadata.json").is_file())
+            .expect("recording with metadata.json");
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(recording.join("metadata.json")).expect("read metadata.json"),
+        )
+        .expect("parse metadata.json");
+        assert_eq!(
+            metadata["local_networking"],
+            serde_json::Value::Bool(expected),
+            "stored network choice ({flag:?})"
+        );
+
+        let mut replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        replay
+            .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+            .arg(data_dir.path());
+        let replay_output = command_output(replay, "network-choice replay");
+        assert_eq!(
+            replay_output.stdout, b"hello\n",
+            "replayed stdout ({flag:?})"
+        );
+    }
+}
+
 #[test]
 fn record_proc_mountinfo_replays_the_captured_read_buffer() {
     let _guard = hermit_record_lock();
