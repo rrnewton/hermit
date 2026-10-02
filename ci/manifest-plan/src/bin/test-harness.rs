@@ -20,6 +20,7 @@ use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::parity;
 use hermit_manifest_plan::parity::ParityCellId;
+use hermit_manifest_plan::runner::CellId;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
@@ -2828,12 +2829,24 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             published
         },
     );
+    // Why the run fails beyond its failed cells. Each reason fails the exit
+    // status AND is reported to Tpx, so the two cannot disagree.
+    let mut run_failures = Vec::new();
+    let returned = indexed_results
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<BTreeSet<_>>();
+    let missing = (0..expected)
+        .filter(|index| !returned.contains(index))
+        .map(|index| tpx_test_name(&cells[index].id))
+        .collect::<Vec<_>>();
     if indexed_results.len() != expected {
-        eprintln!(
-            "test-harness: only {} of {expected} selected cells returned a result",
+        let reason = format!(
+            "only {} of {expected} selected cells returned a result",
             indexed_results.len()
         );
-        failed = true;
+        eprintln!("test-harness: {reason}");
+        run_failures.push(reason);
     }
     indexed_results.sort_by_key(|(index, _)| *index);
     let diagnostic_cells = indexed_results
@@ -2888,16 +2901,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         };
         if let Err(error) = written {
             eprintln!("test-harness: {error}");
-            failed = true;
+            run_failures.push(format!("cannot write DAGRUN_TEST_COUNTS_PATH: {error}"));
         }
     }
-    if expected > 0 && host_inapplicable == expected {
-        eprintln!(
-            "test-harness: every one of the {expected} selected cell(s) was host-inapplicable; \
-             a run that executed no cell is not a pass"
-        );
-        failed = true;
+    if let Some(reason) = vacuity_refusal(expected, host_inapplicable) {
+        eprintln!("test-harness: {reason}");
+        run_failures.push(reason);
     }
+    failed |= !run_failures.is_empty();
     write_junit(&junit, &results).unwrap();
     let summary = serde_json::json!({
         "schema": 1,
@@ -2928,7 +2939,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     )
     .unwrap();
     if let Some(path) = &args.tpx_json {
-        if let Err(error) = write_tpx_json(path, &results, &excused) {
+        if let Err(error) = write_tpx_json(path, &results, &excused, &missing, &run_failures) {
             eprintln!("test-harness: cannot write {}: {error}", path.display());
             failed = true;
         }
@@ -2950,6 +2961,30 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     exit
 }
 
+/// The refusal of a run in which every selected cell was host-inapplicable:
+/// it executed nothing, so it is not a pass.
+fn vacuity_refusal(expected: usize, host_inapplicable: usize) -> Option<String> {
+    (expected > 0 && host_inapplicable == expected).then(|| {
+        format!(
+            "every one of the {expected} selected cell(s) was host-inapplicable; \
+             a run that executed no cell is not a pass"
+        )
+    })
+}
+
+/// A cell's Tpx test name: `test/mode@backend`, `native` without a backend.
+fn tpx_test_name(id: &CellId) -> String {
+    format!(
+        "{}/{}@{}",
+        id.test,
+        id.mode,
+        id.backend.as_deref().unwrap_or("native")
+    )
+}
+
+/// The Tpx test name of the record that carries run-level failures.
+const TPX_RUN_VERDICT_TEST: &str = "test-harness/run-verdict";
+
 /// Write one Tpx HPHP-JSON `test_done` record per final cell, then `all_done`,
 /// so a Buck `type = "json"` test reports each cell as its own test case.
 ///
@@ -2957,8 +2992,31 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 /// host-inapplicable cell ran nothing and an excused diagnostic failure does
 /// not fail the run, so both are `skipped`; any other outcome is `failed`.
 /// `details` carries the row's verdict fields, so a skip still says why.
-fn write_tpx_json(path: &Path, results: &[CellResult], excused: &[bool]) -> std::io::Result<()> {
+///
+/// A run can fail without a failed cell, so the failure is reported too: each
+/// selected cell that returned no result is a `failed` record named by its
+/// identity, and the run-level `run_failures` (the all-host-inapplicable
+/// refusal, an unwritable test-count file, missing results) are one `failed`
+/// [`TPX_RUN_VERDICT_TEST`] record. Otherwise Tpx would read a run whose exit
+/// status failed as passed or skipped.
+fn write_tpx_json(
+    path: &Path,
+    results: &[CellResult],
+    excused: &[bool],
+    missing: &[String],
+    run_failures: &[String],
+) -> std::io::Result<()> {
     let mut lines = String::new();
+    let mut push = |test: &str, status: &str, details: serde_json::Value| {
+        let record = serde_json::json!({
+            "op": "test_done",
+            "test": test,
+            "status": status,
+            "details": details.to_string(),
+        });
+        lines.push_str(&record.to_string());
+        lines.push('\n');
+    };
     for (result, excused) in results.iter().zip(excused) {
         let status = match result.outcome.as_str() {
             "PASS" => "passed",
@@ -2977,19 +3035,29 @@ fn write_tpx_json(path: &Path, results: &[CellResult], excused: &[bool]) -> std:
             "cpu_usage_usec": result.cpu_usage_usec,
             "artifact_dir": result.artifact_dir,
         });
-        let record = serde_json::json!({
-            "op": "test_done",
-            "test": format!(
-                "{}/{}@{}",
-                result.test,
-                result.mode,
-                result.backend.as_deref().unwrap_or("native")
-            ),
-            "status": status,
-            "details": details.to_string(),
+        let test = tpx_test_name(&CellId {
+            test: result.test.clone(),
+            mode: result.mode.clone(),
+            backend: result.backend.clone(),
         });
-        lines.push_str(&record.to_string());
-        lines.push('\n');
+        push(&test, status, details);
+    }
+    for test in missing {
+        push(
+            test,
+            "failed",
+            serde_json::json!({
+                "outcome": null,
+                "reason": "the selected cell returned no result",
+            }),
+        );
+    }
+    if !run_failures.is_empty() {
+        push(
+            TPX_RUN_VERDICT_TEST,
+            "failed",
+            serde_json::json!({ "run_failures": run_failures }),
+        );
     }
     lines.push_str(&serde_json::json!({ "op": "all_done" }).to_string());
     lines.push('\n');
@@ -6375,7 +6443,7 @@ sys.exit(1 if failed else 0)
             ),
         ];
         let path = std::env::temp_dir().join(format!("tpx-json-{}.jsonl", std::process::id()));
-        super::write_tpx_json(&path, &rows, &[false, false, true, false, false]).unwrap();
+        super::write_tpx_json(&path, &rows, &[false, false, true, false, false], &[], &[]).unwrap();
         let records = fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -6419,6 +6487,264 @@ sys.exit(1 if failed else 0)
             keys.sort();
             assert_eq!(keys, ["details", "op", "status", "test"]);
         }
+    }
+
+    /// Read a Tpx file back as `(test, status, details)` per `test_done`
+    /// record, checking the record keys and the closing `all_done`.
+    fn read_tpx(path: &std::path::Path) -> Vec<(String, String, serde_json::Value)> {
+        let records = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.last().unwrap(),
+            &serde_json::json!({"op": "all_done"})
+        );
+        records[..records.len() - 1]
+            .iter()
+            .map(|record| {
+                let mut keys = record
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                keys.sort();
+                assert_eq!(keys, ["details", "op", "status", "test"]);
+                assert_eq!(record["op"], "test_done");
+                (
+                    record["test"].as_str().unwrap().to_string(),
+                    record["status"].as_str().unwrap().to_string(),
+                    serde_json::from_str(record["details"].as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// A run can fail without a failed cell. Each selected cell that returned
+    /// no result is a failed record named by its identity, and the run-level
+    /// reasons are one failed run-verdict record, so Tpx sees the failure.
+    #[test]
+    fn tpx_json_reports_missing_cells_and_run_failures_as_failed() {
+        let rows = [attempt_row(
+            "t/pass",
+            1,
+            "PASS",
+            None,
+            "required",
+            &[],
+            None,
+        )];
+        let missing = ["t/gone/verify@kvm".to_string()];
+        let failures = [
+            "only 1 of 2 selected cells returned a result".to_string(),
+            "cannot write DAGRUN_TEST_COUNTS_PATH: disk full".to_string(),
+        ];
+        let path = std::env::temp_dir().join(format!("tpx-missing-{}.jsonl", std::process::id()));
+        super::write_tpx_json(&path, &rows, &[false], &missing, &failures).unwrap();
+        let records = read_tpx(&path);
+        fs::remove_file(&path).unwrap();
+        let reported = records
+            .iter()
+            .map(|(test, status, _)| (test.as_str(), status.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reported,
+            [
+                ("t/pass/verify@ptrace", "passed"),
+                ("t/gone/verify@kvm", "failed"),
+                (super::TPX_RUN_VERDICT_TEST, "failed"),
+            ]
+        );
+        assert_eq!(
+            records[1].2["reason"],
+            "the selected cell returned no result"
+        );
+        assert_eq!(records[2].2["run_failures"], serde_json::json!(failures));
+        // A run with neither adds no record beyond its cells.
+        super::write_tpx_json(&path, &rows, &[false], &[], &[]).unwrap();
+        let records = read_tpx(&path);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    /// A run whose every cell was host-inapplicable executed nothing and is
+    /// refused; the refusal is a run failure, which fails the exit status and
+    /// is a failed Tpx record. A single inapplicable cell must not read as a
+    /// skipped (green) Tpx run while the harness exits 1.
+    #[test]
+    fn a_lone_host_inapplicable_cell_fails_the_run_in_tpx_too() {
+        assert_eq!(super::vacuity_refusal(0, 0), None);
+        assert_eq!(super::vacuity_refusal(2, 1), None);
+        let refusal = super::vacuity_refusal(1, 1).unwrap();
+        assert!(refusal.contains("not a pass"), "{refusal}");
+        let rows = [attempt_row(
+            "t/hi",
+            1,
+            "HOST-INAPPLICABLE",
+            Some("understood_prerequisite_failure"),
+            "required",
+            &[],
+            Some("no kvm"),
+        )];
+        let path = std::env::temp_dir().join(format!("tpx-vacuous-{}.jsonl", std::process::id()));
+        super::write_tpx_json(&path, &rows, &[false], &[], std::slice::from_ref(&refusal)).unwrap();
+        let records = read_tpx(&path);
+        fs::remove_file(&path).unwrap();
+        let reported = records
+            .iter()
+            .map(|(test, status, _)| (test.as_str(), status.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reported,
+            [
+                ("t/hi/verify@ptrace", "skipped"),
+                (super::TPX_RUN_VERDICT_TEST, "failed"),
+            ]
+        );
+        assert_eq!(records[1].2["run_failures"], serde_json::json!([refusal]));
+    }
+
+    /// The real run(): one passing native cell, but the scheduler test-count
+    /// file cannot be written. The run exits 1 and its Tpx output says so with
+    /// a failed run-verdict record, not just a passed cell.
+    #[test]
+    fn an_unwritable_count_file_fails_the_run_in_tpx_too() {
+        use std::path::Path;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use serde_json::json;
+
+        const CHILD_FIXTURE: &str = "HERMIT_HARNESS_TPX_COUNTS_TEST_FIXTURE";
+        const TEST_NAME: &str = "tests::an_unwritable_count_file_fails_the_run_in_tpx_too";
+        if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
+            let fixture = PathBuf::from(fixture);
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let argv: Vec<String> = vec![
+                "--mode".into(),
+                "naked".into(),
+                "--results".into(),
+                fixture.join("results.jsonl").to_string_lossy().into_owned(),
+                "--junit".into(),
+                fixture.join("junit.xml").to_string_lossy().into_owned(),
+                "--tpx-json".into(),
+                fixture.join("tpx.jsonl").to_string_lossy().into_owned(),
+            ];
+            let args = parse(argv.into_iter());
+            super::validate_args("run", &args);
+            assert_eq!(super::run(&root, &manifests, &args), ExitCode::FAILURE);
+            return;
+        }
+
+        let fixture =
+            std::env::temp_dir().join(format!("hermit-harness-tpx-counts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&fixture);
+        fs::create_dir(&fixture).unwrap();
+        let manifests = fixture.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 2\ncpu_timeout_seconds: 1\n",
+        )
+        .unwrap();
+        let disabled = json!({
+            "ci": false,
+            "backends_enabled": [],
+            "backends_disabled": {
+                "ptrace": "This control executes native commands only",
+                "dbt": "This control executes native commands only",
+                "kvm": "This control executes native commands only",
+                "sabre": "This control executes native commands only",
+                "liteinst": "This control executes native commands only"
+            }
+        });
+        let manifest = json!({
+            "schema": 3,
+            "bucket": "counts",
+            "test": [{
+                "id": "counts/pass",
+                "description": "Native Tpx run-verdict control",
+                "lane": "portable",
+                "occasional": false,
+                "direct": ["/bin/true"],
+                "observation": {"status": true, "stdout": true, "stderr": true},
+                "modes": {
+                    "naked": {
+                        "ci": false,
+                        "ci_disabled_reason": "Native Tpx control is explicitly selected",
+                        "backends_enabled": ["native"],
+                        "runs": 1,
+                        "assert": {"min_distinct": 1}
+                    },
+                    "verify": disabled,
+                    "chaos": disabled,
+                    "replay": disabled,
+                    "custom": disabled
+                }
+            }]
+        });
+        fs::write(
+            manifests.join("counts.yaml"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let output = Command::new("timeout")
+            .args(["--kill-after=2s", "25s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(CHILD_FIXTURE, &fixture)
+            .env("HERMIT_BIN", fixture.join("missing-hermit"))
+            .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
+            .env("E2E_BUILD_ROOT", fixture.join("build"))
+            .env("E2E_RUN_ID", "tpx-counts-control")
+            .env("E2E_MACHINE_SHORTNAME", "tpx-counts-control")
+            .env("E2E_KERNEL_VERSION", "tpx-counts-control")
+            // Its directory does not exist, so publishing the counts fails.
+            .env(
+                "DAGRUN_TEST_COUNTS_PATH",
+                fixture.join("no-such-dir/counts.json"),
+            )
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the child must exit 1 from run(): {}\n{}\n{stderr}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let records = read_tpx(&fixture.join("tpx.jsonl"));
+        let reported = records
+            .iter()
+            .map(|(test, status, _)| (test.as_str(), status.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reported,
+            [
+                ("counts/pass/naked@native", "passed"),
+                (super::TPX_RUN_VERDICT_TEST, "failed"),
+            ],
+            "{stderr}"
+        );
+        let failures = records[1].2["run_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0]
+                .as_str()
+                .unwrap()
+                .starts_with("cannot write DAGRUN_TEST_COUNTS_PATH: "),
+            "{failures:?}"
+        );
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
