@@ -10,6 +10,8 @@ use super::*;
 use crate::network_replay::NetworkStreamOwner;
 use crate::network_runtime::ForegroundRoot;
 
+mod heap;
+
 #[derive(Debug, Clone)]
 pub(crate) struct OriginalArena {
     root: Arc<ForegroundRoot>,
@@ -34,7 +36,8 @@ impl OriginalArena {
     }
 }
 
-/// One selected nonempty destination within the exact native mmap generation.
+/// One selected nonempty destination within an exact native mmap or brk growth
+/// generation. The event-arena API below remains mmap-only.
 /// This is only mapping provenance. It neither excludes concurrent native work
 /// nor grants a store, certifies its result, or authorizes stream consumption.
 /// In particular, an unused iovec tail is not part of this selected footprint.
@@ -69,6 +72,7 @@ pub(super) struct State {
     exhausted: bool,
     pending: Option<Pending>,
     arena: Option<OriginalArena>,
+    heap: heap::State,
 }
 
 /// The kernel reads mmap's descriptor as a C int, so a guest that loads -1
@@ -84,8 +88,9 @@ fn arguments(args: SyscallArgs) -> [usize; 6] {
 }
 
 /// The two already-admitted terminal queries do not change FD/process lineage
-/// on these supported inherited stdio objects. This does NOT preserve memory
-/// authority: every ioctl still invalidates the arena before a possible copy.
+/// on these supported inherited stdio objects. Every ioctl still revokes old
+/// copy spans and the mmap event arena before a possible copy. Only this exact
+/// classification may retain heap geometry until the matched native return.
 pub(crate) fn preserves_foreground_terminal_query(
     nr: Sysno,
     args: SyscallArgs,
@@ -186,7 +191,7 @@ pub(crate) fn invalidates_original_arena(nr: Sysno) -> bool {
 }
 
 impl MemoryMetadata {
-    /// The synchronous backend mmap observer is the sole arena issuer. The
+    /// The synchronous backend mapping observer is the sole span issuer. The
     /// range supplied here describes only selected bytes, never a whole read's
     /// otherwise-unused destination or an inferred permission from VM metadata.
     pub(crate) fn original_copy_span(
@@ -209,9 +214,22 @@ impl MemoryMetadata {
                         .checked_add(length)
                         .is_some_and(|end| end <= arena.end)
             })
+            .cloned()
+            .or_else(|| {
+                (!self.original_arena.exhausted && self.original_arena.pending.is_none())
+                    .then(|| {
+                        self.original_arena.heap.span(
+                            owner,
+                            self.original_arena.generation,
+                            address,
+                            length,
+                        )
+                    })
+                    .flatten()
+            })
             .ok_or("receive destination lacks an authenticated private anonymous span")?;
         Ok(OriginalCopySpan {
-            arena: arena.clone(),
+            arena,
             address,
             length,
         })
@@ -230,6 +248,11 @@ impl MemoryMetadata {
     }
 
     pub(crate) fn invalidate_original_arena(&mut self) {
+        self.original_arena.heap = heap::State::default();
+        self.revoke_original_spans();
+    }
+
+    fn revoke_original_spans(&mut self) {
         self.original_arena.pending = None;
         self.original_arena.arena = None;
         match self.original_arena.generation.checked_add(1) {
@@ -247,9 +270,27 @@ impl MemoryMetadata {
         args: SyscallArgs,
         event: Event,
     ) -> Result<(), &'static str> {
+        self.observe_original_memory_operation(root, nr, args, event, false)
+    }
+
+    /// `terminal_query` is supplied only by the synchronous observer after its
+    /// existing typed-command, original OFD, sole-root and registered-MM checks.
+    pub(crate) fn observe_original_memory_operation(
+        &mut self,
+        root: &Arc<ForegroundRoot>,
+        nr: Sysno,
+        args: SyscallArgs,
+        event: Event,
+        terminal_query: bool,
+    ) -> Result<(), &'static str> {
         let raw = arguments(args);
         if event == Event::Prepared && invalidates_original_arena(nr) {
-            self.invalidate_original_arena();
+            self.revoke_original_spans();
+            if self.original_arena.exhausted {
+                self.original_arena.heap = heap::State::default();
+            } else {
+                self.original_arena.heap.prepare(root, nr, raw, terminal_query);
+            }
             let qualifies = nr == Sysno::mmap
                 && raw[0] == 0
                 && raw[1] != 0
@@ -266,6 +307,10 @@ impl MemoryMetadata {
                 });
             }
             return Ok(());
+        }
+        if let Err(error) = self.original_arena.heap.complete(root, nr, raw, event) {
+            self.invalidate_original_arena();
+            return Err(error);
         }
         if nr != Sysno::mmap {
             return Ok(());

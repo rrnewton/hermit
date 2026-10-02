@@ -97,11 +97,12 @@ impl GlobalState {
             {
                 return Err("native mmap observation changed registered task/MM metadata");
             }
-            state
-                .memory_metadata
-                .lock()
-                .unwrap()
-                .observe_original_arena(&root, nr, args, event)
+            let mut memory = state.memory_metadata.lock().unwrap();
+            if terminal_query {
+                memory.observe_original_memory_operation(&root, nr, args, event, true)
+            } else {
+                memory.observe_original_arena(&root, nr, args, event)
+            }
         })();
         if let Err(detail) = observed {
             state
