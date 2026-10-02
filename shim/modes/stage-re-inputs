@@ -35,9 +35,10 @@ echo "$lu: $(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' libunwind-devel 2>/dev/
 
 xz=$root/shim/third-party/xz/staged
 mkdir -p "$xz"
+xzlib=${XZ_LIBDIR:-/usr/lib64}
 for f in liblzma.so liblzma.so.5; do
-    [[ -e /usr/lib64/$f ]] || { echo "missing /usr/lib64/$f: install xz-devel" >&2; exit 1; }
-    cmp -s "/usr/lib64/$f" "$xz/$f" || cp -L "/usr/lib64/$f" "$xz/$f"
+    [[ -e $xzlib/$f ]] || { echo "missing $xzlib/$f: install xz-devel (or set XZ_LIBDIR)" >&2; exit 1; }
+    cmp -s "$xzlib/$f" "$xz/$f" || cp -L "$xzlib/$f" "$xz/$f"
 done
 echo "$xz: $(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' xz-devel 2>/dev/null || echo liblzma)"
 

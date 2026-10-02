@@ -51,6 +51,30 @@ sha=$(git -C "$root" rev-parse HEAD)
 tmp=$(mktemp -d)
 trap 'rm -rf "${tmp:?}"' EXIT
 
+# patchelf sets the staged hermit's runtime search path. Hosts without it (devbig030
+# has no patchelf package) use the static binary from the pinned PyPI wheel, fetched
+# once into ignored/host-tools/ and checked against its sha256.
+patchelf=${PATCHELF:-$(command -v patchelf || true)}
+if [[ -z $patchelf ]]; then
+    wheel=patchelf-0.19.1.0-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.musllinux_1_1_x86_64.whl
+    wheel_sha256=a8f6331ccf40c345507279f755f4a38c2cb00b9efda746fd43c17713cce0aba4
+    tools=$root/ignored/host-tools/patchelf-0.19.1.0
+    patchelf=$tools/patchelf-0.19.1.0.data/scripts/patchelf
+    if [[ ! -x $patchelf ]]; then
+        proxy=()
+        command -v with-proxy >/dev/null && proxy=(with-proxy)
+        mkdir -p "$tmp/wheel"
+        "${proxy[@]}" python3 -m pip download --quiet --no-deps --only-binary=:all: \
+            --dest "$tmp/wheel" patchelf==0.19.1.0
+        echo "$wheel_sha256  $tmp/wheel/$wheel" | sha256sum --check --quiet ||
+            { echo "ci/buck-e2e/stage: downloaded $wheel does not match its pinned sha256" >&2; exit 1; }
+        rm -rf "$tools"
+        mkdir -p "$tools"
+        python3 -m zipfile -e "$tmp/wheel/$wheel" "$tools"
+        chmod +x "$patchelf"
+    fi
+fi
+
 # 1. Binaries: the release harness, the validate-profile hermit and its install bundle.
 cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins --target-dir "$target_dir"
 cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt --target-dir "$target_dir"
@@ -72,7 +96,7 @@ for lib in libunwind.so.8 libunwind-x86_64.so.8; do
     install -m 644 "$(readlink -f "/usr/lib64/$lib")" "$tmp/install_pkg/rsrcs/hermit-runtime/$lib"
 done
 install -m 755 "$target_dir/validate/hermit" "$tmp/hermit"
-patchelf --force-rpath --set-rpath '$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime' "$tmp/hermit"
+"$patchelf" --force-rpath --set-rpath '$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime' "$tmp/hermit"
 "$root/ci/publish-hermit-e2e-artifact.sh" "$tmp/hermit" "$tmp/published" "$tmp/pointer" "$tmp/install_pkg" >/dev/null
 published=$(cat "$tmp/pointer")
 cp -a "$published/install" "$staged/install"
