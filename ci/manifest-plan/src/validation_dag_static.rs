@@ -622,7 +622,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // version_names_a_revision_only_when_the_build_was_stamped
     // (https://github.com/rrnewton/hermit/pull/3547) retains all 102 prior
     // selected CLI identities.
-    ("test.cli", 103),
+    // hermit_dap_attach_keeps_the_thread_across_continue_and_stack_trace and
+    // hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording
+    // (https://github.com/rrnewton/reverie/pull/885) retain all 103 prior
+    // selected CLI identities.
+    ("test.cli", 105),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -654,7 +658,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
     // retains all 102.
-    ("test.cli_on_host", 103),
+    // The same two hermit-dap
+    // end-to-end tests as test.cli; all 103 prior identities retained.
+    ("test.cli_on_host", 105),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -3103,8 +3109,19 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         // A hermit-dap missing from the build must fail the hermit_dap_*
         // cases here rather than let them skip
-        // (https://github.com/rrnewton/hermit/issues/3419).
-        env: &[(r########"HERMIT_REQUIRE_DAP"########, r########"1"########)],
+        // (https://github.com/rrnewton/hermit/issues/3419). The pinned
+        // hermetic image ships GDB 17.2 at /bin/gdb, so the hermit-dap
+        // end-to-end cases must drive it here rather than skip. The hosted
+        // twin does not set HERMIT_REQUIRE_DAP_GDB: its distribution GDB is
+        // not the tested 17.2, and there the cases skip loudly when GDB is
+        // absent or refused by managed replay.
+        env: &[
+            (r########"HERMIT_REQUIRE_DAP"########, r########"1"########),
+            (
+                r########"HERMIT_REQUIRE_DAP_GDB"########,
+                r########"1"########,
+            ),
+        ],
         hint: HintSpec {
             resources: &[(r########"integration_test_binaries.cli"########, 1)],
             est_duration_s: 150.0,

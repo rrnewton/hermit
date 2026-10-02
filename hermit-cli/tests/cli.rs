@@ -6217,6 +6217,737 @@ fn hermit_dap_rejects_replay_options_without_replay() {
     );
 }
 
+/// Set where a DAP-capable GDB is installed and must be exercised. Validation
+/// sets it on `test.cli`, whose pinned hermetic image ships GDB 17.2, so the
+/// end-to-end hermit-dap tests below FAIL there instead of skipping when GDB
+/// is missing, lacks a DAP interpreter, or is refused by managed replay.
+const HERMIT_REQUIRE_DAP_GDB: &str = "HERMIT_REQUIRE_DAP_GDB";
+
+/// How long one DAP exchange may take before the test fails rather than hangs.
+/// A reverse request restarts the replay and runs it forward, so it gets more.
+const DAP_TIMEOUT: Duration = Duration::from_secs(120);
+const DAP_REVERSE_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// The line of `square`'s body in [`DAP_GUEST_SOURCE`], where the tests break.
+const DAP_GUEST_BREAK_LINE: u64 = 4;
+/// The line in `main` that calls `square`.
+const DAP_GUEST_CALL_LINE: u64 = 11;
+// ⚠️ THE TWO LINE NUMBERS ABOVE ARE THIS LAYOUT. Keep them in step.
+const DAP_GUEST_SOURCE: &str = r#"#include <stdio.h>
+
+static int square(int x) {
+  int y = x * x;
+  return y;
+}
+
+int main(void) {
+  int total = 0;
+  for (int i = 0; i < 3; i++) {
+    total += square(i);
+  }
+  printf("total=%d\n", total);
+  return 0;
+}
+"#;
+
+/// The GDB hermit-dap would pick (`/usr/bin/gdb`, else `gdb` on `PATH`), when it
+/// has a DAP interpreter.
+///
+/// hermit-dap is only a launcher: everything after `exec` is GDB's DAP server,
+/// so these tests need a real one. Where none is installed they skip loudly; a
+/// job that sets [`HERMIT_REQUIRE_DAP_GDB`] turns the skip into a failure.
+fn dap_capable_gdb(test: &str) -> Option<PathBuf> {
+    let candidate = if Path::new("/usr/bin/gdb").is_file() {
+        Some(PathBuf::from("/usr/bin/gdb"))
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("gdb"))
+                .find(|gdb| gdb.is_file())
+        })
+    };
+    let reason = match &candidate {
+        None => "no gdb at /usr/bin/gdb or on PATH".to_owned(),
+        Some(gdb) => match Command::new(gdb)
+            .args(["--batch", "-nx", "-ex", "python import gdb.dap.server"])
+            .output()
+        {
+            Ok(output) if output.status.success() => return candidate,
+            Ok(output) => format!(
+                "{} has no DAP interpreter (`python import gdb.dap.server` failed: {})",
+                gdb.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => format!("{} could not be run: {error}", gdb.display()),
+        },
+    };
+    dap_gdb_skip(test, &reason);
+    None
+}
+
+/// Skips `test` loudly, or fails it where [`HERMIT_REQUIRE_DAP_GDB`] is set.
+fn dap_gdb_skip(test: &str, reason: &str) {
+    assert!(
+        std::env::var_os(HERMIT_REQUIRE_DAP_GDB).is_none(),
+        "{HERMIT_REQUIRE_DAP_GDB} is set, but {reason}, so {test} cannot drive hermit-dap \
+         through a real GDB"
+    );
+    eprintln!(
+        "skipping {test}: {reason}; install a GDB with DAP support (tested with GDB 17.2), \
+         or set {HERMIT_REQUIRE_DAP_GDB}=1 to make this a failure"
+    );
+}
+
+/// Writes and compiles [`DAP_GUEST_SOURCE`] under `directory`, returning the
+/// source and program paths. Each test passes its own directory: nextest runs
+/// tests in separate processes, so a shared output file would race.
+fn dap_guest(directory: &Path) -> (PathBuf, PathBuf) {
+    let source = directory.join("squares.c");
+    fs::write(&source, DAP_GUEST_SOURCE).expect("failed to write the hermit-dap guest source");
+    let program = directory.join("squares");
+    let output = Command::new("cc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to run cc for the hermit-dap guest");
+    assert!(
+        output.status.success(),
+        "hermit-dap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (source, program)
+}
+
+/// A loopback port nothing is listening on right now.
+fn unused_local_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("failed to find an unused loopback port")
+        .port()
+}
+
+/// Whether anything in this network namespace listens on TCP `port`.
+///
+/// Read from /proc rather than by connecting: Hermit's gdbserver accepts one
+/// client, and a probe connection would be that client.
+fn tcp_port_is_listening(port: u16) -> bool {
+    let wanted = format!(":{port:04X}");
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+        fs::read_to_string(table).is_ok_and(|text| {
+            text.lines().skip(1).any(|row| {
+                let fields: Vec<&str> = row.split_whitespace().collect();
+                fields.len() > 3 && fields[1].ends_with(&wanted) && fields[3] == "0A"
+            })
+        })
+    })
+}
+
+/// Kills and reaps the child when dropped, so a failed assertion cannot leave a
+/// gdbserver or guest running.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A Debug Adapter Protocol client for hermit-dap, keeping a transcript so a
+/// failure shows the whole exchange together with the adapter's stderr.
+struct DapClient {
+    adapter: KillOnDrop,
+    stdin: std::process::ChildStdin,
+    messages: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+    next_seq: u64,
+    transcript: Vec<String>,
+    stderr_path: PathBuf,
+}
+
+impl DapClient {
+    fn spawn(mut command: Command, stderr_path: PathBuf) -> Self {
+        let stderr =
+            fs::File::create(&stderr_path).expect("failed to create the hermit-dap stderr file");
+        let mut adapter = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .expect("failed to spawn hermit-dap");
+        let stdin = adapter
+            .stdin
+            .take()
+            .expect("hermit-dap stdin should be piped");
+        let stdout = adapter
+            .stdout
+            .take()
+            .expect("hermit-dap stdout should be piped");
+        let (sender, messages) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().ok();
+                    }
+                }
+                let message = match length {
+                    None => Err("a DAP header block had no Content-Length".to_owned()),
+                    Some(length) => {
+                        let mut body = vec![0; length];
+                        match std::io::Read::read_exact(&mut reader, &mut body) {
+                            Err(error) => Err(format!("a DAP body was cut short: {error}")),
+                            Ok(()) => serde_json::from_slice(&body).map_err(|error| {
+                                format!(
+                                    "unparsable DAP message ({error}): {}",
+                                    String::from_utf8_lossy(&body)
+                                )
+                            }),
+                        }
+                    }
+                };
+                let stop = message.is_err();
+                if sender.send(message).is_err() || stop {
+                    return;
+                }
+            }
+        });
+        Self {
+            adapter: KillOnDrop(adapter),
+            stdin,
+            messages,
+            next_seq: 0,
+            transcript: Vec::new(),
+            stderr_path,
+        }
+    }
+
+    fn adapter_stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    fn fail(&self, problem: &str) -> ! {
+        panic!(
+            "{problem}\nDAP transcript:\n{}\nhermit-dap stderr:\n{}",
+            self.transcript.join("\n"),
+            self.adapter_stderr()
+        )
+    }
+
+    fn request(&mut self, command: &str, arguments: serde_json::Value) -> u64 {
+        self.next_seq += 1;
+        let body = serde_json::json!({
+            "seq": self.next_seq,
+            "type": "request",
+            "command": command,
+            "arguments": arguments,
+        })
+        .to_string();
+        self.transcript.push(format!("-> {body}"));
+        let sent = write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len())
+            .and_then(|()| self.stdin.flush());
+        if let Err(error) = sent {
+            self.fail(&format!("could not send {command}: {error}"));
+        }
+        self.next_seq
+    }
+
+    /// The next message `matches` accepts; earlier messages are only logged.
+    fn wait_for(
+        &mut self,
+        what: &str,
+        timeout: Duration,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(message)) => {
+                    let text = message.to_string();
+                    self.transcript
+                        .push(format!("<- {}", text.chars().take(600).collect::<String>()));
+                    if matches(&message) {
+                        return message;
+                    }
+                }
+                Ok(Err(problem)) => self.fail(&format!("waiting for {what}: {problem}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.fail(&format!("timed out after {timeout:?} waiting for {what}"))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.fail(&format!(
+                    "hermit-dap closed its output while waiting for {what}"
+                )),
+            }
+        }
+    }
+
+    /// Sends `command` and returns its response, which must report success.
+    fn call(
+        &mut self,
+        command: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> serde_json::Value {
+        let seq = self.request(command, arguments);
+        let response = self.wait_for(&format!("the {command} response"), timeout, |message| {
+            message["type"] == "response" && message["request_seq"] == seq
+        });
+        if response["success"] != true {
+            self.fail(&format!("{command} failed: {response}"));
+        }
+        response
+    }
+
+    /// Sends `initialize`. If the adapter exits first because managed replay
+    /// refused this GDB, returns that refusal instead of failing.
+    fn initialize(&mut self) -> Result<serde_json::Value, String> {
+        let seq = self.request(
+            "initialize",
+            serde_json::json!({
+                "adapterID": "hermit",
+                "linesStartAt1": true,
+                "columnsStartAt1": true,
+                "pathFormat": "path",
+            }),
+        );
+        let deadline = Instant::now() + DAP_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(message)) => {
+                    self.transcript.push(format!("<- {message}"));
+                    if message["type"] == "response" && message["request_seq"] == seq {
+                        if message["success"] != true {
+                            self.fail(&format!("initialize failed: {message}"));
+                        }
+                        return Ok(message);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let exit_deadline = Instant::now() + Duration::from_secs(10);
+                    while self.adapter.0.try_wait().ok().flatten().is_none()
+                        && Instant::now() < exit_deadline
+                    {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    let stderr = self.adapter_stderr();
+                    if let Some(line) = stderr
+                        .lines()
+                        .find(|line| line.contains("managed replay does not support this GDB"))
+                    {
+                        return Err(line.to_owned());
+                    }
+                    self.fail("hermit-dap closed its output before answering initialize")
+                }
+                Ok(Err(problem)) => self.fail(&format!("waiting for initialize: {problem}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.fail("timed out waiting for the initialize response")
+                }
+            }
+        }
+    }
+
+    /// Attaches to `target`, sets one breakpoint at `line` of `source`, finishes
+    /// configuration, and returns the thread of the initial stop.
+    fn attach_and_break(
+        &mut self,
+        program: &Path,
+        target: &str,
+        source: &Path,
+        line: u64,
+    ) -> serde_json::Value {
+        let attach = self.request(
+            "attach",
+            serde_json::json!({"program": program, "target": target}),
+        );
+        let initialized = self.wait_for("the initialized event", DAP_TIMEOUT, |message| {
+            message["event"] == "initialized"
+                || (message["type"] == "response" && message["request_seq"] == attach)
+        });
+        if initialized["type"] == "response" && initialized["success"] != true {
+            self.fail(&format!("attach failed: {initialized}"));
+        }
+        let breakpoints = self.call(
+            "setBreakpoints",
+            serde_json::json!({"source": {"path": source}, "breakpoints": [{"line": line}]}),
+            DAP_TIMEOUT,
+        );
+        // GDB answers before `target remote` has run, so the breakpoint is
+        // still pending here. That it resolved is proved later, by a
+        // `breakpoint` stop at this line.
+        if breakpoints["body"]["breakpoints"]
+            .as_array()
+            .is_none_or(|breakpoints| breakpoints.len() != 1)
+        {
+            self.fail(&format!(
+                "expected one breakpoint for line {line}: {breakpoints}"
+            ));
+        }
+        self.call("configurationDone", serde_json::json!({}), DAP_TIMEOUT);
+        let stop = self.stopped("the stop after attaching", DAP_TIMEOUT);
+        if !stop["threadId"].is_u64() {
+            self.fail(&format!("the attach stop names no thread: {stop}"));
+        }
+        stop["threadId"].clone()
+    }
+
+    /// The body of the next `stopped` event; the debuggee ending first fails.
+    fn stopped(&mut self, what: &str, timeout: Duration) -> serde_json::Value {
+        let event = self.wait_for(what, timeout, |message| {
+            message["type"] == "event"
+                && matches!(
+                    message["event"].as_str(),
+                    Some("stopped" | "terminated" | "exited")
+                )
+        });
+        if event["event"] != "stopped" {
+            self.fail(&format!("expected {what}, but the debuggee ended: {event}"));
+        }
+        event["body"].clone()
+    }
+
+    /// Requires that `stop` is a `reason` stop of `thread` whose stack starts
+    /// with `frames`, each (function, line), and whose innermost frame
+    /// evaluates `watch.0` to `watch.1`. Checks the thread through `threads`
+    /// and `stackTrace`, the two requests that lost it before the fix.
+    fn assert_stop(
+        &mut self,
+        what: &str,
+        stop: &serde_json::Value,
+        thread: &serde_json::Value,
+        reason: &str,
+        frames: &[(&str, u64)],
+        watch: (&str, &str),
+    ) {
+        let (variable, value) = watch;
+        if stop["reason"] != reason || stop["threadId"] != *thread {
+            self.fail(&format!(
+                "{what}: expected a {reason} stop of thread {thread}, got {stop}"
+            ));
+        }
+        let threads = self.call("threads", serde_json::json!({}), DAP_TIMEOUT);
+        let listed = threads["body"]["threads"]
+            .as_array()
+            .is_some_and(|threads| threads.iter().any(|entry| entry["id"] == *thread));
+        if !listed {
+            self.fail(&format!(
+                "{what}: thread {thread} is missing from {threads}"
+            ));
+        }
+        let trace = self.call(
+            "stackTrace",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let stack: Vec<(String, u64, serde_json::Value)> = trace["body"]["stackFrames"]
+            .as_array()
+            .map(|frames| {
+                frames
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame["name"].as_str().unwrap_or_default().to_owned(),
+                            frame["line"].as_u64().unwrap_or_default(),
+                            frame["id"].clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let observed: Vec<(&str, u64)> = stack
+            .iter()
+            .take(frames.len())
+            .map(|(name, line, _)| (name.as_str(), *line))
+            .collect();
+        if observed != frames {
+            self.fail(&format!(
+                "{what}: expected the stack to start {frames:?}, got {observed:?}"
+            ));
+        }
+        let evaluated = self.call(
+            "evaluate",
+            serde_json::json!({"expression": variable, "frameId": stack[0].2, "context": "watch"}),
+            DAP_TIMEOUT,
+        );
+        if evaluated["body"]["result"] != value {
+            self.fail(&format!(
+                "{what}: expected {variable} = {value}, got {evaluated}"
+            ));
+        }
+    }
+}
+
+/// Attaching hermit-dap to `hermit run --gdbserver` must keep the stopped
+/// thread usable across `continue`, `threads` and `stackTrace`.
+///
+/// Before the fix, GDB's DAP server switched threads with `thread N` before
+/// every resume and stack walk. GDB checks the thread with the remote `T`
+/// (thread-alive) packet, and Reverie's gdbstub had its `T` handler commented
+/// out, so it answered with an empty reply. GDB treats any reply other than
+/// `OK` as a dead thread. Measured with GDB 17.2 before the fix: the first
+/// `continue` failed with "Thread ID 1 has terminated." The fix is in Reverie
+/// (<https://github.com/rrnewton/reverie/pull/885>), which answers `T` with
+/// `OK` for a live thread and `E01` otherwise.
+#[test]
+fn hermit_dap_attach_keeps_the_thread_across_continue_and_stack_trace() {
+    const TEST: &str = "hermit_dap_attach_keeps_the_thread_across_continue_and_stack_trace";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let program_arg = program.to_str().expect("guest path should be UTF-8");
+    let port = unused_local_port();
+    let port_arg = port.to_string();
+    let guest_stdout = work.path().join("hermit-run.stdout");
+    let guest_stderr = work.path().join("hermit-run.stderr");
+    let mut command = hermit_command(&[
+        "run",
+        "--gdbserver",
+        "--gdbserver-port",
+        &port_arg,
+        "--",
+        program_arg,
+    ]);
+    command
+        .stdout(fs::File::create(&guest_stdout).expect("failed to create the run stdout file"))
+        .stderr(fs::File::create(&guest_stderr).expect("failed to create the run stderr file"));
+    let mut run = KillOnDrop(
+        command
+            .spawn()
+            .expect("failed to spawn hermit run --gdbserver"),
+    );
+
+    let deadline = Instant::now() + DAP_TIMEOUT;
+    while !tcp_port_is_listening(port) {
+        let exited = run.0.try_wait().expect("failed to poll hermit run");
+        assert!(
+            exited.is_none() && Instant::now() < deadline,
+            "hermit run --gdbserver never listened on port {port} (exit: {exited:?})\nstderr:\n{}",
+            fs::read_to_string(&guest_stderr).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut adapter = Command::new(hermit_dap);
+    adapter.arg("--gdb").arg(&gdb);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap.fail(&format!(
+            "attach mode needs no managed-replay hooks: {refusal}"
+        ));
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_GUEST_BREAK_LINE,
+    );
+
+    // Two continues: the thread must survive the first resume AND the second.
+    for x in ["0", "1"] {
+        dap.call(
+            "continue",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let what = format!("the breakpoint hit with x = {x}");
+        let stop = dap.stopped(&what, DAP_TIMEOUT);
+        dap.assert_stop(
+            &what,
+            &stop,
+            &thread,
+            "breakpoint",
+            &[
+                ("square", DAP_GUEST_BREAK_LINE),
+                ("main", DAP_GUEST_CALL_LINE),
+            ],
+            ("x", x),
+        );
+    }
+
+    // Run the guest to completion: it must finish with its real output.
+    dap.call(
+        "setBreakpoints",
+        serde_json::json!({"source": {"path": source}, "breakpoints": []}),
+        DAP_TIMEOUT,
+    );
+    dap.call(
+        "continue",
+        serde_json::json!({"threadId": thread}),
+        DAP_TIMEOUT,
+    );
+    dap.wait_for("the guest's exit", DAP_TIMEOUT, |message| {
+        message["type"] == "event"
+            && matches!(message["event"].as_str(), Some("exited" | "terminated"))
+    });
+    drop(dap);
+
+    let deadline = Instant::now() + DAP_TIMEOUT;
+    let status = loop {
+        if let Some(status) = run.0.try_wait().expect("failed to poll hermit run") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hermit run did not exit after its guest finished\nstderr:\n{}",
+            fs::read_to_string(&guest_stderr).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = fs::read_to_string(&guest_stdout).unwrap_or_default();
+    assert!(
+        status.success() && stdout.contains("total=5"),
+        "hermit run --gdbserver: status {status}, stdout {stdout:?}\nstderr:\n{}",
+        fs::read_to_string(&guest_stderr).unwrap_or_default()
+    );
+}
+
+/// Managed replay must step backward and reverse-continue through a recording,
+/// landing where the guest really was earlier.
+///
+/// Before the fix, the replay hook script failed on GDB 17.2 before serving a
+/// request: it wrapped `gdb.dap.server.Server.send_event`, which GDB 17.2
+/// renamed to `_send_event` (AttributeError). Repairing that exposed further
+/// defects that this test also pins: stepBack moved FORWARD in time (lines 3
+/// and 4 resolve to one breakpoint address, so each arrival was recorded twice
+/// and the occurrence count overshot), `readelf` output truncated without
+/// `--wide` silently dropped every line breakpoint, and GDB's DAP frame cache
+/// survived the replay restart ("Frame is invalid.").
+///
+/// The expected positions are the guest's real history: the second hit of
+/// `square` has x = 1, one source line earlier is the call in `main` with
+/// i = 1, and the breakpoint hit before that is the first call, x = 0.
+#[test]
+fn hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording() {
+    const TEST: &str = "hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let program_arg = program.to_str().expect("guest path should be UTF-8");
+    let data_dir = work.path().join("recordings");
+
+    let recorded = hermit_command(&["record", "start", "--", program_arg])
+        .env("HERMIT_DATA_DIR", &data_dir)
+        .output()
+        .expect("failed to run hermit record start");
+    assert!(
+        recorded.status.success() && String::from_utf8_lossy(&recorded.stdout).contains("total=5"),
+        "hermit record start: {}\nstdout:\n{}\nstderr:\n{}",
+        recorded.status,
+        String::from_utf8_lossy(&recorded.stdout),
+        stderr(&recorded)
+    );
+    let recording = fs::read_to_string(data_dir.join("last"))
+        .expect("hermit record start wrote no `last` recording id");
+    let recording = recording.trim();
+
+    let port = unused_local_port();
+    let mut adapter = Command::new(hermit_dap);
+    adapter
+        .arg("--gdb")
+        .arg(&gdb)
+        .args(["--replay", recording, "--data-dir"])
+        .arg(&data_dir)
+        .args(["--gdbserver-port", &port.to_string()]);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    let initialized = match dap.initialize() {
+        Ok(response) => response,
+        Err(refusal) => {
+            dap_gdb_skip(TEST, &refusal);
+            return;
+        }
+    };
+    if initialized["body"]["supportsStepBack"] != true {
+        dap.fail(&format!(
+            "managed replay must advertise supportsStepBack: {initialized}"
+        ));
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_GUEST_BREAK_LINE,
+    );
+    let in_square = [
+        ("square", DAP_GUEST_BREAK_LINE),
+        ("main", DAP_GUEST_CALL_LINE),
+    ];
+
+    for x in ["0", "1"] {
+        dap.call(
+            "continue",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let what = format!("the breakpoint hit with x = {x}");
+        let stop = dap.stopped(&what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_square, ("x", x));
+    }
+
+    dap.call(
+        "stepBack",
+        serde_json::json!({"threadId": thread}),
+        DAP_REVERSE_TIMEOUT,
+    );
+    let stop = dap.stopped("the stop after stepBack", DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        "stepBack from the second hit",
+        &stop,
+        &thread,
+        "step",
+        &[("main", DAP_GUEST_CALL_LINE)],
+        ("i", "1"),
+    );
+
+    dap.call(
+        "reverseContinue",
+        serde_json::json!({"threadId": thread}),
+        DAP_REVERSE_TIMEOUT,
+    );
+    let stop = dap.stopped("the stop after reverseContinue", DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        "reverseContinue to the first hit",
+        &stop,
+        &thread,
+        "breakpoint",
+        &in_square,
+        ("x", "0"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
 /// A recorded PMU skid overshoot and a guest that exited 1 must be
 /// distinguishable from `$?`
 /// ALONE, with no stderr parsing.

@@ -267,12 +267,14 @@ Use `--data-dir=DIR` or `HERMIT_DATA_DIR` to select another directory.
 
 ### Debug Adapter Protocol
 
-The DAP adapter is experimental. End-to-end attach and reverse replay are
-currently broken with GDB 17.2: an attached session can report that its thread
-has terminated, and reverse replay fails while loading the adapter's Python
-extension. No working GDB version is established by this guide. The examples
-below describe the interface; use ordinary GDB debugging or replay with
-`--autopilot` when these adapter failures affect you.
+The DAP adapter is experimental. It is tested end to end with GDB 17.2 on a
+single-threaded C program: attaching to `run --gdbserver`, hitting a source
+breakpoint, continuing, reading the stack and evaluating variables, and, for a
+recording, `stepBack` and `reverseContinue` (the `hermit_dap_*` tests in
+`hermit-cli/tests/cli.rs`). Other GDB versions are not tested. Reverse replay
+patches GDB's DAP server internals, so it refuses to start, naming the missing
+hook, under a GDB whose DAP server lacks them; it also requires `readelf` and
+`setpriv` on `PATH`. Multithreaded guests are not yet covered by these tests.
 
 Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
 `hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local

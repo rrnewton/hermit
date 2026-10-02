@@ -26,22 +26,78 @@ from gdb.dap.state import set_thread
 
 
 server = importlib.import_module("gdb.dap.server")
+frames = importlib.import_module("gdb.dap.frames")
 
 # hermit-dap.rs defines both names before it execs this script.
 _replay_command = HERMIT_REPLAY_COMMAND  # noqa: F821
 _replay_target = HERMIT_REPLAY_TARGET  # noqa: F821
 _replay_process = None
+_setpriv = None
 _history = []
 _line_breakpoints = []
+_arrival_leaders = {}
 _line_program = None
 _suppress_events = False
 _last_stopped = None
 
 
+def _unsupported_gdb(problem):
+    # Fail at startup, before the client sees an adapter that lacks reverse
+    # requests, and say which GDB is wrong rather than leaving a traceback.
+    gdb.write(
+        "hermit-dap: managed replay does not support this GDB ({}): {}. "
+        "It is tested with GDB 17.2; use --gdb to select a GDB whose DAP "
+        "interpreter provides these hooks.\n".format(gdb.VERSION, problem),
+        gdb.STDERR,
+    )
+    os._exit(1)
+
+
+# The reverse requests below rely on these parts of GDB's DAP implementation;
+# none of them is a stable public interface, so check them all up front.
+_missing_hooks = [
+    name
+    for name in (
+        "send_event",
+        "call_function_later",
+        "send_gdb",
+        "send_gdb_with_response",
+        "_commands",
+    )
+    if not hasattr(server, name)
+]
+if _missing_hooks or not hasattr(gdb, "with_parameter"):
+    _unsupported_gdb(
+        "gdb.dap.server lacks {}".format(
+            ", ".join(_missing_hooks or ["(gdb.with_parameter)"])
+        )
+    )
+if not callable(getattr(frames, "_clear_frame_ids", None)):
+    _unsupported_gdb("gdb.dap.frames lacks _clear_frame_ids")
+for _command in ("attach", "disconnect"):
+    if _command not in server._commands:
+        _unsupported_gdb("gdb.dap has no '{}' request".format(_command))
+
+
 # GDB's DAP modules do not expose a supported event-suppression interface. Keep
 # their handlers connected so they can maintain thread and frame state, but
 # hide the process churn caused by an internal replay restart from the client.
-_original_send_event = server.Server.send_event
+#
+# Every event leaves through one Server method. GDB 17.2 names it _send_event
+# (send_event_maybe_later and the module-level send_event both call it at call
+# time); older DAP servers named it send_event. Wrap whichever this GDB has, so
+# a renamed sink stops the adapter here instead of leaking restart events.
+_event_sink_name = next(
+    (
+        name
+        for name in ("_send_event", "send_event")
+        if callable(getattr(server.Server, name, None))
+    ),
+    None,
+)
+if _event_sink_name is None:
+    _unsupported_gdb("gdb.dap.server.Server has neither _send_event nor send_event")
+_original_send_event = getattr(server.Server, _event_sink_name)
 
 
 def _send_event(self, event, body=None):
@@ -60,27 +116,44 @@ def _send_event(self, event, body=None):
     _original_send_event(self, event, body)
 
 
-server.Server.send_event = _send_event
+setattr(server.Server, _event_sink_name, _send_event)
 
 
 def _append_line(pc, file, line, thread_id):
-    position = {
-        "pc": pc,
-        "file": os.path.realpath(file),
-        "line": line,
-        "thread_id": thread_id,
-        "breakpoint": False,
-        "breakpoint_ids": [],
-    }
-    if (
-        _history
-        and _history[-1]["pc"] == position["pc"]
-        and _history[-1]["file"] == position["file"]
-        and _history[-1]["line"] == position["line"]
-        and _history[-1]["thread_id"] == position["thread_id"]
-    ):
-        return
-    _history.append(position)
+    # One entry per arrival at a line address. Reverse requests count earlier
+    # entries with the same pc to choose which hit of a temporary breakpoint
+    # to stop at, so an extra or a missing entry moves the target in time.
+    _history.append(
+        {
+            "pc": pc,
+            "file": os.path.realpath(file),
+            "line": line,
+            "thread_id": thread_id,
+            "breakpoint": False,
+            "breakpoint_ids": [],
+        }
+    )
+
+
+def _arrival_leader(pc):
+    # GDB often resolves several source lines to one address (a function's
+    # opening line and its first statement both land after the prologue) and
+    # calls stop() once for each of those breakpoints on a single arrival.
+    # Only the lowest-numbered line breakpoint at the address records it.
+    if pc not in _arrival_leaders:
+        _arrival_leaders[pc] = min(
+            (
+                breakpoint.number
+                for breakpoint in _line_breakpoints
+                if breakpoint.is_valid()
+                and any(
+                    location.address is not None and int(location.address) == pc
+                    for location in breakpoint.locations
+                )
+            ),
+            default=None,
+        )
+    return _arrival_leaders[pc]
 
 
 class _LineBreakpoint(gdb.Breakpoint):
@@ -93,12 +166,14 @@ class _LineBreakpoint(gdb.Breakpoint):
     def stop(self):
         if not _suppress_events:
             try:
-                _append_line(
-                    int(gdb.newest_frame().pc()),
-                    self.file,
-                    self.line,
-                    gdb.selected_thread().global_num,
-                )
+                pc = int(gdb.newest_frame().pc())
+                if _arrival_leader(pc) in (None, self.number):
+                    _append_line(
+                        pc,
+                        self.file,
+                        self.line,
+                        gdb.selected_thread().global_num,
+                    )
             except (gdb.error, AttributeError):
                 pass
         return False
@@ -114,7 +189,9 @@ def _install_line_breakpoints(event=None):
 
     try:
         decoded = subprocess.run(
-            ["readelf", "--debug-dump=decodedline", program],
+            # Without --wide, readelf truncates long file names to a fixed
+            # column, and no line breakpoint can be set from a truncated name.
+            ["readelf", "--wide", "--debug-dump=decodedline", program],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -131,6 +208,7 @@ def _install_line_breakpoints(event=None):
 
     previous_suppression = _suppress_events
     _suppress_events = True
+    _arrival_leaders.clear()
     try:
         for file, line in sorted(source_lines):
             try:
@@ -174,15 +252,15 @@ def _remember_stop(event):
     position = _source_position(event)
     if position is None:
         return
+    # A stop at the address a line breakpoint just recorded is that same
+    # arrival, even when the recording breakpoint names another source line
+    # that resolves to the same address.
     if (
         _history
         and _history[-1]["pc"] == position["pc"]
-        and _history[-1]["file"] == position["file"]
-        and _history[-1]["line"] == position["line"]
         and _history[-1]["thread_id"] == position["thread_id"]
     ):
-        _history[-1]["breakpoint"] = position["breakpoint"]
-        _history[-1]["breakpoint_ids"] = position["breakpoint_ids"]
+        _history[-1].update(position)
     else:
         _history.append(position)
 
@@ -209,7 +287,7 @@ def _terminate_replay():
 def _start_replay():
     global _replay_process
     _replay_process = subprocess.Popen(
-        ["/usr/bin/setpriv", "--pdeathsig", "SIGKILL", "--"] + _replay_command,
+        [_setpriv, "--pdeathsig", "SIGKILL", "--"] + _replay_command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -268,6 +346,10 @@ def _restart_at(position, occurrence, reason):
 
         _start_replay()
         _connect_replay()
+        # GDB's DAP layer caches frames per thread and drops the cache only
+        # when the inferior resumes. A restart that stops at the replay's
+        # entry never resumes, so drop the killed inferior's frames here.
+        frames._clear_frame_ids(None)
 
         if position is not None:
             target = gdb.Breakpoint(
@@ -457,9 +539,14 @@ def _cleanup(event):
     _terminate_replay()
 
 
-if shutil.which("readelf") is None or not os.path.isfile("/usr/bin/setpriv"):
+_setpriv = (
+    "/usr/bin/setpriv"
+    if os.path.isfile("/usr/bin/setpriv")
+    else shutil.which("setpriv")
+)
+if shutil.which("readelf") is None or _setpriv is None:
     gdb.write(
-        "hermit-dap: managed replay requires readelf and /usr/bin/setpriv\n",
+        "hermit-dap: managed replay requires readelf and setpriv\n",
         gdb.STDERR,
     )
     os._exit(1)
