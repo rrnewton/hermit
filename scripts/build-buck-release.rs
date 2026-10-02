@@ -19,6 +19,8 @@
  */
 //! Build and shadow-validate the feature-complete Buck release binary.
 
+#[path = "lib/reverie_dbt_inventory.rs"]
+mod reverie_dbt_inventory;
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 #[allow(dead_code)]
@@ -1482,9 +1484,10 @@ fn verify_generated_buck(text: &str) -> Result<(), String> {
             line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.4.0/")
         })
         .count();
-    if mapped_files != 931 {
+    if mapped_files != reverie_dbt_inventory::REVERIE_DBT_FILES {
         return Err(format!(
-            "generated reverie-dbt manifest map has {mapped_files} files, expected 931; rerun regeneration and inspect the pin"
+            "generated reverie-dbt manifest map has {mapped_files} files, expected {}; rerun regeneration and inspect the pin",
+            reverie_dbt_inventory::REVERIE_DBT_FILES
         ));
     }
     Ok(())
@@ -8325,6 +8328,31 @@ mod tests {
     #[test]
     fn stale_generated_graph_is_refused() {
         assert!(verify_generated_buck("# stale\n").is_err());
+    }
+
+    #[test]
+    fn generated_graph_must_map_the_pinned_reverie_dbt_inventory() {
+        let graph = |files: usize| {
+            let mut text = GENERATED_MARKERS.join("\n");
+            for index in 0..files {
+                text.push_str(&format!(
+                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.4.0/f{index}\","
+                ));
+            }
+            text
+        };
+        let pinned = reverie_dbt_inventory::REVERIE_DBT_FILES;
+        assert_eq!(verify_generated_buck(&graph(pinned)), Ok(()));
+        for found in [pinned - 1, pinned + 1] {
+            assert_eq!(
+                verify_generated_buck(&graph(found)),
+                Err(format!(
+                    "generated reverie-dbt manifest map has {found} files, expected {pinned}; \
+                     rerun regeneration and inspect the pin"
+                )),
+                "{found}"
+            );
+        }
     }
 
     #[test]

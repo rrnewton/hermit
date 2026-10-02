@@ -223,6 +223,8 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 	./scripts/check-record-version-floor.rs
+	./scripts/check-buck-reindeer-features.rs
+	./scripts/patch-reverie-dbt-buck.rs --check-inventory
 	./scripts/core-review-protocol-lint-test.sh
 	python3 ./ci/test_audit_test_binary_registration.py
 	./ci/run-with-reverie-dbt-budget-test.sh
