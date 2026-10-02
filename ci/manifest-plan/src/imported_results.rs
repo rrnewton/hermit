@@ -7,15 +7,29 @@
 //! publication path, so `results.jsonl`, JUnit, `summary.json`, the retry
 //! history and the dagrun test counts are produced exactly as for an executed
 //! bucket. Every selected cell must be accounted for: a cell with no row and no
-//! recorded host inapplicability becomes an ERROR row. That is the
+//! host inapplicability this machine confirms becomes an ERROR row. That is the
 //! executed-equals-plan gate for an imported run, and nothing here may relax it.
+//!
+//! An imported cell may not end better than the same rows would have ended in
+//! an executed run:
+//!
+//! - Every row must describe this commit's clean source, this checkout's test
+//!   source, the current timeout policy, and (when the binary was stamped) a
+//!   binary built from this commit. Otherwise the cell is one `import-stale`
+//!   ERROR.
+//! - The producer retries every failure; this run's retry policy decides which
+//!   of those retries it would have made. History after an attempt that does
+//!   not earn a retry here is dropped, so that attempt is the cell's verdict.
+//! - A PASS counts only if the producer recorded complete evidence for the
+//!   cell (`evidence_complete_cells` in the bucket's `summary.json`).
+//! - A producer's host-inapplicable claim counts only if this machine lacks a
+//!   capability the cell requires, and the row carries this machine's reason.
 //!
 //! An imported row is rebound to this run before publication: its `run_id`
 //! (and the run id its CPU observations are bound to) becomes this run's, and
 //! the observations' outer attempt follows the row's attempt, which the ingest
 //! assigned from Tpx's execution order. The rows' original run ids are kept
-//! and reported. A row built from a different source commit is not rebound; it
-//! becomes an ERROR, so a stale import root cannot pass for this commit.
+//! and reported.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -29,8 +43,10 @@ use crate::runner::CELL_RESULT_SCHEMA;
 use crate::runner::CellResult;
 use crate::runner::RunContext;
 use crate::runner::SelectedCell;
+use crate::runner::cell_timeouts;
 use crate::runner::host_inapplicable_result;
 use crate::runner::infrastructure_error_result;
+use crate::runner::test_digest;
 
 pub const IMPORT_RESULTS_ENV: &str = "E2E_IMPORT_RESULTS";
 
@@ -38,6 +54,15 @@ pub const IMPORT_RESULTS_ENV: &str = "E2E_IMPORT_RESULTS";
 pub fn bucket_dir(root: &Path, lane: &str, category: &str) -> PathBuf {
     root.join(lane)
         .join(format!("manifest_{}", category.replace('-', "_")))
+}
+
+/// The decisions an executed run makes for itself, applied to imported rows.
+pub struct ImportPolicy<'a> {
+    /// Whether this run would retry after `row` (its retry setting and the
+    /// cell's `no_retry_reason`).
+    pub earns_retry: &'a dyn Fn(&SelectedCell, &CellResult) -> bool,
+    /// Why this machine cannot run the cell, if it cannot.
+    pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
 }
 
 /// What the import root says about one selected cell, already turned into the
@@ -54,16 +79,21 @@ pub struct ImportedRun {
     pub source_run_ids: BTreeSet<String>,
     /// Selected cells the root had nothing for.
     pub missing: usize,
+    /// Producer attempts dropped because the attempt before them would not
+    /// have been retried by this run.
+    pub dropped_retries: usize,
 }
 
 #[derive(Deserialize)]
 struct Summary {
     #[serde(default)]
-    host_inapplicable_cells: Vec<HostInapplicable>,
+    host_inapplicable_cells: Vec<SummaryCell>,
+    #[serde(default)]
+    evidence_complete_cells: Vec<SummaryCell>,
 }
 
 #[derive(Deserialize)]
-struct HostInapplicable {
+struct SummaryCell {
     test: String,
     mode: String,
     backend: Option<String>,
@@ -98,6 +128,76 @@ fn error_row(context: &RunContext, cell: &SelectedCell, kind: &str, reason: Stri
     row
 }
 
+/// Why `row` cannot stand for `cell` in this run, if it cannot.
+fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> Option<String> {
+    if row.schema != CELL_RESULT_SCHEMA {
+        return Some(format!(
+            "imported row has schema {}, expected {CELL_RESULT_SCHEMA}",
+            row.schema
+        ));
+    }
+    if row.hermit_sha != context.source_sha {
+        return Some(format!(
+            "imported row was built from {}, this run is {}",
+            row.hermit_sha, context.source_sha
+        ));
+    }
+    if row.source_tree_dirty {
+        return Some("imported row was produced from a dirty source tree".into());
+    }
+    if let Some(binary) = row.binary_build_sha.as_deref() {
+        if binary != "unknown" && !(binary.len() >= 7 && context.source_sha.starts_with(binary)) {
+            return Some(format!(
+                "imported row ran a Hermit stamped {binary}, this run is {}",
+                context.source_sha
+            ));
+        }
+    }
+    match test_digest(&context.root, &cell.test) {
+        Ok(digest) if digest == row.test_sha256 => {}
+        Ok(digest) => {
+            return Some(format!(
+                "imported row ran test source {}, this checkout has {digest}",
+                row.test_sha256
+            ));
+        }
+        Err(error) => {
+            return Some(format!(
+                "cannot digest this checkout's test source: {error}"
+            ));
+        }
+    }
+    match cell_timeouts(context, cell) {
+        Ok(policy)
+            if row.execution_cpu_timeout_seconds == Some(policy.cpu_seconds)
+                && row.execution_wall_timeout_seconds == Some(policy.wall_seconds) => {}
+        Ok(policy) => {
+            return Some(format!(
+                "imported row ran with cpu/wall timeouts {:?}/{:?}, this run's policy is {}/{}",
+                row.execution_cpu_timeout_seconds,
+                row.execution_wall_timeout_seconds,
+                policy.cpu_seconds,
+                policy.wall_seconds
+            ));
+        }
+        Err(error) => return Some(format!("cannot resolve this cell's timeouts: {error}")),
+    }
+    // Each producer execution is its own --no-retry harness run, so its CPU
+    // observations are bound to that run's id and outer attempt 1; the
+    // ingest's attempt number is assigned afterwards.
+    if row.cpu_observations.is_none() {
+        return Some("imported row has no CPU observations".into());
+    }
+    let mut as_executed = row.clone();
+    as_executed.attempt = 1;
+    if let Err(error) = as_executed.require_cpu_observations() {
+        return Some(format!(
+            "imported row's CPU observations do not belong to its own execution: {error}"
+        ));
+    }
+    None
+}
+
 /// Read the import root for `cells`. `results_path` is where this run
 /// publishes; an import file that is the same file is refused, because the
 /// harness appends to it.
@@ -106,6 +206,7 @@ pub fn load(
     cells: &[SelectedCell],
     context: &RunContext,
     results_path: &Path,
+    policy: &ImportPolicy<'_>,
 ) -> Result<ImportedRun, String> {
     let wanted = cells.iter().map(cell_key).collect::<BTreeSet<_>>();
     let buckets = cells
@@ -115,6 +216,7 @@ pub fn load(
     let publish = fs::canonicalize(results_path).ok();
     let mut rows = BTreeMap::<Key, Vec<CellResult>>::new();
     let mut inapplicable = BTreeMap::<Key, String>::new();
+    let mut evidence_complete = BTreeSet::<Key>::new();
     for (lane, category) in &buckets {
         let dir = bucket_dir(root, lane, category);
         let results = dir.join("results.jsonl");
@@ -156,18 +258,22 @@ pub fn load(
             Ok(bytes) => {
                 let summary: Summary = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("{}: {error}", summary.display()))?;
-                for cell in summary.host_inapplicable_cells {
-                    let id = key(
+                let id = |cell: &SummaryCell| {
+                    key(
                         lane,
                         category,
                         &cell.test,
                         &cell.mode,
                         cell.backend.as_deref(),
-                    );
+                    )
+                };
+                for cell in summary.host_inapplicable_cells {
+                    let id = id(&cell);
                     if wanted.contains(&id) {
                         inapplicable.insert(id, cell.reason.unwrap_or_default());
                     }
                 }
+                evidence_complete.extend(summary.evidence_complete_cells.iter().map(id));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("{}: {error}", summary.display())),
@@ -176,13 +282,14 @@ pub fn load(
 
     let mut source_run_ids = BTreeSet::new();
     let mut missing = 0;
+    let mut dropped_retries = 0;
     let cells = cells
         .iter()
         .map(|cell| {
             let id = cell_key(cell);
             let found = rows.remove(&id);
-            let reason = inapplicable.remove(&id);
-            let rows = match (found, reason) {
+            let claimed = inapplicable.remove(&id);
+            let rows = match (found, claimed) {
                 (Some(_), Some(_)) => vec![error_row(
                     context,
                     cell,
@@ -191,7 +298,17 @@ pub fn load(
                         "{IMPORT_RESULTS_ENV} has both result rows and a host-inapplicable entry for this cell"
                     ),
                 )],
-                (None, Some(reason)) => vec![host_inapplicable_result(context, cell, reason)],
+                (None, Some(claimed)) => match (policy.host_inapplicable)(cell) {
+                    Some(reason) => vec![host_inapplicable_result(context, cell, reason)],
+                    None => vec![error_row(
+                        context,
+                        cell,
+                        "import-host-inapplicable-unconfirmed",
+                        format!(
+                            "{IMPORT_RESULTS_ENV} says this cell could not run ({claimed:?}), but this machine has every capability it requires"
+                        ),
+                    )],
+                },
                 (None, None) => {
                     missing += 1;
                     vec![error_row(
@@ -206,31 +323,43 @@ pub fn load(
                 }
                 (Some(mut found), None) => {
                     found.sort_by_key(|row| row.attempt);
-                    match found.iter().find_map(|row| {
-                        (row.schema != CELL_RESULT_SCHEMA).then(|| {
-                            format!("imported row has schema {}, expected {CELL_RESULT_SCHEMA}", row.schema)
-                        }).or_else(|| (row.hermit_sha != context.source_sha).then(|| {
-                            format!(
-                                "imported row was built from {}, this run is {}",
-                                row.hermit_sha, context.source_sha
-                            )
-                        }))
-                    }) {
-                        Some(reason) => vec![error_row(context, cell, "import-stale", reason)],
-                        None => found
-                            .into_iter()
-                            .map(|mut row| {
-                                source_run_ids.insert(std::mem::replace(
-                                    &mut row.run_id,
-                                    context.run_id.clone(),
-                                ));
-                                if let Some(observations) = row.cpu_observations.as_mut() {
-                                    observations.binding.run_id = context.run_id.clone();
-                                    observations.binding.outer_attempt = row.attempt;
-                                }
-                                row
-                            })
-                            .collect(),
+                    if let Some(reason) = found.iter().find_map(|row| stale_reason(context, cell, row)) {
+                        vec![error_row(context, cell, "import-stale", reason)]
+                    } else {
+                        // Keep the history up to the first attempt this run
+                        // would not have retried.
+                        let kept = found
+                            .iter()
+                            .position(|row| !(policy.earns_retry)(cell, row))
+                            .map_or(found.len(), |terminal| terminal + 1);
+                        dropped_retries += found.len() - kept;
+                        found.truncate(kept);
+                        let last = found.last().expect("a found cell has at least one row");
+                        if last.outcome == "PASS" && !evidence_complete.contains(&id) {
+                            vec![error_row(
+                                context,
+                                cell,
+                                "import-evidence-incomplete",
+                                format!(
+                                    "{IMPORT_RESULTS_ENV} has a PASS for this cell without the producer's evidence_complete record"
+                                ),
+                            )]
+                        } else {
+                            found
+                                .into_iter()
+                                .map(|mut row| {
+                                    source_run_ids.insert(std::mem::replace(
+                                        &mut row.run_id,
+                                        context.run_id.clone(),
+                                    ));
+                                    if let Some(observations) = row.cpu_observations.as_mut() {
+                                        observations.binding.run_id = context.run_id.clone();
+                                        observations.binding.outer_attempt = row.attempt;
+                                    }
+                                    row
+                                })
+                                .collect()
+                        }
                     }
                 }
             };
@@ -241,5 +370,6 @@ pub fn load(
         cells,
         source_run_ids,
         missing,
+        dropped_retries,
     })
 }
