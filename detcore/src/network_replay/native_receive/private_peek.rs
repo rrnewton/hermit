@@ -144,7 +144,7 @@ impl NetworkReplayEngine {
             .shadow_probes
             .get(&lease)
             .and_then(|probe| self.stream_calls.get(&probe.call))
-            .is_some_and(|call| (call.private_receive.is_some() || call.record_no_store.is_some()))
+            .is_some_and(|call| call.private_receive.is_some() || call.record_no_store.is_some())
         {
             return self.confirm_private_cursor_restore(owner, lease, observed);
         }
@@ -315,7 +315,7 @@ impl NetworkReplayEngine {
             .shadow_probes
             .get(&lease)
             .and_then(|probe| self.stream_calls.get(&probe.call))
-            .is_some_and(|call| (call.private_receive.is_some() || call.record_no_store.is_some()));
+            .is_some_and(|call| call.private_receive.is_some() || call.record_no_store.is_some());
         if !private {
             return self.submit_stream_physical(owner, lease, effect);
         }

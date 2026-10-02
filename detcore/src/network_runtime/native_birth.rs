@@ -31,7 +31,7 @@ pub(crate) struct NativeBirthAdmission {
     raw: NativeBirth,
 }
 impl NativeBirthAdmission {
-    pub(crate) fn raw(&self) -> &NativeBirth {
+    pub(super) fn raw(&self) -> &NativeBirth {
         &self.raw
     }
     pub(crate) fn permit(&self) -> NetworkFdPublicationPermit {
@@ -108,7 +108,7 @@ fn check_birth(
     // construction. This does not claim support of a valid raced clone3 call.
     let expected_flags = match syscall {
         435 => flags.bits(), // clone3 exit_signal is a separate kernel-copied field.
-        56 | 57 | 58 => flags.bits() & !0xff, // legacy family embeds CSIGNAL.
+        56..=58 => flags.bits() & !0xff, // legacy family embeds CSIGNAL.
         _ => return Err(invalid("birth names another syscall shape")),
     };
     if raw.kernel_flags != expected_flags {
@@ -148,7 +148,7 @@ fn check_birth(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NativeBirthCleanupRequest {
     Uninvoked {
-        admission: crate::network_replay::NetworkFdMutationAdmission,
+        admission: Box<crate::network_replay::NetworkFdMutationAdmission>,
         marker: Option<crate::scheduler::UninvokedWaitCall>,
     },
     Failed {

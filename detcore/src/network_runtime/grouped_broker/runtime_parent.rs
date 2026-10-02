@@ -218,12 +218,12 @@ impl GroupedParentOwner {
         }
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refusal.is_none() {
+        if let Err(error) = &result
+            && self.refusal.is_none()
+        {
                 self.refusal = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     fn run_fields(&self) -> io::Result<(String, u64, u64)> {
@@ -503,9 +503,11 @@ impl GroupedParentOwner {
             owner_nonce,
             self.helper.clone(),
             owner_args,
-            input,
-            common::duplicate(self.directories[5].as_fd())?,
-            common::duplicate(self.image.as_ref().unwrap().as_fd())?,
+            (
+                input,
+                common::duplicate(self.directories[5].as_fd())?,
+                common::duplicate(self.image.as_ref().unwrap().as_fd())?,
+            ),
             deadline,
             native,
         ));

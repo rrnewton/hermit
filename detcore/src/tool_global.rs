@@ -15,6 +15,7 @@ mod original_connect;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
+#[cfg(test)]
 pub(crate) use foreground_store::ReceiveRetryFailure;
 pub(crate) use foreground_store::SavedReceivePolicy;
 mod original_installation;
@@ -1792,10 +1793,9 @@ impl GlobalTool for GlobalState {
                         let birth = sched.thread_tree.prepare_no_seq_birth(
                             owner,
                             *process,
-                            crate::resources::ExternalOpId::new(dtid, *syscall_count),
-                            *flags,
+                            crate::resources::ExternalOpId::new(dtid, *syscall_count), (*flags,
                             *child_tid_addr,
-                            *exit_signal,
+                            *exit_signal),
                             *priority_entropy,
                             *fd_permit,
                         );
@@ -1875,7 +1875,7 @@ impl GlobalTool for GlobalState {
                         use crate::network_runtime::native_birth::NativeBirthCleanupRequest;
                         let retained = runtime.retain_native_birth_cleanup(
                             NativeBirthCleanupRequest::Uninvoked {
-                                admission: admission.clone(),
+                                admission: Box::new(admission.clone()),
                                 marker: uninvoked.clone(),
                             },
                             self.native_birth_cleanup_recovery()
@@ -1909,8 +1909,7 @@ impl GlobalTool for GlobalState {
                 if retired
                     && let Some(admission) = uninvoked_fd_clone
                     && let Some(runtime) = &self.network_runtime
-                {
-                    if runtime
+                    && runtime
                         .native_birth_semantics_consumed(admission.publication.permit, None, true)
                         .is_err()
                     {
@@ -1921,7 +1920,6 @@ impl GlobalTool for GlobalState {
                         });
                         return (None, R::NoSeqBirthOwnerGone(false));
                     }
-                }
                 return (None, R::NoSeqBirthOwnerGone(retired));
             };
             let retired = runtime.wait_native_birth_cleanup(&cleanup).await.is_ok();
@@ -3579,9 +3577,8 @@ impl GlobalState {
                     owner,
                     process,
                     crate::resources::ExternalOpId::new(owner.thread, state.stats.syscall_count),
-                    state.pending_no_seq_birth.as_ref(),
-                    nr,
-                    args,
+                    state.pending_no_seq_birth.as_ref(), (nr,
+                    args),
                     event,
                 )
         };
@@ -4042,14 +4039,13 @@ impl GlobalState {
                 return SchedulerRpcResult::ThreadExited;
             }
 
-            if let Some(birth) = &inherited_birth {
-                if sender != child_dettid
+            if let Some(birth) = &inherited_birth
+                && (sender != child_dettid
                     || (self.cfg.sequentialize_threads && !birth.native_required)
-                    || !sched.thread_tree.check_no_seq_birth(birth, child_dettid)
+                    || !sched.thread_tree.check_no_seq_birth(birth, child_dettid))
                 {
                     return SchedulerRpcResult::ThreadExited;
                 }
-            }
 
             let native = inherited_birth
                 .as_ref()
@@ -4272,8 +4268,7 @@ impl GlobalState {
         self.exec_preparation_changed.notify_waiters();
         if let Some(proof) = native_child_consumed
             && let Some(runtime) = &self.network_runtime
-        {
-            if proof
+            && proof
                 .and_then(|proof| runtime.native_child_semantics_consumed(&proof))
                 .is_err()
             {
@@ -4284,7 +4279,6 @@ impl GlobalState {
                 });
                 return SchedulerRpcResult::ThreadExited;
             }
-        }
         // The child queue position above determines which equal-priority side
         // gets the first turn when the parent requests ParentContinue.
         // A vfork parent is already blocked by the kernel and is not in the run
@@ -5478,8 +5472,7 @@ impl GlobalState {
                         ..
                     },
                 ) = &request
-                {
-                    if sched.registered_process(owner.thread) != Some(receipt.process)
+                    && (sched.registered_process(owner.thread) != Some(receipt.process)
                         || receipt.caller != owner.thread
                         || receipt.mm != owner.mm
                         || !self
@@ -5487,13 +5480,12 @@ impl GlobalState {
                             .lock()
                             .unwrap()
                             .get(&receipt.process)
-                            .is_some_and(|pending| pending.receipt == *receipt)
+                            .is_some_and(|pending| pending.receipt == *receipt))
                     {
                         return GlobalResponse::Network(Err(NetworkRpcError::internal(
                             "exec mutation lacks the current authenticated preparation",
                         )));
                     }
-                }
                 // The borrowed proof stays inside this scheduler guard through
                 // metadata -> engine admission. NoSeq deliberately has no turn.
                 let ordinary = if matches!(&request, NetworkRequest::BeginOrdinaryFdRead { .. })
@@ -5558,8 +5550,8 @@ impl GlobalState {
                         "network engine mutex was poisoned",
                     )));
                 };
-                if let Some(files) = metadata_files {
-                    if let Err(error) = engine.validate_fd_metadata(
+                if let Some(files) = metadata_files
+                    && let Err(error) = engine.validate_fd_metadata(
                         owner,
                         files,
                         metadata.as_ref().expect("reader metadata"),
@@ -5569,20 +5561,17 @@ impl GlobalState {
                             error.to_string(),
                         )));
                     }
-                }
                 let observed_at = self.global_time.lock().unwrap().as_nanos();
                 // Shared child creation becomes eligible before an inheritable
                 // guest mutation can commit at this logical cut. No accepter is
                 // selected by this release and unrelated channels never gate it.
                 if engine.accepted_mode()
                     && engine.mode() == crate::network_replay::NetworkEngineMode::Replay
-                {
-                    if let Err(error) = engine.release_eligible(observed_at) {
+                    && let Err(error) = engine.release_eligible(observed_at) {
                         return GlobalResponse::Network(Err(NetworkRpcError::internal(
                             error.to_string(),
                         )));
                     }
-                }
                 let result = match &request {
                     NetworkRequest::FdMutation(request) => engine
                         .recv_fd_mutation(owner, request.clone())
@@ -5831,15 +5820,14 @@ impl GlobalState {
                     } => engine
                         .reserve_stream_call_chunk(owner, *call, *maximum, *peek_offset)
                         .and_then(|chunk| {
-                            if let NetworkStreamChunk::Reserved { lease, .. } = &chunk {
-                                if let Some(runtime) = &self.network_runtime {
+                            if let NetworkStreamChunk::Reserved { lease, .. } = &chunk
+                                && let Some(runtime) = &self.network_runtime {
                                     runtime
                                         .bind_native_stream_lease(owner, *call, *lease)
                                         .map_err(|_| {
                                             NetworkReplayError::UnresolvedStreamOperation(*lease)
                                         })?;
                                 }
-                            }
                             Ok(NetworkReply::StreamChunk(chunk))
                         }),
                     NetworkRequest::ZeroStreamReceive { call, peek_offset } => engine
@@ -6026,7 +6014,7 @@ impl GlobalState {
                 engine.validate_fd_metadata(publisher, mutation.publication.permit.files, &actual, &metadata)?;
                 if mutation.publication.recovery.is_some() {
                     let binding = engine.recover_terminal_allocator_publication(original, admission,
-                        publisher, &mutation, receipt, &actual, &mut metadata)?;
+                        publisher, &mutation, receipt, (&actual, &mut metadata))?;
                     engine.original_allocator_publication_finished(original, admission,
                         mutation.publication.permit)?;
                     return Ok(binding);
@@ -6048,18 +6036,16 @@ impl GlobalState {
                         &bound, &actual, &mut metadata, now)?
                 } else if let Some(opened) = profile.opened {
                     engine.publish_original_openat_installation(publisher, &mutation.publication,
-                        &bound, &actual, &mut metadata, opened, stat, now)?
+                        &bound, (&actual, &mut metadata), (opened, stat), now)?
                 } else {
-                    if let Some(fresh) = &profile.fresh {
-                        if engine.accepted_mode() {
+                    if let Some(fresh) = &profile.fresh
+                        && engine.accepted_mode() {
                             engine.register_accepted_fresh_send(fresh.key,
                                 fresh.observed_profile.as_ref().map(|_| detcore_model::network_trace::ReceiveTimeoutV3::Infinite))?;
                         }
-                    }
                     engine.publish_original_installation(publisher, &mutation.publication,
-                        &bound, &actual, &mut metadata,
-                        crate::network_replay::original_installation::socket_installation_flags(
-                            admission.arguments.address as u32 as i32), stat, profile.fresh, now)?
+                        &bound, (&actual, &mut metadata), (crate::network_replay::original_installation::socket_installation_flags(
+                            admission.arguments.address as u32 as i32), stat, profile.fresh), now)?
                 };
                 engine.original_allocator_publication_finished(original, admission,
                     mutation.publication.permit)?;
@@ -7063,7 +7049,7 @@ pub enum NetworkReply {
     /// Existing Call admission for the actual original Connect invocation.
     OriginalConnectAdmission(crate::network_replay::original_connect::Admission),
     /// Retained final observation, authenticated against the backend raw return.
-    OriginalConnectOutcome(crate::network_runtime::original_connect::Outcome),
+    OriginalConnectOutcome(Box<crate::network_runtime::original_connect::Outcome>),
     /// Known acquisition failure; no physical pin or semantic call survives.
     NativeStreamPinFailed(i32),
     /// Retained raw result and exact bytes from an original-OFD operation.
@@ -9762,6 +9748,7 @@ mod tests {
             else {
                 panic!("clone admission")
             };
+            let admission = *admission;
             engine
                 .submit_fd_mutation(owner, admission.publication.permit)
                 .unwrap();
@@ -9875,11 +9862,21 @@ mod tests {
                     // Actual reply is retained while the real common consumer
                     // waits for its usual scheduler mutex. Dropping Global
                     // cannot drop the driver's validated continuation.
-                    let sched = state.sched.lock().unwrap();
+                    let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+                    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+                    let scheduler = state.sched.clone();
+                    let holder = std::thread::spawn(move || {
+                        let _scheduler = scheduler.lock().unwrap();
+                        acquired_tx.send(()).unwrap();
+                        // A dropped sender also releases the lock on test unwind.
+                        let _ = release_rx.recv();
+                    });
+                    acquired_rx.recv().unwrap();
                     peer.finish_reply(false);
                     peer.wait_reply_retained().await;
                     drop(future);
-                    drop(sched);
+                    release_tx.send(()).unwrap();
+                    holder.join().unwrap();
                     peer.receive_retirement().await;
                 } else {
                     peer.finish_reply(false);
@@ -10776,7 +10773,7 @@ mod tests {
             .unwrap(),
             NetworkReply::FdMutation(P::Unit)
         );
-        a
+        *a
     }
 
     #[tokio::test]
@@ -12663,6 +12660,7 @@ mod tests {
         else {
             panic!("missing original selected grant")
         };
+        let read = *read;
         let current = metadata.lock().unwrap().descriptor_binding(7).unwrap();
         assert_ne!(current, original);
         assert_eq!(read.binding, Some(current));
@@ -12763,6 +12761,7 @@ mod tests {
                 let SchedResponse::GoFdRead(_, read) = response.try_read().unwrap() else {
                     panic!("missing grant")
                 };
+                let read = *read;
                 // Observer reads the durable response, but the Guest future is
                 // dropped here without polling or receiving that response.
                 read
@@ -12869,6 +12868,7 @@ mod tests {
         let ResourceReply::ReadGrant { read, .. } = first else {
             panic!("missing first grant")
         };
+        let read = *read;
         let admission = {
             let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
             let admission = engine
@@ -13005,6 +13005,7 @@ mod tests {
         let ResourceReply::ReadGrant { read, .. } = second else {
             panic!("missing peer grant")
         };
+        let read = *read;
         assert_eq!(read.publication.permit.owner, peer_owner);
         assert_eq!(
             state
@@ -13065,6 +13066,7 @@ mod tests {
         let ResourceReply::ReadGrant { read, .. } = first else {
             panic!("missing first grant")
         };
+        let read = *read;
         let admission = {
             let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
             let admission = engine
@@ -13224,6 +13226,7 @@ mod tests {
         let ResourceReply::ReadGrant { read, .. } = second else {
             panic!("missing peer grant")
         };
+        let read = *read;
         assert_eq!(read.publication.permit.owner, peer_owner);
         assert_eq!(
             state
@@ -13512,6 +13515,7 @@ mod tests {
         else {
             panic!("reader was not admitted")
         };
+        let read = *read;
         assert!(read.binding.is_none() && read.control.is_none());
         let mut pending = std::pin::pin!(stream_rpc(
             &state,
@@ -13531,6 +13535,7 @@ mod tests {
         else {
             panic!("successor was not admitted")
         };
+        let next = *next;
         assert_eq!(next.publication.permit.owner, peer);
         assert_ne!(next.publication.permit.lease, read.publication.permit.lease);
         assert_eq!(
@@ -13984,7 +13989,7 @@ mod tests {
         unsafe { libc::FD_SET(7, &mut readfds) };
         let call = reverie::syscalls::Select::new()
             .with_nfds(8)
-            .with_readfds(reverie::syscalls::AddrMut::from_ptr(&mut readfds))
+            .with_readfds(reverie::syscalls::AddrMut::from_ptr(std::ptr::addr_of_mut!(readfds)))
             .with_writefds(None)
             .with_exceptfds(None)
             .with_timeout(None);
@@ -14013,7 +14018,7 @@ mod tests {
         let mut byte = 0u8;
         let call = reverie::syscalls::Recvfrom::new()
             .with_fd(7)
-            .with_buf(reverie::syscalls::AddrMut::from_ptr(&mut byte))
+            .with_buf(reverie::syscalls::AddrMut::from_ptr(std::ptr::addr_of_mut!(byte)))
             .with_len(1)
             .with_flags(0);
         let mut pending = std::pin::pin!(tool.handle_network_io(&mut guest, call.into()));
@@ -14221,35 +14226,36 @@ mod tests {
             assert_eq!(state.global_time.lock().unwrap().as_nanos(), clock);
             assert_eq!(guest.thread.thread_logical_time.as_nanos(), local);
             assert_eq!(guest.thread.stats.syscall_count, count);
-            let requests = guest.requests.lock().unwrap();
-            assert!(requests.iter().all(|r| !matches!(
-                r,
-                GlobalRequest::RequestResources(..) | GlobalRequest::ParkedRequest(..)
-            )));
-            assert_eq!(
-                requests
-                    .iter()
-                    .filter(|r| matches!(
-                        r,
-                        GlobalRequest::Network(NetworkRequest::BeginEmulatedReadFromRead { .. })
-                    ))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                requests
-                    .iter()
-                    .filter(|r| matches!(
-                        r,
-                        GlobalRequest::Network(NetworkRequest::CompleteEmulatedRead {
-                            returned: 24,
-                            ..
-                        })
-                    ))
-                    .count(),
-                1
-            );
-            drop(requests);
+            {
+                let requests = guest.requests.lock().unwrap();
+                assert!(requests.iter().all(|r| !matches!(
+                    r,
+                    GlobalRequest::RequestResources(..) | GlobalRequest::ParkedRequest(..)
+                )));
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| matches!(
+                            r,
+                            GlobalRequest::Network(NetworkRequest::BeginEmulatedReadFromRead { .. })
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| matches!(
+                            r,
+                            GlobalRequest::Network(NetworkRequest::CompleteEmulatedRead {
+                                returned: 24,
+                                ..
+                            })
+                        ))
+                        .count(),
+                    1
+                );
+            }
             // Compare the actual legacy data mover at offset zero, not a
             // separately implemented random stream or expected native receipt.
             let mut legacy = owned_read_guest(
@@ -14660,6 +14666,7 @@ mod tests {
         else {
             panic!("missing actual external Read grant")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         assert_eq!(read.external_grant, Some(operation));
         {
@@ -18359,6 +18366,7 @@ mod tests {
                 else {
                     panic!("clone admitted");
                 };
+                let admission = *admission;
                 engine
                     .submit_fd_mutation(owner, admission.publication.permit)
                     .unwrap();
@@ -19263,13 +19271,14 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
-            assert!(
-                engine.cancel_uninvoked_clone_admission(&admission).is_err(),
-                "exact admission already consumed"
-            );
-            engine.finish_fd_mutations().unwrap();
-            drop(engine);
+            {
+                let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+                assert!(
+                    engine.cancel_uninvoked_clone_admission(&admission).is_err(),
+                    "exact admission already consumed"
+                );
+                engine.finish_fd_mutations().unwrap();
+            }
             assert_eq!(
                 state
                     .sched
@@ -19349,6 +19358,7 @@ mod tests {
             else {
                 panic!("admitted");
             };
+            let admission = *admission;
             engine
                 .submit_fd_mutation(first, admission.publication.permit)
                 .unwrap();
@@ -19773,7 +19783,7 @@ mod tests {
                 Tid::from_raw(child.as_raw()),
                 &state,
                 &mut child_local,
-                status.clone(),
+                status,
             );
             assert!(!state.sched.lock().unwrap().backend_failed());
             assert!(wakes.0.load(std::sync::atomic::Ordering::SeqCst) > before);

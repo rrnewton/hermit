@@ -17,6 +17,7 @@ use super::Stage;
 
 #[derive(Debug)]
 #[must_use = "retain original parent/query custody until joined cleanup"]
+#[expect(dead_code, reason = "Legacy failed-parent retirement is not constructed by the maintained entry")]
 pub(in super::super) struct ParentFailedRetirement {
     parent: ParentLaunchCustody,
     source_failure: Option<Failure>,
@@ -36,12 +37,14 @@ pub(in super::super) struct ParentFailedRetirement {
 /// Private construction follows actual retained terminal/unlinked/manager/wait
 /// checks. The borrowed owners cannot be released or replaced while it exists.
 /// This proof is consumed immediately by one failed-unit query start.
+#[expect(dead_code, reason = "Legacy failed-parent proof remains private and unissued")]
 pub(in super::super) struct ParentFailedUnitProof<'a> {
     parent: &'a ParentLaunchCustody,
     snapshot: &'a owner::ManagerSnapshot,
     deadline: Instant,
     status: i32,
 }
+#[expect(dead_code, reason = "Legacy failed-parent proof remains private and unissued")]
 impl ParentFailedUnitProof<'_> {
     pub(in super::super) fn unit(&self) -> &str {
         &self.parent.unit
@@ -63,6 +66,7 @@ impl ParentFailedUnitProof<'_> {
         owner::check_parent_failed_launcher(&self.parent.source_launcher, self.status)
     }
 }
+#[expect(dead_code, reason = "Preserve checked legacy transitions without claiming maintained-path integration")]
 impl ParentFailedRetirement {
     pub fn retain(parent: ParentLaunchCustody) -> Self {
         Self {

@@ -21,6 +21,7 @@ use crate::network_replay::accepted::ChildCreationCertificate;
 
 #[derive(Debug, Clone)]
 enum Read {
+    #[cfg(test)]
     Status,
     Creation(u32),
 }
@@ -116,8 +117,15 @@ impl Creations {
         let ordinal = u32::try_from(self.next_creation)
             .map_err(|_| io::Error::other("provider creation sequence overflow"))?;
         let pending = self.prepare(owner, Read::Creation(ordinal))?;
-        let Read::Creation(ordinal) = pending.read else {
-            return Err(io::Error::other("unexpected legacy observation request"));
+        #[cfg(not(test))]
+        let Read::Creation(ordinal) = pending.read;
+        #[cfg(test)]
+        let ordinal = match pending.read {
+            Read::Creation(ordinal) => ordinal,
+            #[cfg(test)]
+            Read::Status => {
+                return Err(io::Error::other("unexpected legacy observation request"));
+            }
         };
         let request = Request::AwaitCreation {
             sequence: ordinal,
@@ -288,9 +296,6 @@ impl ObservedCreation {
     }
     pub(crate) fn cookie(&self) -> u64 {
         self.raw.cookie_at_creation
-    }
-    pub(crate) fn sequence(&self) -> u64 {
-        self.raw.sequence
     }
     pub(crate) fn listener(&self) -> AcceptedPhysicalIdentity {
         AcceptedPhysicalIdentity {
@@ -597,8 +602,10 @@ mod tests {
     #[tokio::test]
     async fn accepted_creation_publication_cancellation_and_exact_ack_are_distinct() {
         let (_, evidence) = fixture();
-        let mut state = Creations::default();
-        state.ready = Some(evidence.clone());
+        let state = Creations {
+            ready: Some(evidence.clone()),
+            ..Creations::default()
+        };
         let shared = tokio::sync::Mutex::new(state);
         let guard = shared.lock().await;
         drop(Publication {
@@ -619,9 +626,11 @@ mod tests {
     #[test]
     fn accepted_observer_publication_is_required_before_transport_retirement() {
         let (_, evidence) = fixture();
-        let mut cursor = Creations::default();
-        cursor.ready = Some(evidence.clone());
-        cursor.ready_request = Some((1, 7, b"exact reply".to_vec()));
+        let mut cursor = Creations {
+            ready: Some(evidence.clone()),
+            ready_request: Some((1, 7, b"exact reply".to_vec())),
+            ..Creations::default()
+        };
         let mut bad = evidence.clone();
         bad.raw.sequence += 1;
         assert!(cursor.acknowledge(&bad).is_err());

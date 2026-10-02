@@ -150,7 +150,7 @@ pub enum SchedResponse {
     /// Same selected turn with short table/OFD custody for consuming transfer.
     GoFdRead(
         Option<SchedValue>,
-        crate::network_replay::NetworkFdReadAdmission,
+        Box<crate::network_replay::NetworkFdReadAdmission>,
     ),
 
     /// The guest was interupted by a signal while waiting on the scheduler, and will now execute
@@ -1391,9 +1391,7 @@ impl ThreadTree {
         parent: crate::network_replay::NetworkStreamOwner,
         process: DetPid,
         operation: ExternalOpId,
-        flags: reverie::syscalls::CloneFlags,
-        child_tid_addr: usize,
-        exit_signal: libc::c_int,
+        (flags, child_tid_addr, exit_signal): (reverie::syscalls::CloneFlags, usize, libc::c_int),
         priority_entropy: Option<u64>,
         fd_permit: Option<crate::network_replay::NetworkFdPublicationPermit>,
     ) -> Option<NoSeqChildBirth> {
@@ -1531,11 +1529,9 @@ impl ThreadTree {
                         .get(&birth.process)
                         .and_then(|entry| entry.births.get(&(birth.operation, birth.parent.mm)))
                         .and_then(|state| state.birth.native_owner.as_ref())
-                    {
-                        if retained.settle_failure(&birth.request_identity()).is_err() {
+                        && retained.settle_failure(&birth.request_identity()).is_err() {
                             return false;
                         }
-                    }
                     self.process_wait
                         .get_mut(&birth.process)
                         .unwrap()
@@ -1614,11 +1610,11 @@ impl ThreadTree {
         if !birth.submitted {
             return Err(std::io::Error::other("native rebind precedes submission"));
         }
-        if let Some(child) = birth.child {
-            if owner.outcome()?.child().thread != child {
+        if let Some(child) = birth.child
+            && owner.outcome()?.child().thread != child
+        {
                 return Err(std::io::Error::other("native rebind changed actual child"));
             }
-        }
         birth.native_owner = Some(owner);
         birth.native_required = true;
         Ok(())
@@ -2024,11 +2020,9 @@ impl ThreadTree {
             .birth
             .native_owner
             .as_ref()
-        {
-            if owner.settle_failure(&birth.request_identity()).is_err() {
+            && owner.settle_failure(&birth.request_identity()).is_err() {
                 return false;
             }
-        }
         entry.births.remove(&(birth.operation, birth.parent.mm));
         self.prune_reaped_birth_entry(birth.process);
         true
@@ -2170,8 +2164,7 @@ impl ThreadTree {
         process: DetPid,
         operation: ExternalOpId,
         birth: Option<&NoSeqChildBirth>,
-        nr: reverie::syscalls::Sysno,
-        args: reverie::syscalls::SyscallArgs,
+        (nr, args): (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs),
         event: reverie::InjectedSyscallEvent,
     ) -> Result<(), &'static str> {
         use reverie::InjectedSyscallEvent as Event;
@@ -2987,7 +2980,7 @@ pub(crate) async fn finish_selected_turn(
                         .get_mut(&next_dtid)
                         .expect("selected transport")
                         .protocol
-                        .fd_read = read;
+                        .fd_read = read.map(|read| *read);
                     // Keep the old request and both commit paths. External IO
                     // unblocks in step4, so admission must precede that step.
                     mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
@@ -6900,7 +6893,7 @@ impl Scheduler {
                 .map(LogicalTime::as_nanos)
                 .map(SchedValue::Value);
             match read {
-                Some(read) => SchedResponse::GoFdRead(as_schedvalue, read),
+                Some(read) => SchedResponse::GoFdRead(as_schedvalue, Box::new(read)),
                 None => SchedResponse::Go(as_schedvalue),
             }
         };
@@ -13024,10 +13017,9 @@ mod test {
             .prepare_no_seq_birth(
                 owner,
                 parent,
-                ExternalOpId::new(parent, 3),
-                CloneFlags::empty(),
+                ExternalOpId::new(parent, 3), (CloneFlags::empty(),
                 0,
-                libc::SIGCHLD,
+                libc::SIGCHLD),
                 None,
                 None,
             )
@@ -13052,9 +13044,8 @@ mod test {
                     owner,
                     birth.process,
                     birth.operation,
-                    Some(&birth),
-                    Sysno::clone,
-                    args,
+                    Some(&birth), (Sysno::clone,
+                    args),
                     Event::ChildCreated(child_tid),
                 )
                 .unwrap();
@@ -13065,9 +13056,8 @@ mod test {
                         owner,
                         birth.process,
                         birth.operation,
-                        Some(&birth),
-                        Sysno::clone,
-                        args,
+                        Some(&birth), (Sysno::clone,
+                        args),
                         Event::ChildSyscallReturned {
                             child: child_tid,
                             raw: 62,
@@ -13107,9 +13097,8 @@ mod test {
                     owner,
                     birth.process,
                     birth.operation,
-                    Some(&birth),
-                    Sysno::clone,
-                    args,
+                    Some(&birth), (Sysno::clone,
+                    args),
                     valid
                 )
                 .is_err()
@@ -13120,9 +13109,8 @@ mod test {
                 owner,
                 birth.process,
                 birth.operation,
-                Some(&birth),
-                Sysno::clone,
-                args,
+                Some(&birth), (Sysno::clone,
+                args),
                 Event::ChildCreated(child),
             )
             .unwrap();
@@ -13144,9 +13132,8 @@ mod test {
                         owner,
                         birth.process,
                         birth.operation,
-                        Some(&birth),
-                        Sysno::clone,
-                        args,
+                        Some(&birth), (Sysno::clone,
+                        args),
                         event
                     )
                     .is_err()
@@ -13164,9 +13151,8 @@ mod test {
                     owner,
                     birth.process,
                     ExternalOpId::new(owner.thread, birth.operation.sequence + 1),
-                    Some(&birth),
-                    Sysno::clone,
-                    args,
+                    Some(&birth), (Sysno::clone,
+                    args),
                     valid
                 )
                 .is_err()
@@ -13177,9 +13163,8 @@ mod test {
                 owner,
                 birth.process,
                 birth.operation,
-                Some(&birth),
-                Sysno::clone,
-                args,
+                Some(&birth), (Sysno::clone,
+                args),
                 valid,
             )
             .unwrap();
@@ -13190,9 +13175,8 @@ mod test {
                     owner,
                     birth.process,
                     birth.operation,
-                    Some(&birth),
-                    Sysno::clone,
-                    args,
+                    Some(&birth), (Sysno::clone,
+                    args),
                     valid
                 )
                 .is_err()
@@ -13233,10 +13217,9 @@ mod test {
             .prepare_no_seq_birth(
                 owner,
                 parent,
-                ExternalOpId::new(parent, 3),
-                CloneFlags::CLONE_PARENT,
+                ExternalOpId::new(parent, 3), (CloneFlags::CLONE_PARENT,
                 0,
-                libc::SIGCHLD,
+                libc::SIGCHLD),
                 None,
                 None,
             )
@@ -13265,9 +13248,8 @@ mod test {
                 owner,
                 parent,
                 ExternalOpId::new(parent, 3),
-                Some(&birth),
-                nr,
-                args,
+                Some(&birth), (nr,
+                args),
                 reverie::InjectedSyscallEvent::ChildCreated(reverie::Tid::from_raw(child.as_raw())),
             )
             .unwrap();
@@ -13325,10 +13307,9 @@ mod test {
                     mm: local.mm_id,
                 },
                 parent,
-                ExternalOpId::new(parent, 3),
-                CloneFlags::CLONE_PARENT,
+                ExternalOpId::new(parent, 3), (CloneFlags::CLONE_PARENT,
                 0,
-                libc::SIGCHLD,
+                libc::SIGCHLD),
                 None,
                 None,
             )
@@ -13407,10 +13388,9 @@ mod test {
             .prepare_no_seq_birth(
                 owner,
                 parent,
-                ExternalOpId::new(parent, 5),
-                CloneFlags::empty(),
+                ExternalOpId::new(parent, 5), (CloneFlags::empty(),
                 0,
-                libc::SIGCHLD,
+                libc::SIGCHLD),
                 None,
                 None,
             )
@@ -13434,10 +13414,9 @@ mod test {
             tree.prepare_no_seq_birth(
                 owner,
                 parent,
-                ExternalOpId::new(parent, 5),
-                CloneFlags::empty(),
+                ExternalOpId::new(parent, 5), (CloneFlags::empty(),
                 0,
-                libc::SIGCHLD,
+                libc::SIGCHLD),
                 None,
                 None
             )
@@ -13460,10 +13439,9 @@ mod test {
             .prepare_no_seq_birth(
                 owner,
                 parent,
-                ExternalOpId::new(parent, 1),
-                CloneFlags::empty(),
+                ExternalOpId::new(parent, 1), (CloneFlags::empty(),
                 0,
-                libc::SIGCHLD,
+                libc::SIGCHLD),
                 None,
                 None,
             )
@@ -13499,10 +13477,9 @@ mod test {
                 .prepare_no_seq_birth(
                     owner,
                     parent,
-                    ExternalOpId::new(parent, 1),
-                    CloneFlags::empty(),
+                    ExternalOpId::new(parent, 1), (CloneFlags::empty(),
                     0,
-                    libc::SIGCHLD,
+                    libc::SIGCHLD),
                     None,
                     None,
                 )
@@ -13532,10 +13509,9 @@ mod test {
                 .prepare_no_seq_birth(
                     owner,
                     parent,
-                    ExternalOpId::new(parent, 1),
-                    CloneFlags::empty(),
+                    ExternalOpId::new(parent, 1), (CloneFlags::empty(),
                     0,
-                    libc::SIGCHLD,
+                    libc::SIGCHLD),
                     None,
                     None,
                 )
@@ -13595,10 +13571,9 @@ mod test {
                 tree.prepare_no_seq_birth(
                     birth_owner,
                     parent,
-                    ExternalOpId::new(parent, 2),
-                    CloneFlags::empty(),
+                    ExternalOpId::new(parent, 2), (CloneFlags::empty(),
                     0,
-                    libc::SIGCHLD,
+                    libc::SIGCHLD),
                     None,
                     None
                 )
@@ -13625,10 +13600,9 @@ mod test {
                 tree.prepare_no_seq_birth(
                     birth_owner,
                     parent,
-                    ExternalOpId::new(parent, 2),
-                    CloneFlags::empty(),
+                    ExternalOpId::new(parent, 2), (CloneFlags::empty(),
                     0,
-                    libc::SIGCHLD,
+                    libc::SIGCHLD),
                     None,
                     None
                 )
@@ -13675,10 +13649,9 @@ mod test {
                 .prepare_no_seq_birth(
                     birth_owner,
                     parent,
-                    ExternalOpId::new(parent, 2),
-                    CloneFlags::CLONE_PARENT,
+                    ExternalOpId::new(parent, 2), (CloneFlags::CLONE_PARENT,
                     0,
-                    libc::SIGCHLD,
+                    libc::SIGCHLD),
                     None,
                     None,
                 )
@@ -13775,10 +13748,9 @@ pub(crate) fn synthetic_common_birth(
         .prepare_no_seq_birth(
             admission.permit().owner,
             parent,
-            ExternalOpId::new(parent, 3),
-            requested,
+            ExternalOpId::new(parent, 3), (requested,
             0x1111,
-            17,
+            17),
             Some(91),
             Some(admission.permit()),
         )

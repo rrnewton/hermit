@@ -18,7 +18,8 @@ struct Fixture {
     engine: Arc<Mutex<NetworkReplayEngine>>,
     call: NetworkStreamCallId,
     lease: NetworkStreamLeaseId,
-    effect: NetworkStreamPhysicalEffect,
+    // Retain the exact physical effect and its original lifetime/drop order.
+    _effect: NetworkStreamPhysicalEffect,
     observed: native_peer::Observation,
 }
 impl Fixture {
@@ -71,7 +72,7 @@ impl Fixture {
             engine,
             call,
             lease,
-            effect,
+            _effect: effect,
             observed,
         }
     }
@@ -222,7 +223,7 @@ async fn copy_exclusion_requires_actual_runtime_root_join_confirmation_publicati
         let mut root = f.root.clone();
         let mut keep_foreign = None;
         match variant {
-            0 | 1 | 2 => {}
+            0..=2 => {}
             3 => {
                 let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
                 let other = super::super::controlled_foreground_runtime(tid);

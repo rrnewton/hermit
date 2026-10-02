@@ -72,7 +72,8 @@ struct CloseRow {
 
 #[derive(Debug)]
 struct SnapshotRow {
-    fd: i32,
+    // Keep the original observation identity alongside its read results.
+    _fd: i32,
     rewind: Option<(i64, Option<i32>)>,
     reads: Vec<(isize, Option<i32>)>,
     bytes: Vec<u8>,
@@ -169,7 +170,7 @@ fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<wire::Credentials> {
     })
 }
 
-fn bytes32(value: &Value) -> io::Result<[u8; 32]> {
+fn bytes32(value: &Value) -> io::Result<[u8; 32]>{
     let text = value
         .as_str()
         .ok_or_else(|| io::Error::other("runtime library digest missing"))?;
@@ -181,7 +182,7 @@ fn bytes32(value: &Value) -> io::Result<[u8; 32]> {
         "runtime library digest malformed",
     )?;
     let mut result = [0; 32];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         result[index] =
             u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).map_err(io::Error::other)?;
     }
@@ -202,7 +203,7 @@ fn decode_line(value: &Value) -> io::Result<Vec<u8>> {
         "runtime removal line exceeds original exact bound",
     )?;
     text.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|pair| {
             u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).map_err(io::Error::other)
         })
@@ -1002,7 +1003,7 @@ impl RuntimeKeeper {
         )?;
         let retained = self.snapshots.len();
         self.snapshots.push(SnapshotRow {
-            fd,
+            _fd: fd,
             rewind: None,
             reads: Vec::new(),
             bytes: Vec::new(),
@@ -1462,6 +1463,12 @@ impl RuntimeKeeper {
 /// Private actual helper entry. Caller supplies the authenticated CLI bootstrap
 /// endpoint and original startup deadline. No JSON/boolean constructor can mint
 /// the source, cursor or runtime cleanup owner used above.
+///
+/// # Safety
+/// Invoke only as the dedicated authenticated helper process: this changes
+/// process-wide limits and subreaper state, then exits without unwinding.
+/// The caller must transfer the original bootstrap endpoint and must not
+/// depend on any other thread or Rust destructor running in this process.
 pub unsafe fn run_grouped_runtime_keeper_process(input: OwnedFd, run: [u8; 16], stage: u64) -> ! {
     let mut state = ManuallyDrop::new(RuntimeKeeper::retain(input, run, stage));
     let result = (|| {

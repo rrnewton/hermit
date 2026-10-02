@@ -287,8 +287,7 @@ impl Backend for Physical<'_> {
             .0
             .prepare_helper_receive(
                 pin.as_fd(),
-                call,
-                mm,
+                (call, mm),
                 fd,
                 address,
                 count,
@@ -322,8 +321,7 @@ impl Backend for Physical<'_> {
             }
             Kind::Openat => self.0.prepare_original_openat(
                 pidfd.as_fd(),
-                r.call,
-                r.mm,
+                (r.call, r.mm),
                 r.fd,
                 r.address,
                 r.length,
@@ -339,8 +337,7 @@ impl Backend for Physical<'_> {
             ),
             Kind::EpollCtl => self.0.prepare_original_epoll_ctl(
                 pidfd.as_fd(),
-                r.call,
-                r.mm,
+                (r.call, r.mm),
                 r.fd,
                 r.length,
                 r.original_count as u32 as i32,
@@ -1392,8 +1389,8 @@ impl Registrations {
                     if returned_command != command {
                         return Err(io::Error::other("provider finish returned another command"));
                     }
-                    if let Reply::OriginalEffect(observed) = &reply {
-                        if matches!(
+                    if let Reply::OriginalEffect(observed) = &reply
+                        && matches!(
                             original_kind,
                             Some(
                                 crate::network_replay::original_connect::Kind::Socket
@@ -1403,7 +1400,6 @@ impl Registrations {
                         ) {
                             receipt.last_allocator = Some(observed.raw.clone());
                         }
-                    }
                     receipt.active = None;
                 } else {
                     receipt.active.as_mut().unwrap().failed_finish = Some(envelope.sequence);

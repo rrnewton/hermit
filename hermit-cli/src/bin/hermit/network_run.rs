@@ -502,122 +502,20 @@ fn accepted_root_for_mode(
     }
 }
 
-/// Default policy and replay use the same Unix guard startup and terminal proof.
-pub(super) fn run(
-    container: &mut Container,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
-    mut execute: impl FnMut(Option<NetworkRuntimeResources>) -> Result<RunValue, Error>,
-) -> Result<RunValue, Error> {
-    run_owned(
-        container,
-        roots,
-        accepted_root,
-        true,
-        false,
-        "with_container",
-        None,
-        None,
-        None,
-        |resource, _| execute(resource),
-    )
-}
-/// Record retains live networking and authenticates original syscall observation.
-pub(super) fn run_record(
-    container: &mut Container,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
-    mut execute: impl FnMut(Option<NetworkRuntimeResources>) -> Result<RunValue, Error>,
-) -> Result<RunValue, Error> {
-    run_owned(
-        container,
-        roots,
-        accepted_root,
-        false,
-        true,
-        "with_container",
-        None,
-        None,
-        None,
-        |resource, _| execute(resource),
-    )
-}
-/// Replay needs original file-table authority and fail-closed network policy.
-/// The caller must also install the offline network namespace before clone.
-pub(super) fn run_replay(
-    container: &mut Container,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
-    mut execute: impl FnMut(Option<NetworkRuntimeResources>) -> Result<RunValue, Error>,
-) -> Result<RunValue, Error> {
-    run_owned(
-        container,
-        roots,
-        accepted_root,
-        true,
-        true,
-        "with_container",
-        None,
-        None,
-        None,
-        |resource, _| execute(resource),
-    )
-}
-pub(super) fn run_record_at(
-    container: &mut Container,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
-    site: &'static str,
-    mut execute: impl FnMut(Option<NetworkRuntimeResources>) -> Result<RunValue, Error>,
-) -> Result<RunValue, Error> {
-    run_owned(
-        container,
-        roots,
-        accepted_root,
-        false,
-        true,
-        site,
-        None,
-        None,
-        None,
-        |resource, _| execute(resource),
-    )
-}
-pub(super) fn run_replay_at(
-    container: &mut Container,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
-    site: &'static str,
-    listener: Option<std::net::TcpListener>,
-    execute: impl FnMut(
-        Option<NetworkRuntimeResources>,
-        Option<std::net::TcpListener>,
-    ) -> Result<RunValue, Error>,
-) -> Result<RunValue, Error> {
-    run_owned(
-        container,
-        roots,
-        accepted_root,
-        true,
-        true,
-        site,
-        listener,
-        None,
-        None,
-        execute,
-    )
-}
-
-fn run_owned_with_guards<G, F>(
-    container: &mut Container,
-    guards: G,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
+struct RunSettings<'a> {
+    roots: Option<(&'a Path, &'a Path)>,
+    accepted_root: Option<&'a Path>,
     use_guard: bool,
     use_accepted: bool,
     site: &'static str,
     listener: Option<std::net::TcpListener>,
     timeout: Option<Duration>,
+}
+
+fn run_owned_with_guards<G, F>(
+    container: &mut Container,
+    guards: G,
+    settings: RunSettings<'_>,
     work: F,
 ) -> Result<(RunValue, G), Error>
 where
@@ -634,13 +532,7 @@ where
     let backing: Option<Box<dyn Any>> = Some(Box::new(Rc::clone(&state)));
     let value = run_owned(
         container,
-        roots,
-        accepted_root,
-        use_guard,
-        use_accepted,
-        site,
-        listener,
-        timeout,
+        settings,
         backing,
         move |resource, listener| {
             let mut state = child_state.borrow_mut();
@@ -670,13 +562,10 @@ where
     run_owned_with_guards(
         container,
         guards,
-        roots,
-        accepted_root,
-        false,
-        true,
-        site,
-        None,
-        timeout,
+        RunSettings {
+            roots, accepted_root, use_guard: false, use_accepted: true,
+            site, listener: None, timeout,
+        },
         move |guards, resource, _| work(guards, resource),
     )
 }
@@ -687,8 +576,7 @@ pub(super) fn run_replay_at_owned<G, F>(
     roots: Option<(&Path, &Path)>,
     accepted_root: Option<&Path>,
     site: &'static str,
-    listener: Option<std::net::TcpListener>,
-    timeout: Option<Duration>,
+    control: (Option<std::net::TcpListener>, Option<Duration>),
     work: F,
 ) -> Result<(RunValue, G), Error>
 where
@@ -703,13 +591,10 @@ where
     run_owned_with_guards(
         container,
         guards,
-        roots,
-        accepted_root,
-        true,
-        true,
-        site,
-        listener,
-        timeout,
+        RunSettings {
+            roots, accepted_root, use_guard: true, use_accepted: true,
+            site, listener: control.0, timeout: control.1,
+        },
         work,
     )
 }
@@ -730,13 +615,10 @@ where
     run_owned_with_guards(
         container,
         guards,
-        roots,
-        accepted_root,
-        true,
-        false,
-        site,
-        None,
-        timeout,
+        RunSettings {
+            roots, accepted_root, use_guard: true, use_accepted: false,
+            site, listener: None, timeout,
+        },
         move |guards, resource, _| work(guards, resource),
     )
 }
@@ -848,9 +730,9 @@ impl AcceptedStartup {
     ) -> Option<Error> {
         use hermit::network_container::NetworkParentOwnership;
         let (service, error) = match parent {
-            Some(NetworkParentOwnership::Running(service)) => (Some(service), None),
+            Some(NetworkParentOwnership::Running(service)) => (Some(*service), None),
             Some(NetworkParentOwnership::StartupFailed(failure)) => (
-                Some(failure.owner),
+                Some(*failure.owner),
                 Some(Error::new(failure.error).context("accepted provider startup")),
             ),
             None => (None, None),
@@ -874,19 +756,22 @@ struct GuardFinalization {
 
 fn run_owned(
     container: &mut Container,
-    roots: Option<(&Path, &Path)>,
-    accepted_root: Option<&Path>,
-    use_guard: bool,
-    use_accepted: bool,
-    site: &'static str,
-    listener: Option<std::net::TcpListener>,
-    timeout: Option<Duration>,
+    settings: RunSettings<'_>,
     mut failed_backing: Option<Box<dyn Any>>,
     mut execute: impl FnMut(
         Option<NetworkRuntimeResources>,
         Option<std::net::TcpListener>,
     ) -> Result<RunValue, Error>,
 ) -> Result<RunValue, Error> {
+    let RunSettings {
+        roots,
+        accepted_root,
+        use_guard,
+        use_accepted,
+        site,
+        listener,
+        timeout,
+    } = settings;
     let debugger = ControllerDebugger(RefCell::new(listener));
     if FAILED.with(|slot| slot.borrow().is_some()) {
         return Err(refusal("earlier invocation retains unresolved ownership"));
@@ -919,13 +804,13 @@ fn run_owned(
     } else {
         None
     };
-    if let Some(startup) = accepted.as_mut() {
-        if let Err(error) = startup.prepare() {
+    if let Some(startup) = accepted.as_mut()
+        && let Err(error) = startup.prepare()
+    {
             let _ = startup.receipts.failure(&error.to_string());
             retain(None, None, accepted.take(), failed_backing.take());
             return Err(error);
         }
-    }
     let guard_preparation = (|| -> Result<_, Error> {
         let mut guard_context = None;
         let prepared = if let Some(roots) = guard_roots {
@@ -965,8 +850,7 @@ fn run_owned(
             let prepared = match unsafe {
                 prepare_guard(
                     &launch,
-                    stdout.as_fd(),
-                    stderr.as_fd(),
+                    (stdout.as_fd(), stderr.as_fd()),
                     package.object.try_clone()?,
                     roots.bpffs,
                     roots.recovery,
@@ -1141,7 +1025,7 @@ fn run_owned(
                     super::run_timeout::stall_the_unwind_if_asked();
                 }
                 let exit = super::owned_container::PublishedFailureExit::new(unresolved, alarm);
-                let result: Wire = result.map_err(SerializableError::from);
+                let result: Wire = result;
                 (result, (runtime_owner, exit))
             },
         )
@@ -1308,16 +1192,15 @@ fn finalize_owned(
         );
         return Err(primary.unwrap_or_else(|| Error::msg("network child terminal unknown")));
     }
-    if classify_actual_missing_terminal {
-        if let Some(status) = child_status {
-            if let Some(actual) = classify_missing_terminal(status) {
+    if classify_actual_missing_terminal
+        && let Some(status) = child_status
+        && let Some(actual) = classify_missing_terminal(status)
+    {
                 primary = Some(match primary.take() {
                     Some(error) => actual.context(error.to_string()),
                     None => actual,
                 });
             }
-        }
-    }
     let mut outcome = match primary {
         Some(error) => UnpublishedChildResult(Err(error)),
         None => match encoded {

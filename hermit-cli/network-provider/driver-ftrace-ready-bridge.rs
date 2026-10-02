@@ -10,22 +10,19 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+use driver_ftrace_process::DRIVER_FTRACE_IMPORT_FENCE;
+use driver_ftrace_process::LIMITS;
+use driver_ftrace_process::execute_stage;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 
-use super::{ProviderArtifact, ProviderReady};
-use super::super::{ProviderTopology, ProviderWireFormat};
-
-#[path = "driver-ftrace-inputs.rs"]
-mod driver_ftrace_inputs;
-#[path = "driver-ftrace-process.rs"]
-mod driver_ftrace_process;
-// Reuse the maintained supervisor verbatim. Its eight existing tests also
-// register in Detcore; they are separate from this one inventory coupling test.
-#[path = "process_group.rs"]
-mod process_group;
-
-use driver_ftrace_process::{DRIVER_FTRACE_IMPORT_FENCE, LIMITS, execute_stage};
+use super::super::ProviderTopology;
+use super::super::ProviderWireFormat;
+// Both C bridges share one maintained supervisor and its eight existing tests.
+use super::super::{driver_ftrace_inputs, driver_ftrace_process, process_group};
+use super::ProviderArtifact;
+use super::ProviderReady;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

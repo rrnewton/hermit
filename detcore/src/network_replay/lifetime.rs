@@ -67,11 +67,25 @@ pub(crate) struct NetworkSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LeaseKind {
     Transfer,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained lease model exercised by transport-cancellation controls"
+        )
+    )]
     Transport,
     /// Run-global stream-call allocator; distinct from syscall operation IDs.
     StreamCall,
     /// Run-global descriptor mutation allocator; distinct from stream calls.
     DescriptorMutation,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained lease model exercised by delivery-custody controls"
+        )
+    )]
     Delivery,
 }
 
@@ -114,6 +128,7 @@ pub(crate) enum LifetimeError {
     StaleTask(TaskOwner),
     TableAlreadyUsed(FilesId),
     InvalidDescriptor(RawFd),
+    #[cfg(test)]
     SlotOccupied(RawFd),
     SlotIdentity(RawFd),
     SlotGeneration(FdSlotBinding),
@@ -122,13 +137,20 @@ pub(crate) enum LifetimeError {
     LeaseIdentity(LeaseId),
     ExecAlreadyPrepared(DetPid),
     ExecIdentity,
+    #[cfg(test)]
     TransportAcknowledgementRequired(LeaseId),
     UnresolvedTransport(LeaseId),
     OutstandingOwners,
-    PublicationIdentity { files: FilesId, sequence: u64 },
+    PublicationIdentity {
+        files: FilesId,
+        sequence: u64,
+    },
     CloneIdentity,
     SelectionIdentity(LeaseId),
-    SelectionCapacity { files: FilesId, fd: RawFd },
+    SelectionCapacity {
+        files: FilesId,
+        fd: RawFd,
+    },
 }
 
 impl fmt::Display for LifetimeError {
@@ -199,7 +221,18 @@ pub(crate) enum SlotInstallationSource {
         kind: OriginalCreationKind,
     },
     Alias(FdSlotBinding),
+    #[expect(
+        dead_code,
+        reason = "no transfer publication issuer is integrated; preserve its modeled lease validation"
+    )]
     Transfer(LeaseId),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained non-network replacement model exercised by publication controls"
+        )
+    )]
     NonNetwork,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,15 +360,15 @@ impl NetworkLifetime {
                     return Err(error());
                 }
             }
-            if let Some(after) = change.after {
-                if after.binding.generation != change.installation_generation {
-                    return Err(error());
-                }
+            if let Some(after) = change.after
+                && after.binding.generation != change.installation_generation
+            {
+                return Err(error());
             }
-            if let Some(before) = change.before {
-                if before.binding.generation >= change.installation_generation {
-                    return Err(error());
-                }
+            if let Some(before) = change.before
+                && before.binding.generation >= change.installation_generation
+            {
+                return Err(error());
             }
             let actual = candidate.binding_in_table(files, fd);
             let expected = change.before.map(|value| value.binding);
@@ -639,6 +672,7 @@ impl NetworkLifetime {
 
     /// Publish one actual initial table. Inherited slots are installed through
     /// explicit open/transfer operations; this does not discover host fds.
+    #[cfg(test)]
     pub fn register(
         &mut self,
         owner: TaskOwner,
@@ -756,6 +790,7 @@ impl NetworkLifetime {
     }
 
     /// CLONE_FILES adds a task owner, not another copy of the table's slots.
+    #[cfg(test)]
     pub fn share_table(
         &mut self,
         parent: TaskOwner,
@@ -779,6 +814,7 @@ impl NetworkLifetime {
     }
 
     /// Fork copies slots for a new task while preserving OFD identity.
+    #[cfg(test)]
     pub fn copy_table(
         &mut self,
         parent: TaskOwner,
@@ -801,6 +837,7 @@ impl NetworkLifetime {
     }
 
     /// Publish a fresh OFD only after successful kernel creation.
+    #[cfg(test)]
     pub fn open(
         &mut self,
         owner: TaskOwner,
@@ -823,6 +860,7 @@ impl NetworkLifetime {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_cloexec(
         &mut self,
         owner: TaskOwner,
@@ -843,6 +881,7 @@ impl NetworkLifetime {
 
     /// A successful dup2(fd, fd) is a no-op, including FD_CLOEXEC. Callers must
     /// not publish failed dup/dup3 syscalls as successful mutations.
+    #[cfg(test)]
     pub fn duplicate(
         &mut self,
         owner: TaskOwner,
@@ -871,6 +910,7 @@ impl NetworkLifetime {
         Ok(self.collect_retired())
     }
 
+    #[cfg(test)]
     pub fn close(
         &mut self,
         owner: TaskOwner,
@@ -954,6 +994,7 @@ impl NetworkLifetime {
 
     // Existing transition entry points also allocate incarnations, so tests of
     // clone/exec/transfer exercise the same table state as authenticated adapters.
+    #[cfg(test)]
     fn install_generated(
         &mut self,
         files: FilesId,
@@ -978,6 +1019,7 @@ impl NetworkLifetime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_install(
         &self,
         owner: TaskOwner,
@@ -1028,6 +1070,7 @@ impl NetworkLifetime {
     /// Publish an actual successful socket creation under an authenticated
     /// table mutation receipt. A stale modeled slot may have been removed by a
     /// still-pending close; replacement names that exact incarnation.
+    #[cfg(test)]
     pub fn publish_created_slot(
         &mut self,
         owner: TaskOwner,
@@ -1047,6 +1090,7 @@ impl NetworkLifetime {
 
     /// Publish successful dup/F_DUPFD while the short atomic source/target
     /// admission remains held. Failed replacement must never reach this call.
+    #[cfg(test)]
     pub fn publish_duplicated_slot(
         &mut self,
         owner: TaskOwner,
@@ -1076,6 +1120,7 @@ impl NetworkLifetime {
     /// Reconcile an authenticated descriptor-removal result. A completed older
     /// operation may name an already-superseded installation, never its numeric
     /// replacement. Operation receipts still enforce exactly-once completion.
+    #[cfg(test)]
     pub fn close_binding(
         &mut self,
         owner: TaskOwner,
@@ -1093,6 +1138,7 @@ impl NetworkLifetime {
         self.close(owner, binding.slot.fd, binding.open_file)
     }
 
+    #[cfg(test)]
     pub fn set_cloexec_binding(
         &mut self,
         owner: TaskOwner,
@@ -1213,6 +1259,7 @@ impl NetworkLifetime {
 
     /// Retain an exact queued/captured object for a receiving task or a new
     /// operation stage; numeric fd reuse cannot substitute another object.
+    #[cfg(test)]
     pub fn retain_lease(
         &mut self,
         source: LeaseId,
@@ -1239,6 +1286,7 @@ impl NetworkLifetime {
 
     /// Install an SCM_RIGHTS/captured object and consume its transfer lease
     /// atomically. Transport/delivery completion is a separate operation.
+    #[cfg(test)]
     pub fn install_transfer(
         &mut self,
         owner: TaskOwner,
@@ -1272,6 +1320,7 @@ impl NetworkLifetime {
 
     /// Requires actual completion/cancellation acknowledgement. It deliberately
     /// works after the initiating task exits, and never consumes network data.
+    #[cfg(test)]
     pub fn release_lease(
         &mut self,
         lease: LeaseId,
@@ -1547,6 +1596,7 @@ impl NetworkLifetime {
         counts
     }
 
+    #[cfg(test)]
     pub fn is_retired(&self, open_file: OpenFileId) -> bool {
         self.retired.contains(&open_file)
     }
@@ -1563,6 +1613,35 @@ impl NetworkLifetime {
             assert!(self.retired.insert(*id));
         }
         retired
+    }
+}
+
+impl NetworkLifetime {
+    /// Logical half only: native census/root provenance is checked separately.
+    pub(super) fn validate_foreground_epoll_root(
+        &self,
+        owner: TaskOwner,
+        files: FilesId,
+    ) -> Result<(), LifetimeError> {
+        let task = self.task(owner)?;
+        let table = self
+            .tables
+            .get(&files)
+            .ok_or(LifetimeError::SlotIdentity(-1))?;
+        if task.files != files
+            || !task.metadata_ready
+            || self.tasks.len() != 1
+            || !table.complete_census
+            || table.owners.len() != 1
+            || !table.owners.contains(&owner)
+            || !self.pending_exec.is_empty()
+            || !self.pending_clones.is_empty()
+            || !self.pending_selections.is_empty()
+            || !self.leases.is_empty()
+        {
+            return Err(LifetimeError::SlotIdentity(-1));
+        }
+        Ok(())
     }
 }
 
@@ -2680,34 +2759,5 @@ mod tests {
             Err(LifetimeError::TableAlreadyUsed(ticket.new_files))
         );
         assert_eq!(state, before);
-    }
-}
-
-impl NetworkLifetime {
-    /// Logical half only: native census/root provenance is checked separately.
-    pub(super) fn validate_foreground_epoll_root(
-        &self,
-        owner: TaskOwner,
-        files: FilesId,
-    ) -> Result<(), LifetimeError> {
-        let task = self.task(owner)?;
-        let table = self
-            .tables
-            .get(&files)
-            .ok_or(LifetimeError::SlotIdentity(-1))?;
-        if task.files != files
-            || !task.metadata_ready
-            || self.tasks.len() != 1
-            || !table.complete_census
-            || table.owners.len() != 1
-            || !table.owners.contains(&owner)
-            || !self.pending_exec.is_empty()
-            || !self.pending_clones.is_empty()
-            || !self.pending_selections.is_empty()
-            || !self.leases.is_empty()
-        {
-            return Err(LifetimeError::SlotIdentity(-1));
-        }
-        Ok(())
     }
 }

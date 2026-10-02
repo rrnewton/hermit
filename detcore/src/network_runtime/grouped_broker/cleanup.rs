@@ -156,8 +156,10 @@ impl Readiness {
 enum CursorPhase {
     Source,
     Parent,
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     GrantSubmitted,
     Peer,
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     Unknown,
     Closed,
 }
@@ -287,16 +289,18 @@ pub(super) fn select_runtime_creation_recovery(
     Ok((selected.steps, selected.eligible, selected.relation))
 }
 fn ffi_owner(value: &journal::OwnerSnapshot) -> io::Result<ffi::Owner> {
-    let mut out = ffi::Owner::default();
-    out.incarnation = value.incarnation;
-    out.phase = value.phase as _;
-    out.verified_sites = value.verified_sites;
-    out.attempted_sites = value.attempted_sites;
-    out.event_id = value.event_id;
-    out.write_unknown = value.write_unknown;
-    out.pending_role = value.pending_role;
-    out.pending_remove = value.pending_remove;
-    out.pending_bytes = usize::try_from(value.pending_bytes).map_err(io::Error::other)?;
+    let mut out = ffi::Owner {
+        incarnation: value.incarnation,
+        phase: value.phase as _,
+        verified_sites: value.verified_sites,
+        attempted_sites: value.attempted_sites,
+        event_id: value.event_id,
+        write_unknown: value.write_unknown,
+        pending_role: value.pending_role,
+        pending_remove: value.pending_remove,
+        pending_bytes: usize::try_from(value.pending_bytes).map_err(io::Error::other)?,
+        ..ffi::Owner::default()
+    };
     require(
         value.group.len() < out.group.len() && value.event.len() < out.event.len(),
         "cleanup owner names exceed native bounds",
@@ -334,7 +338,7 @@ fn rust_owner(value: &ffi::Owner) -> io::Result<journal::OwnerSnapshot> {
     }
     Ok(journal::OwnerSnapshot {
         incarnation: value.incarnation,
-        phase: value.phase as u32,
+        phase: value.phase,
         verified_sites: value.verified_sites,
         attempted_sites: value.attempted_sites,
         event_id: value.event_id,
@@ -367,6 +371,7 @@ fn rust_write(value: &ffi::Write) -> io::Result<journal::Write> {
 pub(super) struct AsymmetricAgreement {
     guardian: Value,
     keeper: Value,
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     guardian_history: journal::SourceHistory,
     keeper_history: journal::SourceHistory,
     selection: Selection,
@@ -505,6 +510,7 @@ impl AsymmetricAgreement {
         json!({"schema":"hermit-creation-cleanup-agreement-v1","guardian":self.guardian,"keeper":self.keeper,
         "eligible":self.selection.eligible,"relation":self.selection.relation,"cutoff":self.native_cutoff})
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     pub(super) fn check_holder(&self, record: &Value, deadline: Instant) -> io::Result<()> {
         require(
             self.peer_acknowledged
@@ -600,6 +606,7 @@ impl CallbackOwner {
             }
         }
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     fn ack_recovery(
         &mut self,
         native: &ffi::Owner,
@@ -718,6 +725,7 @@ impl CallbackOwner {
         Ok(())
     }
 }
+#[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
 unsafe extern "C" fn recovery_callback(
     context: *mut libc::c_void,
     owner: *const ffi::Owner,
@@ -777,6 +785,7 @@ struct CleanupEnvelope {
     registration_attempted: bool,
     prepared: bool,
     inventory: owner::CensusInventory,
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     recovery_steps: [ffi::RecoveryStep; 17],
 }
 impl CleanupEnvelope {
@@ -883,6 +892,7 @@ impl CleanupEnvelope {
         )?;
         Ok(true)
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     fn cancel_after_prefix(&mut self, cause: io::Error) -> io::Result<()> {
         require(
             self.callbacks.primary.is_none(),
@@ -917,6 +927,7 @@ impl CleanupEnvelope {
         self.callbacks.send(json!({"schema":"hermit-cleanup-cancel-v1","nonce":self.callbacks.intent.nonce,
             "incarnation":self.callbacks.intent.incarnation,"origin":origin,"cutoff":cutoff,"cause":cause.to_string()}))
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     fn join_terminal_histories(&mut self) -> io::Result<()> {
         self.callbacks.cutoff()?;
         let peer = self.callbacks.receive()?;
@@ -978,6 +989,7 @@ impl CleanupEnvelope {
         self.callbacks.cursor.phase = CursorPhase::Parent;
         Ok(())
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     fn delete_owned_prefix(&mut self) -> io::Result<()> {
         self.callbacks.cutoff()?;
         self.callbacks.cursor.parent()?;
@@ -1048,6 +1060,7 @@ impl CleanupEnvelope {
         self.callbacks.ledger.store.append(json!({"kind":"two-fresh-C-absence-receipts-and-alias-retirement","original_cutoff":self.callbacks.native_cutoff}))?;
         Ok(())
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     fn close_peer(&mut self) -> io::Result<()> {
         self.callbacks.cutoff()?;
         self.callbacks.send(json!({"schema":"hermit-cleanup-close-v1","nonce":self.callbacks.intent.nonce,
@@ -1471,6 +1484,7 @@ impl CreationPeer {
     pub(super) fn source_protocol_active(&self) -> bool {
         matches!(self.phase, PeerPhase::Preparing | PeerPhase::Source)
     }
+    #[expect(dead_code, reason = "Retained typed creation-recovery protocol is not yet wired into the startup continuation")]
     pub(super) fn complete(&self) -> bool {
         self.phase == PeerPhase::Closed && self.refused.is_none()
     }

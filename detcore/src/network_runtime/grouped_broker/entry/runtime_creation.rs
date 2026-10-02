@@ -93,12 +93,12 @@ impl RuntimeCreationCustody {
         }
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refused.is_none() {
+        if let Err(error) = &result
+            && self.refused.is_none()
+        {
                 self.refused = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     fn check_peer(&self) -> io::Result<()> {
@@ -315,13 +315,13 @@ impl RuntimeCreationCustody {
         &mut self,
         creator: &owner::Creator,
         controls: &owner::Controls,
-        keeper_pidfd: BorrowedFd<'_>,
-        keeper_pid: i32,
+        keeper: (BorrowedFd<'_>, i32),
         guardian_store: [BorrowedFd<'_>; 2],
         keeper_store: [BorrowedFd<'_>; 2],
-        guardian_history: &journal::SourceHistory,
-        keeper_history: &journal::SourceHistory,
+        histories: (&journal::SourceHistory, &journal::SourceHistory),
     ) -> io::Result<()> {
+        let (keeper_pidfd, keeper_pid) = keeper;
+        let (guardian_history, keeper_history) = histories;
         let result = (|| {
             self.check_peer()?;
             require(

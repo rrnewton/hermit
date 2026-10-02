@@ -103,7 +103,7 @@ pub(crate) struct EmptyCopyTerminalAuthority {
     terminal: crate::network_runtime::accepted_provider::OriginalTerminal,
 }
 impl EmptyCopyTerminalAuthority {
-    pub(crate) fn validate_binding(
+    pub(in crate::network_runtime) fn validate_binding(
         &self,
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
@@ -135,12 +135,12 @@ fn status(value: &CallStatus, name: &str) -> io::Result<()> {
     }
     Ok(())
 }
-fn outgoing<'a>(
-    state: &'a State,
+fn outgoing(
+    state: &State,
     run: [u8; 16],
     owner: NetworkStreamOwner,
     sequence: u64,
-) -> io::Result<(&'a Envelope, &'a [OwnedFd], &'a [u8])> {
+) -> io::Result<(&Envelope, &[OwnedFd], &[u8])> {
     let (envelope, rights, response) = state.session.acknowledged_outgoing_request(sequence)?;
     if sequence == 0
         || envelope.sequence != sequence
@@ -372,14 +372,13 @@ impl Controller {
         {
             return Err(invalid("empty terminal changed retained selection query"));
         }
-        if let Some(selected) = state.session.response(selected_request)? {
-            if !matches!(serde_json::from_slice::<Reply>(selected), Ok(Reply::OriginalTerminated(ref same)) if *same == observed)
-            {
+        if let Some(selected) = state.session.response(selected_request)?
+            && !matches!(serde_json::from_slice::<Reply>(selected), Ok(Reply::OriginalTerminated(ref same)) if *same == observed)
+        {
                 return Err(invalid(
                     "empty terminal cannot replace an observed selection or different receipt",
                 ));
             }
-        }
         let raw = observed.raw;
         let zero: OriginalResult = ffi::OriginalResult::default().into();
         if raw.call != call
@@ -693,7 +692,7 @@ pub(crate) fn controlled_copy_authority_with_preparation(
 }
 
 #[cfg(test)]
-pub(crate) fn controlled_empty_copy_terminal_authority(
+pub(in crate::network_runtime) fn controlled_empty_copy_terminal_authority(
     wire: ProviderWireFormat,
     owner: NetworkStreamOwner,
     selection_for_prepare: OriginalSelection,

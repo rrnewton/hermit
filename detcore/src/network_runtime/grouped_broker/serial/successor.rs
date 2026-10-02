@@ -91,14 +91,14 @@ impl RetainedSuccessor {
     /// the caller has retained this object outside cancellable request work.
     pub fn retain(
         source: SerialOwner,
-        channel: OwnedFd,
-        guardian_endpoint: OwnedFd,
+        endpoints: (OwnedFd, OwnedFd),
         guardian: owner::Launcher,
         provider: ProviderIdentity,
         journal_directory: OwnedFd,
         creator_cutoff: u64,
         intent: super::super::Intent,
     ) -> Self {
+        let (channel, guardian_endpoint) = endpoints;
         Self {
             source,
             channel: wire::Channel::retain(channel),
@@ -232,14 +232,14 @@ impl RetainedSuccessor {
         self.source.notify_runtime_failure(origin, cause)
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refusal.is_none() {
+        if let Err(error) = &result
+            && self.refusal.is_none()
+        {
                 self.refusal = Some(Failure::capture(error));
                 // Failure to sample remains unknown. Never substitute a later
                 // cleanup request's clock reading for this original origin.
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
 
@@ -401,7 +401,8 @@ impl RetainedSuccessor {
                 .iter()
                 .flat_map(|p| p.rights.iter().map(AsRawFd::as_raw_fd)),
         );
-        for launcher in [&self.guardian] {
+        {
+            let launcher = &self.guardian;
             required.extend(launcher.pidfd.iter().map(AsRawFd::as_raw_fd));
             required.extend(launcher.log_files.iter().flatten().map(AsRawFd::as_raw_fd));
             required.extend(launcher.child.stdout.iter().map(AsRawFd::as_raw_fd));
@@ -694,16 +695,6 @@ impl RetainedSuccessor {
         self.stage == Stage::Acknowledged && self.refusal.is_none()
     }
 
-    pub fn diagnostics(&self) -> serde_json::Value {
-        json!({"stage":format!("{:?}",self.stage),
-            "failure":self.refusal.as_ref().map(|f| &f.message),
-            "failure_origin":self.failure_origin,
-            "acknowledgement_sent":self.acknowledgement_sent(),
-            "provider_authority":false,
-            "echo_rights":self.offer.as_ref().and_then(|o|o.echo_index)
-                .map(|index|self.channel.packets[index].rights.len()),
-            "fresh_observations":self.observations.len()})
-    }
 }
 
 fn require_same_descriptions(original: &[OwnedFd], received: &[OwnedFd]) -> io::Result<()> {

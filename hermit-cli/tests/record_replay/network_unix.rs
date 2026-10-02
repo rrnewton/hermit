@@ -371,7 +371,7 @@ fn default_unix_denies_external_contact_and_preserves_guest_ipc() {
         "no-contact requires natural controller timeout, not killed controller"
     );
     assert!(
-        !output.status.success() && !matches!(output.status.code(), None | Some(124 | 125 | 126)),
+        !output.status.success() && !matches!(output.status.code(), None | Some(124..=126)),
         "{output:?}"
     );
     // The shared controller's typed policy terminal is exactly 122. A guest

@@ -88,13 +88,13 @@ impl LeafDelegate {
     pub fn retain(
         intent: Intent,
         unit: String,
-        deadline: Instant,
-        native_deadline: u64,
+        deadlines: (Instant, u64),
         image: OwnedFd,
         arguments: Vec<OsString>,
         channel: OwnedFd,
         logs: OwnedFd,
     ) -> Self {
+        let (deadline, native_deadline) = deadlines;
         Self {
             intent,
             unit,
@@ -781,18 +781,19 @@ impl LeafDelegate {
         // The controller already sent its original failure before entering
         // this path. Persist the untouched phase/query observations before
         // retirement polls them; diagnostic failure must not stop cleanup.
-        if !self.failure_record_attempted {
-            if let Err(error) = self.persist_first_failure(cutoff) {
+        if !self.failure_record_attempted
+            && let Err(error) = self.persist_first_failure(cutoff)
+        {
                 self.failure_record_error = Some(Failure::capture(&error));
             }
-        }
         let cause = self.failure.as_ref().unwrap().error();
         let mut pending = false;
-        if let Some(query) = &mut self.namespace_query {
-            if !query.successful_resources_retired()? && self.namespace_snapshot.is_none() {
+        if let Some(query) = &mut self.namespace_query
+            && !query.successful_resources_retired()?
+            && self.namespace_snapshot.is_none()
+        {
                 pending |= query.retire_custody(cutoff, &cause)? == QueryRetirement::Pending;
             }
-        }
         for query in self
             .manager
             .iter_mut()

@@ -171,9 +171,8 @@ impl GlobalState {
                 .unwrap()
                 .begin_foreground_epoll_ctl(
                     owner,
-                    arguments,
-                    &actual,
-                    &local,
+                    arguments, (&actual,
+                    &local),
                     &memory,
                     joined,
                     grant.epoch(),

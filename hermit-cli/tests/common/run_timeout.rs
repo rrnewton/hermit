@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Non-vacuous session census for the CLI timeout regressions. The session
 //! leader remains an unreaped child until observation and cleanup are complete;
@@ -350,13 +350,12 @@ pub(super) fn wait(mut child: Child, started: Instant) -> io::Result<Observation
             failure = Some(format!("owned task cleanup: {error}"));
         }
     }
-    if failure.is_some() {
-        if let Some(leader) = &leader_task {
-            if let Err(error) = leader.kill() {
+    if failure.is_some()
+        && let Some(leader) = &leader_task
+        && let Err(error) = leader.kill()
+    {
                 failure = Some(format!("leader cleanup: {error}"));
             }
-        }
-    }
     // The leader stays reserved through every possible signal. A terminal child
     // can now be reaped without risking that a later cleanup kills a new SID.
     loop {
@@ -455,7 +454,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(captured, vec![b'x'; bound]);
-        let error = collect(&mut io::Cursor::new([b'y']), &mut captured, deadline).unwrap_err();
+        let error = collect(&mut io::Cursor::new(*b"y"), &mut captured, deadline).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(captured, vec![b'x'; bound]);
         let mut stderr = Vec::new();

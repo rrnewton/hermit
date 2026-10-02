@@ -1,18 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 //! Actual C producer -> actual copy5 Rust decoder. Kernel callbacks, selection,
 //! saved frame, source memory and EXIT are host premises, not native evidence.
-use super::*;
-use std::fs::{self, File};
+use std::fs::File;
+use std::fs::{self};
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-#[path = "driver-ftrace-inputs.rs"]
-mod driver_ftrace_inputs;
-#[path = "driver-ftrace-process.rs"]
-mod driver_ftrace_process;
-#[path = "process_group.rs"]
-mod process_group;
+use super::super::driver_ftrace_inputs;
+use super::super::driver_ftrace_process;
+use super::super::process_group;
+use super::*;
 
 const EXTRA: &[(&str, &[u8])] = &[
     ("stream-copy-record-export.c", include_bytes!("stream-copy-record-export.c")),
@@ -40,11 +38,16 @@ fn decode_export(bytes: &[u8]) -> Capture {
     assert_eq!(std::mem::size_of::<RawRecord>(),584);
     assert_eq!(bytes.len()%584,0);
     assert!(bytes.len()<=64*584);
-    let mut records: Vec<Record> = bytes.chunks_exact(584).map(|b| {
+    let mut records: Vec<Record> = bytes
+        .as_chunks::<584>()
+        .0
+        .iter()
+        .map(|b| {
         // repr(C) fixed integer/byte fields, no invalid bit patterns.
         let raw=unsafe { std::ptr::read_unaligned(b.as_ptr().cast::<RawRecord>()) };
         Record::from(raw)
-    }).collect();
+    })
+        .collect();
     let commit=records.pop().unwrap();
     assert_eq!(commit.kind,2);
     assert_eq!(commit.length,64);
@@ -55,11 +58,16 @@ fn decode_export(bytes: &[u8]) -> Capture {
         owner_mm:0,user_address:0,requested_fd:0,address_length:0};
     let returned=commit.offset as i64;
     let mut raw=crate::network_runtime::accepted_provider_ffi::OriginalEffect::default();
-    raw.command.operation=11;raw.command.command=selected.command;
-    raw.command.returned=returned.try_into().unwrap();raw.command.phase=1;
-    raw.command.identity.provider=selected.provider;raw.command.task=selected.task;
-    raw.command.start_boottime=selected.task_start;raw.command.original_count=selected.original_count;
-    raw.original.returned=returned.try_into().unwrap();raw.original.complete=1;
+    raw.command.operation=11;
+    raw.command.command=selected.command;
+    raw.command.returned=returned.try_into().unwrap();
+    raw.command.phase=1;
+    raw.command.identity.provider=selected.provider;
+    raw.command.task=selected.task;
+    raw.command.start_boottime=selected.task_start;
+    raw.command.original_count=selected.original_count;
+    raw.original.returned=returned.try_into().unwrap();
+    raw.original.complete=1;
     let mut effect:OriginalEffect=raw.into();
     effect.original.selection=selected.clone();
     effect.read_copy=Some(Manifest {provider:commit.provider,command:commit.command,
@@ -105,13 +113,19 @@ fn retain_bytes(cohort: &str, name: &str, bytes: &[u8]) {
     eprintln!("ACTUAL_C_RECORDS cohort={cohort} case={name} hex={hex}");
 }
 fn corrupt_actual_records(bytes: &[u8]) {
-    let end=bytes.chunks_exact(584).position(|r|
-        u32::from_ne_bytes(r[68..72].try_into().unwrap())==frontier::FINISH).unwrap();
+    let end = bytes
+        .as_chunks::<584>()
+        .0
+        .iter()
+        .position(|r| {
+            u32::from_ne_bytes(r[68..72].try_into().unwrap()) == frontier::FINISH
+        })
+        .unwrap();
     for mutation in ["missing-data","request","failed-frontier"] {
         let mut changed=bytes.to_vec();
         match mutation {
             "missing-data" => {
-                let data=changed.chunks_exact(584).position(|r|
+                let data=changed.as_chunks::<584>().0.iter().position(|r|
                     u32::from_ne_bytes(r[68..72].try_into().unwrap())==DATA).unwrap();
                 changed.drain(data*584..(data+1)*584);
             }

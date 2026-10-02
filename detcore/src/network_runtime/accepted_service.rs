@@ -157,13 +157,11 @@ fn command_preparation(
                 if let Request::CollectOriginalConnect {
                     kind: submitted, ..
                 } = serde_json::from_slice(&envelope.body)?
-                {
-                    if submitted != kind {
+                    && submitted != kind {
                         return Err(io::Error::other(
                             "original completion changed prepared syscall kind",
                         ));
                     }
-                }
                 (call, 1)
             }
             (
@@ -173,13 +171,11 @@ fn command_preparation(
                 if let Request::CollectOriginalFileObservation {
                     role: submitted, ..
                 } = serde_json::from_slice(&envelope.body)?
-                {
-                    if submitted != role {
+                    && submitted != role {
                         return Err(io::Error::other(
                             "auxiliary collection changed prepared role",
                         ));
                     }
-                }
                 (call, if role.is_receive() { 2 } else { 1 })
             }
             (Operation::PrepareNativeBirth, Request::PrepareNativeBirth { call, .. }) => (call, 1),
@@ -701,7 +697,7 @@ impl AcceptedProviderService {
                 // SAFETY: from_private_stdin's owning launcher authenticated
                 // immutable artifacts/dependencies before this service existed.
                 let ready = unsafe { provider.open(library, object, run, &expected) }?;
-                serde_json::to_vec(&BootstrapReply::Ready(ready)).map_err(io::Error::other)
+                serde_json::to_vec(&BootstrapReply::Ready(Box::new(ready))).map_err(io::Error::other)
             })?;
             self.bootstrap_reply = Some(sequence);
             self.bootstrap_sent = self.bootstrap.try_reply(sequence)?;
@@ -732,18 +728,19 @@ impl AcceptedProviderService {
                 self.run_replies.push(sequence);
             }
         }
-        if let Some(pending) = &mut self.observation {
-            if let Some(body) = pending.probe(Instant::now(), |ordinal| {
+        if let Some(pending) = &mut self.observation
+            && let Some(body) = pending.probe(Instant::now(), |ordinal| {
                 self.provider.poll_creation(ordinal)
-            })? {
+            })?
+        {
                 session.finish_observation(pending.request, body)?;
                 self.run_replies.push(pending.request);
                 self.observation = None;
             }
-        }
 
-        if let Some((request, ordinal, next_probe)) = &mut self.fd_observation {
-            if Instant::now() >= *next_probe {
+        if let Some((request, ordinal, next_probe)) = &mut self.fd_observation
+            && Instant::now() >= *next_probe
+        {
                 *next_probe = Instant::now() + OBSERVATION_MAINTENANCE;
                 let (ready, body) = self.provider.poll_fd_event(*ordinal)?;
                 self.last_fd_probe = Some(body.clone());
@@ -759,7 +756,6 @@ impl AcceptedProviderService {
                     self.fd_observation = None;
                 }
             }
-        }
 
         while let Some(sequence) = self.run_replies.first().copied() {
             if !session.try_reply(sequence)? {
@@ -832,8 +828,7 @@ impl AcceptedProviderService {
             let Some(chunk) = session.read_copy_chunk(
                 &envelope,
                 rights,
-                *call,
-                *command,
+                (*call, *command),
                 *prepared,
                 *first,
                 || {
@@ -1394,11 +1389,10 @@ impl AcceptedProviderService {
             };
             // A lost/repeated reply reuses the retained result, even after its
             // positively completed provider ACK has made the slot reusable.
-            if !session.read_copy_completed(sequence)? {
-                if let Some(records) = provider.copy_for_completed(body)? {
+            if !session.read_copy_completed(sequence)?
+                && let Some(records) = provider.copy_for_completed(body)? {
                     session.retain_read_copy(sequence, records)?;
                 }
-            }
         }
         // dispatch has installed the complete primary response in the durable
         // inbox. Retain the separate ACK effect before making a provider slot

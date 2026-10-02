@@ -36,15 +36,23 @@ mod tests;
 mod wire;
 
 use std::io;
+#[cfg(test)]
 use std::os::fd::AsRawFd;
+#[cfg(test)]
 use std::os::fd::OwnedFd;
+#[cfg(test)]
 use std::process::Child;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
 use serde_json::json;
 
 fn require(ok: bool, message: &str) -> io::Result<()> {
@@ -54,6 +62,7 @@ fn require(ok: bool, message: &str) -> io::Result<()> {
         Err(io::Error::other(message.to_owned()))
     }
 }
+#[cfg(test)]
 fn query_admission(
     creator: bool,
     query: Option<usize>,
@@ -164,8 +173,12 @@ impl Intent {
         ))
     }
 }
+#[cfg(test)]
 #[derive(Debug)]
+#[expect(dead_code, reason = "Retained checked recovery state; only the cancellation-owner control is wired")]
 struct State {
+    // Retain all original fields in declaration order for the cancellation
+    // control's owner lifetime, including otherwise uninspected capabilities.
     intent: Intent,
     unit: String,
     deadline: Instant,
@@ -192,15 +205,18 @@ struct State {
 }
 /// This owner belongs to the controller's recovery scope, outside the operation
 /// future. No Drop implementation turns open resources into terminal success.
+#[cfg(test)]
 #[derive(Debug)]
 #[must_use = "retain outside cancellable operations until actual joined cleanup"]
 pub(super) struct RecoveryOwner {
     state: Arc<Mutex<State>>,
 }
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct Operations {
     state: Arc<Mutex<State>>,
 }
+#[cfg(test)]
 impl RecoveryOwner {
     /// Infallible transfer. Even initialization refusal leaves every original
     /// FD/Child in this state. `directory` and `journal_directory` are separately
@@ -246,30 +262,6 @@ impl RecoveryOwner {
             Operations { state },
         )
     }
-    /// Transfer the actual expected image before fallible hashing and before
-    /// source admission. Repeated/failed transfers stay in the external owner.
-    pub fn retain_entry(
-        &self,
-        file: OwnedFd,
-        arguments: Vec<std::ffi::OsString>,
-    ) -> io::Result<()> {
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("grouped recovery state poisoned"))?;
-        s.entries.push(owner::EntryImage::retain(file, arguments));
-        let result = (|| {
-            require(
-                s.entries.len() == 1 && !s.initialized,
-                "entry must be retained once before initialization",
-            )?;
-            s.entries[0].initialize()
-        })();
-        if let Err(error) = &result {
-            s.failure.get_or_insert_with(|| Failure::capture(error));
-        }
-        result
-    }
     /// Read-only diagnostics. Counts/booleans here never issue adoption, deletion,
     /// successor or provider-open authority.
     pub fn diagnostics(&self) -> io::Result<Value> {
@@ -309,6 +301,7 @@ impl RecoveryOwner {
         )
     }
 }
+#[cfg(test)]
 impl Operations {
     fn step<T>(&self, operation: impl FnOnce(&mut State) -> io::Result<T>) -> io::Result<T> {
         let mut s = self
@@ -330,6 +323,7 @@ impl Operations {
         }
         result
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn initialize(&self, header: Value) -> io::Result<()> {
         self.step(|s| {
             require(!s.initialized, "grouped owner cannot initialize twice")?;
@@ -360,6 +354,7 @@ impl Operations {
             Ok(())
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn receive_creator(&self) -> io::Result<bool> {
         self.step(|s| {
             require(
@@ -378,6 +373,7 @@ impl Operations {
             Ok(true)
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn begin_manager_query(&self) -> io::Result<()> {
         self.step(|s| {
             query_admission(
@@ -414,6 +410,7 @@ impl Operations {
             Ok(())
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn poll_creator_authentication(&self) -> io::Result<bool> {
         self.step(|s| {
             let index = s
@@ -468,6 +465,7 @@ impl Operations {
             Ok(true)
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn acknowledge_creator(&self) -> io::Result<()> {
         self.step(|s| {
             let creator = s.creator.as_ref().ok_or_else(||io::Error::other("creator owner absent"))?;
@@ -485,6 +483,7 @@ impl Operations {
             result
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn receive_controls(&self) -> io::Result<bool> {
         self.step(|s| {
             require(
@@ -531,6 +530,7 @@ impl Operations {
             Ok(true)
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn receive_journal(&self) -> io::Result<bool> {
         self.step(|s| {
             let controls = s.controls.as_ref().ok_or_else(||io::Error::other("journal lacks actual tracefs controls"))?;
@@ -552,6 +552,7 @@ impl Operations {
             Ok(true)
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn receive_source_eof(&self) -> io::Result<bool> {
         self.step(|s| {
             require(!s.source_eof, "source EOF cannot be reused")?;
@@ -567,11 +568,13 @@ impl Operations {
             s.source_eof = true; Ok(true)
         })
     }
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn drain_launcher(&self) -> io::Result<()> {
         self.step(|s| s.launcher.drain())
     }
     /// Diagnostic terminal join only. It deliberately issues no LeafPlan until
     /// the independent guardian's actual journal and endpoint join is wired.
+    #[expect(dead_code, reason = "Retained checked recovery operations; only the cancellation-owner control is wired")]
     pub fn check_source_terminal(&self) -> io::Result<()> {
         self.step(|s| {
             require(

@@ -178,7 +178,7 @@ impl EntryFixture {
             let ResourceReply::ReadGrant { read, .. } = pending.await else {
                 panic!("exact FD reader grant absent")
             };
-            read
+            *read
         };
         assert_eq!(read.binding, Some(binding));
         let arguments = Arguments {
@@ -319,12 +319,11 @@ impl Fixture {
             .original_connect_selected(
                 owner,
                 &result.admission,
-                selected.command,
-                selected.provider,
+                selected.command, (selected.provider,
                 selected.task,
                 selected.task_start,
                 selected.table,
-                selected.file,
+                selected.file),
             )
             .unwrap();
         result

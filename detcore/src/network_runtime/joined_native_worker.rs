@@ -22,6 +22,7 @@ impl JoinedNativeWorkerReceipt {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn same(&self, other: &Self) -> bool {
         self.runtime.ptr_eq(&other.runtime) && Arc::ptr_eq(&self.worker, &other.worker)
     }

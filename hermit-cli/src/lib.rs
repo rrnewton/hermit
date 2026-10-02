@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 // Treat all Clippy warnings as errors.
 #![deny(clippy::all)]
@@ -3590,9 +3590,7 @@ fn replay_plain(
             Replay::spawn(prepared, false, port, &mounts)
                 .await?
                 .wait(control)
-                .await
-                .map_err(Error::from)
-        }
+                .await}
         .await;
         let result = finish_native_controller_result(result, &mut native_owner).await;
         report.finish(result)
@@ -3619,9 +3617,7 @@ pub fn replay_with_output_and_mounts(
             Replay::spawn(prepared, true, None, &mounts)
                 .await?
                 .wait_with_output(control)
-                .await
-                .map_err(Error::from)
-        }
+                .await}
         .await;
         let result = finish_native_controller_result(result, &mut native_owner).await;
         report.finish(result)

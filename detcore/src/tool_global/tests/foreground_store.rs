@@ -703,40 +703,38 @@ async fn foreground_store_foreign_exclusion_and_whole_selection_over_limit_canno
         .unwrap();
     let foreign_store = foreign.retained_store();
     let owner = first.root.owner();
-    let scheduler = first.state.sched.lock().unwrap();
-    let epoch = scheduler
-        .foreground_native_observation(owner, &first.root)
-        .unwrap()
-        .epoch();
-    let memory = first.thread.memory_metadata.lock().unwrap();
-    let span = memory
-        .original_copy_span(owner, first.pages.at(128), 512)
-        .unwrap();
-    let mut engine = first.state.network_engine.as_ref().unwrap().lock().unwrap();
-    assert_ne!(
-        engine
-            .private_receive_completion(owner, first.lease)
-            .unwrap(),
-        foreign_store.completion()
-    );
-    let before = format!("{engine:?}");
-    assert!(
-        engine
-            .prepare_foreground_store(
-                owner,
-                first.lease,
-                first.root.clone(),
-                &memory,
-                span,
-                foreign_store.exclusion().clone(),
-                epoch
-            )
-            .is_err()
-    );
-    assert_eq!(format!("{engine:?}"), before);
-    drop(engine);
-    drop(memory);
-    drop(scheduler);
+    {
+        let scheduler = first.state.sched.lock().unwrap();
+        let epoch = scheduler
+            .foreground_native_observation(owner, &first.root)
+            .unwrap()
+            .epoch();
+        let memory = first.thread.memory_metadata.lock().unwrap();
+        let span = memory
+            .original_copy_span(owner, first.pages.at(128), 512)
+            .unwrap();
+        let mut engine = first.state.network_engine.as_ref().unwrap().lock().unwrap();
+        assert_ne!(
+            engine
+                .private_receive_completion(owner, first.lease)
+                .unwrap(),
+            foreign_store.completion()
+        );
+        let before = format!("{engine:?}");
+        assert!(
+            engine
+                .prepare_foreground_store(
+                    owner,
+                    first.lease,
+                    (first.root.clone(), &memory),
+                    span,
+                    foreign_store.exclusion().clone(),
+                    epoch
+                )
+                .is_err()
+        );
+        assert_eq!(format!("{engine:?}"), before);
+    }
     assert_eq!(first.pages.bytes(0, 8192), vec![0xa5; 8192]);
     // Explicit over-bound complete-selection premise. A 512-byte view of a
     // larger delivery must never qualify that complete delivery for stores.
@@ -2265,6 +2263,7 @@ impl ReplayIssuerFixture {
         else {
             panic!("real ordinary reader was not admitted")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         assert!(read.control.is_some());
         let thread = guest.thread;
@@ -2509,6 +2508,7 @@ async fn replay_real_issuer_store_and_commit_cross_rows_with_exact_producer_fron
     else {
         panic!("second actual reader")
     };
+    let read = *read;
     let second = f
         .state
         .begin_replay_receive_call(f.tid, &guest.thread, read, f.pages.at(256), 3)
@@ -2868,33 +2868,35 @@ async fn unsubmitted_entry_cleanup_rejects_first_binding_to_foreign_root_metadat
         .join_foreground_prefix(other.root.clone())
         .await
         .unwrap();
-    let mut engine = f.state.network_engine.as_ref().unwrap().lock().unwrap();
-    let call = engine
-        .begin_native_stream_call_from_read(owner, f.read.clone())
-        .unwrap();
-    let mut attempt = engine.begin_native_entry_stamp(owner, call.id).unwrap();
-    let retained = attempt.retain_unsubmitted_recovery(&prefix).unwrap();
-    drop(attempt);
-    let before = format!("{engine:?}");
-    let error = foreign
-        .with_foreground_prefix(&prefix, |proof| {
-            engine
-                .cancel_unsubmitted_native_entry(&retained, proof)
-                .map_err(std::io::Error::other)
-        })
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("changed actual engine/root metadata custody")
-    );
-    assert_eq!(format!("{engine:?}"), before);
-    assert_eq!(
-        engine.native_capture_fixture_counts(f.binding.open_file),
-        (1, 1, 1, 1)
-    );
-    assert!(engine.begin_native_entry_stamp(owner, call.id).is_err());
-    drop(engine);
+    let (_call, retained, before) = {
+        let mut engine = f.state.network_engine.as_ref().unwrap().lock().unwrap();
+        let call = engine
+            .begin_native_stream_call_from_read(owner, f.read.clone())
+            .unwrap();
+        let mut attempt = engine.begin_native_entry_stamp(owner, call.id).unwrap();
+        let retained = attempt.retain_unsubmitted_recovery(&prefix).unwrap();
+        drop(attempt);
+        let before = format!("{engine:?}");
+        let error = foreign
+            .with_foreground_prefix(&prefix, |proof| {
+                engine
+                    .cancel_unsubmitted_native_entry(&retained, proof)
+                    .map_err(std::io::Error::other)
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed actual engine/root metadata custody")
+        );
+        assert_eq!(format!("{engine:?}"), before);
+        assert_eq!(
+            engine.native_capture_fixture_counts(f.binding.open_file),
+            (1, 1, 1, 1)
+        );
+        assert!(engine.begin_native_entry_stamp(owner, call.id).is_err());
+        (call, retained, before)
+    };
     let own_prefix = runtime
         .join_foreground_prefix(f.root.clone())
         .await
@@ -3072,26 +3074,27 @@ async fn native_retirement_rpc_real_pin_close_finishes_both_owners_once() {
         GlobalResponse::Network(Ok(NetworkReply::Unit))
     );
     native_release_peer_eof(&mut f);
-    let e = f.state.network_engine.as_ref().unwrap().lock().unwrap();
-    assert_eq!(e.channel_for(ofd), None);
-    let trace = e.native_trace_fixture();
-    trace.validate().unwrap();
-    assert_eq!(
-        trace
-            .release_model
-            .nodes()
-            .iter()
-            .filter(|node| matches!(
-                node.kind,
-                detcore_model::network_trace::NetworkReleaseNodeKindV4::Progress {
-                    milestone: detcore_model::network_trace::NetworkProgressV4::Retired,
-                    ..
-                }
-            ))
-            .count(),
-        1
-    );
-    drop(e);
+    {
+        let e = f.state.network_engine.as_ref().unwrap().lock().unwrap();
+        assert_eq!(e.channel_for(ofd), None);
+        let trace = e.native_trace_fixture();
+        trace.validate().unwrap();
+        assert_eq!(
+            trace
+                .release_model
+                .nodes()
+                .iter()
+                .filter(|node| matches!(
+                    node.kind,
+                    detcore_model::network_trace::NetworkReleaseNodeKindV4::Progress {
+                        milestone: detcore_model::network_trace::NetworkProgressV4::Retired,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
     let runtime = f.state.network_runtime.as_ref().unwrap();
     runtime
         .join_foreground_prefix(f.root.clone())
@@ -3262,9 +3265,8 @@ async fn f3_private_capture_revoked_mm_releases_real_pin_and_both_ledgers() {
                 f.tid,
                 &f.thread,
                 &f.root,
-                epoch,
-                call,
-                f.read.control.unwrap(),
+                epoch, (call,
+                f.read.control.unwrap()),
                 captured,
             )
             .await
@@ -3383,9 +3385,8 @@ async fn f3_private_capture_known_errno_releases_both_owners_without_guest_or_jo
             f.tid,
             &f.thread,
             &f.root,
-            epoch,
-            call,
-            f.read.control.unwrap(),
+            epoch, (call,
+            f.read.control.unwrap()),
             captured,
         )
         .await
@@ -3509,9 +3510,8 @@ async fn f3_private_capture_success_transfers_real_pin_then_releases_once() {
                 f.tid,
                 &f.thread,
                 &f.root,
-                epoch,
-                call,
-                f.read.control.unwrap(),
+                epoch, (call,
+                f.read.control.unwrap()),
                 captured
             )
             .await
@@ -3637,9 +3637,8 @@ async fn f3_private_capture_changed_grant_releases_real_pin_without_reentering_g
             f.tid,
             &f.thread,
             &f.root,
-            epoch,
-            call,
-            f.read.control.unwrap(),
+            epoch, (call,
+            f.read.control.unwrap()),
             captured,
         )
         .await
@@ -3715,6 +3714,7 @@ async fn f3_returned_reader_cleanup_wakes_actual_pending_fd_admission() {
     else {
         panic!("local release did not wake the already registered RPC contender")
     };
+    let next = *next;
     assert_eq!(next.binding, Some(f.binding));
     assert_ne!(next.publication.permit, f.read.publication.permit);
     f.state
@@ -4004,7 +4004,7 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
             (
                 args.arg0,
                 args.arg1,
-                args.arg2 as usize,
+                args.arg2,
                 args.arg3,
                 args.arg4
             ),
@@ -4589,18 +4589,21 @@ fn actual_replay_wait(
     (call, expected, next.resp.clone())
 }
 
+type FutureWaitContext<'a> = (
+    &'a GlobalState,
+    &'a Arc<crate::network_runtime::ForegroundRoot>,
+    crate::types::FdSlotBinding,
+    NetworkStreamCallId,
+);
+type FutureWaitEvidence<'a> = (&'a Pages, &'a Arc<Mutex<Vec<&'static str>>>, u64);
+
 async fn select_future_replay_wait(
-    state: &GlobalState,
-    root: &Arc<crate::network_runtime::ForegroundRoot>,
-    binding: crate::types::FdSlotBinding,
-    call: NetworkStreamCallId,
+    (state, root, binding, call): FutureWaitContext<'_>,
     request: &Resources,
     response: &Ivar<crate::scheduler::SchedResponse>,
     committed: Resources,
     deadline: LogicalTime,
-    pages: &Pages,
-    events: &Arc<Mutex<Vec<&'static str>>>,
-    old_epoch: u64,
+    (pages, events, old_epoch): FutureWaitEvidence<'_>,
 ) {
     let owner = root.owner();
     let engine = state.network_engine.as_ref().unwrap();
@@ -4783,8 +4786,7 @@ async fn guest_v4_replay_future_input_parks_then_uses_actual_new_foreground_gran
             actual_replay_wait(&state, &requests, owner, binding);
         call = actual_call;
         select_future_replay_wait(
-            &state, &root, binding, call, &request, &response, committed, deadline, &pages,
-            &events, old_epoch,
+            (&state, &root, binding, call), &request, &response, committed, deadline, (&pages, &events, old_epoch),
         )
         .await;
         assert_eq!(pending.await.unwrap(), 5);
@@ -5137,8 +5139,7 @@ async fn guest_v4_replay_reentry_rechecks_registered_mm_root_and_normal_grant() 
                 actual_replay_wait(&state, &requests, owner, binding);
             call = actual_call;
             select_future_replay_wait(
-                &state, &root, binding, call, &request, &response, committed, deadline, &pages,
-                &events, old_epoch,
+                (&state, &root, binding, call), &request, &response, committed, deadline, (&pages, &events, old_epoch),
             )
             .await;
             match variant {
@@ -5387,7 +5388,7 @@ fn assert_replay_release_responses(
                 else {
                     panic!("release was not accepted: {:?}", responses[i])
                 };
-                Some(channels.iter().copied().collect::<Vec<_>>())
+                Some(channels.to_vec())
             } else {
                 None
             }
@@ -6790,7 +6791,7 @@ async fn no_store_same_ofd_successor_policy(
     );
     let admitted = f
         .state
-        .complete_private_receive_capture(f.tid, &f.thread, &f.root, epoch, call, control, outcome)
+        .complete_private_receive_capture(f.tid, &f.thread, &f.root, epoch, (call, control), outcome)
         .await
         .unwrap();
     f.call = admitted.id;
@@ -6806,15 +6807,15 @@ async fn no_store_same_ofd_successor_policy(
     let effect = NetworkStreamPhysicalEffect::Peek { maximum: 1024 };
     f.lease = {
         let mut e = engine.lock().unwrap();
-        let lease = e
+
+        e
             .begin_shadow_probe(
                 owner,
                 f.call,
                 f.state.global_time.lock().unwrap().as_nanos(),
             )
             .unwrap()
-            .lease;
-        lease
+            .lease
     };
     runtime
         .bind_native_stream_lease(owner, f.call, f.lease)
@@ -7658,17 +7659,12 @@ async fn guest_v4_replay_positive_selection_keeps_mapped_span_refusal_and_exact_
 }
 
 async fn select_future_eof_wait(
-    state: &GlobalState,
-    root: &Arc<crate::network_runtime::ForegroundRoot>,
-    binding: crate::types::FdSlotBinding,
-    call: NetworkStreamCallId,
+    (state, root, binding, call): FutureWaitContext<'_>,
     request: &Resources,
     response: &Ivar<crate::scheduler::SchedResponse>,
     committed: Resources,
     deadline: LogicalTime,
-    pages: &Pages,
-    events: &Arc<Mutex<Vec<&'static str>>>,
-    old_epoch: u64,
+    (pages, events, old_epoch): FutureWaitEvidence<'_>,
 ) {
     let owner = root.owner();
     let engine = state.network_engine.as_ref().unwrap();
@@ -7853,8 +7849,7 @@ async fn guest_v4_replay_future_eof_uses_real_wait_then_consumes_exact_input() {
         let (actual, request, response) = actual_replay_wait(&state, &requests, owner, binding);
         call = actual;
         select_future_eof_wait(
-            &state, &root, binding, call, &request, &response, committed, deadline, &pages,
-            &events, old_epoch,
+            (&state, &root, binding, call), &request, &response, committed, deadline, (&pages, &events, old_epoch),
         )
         .await;
         assert_eq!(pending.await.unwrap(), 0);
@@ -8346,9 +8341,8 @@ async fn record_guest_after_canonical_probe<'a>(
         .foreground_v4_receive_after_probe(
             &mut guest,
             scalar_read(17, address, 8),
-            admitted,
-            crate::network_replay::NetworkEngineMode::Record,
-            nonblocking,
+            admitted, (crate::network_replay::NetworkEngineMode::Record,
+            nonblocking),
             prepared,
             None,
         )
@@ -8789,7 +8783,7 @@ async fn retry_complete(f: &NativeNoStoreFixture) -> crate::network_replay::Comp
 }
 async fn assert_retry_failure_released(
     f: &mut NativeNoStoreFixture,
-    failure: crate::tool_global::ReceiveRetryFailure,
+    failure: Box<crate::tool_global::ReceiveRetryFailure>,
 ) {
     let primary = failure.primary().clone();
     let q = &mut f.fixture;
@@ -9677,9 +9671,8 @@ async fn record_blocking_dispatch<'a>(
         let mut pending = std::pin::pin!(tool.foreground_v4_receive_after_probe(
             &mut guest,
             read,
-            admitted,
-            crate::network_replay::NetworkEngineMode::Record,
-            false,
+            admitted, (crate::network_replay::NetworkEngineMode::Record,
+            false),
             prepared,
             Some(invocation)
         ));
@@ -10566,9 +10559,8 @@ async fn guest_v4_finite_record_empty_expiry_before_or_during_clock_rpc_does_not
             .foreground_v4_receive_after_probe(
                 &mut guest,
                 read,
-                admitted,
-                crate::network_replay::NetworkEngineMode::Record,
-                false,
+                admitted, (crate::network_replay::NetworkEngineMode::Record,
+                false),
                 prepared,
                 Some(invocation),
             )
@@ -10660,9 +10652,8 @@ async fn guest_v4_finite_record_interrupted_timer_reprobes_before_data_eof_or_er
             let mut pending = std::pin::pin!(tool.foreground_v4_receive_after_probe(
                 &mut guest,
                 read,
-                admitted,
-                crate::network_replay::NetworkEngineMode::Record,
-                false,
+                admitted, (crate::network_replay::NetworkEngineMode::Record,
+                false),
                 prepared,
                 Some(invocation)
             ));
@@ -10963,9 +10954,8 @@ async fn guest_v4_finite_actual_signaled_refuses_without_normal_grant_in_record_
             let mut pending = std::pin::pin!(tool.foreground_v4_receive_after_probe(
                 &mut guest,
                 read,
-                admitted,
-                crate::network_replay::NetworkEngineMode::Record,
-                false,
+                admitted, (crate::network_replay::NetworkEngineMode::Record,
+                false),
                 prepared,
                 Some(invocation)
             ));

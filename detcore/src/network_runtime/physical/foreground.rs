@@ -18,7 +18,9 @@ mod policy_tests;
 pub(crate) struct ForegroundRoot {
     association: InitialTableAssociation,
     owner: NetworkStreamOwner,
-    logical_process: crate::types::DetPid,
+    // Retain the original logical process identity and field/drop order even
+    // though the current physical consumer uses the process below.
+    _logical_process: crate::types::DetPid,
     process: i32,
     thread: i32,
     native_identity: (u64, u64, u64, u64),
@@ -31,12 +33,20 @@ pub(crate) struct ForegroundRoot {
 }
 impl ForegroundRoot {
     #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "retained shared-birth guard fixture; no active caller or qualification claim"
+    )]
     pub(crate) async fn controlled_shared_birth_fixture(
         thread: i32,
     ) -> policy_tests::SharedBirthFixture {
         policy_tests::SharedBirthFixture::new(thread).await
     }
     #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "retained pre-close shared-birth guard fixture; no active caller or qualification claim"
+    )]
     pub(crate) async fn controlled_shared_birth_after_close_setup(
         thread: i32,
         before: impl FnOnce(&Arc<Self>, &InitialTableClaim),
@@ -65,9 +75,6 @@ impl ForegroundRoot {
     }
     pub(crate) fn process(&self) -> i32 {
         self.process
-    }
-    pub(crate) fn logical_process(&self) -> crate::types::DetPid {
-        self.logical_process
     }
     pub(crate) fn thread(&self) -> i32 {
         self.thread
@@ -128,6 +135,7 @@ impl ForegroundRoot {
     /// CLONE_VM sibling to use a mapping observed from its creator without
     /// treating equal numeric MM IDs or independently reconstructed metadata as
     /// authority.
+    #[cfg(test)]
     pub(crate) fn same_memory_authority(&self, other: &ForegroundRoot) -> bool {
         self.is_current(self.owner())
             && other.is_current(other.owner())
@@ -215,7 +223,7 @@ impl<T> CustodyTasks<T> {
                 Some(Arc::new(ForegroundRoot {
                     association: parent.association.clone(),
                     owner,
-                    logical_process: birth.child_process(),
+                    _logical_process: birth.child_process(),
                     process,
                     thread,
                     native_identity: (
@@ -277,7 +285,7 @@ impl<T> CustodyTasks<T> {
         task.foreground_root = Some(Arc::new(ForegroundRoot {
             association: association.clone(),
             owner,
-            logical_process: owner.thread,
+            _logical_process: owner.thread,
             process: task.process,
             thread: task.thread,
             native_identity: (
@@ -320,15 +328,31 @@ impl<T> CustodyTasks<T> {
 // Explicit component premises using the existing census/semantic issuer. They
 // do not represent a native receipt or authorize production via configuration.
 #[cfg(test)]
-fn controlled_tasks(
-    thread: i32,
-) -> (
+type ControlledTaskFixture = (
     CustodyTasks<u64>,
     NetworkStreamOwner,
     Arc<Mutex<FileMetadata>>,
     Arc<Mutex<MemoryMetadata>>,
     InitialTableClaim,
-) {
+);
+#[cfg(test)]
+type ControlledRootFixture = (
+    Arc<ForegroundRoot>,
+    Arc<Mutex<FileMetadata>>,
+    Arc<Mutex<MemoryMetadata>>,
+    InitialTableClaim,
+);
+#[cfg(test)]
+type ControlledRuntimeFixture = (
+    super::super::NetworkRuntimeResources,
+    Arc<ForegroundRoot>,
+    Arc<Mutex<FileMetadata>>,
+    Arc<Mutex<MemoryMetadata>>,
+    InitialTableClaim,
+);
+
+#[cfg(test)]
+fn controlled_tasks(thread: i32) -> ControlledTaskFixture {
     let thread = DetTid::from_raw(thread);
     let before = MmId::initial(thread);
     let owner = NetworkStreamOwner {
@@ -374,14 +398,7 @@ fn controlled_tasks(
     )
 }
 #[cfg(test)]
-pub(crate) fn controlled_foreground_root(
-    thread: i32,
-) -> (
-    Arc<ForegroundRoot>,
-    Arc<Mutex<FileMetadata>>,
-    Arc<Mutex<MemoryMetadata>>,
-    InitialTableClaim,
-) {
+pub(crate) fn controlled_foreground_root(thread: i32) -> ControlledRootFixture {
     let (mut tasks, owner, metadata, memory, claim) = controlled_tasks(thread);
     tasks
         .bind_foreground_metadata(owner, &metadata, &memory)
@@ -392,6 +409,46 @@ pub(crate) fn controlled_foreground_root(
         memory,
         claim,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn controlled_foreground_runtime(thread: i32) -> ControlledRuntimeFixture {
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    let (mut tasks, owner, metadata, memory, claim) = controlled_tasks(thread);
+    tasks
+        .bind_foreground_metadata(owner, &metadata, &memory)
+        .unwrap();
+    let root = tasks.foreground_root(owner).unwrap();
+    let (runtime, _) = super::super::tests::fixture(94);
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, thread, libc::O_EXCL) };
+    assert!(
+        raw >= 0,
+        "controlled current-process PIDFD_THREAD: {}",
+        std::io::Error::last_os_error()
+    );
+    let task = tasks.tasks.remove(&owner.thread).unwrap();
+    let mut actual = runtime.shared.physical.lock().unwrap();
+    actual.first_task = tasks.first_task;
+    actual.next_registration = tasks.next_registration;
+    actual.sole_initial_root_lost = tasks.sole_initial_root_lost.clone();
+    actual.tasks.insert(
+        owner.thread,
+        Task {
+            mm: task.mm,
+            process: task.process,
+            thread: task.thread,
+            handle: unsafe { OwnedFd::from_raw_fd(raw as i32) },
+            initial_exec: task.initial_exec,
+            foreground_root: task.foreground_root,
+            retired: task.retired,
+            enrollment: task.enrollment,
+            native_birth: task.native_birth,
+            foreground_metadata: task.foreground_metadata,
+        },
+    );
+    drop(actual);
+    (runtime, root, metadata, memory, claim)
 }
 #[cfg(test)]
 mod tests {
@@ -495,52 +552,4 @@ mod tests {
             "forget cannot erase physical history"
         );
     }
-}
-
-#[cfg(test)]
-pub(crate) fn controlled_foreground_runtime(
-    thread: i32,
-) -> (
-    super::super::NetworkRuntimeResources,
-    Arc<ForegroundRoot>,
-    Arc<Mutex<FileMetadata>>,
-    Arc<Mutex<MemoryMetadata>>,
-    InitialTableClaim,
-) {
-    use std::os::fd::FromRawFd;
-    use std::os::fd::OwnedFd;
-    let (mut tasks, owner, metadata, memory, claim) = controlled_tasks(thread);
-    tasks
-        .bind_foreground_metadata(owner, &metadata, &memory)
-        .unwrap();
-    let root = tasks.foreground_root(owner).unwrap();
-    let (runtime, _) = super::super::tests::fixture(94);
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, thread, libc::O_EXCL) };
-    assert!(
-        raw >= 0,
-        "controlled current-process PIDFD_THREAD: {}",
-        std::io::Error::last_os_error()
-    );
-    let task = tasks.tasks.remove(&owner.thread).unwrap();
-    let mut actual = runtime.shared.physical.lock().unwrap();
-    actual.first_task = tasks.first_task;
-    actual.next_registration = tasks.next_registration;
-    actual.sole_initial_root_lost = tasks.sole_initial_root_lost.clone();
-    actual.tasks.insert(
-        owner.thread,
-        Task {
-            mm: task.mm,
-            process: task.process,
-            thread: task.thread,
-            handle: unsafe { OwnedFd::from_raw_fd(raw as i32) },
-            initial_exec: task.initial_exec,
-            foreground_root: task.foreground_root,
-            retired: task.retired,
-            enrollment: task.enrollment,
-            native_birth: task.native_birth,
-            foreground_metadata: task.foreground_metadata,
-        },
-    );
-    drop(actual);
-    (runtime, root, metadata, memory, claim)
 }

@@ -55,7 +55,7 @@ impl BridgeConfiguration {
     }
 }
 
-pub(super) fn decode_digest(text: &str) -> io::Result<[u8; 32]> {
+pub(super) fn decode_digest(text: &str) -> io::Result<[u8; 32]>{
     require(
         text.len() == 64
             && text
@@ -64,7 +64,7 @@ pub(super) fn decode_digest(text: &str) -> io::Result<[u8; 32]> {
         "bridge digest grammar differs",
     )?;
     let mut bytes = [0; 32];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] =
             u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).map_err(io::Error::other)?;
     }
@@ -209,7 +209,7 @@ impl EntryCustody {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let milliseconds = ((self.creator_cutoff - now + 999_999) / 1_000_000) as i32;
+            let milliseconds = (self.creator_cutoff - now).div_ceil(1_000_000) as i32;
             let raw = unsafe { libc::poll(&mut fd, 1, milliseconds) };
             if raw < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;

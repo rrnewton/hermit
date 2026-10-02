@@ -635,6 +635,7 @@ impl Journal {
 #[derive(Debug)]
 pub(super) struct FrozenJournal<'a> {
     original: &'a Journal,
+    #[expect(dead_code, reason = "Frozen journal paired bytes are retained for the unwired recovery export")]
     pairs: Vec<u8>,
 }
 impl FrozenJournal<'_> {
@@ -647,6 +648,7 @@ impl FrozenJournal<'_> {
     pub fn bytes(&self) -> &[u8] {
         &self.original.store.content
     }
+    #[expect(dead_code, reason = "Frozen journal paired bytes are retained for the unwired recovery export")]
     pub fn pairs(&self) -> &[u8] {
         &self.pairs
     }
@@ -869,7 +871,7 @@ fn validate_created_archive(bytes: &[u8], header: &Value, export: &Value) -> io:
     let mut rows = Vec::new();
     for line in bytes[..bytes.len() - 1].split(|b| *b == b'\n') {
         require(
-            !line.is_empty() && line.len() + 1 <= 4096,
+            !line.is_empty() && line.len() < 4096,
             "archive original row bound exceeded",
         )?;
         let row: Value = serde_json::from_slice(line)?;
@@ -902,7 +904,7 @@ fn validate_created_archive(bytes: &[u8], header: &Value, export: &Value) -> io:
             "archive contains extra or duplicate callback",
         )?;
         let pair = &pairs[sequence / 2];
-        let before = sequence % 2 == 0;
+        let before = sequence.is_multiple_of(2);
         require(
             kind == if before {
                 "before-write"
@@ -1122,6 +1124,7 @@ pub(super) struct AcknowledgedSourceReadback {
 }
 #[derive(Debug)]
 pub(super) struct AcknowledgedPrefixAttempt {
+    #[expect(dead_code, reason = "Original acknowledged-prefix diagnostic is retained; its diagnostic accessor is not yet integrated")]
     pub(super) prefix_bytes: usize,
     pub(super) observed_size: Option<usize>,
     pub(super) raw: Option<isize>,
@@ -1212,6 +1215,7 @@ impl SourceLedgerReader {
     pub(super) fn held_rights(&self) -> &[OwnedFd] {
         &self.rights
     }
+    #[expect(dead_code, reason = "Original acknowledged-prefix diagnostic is retained; its diagnostic accessor is not yet integrated")]
     pub(super) fn acknowledged_prefix_attempt(&self) -> Option<&AcknowledgedPrefixAttempt> {
         self.acknowledged_prefix_attempt.as_ref()
     }

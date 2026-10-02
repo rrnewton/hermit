@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 #[macro_use]
 mod macros;
@@ -379,24 +379,22 @@ impl detcore::RecordOrReplay for Replayer {
             detcore::OriginalFileExecution::Native
         }
     }
-    fn consume_recorded_original_file<G: Guest<Self>>(
+    async fn consume_recorded_original_file<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
-    ) -> impl std::future::Future<Output = Result<i64, Error>> + Send {
-        async move {
-            if !matches!(call, Syscall::Read(_))
-                && !matches!(call, Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETFL))
-            {
-                return Err(Error::Tool(anyhow::anyhow!(
-                    "recorded original-file command changed"
-                )));
-            }
-            // Use the ordinary dispatcher: ReadV2 supplies its existing bytes-
-            // derived result or serialized errno; F_GETFL consumes Return.
-            // No injection, new event, provider receipt or second format exists.
-            self.handle_syscall_event(guest, call).await
+    ) -> Result<i64, Error> {
+        if !matches!(call, Syscall::Read(_))
+            && !matches!(call, Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETFL))
+        {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "recorded original-file command changed"
+            )));
         }
+        // Use the ordinary dispatcher: ReadV2 supplies its existing bytes-
+        // derived result or serialized errno; F_GETFL consumes Return.
+        // No injection, new event, provider receipt or second format exists.
+        self.handle_syscall_event(guest, call).await
     }
 }
 

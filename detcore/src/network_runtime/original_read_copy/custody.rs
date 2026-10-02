@@ -106,6 +106,7 @@ impl CompletedDelta {
     }
     /// Borrow the unchanged native DATA plus following UNIT record. This
     /// callback runs under raw custody and must not reenter the engine/Driver.
+    #[cfg(test)]
     pub(crate) fn with_unit<T>(
         &self,
         ordinal: usize,
@@ -188,7 +189,7 @@ impl ReadCopyCustody {
     /// Physical diagnostic custody for an actually dead task with no selected
     /// Call row. This is not a grammar or file-selection capability. It stays
     /// pending until the same raw store receives the finite empty terminal cut.
-    pub(crate) fn prepare_empty_terminal(
+    pub(in crate::network_runtime) fn prepare_empty_terminal(
         &self,
         authority: crate::network_runtime::copy_wire_authority::EmptyCopyTerminalAuthority,
         terminal: &OriginalTerminal,
@@ -229,7 +230,7 @@ impl ReadCopyCustody {
     /// Retain every raw record first, even though this capability permits no
     /// data interpretation. Only the actual finite ThreadTerminal cut and an
     /// empty unchanged canonical store can become eligible for validation.
-    pub(crate) fn append_empty_terminal(
+    pub(in crate::network_runtime) fn append_empty_terminal(
         &self,
         terminal: &OriginalTerminal,
         first: u64,
@@ -482,7 +483,10 @@ impl ReadCopyCustody {
         }))
     }
 
-    pub(crate) fn collect(&self, effect: &OriginalEffect) -> io::Result<Arc<Capture>> {
+    pub(in crate::network_runtime) fn collect(
+        &self,
+        effect: &OriginalEffect,
+    ) -> io::Result<Arc<Capture>> {
         let mut state = self.lock()?;
         let result = (|| {
             if state.wire_started && state.prefix.wire.is_none() {
@@ -571,7 +575,7 @@ impl ReadCopyCustody {
         self.collect(&effect)
     }
 
-    pub(crate) fn validate_terminal(
+    pub(in crate::network_runtime) fn validate_terminal(
         &self,
         terminal: &OriginalTerminal,
         end: End,
@@ -764,7 +768,7 @@ mod tests {
                 CONSUME,
             ];
             let mut bytes = vec![0; RECORD_BYTES];
-            for (slot, field) in bytes[..72].chunks_exact_mut(8).zip(fields) {
+            for (slot, field) in bytes[..72].as_chunks_mut::<8>().0.iter_mut().zip(fields) {
                 slot.copy_from_slice(&field.to_le_bytes());
             }
             all.push(Record {
@@ -1521,7 +1525,7 @@ mod empty_terminal_tests {
         unit.length = 72;
         for (word, value) in unit
             .bytes
-            .chunks_exact_mut(8)
+            .as_chunks_mut::<8>().0.iter_mut()
             .zip([23u64, 1, 0, 3, 3, 0, 42, 1, 1])
         {
             word.copy_from_slice(&value.to_le_bytes());
@@ -1647,6 +1651,9 @@ mod empty_terminal_tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) type ControlledCopyAttempt = (u64, u64, u64, u64, Vec<u8>, i64);
+
 /// Explicit provider input for engine component controls. The actual private
 /// Controller issuer, negotiated parser and canonical store remain in the path.
 /// These records are controlled metadata, never a native BPF witness.
@@ -1657,7 +1664,7 @@ impl ReadCopyCustody {
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
         selected: OriginalSelection,
-        attempts: &[(u64, u64, u64, u64, Vec<u8>, i64)],
+        attempts: &[ControlledCopyAttempt],
     ) -> io::Result<Vec<Record>> {
         self.bind(owner, call, selected.command)?;
         if !self.lock()?.wire_started {
@@ -1678,7 +1685,7 @@ impl ReadCopyCustody {
         let mut records = Vec::new();
         let mut word_record = |ordinal: u64, offset: u64, kind: u32, words: &[u64]| {
             let mut bytes = vec![0; RECORD_BYTES];
-            for (slot, value) in bytes.chunks_exact_mut(8).zip(words) {
+            for (slot, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
                 slot.copy_from_slice(&value.to_le_bytes());
             }
             let record = Record {

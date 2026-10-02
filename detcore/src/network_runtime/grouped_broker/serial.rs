@@ -86,6 +86,7 @@ pub(super) struct InFlightSource {
 impl InFlightSource {
     /// Infallible move BEFORE the caller drives terminal/export operations.
     /// Bounds come from the actual original Holder, not a supplied new origin.
+    #[expect(dead_code, reason = "Legacy local source constructor; the maintained entry uses remote runtime custody")]
     pub fn retain(
         guardian: guardian::Holder,
         source: owner::Launcher,
@@ -205,12 +206,12 @@ impl InFlightSource {
         self.source.drain()?;
         self.keeper.drain()?;
         self.guardian.progress()?;
-        if self.keeper_notice.is_none() {
-            if let Some(index) = self.parent.receive(4096)? {
+        if self.keeper_notice.is_none()
+            && let Some(index) = self.parent.receive(4096)?
+        {
                 self.parent.packets[index].exact(0, self.peer())?;
                 self.keeper_notice = Some(index);
             }
-        }
         if !self.guardian.source_exit_observed() || self.keeper_notice.is_none() {
             return Ok(false);
         }
@@ -344,7 +345,8 @@ struct Joining {
 pub(super) struct SourceTerminal {
     source: JoinedSource,
     cursor: adoption::CursorCustody,
-    observations: owner::CreatedObservations,
+    // Retain the original terminal observations through the owner transition.
+    _observations: owner::CreatedObservations,
 }
 impl SourceTerminal {
     pub(super) fn check_namespace_terminal(&self) -> io::Result<()> {
@@ -383,8 +385,8 @@ struct LeafPlan {
     request: SuccessorRequest,
     intent_attempted: bool,
     intent_complete: bool,
-    keeper_spawn_attempted: bool,
-    source_spawn_attempted: bool,
+    _keeper_spawn_attempted: bool,
+    _source_spawn_attempted: bool,
     refused: Option<Failure>,
     // Captured from the actual completed Holder before its one-use handoff.
     // The new owner retains these bytes with both original journals; no
@@ -487,12 +489,12 @@ impl SerialOwner {
         )
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refused.is_none() {
+        if let Err(error) = &result
+            && self.refused.is_none()
+        {
                 self.refused = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     pub fn take_leaf_namespace(&mut self) -> io::Result<owner::PreparedLeafNamespace> {
@@ -548,7 +550,7 @@ impl SerialOwner {
             self.phase = Some(Phase::Terminal(SourceTerminal {
                 source: joining.source,
                 cursor: joining.cursor.unwrap(),
-                observations: joining.observations.unwrap(),
+                _observations: joining.observations.unwrap(),
             }));
             Ok(true)
         })();
@@ -709,7 +711,7 @@ impl SerialOwner {
     }
     /// Consume exactly once before validation/durable intent. A refused plan
     /// keeps the original source/archive/native resources in this owner.
-    pub fn into_leaf_plan(&mut self, request: SuccessorRequest) -> io::Result<()> {
+    pub fn prepare_leaf_plan(&mut self, request: SuccessorRequest) -> io::Result<()> {
         let result = (|| {
             self.check()?;
             require(
@@ -724,8 +726,8 @@ impl SerialOwner {
                 request,
                 intent_attempted: false,
                 intent_complete: false,
-                keeper_spawn_attempted: false,
-                source_spawn_attempted: false,
+                _keeper_spawn_attempted: false,
+                _source_spawn_attempted: false,
                 refused: None,
                 created_pairs: None,
             }));

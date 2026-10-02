@@ -112,12 +112,12 @@ impl NetworkReplayEngine {
         if prior.is_some_and(|prior| !prior.ptr_eq(&weak)) {
             return Err(protocol("live FilesId changed its actual metadata object"));
         }
-        if prior.is_none() {
-            if let Some(initial) = initial {
-                initial
-                    .bind(owner, observed)
-                    .map_err(|error| protocol(&error.to_string()))?;
-            }
+        if prior.is_none()
+            && let Some(initial) = initial
+        {
+            initial
+                .bind(owner, observed)
+                .map_err(|error| protocol(&error.to_string()))?;
         }
         self.associate_fd_metadata(owner, actual, observed)
     }
@@ -271,6 +271,7 @@ mod tests {
         else {
             panic!("fully published fixture must admit its exact reader");
         };
+        let read = *read;
         let before = format!("{engine:?}");
         assert!(
             engine

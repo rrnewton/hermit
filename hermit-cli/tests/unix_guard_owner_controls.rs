@@ -3,7 +3,7 @@
  * All rights reserved.
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 //! Maintained controls over actual owner/API source; no keeper or policy load.
 //! The native monitor and final controller exit are explicit test substitutes.
 use std::fs::File;
@@ -642,7 +642,7 @@ fn unix_guard_owner_controls() {
     let late_cleanup = run(
         &root,
         "late-cleanup-observation",
-        &mut Command::new(&hang).arg("--late-success"),
+        Command::new(&hang).arg("--late-success"),
         WALL,
         Inject::DelayCleanupObservation {
             budget: Duration::from_millis(10),

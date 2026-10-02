@@ -22,7 +22,7 @@ fn selection(maximum: u64) -> OriginalSelection {
 }
 fn words(sequence: u64, attempt: u64, offset: u64, kind: u32, fields: &[u64]) -> Record {
     let mut bytes = vec![0; RECORD_BYTES];
-    for (word, value) in bytes.chunks_exact_mut(8).zip(fields) {
+    for (word, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
         word.copy_from_slice(&value.to_le_bytes());
     }
     Record {
@@ -39,6 +39,10 @@ fn words(sequence: u64, attempt: u64, offset: u64, kind: u32, fields: &[u64]) ->
         bytes,
     }
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Grammar tests vary each wire field independently, including invalid combinations"
+)]
 fn attempt(
     records: &mut Vec<Record>,
     attempt: u64,

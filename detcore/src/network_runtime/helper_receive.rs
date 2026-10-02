@@ -179,6 +179,7 @@ pub(super) struct Held {
     state: Arc<Mutex<State>>,
 }
 impl Held {
+    #[cfg(test)]
     pub(super) fn new_bound(
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
@@ -390,6 +391,7 @@ impl Scratch {
                 0
             }
     }
+    #[cfg(test)]
     fn operation(&self) -> u64 {
         if self.kind == ReceiveKind::Drain {
             21
@@ -1078,7 +1080,7 @@ impl Held {
         let mut records = Vec::new();
         let mut record = |kind: u32, fields: &[u64], payload: Option<&[u8]>| {
             let mut bytes = vec![0; RECORD_BYTES];
-            for (word, value) in bytes.chunks_exact_mut(8).zip(fields) {
+            for (word, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
                 word.copy_from_slice(&value.to_le_bytes());
             }
             let length = if let Some(payload) = payload {
@@ -1393,7 +1395,7 @@ mod tests {
             assert_eq!(scratch.header.msg_controllen, 0);
             assert_eq!(scratch.header.msg_flags, 0);
             assert_eq!(scratch.flags(), 0x42);
-            let moved = vec![Box::new(scratch)];
+            let moved = [Box::new(scratch)];
             assert_eq!(moved[0].address(), address);
             assert_eq!(moved[0].header.msg_iov, iov);
             assert_eq!(moved[0]._iov.len(), moved[0].header.msg_iovlen);
@@ -1720,6 +1722,10 @@ mod tests {
 /// this is not native BPF evidence or a supported TCP/Unix classification test.
 #[cfg(test)]
 impl Binding {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture independently names owner, Call, lease, engine, bytes, wire version, worker join, and EOF"
+    )]
     pub(crate) async fn controlled_joined_peek(
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
@@ -1742,6 +1748,10 @@ impl Binding {
     // A nonzero sink prefix is explicit controlled provider DATA. The actual
     // syscall's entire return/errno and returned suffix remain checked below;
     // no native BPF or actual sink-buffer readback is claimed by this fixture.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture independently names owner, Call, lease, engine, bytes, wire version, worker join, EOF, and provider prefix"
+    )]
     pub(crate) async fn controlled_joined_peek_prefix(
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
@@ -1763,6 +1773,10 @@ impl Binding {
         )
         .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture independently names runtime, owner, Call, lease, engine, bytes, wire version, worker join, and EOF"
+    )]
     pub(crate) async fn controlled_joined_peek_on(
         runtime: NetworkRuntimeResources,
         owner: NetworkStreamOwner,
@@ -1783,6 +1797,10 @@ impl Binding {
         )
         .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture independently names runtime, owner, Call, lease, engine, bytes, wire version, worker join, EOF, and provider prefix"
+    )]
     pub(crate) async fn controlled_joined_peek_in_runtime(
         runtime: NetworkRuntimeResources,
         owner: NetworkStreamOwner,
@@ -1804,6 +1822,10 @@ impl Binding {
         )
         .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture independently names runtime, owner, Call, lease, engine, bytes, wire version, worker join, EOF, provider prefix, and retained peer"
+    )]
     pub(crate) async fn controlled_joined_peek_retaining_peer(
         runtime: NetworkRuntimeResources,
         owner: NetworkStreamOwner,

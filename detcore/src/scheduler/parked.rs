@@ -3,7 +3,7 @@
  * All rights reserved.
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! A logical parked request can use several single-use RPC responses. Only the
 //! scheduler daemon moves its queue entry; RPC handlers post bounded intents.
@@ -194,7 +194,7 @@ pub enum ResourceReply {
         /// Existing resume disposition; this variant is emitted only on normal Go.
         status: ResumeStatus,
         /// Engine-owned current binding and publication token.
-        read: crate::network_replay::NetworkFdReadAdmission,
+        read: Box<crate::network_replay::NetworkFdReadAdmission>,
     },
     ObserveSignal(Box<AlarmControl>),
 }

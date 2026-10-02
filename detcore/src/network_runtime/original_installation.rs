@@ -30,11 +30,11 @@ pub(crate) enum Source {
 /// Annotation returned only after the existing exact metadata transaction.
 /// These RPC fields carry no provider/installation authority of their own.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct OpenatPublication {
-    pub binding: Option<crate::types::FdSlotBinding>,
-    pub live: bool,
-    pub stat: Option<crate::stat::DetStat>,
-    pub resolved_path: Option<std::path::PathBuf>,
+pub struct OpenatPublication {
+    pub(crate) binding: Option<crate::types::FdSlotBinding>,
+    pub(crate) live: bool,
+    pub(crate) stat: Option<crate::stat::DetStat>,
+    pub(crate) resolved_path: Option<std::path::PathBuf>,
 }
 
 /// Complete observations supplied to the same synchronous metadata publisher.
@@ -367,12 +367,8 @@ impl Installation {
         owner: Owner,
         permit: NetworkFdPublicationPermit,
         source: Source,
-        command: u64,
-        fd: i32,
-        file: u64,
-        begin: u64,
-        end: u64,
-        through: u64,
+        effect: (u64, i32, u64),
+        cut: (u64, u64, u64),
         history: &History,
     ) -> io::Result<Self> {
         if permit.owner != owner.owner || permit.files != owner.files {
@@ -384,12 +380,8 @@ impl Installation {
             owner,
             Some(permit),
             source,
-            command,
-            fd,
-            file,
-            begin,
-            end,
-            through,
+            effect,
+            cut,
             history,
         )
     }
@@ -399,16 +391,12 @@ impl Installation {
     pub(super) fn checked_terminal(
         owner: Owner,
         source: Source,
-        command: u64,
-        fd: i32,
-        file: u64,
-        begin: u64,
-        end: u64,
-        through: u64,
+        effect: (u64, i32, u64),
+        cut: (u64, u64, u64),
         history: &History,
     ) -> io::Result<Self> {
         Self::checked_effect(
-            owner, None, source, command, fd, file, begin, end, through, history,
+            owner, None, source, effect, cut, history,
         )
         .and_then(|receipt| receipt.reconcile(history))
     }
@@ -417,12 +405,8 @@ impl Installation {
         owner: Owner,
         permit: Option<NetworkFdPublicationPermit>,
         source: Source,
-        command: u64,
-        fd: i32,
-        file: u64,
-        begin: u64,
-        end: u64,
-        through: u64,
+        (command, fd, file): (u64, i32, u64),
+        (begin, end, through): (u64, u64, u64),
         history: &History,
     ) -> io::Result<Self> {
         if command == 0
@@ -936,12 +920,8 @@ impl super::NetworkRuntimeResources {
                     }
                     _ => unreachable!("allocator checked above"),
                 },
-                command,
-                fd,
-                effect.original.selection.file,
-                begin,
-                end,
-                through,
+                (command, fd, effect.original.selection.file),
+                (begin, end, through),
                 journal.history(),
             )
             .and_then(|mut receipt| {
@@ -1417,12 +1397,8 @@ impl super::RuntimeShared {
                     let mut receipt = Installation::checked_terminal(
                         bound.clone(),
                         source,
-                        command,
-                        fd,
-                        effect.original.selection.file,
-                        begin,
-                        end,
-                        through,
+                        (command, fd, effect.original.selection.file),
+                        (begin, end, through),
                         journal.history(),
                     )?;
                     if admission.arguments.kind == Kind::Openat {
@@ -1621,12 +1597,8 @@ impl super::RuntimeShared {
                     Installation::checked_terminal(
                         bound.clone(),
                         receipt.source(),
-                        command,
-                        fd,
-                        effect.original.selection.file,
-                        begin,
-                        end,
-                        through,
+                        (command, fd, effect.original.selection.file),
+                        (begin, end, through),
                         journal.history(),
                     )?
                 };
@@ -1863,12 +1835,8 @@ pub(crate) fn installation_fixture(
         },
         permit,
         source,
-        command,
-        fd,
-        19,
-        1,
-        2,
-        status.next_event,
+        (command, fd, 19),
+        (1, 2, status.next_event),
         &history,
     )
     .unwrap()
@@ -1971,12 +1939,8 @@ pub(crate) fn removed_installation_fixture(
         },
         permit,
         source,
-        command,
-        fd,
-        19,
-        1,
-        2,
-        status.next_event,
+        (command, fd, 19),
+        (1, 2, status.next_event),
         &history,
     )
     .unwrap()
@@ -2088,12 +2052,8 @@ pub(crate) fn terminal_installation_fixture(
             table: 13,
         },
         source,
-        command,
-        fd,
-        19,
-        1,
-        2,
-        through,
+        (command, fd, 19),
+        (1, 2, through),
         &history,
     )
     .unwrap()
@@ -2370,12 +2330,8 @@ mod recovery_tests {
                 },
                 permit,
                 Source::Socket(NetworkStreamCallId::controlled_fixture(1)),
-                71,
-                17,
-                19,
-                1,
-                2,
-                status.next_event,
+                (71, 17, 19),
+                (1, 2, status.next_event),
                 &history,
             )
             .unwrap();
@@ -2490,12 +2446,8 @@ mod recovery_tests {
                         },
                         permit,
                         Source::Socket(NetworkStreamCallId::controlled_fixture(1)),
-                        71,
-                        17,
-                        19,
-                        1,
-                        2,
-                        status.next_event,
+                        (71, 17, 19),
+                        (1, 2, status.next_event),
                         &history,
                     )
                     .unwrap();
@@ -2625,12 +2577,8 @@ mod recovery_tests {
             let good = Installation::checked_terminal(
                 bound.clone(),
                 Source::Socket(NetworkStreamCallId::controlled_fixture(1)),
-                71,
-                17,
-                19,
-                1,
-                2,
-                cut,
+                (71, 17, 19),
+                (1, 2, cut),
                 &history,
             );
             assert_eq!(good.is_ok(), cut == 5, "unfinished table put cut={cut}");
@@ -2640,12 +2588,8 @@ mod recovery_tests {
                 Installation::checked_terminal(
                     changed,
                     Source::Socket(NetworkStreamCallId::controlled_fixture(1)),
-                    71,
-                    17,
-                    19,
-                    1,
-                    2,
-                    cut,
+                    (71, 17, 19),
+                    (1, 2, cut),
                     &history
                 )
                 .is_err()

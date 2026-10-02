@@ -259,7 +259,7 @@ pub(crate) fn validate_selection(request: &Request, raw: &OriginalResult) -> io:
 }
 /// Linux has already executed the original ADD/MOD/DEL, including all error
 /// ordering. This validates the result's provenance; it does not redo control.
-pub(crate) fn validate_completion(
+pub(super) fn validate_completion(
     request: &Request,
     effect: &OriginalEffect,
 ) -> io::Result<(Capture, i64)> {

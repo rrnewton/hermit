@@ -18,10 +18,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-pub const CREATED: u64 = 1;
-pub const QUEUED: u64 = 2;
-pub const RETIRED: u64 = 4;
-pub const MATCHED: u64 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -396,15 +392,6 @@ pub struct Observation<T> {
     /// May be zero, partial or complete on error; never a certificate by itself.
     pub raw: T,
 }
-impl<T> Observation<T> {
-    pub fn into_result(self) -> Result<T, Self> {
-        if self.status.succeeded() {
-            Ok(self.raw)
-        } else {
-            Err(self)
-        }
-    }
-}
 #[derive(Clone, Debug)]
 pub struct Inventory {
     pub status: CallStatus,
@@ -439,9 +426,6 @@ pub struct AuditState {
 #[derive(Clone, Debug, Default)]
 pub struct AuditHandle(Arc<Mutex<AuditState>>);
 impl AuditHandle {
-    pub fn snapshot(&self) -> AuditState {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
     fn record(&self, receipt: CloseReceipt) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.invalidated |=
@@ -679,12 +663,14 @@ struct Api {
     ) -> c_int,
     finish_setter: unsafe extern "C" fn(SessionPtr, c_int, u64, *mut CommandResult) -> c_int,
     resolve_accepted: unsafe extern "C" fn(SessionPtr, c_int, c_int, *mut CommandResult) -> c_int,
-    match_accepted:
+    // Resolve and retain the complete required ABI even when this client uses
+    // the original-command route rather than these legacy convenience calls.
+    _match_accepted:
         unsafe extern "C" fn(SessionPtr, c_int, c_int, Identity, *mut CommandResult) -> c_int,
     ack_command: unsafe extern "C" fn(SessionPtr, *const CommandResult) -> c_int,
     read_creation: unsafe extern "C" fn(SessionPtr, u32, *mut Creation) -> c_int,
     read_status: unsafe extern "C" fn(SessionPtr, *mut Status) -> c_int,
-    validate_creation: unsafe extern "C" fn(*const Creation, *const Status) -> c_int,
+    _validate_creation: unsafe extern "C" fn(*const Creation, *const Status) -> c_int,
     identifiers: unsafe extern "C" fn(SessionPtr, *mut ResourceId, u32, *mut u32) -> c_int,
     close: unsafe extern "C" fn(SessionPtr) -> c_int,
 }
@@ -1078,7 +1064,7 @@ impl Library {
                 "ap_resolve_accepted",
                 unsafe extern "C" fn(SessionPtr, c_int, c_int, *mut CommandResult) -> c_int
             ),
-            match_accepted: symbol!(
+            _match_accepted: symbol!(
                 "ap_match_accepted",
                 unsafe extern "C" fn(
                     SessionPtr,
@@ -1100,7 +1086,7 @@ impl Library {
                 "ap_read_status",
                 unsafe extern "C" fn(SessionPtr, *mut Status) -> c_int
             ),
-            validate_creation: symbol!(
+            _validate_creation: symbol!(
                 "ap_validate_creation",
                 unsafe extern "C" fn(*const Creation, *const Status) -> c_int
             ),
@@ -1123,12 +1109,6 @@ impl Library {
     }
     pub fn wire_format(&self) -> super::ProviderWireFormat {
         self.wire_format
-    }
-
-    pub fn validate_creation(&self, creation: &Creation, status: &Status) -> CallStatus {
-        CallStatus::capture("ap_validate_creation", unsafe {
-            (self.api.validate_creation)(creation, status)
-        })
     }
 }
 
@@ -1172,15 +1152,15 @@ impl Session {
             grouped: false,
             grouped_parts: None,
         });
-        if rc == 0 && session.is_some() {
-            return Ok(session.expect("checked Some"));
+        match (rc, session) {
+            (0, Some(session)) => Ok(session),
+            (_, partial) => Err(OpenFailure {
+                status,
+                partial,
+                audit,
+                success_without_session: rc == 0,
+            }),
         }
-        Err(OpenFailure {
-            status,
-            partial: session,
-            audit,
-            success_without_session: rc == 0,
-        })
     }
     pub fn audit(&self) -> AuditHandle {
         self.audit.clone()
@@ -1474,8 +1454,7 @@ impl Session {
     pub fn prepare_original_epoll_ctl(
         &mut self,
         target: BorrowedFd<'_>,
-        call: u64,
-        mm: u64,
+        (call, mm): (u64, u64),
         epfd: i32,
         operation: i32,
         target_fd: i32,
@@ -1549,8 +1528,7 @@ impl Session {
     pub fn prepare_original_openat(
         &mut self,
         target: BorrowedFd<'_>,
-        call: u64,
-        mm: u64,
+        (call, mm): (u64, u64),
         dirfd: i32,
         pathname: u64,
         flags: i32,
@@ -1631,8 +1609,7 @@ impl Session {
     pub fn prepare_helper_receive(
         &mut self,
         target: BorrowedFd<'_>,
-        call: u64,
-        mm: u64,
+        (call, mm): (u64, u64),
         fd: i32,
         address: u64,
         count: u64,
@@ -2003,27 +1980,6 @@ impl Session {
             raw,
         }
     }
-    pub fn match_accepted(
-        &mut self,
-        helper_pidfd: BorrowedFd<'_>,
-        socket: BorrowedFd<'_>,
-        expected: Identity,
-    ) -> Observation<CommandResult> {
-        let mut raw = CommandResult::default();
-        let rc = unsafe {
-            (self.library.api.match_accepted)(
-                self.pointer(),
-                helper_pidfd.as_raw_fd(),
-                socket.as_raw_fd(),
-                expected,
-                &mut raw,
-            )
-        };
-        Observation {
-            status: CallStatus::capture("ap_match_accepted", rc),
-            raw,
-        }
-    }
     /// The durable service inbox must already own this complete observation.
     /// A failed/repeated ACK is retained as its actual status, never inferred to
     /// mean a prior attempt succeeded or permission to submit a new command.
@@ -2052,9 +2008,6 @@ impl Session {
         self.library.wire_format()
     }
 
-    pub fn validate_creation(&self, creation: &Creation, status: &Status) -> CallStatus {
-        self.library.validate_creation(creation, status)
-    }
     pub fn identifiers(&mut self) -> Inventory {
         let capacity = self.inventory_capacity.get() as usize;
         let mut ids = vec![ResourceId::default(); capacity];
@@ -2240,16 +2193,6 @@ pub(super) struct GroupedSessionOwner {
 }
 pub(super) type GroupedBootstrapOwner = GroupedSessionOwner;
 impl GroupedSessionOwner {
-    pub(super) fn retain(
-        bridge: super::grouped_broker::Bridge,
-        library: Rc<Library>,
-        run_controller_pidfd: OwnedFd,
-        broker_endpoint: OwnedFd,
-    ) -> Self {
-        let mut owner = Self::retain_pending(bridge, run_controller_pidfd, broker_endpoint);
-        owner.custody.library = Some(library);
-        owner
-    }
     pub(super) fn retain_pending(
         bridge: super::grouped_broker::Bridge,
         run_controller_pidfd: OwnedFd,
@@ -2354,8 +2297,7 @@ impl GroupedSessionOwner {
                 c.broker_endpoint.as_fd(),
                 incarnation,
                 nonce,
-                deadline,
-                creator_cutoff,
+                (deadline, creator_cutoff),
                 unit,
                 leaves,
             )
@@ -2367,27 +2309,6 @@ impl GroupedSessionOwner {
     /// journal/cursor context and join startup actors; a LEAVES status cannot
     /// satisfy this call. Precondition refusal leaves the input slot untouched;
     /// after transfer starts the owner stays here on every partial failure.
-    pub(super) fn install_runtime_cleanup(
-        &mut self,
-        runtime: &mut Option<super::grouped_broker::RuntimeCleanup>,
-    ) -> io::Result<()> {
-        let c = &mut *self.custody;
-        if c.runtime.is_some()
-            || c.runtime_install_attempted
-            || c.open_attempted
-            || c.first_failure.is_some()
-        {
-            return Err(io::Error::other(
-                "runtime cleanup transfer is one-use before open",
-            ));
-        }
-        c.runtime = Some(
-            runtime
-                .take()
-                .ok_or_else(|| io::Error::other("original runtime cleanup owner is absent"))?,
-        );
-        self.install_retained_runtime_cleanup()
-    }
     pub(super) fn install_retained_runtime_cleanup(&mut self) -> io::Result<()> {
         let result = (|| {
             let c = &mut *self.custody;

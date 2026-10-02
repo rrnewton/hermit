@@ -100,6 +100,7 @@ fn alias(
     else {
         panic!("existing alias source must be admitted");
     };
+    let admission = *admission;
     let permit = admission.publication.permit;
     let captured = metadata.capture_fd(source_fd).unwrap();
     engine.submit_fd_mutation(owner, permit).unwrap();

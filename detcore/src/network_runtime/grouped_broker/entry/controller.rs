@@ -359,11 +359,9 @@ fn run_guardian(
         holder = Some(guardian::Holder::retain(
             intent.clone(),
             config.unit,
-            deadline,
-            native,
+            (deadline, native),
             guardian::Role::Guardian,
-            local,
-            packet.rights.remove(1),
+            (local, packet.rights.remove(1)),
             packet.rights.remove(0),
             arguments,
         ));
@@ -673,18 +671,18 @@ impl Controller {
         let holder = guardian::Holder::retain(
             self.intent.clone(),
             unit.clone(),
-            self.deadline,
-            self.native,
+            (self.deadline, self.native),
             guardian::Role::Guardian,
-            guardian_channel,
-            directory(self.root.as_ref().unwrap(), "source-guardian")?,
+            (
+                guardian_channel,
+                directory(self.root.as_ref().unwrap(), "source-guardian")?,
+            ),
             duplicate(self.image.as_ref().unwrap())?,
             expected.clone(),
         );
         self.source = Some(cleanup::startup::PreparedSource::retain(
             holder,
-            duplicate(self.bridge.as_ref().unwrap())?,
-            digest,
+            (duplicate(self.bridge.as_ref().unwrap())?, digest),
             parent,
             directory(self.root.as_ref().unwrap(), "source-guardian-cleanup")?,
             directory(self.root.as_ref().unwrap(), "source-logs")?,
@@ -783,8 +781,7 @@ impl Controller {
         self.leaf = Some(owner::LeafDelegate::retain(
             self.intent.clone(),
             unit.clone(),
-            self.deadline,
-            self.native,
+            (self.deadline, self.native),
             duplicate(self.image.as_ref().unwrap())?,
             expected,
             local,
@@ -815,9 +812,7 @@ impl Controller {
         let root = namespace.root();
         let argv = launch.arguments_with_prepared_namespace(
             &self.intent.nonce,
-            namespace.fd().as_raw_fd(),
-            setup,
-            image,
+            (namespace.fd().as_raw_fd(), setup, image),
             (ns.device, ns.inode),
             (user.device, user.inode),
             (root.device, root.inode),
@@ -962,8 +957,10 @@ impl Controller {
         let store = directory(self.root.as_ref().unwrap(), "successor-keeper")?;
         self.successor = Some(serial::successor::RetainedSuccessor::retain(
             self.source.as_mut().unwrap().take_serial()?,
-            self.s2.take().unwrap().fd,
-            self.guardian_endpoint.take().unwrap(),
+            (
+                self.s2.take().unwrap().fd,
+                self.guardian_endpoint.take().unwrap(),
+            ),
             self.guardian.take().unwrap(),
             self.provider.take().unwrap(),
             store,
@@ -1265,22 +1262,20 @@ impl Controller {
         if let Ok(cutoff) = cleanup_cutoff(self.deadline, self.first_failure_origin) {
             let later_guardian =
                 self.guardian.is_some() || self.successor.is_some() || self.completed.is_some();
-            if let Some(parent) = &self.guardian_parent {
-                if let Err(e) = self.guardian_shutdown.progress(parent) {
+            if let Some(parent) = &self.guardian_parent
+                && let Err(e) = self.guardian_shutdown.progress(parent) {
                     eprintln!("Guardian writer retirement refused: {e}");
                 }
-            }
             // The Leaf's original successful join predates S2's actual Child.
             // Finish S2 first before asking the retained Leaf to recheck global
             // ECHILD. Before S2, the only possible live local actor is the Leaf
             // itself (S1 joined before it was spawned).
             let mut local_complete = true;
-            if later_guardian || self.leaf.is_none() {
-                if let Err(e) = self.finish_local_custody(cutoff, error) {
+            if (later_guardian || self.leaf.is_none())
+                && let Err(e) = self.finish_local_custody(cutoff, error) {
                     local_complete = false;
                     eprintln!("controller local custody refused: {e}");
                 }
-            }
             if let Some(leaf) = &mut self.leaf {
                 leaf.refuse(error);
                 loop {
@@ -1301,21 +1296,19 @@ impl Controller {
                     }
                 }
             }
-            if !later_guardian && self.leaf.is_some() {
-                if let Err(e) = self.finish_local_custody(cutoff, error) {
+            if !later_guardian && self.leaf.is_some()
+                && let Err(e) = self.finish_local_custody(cutoff, error) {
                     local_complete = false;
                     eprintln!("controller local custody refused: {e}");
                 }
-            }
             if let Err(e) = owner::check_no_children() {
                 local_complete = false;
                 eprintln!("controller final local child census refused: {e}");
             }
-            if local_complete {
-                if let Err(e) = self.emit_local_custody(cutoff) {
+            if local_complete
+                && let Err(e) = self.emit_local_custody(cutoff) {
                     eprintln!("controller durable custody receipt refused: {e}");
                 }
-            }
         }
         eprintln!("startup controller retained failure: {error}");
     }

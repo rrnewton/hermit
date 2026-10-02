@@ -187,12 +187,11 @@ impl SourceAuthorityUnit {
         nonce: String,
         helper: PathBuf,
         arguments: Vec<OsString>,
-        input: OwnedFd,
-        logs: OwnedFd,
-        image: OwnedFd,
+        descriptors: (OwnedFd, OwnedFd, OwnedFd),
         deadline: Instant,
         stage: u64,
     ) -> Self {
+        let (input, logs, image) = descriptors;
         let mut argv = vec![helper.as_os_str().to_owned()];
         argv.extend(arguments.iter().cloned());
         Self {
@@ -233,12 +232,12 @@ impl SourceAuthorityUnit {
         }
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refusal.is_none() {
+        if let Err(error) = &result
+            && self.refusal.is_none()
+        {
                 self.refusal = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     fn bound(&self, cutoff: u64) -> io::Result<Instant> {

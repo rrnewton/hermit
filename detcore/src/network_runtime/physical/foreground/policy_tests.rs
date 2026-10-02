@@ -28,7 +28,8 @@ pub(crate) struct SharedBirthFixture {
     pub(crate) runtime: NetworkRuntimeResources,
     pub(crate) parent: Arc<ForegroundRoot>,
     pub(crate) child: Arc<ForegroundRoot>,
-    pub(crate) birth: NativeBirthAdmission,
+    // Keep the actual issued birth admission alive in the same field/drop order.
+    pub(crate) _birth: NativeBirthAdmission,
     pub(crate) metadata: Arc<Mutex<FileMetadata>>,
     pub(crate) memory: Arc<Mutex<MemoryMetadata>>,
     _peer: BirthPeer,
@@ -89,6 +90,10 @@ impl SharedBirthFixture {
     ) -> Self {
         Self::new_with_setup(thread, |_, _| {}, before).await
     }
+    #[expect(
+        dead_code,
+        reason = "retained pre-close shared-birth guard fixture; no active caller or qualification claim"
+    )]
     pub(crate) async fn new_after_setup(
         thread: i32,
         setup: impl FnOnce(&Arc<ForegroundRoot>, &InitialTableClaim),
@@ -275,7 +280,7 @@ impl SharedBirthFixture {
             runtime,
             parent,
             child,
-            birth,
+            _birth: birth,
             metadata,
             memory,
             _peer: peer,

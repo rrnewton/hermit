@@ -400,7 +400,7 @@ pub(super) enum Request {
     /// Only a PIDFD crosses this channel; the regular file stays in the worker.
     ObserveTerminalSocket {
         call: u64,
-        effect: OriginalEffect,
+        effect: Box<OriginalEffect>,
     },
     RetireTerminalSocketObservation {
         call: u64,
@@ -874,7 +874,7 @@ fn acknowledge_response(
             selection,
             effect: Some(observation),
         } if envelope.operation == Operation::CollectOriginalFileObservation
-            && matches!(expected_operation, 21 | 22 | 23)
+            && matches!(expected_operation, 21..=23)
             && selection.status.returned == 0
             && selection.status.errno.is_none()
             && selection.raw == observation.raw.original.selection =>
@@ -1004,9 +1004,6 @@ impl Provider {
             .as_mut()
             .ok_or_else(|| io::Error::other("actual grouped bootstrap owner is absent"))
     }
-    pub(super) fn has_grouped_owner(&self) -> bool {
-        self.grouped.is_some()
-    }
     /// # Safety
     /// Library and object must be immutable authenticated artifacts under the
     /// reviewed outside-service deployment. Loader dependencies/environment must
@@ -1019,11 +1016,11 @@ impl Provider {
         expected: &ProviderArtifact,
     ) -> io::Result<ProviderReady> {
         let result = unsafe { self.open_retained(library, object, run, expected) };
-        if let Err(error) = &result {
-            if let Some(owner) = &mut self.grouped {
+        if let Err(error) = &result
+            && let Some(owner) = &mut self.grouped
+        {
                 owner.retain_failure(error);
             }
-        }
         result
     }
     unsafe fn open_retained(
@@ -1780,7 +1777,7 @@ mod tests {
             operation: Operation::ObserveTerminalSocket,
             body: serde_json::to_vec(&Request::ObserveTerminalSocket {
                 call: 19,
-                effect: effect.clone(),
+                effect: Box::new(effect.clone()),
             })
             .unwrap(),
         };
@@ -2332,8 +2329,10 @@ mod tests {
     #[test]
     fn accepted_observer_provider_waits_for_queue_but_returns_terminal_and_errors() {
         let status = observed(ffi::Status::default().into());
-        let mut raw = ffi::Creation::default();
-        raw.phase = 1;
+        let mut raw = ffi::Creation {
+            phase: 1,
+            ..ffi::Creation::default()
+        };
         assert!(
             creation_response(status.clone(), observed(raw.into()))
                 .unwrap()
@@ -3105,19 +3104,21 @@ mod original_control_ack_tests {
             })
             .unwrap(),
         };
-        let mut raw = ffi::OriginalEffect::default();
-        raw.command = ffi::CommandResult {
-            command: 26,
-            operation: 20,
-            phase: 1,
-            task: 61,
-            start_boottime: 99,
-            identity: ffi::Identity {
-                provider: 3,
-                object: 0,
-                namespace: 0,
+        let raw = ffi::OriginalEffect {
+            command: ffi::CommandResult {
+                command: 26,
+                operation: 20,
+                phase: 1,
+                task: 61,
+                start_boottime: 99,
+                identity: ffi::Identity {
+                    provider: 3,
+                    object: 0,
+                    namespace: 0,
+                },
+                original_count: 4,
+                ..Default::default()
             },
-            original_count: 4,
             ..Default::default()
         };
         // This exercises the physical command ACK router. The independent

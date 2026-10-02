@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 #[cfg(test)]
 use std::ffi::OsStr;
@@ -623,8 +623,7 @@ impl StartOpts {
                 self.network_deployment.roots()?,
                 self.network_deployment.accepted_root(),
                 "record_verify.replay",
-                None,
-                record_timeout,
+                (None, record_timeout),
                 move |(_, _, _, _, prepared), resource, listener| {
                     if listener.is_some() {
                         return Err(Error::msg("autopilot received a debugger listener"));
@@ -796,8 +795,7 @@ impl StartOpts {
                 self.network_deployment.roots()?,
                 self.network_deployment.accepted_root(),
                 "record_verify_debug.replay",
-                Some(gdb_listener),
-                record_timeout,
+                (Some(gdb_listener), record_timeout),
                 move |(_, _, _, prepared), resource, listener| {
                     let _guard = replay_global.init_tracing();
                     let prepared_replay = prepared

@@ -568,12 +568,12 @@ impl SourceOwner {
         // The original journal may itself be the refused operation. Never reset
         // it or replace that cause: the independently fsynced file remains the
         // diagnostic authority, and only a healthy Store gets its hash row.
-        if let Some(ledger) = &mut self.ledger {
-            if ledger.store.refused.is_none() {
+        if let Some(ledger) = &mut self.ledger
+            && ledger.store.refused.is_none()
+        {
                 ledger.store.append(json!({"kind":"source-owner-first-failure",
                 "file":"source-owner-first-failure.json","bytes":bytes.len(),"sha256":hex(&Sha256::digest(&bytes))}))?;
             }
-        }
         common::before(cutoff)
     }
     fn observe(&mut self, cutoff: u64) -> io::Result<()> {
@@ -1068,10 +1068,11 @@ impl SourceOwner {
         owner::check_no_children()?;
         self.observe(cutoff)?;
         let mut owned = vec![self.input.fd.as_raw_fd(), self.census.held_descriptor()?];
-        for fd in [&self.receipts, &self.parent_pin, &self.image] {
-            if let Some(fd) = fd {
-                owned.push(fd.as_raw_fd());
-            }
+        for fd in [&self.receipts, &self.parent_pin, &self.image]
+            .into_iter()
+            .flatten()
+        {
+            owned.push(fd.as_raw_fd());
         }
         if let Some(link) = &self.keeper {
             owned.push(link.1.as_raw_fd());
@@ -1094,11 +1095,11 @@ impl SourceOwner {
         if let Some(fd) = self.ledger_directory {
             owned.push(fd);
         }
-        if let Some(ledger) = &self.ledger {
-            if let Some(fd) = &ledger.store.file {
+        if let Some(ledger) = &self.ledger
+            && let Some(fd) = &ledger.store.file
+        {
                 owned.push(fd.as_raw_fd());
             }
-        }
         if let Some(source) = &self.source {
             owned.extend(
                 source
@@ -1108,10 +1109,8 @@ impl SourceOwner {
                     .filter(|(index, _)| *index != 0 || source.input_close != Some((0, None)))
                     .map(|(_, fd)| fd.as_raw_fd()),
             );
-            for fd in [&source.directory, &source.input_alias] {
-                if let Some(fd) = fd {
-                    owned.push(fd.as_raw_fd());
-                }
+            for fd in [&source.directory, &source.input_alias].into_iter().flatten() {
+                owned.push(fd.as_raw_fd());
             }
             if let Some(launcher) = &source.launcher {
                 if let Some(fd) = &launcher.pidfd {

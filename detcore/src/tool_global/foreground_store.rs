@@ -491,7 +491,7 @@ impl GlobalState {
         state: &crate::tool_local::ThreadState<T>,
         read: reverie::syscalls::Read,
         call: crate::network_replay::NetworkStreamCall,
-    ) -> Result<CheckedReadInvocation, ReceiveAdmissionFailure> {
+    ) -> Result<CheckedReadInvocation, Box<ReceiveAdmissionFailure>> {
         let owner = range.root.owner();
         let result = (|| {
             range.check(self, tid, state, read)?;
@@ -550,7 +550,7 @@ impl GlobalState {
         read: reverie::syscalls::Read,
         invocation: &mut CheckedReadInvocation,
         completed: crate::network_replay::CompletedNoStore,
-    ) -> Result<(), ReceiveRetryFailure> {
+    ) -> Result<(), Box<ReceiveRetryFailure>> {
         let owner = invocation.range.root.owner();
         let call = invocation.call.id;
         let mut retry = None;
@@ -645,7 +645,7 @@ impl GlobalState {
             if let Some(attempt) = &retry {
                 attempt.fail(&primary);
             }
-            ReceiveRetryFailure {
+            Box::new(ReceiveRetryFailure {
                 primary,
                 cleanup: None,
                 owner,
@@ -656,7 +656,7 @@ impl GlobalState {
                     .map(Arc::downgrade)
                     .unwrap_or_default(),
                 custody: ReceiveRetryCustody::Call,
-            }
+            })
         })
     }
 
@@ -664,8 +664,8 @@ impl GlobalState {
     /// Actual worker joins precede close; the F6 completion alone permits ACK.
     pub(crate) async fn cleanup_receive_retry_failure(
         &self,
-        mut failure: ReceiveRetryFailure,
-    ) -> ReceiveRetryFailure {
+        mut failure: Box<ReceiveRetryFailure>,
+    ) -> Box<ReceiveRetryFailure> {
         if failure.released() {
             return failure;
         }
@@ -789,6 +789,7 @@ impl ReceiveAdmissionFailure {
     pub(crate) fn cleanup_diagnostic(&self) -> Option<&NetworkRpcError> {
         self.cleanup.as_ref()
     }
+    #[cfg(test)]
     pub(crate) fn custody(&self) -> &ReceiveAdmissionCustody {
         &self.custody
     }
@@ -807,8 +808,8 @@ impl GlobalState {
     /// failed cleanup returns its original custody and an additional diagnostic.
     pub(crate) async fn cleanup_receive_admission_failure(
         &self,
-        mut failure: ReceiveAdmissionFailure,
-    ) -> ReceiveAdmissionFailure {
+        mut failure: Box<ReceiveAdmissionFailure>,
+    ) -> Box<ReceiveAdmissionFailure> {
         if matches!(failure.custody, ReceiveAdmissionCustody::Released) {
             return failure;
         }
@@ -922,8 +923,8 @@ impl GlobalState {
         owner: NetworkStreamOwner,
         primary: NetworkRpcError,
         custody: ReceiveAdmissionCustody,
-    ) -> ReceiveAdmissionFailure {
-        ReceiveAdmissionFailure {
+    ) -> Box<ReceiveAdmissionFailure> {
+        Box::new(ReceiveAdmissionFailure {
             primary,
             cleanup: None,
             owner,
@@ -933,7 +934,7 @@ impl GlobalState {
                 .map(Arc::downgrade)
                 .unwrap_or_default(),
             custody,
-        }
+        })
     }
 }
 
@@ -947,7 +948,7 @@ impl GlobalState {
         read: crate::network_replay::NetworkFdReadAdmission,
         destination: u64,
         maximum: usize,
-    ) -> Result<crate::network_replay::NetworkStreamCall, ReceiveAdmissionFailure> {
+    ) -> Result<crate::network_replay::NetworkStreamCall, Box<ReceiveAdmissionFailure>> {
         let owner = NetworkStreamOwner {
             thread: state.dettid,
             mm: state.mm_id,
@@ -1324,9 +1325,8 @@ impl GlobalState {
                 .unwrap()
                 .prepare_foreground_store(
                     owner,
-                    lease,
-                    root.clone(),
-                    &memory,
+                    lease, (root.clone(),
+                    &memory),
                     span,
                     exclusion,
                     epoch,
@@ -1577,7 +1577,7 @@ impl GlobalState {
             crate::network_replay::original_connect::Admission,
             std::os::fd::OwnedFd,
         ),
-        ReceiveAdmissionFailure,
+        Box<ReceiveAdmissionFailure>,
     > {
         let mut custody = ReceiveAdmissionCustody::ReturnedRead(read.clone());
         let mut cleanup_diagnostic = None;
@@ -1692,7 +1692,7 @@ impl GlobalState {
         read: crate::network_replay::NetworkFdReadAdmission,
         destination: u64,
         maximum: usize,
-    ) -> Result<crate::network_replay::NetworkStreamCall, ReceiveAdmissionFailure> {
+    ) -> Result<crate::network_replay::NetworkStreamCall, Box<ReceiveAdmissionFailure>> {
         let owner = NetworkStreamOwner {
             thread: state.dettid,
             mm: state.mm_id,
@@ -1850,7 +1850,7 @@ impl GlobalState {
         match captured {
             Ok(captured) => {
                 self.complete_private_receive_capture(
-                    tid, state, &root, epoch, call, control, captured,
+                    tid, state, &root, epoch, (call, control), captured,
                 )
                 .await
             }
@@ -1869,7 +1869,7 @@ impl GlobalState {
         owner: NetworkStreamOwner,
         call: crate::network_replay::NetworkStreamCall,
         primary: NetworkRpcError,
-    ) -> ReceiveAdmissionFailure {
+    ) -> Box<ReceiveAdmissionFailure> {
         let failure = self.receive_admission_failure(
             owner,
             primary,
@@ -1889,16 +1889,18 @@ impl GlobalState {
         state: &crate::tool_local::ThreadState<T>,
         root: &Arc<crate::network_runtime::ForegroundRoot>,
         epoch: u64,
-        call: crate::network_replay::NetworkStreamCall,
-        control: NetworkStreamLeaseId,
+        (call, control): (
+            crate::network_replay::NetworkStreamCall,
+            NetworkStreamLeaseId,
+        ),
         captured: crate::network_replay::NetworkStreamPinOutcome,
-    ) -> Result<crate::network_replay::NetworkStreamCall, ReceiveAdmissionFailure> {
+    ) -> Result<crate::network_replay::NetworkStreamCall, Box<ReceiveAdmissionFailure>> {
         let owner = root.owner();
         let result = (|| -> Result<_, NetworkRpcError> {
             use crate::network_replay::NetworkSocketControlFinish;
             use crate::network_replay::NetworkStreamPinOutcome;
             let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
-            let runtime = self
+            let _runtime = self
                 .network_runtime
                 .as_ref()
                 .ok_or_else(|| NetworkRpcError::internal("private entry runtime absent"))?;
@@ -1924,7 +1926,7 @@ impl GlobalState {
             };
             let scheduler = self.sched.lock().unwrap();
             let grant = scheduler
-                .foreground_native_observation(owner, &root)
+                .foreground_native_observation(owner, root)
                 .map_err(|e| fail(&e))?;
             check_local()?;
             if grant.epoch() != epoch {

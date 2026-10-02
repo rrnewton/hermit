@@ -53,12 +53,10 @@ impl GlobalState {
         let result = engine.publish_original_installation(
             owner,
             admission,
-            installation,
-            &actual,
-            &mut metadata,
-            flags,
+            installation, (&actual,
+            &mut metadata), (flags,
             stat,
-            None,
+            None),
             self.global_time.lock().unwrap().as_nanos(),
         );
         self.release_lifetime_ports(engine.take_lifetime_retired_ports());
@@ -184,7 +182,7 @@ impl GlobalState {
                         (Some(profile), NetworkPolicy::Record)
                             if *profile
                                 == observed
-                                    .fresh_profile(fresh.key, profile.normalization.clone())
+                                    .fresh_profile(fresh.key, profile.normalization)
                                     .map_err(internal)? => {}
                         (None, NetworkPolicy::Replay) => {}
                         _ => return Err(internal("Socket enrollment changed held fresh profile")),
@@ -224,14 +222,12 @@ impl GlobalState {
                 let result = engine.publish_original_installation(
                     owner,
                     &mutation.publication,
-                    receipt,
-                    actual.as_ref().unwrap(),
-                    local.as_mut().unwrap(),
-                    crate::network_replay::original_installation::socket_installation_flags(
+                    receipt, (actual.as_ref().unwrap(),
+                    local.as_mut().unwrap()), (crate::network_replay::original_installation::socket_installation_flags(
                         admission.arguments.address as u32 as i32,
                     ),
                     stat,
-                    enrollment,
+                    enrollment),
                     self.global_time.lock().unwrap().as_nanos(),
                 );
                 self.release_lifetime_ports(engine.take_lifetime_retired_ports());
@@ -461,14 +457,12 @@ impl GlobalState {
                 let result = engine.publish_original_openat_installation(
                     owner,
                     &mutation.publication,
-                    receipt,
-                    actual.as_ref().unwrap(),
-                    local.as_mut().unwrap(),
-                    opened.unwrap(),
+                    receipt, (actual.as_ref().unwrap(),
+                    local.as_mut().unwrap()), (opened.unwrap(),
                     self.cfg
                         .virtualize_metadata
                         .then_some(annotation_stat)
-                        .flatten(),
+                        .flatten()),
                     self.global_time.lock().unwrap().as_nanos(),
                 );
                 self.release_lifetime_ports(engine.take_lifetime_retired_ports());

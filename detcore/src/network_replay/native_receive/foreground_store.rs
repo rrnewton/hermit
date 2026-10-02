@@ -28,7 +28,9 @@ enum Phase {
     Prepared,
     CheckingAccess,
     Possible,
-    Observed(StoreOutcome),
+    // Preserve the actual outcome through failed post-write checks and drop;
+    // only the controlled diagnostic accessor reads this unresolved payload.
+    Observed { _outcome: StoreOutcome },
     Checked(StoreOutcome),
     ExclusionEnded(StoreOutcome),
 }
@@ -121,11 +123,12 @@ impl ForegroundStore {
         self.record_completion()
             .expect("controlled Record fixture has its actual helper completion")
     }
+    #[cfg(test)]
     pub(crate) fn raw_outcome(&self) -> Option<StoreOutcome> {
         match &*self.phase.lock().unwrap() {
-            Phase::Observed(raw) | Phase::Checked(raw) | Phase::ExclusionEnded(raw) => {
-                Some(raw.clone())
-            }
+            Phase::Observed { _outcome: raw }
+            | Phase::Checked(raw)
+            | Phase::ExclusionEnded(raw) => Some(raw.clone()),
             _ => None,
         }
     }
@@ -259,12 +262,12 @@ impl NetworkReplayEngine {
         &mut self,
         owner: NetworkStreamOwner,
         lease: NetworkStreamLeaseId,
-        root: Arc<ForegroundRoot>,
-        memory: &MemoryMetadata,
+        source_memory: (Arc<ForegroundRoot>, &MemoryMetadata),
         span: OriginalCopySpan,
         exclusion: NativeCopyExclusion,
         epoch: u64,
     ) -> Result<Arc<ForegroundStore>, NetworkReplayError> {
+        let (root, memory) = source_memory;
         let (source, length) = self.foreground_store_selection(owner, lease)?;
         let (call, offset) = match &source {
             ForegroundStoreSource::Record(completion) => {
@@ -417,7 +420,9 @@ impl NetworkReplayEngine {
             Ok(raw) => StoreOutcome::Returned(raw),
             Err(_) => StoreOutcome::Panicked,
         };
-        *phase = Phase::Observed(outcome.clone());
+        *phase = Phase::Observed {
+            _outcome: outcome.clone(),
+        };
         // These checks can fail after real writes. Observed is deliberately
         // retained, never reset to Prepared or converted to zero effects.
         self.check_foreground_access(store, grant, metadata, runtime)?;

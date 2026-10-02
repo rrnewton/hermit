@@ -116,10 +116,13 @@ impl NoInstallation {
             && self.through == other.through
     }
 }
+type Collection = Result<(u64, Option<Result<(), String>>), String>;
+
 #[derive(Debug)]
 struct Accept<T> {
     owner: NetworkStreamOwner,
-    listener_call: NetworkStreamCallId,
+    // Keep the admitting call with the pin until this original entry retires.
+    _listener_call: NetworkStreamCallId,
     returned: Option<Result<i32, i32>>,
     pin: Option<T>,
     capture_error: Option<String>,
@@ -136,7 +139,7 @@ struct Accept<T> {
     installation_admission: Option<crate::network_replay::NetworkFdPublicationAdmission>,
     physical_effect:
         Option<super::accepted_provider::Observation<super::accepted_provider::AcceptedEffect>>,
-    collection: Option<Result<(u64, Option<Result<(), String>>), String>>,
+    collection: Option<Collection>,
 }
 
 #[derive(Debug)]
@@ -229,12 +232,8 @@ impl<T> AcceptedCustody<T> {
                 lease,
                 child: historical.resolved,
             },
-            historical.command,
-            begin.fd,
-            begin.file,
-            begin.sequence,
-            end.sequence,
-            through,
+            (historical.command, begin.fd, begin.file),
+            (begin.sequence, end.sequence, through),
             history,
         )
     }
@@ -576,7 +575,7 @@ impl<T> AcceptedCustody<T> {
             lease,
             Accept {
                 owner,
-                listener_call,
+                _listener_call: listener_call,
                 returned: None,
                 pin: None,
                 capture_error: None,
@@ -989,6 +988,7 @@ impl<T> AcceptedCustody<T> {
             .ok_or_else(|| invalid("accept has no confirmed owned descriptor"))
     }
 
+    #[cfg(test)]
     pub(super) fn match_pin(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1034,14 +1034,16 @@ impl<T> AcceptedCustody<T> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn listener_call(
         &self,
         owner: NetworkStreamOwner,
         lease: NetworkAcceptLeaseId,
     ) -> io::Result<NetworkStreamCallId> {
-        Ok(self.operation(owner, lease)?.listener_call)
+        Ok(self.operation(owner, lease)?._listener_call)
     }
 
+    #[cfg(test)]
     pub(super) fn returned(
         &self,
         owner: NetworkStreamOwner,

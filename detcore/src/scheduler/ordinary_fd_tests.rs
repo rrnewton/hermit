@@ -3,7 +3,7 @@
  * All rights reserved.
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 // Reuse the maintained scheduler/signal fixture, actual request/grant/parked
 // transitions and its backend contract double. No native signal or Read claim.
@@ -665,12 +665,14 @@ fn foreground_epoll_birth_bookkeeping_never_lends_v4_sole_root_authority() {
     assert_eq!((s.turn, s.committed_time), before);
 }
 
-fn native_capture_entry_fixture() -> (
+type NativeCaptureFixture = (
     Scheduler,
     Arc<crate::network_runtime::ForegroundRoot>,
     Arc<Mutex<crate::tool_local::FileMetadata>>,
     Arc<Mutex<crate::memory::MemoryMetadata>>,
-) {
+);
+
+fn native_capture_entry_fixture() -> NativeCaptureFixture {
     let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
     let (root, metadata, memory, _) = crate::network_runtime::controlled_foreground_root(raw);
     let owner = root.owner();

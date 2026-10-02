@@ -101,6 +101,7 @@ pub(crate) struct CompletedNoStore {
     replay_timed_out: bool,
 }
 impl CompletedNoStore {
+    #[cfg(test)]
     pub(crate) fn into_outcome(self) -> NoStoreReturn {
         self.outcome
     }
@@ -739,9 +740,12 @@ impl NetworkReplayEngine {
                 }
             }
             None if nonblocking => ReplayNoStoreKind::WouldBlock,
-            None if policy.as_ref().is_some_and(|saved|
-                now.is_some_and(|now| now >= saved.started() && saved.expired(now))) =>
-                ReplayNoStoreKind::TimedOut,
+            None if policy.as_ref().is_some_and(|saved| {
+                now.is_some_and(|now| now >= saved.started() && saved.expired(now))
+            }) =>
+            {
+                ReplayNoStoreKind::TimedOut
+            }
             None => return Ok(ReplayReceivePlan::Wait),
             _ => {
                 return Err(invalid(
@@ -811,7 +815,9 @@ impl NetworkReplayEngine {
         };
         let outcome = match plan.kind {
             ReplayNoStoreKind::Eof { .. } => NoStoreReturn::Eof,
-            ReplayNoStoreKind::WouldBlock | ReplayNoStoreKind::TimedOut => NoStoreReturn::WouldBlock,
+            ReplayNoStoreKind::WouldBlock | ReplayNoStoreKind::TimedOut => {
+                NoStoreReturn::WouldBlock
+            }
         };
         // All fallible validation precedes the first semantic mutation. Empty
         // attempts/repeated EOF do not manufacture queue or epoch progress.

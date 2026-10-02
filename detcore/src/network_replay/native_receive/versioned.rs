@@ -39,9 +39,11 @@ pub(in crate::network_replay) struct NativeState {
 }
 #[derive(Debug)]
 struct NativeClosePolicy {
-    root: Arc<crate::network_runtime::ForegroundRoot>,
-    arguments: crate::network_replay::original_connect::Arguments,
-    epoch: u64,
+    // These values still retain the original root and Call in the same order;
+    // the separate original-Close policy consumer is not yet activated.
+    _root: Arc<crate::network_runtime::ForegroundRoot>,
+    _arguments: crate::network_replay::original_connect::Arguments,
+    _epoch: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NativePollWitness {
@@ -444,7 +446,7 @@ impl NetworkReplayEngine {
         // Only the empty shared container is reused. There is no V2 history or
         // projected V2 release metadata alongside the authoritative V4 journal.
         let mut engine = Self::record_shadow(epoch);
-        engine.mode = EngineState::Native(NativeState {
+        engine.mode = EngineState::Native(Box::new(NativeState {
             trace: NetworkTraceV4 {
                 epoch,
                 channels: Vec::new(),
@@ -467,7 +469,7 @@ impl NetworkReplayEngine {
             policy_root: None,
             policy_failure: false,
             close_policy: BTreeMap::new(),
-        });
+        }));
         engine
     }
 
@@ -531,7 +533,7 @@ impl NetworkReplayEngine {
             accepted: None,
         });
         let released = vec![false; trace.inputs.len()];
-        engine.mode = EngineState::Native(NativeState {
+        engine.mode = EngineState::Native(Box::new(NativeState {
             trace,
             replay: Some(NativeReplay {
                 released,
@@ -544,7 +546,7 @@ impl NetworkReplayEngine {
             policy_root: None,
             policy_failure: false,
             close_policy: BTreeMap::new(),
-        });
+        }));
         Ok(engine)
     }
 
@@ -607,6 +609,7 @@ impl NetworkReplayEngine {
     /// only as a run-local obligation: a later private receive must publish at
     /// least this low-water prefix at the same physical stream cut. No poll
     /// result itself becomes portable trace authority.
+    #[expect(dead_code, reason = "unintegrated entrypoint; no qualification claim")]
     pub(crate) fn finish_native_poll_probe(
         &mut self,
         owner: NetworkStreamOwner,
@@ -714,6 +717,7 @@ impl NetworkReplayEngine {
     /// Transfer the actual selected Close reader under the sole-root policy.
     /// The original-call issuer authenticates the reader/slot/source and owns
     /// cancellation. No channel, Connect entry, input or progress is required.
+    #[expect(dead_code, reason = "unintegrated entrypoint; no qualification claim")]
     pub(crate) fn begin_native_original_close_from_read(
         &mut self,
         arguments: crate::network_replay::original_connect::Arguments,
@@ -758,9 +762,9 @@ impl NetworkReplayEngine {
         native.close_policy.insert(
             call.call,
             NativeClosePolicy {
-                root: root.clone(),
-                arguments: call.arguments.clone(),
-                epoch: grant.epoch(),
+                _root: root.clone(),
+                _arguments: call.arguments.clone(),
+                _epoch: grant.epoch(),
             },
         );
         Ok(call)
@@ -768,6 +772,7 @@ impl NetworkReplayEngine {
 
     /// Recheck the same admission after preparation and before invocation.
     /// Cleanup/terminal paths deliberately do not require a live grant.
+    #[expect(dead_code, reason = "unintegrated entrypoint; no qualification claim")]
     pub(crate) fn validate_native_original_close_policy(
         &self,
         admission: &crate::network_replay::original_connect::Admission,
@@ -790,10 +795,10 @@ impl NetworkReplayEngine {
             .close_policy
             .get(&admission.call)
             .ok_or_else(|| invalid("V4 original Close lost its pre-effect policy admission"))?;
-        if retained.arguments != admission.arguments
-            || retained.arguments.operation != grant.operation()
-            || retained.epoch != grant.epoch()
-            || !Arc::ptr_eq(&retained.root, root)
+        if retained._arguments != admission.arguments
+            || retained._arguments.operation != grant.operation()
+            || retained._epoch != grant.epoch()
+            || !Arc::ptr_eq(&retained._root, root)
             || !grant.admits_sole_initial_root(root)
             || native
                 .policy_root
@@ -814,6 +819,7 @@ impl NetworkReplayEngine {
     /// Original-syscall Close has a separate selected-call admission path; it
     /// must prove the same policy before submission rather than calling this
     /// after Linux has selected or removed the descriptor.
+    #[cfg(test)]
     pub(crate) fn submit_native_descriptor_close(
         &mut self,
         control: NetworkStreamLeaseId,
@@ -1046,12 +1052,12 @@ impl NetworkReplayEngine {
                 "unsubmitted recovery changed its actual owner/Call",
             ));
         }
-        if let Some(original) = &state.original {
-            if !original.native_entry_cancellable() {
-                return Err(invalid(
-                    "unsubmitted Connect already owns a native invocation",
-                ));
-            }
+        if let Some(original) = &state.original
+            && !original.native_entry_cancellable()
+        {
+            return Err(invalid(
+                "unsubmitted Connect already owns a native invocation",
+            ));
         }
         if state
             .native_entry_attempted
@@ -1329,6 +1335,7 @@ impl NetworkReplayEngine {
     /// Recheck an existing foreground Call under the current scheduler borrow,
     /// including after a worker join. Retained entry provenance alone does not
     /// establish that the original Normal grant is still open.
+    #[cfg(test)]
     pub(crate) fn validate_native_foreground_call(
         &self,
         call: NetworkStreamCallId,
@@ -1570,6 +1577,7 @@ impl NetworkReplayEngine {
     }
 
     /// Reserve one short OFD control for an immutable, helper-owned send.
+    #[cfg(test)]
     pub(crate) fn begin_native_transmit(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1621,13 +1629,13 @@ impl NetworkReplayEngine {
             call,
             bytes,
             flags,
-            entry_cut,
-            prerequisites,
+            _entry_cut: entry_cut,
+            _prerequisites: prerequisites,
             submitted: false,
-            timing_identity: None,
-            timing_claimed: false,
-            timing_normal_epoch: None,
-            timing_receipt: None,
+            _timing_identity: None,
+            _timing_claimed: false,
+            _timing_normal_epoch: None,
+            _timing_receipt: None,
         });
         Ok(lease)
     }
@@ -1661,6 +1669,7 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn confirm_native_transmit_if_pending(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1675,6 +1684,7 @@ impl NetworkReplayEngine {
         Some(self.confirm_native_transmit(owner, lease, pending, observed))
     }
 
+    #[cfg(test)]
     fn confirm_native_transmit(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1685,7 +1695,7 @@ impl NetworkReplayEngine {
         // Scheduler timing is not original-task return provenance, and an
         // output-only V4 row cannot carry entry/completion/handback authority.
         // Never silently fall back to the old writer after enrollment.
-        if pending.timing_claimed {
+        if pending._timing_claimed {
             return Err(invalid(
                 "timed original send requires a versioned attempt writer",
             ));
@@ -1697,8 +1707,8 @@ impl NetworkReplayEngine {
         let open_file = control.open_file;
         self.owned_stream_call(owner, pending.call)?;
         let entry = self.native_transmit_entry(owner, pending.call)?;
-        if entry.receive_entry_cut != pending.entry_cut
-            || entry.prerequisites != pending.prerequisites
+        if entry.receive_entry_cut != pending._entry_cut
+            || entry.prerequisites != pending._prerequisites
         {
             return Err(invalid("V4 transmit replaced its original entry proof"));
         }
@@ -1708,12 +1718,12 @@ impl NetworkReplayEngine {
         };
         if native.mode() != NetworkEngineMode::Record
             || u64::try_from(native.trace.release_model.nodes().len()).ok()
-                != Some(pending.entry_cut.0)
+                != Some(pending._entry_cut.0)
             || native
                 .trace
-                .entry_frontier(pending.entry_cut)
+                .entry_frontier(pending._entry_cut)
                 .map_err(|error| invalid(&error.to_string()))?
-                != pending.prerequisites
+                != pending._prerequisites
         {
             return Err(invalid(
                 "V4 native transmit changed its one-use entry frontier",
@@ -1762,7 +1772,7 @@ impl NetworkReplayEngine {
         let node = NetworkReleaseNodeV4 {
             id: NetworkReleaseNodeIdV4(node_id),
             kind: NetworkReleaseNodeKindV4::Progress { channel, milestone },
-            prerequisites: pending.prerequisites.clone(),
+            prerequisites: pending._prerequisites.clone(),
         };
         let mut candidate = native.trace.clone();
         candidate.outputs.push(output.clone());
@@ -1809,6 +1819,7 @@ impl NetworkReplayEngine {
     }
 }
 
+#[cfg(test)]
 fn native_stream_output_offset(
     trace: &NetworkTraceV4,
     channel: NetworkChannelId,

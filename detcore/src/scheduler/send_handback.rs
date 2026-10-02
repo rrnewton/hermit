@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::Scheduler;
+#[cfg(test)]
 use super::ordinary_fd::OrdinaryFdResume;
 use crate::network_replay::send_timing::PendingSendTiming;
 use crate::resources::ExternalOpId;
@@ -15,6 +16,7 @@ use crate::types::LogicalTime;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SendTimingError {
+    #[cfg(test)]
     Missing,
     Identity,
     Phase,
@@ -33,6 +35,7 @@ pub(crate) struct SendTimingStamp {
     pub(crate) publication: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SendTimingHandle {
     identity: Arc<()>,
@@ -41,29 +44,30 @@ pub(crate) struct SendTimingHandle {
 
 #[derive(Debug)]
 pub(crate) struct SendHandbackReceipt {
-    pending: PendingSendTiming,
-    operation: ExternalOpId,
-    normal: SendTimingStamp,
-    entry: SendTimingStamp,
-    completion: SendTimingStamp,
-    handback: SendTimingStamp,
+    _pending: PendingSendTiming,
+    _operation: ExternalOpId,
+    _normal: SendTimingStamp,
+    _entry: SendTimingStamp,
+    _completion: SendTimingStamp,
+    _handback: SendTimingStamp,
 }
 
+#[cfg(test)]
 impl SendHandbackReceipt {
     pub(crate) fn matches(&self, pending: &PendingSendTiming) -> bool {
-        self.pending.same_pending(pending)
+        self._pending.same_pending(pending)
     }
     pub(crate) fn operation(&self) -> ExternalOpId {
-        self.operation
+        self._operation
     }
-    pub(crate) fn stamps(&self) -> [SendTimingStamp; 4] {
-        [self.normal, self.entry, self.completion, self.handback]
+    pub(crate) fn stamps(&self) -> [SendTimingStamp; 4]{
+        [self._normal, self._entry, self._completion, self._handback]
     }
 }
 
 #[derive(Debug)]
 struct Attempt {
-    identity: Arc<()>,
+    _identity: Arc<()>,
     pending: PendingSendTiming,
     operation: ExternalOpId,
     normal: SendTimingStamp,
@@ -84,6 +88,7 @@ pub(super) struct SendTimingBook {
 impl Scheduler {
     /// Production lock-order seam for the original-send owner to use before
     /// requesting its existing external pair. It performs no physical effect.
+    #[cfg(test)]
     pub(crate) fn claim_send_timing(
         &mut self,
         engine: &mut crate::network_replay::NetworkReplayEngine,
@@ -131,6 +136,7 @@ impl Scheduler {
 
     /// Call under scheduler -> engine lock order, immediately after claiming
     /// the engine pending capability. No request/turn/time is added here.
+    #[cfg(test)]
     pub(crate) fn enroll_send_timing(
         &mut self,
         pending: PendingSendTiming,
@@ -162,7 +168,7 @@ impl Scheduler {
         self.send_timing.attempts.insert(
             owner.thread,
             Attempt {
-                identity: identity.clone(),
+                _identity: identity.clone(),
                 pending,
                 operation,
                 normal: stamp,
@@ -177,6 +183,7 @@ impl Scheduler {
 
     /// Read only after the real Normal response has installed its empty gate.
     /// Move out once; a copied operation number cannot recreate this handle.
+    #[cfg(test)]
     pub(crate) fn take_send_handback(
         &mut self,
         handle: &SendTimingHandle,
@@ -186,7 +193,7 @@ impl Scheduler {
             .attempts
             .get(&handle.owner.thread)
             .ok_or(SendTimingError::Missing)?;
-        if !Arc::ptr_eq(&attempt.identity, &handle.identity)
+        if !Arc::ptr_eq(&attempt._identity, &handle.identity)
             || attempt.pending.owner() != handle.owner
         {
             return Err(SendTimingError::Identity);
@@ -209,12 +216,12 @@ impl Scheduler {
             .remove(&handle.owner.thread)
             .unwrap();
         Ok(SendHandbackReceipt {
-            pending: attempt.pending,
-            operation: attempt.operation,
-            normal: attempt.normal,
-            entry,
-            completion,
-            handback,
+            _pending: attempt.pending,
+            _operation: attempt.operation,
+            _normal: attempt.normal,
+            _entry: entry,
+            _completion: completion,
+            _handback: handback,
         })
     }
 

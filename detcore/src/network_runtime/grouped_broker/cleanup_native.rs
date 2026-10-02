@@ -304,7 +304,9 @@ impl Returned {
 /// handle and this diagnostic separately from the original bridge failure.
 #[derive(Debug)]
 pub(super) struct LoaderClose {
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub raw: c_int,
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub diagnostic: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -322,7 +324,9 @@ pub(super) struct ReadbackIssue {
 #[derive(Debug)]
 pub(super) struct Readback {
     pub operation: Operation,
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub status_call: Returned,
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub history_call: Returned,
     pub absence_call: Option<Returned>,
     pub status: Option<Status>,
@@ -418,12 +422,14 @@ impl CleanupBridge {
             _single_thread: std::marker::PhantomData,
         }
     }
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub fn refusal(&self) -> Option<&str> {
         self.refusal.as_deref()
     }
     pub fn attempts(&self) -> &[Attempt; OPERATIONS] {
         &self.attempts
     }
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub fn excess_observation_requests(&self) -> u64 {
         self.excess_observation_requests
     }
@@ -444,6 +450,7 @@ impl CleanupBridge {
             .rev()
             .find_map(|row| row.history.as_ref())
     }
+    #[expect(dead_code, reason = "Retained native cleanup observations keep original failures for diagnostic consumers not yet wired")]
     pub fn absence(&self, index: usize) -> Option<&AbsenceSnapshot> {
         self.observations
             .get(index)

@@ -12,8 +12,10 @@ use crate::types::OpenFileId;
 #[derive(Debug)]
 struct Listener<T> {
     owner: NetworkStreamOwner,
-    call: NetworkStreamCallId,
-    fd: i32,
+    // Retain the original capture identity beside its pin for the whole entry
+    // lifetime; neither field is authority to reacquire a reused descriptor.
+    _call: NetworkStreamCallId,
+    _fd: i32,
     pin: Option<T>,
     error: Option<String>,
 }
@@ -48,8 +50,8 @@ impl<T> Listeners<T> {
             open_file,
             Listener {
                 owner,
-                call,
-                fd,
+                _call: call,
+                _fd: fd,
                 pin: None,
                 error: None,
             },
@@ -101,8 +103,8 @@ mod tests {
             .unwrap();
         assert_eq!(*listeners.pin(ofd).unwrap().1, 99);
         let receipt = listeners.0.get(&ofd).unwrap();
-        assert_eq!(receipt.call, call);
-        assert_eq!(receipt.fd, 4);
+        assert_eq!(receipt._call, call);
+        assert_eq!(receipt._fd, 4);
     }
     #[test]
     fn accepted_listener_failed_capture_remains_unknown_after_fd_reuse() {

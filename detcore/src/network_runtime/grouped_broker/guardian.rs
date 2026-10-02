@@ -152,18 +152,24 @@ struct FailedRetirement {
 struct InflightRetirement {
     native_origin: u64,
     deadline: Instant,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     queries_retired: bool,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     query_failure: Option<Failure>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     write_shutdown: Option<ShutdownAttempt>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     shutdown_failure: Option<Failure>,
 }
 #[derive(Debug)]
 enum ShutdownAttempt {
     IntentOnly,
     Submitted,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     Returned(wire::RawCall),
 }
 impl ShutdownAttempt {
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn observation(&self) -> serde_json::Value {
         match self {
             Self::IntentOnly => json!({"state":"intent-only"}),
@@ -178,11 +184,13 @@ impl ShutdownAttempt {
 /// real endpoint/query custody, and durably joined an authenticated Keeper's
 /// rejected-source history to the parent's independently captured native owner.
 #[derive(Clone, Copy, Debug)]
+#[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
 enum EarlyCustodyKind {
     CapturedRejection,
     UncapturedCancellation,
 }
 #[derive(Debug)]
+#[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
 pub(super) struct EarlyCustodyAgreement {
     kind: EarlyCustodyKind,
     deadline: Instant,
@@ -190,6 +198,7 @@ pub(super) struct EarlyCustodyAgreement {
     keeper_record: serde_json::Value,
     durable_record: serde_json::Value,
 }
+#[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
 impl EarlyCustodyAgreement {
     pub(super) fn deadline(&self) -> Instant {
         self.deadline
@@ -246,8 +255,11 @@ pub(super) struct Holder {
     namespace_required: bool,
     namespace_creator_cutoff: Option<u64>,
     namespace: Option<owner::NamespaceCustody>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     partial_creator: Option<owner::PartialCreatorCustody>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     partial_record: Option<serde_json::Value>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     partial_custody_failure: Option<Failure>,
     controls: Option<owner::Controls>,
     manager: Option<owner::ManagerQuery>,
@@ -266,12 +278,16 @@ pub(super) struct Holder {
     source_launcher: Option<owner::LauncherLease>,
     failed_retirement: Option<FailedRetirement>,
     forget_failed: Option<owner::ManagerForgetFailed>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     failed_agreement: Option<serde_json::Value>,
     creation: Option<CreationGate>,
     unstarted_retirement: Option<FailedRetirement>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     rejected_write_shutdown: Option<ShutdownAttempt>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     rejected_shutdown_failure: Option<Failure>,
     guardian_forward_attempted: bool,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     uninitialized_passcred_failure: Option<wire::RawCall>,
     stage: Stage,
     refused: Option<Failure>,
@@ -279,7 +295,9 @@ pub(super) struct Holder {
     // never become a later cleanup origin merely because cleanup is requested.
     failure_origin: Option<u64>,
     inflight_retirement: Option<InflightRetirement>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     early_agreement_attempted: bool,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     early_agreement_failure: Option<Failure>,
     local_custody: LocalCustodyRetirement,
     admission_timing: AdmissionTiming,
@@ -658,14 +676,14 @@ impl Holder {
     pub fn retain(
         intent: Intent,
         unit: String,
-        deadline: Instant,
-        native_deadline: u64,
+        deadlines: (Instant, u64),
         role: Role,
-        channel: OwnedFd,
-        journal_directory: OwnedFd,
+        channels: (OwnedFd, OwnedFd),
         image: OwnedFd,
         arguments: Vec<OsString>,
     ) -> Self {
+        let (deadline, native_deadline) = deadlines;
+        let (channel, journal_directory) = channels;
         Self {
             journal: journal::Journal::retain(journal_directory, intent.clone()),
             intent,
@@ -714,6 +732,7 @@ impl Holder {
             admission_timing: AdmissionTiming::new(),
         }
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn actual_creator(&self) -> Option<&owner::Creator> {
         self.creator.as_ref().or_else(|| {
             self.partial_creator
@@ -828,10 +847,11 @@ impl Holder {
         let deadline = self.clip_failure_deadline(caller)?;
         let writer = self.local_custody.writer.progress(&self.channel);
         let mut outcomes = vec![writer.map(|()| owner::QueryRetirement::Retired)];
-        for query in [&mut self.manager, &mut self.terminal_manager] {
-            if let Some(query) = query {
-                outcomes.push(query.retire_custody(deadline, cause));
-            }
+        for query in [&mut self.manager, &mut self.terminal_manager]
+            .into_iter()
+            .flatten()
+        {
+            outcomes.push(query.retire_custody(deadline, cause));
         }
         if let Some(query) = &mut self.image {
             outcomes.push(query.retire_custody(deadline, cause));
@@ -867,6 +887,7 @@ impl Holder {
         }
         Ok(complete)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn check_inflight_state(&self) -> io::Result<()> {
         require(
             matches!(
@@ -888,11 +909,13 @@ impl Holder {
     }
     /// Cancellation is a permanent local refusal, not permission to resume
     /// protocol after query children finish. Existing refusal/origin wins.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn cancel_inflight(&mut self, cause: &io::Error) -> io::Result<()> {
         self.check_inflight_state()?;
         self.latch_failure(cause);
         Ok(())
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn begin_inflight_retirement(&mut self, caller: Instant) -> io::Result<()> {
         self.check_inflight_state()?;
         require(
@@ -950,6 +973,7 @@ impl Holder {
     /// Each actual query is driven even if another query refuses cleanup. A
     /// completed typed snapshot reuses its original EOF/wait/group proof; failed
     /// or incomplete queries use custody-only retirement and are never parsed.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn progress_inflight_queries(&mut self) -> io::Result<bool> {
         self.check_inflight_state()?;
         let deadline = self.inflight_deadline()?;
@@ -1013,6 +1037,7 @@ impl Holder {
     /// Close only this retained original endpoint's writer. This grants no
     /// Creator/admission/terminal authority and never discards incoming rights.
     /// Unknown syscall/durable-log outcome remains an occupied one-shot attempt.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn shutdown_inflight_writer(&mut self) -> io::Result<()> {
         let result = (|| {
             self.check_inflight_state()?;
@@ -1056,17 +1081,18 @@ impl Holder {
             require(raw == 0, "inflight writer shutdown result differs")?;
             self.inflight_deadline().map(|_| ())
         })();
-        if let Err(error) = &result {
-            if let Some(state) = &mut self.inflight_retirement {
+        if let Err(error) = &result
+            && let Some(state) = &mut self.inflight_retirement
+        {
                 state
                     .shutdown_failure
                     .get_or_insert_with(|| Failure::capture(error));
             }
-        }
         result
     }
     /// Diagnostic custody only. No complete-history or source capability exists
     /// merely because the query children have finished.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn inflight_observation(&self) -> io::Result<serde_json::Value> {
         self.check_inflight_state()?;
         self.inflight_deadline()?;
@@ -1088,9 +1114,11 @@ impl Holder {
             "provider_authority_created":false}),
         )
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn inflight_cleanup_deadline(&self) -> io::Result<Instant> {
         self.inflight_deadline()
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn keeper_unadmitted_observation(&self) -> io::Result<serde_json::Value> {
         require(
             self.role == Role::Keeper
@@ -1114,6 +1142,7 @@ impl Holder {
     }
     /// Authenticated parent coordination is retained as evidence; only this
     /// Holder's own original Creator/EOF/history predicates grant local custody.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn record_keeper_first_agreement(
         &mut self,
         value: &serde_json::Value,
@@ -1188,6 +1217,7 @@ impl Holder {
         }
         result
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn agree_keeper_first_rejection(
         &mut self,
         packet: &wire::Packet,
@@ -1259,6 +1289,7 @@ impl Holder {
     }
     /// Separate cleanup scope: neither initial query has produced a Snapshot,
     /// and the actual received Creator remains uncaptured and unadmitted.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn check_uncaptured_query_boundary(&self) -> io::Result<()> {
         self.check_inflight_state()?;
         let creator = self
@@ -1281,12 +1312,14 @@ impl Holder {
             "partial cleanup lacks actual uncaptured unforwarded query custody",
         )
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn cancel_uncaptured_queries(&mut self, cause: &io::Error) -> io::Result<()> {
         // Existing primary refusal wins before any new cancellation is accepted.
         self.check()?;
         self.check_uncaptured_query_boundary()?;
         self.cancel_inflight(cause)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn keeper_uncaptured_observation(&self) -> io::Result<serde_json::Value> {
         self.check_uncaptured_query_boundary()?;
         require(
@@ -1300,6 +1333,7 @@ impl Holder {
             "native_origin":self.failure_origin,"original_failure":self.refused.as_ref().unwrap().message}),
         )
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn begin_partial_creator_retirement(&mut self, caller: Instant) -> io::Result<()> {
         if let Some(error) = &self.partial_custody_failure {
             return Err(error.error());
@@ -1326,6 +1360,7 @@ impl Holder {
         }
         result
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn progress_partial_creator_retirement(&mut self) -> io::Result<bool> {
         if let Some(error) = &self.partial_custody_failure {
             return Err(error.error());
@@ -1393,6 +1428,7 @@ impl Holder {
         }
         result
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn partial_creator_retirement_observation(&mut self) -> io::Result<serde_json::Value> {
         require(
             self.progress_partial_creator_retirement()?,
@@ -1400,6 +1436,7 @@ impl Holder {
         )?;
         Ok(self.partial_record.as_ref().unwrap().clone())
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn record_partial_keeper_agreement(
         &mut self,
         value: &serde_json::Value,
@@ -1471,6 +1508,7 @@ impl Holder {
         }
         result
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn agree_partial_keeper_cancellation(
         &mut self,
         packet: &wire::Packet,
@@ -1941,6 +1979,7 @@ impl Holder {
     /// Keeper can fail native setup after moving originals here but before
     /// initialize was called. Retain that caller's first setup cause without
     /// fabricating a journal attempt, creator admission or query ownership.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn retain_unforwarded_configuration_failure(
         &mut self,
         cause: &io::Error,
@@ -1972,6 +2011,7 @@ impl Holder {
         self.latch_failure(cause);
         Ok(())
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn check_unforwarded_configuration(&self) -> io::Result<()> {
         require(
             self.role == Role::Keeper
@@ -1987,6 +2027,7 @@ impl Holder {
             "unforwarded configuration already has source or journal admission",
         )
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn observe_unforwarded_configuration_eof(&mut self, deadline: Instant) -> io::Result<bool> {
         let deadline = self.clip_failure_deadline(deadline)?;
         require(
@@ -2028,6 +2069,7 @@ impl Holder {
         self.source_eof = true;
         Ok(true)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn unforwarded_configuration_observation(&self) -> io::Result<serde_json::Value> {
         require(
             self.source_eof
@@ -2058,6 +2100,7 @@ impl Holder {
             "history_complete_claimed":false,"provider_authority_created":false}),
         )
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn begin_unstarted_retirement(&mut self, native_origin: u64) -> io::Result<()> {
         if let Some(state) = &self.unstarted_retirement {
             return require(
@@ -2098,6 +2141,7 @@ impl Holder {
         self.journal.store.append(json!({"kind":"unstarted-source-retirement-intent","native_origin":native_origin,"original_release_ns":1_000_000_000u64,"original_failure":self.refused.as_ref().unwrap().message}))?;
         self.unstarted_retirement_deadline().map(|_| ())
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn unstarted_retirement_deadline(&self) -> io::Result<Instant> {
         let state = self
             .unstarted_retirement
@@ -2117,6 +2161,7 @@ impl Holder {
         )?;
         self.clip_failure_deadline(deadline)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn progress_unstarted_retirement(&mut self) -> io::Result<bool> {
         let deadline = self.unstarted_retirement_deadline()?;
         require(
@@ -2153,6 +2198,7 @@ impl Holder {
         self.unstarted_retirement.as_mut().unwrap().complete = true;
         Ok(true)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn unstarted_retirement_observation(&mut self) -> io::Result<serde_json::Value> {
         self.unstarted_retirement_deadline()?;
         require(
@@ -2169,6 +2215,7 @@ impl Holder {
             "history_complete_claimed":false,"provider_authority_created":false}),
         )
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn record_unstarted_agreement(
         &mut self,
         keeper_record: &serde_json::Value,
@@ -2191,15 +2238,18 @@ impl Holder {
     /// A rejected creator retains kernel/manager/cgroup custody but never gains
     /// admission. The real completed initial queries remain owned; no ACK was
     /// attempted, so this path cannot authorize source creation or adoption.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn begin_rejected_creator_retirement(&mut self, native_origin: u64) -> io::Result<()> {
         self.begin_rejected_creator_role(native_origin, Role::Guardian)
     }
     /// Keeper-first image refusal has its own real captured Creator. It must
     /// not manufacture a Guardian Creator or forward that Guardian endpoint.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn keeper_rejected_cleanup_deadline(&self) -> io::Result<Instant> {
         self.keeper_unadmitted_observation()?;
         self.failed_retirement_deadline()
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn begin_keeper_rejected_creator_retirement(&mut self) -> io::Result<()> {
         require(
             !self.guardian_forward_attempted,
@@ -2210,6 +2260,7 @@ impl Holder {
             .ok_or_else(|| io::Error::other("keeper rejection original failure origin unknown"))?;
         self.begin_rejected_creator_role(origin, Role::Keeper)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn begin_rejected_creator_role(&mut self, native_origin: u64, role: Role) -> io::Result<()> {
         require(
             self.role == role
@@ -2235,9 +2286,11 @@ impl Holder {
     /// rejection. Keep its reader and every received right for strict real EOF.
     /// Native EOF makes the unchanged C expected-ACK path refuse immediately;
     /// no new wire frame or original deadline is introduced.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn shutdown_rejected_creator_writer(&mut self) -> io::Result<()> {
         self.shutdown_rejected_creator_role(Role::Guardian)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn shutdown_keeper_rejected_creator_writer(&mut self) -> io::Result<()> {
         require(
             !self.guardian_forward_attempted,
@@ -2245,6 +2298,7 @@ impl Holder {
         )?;
         self.shutdown_rejected_creator_role(Role::Keeper)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn shutdown_rejected_creator_role(&mut self, role: Role) -> io::Result<()> {
         let result = (|| {
             self.failed_retirement_deadline()?;
@@ -2443,6 +2497,7 @@ impl Holder {
     }
     /// Accept only an actual packet from the separately retained keeper peer.
     /// This coordinates retained custody records; it creates no provider right.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn accept_failed_keeper_observation(
         &mut self,
         packet: &wire::Packet,
@@ -2473,6 +2528,7 @@ impl Holder {
         self.failed_agreement = Some(agreement.clone());
         Ok(agreement)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn forget_failed_source_unit(&mut self) -> io::Result<bool> {
         let deadline = self.failed_retirement_deadline()?;
         require(
@@ -2504,6 +2560,7 @@ impl Holder {
         }
         self.forget_failed.as_mut().unwrap().poll(deadline)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn record_failed_agreement(&mut self, agreement: &serde_json::Value) -> io::Result<()> {
         self.failed_retirement_deadline()?;
         require(
@@ -2525,6 +2582,7 @@ impl Holder {
     }
     /// Bind the actual source launcher while it is still live. The parent keeps
     /// the original Child, pipes, pidfd and wait throughout joined retirement.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn bind_source_launcher(&mut self, launcher: &owner::Launcher) -> io::Result<()> {
         require(
             self.role == Role::Guardian && self.source_launcher.is_none(),
@@ -2683,6 +2741,7 @@ impl Holder {
     pub fn controls_ready(&self) -> bool {
         self.stage == Stage::Journal && self.refused.is_none()
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub fn diagnostics(&self) -> io::Result<serde_json::Value> {
         Ok(
             json!({"role":self.role.name(),"stage":format!("{:?}",self.stage),"creator":self.actual_creator().map(owner::Creator::receipt),"partial_creator":self.partial_creator.as_ref().map(owner::PartialCreatorCustody::diagnostics),"partial_custody_failure":self.partial_custody_failure.as_ref().map(|e|&e.message),
@@ -2783,6 +2842,7 @@ pub(super) fn reap_joined(
 /// Join an actually failed source wrapper and naturally successful keeper after
 /// both holders independently retired failed source custody. This cannot satisfy
 /// reap_joined/reap_success or construct successful source/provider authority.
+#[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
 pub(super) fn reap_joined_failed_source(
     source: &mut owner::Launcher,
     source_directory: std::os::fd::RawFd,
@@ -2851,6 +2911,7 @@ pub(super) fn reap_joined_failed_source(
 /// Independent histories and source identity must agree even when acquisition
 /// stopped between atomic role groups. The original local failures and actual
 /// control populations are retained separately, never replaced by an agreement.
+#[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
 pub(super) fn check_failed_observations(
     left: &serde_json::Value,
     right: &serde_json::Value,
@@ -2906,7 +2967,9 @@ struct CreationGate {
     callback_sequence: Option<u64>,
     callback_attempted: bool,
     external_keeper_mirror: bool,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     shutdown: Option<ShutdownAttempt>,
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     shutdown_failure: Option<Failure>,
 }
 impl Holder {
@@ -3122,6 +3185,7 @@ impl Holder {
         })();
         self.remember(result)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub(super) fn cancel_creation_after_prefix(&mut self, cause: &io::Error) -> io::Result<u64> {
         require(
             !self.journal.pairs.is_empty(),
@@ -3129,6 +3193,7 @@ impl Holder {
         )?;
         self.cancel_held_creation(cause)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub(super) fn cancel_creation_before_first_ack(
         &mut self,
         cause: &io::Error,
@@ -3146,6 +3211,7 @@ impl Holder {
         )?;
         self.cancel_held_creation(cause)
     }
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     fn cancel_held_creation(&mut self, cause: &io::Error) -> io::Result<u64> {
         require(
             self.role == Role::Guardian && self.stage == Stage::Journal,
@@ -3256,6 +3322,7 @@ impl Holder {
     }
     /// Separate private asymmetric authority; the old equal-history field and
     /// comparator are not consulted, filled, cleared, or changed here.
+    #[expect(dead_code, reason = "Retained typed failed-creator recovery is not yet integrated with the active startup route")]
     pub(super) fn forget_failed_creation(
         &mut self,
         agreement: &super::cleanup::AsymmetricAgreement,
@@ -3332,7 +3399,7 @@ impl Holder {
         let history = self.journal.completed_leaf_history()?;
         let pairs: Vec<_> = history
             .frames
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|frames| {
                 json!({"intent_owner":frames[0].owner,"outcome_owner":frames[1].owner,
                 "intent":frames[0].write,"outcome":frames[1].write,"line":frames[0].line})

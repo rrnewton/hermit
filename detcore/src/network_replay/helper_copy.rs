@@ -141,6 +141,77 @@ impl NetworkReplayEngine {
     }
 }
 
+/// Component-only logical owner variant. The real supplied runtime separately
+/// owns its PIDFD/Root and held helper FD; this creates no production authority.
+#[cfg(test)]
+impl NetworkReplayEngine {
+    pub(crate) fn controlled_pending_helper_for_owner(
+        owner: NetworkStreamOwner,
+    ) -> (
+        Self,
+        NetworkStreamCallId,
+        NetworkStreamLeaseId,
+        NetworkStreamPhysicalEffect,
+    ) {
+        use chrono::TimeZone;
+        let mut engine = Self::record_shadow(chrono::Utc.timestamp_opt(1_790_000_000, 0).unwrap());
+        let file = OpenFileId::new_socket(owner.thread, 0);
+        let profile = super::tests::test_fresh_profile(libc::AF_INET);
+        engine
+            .register_stream_socket(
+                file,
+                profile.key,
+                super::tests::test_socket_namespace(),
+                Some(profile),
+            )
+            .unwrap();
+        engine
+            .ensure_channel(
+                file,
+                NetworkChannelBinding {
+                    transport: NetworkTransportV2::Tcp,
+                    role: NetworkEndpointRoleV2::OutboundClient,
+                    peer_address: Some(NetworkAddressV2::Inet4 {
+                        address: [192, 0, 2, 1],
+                        port: 443,
+                    }),
+                    requested_local_constraint: None,
+                    observed_local_address: None,
+                    accepted_from: None,
+                    selected_channel: None,
+                },
+            )
+            .unwrap();
+        let control = engine.begin_socket_controls(owner, vec![file]).unwrap()[0].1;
+        let call = engine.begin_stream_call(owner, control).unwrap().id;
+        engine
+            .confirm_stream_call_pin(owner, call, NetworkStreamPinOutcome::Acquired)
+            .unwrap();
+        engine
+            .finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+        let lease = engine
+            .begin_shadow_probe(
+                owner,
+                call,
+                LogicalTime::from_nanos(1_790_000_000_000_000_001),
+            )
+            .unwrap()
+            .lease;
+        engine
+            .submit_stream_physical(owner, lease, NetworkStreamPhysicalEffect::ReadPeekOffset)
+            .unwrap();
+        engine
+            .confirm_stream_physical(owner, lease, NetworkStreamPhysicalResult::PeekOffset(-1))
+            .unwrap();
+        let effect = NetworkStreamPhysicalEffect::Peek { maximum: 1024 };
+        engine
+            .submit_stream_physical(owner, lease, effect.clone())
+            .unwrap();
+        (engine, call, lease, effect)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,76 +394,5 @@ mod tests {
         assert!(
             matches!(engine.finish(),Err(NetworkReplayError::UnresolvedStreamCall(id)) if id==call)
         );
-    }
-}
-
-/// Component-only logical owner variant. The real supplied runtime separately
-/// owns its PIDFD/Root and held helper FD; this creates no production authority.
-#[cfg(test)]
-impl NetworkReplayEngine {
-    pub(crate) fn controlled_pending_helper_for_owner(
-        owner: NetworkStreamOwner,
-    ) -> (
-        Self,
-        NetworkStreamCallId,
-        NetworkStreamLeaseId,
-        NetworkStreamPhysicalEffect,
-    ) {
-        use chrono::TimeZone;
-        let mut engine = Self::record_shadow(chrono::Utc.timestamp_opt(1_790_000_000, 0).unwrap());
-        let file = OpenFileId::new_socket(owner.thread, 0);
-        let profile = super::tests::test_fresh_profile(libc::AF_INET);
-        engine
-            .register_stream_socket(
-                file,
-                profile.key,
-                super::tests::test_socket_namespace(),
-                Some(profile),
-            )
-            .unwrap();
-        engine
-            .ensure_channel(
-                file,
-                NetworkChannelBinding {
-                    transport: NetworkTransportV2::Tcp,
-                    role: NetworkEndpointRoleV2::OutboundClient,
-                    peer_address: Some(NetworkAddressV2::Inet4 {
-                        address: [192, 0, 2, 1],
-                        port: 443,
-                    }),
-                    requested_local_constraint: None,
-                    observed_local_address: None,
-                    accepted_from: None,
-                    selected_channel: None,
-                },
-            )
-            .unwrap();
-        let control = engine.begin_socket_controls(owner, vec![file]).unwrap()[0].1;
-        let call = engine.begin_stream_call(owner, control).unwrap().id;
-        engine
-            .confirm_stream_call_pin(owner, call, NetworkStreamPinOutcome::Acquired)
-            .unwrap();
-        engine
-            .finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
-            .unwrap();
-        let lease = engine
-            .begin_shadow_probe(
-                owner,
-                call,
-                LogicalTime::from_nanos(1_790_000_000_000_000_001),
-            )
-            .unwrap()
-            .lease;
-        engine
-            .submit_stream_physical(owner, lease, NetworkStreamPhysicalEffect::ReadPeekOffset)
-            .unwrap();
-        engine
-            .confirm_stream_physical(owner, lease, NetworkStreamPhysicalResult::PeekOffset(-1))
-            .unwrap();
-        let effect = NetworkStreamPhysicalEffect::Peek { maximum: 1024 };
-        engine
-            .submit_stream_physical(owner, lease, effect.clone())
-            .unwrap();
-        (engine, call, lease, effect)
     }
 }

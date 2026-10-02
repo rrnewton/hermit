@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use super::*;
 
 impl NetworkReplayEngine {
+    #[expect(dead_code, reason = "unintegrated entrypoint; no qualification claim")]
     pub(crate) fn validate_replay_transmit_read(
         &self,
         owner: NetworkStreamOwner,
@@ -60,26 +61,5 @@ impl NetworkReplayEngine {
             ));
         }
         Ok(binding.open_file)
-    }
-}
-
-#[cfg(test)]
-impl NetworkReplayEngine {
-    /// Exact consumer state, not an admission or a manufactured native receipt.
-    pub(crate) fn replay_transmit_fixture_state(
-        &self,
-        open_file: OpenFileId,
-    ) -> (u64, String, Vec<u64>) {
-        let channel = self.bound_channel(open_file).unwrap();
-        let state = &self.channels[&channel];
-        (
-            state.transmitted,
-            format!("{:?}", state.outbound),
-            self.native_completed()
-                .unwrap()
-                .into_iter()
-                .map(|node| node.0)
-                .collect(),
-        )
     }
 }

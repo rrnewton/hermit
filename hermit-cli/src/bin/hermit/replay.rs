@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 use std::path::PathBuf;
 
@@ -87,8 +87,7 @@ impl ReplayOpts {
                 self.network_deployment.roots()?,
                 self.network_deployment.accepted_root(),
                 "with_container",
-                gdb_listener,
-                None,
+                (gdb_listener, None),
                 move |(_, _, prepared), resource, listener| {
                     let prepared_replay = prepared
                         .take()
@@ -156,8 +155,7 @@ impl ReplayOpts {
                     self.network_deployment.roots()?,
                     self.network_deployment.accepted_root(),
                     "with_container",
-                    gdb_listener,
-                    None,
+                    (gdb_listener, None),
                     move |(_, _, _, prepared), resource, listener| {
                         let prepared_replay = prepared.take().ok_or_else(|| {
                             Error::msg("replay trace reservation was consumed twice")

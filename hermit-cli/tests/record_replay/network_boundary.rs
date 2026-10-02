@@ -369,7 +369,11 @@ pub(super) fn run(
             thread::sleep(Duration::from_millis(2));
         }
     }
-    let status = status.unwrap();
+    // try_wait above has already reaped the child. wait returns that cached
+    // status; keeping an explicit join also checks that the observation agrees.
+    let reaped = child.wait().expect("join reaped bounded Hermit child");
+    assert_eq!(status, Some(reaped));
+    let status = reaped;
     assert!(
         status.code().is_some(),
         "Hermit terminated by a signal: {status}"

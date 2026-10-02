@@ -250,14 +250,14 @@ impl GlobalRPC<GlobalState> for CtlGuest<'_> {
                     fail("controlled ctl outcome failure")
                 } else {
                     Ok(NetworkReply::OriginalConnectOutcome(
-                        crate::network_runtime::original_connect::Outcome {
+                        Box::new(crate::network_runtime::original_connect::Outcome {
                             admission,
                             returned,
                             pin: None,
                             address: None,
                             socket: None,
                             read_copy: None,
-                        },
+                        }),
                     ))
                 }
             }

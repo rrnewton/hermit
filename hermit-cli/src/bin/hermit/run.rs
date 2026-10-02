@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
@@ -3702,15 +3702,15 @@ impl RunOpts {
                  original guest path"
             );
         }
-        if self.namespace_only {
-            if let Some(explicit_backend) = self.backend {
+        if self.namespace_only
+            && let Some(explicit_backend) = self.backend
+        {
                 anyhow::bail!(
                     "--backend={} cannot be used with --namespace-only because namespace-only mode \
                      bypasses instrumentation",
                     explicit_backend.as_str()
                 );
             }
-        }
         // Refuse an unsupported bound before probing backend availability. The
         // policy is independent of optional build features. Keep this in main:
         // the DBT launch arm returns directly without reaching RunOpts::run.
@@ -4844,8 +4844,7 @@ impl RunOpts {
                             guest_capture.as_ref(),
                             summary.as_ref(),
                             None,
-                            publication.as_ref().map(NetworkTracePublication::writer_fd),
-                            resource,
+                            (publication.as_ref().map(NetworkTracePublication::writer_fd), resource),
                         )
                         .map(|(status, output)| super::network_run::RunValue::Run(status, output))
                 },
@@ -4878,8 +4877,7 @@ impl RunOpts {
                             guest_capture.as_ref(),
                             summary.as_ref(),
                             Some(identity),
-                            publication.as_ref().map(NetworkTracePublication::writer_fd),
-                            resource,
+                            (publication.as_ref().map(NetworkTracePublication::writer_fd), resource),
                         )
                         .map(|(status, output)| super::network_run::RunValue::Run(status, output))
                 },
@@ -5771,8 +5769,7 @@ impl RunOpts {
                 roots,
                 self.network_accepted_recovery.as_deref(),
                 "with_container",
-                None,
-                timeout,
+                (None, timeout),
                 move |guards, resource, _| execute(guards, resource),
             )
         } else {
@@ -5812,9 +5809,12 @@ impl RunOpts {
         guest_capture: Option<&GuestRunCaptureSession>,
         summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
-        network_output_fd: Option<i32>,
-        network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
+        network: (
+            Option<i32>,
+            Option<detcore::network_runtime::NetworkRuntimeResources>,
+        ),
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        let (network_output_fd, network_runtime) = network;
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
 
         if capture_output && guest_capture.is_some() {

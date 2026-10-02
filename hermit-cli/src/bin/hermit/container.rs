@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 use std::any::Any;
 use std::ffi::CString;
@@ -849,6 +849,7 @@ fn inject_test_fault(site: &str) {
 /// Returns a [`SerializableError`] rather than a bare [`Error`] so the CLASS
 /// survives: a caught panic is tagged HERE, at the only point that still knows
 /// one happened, and the tag then crosses the process boundary with the message.
+#[cfg(test)]
 pub(super) fn catch_child_panic<F, T>(f: &mut F) -> Result<T, SerializableError>
 where
     F: FnMut() -> Result<T, Error>,

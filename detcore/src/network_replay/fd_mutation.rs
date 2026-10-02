@@ -89,7 +89,7 @@ pub enum NetworkFdMutationBegin {
     /// A legal competing mutation changed the captured binding before admission.
     Refresh,
     /// Both the exact table and affected OFDs are exclusively admitted.
-    Admitted(NetworkFdMutationAdmission),
+    Admitted(Box<NetworkFdMutationAdmission>),
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +569,7 @@ impl NetworkReplayEngine {
 
     /// Backend-only admission. The controlled fixture constructor is test-only;
     /// ordinary Record/Replay construction cannot opt into incomplete coverage.
+    #[cfg(test)]
     pub(crate) fn install_fd_table_capability(&mut self, capability: NetworkFdTableCapability) {
         assert!(self.fd_lifecycle.capability.is_none());
         assert!(self.fd_lifecycle.mutations.is_empty());
@@ -907,7 +908,7 @@ impl NetworkReplayEngine {
                 )
                 .is_none()
         );
-        Ok(NetworkFdMutationBegin::Admitted(admission))
+        Ok(NetworkFdMutationBegin::Admitted(Box::new(admission)))
     }
 
     fn fd_mutation(
@@ -2182,7 +2183,7 @@ mod tests {
         kind: NetworkFdMutationKind,
     ) -> NetworkFdMutationAdmission {
         match engine.begin_fd_mutation(owner, files, kind).unwrap() {
-            NetworkFdMutationBegin::Admitted(admission) => admission,
+            NetworkFdMutationBegin::Admitted(admission) => *admission,
             other => panic!("expected admission, got {other:?}"),
         }
     }
@@ -4121,6 +4122,7 @@ mod native_actual_fd_tests {
         else {
             panic!("original clone admission");
         };
+        let admission = *admission;
         let permit = admission.publication.permit;
         engine.submit_fd_mutation(owner, permit).unwrap();
         engine.prepare_native_birth_escrow(owner, permit).unwrap();

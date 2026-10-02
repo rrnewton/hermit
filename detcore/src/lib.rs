@@ -1855,19 +1855,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .thread_state()
             .native_construction()
             .map_err(|e| Error::Tool(anyhow::anyhow!(e)))?
-        {
-            if outcome.child()
+            && (outcome.child()
                 != (crate::network_replay::NetworkStreamOwner {
                     thread: new_dettid,
                     mm: guest.thread_state().mm_id,
                 })
-                || outcome.process() != detpid
+                || outcome.process() != detpid)
             {
                 return Err(Error::Tool(anyhow::anyhow!(
                     "native child start changed actual process/MM generation"
                 )));
             }
-        }
         let is_root_thread = is_root_thread_start(guest.is_root_process(), new_dettid, detpid);
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
@@ -3487,7 +3485,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let prestart_control = tool_global::native_prestart_tests::before_consuming_exit(
             tid,
             &thread_state,
-            exit_status.clone(),
+            exit_status,
         );
         debug!(
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",

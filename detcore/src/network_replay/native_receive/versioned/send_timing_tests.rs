@@ -180,11 +180,11 @@ impl Fixture {
             .as_ref()
             .unwrap();
         assert_eq!(p.call, self.call);
-        assert!(!p.timing_claimed);
+        assert!(!p._timing_claimed);
         assert!(
-            p.timing_identity.is_none()
-                && p.timing_normal_epoch.is_none()
-                && p.timing_receipt.is_none()
+            p._timing_identity.is_none()
+                && p._timing_normal_epoch.is_none()
+                && p._timing_receipt.is_none()
         );
     }
     fn has_receipt(&self) -> bool {
@@ -195,7 +195,7 @@ impl Fixture {
             .transmit_pending
             .as_ref()
             .unwrap()
-            .timing_receipt
+            ._timing_receipt
             .is_some()
     }
     fn legacy_confirmation(&mut self) -> Result<(), NetworkReplayError> {
@@ -234,8 +234,8 @@ async fn engine_claim_accepts_same_call_root_and_consumes_scheduler_receipt_once
         .as_ref()
         .unwrap();
     assert_eq!(p.call, f.call);
-    assert_eq!(p.timing_normal_epoch, Some(f.normal_epoch));
-    assert!(p.timing_claimed && p.timing_identity.is_some() && !p.submitted);
+    assert_eq!(p._timing_normal_epoch, Some(f.normal_epoch));
+    assert!(p._timing_claimed && p._timing_identity.is_some() && !p.submitted);
     assert!(
         matches!(f.claim(), Err(NetworkReplayError::UnresolvedStreamOperation(id)) if id == f.lease)
     );
@@ -398,7 +398,7 @@ async fn engine_second_accept_cannot_replace_retained_receipt() {
         .transmit_pending
         .as_ref()
         .unwrap()
-        .timing_receipt
+        ._timing_receipt
         .as_ref()
         .unwrap()
         .clone();
@@ -417,13 +417,13 @@ async fn engine_second_accept_cannot_replace_retained_receipt() {
         .transmit_pending
         .as_ref()
         .unwrap()
-        .timing_receipt
+        ._timing_receipt
         .as_ref()
         .unwrap();
     assert!(Arc::ptr_eq(&original, retained));
     // A same-token second acceptance cannot be expressed through these
     // move-only APIs. This checks no replacement by another genuine receipt;
-    // it is not isolated mutation coverage of timing_receipt.is_some().
+    // it is not isolated mutation coverage of _timing_receipt.is_some().
 }
 
 #[tokio::test]

@@ -198,6 +198,7 @@ unsafe extern "C" fn digest(bytes: *const u8, count: usize, out: *mut u8) -> c_i
 /// provider/session/terminal authority is created from these native receipts.
 #[derive(Debug)]
 pub(in crate::network_runtime) struct PreOpenAliasRetirement {
+    #[expect(dead_code, reason = "Original native alias-retirement status is retained for diagnostic consumers not yet integrated")]
     pub allocation_retained: bool,
     pub attempted: bool,
     pub returned: Option<NativeCall>,
@@ -362,11 +363,11 @@ impl Bridge {
         channel: BorrowedFd<'_>,
         incarnation: u64,
         nonce: &CStr,
-        deadline: u64,
-        cutoff: u64,
+        bounds: (u64, u64),
         unit: &CStr,
         controls: [BorrowedFd<'_>; 3],
     ) -> io::Result<()> {
+        let (deadline, cutoff) = bounds;
         let result = (|| {
             let call = self.ready()?.source;
             let fds = controls.map(|fd| fd.as_raw_fd());
@@ -409,11 +410,11 @@ impl Bridge {
         channel: BorrowedFd<'_>,
         incarnation: u64,
         nonce: &CStr,
-        deadline: u64,
-        cutoff: u64,
+        bounds: (u64, u64),
         unit: &CStr,
         leaves: [BorrowedFd<'_>; 3],
     ) -> io::Result<()> {
+        let (deadline, cutoff) = bounds;
         let result = (|| {
             let call = self.ready()?.successor;
             let fds = leaves.map(|fd| fd.as_raw_fd());

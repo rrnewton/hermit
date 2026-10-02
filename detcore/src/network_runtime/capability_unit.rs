@@ -1,7 +1,7 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * SPDX-License-Identifier: BSD-3-Clause
- */
+*/
 
 //! Common explicit service-launch policy, not a service ownership registry.
 //! The caller retains its unit identity, wrapper child, private channels, actual
@@ -629,13 +629,12 @@ impl CapabilityUnitLaunch<'_> {
     pub(crate) fn arguments_with_prepared_namespace(
         &self,
         nonce: &str,
-        namespace: i32,
-        setup: i32,
-        image: i32,
+        descriptors: (i32, i32, i32),
         mount_identity: (u64, u64),
         user_identity: (u64, u64),
         root_identity: (u64, u64),
     ) -> io::Result<Vec<OsString>> {
+        let (namespace, setup, image) = descriptors;
         if self.kind != CapabilityServiceKind::Accepted
             || !self.writable_directories.is_empty()
             || !matches!(self.lifetime, CapabilityServiceLifetime::Bounded(1..=20))
@@ -845,7 +844,7 @@ mod grouped_role_tests {
             .arguments_with_grouped_files(GroupedOpenFiles::SuccessorLeaves { nonce })
             .unwrap();
         let prepared = spec
-            .arguments_with_prepared_namespace(nonce, 10, 11, 12, (4, 5), (4, 6), (7, 8))
+            .arguments_with_prepared_namespace(nonce, (10, 11, 12), (4, 5), (4, 6), (7, 8))
             .unwrap();
         for arg in base.iter().take_while(|arg| *arg != "--") {
             let text = arg.to_string_lossy();
@@ -914,9 +913,7 @@ mod grouped_role_tests {
             assert!(
                 spec.arguments_with_prepared_namespace(
                     nonce,
-                    ns,
-                    setup,
-                    image,
+                    (ns, setup, image),
                     (4, 5),
                     (4, 6),
                     (7, 8)
@@ -925,7 +922,7 @@ mod grouped_role_tests {
             );
         }
         assert!(
-            spec.arguments_with_prepared_namespace(nonce, 10, 11, 12, (4, 0), (4, 6), (7, 8))
+            spec.arguments_with_prepared_namespace(nonce, (10, 11, 12), (4, 0), (4, 6), (7, 8))
                 .is_err()
         );
         let other_role = CapabilityUnitLaunch {
@@ -934,7 +931,7 @@ mod grouped_role_tests {
         };
         assert!(
             other_role
-                .arguments_with_prepared_namespace(nonce, 10, 11, 12, (4, 5), (4, 6), (7, 8))
+                .arguments_with_prepared_namespace(nonce, (10, 11, 12), (4, 5), (4, 6), (7, 8))
                 .is_err()
         );
     }

@@ -100,7 +100,7 @@ pub(super) struct BootstrapFailure {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum BootstrapReply {
-    Ready(ProviderReady),
+    Ready(Box<ProviderReady>),
     Failed(BootstrapFailure),
 }
 
@@ -158,8 +158,9 @@ pub struct ParentAcceptedService {
 pub struct ParentAcceptedStartFailure {
     /// Original error; cleanup must not replace it.
     pub error: io::Error,
-    /// Exact run resources, including a possibly live unit wrapper.
-    pub owner: ParentAcceptedService,
+    /// Exact run resources, including a possibly live unit wrapper. Boxing
+    /// preserves this field's ownership and drop order on failure.
+    pub owner: Box<ParentAcceptedService>,
 }
 
 fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
@@ -329,8 +330,10 @@ impl ParentAcceptedService {
         }
     }
 
-    /// Same owned launch with a typed post-spawn capability handoff. The safety
-    /// requirements of start_after_clone apply unchanged.
+    /// Same owned launch with a typed post-spawn capability handoff.
+    ///
+    /// # Safety
+    /// The safety requirements of [Self::start_after_clone] apply unchanged.
     pub unsafe fn start_after_clone_with_hook(
         launch: AcceptedProviderLaunch,
         endpoint: OwnedFd,
@@ -359,7 +362,10 @@ impl ParentAcceptedService {
             grouped_bootstrap: None,
         };
         if let Err(error) = owner.start(deadline, hook) {
-            return Err(ParentAcceptedStartFailure { error, owner });
+            return Err(ParentAcceptedStartFailure {
+                error,
+                owner: Box::new(owner),
+            });
         }
         Ok(owner)
     }
@@ -466,7 +472,7 @@ impl ParentAcceptedService {
                         .ok_or_else(|| io::Error::other("missing accepted startup reply"))?,
                 )?;
                 let ready = match reply {
-                    BootstrapReply::Ready(ready) => ready,
+                    BootstrapReply::Ready(ready) => *ready,
                     BootstrapReply::Failed(failure) => {
                         return Err(io::Error::other(failure.error));
                     }

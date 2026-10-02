@@ -121,7 +121,7 @@ impl RuntimeShared {
                 owner,
                 &Request::ObserveTerminalSocket {
                     call: admission.call.native_command_call(),
-                    effect: effect.clone(),
+                    effect: Box::new(effect.clone()),
                 },
                 || Ok(vec![task.as_fd().try_clone_to_owned()?]),
             )?;

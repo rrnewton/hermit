@@ -3,7 +3,7 @@
  * All rights reserved.
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Borrowed authority for an FD observation inside an already granted turn.
 //! No resource, response, turn, queue entry or physical completion is created.
@@ -297,7 +297,7 @@ impl Scheduler {
         let bad = || std::io::Error::other("native observation lacks an unchanged task projection");
         if !root.is_current(owner)
             || root.owner() != owner
-            || self.thread_tree.tree.get(&owner.thread).is_none()
+            || !self.thread_tree.tree.contains_key(&owner.thread)
         {
             return Err(bad());
         }

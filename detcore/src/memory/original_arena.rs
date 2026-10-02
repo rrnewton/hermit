@@ -243,7 +243,7 @@ impl MemoryMetadata {
                     .checked_add(PAGE_SIZE as u64 - 1)
                     .map(|size| size & !(PAGE_SIZE as u64 - 1));
                 let end = size.and_then(|size| start.checked_add(size));
-                if start == 0 || start % PAGE_SIZE as u64 != 0 || end.is_none() {
+                if start == 0 || !start.is_multiple_of(PAGE_SIZE as u64) || end.is_none() {
                     self.invalidate_original_arena();
                     return Err("native mmap arena span is not canonical");
                 }

@@ -2,57 +2,59 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use super::NetworkReplayEngine;
+#[cfg(test)]
 use super::NetworkReplayError;
 use super::NetworkStreamCallId;
 use super::NetworkStreamLeaseId;
 use super::NetworkStreamOwner;
+#[cfg(test)]
 use crate::scheduler::send_handback::SendHandbackReceipt;
 
 /// Issued only from the engine's existing retained pending Call/control.
 /// This proves neither a physical send nor an original-task return.
 #[derive(Debug)]
 pub(crate) struct PendingSendTiming {
-    pub(super) identity: Arc<()>,
+    // Keep the complete pending identity and its original drop order even while
+    // only the controlled timing consumer reads the non-owner fields.
+    pub(super) _identity: Arc<()>,
     pub(super) owner: NetworkStreamOwner,
-    pub(super) call: NetworkStreamCallId,
-    pub(super) lease: NetworkStreamLeaseId,
-    pub(super) normal_epoch: u64,
+    pub(super) _call: NetworkStreamCallId,
+    pub(super) _lease: NetworkStreamLeaseId,
+    pub(super) _normal_epoch: u64,
 }
 
 impl PendingSendTiming {
     pub(crate) fn owner(&self) -> NetworkStreamOwner {
         self.owner
     }
-    pub(crate) fn call(&self) -> NetworkStreamCallId {
-        self.call
-    }
-    pub(crate) fn lease(&self) -> NetworkStreamLeaseId {
-        self.lease
-    }
+    #[cfg(test)]
     pub(crate) fn normal_epoch(&self) -> u64 {
-        self.normal_epoch
+        self._normal_epoch
     }
+    #[cfg(test)]
     pub(crate) fn same_pending(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
+        Arc::ptr_eq(&self._identity, &other._identity)
             && self.owner == other.owner
-            && self.call == other.call
-            && self.lease == other.lease
-            && self.normal_epoch == other.normal_epoch
+            && self._call == other._call
+            && self._lease == other._lease
+            && self._normal_epoch == other._normal_epoch
     }
 
     #[cfg(test)]
     pub(crate) fn fixture(owner: NetworkStreamOwner, call: u64) -> Self {
         Self {
-            identity: Arc::new(()),
+            _identity: Arc::new(()),
             owner,
-            call: NetworkStreamCallId::controlled_fixture(call),
-            lease: NetworkStreamLeaseId::controlled_fixture(call),
-            normal_epoch: 1,
+            _call: NetworkStreamCallId::controlled_fixture(call),
+            _lease: NetworkStreamLeaseId::controlled_fixture(call),
+            _normal_epoch: 1,
         }
     }
 }
 
+#[cfg(test)]
 impl NetworkReplayEngine {
     /// Claim timing enrollment once, before submission. Caller must enroll
     /// while holding the scheduler -> engine locks and the same Normal gate.
@@ -70,7 +72,7 @@ impl NetworkReplayEngine {
             .transmit_pending
             .as_ref()
             .ok_or(NetworkReplayError::StreamLeaseKindMismatch(lease))?;
-        if pending.submitted || pending.timing_claimed {
+        if pending.submitted || pending._timing_claimed {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
         // The pending source entry must be from this exact retained sole-root
@@ -84,16 +86,16 @@ impl NetworkReplayEngine {
             .transmit_pending
             .as_mut()
             .unwrap();
-        pending.timing_claimed = true;
-        pending.timing_normal_epoch = Some(grant.epoch());
+        pending._timing_claimed = true;
+        pending._timing_normal_epoch = Some(grant.epoch());
         let identity = Arc::new(());
-        pending.timing_identity = Some(identity.clone());
+        pending._timing_identity = Some(identity.clone());
         Ok(PendingSendTiming {
-            identity,
+            _identity: identity,
             owner,
-            call: pending.call,
-            lease,
-            normal_epoch: grant.epoch(),
+            _call: pending.call,
+            _lease: lease,
+            _normal_epoch: grant.epoch(),
         })
     }
 
@@ -114,20 +116,20 @@ impl NetworkReplayEngine {
             .as_ref()
             .ok_or(NetworkReplayError::StreamLeaseKindMismatch(lease))?;
         let expected = PendingSendTiming {
-            identity: pending
-                .timing_identity
+            _identity: pending
+                ._timing_identity
                 .clone()
                 .ok_or(NetworkReplayError::UnresolvedStreamOperation(lease))?,
             owner,
-            call: pending.call,
-            lease,
-            normal_epoch: pending
-                .timing_normal_epoch
+            _call: pending.call,
+            _lease: lease,
+            _normal_epoch: pending
+                ._timing_normal_epoch
                 .ok_or(NetworkReplayError::UnresolvedStreamOperation(lease))?,
         };
-        if !pending.timing_claimed
+        if !pending._timing_claimed
             || !pending.submitted
-            || pending.timing_receipt.is_some()
+            || pending._timing_receipt.is_some()
             || !receipt.matches(&expected)
         {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
@@ -139,7 +141,7 @@ impl NetworkReplayEngine {
             .transmit_pending
             .as_mut()
             .unwrap()
-            .timing_receipt = Some(Arc::new(receipt));
+            ._timing_receipt = Some(Arc::new(receipt));
         Ok(())
     }
 }

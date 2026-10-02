@@ -254,7 +254,7 @@ impl Raw {
             file: selected.raw.file,
             stat,
             status_flags,
-            domain,
+            _domain: domain,
             resolved_path: self.resolved_path.clone(),
         }))
     }
@@ -266,7 +266,7 @@ pub(crate) struct Checked {
     pub file: u64,
     pub stat: crate::stat::DetStat,
     pub status_flags: i32,
-    pub domain: Option<i32>,
+    pub _domain: Option<i32>,
     pub resolved_path: Option<std::path::PathBuf>,
 }
 impl Checked {
@@ -331,15 +331,13 @@ pub(super) fn same_user_namespace(task: BorrowedFd<'_>) -> io::Result<(u64, u64)
 }
 
 fn observe_held(
-    controller: &Controller,
-    executor: &tokio::runtime::Handle,
+    (controller, executor): (&Controller, &tokio::runtime::Handle),
     owner: NetworkStreamOwner,
     admission: &Admission,
     original: &OriginalEffect,
     held: BorrowedFd<'_>,
     raw: &mut Raw,
-    custody: &Arc<Mutex<Custody>>,
-    quarantine: &NativeQuarantine,
+    (custody, quarantine): (&Arc<Mutex<Custody>>, &NativeQuarantine),
 ) -> io::Result<()> {
     let tid = unsafe { libc::syscall(libc::SYS_gettid) };
     // PIDFD_THREAD is O_EXCL in the installed pidfd UAPI. The exact retained
@@ -644,15 +642,13 @@ impl RuntimeShared {
                             return Ok(());
                         };
                         let outcome = observe_held(
-                            &controller,
-                            &executor,
+                            (&controller, &executor),
                             owner,
                             &admitted,
                             &effect,
                             held.as_fd(),
                             &mut raw,
-                            &custody,
-                            &worker_quarantine,
+                            (&custody, &worker_quarantine),
                         );
                         drop(held);
                         if worker_quarantine.is_possible() {

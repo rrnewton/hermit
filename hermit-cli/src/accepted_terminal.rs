@@ -140,7 +140,7 @@ fn receive_bootstrap(socket: BorrowedFd<'_>) -> io::Result<([u8; 16], OwnedFd)> 
                 .cmsg_len
                 .saturating_sub(libc::CMSG_LEN(0) as usize);
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                invalid |= len % std::mem::size_of::<i32>() != 0;
+                invalid |= !len.is_multiple_of(std::mem::size_of::<i32>());
                 for offset in 0..len / std::mem::size_of::<i32>() {
                     let raw =
                         std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<i32>().add(offset));
@@ -704,8 +704,8 @@ impl AcceptedParentFinalizer {
         self.grouped_hook().progress(deadline)
     }
     fn require_grouped_completed(&self) -> io::Result<()> {
-        if let Some(owner) = &self.grouped {
-            if !owner
+        if let Some(owner) = &self.grouped
+            && !owner
                 .try_borrow()
                 .map_err(|_| io::Error::other("grouped parent owner already borrowed"))?
                 .completed()
@@ -714,7 +714,6 @@ impl AcceptedParentFinalizer {
                     "original grouped children or runtime unit remain unjoined",
                 ));
             }
-        }
         Ok(())
     }
     pub fn before_startup(stdout: File, stderr: File, executable: PathBuf) -> Self {
@@ -1181,11 +1180,11 @@ impl AcceptedParentFinalizer {
         if unit != identity.unit {
             return Err(io::Error::other("failed accepted unit identity changed"));
         }
-        if let Some(task) = task {
-            if !pidfd_terminal(task.as_fd())? {
+        if let Some(task) = task
+            && !pidfd_terminal(task.as_fd())?
+        {
                 return Err(io::Error::other("failed accepted helper remains live"));
             }
-        }
         if !group_absent(
             group.ok_or_else(|| io::Error::other("accepted wrapper group missing"))?,
             deadline,
@@ -2350,8 +2349,8 @@ pub fn validate_accepted_receipt(
     }
     validate_startup(&started.observed, expected)?;
     validate_terminal(&started.observed, &terminal.observed, &bytes[1], &bytes[2])?;
-    for i in 0..3 {
-        if before.files[i] != receipt_identity(&files[i])? {
+    for (i, file) in files.iter().enumerate() {
+        if before.files[i] != receipt_identity(file)? {
             return Err(io::Error::other(
                 "accepted file differs from original launch identity",
             ));
@@ -3417,7 +3416,7 @@ mod recovery_receipt_tests {
             }
             let error = validate_accepted_receipt(&r.root, &r.label, &artifact()).unwrap_err();
             match variant {
-                0 | 1 | 2 => assert_eq!(
+                0..=2 => assert_eq!(
                     error.to_string(),
                     "accepted receipt file shape/owner/extent differs"
                 ),

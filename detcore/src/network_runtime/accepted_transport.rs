@@ -19,6 +19,21 @@ const VERSION: u32 = 1;
 const MAX_MESSAGE: usize = 16 * 1024;
 const MAX_RIGHTS: usize = 253; // Linux SCM_MAX_FD; receive enough to retain malformed excess.
 
+type RetainedRequest<'a> = (&'a Envelope, &'a [OwnedFd], Option<&'a [u8]>);
+type ReadCopyRows = (
+    Vec<u64>,
+    Option<Vec<super::original_read_copy::Record>>,
+    Option<super::original_read_copy::End>,
+);
+
+#[cfg(test)]
+type NativeBirthTestGroup = (
+    NetworkStreamOwner,
+    Option<u64>,
+    u64,
+    Vec<(Envelope, Vec<u8>, usize)>,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Operation {
     PrepareNativeBirth,
@@ -1546,8 +1561,7 @@ impl<T> Inbox<T> {
         &mut self,
         request: &Envelope,
         rights: usize,
-        call: u64,
-        command: u64,
+        (call, command): (u64, u64),
         prepared: u64,
         first: u64,
         fetch: impl FnOnce() -> io::Result<Option<super::original_read_copy::Chunk>>,
@@ -2178,7 +2192,7 @@ impl AcceptedSession {
     pub(super) fn retained_request(
         &self,
         sequence: u64,
-    ) -> io::Result<(&Envelope, &[OwnedFd], Option<&[u8]>)> {
+    ) -> io::Result<RetainedRequest<'_>> {
         let entry = self
             .incoming
             .entries
@@ -2222,14 +2236,13 @@ impl AcceptedSession {
         &mut self,
         request: &Envelope,
         rights: usize,
-        call: u64,
-        command: u64,
+        identity: (u64, u64),
         prepared: u64,
         first: u64,
         fetch: impl FnOnce() -> io::Result<Option<super::original_read_copy::Chunk>>,
     ) -> io::Result<Option<super::original_read_copy::Chunk>> {
         self.incoming
-            .read_copy_chunk(request, rights, call, command, prepared, first, fetch)
+            .read_copy_chunk(request, rights, identity, prepared, first, fetch)
     }
     pub(super) fn wait_transport(&self, deadline: Instant) -> io::Result<()> {
         self.wait_transport_with_copy(deadline, None)
@@ -2573,7 +2586,7 @@ fn receive(endpoint: i32) -> io::Result<Option<Unclassified>> {
         }
         if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
             let length = header.cmsg_len - base;
-            if length % std::mem::size_of::<i32>() != 0 {
+            if !length.is_multiple_of(std::mem::size_of::<i32>()) {
                 valid = false;
             }
             let data = unsafe { libc::CMSG_DATA(c).cast::<i32>() };
@@ -2726,7 +2739,11 @@ mod tests {
             owner: Some(owner),
             accept: None,
             operation: Operation::ObserveTerminalSocket,
-            body: serde_json::to_vec(&Request::ObserveTerminalSocket { call: 19, effect }).unwrap(),
+            body: serde_json::to_vec(&Request::ObserveTerminalSocket {
+                call: 19,
+                effect: Box::new(effect),
+            })
+            .unwrap(),
         };
         let body = serde_json::to_vec(&Reply::TerminalSocketObservation {
             call: 19,
@@ -4389,11 +4406,13 @@ mod original_connect_tests {
         use crate::network_runtime::original_read_copy::Record;
         use crate::network_runtime::original_read_copy::Summary;
 
-        fn read_group() -> (
+        type ReadGroup = (
             NetworkStreamOwner,
             Vec<(Envelope, Vec<u8>, usize)>,
             Vec<Record>,
-        ) {
+        );
+
+        fn read_group() -> ReadGroup {
             let (owner, mut rows) = group(1, 9, false);
             let count = 5 * RECORD_BYTES as u64;
             rows[0].0.body = serde_json::to_vec(&Request::PrepareOriginalConnect {
@@ -4473,7 +4492,7 @@ mod original_connect_tests {
                 .collect();
             let fields = [selected_file, 1, 0, count, count, 0, 0, 1, 1];
             let mut bytes = vec![0; RECORD_BYTES];
-            for (slot, field) in bytes[..72].chunks_exact_mut(8).zip(fields) {
+            for (slot, field) in bytes[..72].as_chunks_mut::<8>().0.iter_mut().zip(fields) {
                 slot.copy_from_slice(&field.to_le_bytes());
             }
             records.push(Record {
@@ -4555,7 +4574,7 @@ mod original_connect_tests {
             for first in 0..6 {
                 let request = fragment(owner, first);
                 let chunk = inbox
-                    .read_copy_chunk(&request, 0, 9, 26, 1, first, || {
+                    .read_copy_chunk(&request, 0, (9, 26), 1, first, || {
                         panic!("final retained copy performed another provider read")
                     })
                     .unwrap()
@@ -4603,11 +4622,7 @@ mod original_connect_tests {
         }
         /// Convert the historical controlled receipt into explicit V5 frames;
         /// this supplies no native producer evidence. All old controls stay V4.
-        fn frontier_group() -> (
-            NetworkStreamOwner,
-            Vec<(Envelope, Vec<u8>, usize)>,
-            Vec<Record>,
-        ) {
+        fn frontier_group() -> ReadGroup {
             let (owner, mut rows, mut records) = read_group();
             let old_end = records.pop().unwrap();
             let mut begin = old_end.clone();
@@ -4634,7 +4649,12 @@ mod original_connect_tests {
                 field(7),
                 field(8),
             ];
-            for (slot, value) in begin.bytes[..104].chunks_exact_mut(8).zip(fields) {
+            for (slot, value) in begin.bytes[..104]
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(fields)
+            {
                 slot.copy_from_slice(&value.to_le_bytes());
             }
             for record in &mut records {
@@ -4714,7 +4734,7 @@ mod original_connect_tests {
                         let mut request = fragment(owner, first);
                         request.sequence = 4 + first;
                         let chunk = inbox
-                            .read_copy_chunk(&request, 0, 9, 26, 1, first, || {
+                            .read_copy_chunk(&request, 0, (9, 26), 1, first, || {
                                 panic!("retained records performed another native fetch")
                             })
                             .unwrap()
@@ -4868,7 +4888,7 @@ mod original_connect_tests {
                 );
                 let request = fragment(owner, 0);
                 let chunk = inbox
-                    .read_copy_chunk(&request, 0, 9, 26, 1, 0, || {
+                    .read_copy_chunk(&request, 0, (9, 26), 1, 0, || {
                         panic!("retained no-protocol copy must not fetch again")
                     })
                     .unwrap()
@@ -4933,7 +4953,7 @@ mod original_connect_tests {
                 let mut request = fragment(owner, first);
                 request.sequence = 3 + first;
                 let chunk = inbox
-                    .read_copy_chunk(&request, 0, 9, 26, 1, first, || {
+                    .read_copy_chunk(&request, 0, (9, 26), 1, first, || {
                         Ok(Some(Chunk {
                             prepared: 1,
                             first,
@@ -4973,7 +4993,7 @@ mod original_connect_tests {
             inbox.retain(pending.clone(), vec![]).unwrap();
             assert!(
                 inbox
-                    .read_copy_chunk(&pending, 0, 9, 26, 1, 6, || Ok(None))
+                    .read_copy_chunk(&pending, 0, (9, 26), 1, 6, || Ok(None))
                     .unwrap()
                     .is_none()
             );
@@ -4998,7 +5018,7 @@ mod original_connect_tests {
                 .unwrap();
             assert_eq!(acknowledgements, 1);
             let chunk = inbox
-                .read_copy_chunk(&pending, 0, 9, 26, 1, 6, || {
+                .read_copy_chunk(&pending, 0, (9, 26), 1, 6, || {
                     panic!("retained EXIT reread provider")
                 })
                 .unwrap()
@@ -5213,12 +5233,7 @@ mod native_birth_retirement_tests {
         first: u64,
         call: u64,
         kind: u8,
-    ) -> (
-        NetworkStreamOwner,
-        Option<u64>,
-        u64,
-        Vec<(Envelope, Vec<u8>, usize)>,
-    ) {
+    ) -> NativeBirthTestGroup {
         let thread = DetTid::from_raw(61);
         let owner = NetworkStreamOwner {
             thread,
@@ -5539,12 +5554,7 @@ pub(super) fn native_birth_test_group(
     first: u64,
     call: u64,
     kind: u8,
-) -> (
-    NetworkStreamOwner,
-    Option<u64>,
-    u64,
-    Vec<(Envelope, Vec<u8>, usize)>,
-) {
+) -> NativeBirthTestGroup {
     native_birth_retirement_tests::group(first, call, kind)
 }
 
@@ -5552,12 +5562,7 @@ pub(super) fn native_birth_test_group(
 pub(super) fn native_birth_terminal_test_group(
     first: u64,
     call: u64,
-) -> (
-    NetworkStreamOwner,
-    Option<u64>,
-    u64,
-    Vec<(Envelope, Vec<u8>, usize)>,
-) {
+) -> NativeBirthTestGroup {
     use super::accepted_provider::NativeBirthTerminal;
     use super::accepted_provider::Observation;
     use super::accepted_provider::Reply;
@@ -5773,11 +5778,7 @@ fn validate_read_copy_rows(
     body: &[u8],
     rows: Vec<(&Envelope, &[u8], usize)>,
     version: u64,
-) -> io::Result<(
-    Vec<u64>,
-    Option<Vec<super::original_read_copy::Record>>,
-    Option<super::original_read_copy::End>,
-)> {
+) -> io::Result<ReadCopyRows> {
     use super::accepted_provider::Reply;
     use super::accepted_provider::Request;
     use super::original_read_copy::End;
@@ -6297,7 +6298,12 @@ mod helper_receive_transport_tests {
             1,
             if consume { 1 } else { 2 },
         ];
-        for (chunk, field) in unit.bytes[..72].chunks_exact_mut(8).zip(fields) {
+        for (chunk, field) in unit.bytes[..72]
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(fields)
+        {
             chunk.copy_from_slice(&field.to_le_bytes());
         }
         (owner, role, rows, vec![data, unit])
@@ -6477,7 +6483,7 @@ mod helper_receive_transport_tests {
                 };
                 let chunk = session
                     .incoming
-                    .read_copy_chunk(&request, 0, 17, 91, 1, first, || {
+                    .read_copy_chunk(&request, 0, (17, 91), 1, first, || {
                         panic!("retained helper copy was physically re-read after ACK")
                     })
                     .unwrap()

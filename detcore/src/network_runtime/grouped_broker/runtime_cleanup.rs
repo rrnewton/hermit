@@ -10,7 +10,6 @@ use std::os::fd::FromRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
-use std::time::Instant;
 
 use serde_json::Value;
 use serde_json::json;
@@ -452,6 +451,7 @@ impl SourceArchive {
         }
         result
     }
+    #[expect(dead_code, reason = "Typed archive receive variants are retained; active startup uses progress or inspecting variants")]
     pub(super) fn receive(
         &mut self,
         channel: &mut wire::Channel,
@@ -463,6 +463,7 @@ impl SourceArchive {
     }
     /// Continue with an actual already-retained first packet, after the caller
     /// dispatched its schema. Every original header check still runs here.
+    #[expect(dead_code, reason = "Typed archive receive variants are retained; active startup uses progress or inspecting variants")]
     pub(super) fn receive_started(
         &mut self,
         channel: &mut wire::Channel,
@@ -473,6 +474,7 @@ impl SourceArchive {
     ) -> io::Result<()> {
         self.receive_inner(channel, peer, intent, cutoff, Some(first_index))
     }
+    #[expect(dead_code, reason = "Typed archive receive variants are retained; active startup uses progress or inspecting variants")]
     fn receive_inner(
         &mut self,
         channel: &mut wire::Channel,
@@ -492,7 +494,7 @@ impl SourceArchive {
         first_index: Option<usize>,
         progress: impl FnMut() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.receive_observed(channel, peer, intent, cutoff, first_index, progress, |_| {
+        self.receive_observed(channel, peer, intent, (cutoff, first_index), progress, |_| {
             Ok(())
         })
     }
@@ -511,8 +513,7 @@ impl SourceArchive {
             channel,
             peer,
             intent,
-            cutoff,
-            Some(first_index),
+            (cutoff, Some(first_index)),
             || Ok(()),
             inspect,
         )
@@ -522,11 +523,11 @@ impl SourceArchive {
         channel: &mut wire::Channel,
         peer: wire::Credentials,
         intent: &Intent,
-        cutoff: u64,
-        first_index: Option<usize>,
+        boundary: (u64, Option<usize>),
         mut progress: impl FnMut() -> io::Result<()>,
         mut inspect: impl FnMut(&wire::Packet) -> io::Result<()>,
     ) -> io::Result<()> {
+        let (cutoff, first_index) = boundary;
         let result = (|| {
             require(
                 self.frames.is_empty() && self.refused.is_none(),
@@ -708,7 +709,13 @@ impl SourceArchive {
                 && self.histories[0].frames == self.histories[1].frames,
             "runtime Store callback histories differ or are incomplete",
         )?;
-        for (i, pair) in self.histories[0].frames.chunks_exact(2).enumerate() {
+        for (i, pair) in self.histories[0]
+            .frames
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
             require(
                 pair[1].write.raw == pair[1].write.submitted as i64
                     && pair[1].write.error == 0
@@ -901,7 +908,7 @@ pub(super) fn check_controls(fds: &[OwnedFd]) -> io::Result<()> {
 }
 fn decode_hex(text: &str, cap: usize) -> io::Result<Vec<u8>> {
     require(
-        text.len() % 2 == 0
+        text.len().is_multiple_of(2)
             && text.len() / 2 <= cap
             && text
                 .bytes()
@@ -909,7 +916,7 @@ fn decode_hex(text: &str, cap: usize) -> io::Result<Vec<u8>> {
         "runtime bounded hex differs",
     )?;
     text.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|pair| {
             u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).map_err(io::Error::other)
         })
@@ -1148,7 +1155,7 @@ pub(super) fn rust_owner(value: &ffi::Owner) -> io::Result<journal::OwnerSnapsho
     }
     Ok(journal::OwnerSnapshot {
         incarnation: value.incarnation,
-        phase: value.phase as u32,
+        phase: value.phase,
         verified_sites: value.verified_sites,
         attempted_sites: value.attempted_sites,
         event_id: value.event_id,
@@ -1296,12 +1303,12 @@ impl RuntimeCleanup {
         }
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refusal.is_none() {
+        if let Err(error) = &result
+            && self.refusal.is_none()
+        {
                 self.refusal = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     /// Receive the actual CLI-created channels/pins and local Store. Every
@@ -1633,9 +1640,9 @@ impl RuntimeCleanup {
                 && value["keeper_store"] == expected_histories[1].commitment(),
             "creation agreement changed last durable original Store commitments",
         )?;
-        for index in 0..2 {
+        for (index, expected) in expected_histories.iter().enumerate() {
             let actual =
-                self.early.readers[index].read_acknowledged_prefix(&expected_histories[index])?;
+                self.early.readers[index].read_acknowledged_prefix(expected)?;
             self.early.terminal_readbacks.push(actual);
         }
         let histories = &self.early.terminal_readbacks;
@@ -1995,11 +2002,10 @@ impl RuntimeCleanup {
                             }
                         }
                         Some("hermit-grouped-runtime-creation-prefix-v1") => {
-                            if self.refusal.is_none() {
-                                if let Err(error) = self.progress_creation_prefix(value, cutoff) {
+                            if self.refusal.is_none()
+                                && let Err(error) = self.progress_creation_prefix(value, cutoff) {
                                     wait_cutoff = self.retain_source_failure(&error)?;
                                 }
-                            }
                         }
                         Some("hermit-grouped-runtime-creation-agreement-v1") => {
                             return self.run_creation_cleanup_peer(value);
@@ -2247,7 +2253,7 @@ impl RuntimeCleanup {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let milliseconds = ((cutoff - now + 999_999) / 1_000_000) as i32;
+                let milliseconds = (cutoff - now).div_ceil(1_000_000) as i32;
                 let raw = unsafe { libc::poll(&mut fd, 1, milliseconds) };
                 if raw < 0 {
                     let error = io::Error::last_os_error();
@@ -2398,11 +2404,10 @@ impl RuntimeCleanup {
         {
             // A submitted commit is never turned back into AdmissionHeld. Read
             // the actual retained peer response; a refused channel stays UNKNOWN.
-            if let Err(error) = self.receive_commit(cutoff) {
-                if self.pending_creation_agreement.is_none() {
+            if let Err(error) = self.receive_commit(cutoff)
+                && self.pending_creation_agreement.is_none() {
                     return Err(error);
                 }
-            }
         }
         if self.commit_acknowledged {
             require(
@@ -2473,8 +2478,8 @@ impl RuntimeCleanup {
                     "late custody ACK changed original archive or repeated",
                 )?;
                 let controls = self.archive.controls()?;
-                for i in 0..3 {
-                    same_ofd(controls[i], packet.rights[i].as_fd())?;
+                for (i, control) in controls.into_iter().enumerate() {
+                    same_ofd(control, packet.rights[i].as_fd())?;
                 }
                 self.keeper_archive_ack_seen = true;
                 self.callbacks.ledger.as_mut().unwrap().store.append(
@@ -2594,8 +2599,8 @@ impl RuntimeCleanup {
                 "runtime Keeper did not acknowledge exact original custody",
             )?;
             let controls = self.archive.controls()?;
-            for i in 0..3 {
-                same_ofd(controls[i], packet.rights[i].as_fd())?;
+            for (i, control) in controls.into_iter().enumerate() {
+                same_ofd(control, packet.rights[i].as_fd())?;
             }
             self.keeper_archive_ack_seen = true;
             self.callbacks.peer_live()?;

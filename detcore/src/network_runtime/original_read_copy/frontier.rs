@@ -35,8 +35,8 @@ impl Begin {
             return Err(invalid("copy5 Begin wire shape"));
         }
         let mut f = [0u64; 13];
-        for (field, bytes) in f.iter_mut().zip(record.bytes[..104].chunks_exact(8)) {
-            *field = u64::from_le_bytes(bytes.try_into().unwrap());
+        for (field, bytes) in f.iter_mut().zip(record.bytes[..104].as_chunks::<8>().0) {
+            *field = u64::from_le_bytes(*bytes);
         }
         Ok(Self {
             file: f[0],
@@ -139,8 +139,8 @@ impl Finish {
             return Err(invalid("copy5 End wire shape"));
         }
         let mut f = [0u64; 11];
-        for (field, bytes) in f.iter_mut().zip(record.bytes[..88].chunks_exact(8)) {
-            *field = u64::from_le_bytes(bytes.try_into().unwrap());
+        for (field, bytes) in f.iter_mut().zip(record.bytes[..88].as_chunks::<8>().0) {
+            *field = u64::from_le_bytes(*bytes);
         }
         Ok(Self {
             unit: Unit {

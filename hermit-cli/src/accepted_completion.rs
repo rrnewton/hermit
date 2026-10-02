@@ -6,17 +6,18 @@
 //! This source is shared by the CLI parent and its outside fixture receiver.
 //! No packet grants cleanup authority or changes the CLI's primary result.
 use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+#[cfg(test)]
 use std::time::Instant;
 
 use hermit::accepted_terminal::AcceptedPublication;
+#[cfg(test)]
 use hermit::unix_guard_package::RecoveryDirectoryIdentity;
 
 const ENV: &str = "HERMIT_PRIVATE_ACCEPTED_COMPLETION";
@@ -27,6 +28,7 @@ const MAX_RUNS: usize = 2; // exact largest declared public call: one verify pai
 fn refuse(message: &str) -> io::Error {
     io::Error::other(message)
 }
+#[cfg(test)]
 fn within(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
         return Err(refuse("original accepted completion deadline expired"));
@@ -247,7 +249,8 @@ pub(crate) fn close_in_child() {
     PUBLISHER.with(|slot| drop(slot.borrow_mut().take()));
 }
 
-/// Per-call outside custody. The send alias survives only through Command::spawn.
+/// Test-only outside custody for the aggregate publication protocol.
+#[cfg(test)]
 pub(crate) struct FixtureChannel {
     receive: OwnedFd,
     send: Option<OwnedFd>,
@@ -256,6 +259,7 @@ pub(crate) struct FixtureChannel {
     uid: u32,
     gid: u32,
 }
+#[cfg(test)]
 impl FixtureChannel {
     pub(crate) fn new() -> io::Result<Self> {
         let mut fds = [-1; 2];
@@ -293,29 +297,6 @@ impl FixtureChannel {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         })
-    }
-    pub(crate) fn prepare(&self, command: &mut Command) -> io::Result<()> {
-        let fd = self
-            .send
-            .as_ref()
-            .ok_or_else(|| refuse("completion launch repeated"))?
-            .as_raw_fd();
-        command.env(
-            ENV,
-            format!("{fd}:{}", uuid::Uuid::from_bytes(self.token).simple()),
-        );
-        // The parent alias remains CLOEXEC. Only this exact Command's child
-        // inherits it; no other concurrent fixture spawn receives authority.
-        unsafe {
-            command.pre_exec(move || {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        Ok(())
     }
     pub(crate) fn launched(&mut self, pid: u32) -> io::Result<()> {
         if self.pid.is_some() || pid == 0 || pid > i32::MAX as u32 {
@@ -394,6 +375,7 @@ impl FixtureChannel {
     }
 }
 
+#[cfg(test)]
 fn receive_packet(fd: RawFd) -> io::Result<Option<([u8; BYTES], libc::ucred)>> {
     let mut frame = [0; BYTES];
     let mut iov = libc::iovec {

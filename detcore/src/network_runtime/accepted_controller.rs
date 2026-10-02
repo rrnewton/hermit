@@ -50,8 +50,6 @@ pub(super) enum Effect {
     CollectTableEnrollment(u64),
     PrepareAccept(NetworkAcceptLeaseId),
     CollectAccept(NetworkAcceptLeaseId),
-    PrepareSetter(NetworkStreamLeaseId),
-    FinishSetter(NetworkStreamLeaseId),
     // Observation cuts get a run-owned identity, not a guest TID/syscall order.
     Observation(u64),
     ObservationRetirement(u64),
@@ -590,14 +588,13 @@ impl Controller {
         if let Some(error) = &state.failure {
             return Err(io::Error::other(error.clone()));
         }
-        if let Effect::Listener(open_file) = key {
-            if let Some(sequence) = state
+        if let Effect::Listener(open_file) = key
+            && let Some(sequence) = state
                 .requests
                 .listener_sequence(open_file, operation, &body)?
             {
                 return Ok(sequence);
             }
-        }
         let State {
             session,
             requests,

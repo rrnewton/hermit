@@ -404,7 +404,7 @@ impl KeeperExportReceiver {
                     )?;
                     self.record = Some(value["record"].clone());
                 }
-                1 | 2 | 3 => {
+                1..=3 => {
                     let role = ["", "creator", "controls", "journal"][sequence];
                     require(
                         value
@@ -608,7 +608,7 @@ impl KeeperExportReceiver {
 }
 fn decode_hex(text: &str, cap: usize) -> io::Result<Vec<u8>> {
     require(
-        text.len() % 2 == 0
+        text.len().is_multiple_of(2)
             && text.len() / 2 <= cap
             && text
                 .bytes()
@@ -616,7 +616,7 @@ fn decode_hex(text: &str, cap: usize) -> io::Result<Vec<u8>> {
         "bounded archive hex differs",
     )?;
     text.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|pair| {
             u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).map_err(io::Error::other)
         })

@@ -53,6 +53,17 @@ pub(crate) mod original_read_copy;
 mod physical;
 pub(crate) mod socket_profile;
 mod terminal_socket_observation;
+// Both host C bridges use one supervisor module, including its unchanged
+// process-group tests, rather than registering that source twice.
+#[cfg(test)]
+#[path = "../../hermit-cli/network-provider/driver-ftrace-inputs.rs"]
+mod driver_ftrace_inputs;
+#[cfg(test)]
+#[path = "../../hermit-cli/network-provider/driver-ftrace-process.rs"]
+mod driver_ftrace_process;
+#[cfg(test)]
+#[path = "../../hermit-cli/network-provider/process_group.rs"]
+mod process_group;
 pub use accepted_parent::AcceptedPostSpawn;
 pub use accepted_parent::AcceptedProviderLaunch;
 pub use accepted_parent::AcceptedSpawned;
@@ -72,12 +83,11 @@ pub use grouped_broker::run_grouped_source_owner_process;
 pub use grouped_broker::run_grouped_source_process;
 pub use grouped_broker::run_grouped_startup_controller_process;
 pub(crate) use joined_native_worker::JoinedNativeWorkerReceipt;
-pub(crate) use native_copy_exclusion::JoinedNoStorePrefix;
-pub(crate) use native_copy_exclusion::JoinedReceiveRetryPrefix;
 pub(crate) use native_copy_exclusion::NativeCopyExclusion;
 pub(crate) use native_copy_exclusion::ReceiveRetryAdmission;
 pub(crate) use native_copy_exclusion::ReceiveRetryOrigin;
 pub(crate) use physical::ForegroundRoot;
+#[cfg(test)]
 pub(crate) use physical::InitialDescriptor;
 pub(crate) use physical::InitialFileStat;
 pub(crate) use physical::InitialMetadataIdentity;
@@ -598,16 +608,14 @@ impl RuntimeShared {
                 }
             }
         }
-        if !self.native_workers.lock().unwrap().tasks.is_empty() {
-            if failure.is_none() {
+        if !self.native_workers.lock().unwrap().tasks.is_empty() && failure.is_none() {
                 failure = Some(std::io::Error::other("native workers remain unjoined"));
-            }
         }
-        if let Some(error) = self.native_terminal_failure.lock().unwrap().as_ref() {
-            if failure.is_none() {
+        if let Some(error) = self.native_terminal_failure.lock().unwrap().as_ref()
+            && failure.is_none()
+        {
                 failure = Some(std::io::Error::other(error.clone()));
             }
-        }
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
@@ -739,11 +747,10 @@ impl RuntimeShared {
                 joined
             }
             .await;
-            if let Err(error) = retired {
-                if failure.is_none() {
+            if let Err(error) = retired
+                && failure.is_none() {
                     failure = Some(error);
                 }
-            }
         }
         match failure {
             Some(error) => Err(error),
@@ -1410,22 +1417,6 @@ impl NetworkRuntimeResources {
         }
     }
 
-    /// Final observation retirement has its own exact ACK, so it does not
-    /// require a future child. Aggregate shutdown must call this before provider
-    /// teardown; it does not certify unresolved socket rights or controller exit.
-    pub(crate) async fn finish_accepted_observations(
-        &self,
-        owner: crate::network_replay::NetworkStreamOwner,
-    ) -> std::io::Result<()> {
-        let controller = self.accepted_controller()?;
-        self.shared
-            .creations
-            .lock()
-            .await
-            .finish(&controller, owner)
-            .await
-    }
-
     /// Read at most the next provider occurrence. None means observation is
     /// currently pending; it is not permission to report guest EAGAIN.
     pub(crate) async fn next_accepted_creation(
@@ -1690,7 +1681,7 @@ impl NetworkRuntimeResources {
         let sequence = {
             let mut tasks = self.shared.physical.lock().unwrap();
             tasks.native_read(owner, ticket, register_read_succeeded)?;
-            let sequence = match tasks.collection(owner)? {
+            match tasks.collection(owner)? {
                 Some(prior) => prior.map_err(std::io::Error::other)?,
                 None => {
                     let submitted = controller
@@ -1709,8 +1700,7 @@ impl NetworkRuntimeResources {
                     tasks.retain_collection(owner, submitted.clone())?;
                     submitted.map_err(std::io::Error::other)?
                 }
-            };
-            sequence
+            }
         };
         let observed = match controller.response(sequence).await {
             Ok(accepted_provider::Reply::TableEnrollmentEffect(observation)) => Ok(observation),
@@ -1908,18 +1898,6 @@ impl NetworkRuntimeResources {
             .lock()
             .unwrap()
             .initial_metadata_identity(owner)
-    }
-
-    pub(crate) fn initial_table_association(
-        &self,
-        owner: crate::network_replay::NetworkStreamOwner,
-    ) -> std::io::Result<InitialTableAssociation> {
-        self.shared
-            .physical
-            .lock()
-            .unwrap()
-            .initial_association(owner)
-            .cloned()
     }
 
     pub(crate) fn admit_initial_table(
@@ -2536,6 +2514,19 @@ pub(crate) fn take_network_runtime_resources()
             Ok(slot.resource.take())
         })
         .unwrap_or(Ok(None))
+}
+
+#[cfg(test)]
+pub(crate) fn custody_identity_fixture(
+    owner: crate::network_replay::NetworkStreamOwner,
+) -> impl std::fmt::Debug {
+    let mut identities = physical::CustodyTasks::<()>::default();
+    identities
+        .register(owner, owner.thread.as_raw(), owner.thread.as_raw(), || {
+            Ok(())
+        })
+        .unwrap();
+    identities
 }
 
 #[cfg(test)]
@@ -4345,17 +4336,4 @@ mod tests {
         drop(owner);
         assert!(observed.upgrade().is_none());
     }
-}
-
-#[cfg(test)]
-pub(crate) fn custody_identity_fixture(
-    owner: crate::network_replay::NetworkStreamOwner,
-) -> impl std::fmt::Debug {
-    let mut identities = physical::CustodyTasks::<()>::default();
-    identities
-        .register(owner, owner.thread.as_raw(), owner.thread.as_raw(), || {
-            Ok(())
-        })
-        .unwrap();
-    identities
 }

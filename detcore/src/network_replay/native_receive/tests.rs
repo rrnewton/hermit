@@ -95,11 +95,13 @@ fn reader(
             owner,
             &admission,
             command,
-            selected.provider,
-            selected.task,
-            selected.task_start,
-            selected.table,
-            selected.file,
+            (
+                selected.provider,
+                selected.task,
+                selected.task_start,
+                selected.table,
+                selected.file,
+            ),
         )
         .unwrap();
     let custody = Arc::new(ReadCopyCustody::default());
@@ -116,7 +118,9 @@ fn reader(
         custody,
     }
 }
-fn receipt(reader: &Reader, specs: &[(u64, u64, u64, u64, Vec<u8>, i64)]) -> Vec<NativeAttempt> {
+type NativeAttemptSpec = (u64, u64, u64, u64, Vec<u8>, i64);
+
+fn receipt(reader: &Reader, specs: &[NativeAttemptSpec]) -> Vec<NativeAttempt> {
     reader
         .custody
         .controlled_append_v5(
@@ -516,7 +520,7 @@ fn native_receive_engine_join_does_not_wait_for_canonical_custody_mutex() {
     let _ = release.send(());
     raw_owner.join().unwrap();
     let (engine, result) = joiner.join().unwrap();
-    assert_eq!(completed_before_release.unwrap(), true);
+    assert!(completed_before_release.unwrap());
     result.unwrap();
     assert_eq!(frontier(&engine, binding), Cut { bytes: 3, order: 1 });
 }

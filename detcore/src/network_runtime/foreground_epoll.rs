@@ -261,7 +261,6 @@ impl NetworkRuntimeResources {
 
 #[cfg(test)]
 mod unsubmitted_tests {
-    use super::*;
     #[tokio::test]
     async fn foreground_entry_borrow_refuses_any_actual_runtime_capture_row() {
         let (runtime, _) = super::super::tests::fixture(94);

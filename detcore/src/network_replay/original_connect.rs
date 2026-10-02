@@ -114,17 +114,17 @@ impl Kind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Arguments {
-    pub kind: Kind,
-    pub operation: ExternalOpId,
-    pub files: FilesId,
-    pub binding: Option<FdSlotBinding>,
-    pub fd: i32,
-    pub address: u64,
-    pub length: i32,
+pub struct Arguments {
+    pub(crate) kind: Kind,
+    pub(crate) operation: ExternalOpId,
+    pub(crate) files: FilesId,
+    pub(crate) binding: Option<FdSlotBinding>,
+    pub(crate) fd: i32,
+    pub(crate) address: u64,
+    pub(crate) length: i32,
     /// Full Read count/Openat mode, or the exact zero-extended epoll target int.
     /// Zero for other kinds.
-    pub original_count: u64,
+    pub(crate) original_count: u64,
 }
 impl Arguments {
     fn same_request(&self, other: &Self) -> bool {
@@ -138,9 +138,9 @@ impl Arguments {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Admission {
-    pub call: NetworkStreamCallId,
-    pub arguments: Arguments,
+pub struct Admission {
+    pub(crate) call: NetworkStreamCallId,
+    pub(crate) arguments: Arguments,
 }
 
 /// Failed-run retirement authority for this exact original Call. This is issued
@@ -200,12 +200,12 @@ impl NetworkReplayEngine {
 /// its `invoked == false` value in an actually consumed ThreadState authorizes
 /// the provider's known-uninvoked disarm; READY alone is not that proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Local {
-    pub arguments: Arguments,
-    pub raw_arguments: [usize; 6],
-    pub admission: Option<Admission>,
-    pub invoked: bool,
-    pub returned: Option<i64>,
+pub struct Local {
+    pub(crate) arguments: Arguments,
+    pub(crate) raw_arguments: [usize; 6],
+    pub(crate) admission: Option<Admission>,
+    pub(crate) invoked: bool,
+    pub(crate) returned: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FileMetadataObservation {
@@ -319,7 +319,7 @@ impl NetworkReplayEngine {
     pub(crate) fn begin_original_connect(
         &mut self,
         owner: NetworkStreamOwner,
-        mut arguments: Arguments,
+        arguments: Arguments,
     ) -> Result<Admission, NetworkReplayError> {
         if !self.fd_table_capability()
             || arguments.kind.allocator()
@@ -426,7 +426,7 @@ impl NetworkReplayEngine {
                         "original invocation requires prior publication recovery",
                     ));
                 }
-                NetworkFdReadBegin::Admitted(read) => read,
+                NetworkFdReadBegin::Admitted(read) => *read,
             };
             arguments.binding = read.binding;
             let result =
@@ -1413,6 +1413,7 @@ impl NetworkReplayEngine {
     }
     /// Capture completion transfers custody to this phase; it does not invoke
     /// the ordinary stream confirmation which would release the table permit.
+    #[cfg(test)]
     pub(crate) fn original_connect_prepared(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1762,14 +1763,10 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         admission: &Admission,
         command: u64,
-        provider: u64,
-        task: u64,
-        start: u64,
-        table: u64,
-        file: u64,
+        selected: (u64, u64, u64, u64, u64),
     ) -> Result<(), NetworkReplayError> {
+        let (provider, task, start, table, file) = selected;
         let (state, original) = self.original_connect_state(owner, admission.call)?;
-        let selected = (provider, task, start, table, file);
         if original.arguments != admission.arguments
             || original.command != Some(command)
             || original.uninvoked
@@ -1945,27 +1942,26 @@ impl NetworkReplayEngine {
                 "close lost its lifetime table before actual owner final wait",
             ));
         }
-        if let Some(binding) = binding {
-            if table_live
-                && self
-                    .lifetime
-                    .binding_in_retained_table(binding.slot.files, binding.slot.fd)
-                    != Some(binding)
-            {
-                return Err(protocol(
-                    "close publication changed the original lifetime slot",
-                ));
-            }
+        if let Some(binding) = binding
+            && table_live
+            && self
+                .lifetime
+                .binding_in_retained_table(binding.slot.files, binding.slot.fd)
+                != Some(binding)
+        {
+            return Err(protocol(
+                "close publication changed the original lifetime slot",
+            ));
         }
         // Preserve the private original binding before its numeric slot goes
         // away; unresolved post-copy fdgets may already own that same file.
-        if let Some(binding) = binding {
-            if let Some(identity) = metadata.native_binding_identity(binding) {
-                if !identity.matches(selected.provider, selected.file) {
-                    return Err(protocol("close selected another authenticated native file"));
-                }
-                self.note_epoll_native_binding(binding, identity)?;
+        if let Some(binding) = binding
+            && let Some(identity) = metadata.native_binding_identity(binding)
+        {
+            if !identity.matches(selected.provider, selected.file) {
+                return Err(protocol("close selected another authenticated native file"));
             }
+            self.note_epoll_native_binding(binding, identity)?;
         }
         // The Call's existing semantic lease outlives this slot. It is released
         // only by the distinct final command/physical-custody retirement path.
@@ -2531,11 +2527,13 @@ impl NetworkReplayEngine {
             owner,
             admission,
             selected.command,
-            selected.provider,
-            selected.task,
-            selected.task_start,
-            selected.table,
-            selected.file,
+            (
+                selected.provider,
+                selected.task,
+                selected.task_start,
+                selected.table,
+                selected.file,
+            ),
         )?;
         self.stream_calls
             .get_mut(&admission.call)
@@ -3489,7 +3487,12 @@ mod tests {
             let before = format!("{engine:?}");
             assert!(
                 engine
-                    .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, physical_file)
+                    .original_connect_selected(
+owner,
+&admission,
+17,
+(1, 61, 99, 5, physical_file),
+)
                     .is_err()
             );
             assert_eq!(format!("{engine:?}"), before);
@@ -3515,11 +3518,7 @@ mod tests {
                         owner,
                         &admission,
                         17,
-                        1,
-                        61,
-                        99,
-                        5,
-                        if physical_file == 0 { 7 } else { 0 }
+                        (1, 61, 99, 5, if physical_file == 0 { 7 } else { 0 }),
                     )
                     .is_err()
             );
@@ -3549,7 +3548,7 @@ mod tests {
             }
             assert_eq!(format!("{engine:?}"), before);
             engine
-                .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, physical_file)
+                .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, physical_file))
                 .unwrap();
             assert_eq!(
                 engine.original_connect_result(owner, &admission).unwrap(),
@@ -3776,7 +3775,7 @@ mod tests {
             .unwrap();
         engine.original_read_entered(owner, &admission).unwrap();
         engine
-            .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+            .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7))
             .unwrap();
         (engine, owner, admission, Default::default())
     }
@@ -3881,11 +3880,17 @@ mod tests {
         unit.kind = 3;
         unit.length = 72;
         unit.bytes.fill(0);
-        for (slot, value) in
-            unit.bytes[..72]
-                .chunks_exact_mut(8)
-                .zip([7u64, 4, 0, 3, 3, 0, 55, 1, copy::CONSUME])
-        {
+        for (slot, value) in unit.bytes[..72].as_chunks_mut::<8>().0.iter_mut().zip([
+            7u64,
+            4,
+            0,
+            3,
+            3,
+            0,
+            55,
+            1,
+            copy::CONSUME,
+        ]) {
             slot.copy_from_slice(&value.to_le_bytes());
         }
         let records = vec![first, unit];
@@ -3998,7 +4003,7 @@ mod tests {
             None
         );
         engine
-            .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+            .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7))
             .unwrap();
         engine
             .original_connect_returned(owner, &admission, 3)
@@ -4038,6 +4043,7 @@ mod tests {
             else {
                 panic!("unexpected recovery")
             };
+            let read = *read;
             let read = engine
                 .bind_fd_read_external_grant(owner, read, args.operation)
                 .unwrap();
@@ -4079,6 +4085,7 @@ mod tests {
             else {
                 panic!("peer requires exact released table")
             };
+            let next = *next;
             assert_eq!(next.binding, args.binding);
             engine.finish_fd_read(peer, next).unwrap();
         }
@@ -4096,6 +4103,7 @@ mod tests {
         else {
             panic!("unexpected recovery")
         };
+        let read = *read;
         let next_lease = engine.next_stream_lease;
         let admission = engine
             .begin_original_file_from_read(
@@ -4149,6 +4157,7 @@ mod tests {
         else {
             panic!("unexpected recovery")
         };
+        let read = *read;
         for which in 0..5 {
             let mut wrong = args.clone();
             let sender = if which == 0 {
@@ -4241,7 +4250,7 @@ mod tests {
             .unwrap();
         assert_eq!(engine.native_capture_fixture_counts(file), (1, 1, 1, 1));
         engine
-            .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+            .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7))
             .unwrap();
         assert_eq!(engine.native_capture_fixture_counts(file), (1, 1, 0, 1));
         assert_eq!(
@@ -4334,11 +4343,7 @@ mod tests {
                     owner,
                     &admission,
                     17,
-                    1,
-                    61,
-                    99,
-                    5,
-                    if occupied { 7 } else { 0 },
+                    (1, 61, 99, 5, if occupied { 7 } else { 0 }),
                 )
                 .unwrap();
             if let Some(file) = file {
@@ -4372,18 +4377,18 @@ mod tests {
         assert_eq!(engine.native_capture_fixture_counts(file), (1, 1, 1, 1));
         assert!(
             engine
-                .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+                .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7),)
                 .is_err()
         );
         engine.original_connect_invoked(owner, &admission).unwrap();
         assert!(
             engine
-                .original_connect_selected(owner, &admission, 18, 1, 61, 99, 5, 7)
+                .original_connect_selected(owner, &admission, 18, (1, 61, 99, 5, 7),)
                 .is_err()
         );
         assert_eq!(engine.native_capture_fixture_counts(file), (1, 1, 1, 1));
         engine
-            .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+            .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7))
             .unwrap();
         assert_eq!(engine.native_capture_fixture_counts(file), (1, 0, 0, 1));
         assert!(engine.finish_original_connect(owner, &admission).is_err());
@@ -4444,7 +4449,7 @@ mod tests {
         // A positive exact receipt may arrive after owner withdrawal. It is
         // still the retained task/MM and pin, not a newly inferred live owner.
         engine
-            .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+            .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7))
             .unwrap();
         assert_eq!(engine.native_capture_fixture_counts(file), (1, 0, 0, 1));
     }
@@ -4496,7 +4501,7 @@ mod tests {
         engine.original_connect_invoked(owner, &admission).unwrap();
         assert!(
             engine
-                .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 7)
+                .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 7),)
                 .is_err()
         );
         assert!(
@@ -4505,7 +4510,7 @@ mod tests {
                 .is_some()
         );
         engine
-            .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 0)
+            .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 0))
             .unwrap();
         engine
             .original_connect_returned(owner, &admission, -i64::from(libc::EBADF))
@@ -4579,7 +4584,7 @@ mod tests {
                     // An actual empty first fdget was observed, but this
                     // component deliberately supplies no second-lookup fact.
                     engine
-                        .original_connect_selected(owner, &admission, 17, 1, 61, 99, 5, 0)
+                        .original_connect_selected(owner, &admission, 17, (1, 61, 99, 5, 0))
                         .unwrap();
                 }
                 let local = Local {
@@ -5069,6 +5074,7 @@ mod recorded_file_tests {
         else {
             panic!("unexpected recovery")
         };
+        let read = *read;
         let before = format!("{engine:?}");
         assert!(
             engine

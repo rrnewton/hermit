@@ -73,6 +73,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map_err(|error| read_protocol(error.into_error()))?
             {
                 NetworkReply::FdRead(NetworkFdReadBegin::Admitted(read)) => {
+                    let read = *read;
                     return self.observe_read_input(guest, read).await;
                 }
                 NetworkReply::FdRead(NetworkFdReadBegin::Recover) => {}
@@ -129,7 +130,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::scheduler::parked::ResourceReply::ReadGrant {
                 status: ResumeStatus::Normal,
                 read,
-            } => self.observe_read_input(guest, read).await,
+            } => self.observe_read_input(guest, *read).await,
             // Cancellation/observation is not a file-selection or Read result.
             reply => Err(read_protocol(format!(
                 "external Read lost its selected grant {reply:?}"
@@ -352,7 +353,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.read_selected_timer_slack(guest, fd, call.buf(), call.len())
                         .await
                 } else if procfs {
-                    let result = async {
+
+                    async {
                         if fd.procfs_needs_snapshot() {
                             self.initialize_selected_procfs_snapshot(guest, call, fd)
                                 .await?;
@@ -365,8 +367,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .write_exact(call.buf().ok_or(Errno::EFAULT)?, &bytes)?;
                         Ok(bytes.len() as i64)
                     }
-                    .await;
-                    result
+                    .await
                 } else {
                     fd.with_random_device_stream(|offset| {
                         self.fill_random_device_bytes(

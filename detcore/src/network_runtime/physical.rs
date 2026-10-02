@@ -47,6 +47,7 @@ impl CollectedEnrollment {
     pub(super) fn owner(&self) -> NetworkStreamOwner {
         self.owner
     }
+    #[cfg(test)]
     pub(super) fn process(&self) -> i32 {
         self.process
     }
@@ -93,7 +94,6 @@ impl InitialTableAssociation {
     ) -> (Self, InitialTableClaim) {
         use crate::types::FdSlot;
         use crate::types::FdSlotBinding;
-        use crate::types::FilesId;
         use crate::types::NetworkFdSlot;
         use crate::types::OpenFileId;
         let mut association = self.clone();
@@ -222,7 +222,6 @@ impl InitialTableAssociation {
     /// The view/claim are ordinary RPC data. Only this retained private census
     /// can attest their complete occupancy and physical-to-semantic alias join.
     pub(crate) fn check_claim(&self, claim: &InitialTableClaim) -> std::io::Result<()> {
-        use crate::types::FilesId;
         if claim.view != self.view() || claim.slots.len() != self.slots.len() {
             return Err(std::io::Error::other(
                 "initial semantic claim changed physical census",
@@ -341,7 +340,7 @@ impl InitialMetadataIdentity {
 /// authority: the retained census authenticates the slot/OFD/profile, and the
 /// exact full observation is included in the retained admission claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InitialFileStat {
+pub struct InitialFileStat {
     pub(crate) fd: i32,
     pub(crate) physical_file: u64,
     pub(crate) stat: crate::stat::DetStat,
@@ -512,8 +511,13 @@ pub(super) struct InitialMetadataWork<T> {
 }
 pub(super) enum InitialMetadataRequest<T> {
     Ready(Vec<InitialFileStat>),
-    Work(InitialMetadataWork<T>),
+    Work(Box<InitialMetadataWork<T>>),
 }
+
+type ForegroundMetadata = (
+    std::sync::Weak<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+    std::sync::Weak<std::sync::Mutex<crate::memory::MemoryMetadata>>,
+);
 
 #[derive(Debug)]
 struct Task<T> {
@@ -525,10 +529,7 @@ struct Task<T> {
     retired: bool,
     enrollment: Option<Enrollment>,
     native_birth: Option<super::native_birth::NativeBirthAdmission>,
-    foreground_metadata: Option<(
-        std::sync::Weak<std::sync::Mutex<crate::tool_local::FileMetadata>>,
-        std::sync::Weak<std::sync::Mutex<crate::memory::MemoryMetadata>>,
-    )>,
+    foreground_metadata: Option<ForegroundMetadata>,
     foreground_root: Option<std::sync::Arc<ForegroundRoot>>,
 }
 #[derive(Debug)]
@@ -561,7 +562,7 @@ impl<T> CustodyTasks<T> {
         thread: i32,
         open: impl FnOnce() -> std::io::Result<T>,
     ) -> std::io::Result<()> {
-        if process <= 0 || thread <= 0 || thread != owner.thread.as_raw() as i32 {
+        if process <= 0 || thread <= 0 || thread != owner.thread.as_raw() {
             return Err(std::io::Error::other(
                 "ptrace custody task identity mismatch",
             ));
@@ -773,10 +774,10 @@ impl<T> CustodyTasks<T> {
         result: Result<u64, String>,
     ) -> std::io::Result<()> {
         let e = self.enrollment(owner)?;
-        if let Some(old) = &e.preparation {
-            if old != &result {
-                return Err(std::io::Error::other("enrollment preparation changed"));
-            }
+        if let Some(old) = &e.preparation
+            && old != &result
+        {
+            return Err(std::io::Error::other("enrollment preparation changed"));
         }
         e.preparation = Some(result);
         Ok(())
@@ -829,10 +830,10 @@ impl<T> CustodyTasks<T> {
         result: Result<u64, String>,
     ) -> std::io::Result<()> {
         let e = self.enrollment(owner)?;
-        if let Some(old) = &e.collection {
-            if old != &result {
-                return Err(std::io::Error::other("enrollment collection changed"));
-            }
+        if let Some(old) = &e.collection
+            && old != &result
+        {
+            return Err(std::io::Error::other("enrollment collection changed"));
         }
         e.collection = Some(result);
         Ok(())
@@ -843,10 +844,10 @@ impl<T> CustodyTasks<T> {
         result: Result<Observation<TableEnrollmentEffect>, String>,
     ) -> std::io::Result<()> {
         let e = self.enrollment(owner)?;
-        if let Some(old) = &e.raw {
-            if old != &result {
-                return Err(std::io::Error::other("enrollment raw completion changed"));
-            }
+        if let Some(old) = &e.raw
+            && old != &result
+        {
+            return Err(std::io::Error::other("enrollment raw completion changed"));
         }
         e.raw = Some(result);
         Ok(())
@@ -1024,12 +1025,14 @@ impl<T> CustodyTasks<T> {
                 return Err(error);
             }
         };
-        Ok(InitialMetadataRequest::Work(InitialMetadataWork {
-            registration: e.registration,
-            process: task.process,
-            task: pin,
-            association: association.clone(),
-        }))
+        Ok(InitialMetadataRequest::Work(Box::new(
+            InitialMetadataWork {
+                registration: e.registration,
+                process: task.process,
+                task: pin,
+                association: association.clone(),
+            },
+        )))
     }
     /// Completion is allowed after owner exit only on this still-retained
     /// registration/MM/association. Retention precedes the dispensable reply.

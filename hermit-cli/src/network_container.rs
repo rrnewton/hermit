@@ -30,7 +30,7 @@ use crate::unix_guard_control::GuardControllerOwner;
 #[must_use]
 pub enum NetworkParentOwnership {
     /// Actual service/endpoint/controller pidfd, established before STARTUP_READY.
-    Running(ParentAcceptedService),
+    Running(Box<ParentAcceptedService>),
     /// Actual bootstrap failure retains any broker cleanup capability.
     StartupFailed(ParentAcceptedStartFailure),
 }
@@ -115,7 +115,7 @@ pub unsafe fn run_with_network_startup<T, U, F>(
     accepted_launch: Option<AcceptedProviderLaunch>,
     prepared_guard: Option<PreparedGuard>,
     run: &mut F,
-) -> Result<NetworkContainerRun<T>, NetworkStartupFailure>
+) -> Result<NetworkContainerRun<T>, Box<NetworkStartupFailure>>
 where
     T: serde::Serialize,
     F: FnMut(
@@ -151,7 +151,7 @@ pub unsafe fn run_with_network_startup_observed<T, U, F, O>(
     prepared_guard: Option<PreparedGuard>,
     observe_parent: &mut O,
     run: &mut F,
-) -> Result<NetworkContainerRun<T>, NetworkStartupFailure>
+) -> Result<NetworkContainerRun<T>, Box<NetworkStartupFailure>>
 where
     T: serde::Serialize,
     F: FnMut(
@@ -196,7 +196,7 @@ pub unsafe fn run_with_network_startup_hooked<T, U, F, O>(
     accepted_hook: &mut dyn detcore::network_runtime::AcceptedPostSpawn,
     observe_parent: &mut O,
     run: &mut F,
-) -> Result<NetworkContainerRun<T>, NetworkStartupFailure>
+) -> Result<NetworkContainerRun<T>, Box<NetworkStartupFailure>>
 where
     T: serde::Serialize,
     F: FnMut(
@@ -206,15 +206,15 @@ where
     ) -> (T, U),
     O: FnMut(&NetworkParentOwnership, Instant) -> Result<(), StartupError>,
 {
-    if prepared_guard.is_some() {
-        if let Err(error) = prepare_controller_runtime_before_clone() {
-            return Err(NetworkStartupFailure {
+    if prepared_guard.is_some()
+        && let Err(error) = prepare_controller_runtime_before_clone()
+    {
+        return Err(Box::new(NetworkStartupFailure {
                 cause: StartupError::Protocol,
                 guard_error: Some(error),
                 guard: prepared_guard.map(PreparedGuard::into_parent),
-            });
+            }));
         }
-    }
     // This transport is allocated before ARM/clone, outside the protected guest
     // namespace. Guard-only mode creates no accepted transport or service.
     let wire_format = accepted_launch
@@ -235,11 +235,11 @@ where
         } < 0
         {
             let cause = StartupError::Io(reverie::Errno::last());
-            return Err(NetworkStartupFailure {
+            return Err(Box::new(NetworkStartupFailure {
                 cause,
                 guard_error: None,
                 guard: prepared_guard.map(PreparedGuard::into_parent),
-            });
+            }));
         }
         endpoints = Some((unsafe { OwnedFd::from_raw_fd(raw[0]) }, unsafe {
             OwnedFd::from_raw_fd(raw[1])
@@ -257,11 +257,11 @@ where
             Err(failure) => {
                 drop(controller_endpoint.take());
                 drop(outside_endpoint.take());
-                return Err(NetworkStartupFailure {
+                return Err(Box::new(NetworkStartupFailure {
                     cause: StartupError::Protocol,
                     guard_error: Some(failure.error),
                     guard: Some(failure.owner),
-                });
+                }));
             }
         },
         None => None,
@@ -272,11 +272,11 @@ where
         Err(error) => {
             drop(controller_endpoint.take());
             drop(outside_endpoint.take());
-            return Err(NetworkStartupFailure {
+            return Err(Box::new(NetworkStartupFailure {
                 cause: StartupError::InvalidTimeout,
                 guard_error: Some(error),
                 guard: armed.map(|guard| guard.into_parent()),
-            });
+            }));
         }
     };
     let mut parent = None;
@@ -312,7 +312,7 @@ where
                 )
             } {
                 Ok(service) => {
-                    parent = Some(NetworkParentOwnership::Running(service));
+                    parent = Some(NetworkParentOwnership::Running(Box::new(service)));
                     Ok(())
                 }
                 Err(failure) => {

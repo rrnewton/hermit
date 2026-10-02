@@ -137,7 +137,7 @@ struct ConfigurationRetirement {
 }
 fn decode_argument(text: &str) -> io::Result<OsString> {
     require(
-        text.len() % 2 == 0
+        text.len().is_multiple_of(2)
             && text.len() <= 131_072
             && text
                 .bytes()
@@ -145,7 +145,7 @@ fn decode_argument(text: &str) -> io::Result<OsString> {
         "keeper argv hex differs",
     )?;
     let mut bytes = Vec::with_capacity(text.len() / 2);
-    for p in text.as_bytes().chunks_exact(2) {
+    for p in text.as_bytes().as_chunks::<2>().0 {
         let t = std::str::from_utf8(p).unwrap();
         bytes.push(u8::from_str_radix(t, 16).map_err(io::Error::other)?);
     }
@@ -403,11 +403,9 @@ impl Keeper {
                     self.holder = Some(guardian::Holder::retain(
                         intent,
                         config.unit.clone(),
-                        self.deadline,
-                        config.stage_deadline,
+                        (self.deadline, config.stage_deadline),
                         guardian::Role::Keeper,
-                        source,
-                        directory,
+                        (source, directory),
                         image,
                         arguments,
                     ));
@@ -525,8 +523,15 @@ impl Keeper {
         })();
         self.remember(result)
     }
+}
+
+// This legacy failure protocol is not reached by the maintained source entry.
+// Keep its checked transitions intact; compiling them is not qualification.
+#[expect(dead_code, reason = "Legacy keeper failure entrypoints are not integrated")]
+impl Keeper {
     /// Before a source endpoint was ever sent, retire only original local
     /// configuration custody. This never repairs an uninitialized journal.
+    /// Retain the original configuration-failure origin without extending it.
     pub fn begin_configuration_retirement(&mut self, native_origin: u64) -> io::Result<()> {
         if let Some(previous) = &self.configuration_retirement {
             return require(
@@ -1040,11 +1045,11 @@ impl Keeper {
             self.rejected_startup.as_mut().unwrap().phase = RejectedPhase::Complete;
             Ok(true)
         })();
-        if let Err(error) = &result {
-            if let Some(state) = &mut self.rejected_startup {
+        if let Err(error) = &result
+            && let Some(state) = &mut self.rejected_startup
+        {
                 state.failure.get_or_insert_with(|| Failure::capture(error));
             }
-        }
         result
     }
     pub fn send_rejected_startup_observation(&mut self) -> io::Result<()> {
@@ -1121,11 +1126,11 @@ impl Keeper {
                 .agreement_acknowledged = true;
             Ok(true)
         })();
-        if let Err(error) = &result {
-            if let Some(state) = &mut self.rejected_startup {
+        if let Err(error) = &result
+            && let Some(state) = &mut self.rejected_startup
+        {
                 state.failure.get_or_insert_with(|| Failure::capture(error));
             }
-        }
         result
     }
     pub fn rejected_startup_observation(&self) -> io::Result<serde_json::Value> {
@@ -1295,11 +1300,11 @@ impl Keeper {
             self.uncaptured_startup.as_mut().unwrap().phase = RejectedPhase::Complete;
             Ok(true)
         })();
-        if let Err(error) = &result {
-            if let Some(state) = &mut self.uncaptured_startup {
+        if let Err(error) = &result
+            && let Some(state) = &mut self.uncaptured_startup
+        {
                 state.failure.get_or_insert_with(|| Failure::capture(error));
             }
-        }
         result
     }
     pub fn send_uncaptured_startup_observation(&mut self) -> io::Result<()> {
@@ -1378,11 +1383,11 @@ impl Keeper {
                 .agreement_acknowledged = true;
             Ok(true)
         })();
-        if let Err(error) = &result {
-            if let Some(state) = &mut self.uncaptured_startup {
+        if let Err(error) = &result
+            && let Some(state) = &mut self.uncaptured_startup
+        {
                 state.failure.get_or_insert_with(|| Failure::capture(error));
             }
-        }
         result
     }
     pub fn uncaptured_startup_observation(&self) -> io::Result<serde_json::Value> {
@@ -1453,6 +1458,7 @@ fn close_alias(fd: OwnedFd) -> io::Result<()> {
 }
 
 impl Keeper {
+    #[expect(dead_code, reason = "Legacy creation-cleanup installer is not called by the maintained entry")]
     pub(super) fn install_creation_cleanup(
         &mut self,
         peer: super::cleanup::CreationPeer,
@@ -1493,6 +1499,7 @@ impl Keeper {
         }
         Ok(changed)
     }
+    #[expect(dead_code, reason = "Legacy creation-cleanup completion query is not integrated")]
     pub(super) fn creation_cleanup_complete(&self) -> bool {
         self.creation_cleanup
             .as_ref()

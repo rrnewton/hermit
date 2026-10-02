@@ -520,14 +520,14 @@ impl GuardControllerOwner {
                 .map_err(|_| io::Error::other("guard join ownership lock poisoned"))?;
             (state.observer.take(), state.observer_started)
         };
-        if let Some(observer) = observer {
-            if observer.join().is_err() {
+        if let Some(observer) = observer
+            && observer.join().is_err()
+        {
                 let error = io::Error::other("guard observer terminated with panic");
                 self.shared.record("observer_join", &error);
                 self.shared.publish(internal_failure());
                 return Err(error);
             }
-        }
         // Registration and observer are settled; do not turn an unexpected
         // monitor lock holder into an unbounded wait after the deadline.
         let next = match self.shared.guard.try_lock() {

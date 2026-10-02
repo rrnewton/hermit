@@ -404,7 +404,6 @@ mod tests;
 #[path = "native_receive/no_store.rs"]
 mod no_store;
 pub(crate) use no_store::CompletedNoStore;
-pub(crate) use no_store::CompletedRecordEmptyAttempt;
 pub(crate) use no_store::NoStoreReturn;
 pub(crate) use no_store::ReceiveSelection;
 pub(crate) use no_store::RecordNoStore;

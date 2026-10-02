@@ -91,8 +91,8 @@ impl Unit {
             return Err(invalid("Read unit wire shape"));
         }
         let mut fields = [0u64; 9];
-        for (field, bytes) in fields.iter_mut().zip(record.bytes[..72].chunks_exact(8)) {
-            *field = u64::from_le_bytes(bytes.try_into().unwrap());
+        for (field, bytes) in fields.iter_mut().zip(record.bytes[..72].as_chunks::<8>().0) {
+            *field = u64::from_le_bytes(*bytes);
         }
         Ok(Self {
             file: fields[0],
@@ -237,12 +237,13 @@ fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
 impl Manifest {
-    pub(crate) fn validate(self, effect: &OriginalEffect) -> io::Result<()> {
+    #[cfg(test)]
+    pub(super) fn validate(self, effect: &OriginalEffect) -> io::Result<()> {
         self.validate_for_version(effect, COPY_VERSION)
     }
     /// `version` comes from the authenticated package/prepare contract, never
     /// from this manifest or a raw frame. Historical validate remains copy4.
-    pub(crate) fn validate_for_version(
+    pub(super) fn validate_for_version(
         self,
         effect: &OriginalEffect,
         version: u64,
@@ -382,17 +383,16 @@ impl Prefix {
                     if self.transport != 0 && begin.transport != self.transport {
                         return Err(invalid("copy5 Begin changed the retained transport"));
                     }
-                    if let Some((bytes, order)) = self.frontier {
-                        if begin.before < bytes
+                    if let Some((bytes, order)) = self.frontier
+                        && (begin.before < bytes
                             || begin.order < order
                             || (begin.before == bytes) != (begin.order == order)
-                            || authority.disposition == OBSERVE && begin.before != bytes
+                            || authority.disposition == OBSERVE && begin.before != bytes)
                         {
                             return Err(invalid(
                                 "copy5 Begin regressed or changed the locked Peek frontier",
                             ));
                         }
-                    }
                     self.active_begin = Some((begin, index));
                     self.first = index + 1;
                 }
@@ -546,7 +546,8 @@ impl StreamingPrefix {
             .as_ref()
             .map_or(COPY_VERSION, CopyWireAuthority::version)
     }
-    pub(crate) fn collect(
+    #[cfg(test)]
+    pub(super) fn collect(
         &mut self,
         effect: &OriginalEffect,
         records: Vec<Record>,
@@ -574,6 +575,7 @@ impl StreamingPrefix {
         }
         result
     }
+    #[cfg(test)]
     pub(crate) fn for_helper(operation: u64, flags: i32) -> io::Result<Self> {
         if !matches!(operation, 21 | 22) {
             return Err(invalid("helper receive operation required"));
@@ -629,6 +631,7 @@ impl StreamingPrefix {
         result
     }
 }
+#[cfg(test)]
 fn validate_units(
     effect: &OriginalEffect,
     records: &[Record],
@@ -680,14 +683,7 @@ fn validate_units_for_version(
     }
     Ok((manifest, prefix.units))
 }
-pub(crate) fn validate_terminal_prefix(
-    terminal: &OriginalTerminal,
-    records: &[Record],
-    end: End,
-) -> io::Result<()> {
-    validate_terminal_prefix_for_version(terminal, records, end, COPY_VERSION)
-}
-pub(crate) fn validate_terminal_prefix_for_version(
+pub(super) fn validate_terminal_prefix_for_version(
     terminal: &OriginalTerminal,
     records: &[Record],
     end: End,
@@ -727,27 +723,27 @@ pub(crate) fn validate_terminal_prefix_for_version(
         authority,
         version,
     )?;
-    if let End::OriginalExit { protocol } = end {
-        if terminal.command.phase != 1
+    if let End::OriginalExit { protocol } = end
+        && (terminal.command.phase != 1
             || terminal.original.complete != 1
             || terminal.original.returned != terminal.command.returned
             || protocol && prefix.cursor != i64::from(terminal.original.returned).max(0) as u64
-            || !protocol && (authority.operation != 11 || !records.is_empty())
+            || !protocol && (authority.operation != 11 || !records.is_empty()))
         {
             return Err(invalid(
                 "terminal Read lost the previously observed actual EXIT",
             ));
         }
-    }
     Ok(())
 }
-pub(crate) fn validate_records(
+#[cfg(test)]
+pub(super) fn validate_records(
     effect: &OriginalEffect,
     records: &[Record],
 ) -> io::Result<Manifest> {
     validate_units(effect, records).map(|(manifest, _)| manifest)
 }
-pub(crate) fn validate_records_for_version(
+pub(super) fn validate_records_for_version(
     effect: &OriginalEffect,
     records: &[Record],
     version: u64,
@@ -755,7 +751,8 @@ pub(crate) fn validate_records_for_version(
     validate_units_for_version(effect, records, version).map(|(manifest, _)| manifest)
 }
 
-pub(crate) fn decode(effect: &OriginalEffect, records: Vec<Record>) -> io::Result<Capture> {
+#[cfg(test)]
+pub(super) fn decode(effect: &OriginalEffect, records: Vec<Record>) -> io::Result<Capture> {
     let (manifest, units) = validate_units(effect, &records)?;
     let committed = materialize_committed(manifest, &units, &records)?;
     Ok(Capture {
@@ -795,6 +792,7 @@ impl Capture {
     /// Returns the position-covered source observations for this actual result.
     /// A retained kernel reference proves lifetime, not immutable bytes; callers
     /// must establish that provenance and stream order before publication.
+    #[cfg(test)]
     pub(crate) fn observed_prefix(&self, returned: i64) -> io::Result<&[u8]> {
         if returned <= 0
             || self.manifest.returned != returned
@@ -916,7 +914,7 @@ mod tests {
                 CONSUME,
             ];
             let mut bytes = vec![0; RECORD_BYTES];
-            for (slot, field) in bytes[..72].chunks_exact_mut(8).zip(fields) {
+            for (slot, field) in bytes[..72].as_chunks_mut::<8>().0.iter_mut().zip(fields) {
                 slot.copy_from_slice(&field.to_le_bytes());
             }
             all.push(Record {

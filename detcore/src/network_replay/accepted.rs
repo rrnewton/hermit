@@ -101,6 +101,13 @@ pub(crate) enum AcceptedInstallationFact {
     NoConnection {
         errno: i32,
     },
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained refusal model; the copy-fault control constructs this case"
+        )
+    )]
     DequeuedNoInstallation {
         child: ChildCreationIdV1,
         errno: i32,
@@ -275,6 +282,7 @@ impl NetworkReplayEngine {
     }
 
     /// Explicit enrollment; ordinary V3 Record construction remains unchanged.
+    #[cfg(test)]
     pub(crate) fn record_shadow_accepted(
         epoch: DateTime<Utc>,
         cap: AcceptedBackendCapability,
@@ -362,6 +370,7 @@ impl NetworkReplayEngine {
     }
 
     /// Matched provider enrollment, distinct from the portable listener channel.
+    #[cfg(test)]
     pub(crate) fn enroll_accepted_listener(
         &mut self,
         open_file: OpenFileId,
@@ -399,6 +408,7 @@ impl NetworkReplayEngine {
     }
     /// Provider calls at an authenticated, paid observation cut, before a later
     /// listener option generation can commit. No RPC caller can submit a cert.
+    #[cfg(test)]
     pub(crate) fn observe_child_creation(
         &mut self,
         listener: OpenFileId,
@@ -1115,15 +1125,14 @@ impl NetworkReplayEngine {
                     accepted_from: Some(operation.listener),
                     selected_channel,
                 };
-                if let EngineState::Record(trace) = &self.mode {
-                    if self.channels[&operation.listener]
+                if let EngineState::Record(trace) = &self.mode
+                    && (self.channels[&operation.listener]
                         .published_ingress
                         .is_some()
                         || now < selected.release.not_before_global_time
-                        || (trace.inputs.len() as u64) < selected.history_prefix
-                    {
-                        return Err(NetworkReplayError::InvalidAcceptedReceipt);
-                    }
+                        || (trace.inputs.len() as u64) < selected.history_prefix)
+                {
+                    return Err(NetworkReplayError::InvalidAcceptedReceipt);
                 }
                 // Locate the exact reserved queue entry BEFORE enrollment.
                 // Completion order may differ from FIFO selection order.
@@ -1231,14 +1240,13 @@ impl NetworkReplayEngine {
         &self,
         call: NetworkStreamCallId,
     ) -> Result<(), NetworkReplayError> {
-        if let Ok(runtime) = self.accepted() {
-            if let Some((lease, _)) = runtime
+        if let Ok(runtime) = self.accepted()
+            && let Some((lease, _)) = runtime
                 .operations
                 .iter()
                 .find(|(_, op)| op.listener_call == call)
-            {
-                return Err(NetworkReplayError::UnresolvedAccept(*lease));
-            }
+        {
+            return Err(NetworkReplayError::UnresolvedAccept(*lease));
         }
         Ok(())
     }

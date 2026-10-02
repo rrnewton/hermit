@@ -110,6 +110,7 @@ pub(super) struct Channel {
     pub last_receive: Option<RawCall>,
     pub refused: Option<Failure>,
     received_bytes: usize,
+    #[expect(dead_code, reason = "Original preconfiguration EOF refusal protocol is retained but not yet integrated")]
     pub uninitialized_eof_options: Option<[i32; 3]>,
 }
 impl Channel {
@@ -172,6 +173,7 @@ impl Channel {
     /// original peer and proved it never sent either endpoint. This method
     /// permanently refuses normal protocol use; it returns only exact EOF,
     /// never an accepted packet or source-admission capability.
+    #[expect(dead_code, reason = "Original preconfiguration EOF refusal protocol is retained but not yet integrated")]
     pub fn receive_uninitialized_eof(&mut self, setup: RawCall) -> io::Result<bool> {
         require(
             setup.returned == -1 && setup.errno.is_some(),
@@ -297,7 +299,7 @@ impl Channel {
             let data = unsafe { libc::CMSG_DATA(header) };
             if current.cmsg_level == libc::SOL_SOCKET && current.cmsg_type == libc::SCM_RIGHTS {
                 packet.rights_messages += 1;
-                packet.malformed |= bytes % std::mem::size_of::<i32>() != 0;
+                packet.malformed |= !bytes.is_multiple_of(std::mem::size_of::<i32>());
                 for index in 0..bytes / std::mem::size_of::<i32>() {
                     let fd = unsafe {
                         data.add(index * std::mem::size_of::<i32>())

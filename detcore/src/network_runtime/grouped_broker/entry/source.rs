@@ -64,8 +64,7 @@ pub unsafe fn run_grouped_source_process(
             custody.channel.fd.as_fd(),
             incarnation,
             &nonce,
-            deadline,
-            custody.creator_cutoff,
+            (deadline, custody.creator_cutoff),
             &unit,
             controls.each_ref().map(AsFd::as_fd),
         );

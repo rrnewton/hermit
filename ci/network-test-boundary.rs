@@ -50,13 +50,13 @@ pub fn cause_frame(reason: u8) -> [u8; 2] {
 }
 
 pub fn decode_causes(bytes: &[u8]) -> Option<Vec<&'static str>> {
-    if bytes.len() > 8 || bytes.len() % 2 != 0 {
+    if bytes.len() > 8 || !bytes.len().is_multiple_of(2) {
         return None;
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|frame| {
-            if !(1..=4).contains(&frame[1]) || frame != cause_frame(frame[1]) {
+            if !(1..=4).contains(&frame[1]) || *frame != cause_frame(frame[1]) {
                 return None;
             }
             Some(match frame[1] {

@@ -12,13 +12,13 @@ use crate::network_replay::original_connect::Kind;
 use crate::network_replay::original_connect::Pin;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Outcome {
-    pub admission: Admission,
-    pub returned: i64,
-    pub pin: Option<Pin>,
-    pub address: Option<Vec<u8>>,
-    pub socket: Option<super::installation_observation::Checked>,
-    pub read_copy: Option<super::original_read_copy::Capture>,
+pub struct Outcome {
+    pub(crate) admission: Admission,
+    pub(crate) returned: i64,
+    pub(crate) pin: Option<Pin>,
+    pub(crate) address: Option<Vec<u8>>,
+    pub(crate) socket: Option<super::installation_observation::Checked>,
+    pub(crate) read_copy: Option<super::original_read_copy::Capture>,
 }
 
 impl NativeCaptureRecovery {
@@ -332,7 +332,7 @@ impl RuntimeShared {
                 if state.control_history_started && state.control_history.is_none() {
                     continue;
                 }
-                let mut engine = state.publication.engine.lock().unwrap();
+                let engine = state.publication.engine.lock().unwrap();
                 let (canceled, consumed) =
                     match engine.original_connect_cancellation(owner, &state.admission) {
                         Ok(value) => value,
@@ -590,8 +590,8 @@ impl RuntimeShared {
                 {
                     continue;
                 }
-                if state.selection.is_none() {
-                    if let Some(reply) =
+                if state.selection.is_none()
+                    && let Some(reply) =
                         controller.retained_response(state.selection_request.unwrap())?
                     {
                         let Reply::OriginalSelection(observed) = reply else {
@@ -629,18 +629,13 @@ impl RuntimeShared {
                                     owner,
                                     admission,
                                     raw.command,
-                                    raw.provider,
-                                    raw.task,
-                                    raw.task_start,
-                                    raw.table,
-                                    raw.file,
+                                    (raw.provider, raw.task, raw.task_start, raw.table, raw.file),
                                 )
                                 .map_err(std::io::Error::other)?;
                         }
                         state.selection = Some(raw);
                         state.publication.changed.notify_waiters();
                     }
-                }
                 self.progress_original_read_copy(controller, owner, &mut state)?;
                 let native = state
                     .publication
@@ -706,8 +701,8 @@ impl RuntimeShared {
                     state.completion = Some(observed.raw);
                 }
             } // invoked completion and known-uninvoked disarm are distinct paths
-            if admission.arguments.kind.allocator() {
-                if let Some(terminal) = &state.terminal {
+            if admission.arguments.kind.allocator()
+                && let Some(terminal) = &state.terminal {
                     if terminal.fd_call_present != 1 || terminal.original.complete != 1 {
                         // Actual task death alone cannot certify either success,
                         // failure or no invocation. Keep the exact raw custody.
@@ -728,7 +723,6 @@ impl RuntimeShared {
                         .map_err(std::io::Error::other)?;
                     state.selection = Some(selected);
                 }
-            }
             if admission.arguments.kind == Kind::Read && !state.canceled {
                 self.progress_original_read_copy(controller, owner, &mut state)?;
                 let Some(end) = state.copy_end else { continue };
@@ -755,8 +749,8 @@ impl RuntimeShared {
                     state.copy_custody.validate_terminal(terminal, end)?;
                 }
             }
-            if admission.arguments.kind == Kind::Close {
-                if let Some(terminal) = &state.terminal {
+            if admission.arguments.kind == Kind::Close
+                && let Some(terminal) = &state.terminal {
                     if terminal.fd_call_present == 1 && terminal.original.selection.ready == 1 {
                         if terminal.original.problem != 0 {
                             return Err(std::io::Error::other(
@@ -792,7 +786,6 @@ impl RuntimeShared {
                         continue;
                     }
                 }
-            }
             if state.retirement_request.is_none() {
                 let sequence = controller.prepare(
                     Effect::RetireOriginalConnect(call),

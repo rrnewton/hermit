@@ -140,9 +140,7 @@ impl History {
     fn children(&self, begin: &FdEvent, end: &FdEvent, kind: u64) -> Vec<FdEvent> {
         self.rows
             .range((begin.sequence + 1)..end.sequence)
-            .filter_map(|(_, e)| {
-                (e.dependency == begin.sequence && e.kind == kind).then(|| e.clone())
-            })
+            .filter(|&(_, e)| e.dependency == begin.sequence && e.kind == kind).map(|(_, e)| e.clone())
             .collect()
     }
     fn paired(&self, end: &FdEvent, kind: u64) -> io::Result<&FdEvent> {

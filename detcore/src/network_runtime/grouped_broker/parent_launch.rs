@@ -36,6 +36,7 @@ enum Stage {
 /// grants no Creator, stop, wait, cgroup-unlink or SourceTerminal authority.
 pub(super) struct CapturedNativeInputs<'a> {
     pub unit: &'a str,
+    #[expect(dead_code, reason = "Retained parent failed-source retirement protocol is not yet integrated with the active startup route")]
     pub nonce: &'a str,
     pub pid: libc::pid_t,
     pub invocation: &'a str,
@@ -43,6 +44,7 @@ pub(super) struct CapturedNativeInputs<'a> {
     pub pidfd: BorrowedFd<'a>,
     pub directory: BorrowedFd<'a>,
     pub directory_identity: &'a owner::FileIdentity,
+    #[expect(dead_code, reason = "Retained parent failed-source retirement protocol is not yet integrated with the active startup route")]
     pub snapshots: [&'a owner::ManagerSnapshot; 2],
     pub launcher: &'a owner::LauncherLease,
     pub original_deadline: Instant,
@@ -72,6 +74,7 @@ pub(super) struct ParentLaunchCustody {
     stage: Stage,
     refused: Option<Failure>,
     failure_origin: Option<u64>,
+    #[expect(dead_code, reason = "Retained parent failed-source retirement protocol is not yet integrated with the active startup route")]
     retirement_deadline: Option<Instant>,
 }
 impl ParentLaunchCustody {
@@ -188,13 +191,13 @@ impl ParentLaunchCustody {
         self.source_launcher.check_live()
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refused.is_none() {
+        if let Err(error) = &result
+            && self.refused.is_none()
+        {
                 self.refused = Some(Failure::capture(error));
                 // Unknown origin remains unknown; a later call cannot replace it.
                 self.failure_origin = super::guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     pub fn start(&mut self) -> io::Result<()> {
@@ -651,6 +654,7 @@ impl ParentLaunchCustody {
     /// A refused capture still owns both current query objects, every completed
     /// pre-start query/snapshot, and any partially
     /// acquired native handles. Do not parse a cleanup result as a Snapshot.
+    #[expect(dead_code, reason = "Retained parent failed-source retirement protocol is not yet integrated with the active startup route")]
     pub fn retire_queries(&mut self, deadline: Instant) -> io::Result<bool> {
         let cause = self
             .refused
@@ -684,6 +688,7 @@ impl ParentLaunchCustody {
         Ok(!matches!(initial, Some(owner::QueryRetirement::Pending))
             && !matches!(recheck, Some(owner::QueryRetirement::Pending)))
     }
+    #[expect(dead_code, reason = "Retained parent failed-source retirement protocol is not yet integrated with the active startup route")]
     pub fn failure_deadline(&mut self, caller: Instant) -> io::Result<Instant> {
         require(
             self.refused.is_some(),

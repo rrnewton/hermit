@@ -9,25 +9,27 @@ use super::*;
 struct ReleasedPreparation {
     // Kept after actual explicit C alias release. These originals are never
     // converted into source authority or destructively replaced on an error.
-    intent: Intent,
-    peer: Option<wire::Credentials>,
-    ready: Option<Readiness>,
-    peer_ledger: Option<journal::SourceLedgerReader>,
-    ledger: journal::RemovalJournal,
-    cursor: Cursor,
-    agreement: Option<AsymmetricAgreement>,
-    stage: Instant,
-    native_stage: u64,
-    deadline: Option<Instant>,
-    native_cutoff: Option<u64>,
-    release: Option<ffi::Release>,
-    primary: Option<Failure>,
-    callback_failure: Option<Failure>,
-    closed: bool,
-    removal_sequence: u64,
-    bridge: ffi::CleanupBridge,
-    inventory: owner::CensusInventory,
-    no_provider: NoProviderCreated,
+    // Underscores express retention-only use; declaration order and the
+    // original values preserve the same lifetime and field drop order.
+    _intent: Intent,
+    _peer: Option<wire::Credentials>,
+    _ready: Option<Readiness>,
+    _peer_ledger: Option<journal::SourceLedgerReader>,
+    _ledger: journal::RemovalJournal,
+    _cursor: Cursor,
+    _agreement: Option<AsymmetricAgreement>,
+    _stage: Instant,
+    _native_stage: u64,
+    _deadline: Option<Instant>,
+    _native_cutoff: Option<u64>,
+    _release: Option<ffi::Release>,
+    _primary: Option<Failure>,
+    _callback_failure: Option<Failure>,
+    _closed: bool,
+    _removal_sequence: u64,
+    _bridge: ffi::CleanupBridge,
+    _inventory: owner::CensusInventory,
+    _no_provider: NoProviderCreated,
 }
 
 #[derive(Debug)]
@@ -52,14 +54,14 @@ impl PreparedSource {
     /// original resources here before loading, launching or acknowledging.
     pub fn retain(
         holder: guardian::Holder,
-        bridge_file: OwnedFd,
-        bridge_digest: [u8; 32],
+        bridge: (OwnedFd, [u8; 32]),
         keeper_channel: OwnedFd,
         cleanup_directory: OwnedFd,
         source_logs: OwnedFd,
         keeper_logs: OwnedFd,
         runtime: RuntimeCreationCustody,
     ) -> Self {
+        let (bridge_file, bridge_digest) = bridge;
         let (intent, _, stage, native_stage, _) = holder.original_context();
         let intent = intent.clone();
         let callbacks = Box::new(CallbackOwner {
@@ -112,12 +114,12 @@ impl PreparedSource {
         }
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refusal.is_none() {
+        if let Err(error) = &result
+            && self.refusal.is_none()
+        {
                 self.refusal = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
     fn check(&self) -> io::Result<()> {
@@ -241,8 +243,8 @@ impl PreparedSource {
                 original.receive_readiness()?;
             }
             if original.callbacks.ready.is_some() && !self.runtime_sent {
-                if self.keeper_initial.is_none() {
-                    if let Some(index) = original.callbacks.parent.receive(4096)? {
+                if self.keeper_initial.is_none()
+                    && let Some(index) = original.callbacks.parent.receive(4096)? {
                         let packet = &mut original.callbacks.parent.packets[index];
                         packet.exact(1, original.callbacks.peer.unwrap())?;
                         let value: Value = serde_json::from_slice(&packet.bytes)?;
@@ -261,7 +263,6 @@ impl PreparedSource {
                         ));
                         self.keeper_initial = Some(value);
                     }
-                }
                 if let Some(initial) = &self.keeper_initial {
                     let namespace = self
                         .namespace
@@ -291,15 +292,17 @@ impl PreparedSource {
                         self.runtime.as_mut().unwrap().send(
                             original.holder.creation_creator()?,
                             original.holder.creation_controls()?,
-                            original
-                                .keeper
-                                .as_ref()
-                                .unwrap()
-                                .pidfd
-                                .as_ref()
-                                .unwrap()
-                                .as_fd(),
-                            original.keeper.as_ref().unwrap().child.id() as i32,
+                            (
+                                original
+                                    .keeper
+                                    .as_ref()
+                                    .unwrap()
+                                    .pidfd
+                                    .as_ref()
+                                    .unwrap()
+                                    .as_fd(),
+                                original.keeper.as_ref().unwrap().child.id() as i32,
+                            ),
                             original.holder.creation_source_rights()?,
                             original
                                 .callbacks
@@ -307,8 +310,7 @@ impl PreparedSource {
                                 .as_ref()
                                 .unwrap()
                                 .retained_rights()?,
-                            &guardian,
-                            &keeper,
+                            (&guardian, &keeper),
                         )?;
                     }
                 }
@@ -331,8 +333,8 @@ impl PreparedSource {
             }
             if self.runtime_acknowledged && self.runtime.as_ref().unwrap().mirrored_sequence() < 34
             {
-                if self.keeper_prefix.is_none() {
-                    if let Some(index) = original.callbacks.parent.receive(4096)? {
+                if self.keeper_prefix.is_none()
+                    && let Some(index) = original.callbacks.parent.receive(4096)? {
                         let packet = &original.callbacks.parent.packets[index];
                         packet.exact(0, original.callbacks.peer.unwrap())?;
                         let value: Value = serde_json::from_slice(&packet.bytes)?;
@@ -364,7 +366,6 @@ impl PreparedSource {
                             .unwrap()
                             .begin_prefix(sequence, &guardian, &keeper)?;
                     }
-                }
                 if self.keeper_prefix.is_some()
                     && self.runtime.as_mut().unwrap().receive_prefix_ack()?
                 {
@@ -475,25 +476,25 @@ impl PreparedSource {
                 ),
             ));
             self.released = Some(ReleasedPreparation {
-                intent,
-                peer,
-                ready,
-                peer_ledger,
-                ledger,
-                cursor,
-                agreement,
-                stage,
-                native_stage,
-                deadline,
-                native_cutoff,
-                release,
-                primary,
-                callback_failure,
-                closed,
-                removal_sequence,
-                bridge: original.bridge,
-                inventory: original.inventory,
-                no_provider: original.no_provider,
+                _intent: intent,
+                _peer: peer,
+                _ready: ready,
+                _peer_ledger: peer_ledger,
+                _ledger: ledger,
+                _cursor: cursor,
+                _agreement: agreement,
+                _stage: stage,
+                _native_stage: native_stage,
+                _deadline: deadline,
+                _native_cutoff: native_cutoff,
+                _release: release,
+                _primary: primary,
+                _callback_failure: callback_failure,
+                _closed: closed,
+                _removal_sequence: removal_sequence,
+                _bridge: original.bridge,
+                _inventory: original.inventory,
+                _no_provider: original.no_provider,
             });
             Ok(())
         })();
@@ -522,7 +523,7 @@ impl PreparedSource {
             self.serial
                 .as_mut()
                 .ok_or_else(|| io::Error::other("serial owner absent"))?
-                .into_leaf_plan(request)
+                .prepare_leaf_plan(request)
         })();
         self.remember(result)
     }

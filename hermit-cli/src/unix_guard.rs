@@ -827,7 +827,7 @@ impl GuardReadbackClient {
     pub unsafe fn prepare(
         channel: OwnedFd,
         guard: &ParentGuard,
-    ) -> Result<Self, GuardReadbackFailure> {
+    ) -> Result<Self, Box<GuardReadbackFailure>> {
         use std::os::fd::AsFd;
         let mut owner = Self {
             channel,
@@ -877,7 +877,7 @@ impl GuardReadbackClient {
         })();
         match result {
             Ok(()) => Ok(owner),
-            Err(error) => Err(GuardReadbackFailure { error, owner }),
+            Err(error) => Err(Box::new(GuardReadbackFailure { error, owner })),
         }
     }
     pub fn helper_pidfd(&self) -> Option<BorrowedFd<'_>> {
@@ -1113,11 +1113,11 @@ impl ParentGuard {
         if !self.unresolved_rights.is_empty() {
             return Err(io::Error::other("unclassified received rights retained"));
         }
-        if let Some(controller) = &self.controller {
-            if !pidfd_terminal(controller)? {
+        if let Some(controller) = &self.controller
+            && !pidfd_terminal(controller)?
+        {
                 return Err(io::Error::other("controller still live"));
             }
-        }
         self.readers.clear();
         drop(self.creator_map.take());
         drop(self.controller_channel.take());
@@ -1181,6 +1181,7 @@ pub struct ControllerGuard {
     monitor: GuardEvidence,
 }
 impl ControllerGuard {
+    /// # Safety
     /// This must be called only with the actual backend's authenticated held
     /// pidfd for a stopped initial guest, before that task is permitted to run.
     /// The generic GlobalRPC Tid is deliberately not an input.
@@ -1330,16 +1331,16 @@ impl ControllerGuard {
 /// guard object. This creates only an outside exec helper, never a guest task.
 pub unsafe fn prepare_guard(
     launch: &CapabilityUnitLaunch<'_>,
-    stdout: BorrowedFd<'_>,
-    stderr: BorrowedFd<'_>,
+    logs: (BorrowedFd<'_>, BorrowedFd<'_>),
     elf: OwnedFd,
     bpffs_root: OwnedFd,
     recovery_root: OwnedFd,
     incarnation: u64,
     deadline: Instant,
-) -> Result<PreparedGuard, PrepareFailure> {
+) -> Result<PreparedGuard, Box<PrepareFailure>> {
     use std::os::fd::AsFd;
-    let before = |error| PrepareFailure { error, owner: None };
+    let (stdout, stderr) = logs;
+    let before = |error| Box::new(PrepareFailure { error, owner: None });
     if incarnation == 0 {
         return Err(before(io::Error::other("zero guard incarnation")));
     }
@@ -1481,10 +1482,10 @@ pub unsafe fn prepare_guard(
     // privilege launcher replaces direct exec; INIT supplies the helper pidfd.
     let held = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if held < 0 {
-        return Err(PrepareFailure {
+        return Err(Box::new(PrepareFailure {
             error: io::Error::last_os_error(),
             owner: Some(owner),
-        });
+        }));
     }
     owner.launcher.pidfd = Some(unsafe { OwnedFd::from_raw_fd(held as i32) });
     let result = (|| {
@@ -1553,10 +1554,10 @@ pub unsafe fn prepare_guard(
             deadline,
             _same_thread: PhantomData,
         }),
-        Err(error) => Err(PrepareFailure {
+        Err(error) => Err(Box::new(PrepareFailure {
             error,
             owner: Some(owner),
-        }),
+        })),
     }
 }
 
@@ -1595,7 +1596,7 @@ impl PreparedGuard {
     /// # Safety
     /// Same creator/fork/no-reaper contract as `prepare_guard`. Call immediately
     /// before the sole Container clone, after other fallible preparation.
-    pub unsafe fn arm(self, timeout: Duration) -> Result<ArmedGuard, GuardStartFailure> {
+    pub unsafe fn arm(self, timeout: Duration) -> Result<ArmedGuard, Box<GuardStartFailure>> {
         let mut owner = self.parent.take().expect("one-use prepared guard");
         let deadline = match Instant::now()
             .checked_add(timeout)
@@ -1603,26 +1604,26 @@ impl PreparedGuard {
         {
             Some(deadline) => deadline.min(self.deadline),
             None => {
-                return Err(GuardStartFailure {
+                return Err(Box::new(GuardStartFailure {
                     error: io::Error::other("invalid guard clone timeout"),
                     owner,
-                });
+                }));
             }
         };
         if Instant::now() >= deadline {
-            return Err(GuardStartFailure {
+            return Err(Box::new(GuardStartFailure {
                 error: io::Error::new(
                     io::ErrorKind::TimedOut,
                     "guard preparation used startup deadline",
                 ),
                 owner,
-            });
+            }));
         }
         if let Err(error) = owner.arm_for_clone(deadline) {
             if let Err(secondary) = owner.recover_creator() {
                 owner.creator_recovery_error = Some(secondary);
             }
-            return Err(GuardStartFailure { error, owner });
+            return Err(Box::new(GuardStartFailure { error, owner }));
         }
         Ok(ArmedGuard {
             state: Cell::new(Some(owner)),
@@ -1789,7 +1790,7 @@ pub unsafe fn run_guarded<T, U, F>(
     prepared: PreparedGuard,
     timeout: Duration,
     run: &mut F,
-) -> Result<GuardedContainerRun<T>, GuardStartFailure>
+) -> Result<GuardedContainerRun<T>, Box<GuardStartFailure>>
 where
     T: serde::Serialize,
     F: FnMut(ControllerGuard) -> (T, U),
@@ -1798,10 +1799,10 @@ where
     let remaining = match armed.remaining() {
         Ok(remaining) => remaining,
         Err(error) => {
-            return Err(GuardStartFailure {
+            return Err(Box::new(GuardStartFailure {
                 error,
                 owner: armed.into_parent(),
-            });
+            }));
         }
     };
     let result = container.run_with_startup_owned(

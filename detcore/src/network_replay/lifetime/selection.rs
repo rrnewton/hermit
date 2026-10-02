@@ -62,10 +62,10 @@ impl NetworkLifetime {
         };
         let mut candidates = Vec::new();
         for fd in descriptors {
-            if let Some(binding) = self.binding_in_table(files, fd) {
-                if !candidates.contains(&binding) {
-                    candidates.push(binding);
-                }
+            if let Some(binding) = self.binding_in_table(files, fd)
+                && !candidates.contains(&binding)
+            {
+                candidates.push(binding);
             }
         }
         assert!(self.used_leases.insert(lease));
@@ -105,6 +105,7 @@ impl NetworkLifetime {
         Ok(&self.pending_selection(ticket)?.candidates)
     }
 
+    #[cfg(test)]
     pub(crate) fn original_selection_resolution(
         &self,
         ticket: SelectionTicket,
@@ -126,15 +127,14 @@ impl NetworkLifetime {
             return Err(LifetimeError::SelectionIdentity(ticket.lease));
         }
         for (index, binding) in selected.iter().enumerate() {
-            if let Some(binding) = binding {
-                if binding.slot.files != ticket.files
+            if let Some(binding) = binding
+                && (binding.slot.files != ticket.files
                     || binding.slot.fd != ticket.descriptors[index]
                     || !pending.candidates.contains(binding)
                     || !self.live.contains_key(&binding.open_file)
-                    || self.retired.contains(&binding.open_file)
-                {
-                    return Err(LifetimeError::SelectionIdentity(ticket.lease));
-                }
+                    || self.retired.contains(&binding.open_file))
+            {
+                return Err(LifetimeError::SelectionIdentity(ticket.lease));
             }
         }
         let pending = self.pending_selections.get_mut(&ticket.lease).unwrap();

@@ -28,6 +28,10 @@ use sha2::Digest;
 use sha2::Sha256;
 
 #[path = "../detcore/src/network_runtime/capability_unit.rs"]
+#[expect(
+    dead_code,
+    reason = "Shared launcher APIs are used by Detcore/CLI; this provisioning binary uses only UnixReadback"
+)]
 mod capability_unit;
 #[path = "../hermit-cli/src/unix_guard_process.rs"]
 mod process;
@@ -296,7 +300,7 @@ fn held_unit_state(identity: &UnitIdentity, state: &str) -> io::Result<()> {
             _ => Err(err("retired recovery cgroup replaced or unreadable")),
         }
     } else {
-        if PathBuf::from(format!("/sys/fs/cgroup{group}")) != identity.cgroup {
+        if Path::new(&format!("/sys/fs/cgroup{group}")) != identity.cgroup {
             return Err(err("retained recovery cgroup path differs"));
         }
         let current = identity.cgroup.symlink_metadata()?;
@@ -477,7 +481,7 @@ impl Inventory {
         let mut incarnation = None;
         let mut originals = BTreeSet::new();
         let mut ready = false;
-        for (i, r) in data.chunks_exact(104).enumerate() {
+        for (i, r) in data.as_chunks::<104>().0.iter().enumerate() {
             let inc = u64at(r, 8);
             if u64at(r, 0) != 0x554750494e303031
                 || inc == 0
@@ -509,7 +513,7 @@ impl Inventory {
                 ready = true;
             }
         }
-        if data.len() % 104 != 0 {
+        if !data.len().is_multiple_of(104) {
             return Err(err("partial journal tail; valid prefix retained"));
         }
         let inc = incarnation.ok_or_else(|| err("empty journal"))?;

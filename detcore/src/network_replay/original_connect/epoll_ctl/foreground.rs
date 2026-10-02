@@ -140,12 +140,12 @@ impl NetworkReplayEngine {
         &mut self,
         owner: NetworkStreamOwner,
         arguments: Arguments,
-        actual: &Arc<Mutex<FileMetadata>>,
-        local: &FileMetadata,
+        metadata: (&Arc<Mutex<FileMetadata>>, &FileMetadata),
         memory: &MemoryMetadata,
         joined: JoinedNativePrefix,
         epoch: u64,
     ) -> Result<Admission, NetworkReplayError> {
+        let (actual, local) = metadata;
         let root = joined.root().clone();
         let bindings = self.foreground_epoll_preflight(owner, &arguments, &root, actual, local)?;
         let mut identities = Vec::new();
@@ -499,8 +499,7 @@ mod tests {
                 .begin_foreground_epoll_ctl(
                     owner,
                     args,
-                    &actual,
-                    &actual.lock().unwrap(),
+                    (&actual, &actual.lock().unwrap()),
                     &memory.lock().unwrap(),
                     joined,
                     9,
@@ -630,11 +629,10 @@ mod tests {
                     .begin_foreground_epoll_ctl(
                         owner,
                         args,
-                        &actual,
-                        &actual.lock().unwrap(),
+                        (&actual, &actual.lock().unwrap()),
                         &memory.lock().unwrap(),
                         joined,
-                        9
+                        9,
                     )
                     .is_err(),
                 "case {variant}"

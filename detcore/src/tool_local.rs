@@ -109,6 +109,15 @@ pub struct FileMetadata {
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
 }
 
+type InitialCensusDescription = (
+    RawFd,
+    FdType,
+    i32,
+    bool,
+    Option<DetStat>,
+    Option<ResourceID>,
+);
+
 /// Fence around the one initial import. It names the complete local preimage,
 /// not a physical descriptor claim; the private runtime independently checks
 /// the imported claim against its retained kernel census.
@@ -119,14 +128,7 @@ pub(crate) struct InitialCensusFence {
     socket: u64,
     generation: u64,
     slots: Vec<NetworkFdSlot>,
-    descriptions: Vec<(
-        RawFd,
-        FdType,
-        i32,
-        bool,
-        Option<DetStat>,
-        Option<ResourceID>,
-    )>,
+    descriptions: Vec<InitialCensusDescription>,
 }
 
 // FileMetadata is same-image ThreadState transport, not a versioned recording
@@ -269,11 +271,10 @@ impl FileMetadata {
         if let Some(recovery) = &admission.recovery {
             // Recovery is the server's durable exact prefix, not a newly-created
             // local mutex or an inferred sequence after deserialization.
-            if let Some(local) = &self.network_publication.in_flight {
-                if local != recovery {
+            if let Some(local) = &self.network_publication.in_flight
+                && local != recovery {
                     return Err(fd_publication_error("local/server pending prefix mismatch"));
                 }
-            }
             if self.network_publication.last_acknowledged.as_ref() != Some(recovery) {
                 self.validate_publication_prefix(recovery)?;
                 self.network_publication.in_flight = Some(recovery.clone());
@@ -554,8 +555,8 @@ impl FileMetadata {
         if admission.permit.files != self.files_id {
             return Err(fd_publication_error("admission names another table"));
         }
-        if let Some(pending) = &self.network_publication.awaiting_global_ack {
-            if admission.recovery.is_none()
+        if let Some(pending) = &self.network_publication.awaiting_global_ack
+            && admission.recovery.is_none()
                 && admission.acknowledged_sequence == pending.sequence
                 && admission.acknowledged_generation == pending.through_generation
             {
@@ -563,7 +564,6 @@ impl FileMetadata {
                 // is an authenticated global receipt, never a local assumption.
                 self.network_publication.awaiting_global_ack = None;
             }
-        }
         Ok(())
     }
     fn assert_network_publication_snapshot_ready(&self) {
@@ -1599,6 +1599,7 @@ impl FileMetadata {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_network_installations(&self) -> &[NetworkFdSlotReplacement] {
         &self.pending_network_installations
     }
@@ -1621,14 +1622,10 @@ impl FileMetadata {
         let mut slots: Vec<_> = self
             .file_handles
             .iter()
-            .filter_map(|(&fd, detfd)| {
-                (self.track_network_lifetime || detfd.socket_open_file_id().is_some()).then(|| {
-                    NetworkFdSlot {
+            .filter(|&(&_fd, detfd)| self.track_network_lifetime || detfd.socket_open_file_id().is_some()).map(|(&fd, detfd)| NetworkFdSlot {
                         binding: self.descriptor_binding(fd).expect("registered descriptor"),
                         cloexec: detfd.is_cloexec(),
-                    }
-                })
-            })
+                    })
             .collect();
         slots.sort_by_key(|entry| entry.binding.slot.fd);
         slots
@@ -1725,6 +1722,7 @@ impl FileMetadata {
     }
 
     /// add a raw fd
+    #[cfg(test)]
     pub(crate) fn prepare_original_installation(
         &self,
         creator: DetTid,
@@ -2773,7 +2771,7 @@ mod file_metadata_tests {
         assert_eq!(original.open_file, survived.open_file);
         assert_ne!(original.slot.files, survived.slot.files);
         assert_eq!(replacement.descriptor_binding(8), Err(Errno::EBADF));
-        assert!(replacement.slot_generations.get(&8).is_none());
+        assert!(!replacement.slot_generations.contains_key(&8));
         assert!(table.descriptor_binding(8).is_ok());
     }
 
@@ -4545,16 +4543,9 @@ impl<T> ThreadState<T> {
     }
 
     /// Capture the exact modeled installation before an admitted mutation.
+    #[cfg(test)]
     pub(crate) fn descriptor_binding(&self, fd: RawFd) -> Result<FdSlotBinding, Errno> {
         self.metadata().descriptor_binding(fd)
-    }
-
-    pub(crate) fn network_descriptor_slots(&self) -> Vec<NetworkFdSlot> {
-        self.metadata().network_descriptor_slots()
-    }
-
-    pub(crate) fn remove_descriptor_binding(&self, binding: FdSlotBinding) -> bool {
-        self.metadata().remove_descriptor_binding(binding)
     }
 
     /// Resolve a raw socket descriptor to its stable open-file identity.
@@ -6493,7 +6484,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 B::Dormant => {
                     return Err(fd_publication_error("enrolled table lost global authority"));
                 }
-                B::Admitted(value) => value,
+                B::Admitted(value) => *value,
             };
             {
                 let table = table.lock().unwrap();
@@ -6754,13 +6745,13 @@ impl<T> ThreadState<T> {
         let outcome = self.native_child_outcome.as_ref().ok_or_else(|| {
             std::io::Error::other("active native ThreadState missing authenticated rebind")
         })?;
-        if let Some(birth) = &self.pending_no_seq_birth {
-            if outcome.request() != &birth.request_identity() {
+        if let Some(birth) = &self.pending_no_seq_birth
+            && outcome.request() != &birth.request_identity()
+        {
                 return Err(std::io::Error::other(
                     "native ThreadState changed original birth request",
                 ));
             }
-        }
         Ok(Some(outcome.clone()))
     }
 }

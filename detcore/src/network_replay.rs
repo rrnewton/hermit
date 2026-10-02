@@ -31,7 +31,6 @@ mod native_receive;
 pub(crate) mod original_connect;
 pub(crate) mod send_timing;
 pub(crate) use native_receive::CompletedNoStore;
-pub(crate) use native_receive::CompletedRecordEmptyAttempt;
 pub(crate) use native_receive::ForegroundStore;
 pub(crate) use native_receive::ForegroundStoreSource;
 pub(crate) use native_receive::FullStoreCompletion;
@@ -538,7 +537,7 @@ pub enum NetworkFdReadBegin {
     /// Publish/acknowledge the existing prefix before another admission.
     Recover,
     /// Current logical binding under short table/OFD exclusion.
-    Admitted(NetworkFdReadAdmission),
+    Admitted(Box<NetworkFdReadAdmission>),
 }
 
 impl NetworkReplayEngine {
@@ -585,7 +584,7 @@ impl NetworkReplayEngine {
             .get_mut(&files)
             .expect("admitted table")
             .reader = Some(read.clone());
-        Ok(NetworkFdReadBegin::Admitted(read))
+        Ok(NetworkFdReadBegin::Admitted(Box::new(read)))
     }
 
     fn validate_fd_read(
@@ -1479,13 +1478,15 @@ struct NativeTransmitPending {
     call: NetworkStreamCallId,
     bytes: Vec<u8>,
     flags: i32,
-    entry_cut: detcore_model::network_trace::NetworkReceiveEntryCutV4,
-    prerequisites: Vec<detcore_model::network_trace::NetworkReleaseNodeIdV4>,
+    // Retain the inactive transmit consumer's exact entry and timing state,
+    // including Arc custody and field drop order; no production issuer is added.
+    _entry_cut: detcore_model::network_trace::NetworkReceiveEntryCutV4,
+    _prerequisites: Vec<detcore_model::network_trace::NetworkReleaseNodeIdV4>,
     submitted: bool,
-    timing_identity: Option<std::sync::Arc<()>>,
-    timing_claimed: bool,
-    timing_normal_epoch: Option<u64>,
-    timing_receipt: Option<std::sync::Arc<crate::scheduler::send_handback::SendHandbackReceipt>>,
+    _timing_identity: Option<std::sync::Arc<()>>,
+    _timing_claimed: bool,
+    _timing_normal_epoch: Option<u64>,
+    _timing_receipt: Option<std::sync::Arc<crate::scheduler::send_handback::SendHandbackReceipt>>,
 }
 
 impl SocketControlPhysical {
@@ -3719,7 +3720,7 @@ pub struct NetworkReplayEngine {
 enum EngineState {
     Record(NetworkTraceV2),
     Replay(ReplayState),
-    Native(native_receive::NativeState),
+    Native(Box<native_receive::NativeState>),
 }
 
 #[derive(Debug)]
@@ -11279,6 +11280,7 @@ mod tests {
         else {
             panic!("Socket admission")
         };
+        let mutation = *mutation;
         engine
             .submit_fd_mutation(owner, mutation.publication.permit)
             .unwrap();
@@ -11303,7 +11305,7 @@ mod tests {
             .unwrap();
         engine.original_connect_invoked(owner, &admission).unwrap();
         engine
-            .original_connect_selected(owner, &admission, 71, 7, 31, 101, 13, 19)
+            .original_connect_selected(owner, &admission, 71, (7, 31, 101, 13, 19))
             .unwrap();
         engine
             .original_connect_returned(owner, &admission, 17)
@@ -11345,11 +11347,12 @@ mod tests {
                 owner,
                 &mutation.publication,
                 &receipt,
-                &actual,
-                &mut actual.lock().unwrap(),
-                nix::fcntl::OFlag::empty(),
-                None,
-                Some(original_fresh_enrollment()),
+                (&actual, &mut actual.lock().unwrap()),
+                (
+                    nix::fcntl::OFlag::empty(),
+                    None,
+                    Some(original_fresh_enrollment()),
+                ),
                 time(20),
             )
             .unwrap();
@@ -11360,6 +11363,7 @@ mod tests {
         else {
             panic!("published peer reader")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         assert_eq!(
             engine
@@ -11410,12 +11414,9 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &live,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::empty(),
-                        None,
-                        None,
-                        time(20)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (nix::fcntl::OFlag::empty(), None, None),
+                        time(20),
                     )
                     .is_err()
             );
@@ -11437,11 +11438,8 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &removed,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::empty(),
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::empty(), None, None),
                     time(20),
                 )
                 .unwrap();
@@ -11458,6 +11456,7 @@ mod tests {
             else {
                 panic!("peer after proved retirement")
             };
+            let read = *read;
             assert_eq!(read.binding, None);
             engine.finish_fd_read(peer, read).unwrap();
             engine
@@ -11496,12 +11495,13 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::empty(),
-                        None,
-                        (bad != 0).then_some(fresh),
-                        time(20)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (
+                            nix::fcntl::OFlag::empty(),
+                            None,
+                            (bad != 0).then_some(fresh)
+                        ),
+                        time(20),
                     )
                     .is_err()
             );
@@ -11564,11 +11564,12 @@ mod tests {
                 owner,
                 &mutation.publication,
                 &receipt,
-                &actual,
-                &mut actual.lock().unwrap(),
-                nix::fcntl::OFlag::empty(),
-                None,
-                Some(original_fresh_enrollment()),
+                (&actual, &mut actual.lock().unwrap()),
+                (
+                    nix::fcntl::OFlag::empty(),
+                    None,
+                    Some(original_fresh_enrollment()),
+                ),
                 time(20),
             )
             .unwrap();
@@ -11631,6 +11632,7 @@ mod tests {
         else {
             panic!("ACK must complete exact enrollment")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         assert_eq!(
             engine
@@ -11658,11 +11660,12 @@ mod tests {
                             owner,
                             &mutation.publication,
                             &receipt,
-                            &actual,
-                            &mut actual.lock().unwrap(),
-                            nix::fcntl::OFlag::empty(),
-                            None,
-                            Some(original_fresh_enrollment()),
+                            (&actual, &mut actual.lock().unwrap()),
+                            (
+                                nix::fcntl::OFlag::empty(),
+                                None,
+                                Some(original_fresh_enrollment()),
+                            ),
                             time(20),
                         )
                         .unwrap(),
@@ -11710,11 +11713,12 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::empty(),
-                    None,
-                    Some(original_fresh_enrollment()),
+                    (&actual, &mut actual.lock().unwrap()),
+                    (
+                        nix::fcntl::OFlag::empty(),
+                        None,
+                        Some(original_fresh_enrollment()),
+                    ),
                     time(30),
                 )
                 .unwrap();
@@ -11733,6 +11737,7 @@ mod tests {
             else {
                 panic!("same-table reader after exact recovered ACK")
             };
+            let read = *read;
             assert_eq!(read.binding, Some(binding));
             if cut >= 2 {
                 assert_eq!(
@@ -11771,11 +11776,12 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::empty(),
-                    None,
-                    Some(original_fresh_enrollment()),
+                    (&actual, &mut actual.lock().unwrap()),
+                    (
+                        nix::fcntl::OFlag::empty(),
+                        None,
+                        Some(original_fresh_enrollment()),
+                    ),
                     time(20),
                 )
                 .unwrap();
@@ -11817,12 +11823,9 @@ mod tests {
                         owner,
                         &changed_admission,
                         &changed,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        flags,
-                        stat,
-                        supplied,
-                        time(30)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (flags, stat, supplied),
+                        time(30),
                     )
                     .is_err()
             );
@@ -11837,12 +11840,13 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::empty(),
-                        None,
-                        Some(original_fresh_enrollment()),
-                        time(30)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (
+                            nix::fcntl::OFlag::empty(),
+                            None,
+                            Some(original_fresh_enrollment())
+                        ),
+                        time(30),
                     )
                     .unwrap(),
                 (binding, batch)
@@ -11858,12 +11862,13 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::empty(),
-                        None,
-                        Some(original_fresh_enrollment()),
-                        time(30)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (
+                            nix::fcntl::OFlag::empty(),
+                            None,
+                            Some(original_fresh_enrollment())
+                        ),
+                        time(30),
                     )
                     .unwrap(),
                 binding
@@ -11886,11 +11891,12 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    original_installation::socket_installation_flags(libc::SOCK_STREAM | flags),
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (
+                        original_installation::socket_installation_flags(libc::SOCK_STREAM | flags),
+                        None,
+                        None,
+                    ),
                     time(20),
                 )
                 .unwrap();
@@ -11916,11 +11922,8 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::empty(),
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::empty(), None, None),
                     time(20),
                 )
                 .unwrap();
@@ -11929,6 +11932,7 @@ mod tests {
             else {
                 panic!("ordinary Socket remains admitted")
             };
+            let read = *read;
             assert_eq!(read.binding, Some(binding));
             assert!(
                 engine
@@ -12006,12 +12010,9 @@ mod tests {
                     owner,
                     &publication,
                     &wrong,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::O_CLOEXEC,
-                    None,
-                    None,
-                    time(20)
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::O_CLOEXEC, None, None),
+                    time(20),
                 )
                 .is_err()
         );
@@ -12033,11 +12034,8 @@ mod tests {
                 owner,
                 &publication,
                 &receipt,
-                &actual,
-                &mut actual.lock().unwrap(),
-                nix::fcntl::OFlag::O_CLOEXEC,
-                None,
-                None,
+                (&actual, &mut actual.lock().unwrap()),
+                (nix::fcntl::OFlag::O_CLOEXEC, None, None),
                 time(20),
             )
             .unwrap();
@@ -12052,6 +12050,7 @@ mod tests {
         else {
             panic!("accepted peer reader")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         assert!(
             engine
@@ -12095,12 +12094,9 @@ mod tests {
                     owner,
                     &publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::O_CLOEXEC,
-                    None,
-                    None,
-                    time(20)
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::O_CLOEXEC, None, None),
+                    time(20),
                 )
                 .is_err()
         );
@@ -12177,12 +12173,9 @@ mod tests {
                     owner,
                     &publication,
                     &wrong,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::O_CLOEXEC,
-                    None,
-                    None,
-                    time(20)
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::O_CLOEXEC, None, None),
+                    time(20),
                 )
                 .is_err()
         );
@@ -12204,11 +12197,8 @@ mod tests {
                 owner,
                 &publication,
                 &receipt,
-                &actual,
-                &mut actual.lock().unwrap(),
-                nix::fcntl::OFlag::O_CLOEXEC,
-                None,
-                None,
+                (&actual, &mut actual.lock().unwrap()),
+                (nix::fcntl::OFlag::O_CLOEXEC, None, None),
                 time(20),
             )
             .unwrap();
@@ -12224,6 +12214,7 @@ mod tests {
         else {
             panic!("shared peer must observe completed removal")
         };
+        let read = *read;
         assert_eq!(read.binding, None);
         engine.finish_fd_read(peer, read).unwrap();
         // The unchanged original completion remains success for its historical
@@ -12311,12 +12302,9 @@ mod tests {
                         owner,
                         &publication,
                         &wrong,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::O_CLOEXEC,
-                        None,
-                        None,
-                        time(20)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (nix::fcntl::OFlag::O_CLOEXEC, None, None),
+                        time(20),
                     )
                     .is_err()
             );
@@ -12338,11 +12326,8 @@ mod tests {
                     owner,
                     &publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::O_CLOEXEC,
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::O_CLOEXEC, None, None),
                     time(20),
                 )
                 .unwrap();
@@ -12353,12 +12338,9 @@ mod tests {
                         owner,
                         &publication,
                         &wrong,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::O_CLOEXEC,
-                        None,
-                        None,
-                        time(21)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (nix::fcntl::OFlag::O_CLOEXEC, None, None),
+                        time(21),
                     )
                     .is_err()
             );
@@ -12383,11 +12365,8 @@ mod tests {
                     owner,
                     &publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    nix::fcntl::OFlag::O_CLOEXEC,
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (nix::fcntl::OFlag::O_CLOEXEC, None, None),
                     time(20),
                 )
                 .unwrap();
@@ -12403,6 +12382,7 @@ mod tests {
             else {
                 panic!("accepted peer reader")
             };
+            let read = *read;
             assert_eq!(read.binding, Some(binding));
             assert!(
                 engine
@@ -12446,12 +12426,9 @@ mod tests {
                         owner,
                         &publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        nix::fcntl::OFlag::O_CLOEXEC,
-                        None,
-                        None,
-                        time(20)
+                        (&actual, &mut actual.lock().unwrap()),
+                        (nix::fcntl::OFlag::O_CLOEXEC, None, None),
+                        time(20),
                     )
                     .is_err()
             );
@@ -13005,6 +12982,7 @@ mod tests {
         else {
             panic!("listener descriptor admission")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         let call = engine
             .begin_native_stream_call_from_read(owner, read.clone())
@@ -13415,12 +13393,11 @@ mod tests {
             ancillary: None,
         };
         trace.history.inputs.push(input);
-        let mut class = trace
+        let mut class = *trace
             .channel_socket_classes
             .iter()
             .find(|c| c.channel == NetworkChannelId(2))
-            .unwrap()
-            .clone();
+            .unwrap();
         class.channel = NetworkChannelId(3);
         trace.channel_socket_classes.push(class);
         let ReceiveModelV1::DeclaredCopyUnitsWithAcceptV2 { accepted, .. } =
@@ -14556,6 +14533,7 @@ mod fd_read_transfer_tests {
         else {
             panic!("unexpected recovery")
         };
+        let read = *read;
         assert_eq!(read.binding, Some(binding));
         read
     }

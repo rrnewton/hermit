@@ -409,7 +409,7 @@ impl GlobalState {
             NetworkRequest::NativeOriginalConnectOutcome { .. } => runtime
                 .original_connect_outcome(owner, admission, &publication)
                 .await
-                .map(NetworkReply::OriginalConnectOutcome)
+                .map(|outcome| NetworkReply::OriginalConnectOutcome(Box::new(outcome)))
                 .map_err(physical),
             NetworkRequest::NativeRetireInterruptedRead { .. } => {
                 runtime
@@ -1099,7 +1099,6 @@ mod tests {
 }
 #[cfg(test)]
 mod recorded_file_adapter_tests {
-    use std::future::Future;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1147,16 +1146,14 @@ mod recorded_file_adapter_tests {
         fn original_file_execution(&self, _: Syscall) -> crate::OriginalFileExecution {
             crate::OriginalFileExecution::Recorded
         }
-        fn consume_recorded_original_file<G: Guest<Self>>(
+        async fn consume_recorded_original_file<G: Guest<Self>>(
             &self,
             guest: &mut G,
             call: Syscall,
-        ) -> impl Future<Output = Result<i64, Error>> + Send {
-            async move {
+        ) -> Result<i64, Error> {
                 assert!(matches!(call,Syscall::Fcntl(c) if matches!(c.cmd(),FcntlCmd::F_GETFL)));
                 *guest.thread_state_mut() += 1;
                 Ok(0)
-            }
         }
     }
     struct NoStack;
@@ -1417,14 +1414,15 @@ mod recorded_file_adapter_tests {
             assert_eq!(guest.rpc_count.load(Ordering::SeqCst), 3);
             assert!(guest.thread.original_connect.is_none());
             assert!(guest.thread.original_file_metadata.is_none());
-            let engine = state.network_engine.as_ref().unwrap().lock().unwrap();
-            assert_eq!(engine.native_capture_fixture_counts(file), (0, 0, 0, 0));
-            assert!(!engine.fd_table_capability());
-            assert!(
-                engine.finish_fd_mutations().is_err(),
-                "task ownership is distinct from operation cleanup"
-            );
-            drop(engine);
+            {
+                let engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+                assert_eq!(engine.native_capture_fixture_counts(file), (0, 0, 0, 0));
+                assert!(!engine.fd_table_capability());
+                assert!(
+                    engine.finish_fd_mutations().is_err(),
+                    "task ownership is distinct from operation cleanup"
+                );
+            }
             let owner = NetworkStreamOwner {
                 thread: guest.thread.dettid,
                 mm: guest.thread.mm_id,

@@ -489,6 +489,7 @@ impl Launcher {
     }
     /// Custody retirement of an actual failed natural child. Positive reap_success
     /// remains unchanged and will refuse this retained failed launcher forever.
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     pub fn retire_failed(&mut self, directory: RawFd) -> io::Result<()> {
         let result = self.retire_admitted_failed(directory);
         if let Err(error) = &result {
@@ -496,6 +497,7 @@ impl Launcher {
         }
         result
     }
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     fn retire_admitted_failed(&mut self, directory: RawFd) -> io::Result<()> {
         self.check_log_directory(directory)?;
         require(
@@ -707,14 +709,13 @@ impl Launcher {
         }
         self.check_log_directory(directory)?;
         for index in 0..2 {
-            if let Some(log) = &self.log_files[index] {
-                if !self.held_logs_synced[index] {
+            if let Some(log) = &self.log_files[index]
+                && !self.held_logs_synced[index] {
                     if unsafe { libc::fsync(log.as_raw_fd()) } != 0 {
                         return Err(io::Error::last_os_error());
                     }
                     self.held_logs_synced[index] = true;
                 }
-            }
         }
         if unsafe { libc::fsync(directory) } != 0 {
             return Err(io::Error::last_os_error());
@@ -2233,8 +2234,11 @@ pub(super) enum CgroupReadbackProgress {
 }
 #[derive(Debug)]
 pub(super) struct CgroupPending {
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     pub original: FileIdentity,
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     pub before: FileIdentity,
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     pub after: FileIdentity,
     pub creator_terminal: bool,
 }
@@ -2765,7 +2769,7 @@ impl Controls {
     fn snapshot_guarded(
         &self,
         index: usize,
-        deadline: Instant,
+        _deadline: Instant,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Vec<u8>> {
         check()?;
@@ -2802,26 +2806,31 @@ impl Controls {
 
 // Production extension planned for reviewed composition into owner.rs. It
 // reuses the existing retained CommandQuery and original failed-wait checks.
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 pub(super) fn check_parent_failed_launcher(
     launcher: &LauncherLease,
     status: i32,
 ) -> io::Result<()> {
     launcher.check_failed_unreaped(status)
 }
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 pub(super) fn parent_launcher_terminal(launcher: &LauncherLease) -> io::Result<bool> {
     terminal(launcher.pidfd.as_raw_fd())
 }
 #[derive(Debug)]
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 enum ParentForgetState {
     Retained,
     Submitted,
     Refused(Failure),
 }
 #[derive(Debug)]
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 pub(super) struct ParentForgetFailed {
     query: CommandQuery,
     state: ParentForgetState,
 }
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 impl ParentForgetFailed {
     pub fn retain(proof: &super::parent_launch::ParentFailedUnitProof<'_>) -> Self {
         Self {
@@ -2896,6 +2905,7 @@ impl ParentForgetFailed {
 /// any identity. This owns the same original descriptors, without duplication,
 /// and never changes the original Creator's captured/admitted flags.
 #[derive(Debug)]
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 pub(super) struct PartialCreatorCustody {
     original: Creator,
     membership: Option<String>,
@@ -2905,6 +2915,7 @@ pub(super) struct PartialCreatorCustody {
     deadline: Option<Instant>,
     refused: Option<Failure>,
 }
+#[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
 impl PartialCreatorCustody {
     pub fn retain(original: Creator) -> Self {
         Self {
@@ -3079,7 +3090,9 @@ impl PartialCreatorCustody {
 /// authority. Only the consuming serial join may use them in its own token.
 #[derive(Debug)]
 pub(super) struct CreatedObservations {
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     definitions: Vec<u8>,
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     profile: Vec<u8>,
 }
 pub(super) fn observe_created(
@@ -3227,8 +3240,11 @@ fn profile_count(intent: &Intent, bytes: &[u8], expected: usize) -> io::Result<(
 #[derive(Debug)]
 pub(super) struct CensusRow {
     fd: RawFd,
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     identity: FileIdentity,
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     status_flags: i32,
+    #[expect(dead_code, reason = "Retained original custody and failed-source recovery observations are not yet consumed by active startup")]
     descriptor_flags: i32,
 }
 #[derive(Debug)]

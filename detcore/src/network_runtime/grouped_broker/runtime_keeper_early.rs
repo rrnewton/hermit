@@ -963,9 +963,9 @@ impl RuntimeKeeper {
             self.early_prefix_readbacks.is_empty(),
             "early acknowledged-prefix read cannot repeat",
         )?;
-        for index in 0..2 {
+        for (index, history) in selected.iter().enumerate() {
             callbacks.native.check(cutoff)?;
-            let actual = self.early_stores[index].read_acknowledged_prefix(&selected[index])?;
+            let actual = self.early_stores[index].read_acknowledged_prefix(history)?;
             self.early_prefix_readbacks.push(actual);
         }
         let guardian = &self.early_prefix_readbacks[0].history;

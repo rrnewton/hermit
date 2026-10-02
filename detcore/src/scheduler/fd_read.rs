@@ -42,7 +42,7 @@ impl FdReadIntent {
 /// The wait variant is not a table token or a physical result.
 pub(crate) enum SelectedFdRead {
     /// No intent, or the exact newly admitted reader for this selected grant.
-    Ready(Option<NetworkFdReadAdmission>),
+    Ready(Option<Box<NetworkFdReadAdmission>>),
     /// The failed lookup and an independently runnable exact holder agreed atomically.
     AwaitPriorSelection,
 }
@@ -133,8 +133,8 @@ impl Scheduler {
             }
             Err(error) => return Err(error),
         };
-        let read = engine.bind_fd_read_external_grant(intent.owner, read, intent.operation)?;
-        Ok(SelectedFdRead::Ready(Some(read)))
+        let read = engine.bind_fd_read_external_grant(intent.owner, *read, intent.operation)?;
+        Ok(SelectedFdRead::Ready(Some(Box::new(read))))
     }
 
     /// Exact already-granted operation, distinct from a queued request or a

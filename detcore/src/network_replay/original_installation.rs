@@ -37,7 +37,7 @@ impl OriginalCreationAuthority {
 
 /// Actual fresh Socket profile captured under its existing installation permit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FreshStreamEnrollment {
+pub struct FreshStreamEnrollment {
     /// Exact protocol class checked against original creation operands.
     pub(crate) key: StreamSocketKeyV3,
     /// Captured backend network namespace.
@@ -95,6 +95,18 @@ impl Enrollment {
     }
 }
 
+// Group the metadata identity with its existing held borrow. These aliases do
+// not mint publication authority or change the caller's lock lifetime.
+type InstallationMetadata<'a> = (&'a Arc<Mutex<FileMetadata>>, &'a mut FileMetadata);
+type SocketInstallationProfile = (OFlag, Option<DetStat>, Option<FreshStreamEnrollment>);
+type OpenatInstallationProfile = (OpenatEnrollment, Option<DetStat>);
+type AllocatorInstallationProfile = (
+    OFlag,
+    Option<DetStat>,
+    Option<FreshStreamEnrollment>,
+    Option<OpenatEnrollment>,
+);
+
 impl NetworkReplayEngine {
     pub(crate) fn original_installation_metadata(
         &self,
@@ -117,15 +129,19 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         admission: &NetworkFdPublicationAdmission,
         receipt: &Installation,
-        actual: &Arc<Mutex<FileMetadata>>,
-        metadata: &mut FileMetadata,
-        flags: OFlag,
-        stat: Option<DetStat>,
-        fresh: Option<FreshStreamEnrollment>,
+        metadata: InstallationMetadata<'_>,
+        profile: SocketInstallationProfile,
         now: LogicalTime,
     ) -> Result<FdSlotBinding, NetworkReplayError> {
+        let (actual, metadata) = metadata;
+        let (flags, stat, fresh) = profile;
         let (binding, batch) = self.prepare_original_installation_publication(
-            owner, admission, receipt, actual, metadata, flags, stat, fresh, now,
+            owner,
+            admission,
+            receipt,
+            (actual, metadata),
+            (flags, stat, fresh),
+            now,
         )?;
         self.publish_fd_publication(owner, admission.permit, &batch)?;
         metadata.publication_acknowledge(&batch).map_err(protocol)?;
@@ -143,15 +159,19 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         admission: &NetworkFdPublicationAdmission,
         receipt: &Installation,
-        actual: &Arc<Mutex<FileMetadata>>,
-        metadata: &mut FileMetadata,
-        flags: OFlag,
-        stat: Option<DetStat>,
-        fresh: Option<FreshStreamEnrollment>,
+        metadata: InstallationMetadata<'_>,
+        profile: SocketInstallationProfile,
         now: LogicalTime,
     ) -> Result<(FdSlotBinding, NetworkFdPublicationBatch), NetworkReplayError> {
+        let (actual, metadata) = metadata;
+        let (flags, stat, fresh) = profile;
         self.prepare_allocator_installation_publication(
-            owner, admission, receipt, actual, metadata, flags, stat, fresh, None, now,
+            owner,
+            admission,
+            receipt,
+            (actual, metadata),
+            (flags, stat, fresh, None),
+            now,
         )
     }
 
@@ -160,12 +180,12 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         admission: &NetworkFdPublicationAdmission,
         receipt: &Installation,
-        actual: &Arc<Mutex<FileMetadata>>,
-        metadata: &mut FileMetadata,
-        opened: OpenatEnrollment,
-        stat: Option<DetStat>,
+        metadata: InstallationMetadata<'_>,
+        profile: OpenatInstallationProfile,
         now: LogicalTime,
     ) -> Result<FdSlotBinding, NetworkReplayError> {
+        let (actual, metadata) = metadata;
+        let (opened, stat) = profile;
         let Source::Openat(call) = receipt.source() else {
             return Err(protocol(
                 "Openat publication changed original installation source",
@@ -178,12 +198,8 @@ impl NetworkReplayEngine {
             owner,
             admission,
             receipt,
-            actual,
-            metadata,
-            flags,
-            stat,
-            None,
-            Some(opened),
+            (actual, metadata),
+            (flags, stat, None, Some(opened)),
             now,
         )?;
         self.publish_fd_publication(owner, admission.permit, &batch)?;
@@ -235,12 +251,8 @@ impl NetworkReplayEngine {
             owner,
             admission,
             receipt,
-            actual,
-            metadata,
-            flags,
-            None,
-            None,
-            Some(opened),
+            (actual, metadata),
+            (flags, None, None, Some(opened)),
             now,
         )?;
         self.publish_fd_publication(owner, admission.permit, &batch)?;
@@ -257,14 +269,12 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         admission: &NetworkFdPublicationAdmission,
         receipt: &Installation,
-        actual: &Arc<Mutex<FileMetadata>>,
-        metadata: &mut FileMetadata,
-        flags: OFlag,
-        stat: Option<DetStat>,
-        fresh: Option<FreshStreamEnrollment>,
-        opened: Option<OpenatEnrollment>,
+        metadata: InstallationMetadata<'_>,
+        profile: AllocatorInstallationProfile,
         now: LogicalTime,
     ) -> Result<(FdSlotBinding, NetworkFdPublicationBatch), NetworkReplayError> {
+        let (actual, metadata) = metadata;
+        let (flags, stat, fresh, opened) = profile;
         let permit = admission.permit;
         self.validate_publication_permit(owner, permit)?;
         let flags = if matches!(receipt.source(), Source::Openat(_) | Source::EpollCreate(_)) {
@@ -625,9 +635,9 @@ impl NetworkReplayEngine {
         publisher: NetworkStreamOwner,
         mutation: &NetworkFdMutationAdmission,
         receipt: &Installation,
-        actual: &Arc<Mutex<FileMetadata>>,
-        metadata: &mut FileMetadata,
+        metadata: InstallationMetadata<'_>,
     ) -> Result<FdSlotBinding, NetworkReplayError> {
+        let (actual, metadata) = metadata;
         self.validate_terminal_allocator_recovery(mutation)?;
         let permit = mutation.publication.permit;
         self.validate_fd_metadata(publisher, permit.files, actual, metadata)?;
@@ -802,6 +812,18 @@ impl NetworkReplayEngine {
     }
 }
 
+/// Uses the actual installation consumer and both ACKs with explicit controlled
+/// provider rows; it does not represent native BPF execution.
+#[cfg(test)]
+pub(super) fn controlled_receive_origin() -> (
+    NetworkReplayEngine,
+    NetworkStreamOwner,
+    Arc<Mutex<FileMetadata>>,
+    FdSlotBinding,
+) {
+    tests::receive_origin_fixture()
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -840,6 +862,7 @@ mod tests {
         else {
             panic!("expected existing mutation admission")
         };
+        let mutation = *mutation;
         engine
             .submit_fd_mutation(owner, mutation.publication.permit)
             .unwrap();
@@ -877,11 +900,7 @@ mod tests {
                 owner,
                 admission,
                 71,
-                7,
-                31,
-                101,
-                13,
-                if raw >= 0 { 19 } else { 0 },
+                (7, 31, 101, 13, if raw >= 0 { 19 } else { 0 }),
             )
             .unwrap();
         assert!(
@@ -932,11 +951,8 @@ mod tests {
                 owner,
                 &mutation.publication,
                 &receipt,
-                &actual,
-                &mut actual.lock().unwrap(),
-                OFlag::O_CLOEXEC,
-                None,
-                Some(fresh),
+                (&actual, &mut actual.lock().unwrap()),
+                (OFlag::O_CLOEXEC, None, Some(fresh)),
                 LogicalTime::ZERO,
             )
             .unwrap();
@@ -976,11 +992,8 @@ mod tests {
                 owner,
                 &mutation.publication,
                 &receipt,
-                &actual,
-                &mut actual.lock().unwrap(),
-                OFlag::O_CLOEXEC,
-                None,
-                None,
+                (&actual, &mut actual.lock().unwrap()),
+                (OFlag::O_CLOEXEC, None, None),
                 LogicalTime::ZERO,
             )
             .unwrap();
@@ -998,12 +1011,9 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    OFlag::O_CLOEXEC,
-                    None,
-                    None,
-                    LogicalTime::ZERO
+                    (&actual, &mut actual.lock().unwrap()),
+                    (OFlag::O_CLOEXEC, None, None),
+                    LogicalTime::ZERO,
                 )
                 .is_err()
         );
@@ -1047,11 +1057,8 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        OFlag::O_CLOEXEC,
-                        None,
-                        None,
+                        (&actual, &mut actual.lock().unwrap()),
+                        (OFlag::O_CLOEXEC, None, None),
                         LogicalTime::ZERO,
                     )
                     .unwrap()
@@ -1139,12 +1146,9 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        OFlag::empty(),
-                        None,
-                        None,
-                        LogicalTime::ZERO
+                        (&actual, &mut actual.lock().unwrap()),
+                        (OFlag::empty(), None, None),
+                        LogicalTime::ZERO,
                     )
                     .is_err()
             );
@@ -1289,11 +1293,8 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    OFlag::O_CLOEXEC,
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (OFlag::O_CLOEXEC, None, None),
                     LogicalTime::ZERO,
                 )
                 .unwrap();
@@ -1313,6 +1314,7 @@ mod tests {
             else {
                 panic!("same-table peer must progress after committed removal")
             };
+            let read = *read;
             assert_eq!(read.binding, None);
             engine.finish_fd_read(peer, read).unwrap();
             engine
@@ -1329,12 +1331,9 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        OFlag::O_CLOEXEC,
-                        None,
-                        None,
-                        LogicalTime::ZERO
+                        (&actual, &mut actual.lock().unwrap()),
+                        (OFlag::O_CLOEXEC, None, None),
+                        LogicalTime::ZERO,
                     )
                     .is_err()
             );
@@ -1365,11 +1364,8 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    OFlag::empty(),
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (OFlag::empty(), None, None),
                     LogicalTime::ZERO,
                 )
                 .unwrap();
@@ -1390,11 +1386,8 @@ mod tests {
                     owner,
                     &mutation.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    OFlag::empty(),
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (OFlag::empty(), None, None),
                     LogicalTime::ZERO,
                 )
                 .unwrap();
@@ -1509,11 +1502,13 @@ mod tests {
                 owner,
                 admission,
                 command,
-                7,
-                owner.thread.as_raw() as u64,
-                101,
-                13,
-                if raw >= 0 { 19 } else { 0 },
+                (
+                    7,
+                    owner.thread.as_raw() as u64,
+                    101,
+                    13,
+                    if raw >= 0 { 19 } else { 0 },
+                ),
             )
             .unwrap();
         // Backend return alone cannot acquire publication authority until the
@@ -1660,13 +1655,14 @@ mod tests {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        OpenatEnrollment {
-                            kind,
-                            status_flags: flags,
-                        },
-                        None,
+                        (&actual, &mut actual.lock().unwrap()),
+                        (
+                            OpenatEnrollment {
+                                kind,
+                                status_flags: flags,
+                            },
+                            None,
+                        ),
                         LogicalTime::ZERO,
                     )
                     .unwrap();
@@ -1701,14 +1697,15 @@ mod tests {
                             owner,
                             &mutation.publication,
                             &receipt,
-                            &actual,
-                            &mut actual.lock().unwrap(),
-                            OpenatEnrollment {
-                                kind,
-                                status_flags: flags
-                            },
-                            None,
-                            LogicalTime::ZERO
+                            (&actual, &mut actual.lock().unwrap()),
+                            (
+                                OpenatEnrollment {
+                                    kind,
+                                    status_flags: flags
+                                },
+                                None
+                            ),
+                            LogicalTime::ZERO,
                         )
                         .is_err()
                 );
@@ -2070,13 +2067,14 @@ mod tests {
                                 peer,
                                 &mutation.publication,
                                 &bound,
-                                &actual,
-                                &mut actual.lock().unwrap(),
-                                OpenatEnrollment {
-                                    kind: crate::fd::FdType::Regular,
-                                    status_flags: libc::O_RDWR,
-                                },
-                                None,
+                                (&actual, &mut actual.lock().unwrap()),
+                                (
+                                    OpenatEnrollment {
+                                        kind: crate::fd::FdType::Regular,
+                                        status_flags: libc::O_RDWR,
+                                    },
+                                    None,
+                                ),
                                 LogicalTime::ZERO,
                             )
                             .unwrap()
@@ -2086,11 +2084,8 @@ mod tests {
                                 peer,
                                 &mutation.publication,
                                 &bound,
-                                &actual,
-                                &mut actual.lock().unwrap(),
-                                OFlag::O_RDWR,
-                                None,
-                                None,
+                                (&actual, &mut actual.lock().unwrap()),
+                                (OFlag::O_RDWR, None, None),
                                 LogicalTime::ZERO,
                             )
                             .unwrap()
@@ -2362,13 +2357,14 @@ mod tests {
                                 peer,
                                 &mutation.publication,
                                 &bound,
-                                &actual,
-                                &mut actual.lock().unwrap(),
-                                OpenatEnrollment {
-                                    kind: crate::fd::FdType::Regular,
-                                    status_flags: libc::O_RDWR,
-                                },
-                                None,
+                                (&actual, &mut actual.lock().unwrap()),
+                                (
+                                    OpenatEnrollment {
+                                        kind: crate::fd::FdType::Regular,
+                                        status_flags: libc::O_RDWR,
+                                    },
+                                    None,
+                                ),
                                 LogicalTime::ZERO,
                             )
                             .unwrap();
@@ -2378,11 +2374,8 @@ mod tests {
                                 peer,
                                 &mutation.publication,
                                 &bound,
-                                &actual,
-                                &mut actual.lock().unwrap(),
-                                OFlag::O_RDWR,
-                                None,
-                                None,
+                                (&actual, &mut actual.lock().unwrap()),
+                                (OFlag::O_RDWR, None, None),
                                 LogicalTime::ZERO,
                             )
                             .unwrap();
@@ -2575,11 +2568,8 @@ mod tests {
                         owner,
                         &prior.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        OFlag::O_RDWR,
-                        None,
-                        None,
+                        (&actual, &mut actual.lock().unwrap()),
+                        (OFlag::O_RDWR, None, None),
                         LogicalTime::ZERO,
                     )
                     .unwrap();
@@ -2623,8 +2613,7 @@ mod tests {
                         peer,
                         &mutation,
                         &terminal,
-                        &actual,
-                        &mut actual.lock().unwrap(),
+                        (&actual, &mut actual.lock().unwrap()),
                     )
                     .unwrap();
                 assert_eq!(recovered, binding);
@@ -2683,11 +2672,8 @@ mod tests {
                         owner,
                         &prior.publication,
                         &receipt,
-                        &actual,
-                        &mut actual.lock().unwrap(),
-                        OFlag::O_RDWR,
-                        None,
-                        None,
+                        (&actual, &mut actual.lock().unwrap()),
+                        (OFlag::O_RDWR, None, None),
                         LogicalTime::ZERO,
                     )
                     .unwrap();
@@ -2809,11 +2795,8 @@ mod tests {
                     owner,
                     &prior.publication,
                     &receipt,
-                    &actual,
-                    &mut actual.lock().unwrap(),
-                    OFlag::O_RDWR,
-                    None,
-                    None,
+                    (&actual, &mut actual.lock().unwrap()),
+                    (OFlag::O_RDWR, None, None),
                     LogicalTime::ZERO,
                 )
                 .unwrap();
@@ -3005,16 +2988,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Uses the actual installation consumer and both ACKs with explicit controlled
-/// provider rows; it does not represent native BPF execution.
-#[cfg(test)]
-pub(super) fn controlled_receive_origin() -> (
-    NetworkReplayEngine,
-    NetworkStreamOwner,
-    Arc<Mutex<FileMetadata>>,
-    FdSlotBinding,
-) {
-    tests::receive_origin_fixture()
 }

@@ -296,11 +296,13 @@ impl Context {
                         owner,
                         admission,
                         selected.command,
-                        selected.provider,
-                        selected.task,
-                        selected.task_start,
-                        selected.table,
-                        selected.file,
+                        (
+                            selected.provider,
+                            selected.task,
+                            selected.task_start,
+                            selected.table,
+                            selected.file,
+                        ),
                     )
                     .unwrap();
                 engine
@@ -379,12 +381,8 @@ impl Context {
                     },
                     mutation.publication.permit,
                     Source::Openat(admission.call),
-                    event.command,
-                    fd,
-                    selected.file,
-                    begin,
-                    end,
-                    event.through,
+                    (event.command, fd, selected.file),
+                    (begin, end, event.through),
                     &self.history,
                 )
                 .unwrap();
@@ -405,13 +403,14 @@ impl Context {
                         owner,
                         &mutation.publication,
                         &receipt,
-                        actual,
-                        &mut actual.lock().unwrap(),
-                        OpenatEnrollment {
-                            kind: profile.kind().unwrap(),
-                            status_flags: profile.status_flags,
-                        },
-                        Some(stat.into()),
+                        (actual, &mut actual.lock().unwrap()),
+                        (
+                            OpenatEnrollment {
+                                kind: profile.kind().unwrap(),
+                                status_flags: profile.status_flags,
+                            },
+                            Some(stat.into()),
+                        ),
                         LogicalTime::ZERO,
                     )
                     .unwrap();

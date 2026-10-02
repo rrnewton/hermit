@@ -1215,6 +1215,7 @@ fn native_retirement_failure_refuses_call_transfer_but_releases_actual_fd_reader
     else {
         panic!("reader needs no recovery")
     };
+    let read = *read;
     assert_eq!(read.binding, Some(binding));
     let before = format!("{e:?}");
     assert_eq!(

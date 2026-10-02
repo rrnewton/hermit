@@ -107,12 +107,12 @@ impl CompletedSourceExport {
         self.source.notify_runtime_failure(origin, cause)
     }
     fn remember<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            if self.refusal.is_none() {
+        if let Err(error) = &result
+            && self.refusal.is_none()
+        {
                 self.refusal = Some(Failure::capture(error));
                 self.failure_origin = guardian::monotonic_ns().ok();
             }
-        }
         result
     }
 
@@ -338,13 +338,6 @@ impl CompletedSourceExport {
         self.remember(result)
     }
 
-    pub fn diagnostics(&self) -> Value {
-        json!({"prepared":self.prepared,"frames":self.frames.len(),"sent":self.next,
-            "bytes":self.total_bytes,"acknowledged":self.acknowledged,
-            "provider_authority":false,"startup_terminal":false,
-            "failure":self.refusal.as_ref().map(|f|&f.message),
-            "failure_origin":self.failure_origin})
-    }
     /// Called only after the actual dual-custody ACK. This retires the real
     /// startup Guardian, then proves its unchanged natural child/EOF/ECHILD
     /// outcome; a transport ACK itself never means the actor is terminal.

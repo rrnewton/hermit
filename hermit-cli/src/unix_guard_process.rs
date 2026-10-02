@@ -201,14 +201,15 @@ fn reap_adopted(
         // The same absolute deadline covers successful reaps and EINTR retries.
         within(deadline)?;
         let result = wait();
-        if let Ok((pid, raw)) = result.as_ref() {
-            if *pid > 0 {
+        match result.as_ref() {
+            Ok((pid, raw)) if *pid > 0 => {
                 // Retain a consumed status even if the observation was late.
                 adopted.push((*pid, *raw));
                 if adopted.len() > 128 {
                     return Err(io::Error::other("command descendant census exceeded"));
                 }
             }
+            _ => {}
         }
         within(deadline)?;
         match result {

@@ -349,10 +349,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .stage_original_call(
                 guest,
                 call.into(),
-                Kind::Socket,
-                call.family(),
+                Kind::Socket, (call.family(),
                 u64::from(call.r#type() as u32),
-                call.protocol(),
+                call.protocol()),
                 crate::OriginalFileExecution::Native,
             )
             .await?;
@@ -468,7 +467,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Keep the original syscall and complete raw register tuple. In particular
         // epoll_create(size <= 0) must reach Linux rather than become create1(0).
         let arguments = self
-            .stage_original_call(guest, call, kind, raw.arg0 as i32, nr as u64, 0, source)
+            .stage_original_call(guest, call, kind, (raw.arg0 as i32, nr as u64, 0), source)
             .await?;
         let admission = match network_request(
             guest,
@@ -558,10 +557,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .stage_original_call(
                 guest,
                 call.into(),
-                Kind::EpollCtl,
-                raw.arg0 as i32,
+                Kind::EpollCtl, (raw.arg0 as i32,
                 raw.arg3 as u64,
-                raw.arg1 as i32,
+                raw.arg1 as i32),
                 source,
             )
             .await?;
@@ -589,96 +587,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Every returned preparation/delegate/observation error pays the same
         // continuation. Actual terminal cancellation retains Local/Call for
         // backend final wait; it cannot invent a native result or handback.
-        self.finish_original_epoll_ctl_wait(guest, operation).await;
-        let (admission, _, result, _) = observed?;
-        self.shadow_ack(
-            guest,
-            NetworkRequest::NativeRetireOriginalConnect { admission },
-        )
-        .await?;
-        guest.thread_state_mut().original_connect = None;
-        result
-    }
-
-    /// Qualification-only entry until the positive capability and changed-
-    /// schedule runtime controls are approved. The production gate stays closed.
-    pub(crate) async fn network_foreground_epoll_ctl<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::EpollCtl,
-    ) -> Result<i64, Error> {
-        let result = self.network_foreground_epoll_ctl_inner(guest, call).await;
-        self.finish_original_invocation(guest, result).await
-    }
-    async fn network_foreground_epoll_ctl_inner<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::EpollCtl,
-    ) -> Result<i64, Error> {
-        use crate::network_replay::original_connect::Kind;
-        let source = self.record_or_replay.original_file_execution(call.into());
-        if source != crate::OriginalFileExecution::Native {
-            return Err(engine_error(
-                "foreground ctl requires actual original native authority",
-            ));
-        }
-        let (_, raw) = call.into_parts();
-        let arguments = self
-            .stage_original_call(
-                guest,
-                call.into(),
-                Kind::EpollCtl,
-                raw.arg0 as i32,
-                raw.arg3 as u64,
-                raw.arg1 as i32,
-                source,
-            )
-            .await?;
-        let operation = arguments.operation;
-        let admission = match network_request(
-            guest,
-            NetworkRequest::NativeBeginForegroundEpollCtl { arguments },
-        )
-        .await
-        .map_err(engine_rpc_error)?
-        {
-            NetworkReply::OriginalConnectAdmission(admission) => admission,
-            reply => {
-                return Err(engine_error(format!(
-                    "foreground ctl admission changed reply {reply:?}"
-                )));
-            }
-        };
-        let local = guest.thread_state_mut().original_connect.as_mut().unwrap();
-        local.arguments = admission.arguments.clone();
-        local.admission = Some(admission.clone());
-        self.shadow_ack(
-            guest,
-            NetworkRequest::NativeSubmitOriginalConnect {
-                admission: admission.clone(),
-            },
-        )
-        .await?;
-        self.mark_original_syscall_invoked(guest);
-        // Native mutation happens inside the exact granted foreground turn.
-        let result = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
-        if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
-            return Err(result.unwrap_err());
-        }
-        self.shadow_ack(
-            guest,
-            NetworkRequest::NativeForegroundEpollCtlReturned {
-                admission: admission.clone(),
-            },
-        )
-        .await?;
-        // Only the already-returned semantic/history join may now background.
-        self.begin_original_epoll_ctl_wait(guest, operation).await?;
-        let observed = self
-            .observe_original_call_result(guest, admission, result)
-            .await;
         self.finish_original_epoll_ctl_wait(guest, operation).await;
         let (admission, _, result, _) = observed?;
         self.shadow_ack(
@@ -825,10 +733,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .stage_original_call(
                 guest,
                 call.into(),
-                Kind::Openat,
-                raw.arg0 as i32,
+                Kind::Openat, (raw.arg0 as i32,
                 raw.arg1 as u64,
-                raw.arg2 as i32,
+                raw.arg2 as i32),
                 source,
             )
             .await?;
@@ -1048,8 +955,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         result: Result<i64, Error>,
     ) -> Result<i64, Error> {
-        if let Err(error) = &result {
-            if let Some(local) = guest.thread_state().original_connect.clone() {
+        if let Err(error) = &result
+            && let Some(local) = guest.thread_state().original_connect.clone()
+        {
                 // Returning a Tool error would let the backend drop this task
                 // before its final wait. Publish the existing run-failure fence
                 // and retain this future until exact-task cleanup cancels it.
@@ -1070,7 +978,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 return futures::future::pending().await;
             }
-        }
         result
     }
 
@@ -1079,13 +986,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
         kind: crate::network_replay::original_connect::Kind,
-        fd: i32,
-        address: u64,
-        length: i32,
+        (fd, address, length): (i32, u64, i32),
         source: crate::OriginalFileExecution,
     ) -> Result<crate::network_replay::original_connect::Admission, Error> {
         let arguments = self
-            .stage_original_call(guest, call, kind, fd, address, length, source)
+            .stage_original_call(guest, call, kind, (fd, address, length), source)
             .await?;
         self.admit_original_call(guest, arguments, source, None)
             .await
@@ -1098,9 +1003,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
         kind: crate::network_replay::original_connect::Kind,
-        fd: i32,
-        address: u64,
-        length: i32,
+        (fd, address, length): (i32, u64, i32),
         source: crate::OriginalFileExecution,
     ) -> Result<crate::network_replay::original_connect::Arguments, Error> {
         use crate::network_replay::original_connect::Arguments;
@@ -1264,7 +1167,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "original Connect backend and guest completion disagree",
             ));
         }
-        Ok((admission, outcome, result, returned))
+        Ok((admission, *outcome, result, returned))
     }
 
     async fn network_original_invoke<G: Guest<Self>>(
@@ -1288,10 +1191,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .stage_original_call(
                 guest,
                 call,
-                kind,
-                fd,
+                kind, (fd,
                 address,
-                length,
+                length),
                 crate::OriginalFileExecution::Native,
             )
             .await?;
@@ -1319,7 +1221,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::scheduler::parked::ResourceReply::ReadGrant {
                     status: crate::tool_global::ResumeStatus::Normal,
                     read,
-                } => read,
+                } => *read,
                 // An actual cancelled/terminal transport is handled by the
                 // existing backend consuming path. Never inject this numeric
                 // FD using a signal response in place of an owned lookup.
@@ -1538,10 +1440,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .prepare_original_call_from(
                 guest,
                 call.into(),
-                Kind::File(operation),
-                call.fd(),
+                Kind::File(operation), (call.fd(),
                 operation.syscall() as u64,
-                operation.command(),
+                operation.command()),
                 source,
             )
             .await?;
@@ -4383,7 +4284,7 @@ mod shadow_completion_tests {
         // Native ::1 stream connect(length=24) accepted and transferred payload
         // in root-connect-address-audit-v1. These literal bytes also exercise
         // the common guest/captured codec without executing any socket here.
-        let mut bytes = vec![0u8; 29];
+        let mut bytes = [0u8; 29];
         bytes[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
         bytes[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
         bytes[4..8].copy_from_slice(&0x10203040u32.to_ne_bytes());
@@ -4504,8 +4405,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let read = self.begin_network_fd_read(guest, fd).await?;
         let observed = {
             let table = guest.thread_state().file_metadata.clone();
-            let observed = table.lock().unwrap().observe_fd_read(&read);
-            observed
+
+            table.lock().unwrap().observe_fd_read(&read)
         };
         let observed = match observed {
             Ok(observed) if observed.socket == Some(expected) => observed,
@@ -4539,6 +4440,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map_err(engine_rpc_error)?
             {
                 NetworkReply::FdRead(crate::network_replay::NetworkFdReadBegin::Admitted(read)) => {
+                    let read = *read;
                     return Ok(read);
                 }
                 NetworkReply::FdRead(crate::network_replay::NetworkFdReadBegin::Recover) => {}
@@ -6632,8 +6534,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let read = self.begin_network_fd_read(guest, fd).await?;
         let observed = {
             let table = guest.thread_state().file_metadata.clone();
-            let observed = table.lock().unwrap().observe_fd_read(&read);
-            observed
+
+            table.lock().unwrap().observe_fd_read(&read)
         };
         match observed {
             Ok(observed) if observed.socket.is_some() => self
@@ -7556,7 +7458,7 @@ mod original_file_delegate_error_tests {
             config.network_trace.policy = policy;
             let tid = Tid::from_raw(73);
             let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-            let mut thread = tool.init_thread_state(tid, None);
+            let thread = tool.init_thread_state(tid, None);
             thread
                 .add_fd(socket.as_raw_fd(), OFlag::empty(), FdType::Socket, None)
                 .unwrap();
@@ -7656,7 +7558,7 @@ mod original_file_delegate_error_tests {
             config.network_trace.policy = policy;
             let tid = Tid::from_raw(73);
             let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-            let mut thread = tool.init_thread_state(tid, None);
+            let thread = tool.init_thread_state(tid, None);
             thread
                 .add_fd(77, OFlag::empty(), FdType::Socket, None)
                 .unwrap();
@@ -7692,7 +7594,7 @@ mod original_file_delegate_error_tests {
         config.network_trace.policy = NetworkPolicy::Record;
         let tid = Tid::from_raw(73);
         let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-        let mut thread = tool.init_thread_state(tid, None);
+        let thread = tool.init_thread_state(tid, None);
         thread
             .add_fd(socket.as_raw_fd(), OFlag::empty(), FdType::Socket, None)
             .unwrap();
@@ -7779,7 +7681,7 @@ mod original_file_delegate_error_tests {
             config.network_trace.policy = policy;
             let tid = Tid::from_raw(73);
             let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-            let mut thread = tool.init_thread_state(tid, None);
+            let thread = tool.init_thread_state(tid, None);
             thread
                 .add_fd(77, OFlag::empty(), FdType::Socket, None)
                 .unwrap();
@@ -8412,14 +8314,14 @@ mod original_file_delegate_error_tests {
                     assert_eq!(local.returned, Some(returned));
                     boundary.events.push("outcome");
                     NetworkReply::OriginalConnectOutcome(
-                        crate::network_runtime::original_connect::Outcome {
+                        Box::new(crate::network_runtime::original_connect::Outcome {
                             admission,
                             returned,
                             pin: None,
                             address: None,
                             socket: None,
                             read_copy: None,
-                        },
+                        }),
                     )
                 }
                 GlobalRequest::Network(NetworkRequest::NativeRetireOriginalConnect {
@@ -8633,12 +8535,12 @@ mod original_file_delegate_error_tests {
                         ["admitted-prepared", "submitted", "closed"]
                     );
                     boundary.events.push("outcome");
-                    NetworkReply::OriginalConnectOutcome(
+                    NetworkReply::OriginalConnectOutcome(Box::new(
                         boundary
                             .outcome
                             .clone()
                             .expect("physical close outcome missing"),
-                    )
+                    ))
                 }
                 GlobalRequest::Network(NetworkRequest::NativeRetireOriginalConnect {
                     admission,
@@ -8859,7 +8761,7 @@ mod original_file_delegate_error_tests {
         let mut byte = 0u8;
         let read = syscalls::Read::new()
             .with_fd(fd)
-            .with_buf(AddrMut::from_ptr(&mut byte))
+            .with_buf(AddrMut::from_ptr(std::ptr::addr_of_mut!(byte)))
             .with_len(1);
         assert!(matches!(
             tool.handle_syscall_event(&mut guest, read.into()).await,
@@ -9047,7 +8949,7 @@ mod original_file_delegate_error_tests {
             config.network_trace.policy = NetworkPolicy::Replay;
             let tid = Tid::from_raw(73);
             let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-            let mut thread = tool.init_thread_state(tid, None);
+            let thread = tool.init_thread_state(tid, None);
             thread
                 .add_fd(77, OFlag::empty(), FdType::Socket, None)
                 .unwrap();
@@ -9138,8 +9040,7 @@ mod original_file_delegate_error_tests {
                 Some(Errno::ERESTARTSYS),
             ),
         ] {
-            let mut config = Config::default();
-            config.sequentialize_threads = true;
+            let config = Config { sequentialize_threads: true, ..Config::default() };
             let tid = Tid::from_raw(74);
             let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
             let mut thread = tool.init_thread_state(tid, None);
@@ -9216,7 +9117,7 @@ mod original_file_delegate_error_tests {
                     config.network_trace.policy = policy;
                     let tid = Tid::from_raw(73);
                     let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-                    let mut thread = tool.init_thread_state(tid, None);
+                    let thread = tool.init_thread_state(tid, None);
                     thread
                         .add_fd(
                             endpoint.as_raw_fd(),
@@ -9315,7 +9216,7 @@ mod original_file_delegate_error_tests {
                         config.network_trace.policy = policy;
                         let tid = Tid::from_raw(73);
                         let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
-                        let mut thread = tool.init_thread_state(tid, None);
+                        let thread = tool.init_thread_state(tid, None);
                         thread
                             .add_fd(
                                 endpoint.as_raw_fd(),
@@ -9555,9 +9456,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.foreground_v4_receive_after_probe(
             guest,
             call,
-            admitted,
-            mode,
-            nonblocking,
+            admitted, (mode,
+            nonblocking),
             prepared,
             invocation,
         )
@@ -9572,8 +9472,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
         admitted: crate::network_replay::NetworkStreamCall,
-        mode: crate::network_replay::NetworkEngineMode,
-        nonblocking: bool,
+        (mode, nonblocking): (crate::network_replay::NetworkEngineMode, bool),
         prepared_probe: Result<Option<NetworkStreamLeaseId>, Error>,
         mut invocation: Option<crate::tool_global::CheckedReadInvocation>,
     ) -> Result<i64, Error> {

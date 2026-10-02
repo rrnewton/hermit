@@ -377,6 +377,7 @@ impl PreparedLeafNamespace {
     pub fn held_descriptors(&self) -> Vec<RawFd> {
         self.original.held_descriptors()
     }
+    #[expect(dead_code, reason = "Retained namespace evidence accessor has no current diagnostic consumer")]
     pub fn evidence(&self) -> serde_json::Value {
         self.original.evidence()
     }
