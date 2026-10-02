@@ -74,7 +74,7 @@ h1 em { display: block; color: var(--coral); font-weight: 400; }
 .entropy-4 { left: 50%; top: 100%; }
 .entropy-5 { left: 6.7%; top: 75%; }
 .entropy-6 { left: 6.7%; top: 25%; }
-.entropy-label { display: block; padding: 7px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); font-size: 0.73rem; font-weight: 650; line-height: 1.3; text-align: center; white-space: nowrap; animation: label-turn 72s linear infinite; }
+.entropy-label { display: block; color: var(--coral); font-size: 0.73rem; font-weight: 650; line-height: 1.3; text-align: center; white-space: nowrap; animation: label-turn 72s linear infinite; }
 @keyframes orbit-turn { to { transform: rotate(360deg); } }
 @keyframes label-turn { to { transform: rotate(-360deg); } }
 .motion-toggle { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
