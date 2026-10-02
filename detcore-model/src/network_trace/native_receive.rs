@@ -541,6 +541,7 @@ impl NetworkTraceV4 {
         // before that ledger position, without cloning one set per input/node.
         let mut cuts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         let mut last_input: BTreeMap<NetworkChannelId, (usize, LogicalTime, u64)> = BTreeMap::new();
+        let mut last_poll = BTreeMap::new();
         for (i, input) in self.inputs.iter().enumerate() {
             let n = input_nodes[i].unwrap();
             let cut = usize::try_from(input.release.receive_entry_cut.0)
@@ -553,6 +554,16 @@ impl NetworkTraceV4 {
                 return Err(Invalid::Payload(
                     NetworkTraceValidationError::ReleaseBeforeEpoch,
                 ));
+            }
+            if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. } = input.event {
+                let observation = (consumed_prefix, input.release.not_before_global_time);
+                // Applying eligible state to closure must not erase an
+                // observable zero/ready boundary. Ledger order alone does not
+                // separate two observations at the same byte cut and time,
+                // even if their masks happen to be identical.
+                if last_poll.insert(input.channel, observation) == Some(observation) {
+                    return Err(Invalid::InvalidNativeObservation);
+                }
             }
             if let Some((prior, time, old_cut)) = last_input.insert(
                 input.channel,

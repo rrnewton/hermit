@@ -1216,6 +1216,12 @@ impl NetworkReplayEngine {
         open_file: OpenFileId,
         peer: bool,
     ) -> Result<Option<NetworkAddressV2>, NetworkReplayError> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464):
+        // Outbound V4 endpoints require the original Connect establishment.
+        if self.native_receive_version() {
+            return self.native_outbound_endpoint(open_file, peer);
+        }
         if !self.accepted_mode() {
             return Ok(None);
         }

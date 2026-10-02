@@ -30,6 +30,9 @@ mod non_read_entry;
 #[path = "native_connected/early_completion.rs"]
 mod early_completion;
 
+#[path = "native_connected/endpoints.rs"]
+mod endpoints;
+
 struct EntryFixture {
     config: Config,
     state: GlobalState,

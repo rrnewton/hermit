@@ -3,6 +3,9 @@
 //! owner. No V2 release gate or V3 immutable copy unit is manufactured here.
 use std::sync::Arc;
 
+#[path = "versioned/raw_poll.rs"]
+mod raw_poll;
+
 use detcore_model::network_trace::FreshSendTimeoutV1;
 use detcore_model::network_trace::NetworkCreationModelV4;
 use detcore_model::network_trace::NetworkEstablishmentV4;
@@ -57,6 +60,7 @@ struct NativeReplay {
     connected: BTreeSet<NetworkChannelId>,
     connect_in_progress_delivered: BTreeSet<NetworkChannelId>,
     consumed_eof: BTreeSet<u64>,
+    poll: raw_poll::PollSnapshots,
 }
 impl NativeState {
     pub(in crate::network_replay) fn mode(&self) -> NetworkEngineMode {
@@ -485,6 +489,7 @@ impl NetworkReplayEngine {
                 NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected)
                     | NetworkInputKindV2::Connect(NetworkConnectionResultV2::Error(libc::EINPROGRESS))
                     | NetworkInputKindV2::ConnectEstablished
+                    | NetworkInputKindV2::RawTcpPollState { .. }
                     | NetworkInputKindV2::StreamBytes { .. }
                     | NetworkInputKindV2::PeerShutdown {
                         direction: NetworkShutdownV2::Write,
@@ -543,6 +548,7 @@ impl NetworkReplayEngine {
                 connected: BTreeSet::new(),
                 connect_in_progress_delivered: BTreeSet::new(),
                 consumed_eof: BTreeSet::new(),
+                poll: raw_poll::PollSnapshots::default(),
             }),
             fresh_send,
             poll_witnesses: Vec::new(),
@@ -1425,6 +1431,7 @@ impl NetworkReplayEngine {
                                 replay.connect_in_progress_delivered.contains(&input.channel),
                             NetworkInputKindV2::ConnectEstablished => replay.connected.contains(&input.channel)
                                 && replay.connect_in_progress_delivered.contains(&input.channel),
+                            NetworkInputKindV2::RawTcpPollState { .. } => replay.poll.completed(input.ordinal),
                             NetworkInputKindV2::StreamBytes { stream_offset, bytes } =>
                                 self.channels[&input.channel].inbound_consumed >= *stream_offset + bytes.len() as u64,
                             NetworkInputKindV2::PeerShutdown { direction: NetworkShutdownV2::Write, .. } =>
@@ -1475,6 +1482,16 @@ impl NetworkReplayEngine {
                 blocked.insert(input.channel);
                 continue;
             }
+            if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. } = input.event {
+                let consumed = self.channels[&input.channel].inbound_consumed;
+                if consumed_prefix > consumed {
+                    blocked.insert(input.channel);
+                    continue;
+                }
+                if consumed_prefix < consumed {
+                    return Err(invalid("V4 poll observation passed its consumed-byte cut"));
+                }
+            }
             selected.push(n);
         }
         let mut ready = BTreeSet::new();
@@ -1482,7 +1499,9 @@ impl NetworkReplayEngine {
         // set is independent of whether a released row was consumed this turn.
         for n in selected {
             let input = &native.trace.inputs[n];
-            if input.event == NetworkInputKindV2::ConnectEstablished {
+            if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, revents } = input.event {
+                replay.poll.apply(input.ordinal, input.channel, consumed_prefix, revents);
+            } else if input.event == NetworkInputKindV2::ConnectEstablished {
                 // Apply the separately observed state, not a second syscall
                 // result. Completion of its producer still requires delivery
                 // of the actual preceding EINPROGRESS outcome.
@@ -1515,7 +1534,9 @@ impl NetworkReplayEngine {
             .enumerate()
             .filter(|(n, input)| !replay.released[*n] && seen.insert(input.channel))
             .filter(|(_, input)| {
-                input
+                !matches!(input.event, NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. }
+                    if consumed_prefix > self.channels[&input.channel].inbound_consumed)
+                    && input
                     .release
                     .prerequisites
                     .iter()
@@ -1969,6 +1990,50 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
+    /// Frozen endpoint metadata is not itself release authority. In Replay
+    /// the exact Established node must be completed, including delivery of the
+    /// original Connect outcome, before either endpoint can reach the guest.
+    pub(in crate::network_replay) fn native_outbound_endpoint(
+        &self,
+        open_file: OpenFileId,
+        peer: bool,
+    ) -> Result<Option<NetworkAddressV2>, NetworkReplayError> {
+        let Some(channel) = self.channel_for(open_file) else {
+            return Ok(None);
+        };
+        let EngineState::Native(native) = &self.mode else {
+            return Err(NetworkReplayError::WrongMode);
+        };
+        let definition = native.trace.channels.iter().find(|d| d.id == channel).unwrap();
+        if definition.transport != NetworkTransportV2::Tcp
+            || definition.role != NetworkEndpointRoleV2::OutboundClient
+        {
+            return Ok(None);
+        }
+        native.check_retirement()?;
+        let established = native.trace.release_model.nodes().iter().find(|node| {
+            matches!(node.kind, NetworkReleaseNodeKindV4::Progress {
+                channel: actual,
+                milestone: NetworkProgressV4::Established {
+                    source: NetworkEstablishmentV4::ConnectedInput { .. },
+                },
+            } if actual == channel)
+        }).ok_or_else(|| invalid("outbound endpoint precedes original Connect establishment"))?;
+        if native.replay.is_some() && !self.native_completed()?.contains(&established.id) {
+            return Err(invalid("outbound endpoint precedes delivered Connect establishment"));
+        }
+        let (Some(remote), Some(local)) = (&definition.peer_address, &definition.local_address) else {
+            return Err(invalid("outbound endpoint lacks original same-pin observation"));
+        };
+        if !matches!((remote, local),
+            (NetworkAddressV2::Inet4 { .. }, NetworkAddressV2::Inet4 { port, .. })
+            | (NetworkAddressV2::Inet6 { .. }, NetworkAddressV2::Inet6 { port, .. }) if *port != 0)
+        {
+            return Err(invalid("outbound endpoint changed family or assigned port"));
+        }
+        Ok(Some(if peer { remote.clone() } else { local.clone() }))
+    }
+
     pub(crate) fn publish_native_connected(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1978,8 +2043,8 @@ impl NetworkReplayEngine {
         now: LogicalTime,
     ) -> Result<(), NetworkReplayError> {
         let (open_file, returned) = self.original_native_connected(owner, admission)?;
-        let peer = completed
-            .peer(owner, admission, returned)
+        let (peer, local) = completed
+            .endpoints(owner, admission, returned)
             .map_err(|e| invalid(&e.to_string()))?;
         let channel = self.bound_channel(open_file)?;
         let definition = self
@@ -1990,6 +2055,7 @@ impl NetworkReplayEngine {
         if definition.transport != NetworkTransportV2::Tcp
             || definition.role != NetworkEndpointRoleV2::OutboundClient
             || definition.peer_address.as_ref() != Some(&peer)
+            || definition.local_address.as_ref().is_some_and(|address| address != &local)
         {
             return Err(invalid("V4 Connect channel changed actual original peer"));
         }
@@ -2061,6 +2127,10 @@ impl NetworkReplayEngine {
         let EngineState::Native(native) = &mut self.mode else {
             unreachable!();
         };
+        // The actual same-pin endpoint observation is retained through close
+        // and authenticated with the original effect above. Never synthesize
+        // an ephemeral port from the Replay placeholder or requested target.
+        native.trace.channels.iter_mut().find(|d| d.id == channel).unwrap().local_address = Some(local);
         native.trace.inputs.push(input);
         if asynchronous {
             native.trace.inputs.push(NetworkInputEventV4 {

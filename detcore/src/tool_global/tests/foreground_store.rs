@@ -2,6 +2,9 @@
 //! mmap observation and the access-check backend below are controlled premises.
 //! The writer performs real process_vm_writev; safeptrace separately tests its
 //! production Stopped implementation and target-PKRU check. No BPF/E2E claim.
+mod scalar_recvfrom;
+mod raw_poll;
+
 use std::cell::Cell;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
@@ -3754,6 +3757,7 @@ struct ScalarForegroundGuest<'a> {
     replacement_thread: std::sync::OnceLock<crate::ThreadState<()>>,
     memory_events: Arc<Mutex<Vec<&'static str>>>,
     range_calls: Arc<Mutex<Vec<(i32, u64, usize)>>>,
+    recvfrom_range_calls: Arc<Mutex<Vec<(reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs)>>>,
     range_verdict: reverie::OriginalReadRangeVerdict,
     // Opt-in Record observation timer: one local Timespec slot, one real
     // nfds=0 ppoll. Every other stack, write or injection still panics.
@@ -3958,6 +3962,16 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
         ));
         Ok(self.range_verdict)
     }
+    fn inspect_original_recvfrom_range(
+        &self,
+        receive: reverie::syscalls::Recvfrom,
+    ) -> Result<reverie::OriginalReadRangeVerdict, reverie::Error> {
+        use reverie::syscalls::SyscallInfo;
+        // The same controlled backend-range premise, retaining the actual
+        // Recvfrom number and all six arguments independently of store length.
+        self.recvfrom_range_calls.lock().unwrap().push(receive.into_parts());
+        Ok(self.range_verdict)
+    }
     fn memory(&self) -> Self::Memory {
         ScalarForegroundMemory {
             tid: self.tid.as_raw(),
@@ -4062,6 +4076,7 @@ fn scalar_foreground_guest<'a>(
         replacement_thread: std::sync::OnceLock::new(),
         memory_events: Arc::new(Mutex::new(vec![])),
         range_calls: Arc::new(Mutex::new(vec![])),
+        recvfrom_range_calls: Arc::new(Mutex::new(vec![])),
         range_verdict: reverie::OriginalReadRangeVerdict::Allowed,
         record_timer: None,
         record_timer_eintr: false,

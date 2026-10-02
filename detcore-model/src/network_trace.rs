@@ -34,6 +34,8 @@ mod accepted;
 pub use accepted::*;
 mod native_receive;
 pub use native_receive::*;
+mod raw_poll;
+pub use raw_poll::*;
 
 use crate::fd::OpenFileId;
 use crate::time::LogicalTime;
@@ -764,6 +766,9 @@ pub enum NetworkInputKindV2 {
     /// V4-only completed handshake after an original Connect(EINPROGRESS).
     /// Appended so every existing input discriminant retains its encoding.
     ConnectEstablished,
+    /// V4-only complete poll(0) state at an observed consumed-byte cut.
+    /// Repeated inspection does not consume the state. Zero replaces old bits.
+    RawTcpPollState { consumed_prefix: u64, revents: i16 },
 }
 
 /// One globally ordered observation with schedule-independent release gates.
@@ -1448,6 +1453,7 @@ impl NetworkTraceV2 {
             last_release_output: u64,
             connect_seen: bool,
             connect_in_progress: bool,
+            last_poll_cut: Option<u64>,
         }
         let mut progress: BTreeMap<_, Progress> = channels
             .keys()
@@ -1552,7 +1558,8 @@ impl NetworkTraceV2 {
             }
             state.last_release_time = Some(input.release.not_before_global_time);
             state.last_release_output = input.release.after_transmitted_offset;
-            if state.input_terminal && !matches!(input.event, NetworkInputKindV2::Readiness(_)) {
+            if state.input_terminal && !matches!(input.event,
+                NetworkInputKindV2::Readiness(_) | NetworkInputKindV2::RawTcpPollState { .. }) {
                 return Err(NetworkTraceValidationError::EventAfterTerminal);
             }
             match &input.event {
@@ -1578,6 +1585,16 @@ impl NetworkTraceV2 {
                         return Err(NetworkTraceValidationError::InvalidChannelRelationship);
                     }
                     state.connect_in_progress = false;
+                }
+                NetworkInputKindV2::RawTcpPollState { consumed_prefix, revents } => {
+                    if !early_connect || channel.transport != NetworkTransportV2::Tcp
+                        || channel.role == NetworkEndpointRoleV2::Listener
+                        || !valid_tcp_poll_mask(*revents)
+                        || *consumed_prefix > state.input_offset
+                        || state.last_poll_cut.is_some_and(|cut| *consumed_prefix < cut) {
+                        return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                    }
+                    state.last_poll_cut = Some(*consumed_prefix);
                 }
                 NetworkInputKindV2::Accept {
                     accepted,

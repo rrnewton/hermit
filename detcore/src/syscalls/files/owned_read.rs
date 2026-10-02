@@ -33,6 +33,51 @@ fn read_protocol(detail: impl std::fmt::Display) -> Error {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// The scalar V4 receive shares Read's existing FD admission and Call
+    /// lifetime, but never changes the original syscall or its guest capacity.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464): genuine scalar Recvfrom entry.
+    pub(crate) async fn handle_owned_recvfrom<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvfrom,
+    ) -> Result<i64, Error> {
+        let result = async {
+            let call = crate::tool_global::ScalarReceive::from_syscall(call.into())?;
+            // recv(len=0) can wait/EAGAIN. It is not Read's zero-length path.
+            if call.capacity() == 0 {
+                return Err(read_protocol("V4 zero-capacity Recvfrom remains unsupported"));
+            }
+            let input = self.acquire_ordinary_read(guest, call.fd()).await?;
+            let mode = guest.local_global_state().and_then(|global| global.native_receive_mode());
+            let selected = async {
+                if !matches!(guest.config().network_trace.policy,
+                    NetworkPolicy::Record | NetworkPolicy::Replay)
+                    || input.metadata.socket.is_none()
+                    || input.descriptor.as_ref().is_none_or(|fd|
+                        fd.is_local_socket_pair() || fd.is_network_capability_probe())
+                {
+                    return Err(read_protocol("V4 Recvfrom changed its admitted external socket"));
+                }
+                let mode = mode.ok_or_else(|| read_protocol("V4 Recvfrom lost its native receive engine"))?;
+                if !self.owned_network_read_uses_shadow(guest, input.metadata.socket.unwrap()).await? {
+                    return Err(read_protocol("V4 Recvfrom requires its admitted stream state"));
+                }
+                Ok(mode)
+            }.await;
+            let mode = match selected {
+                Ok(mode) => mode,
+                Err(primary) => {
+                    self.release_read_input(guest, input.read).await?;
+                    return Err(primary);
+                }
+            };
+            self.network_scalar_receive_from_admission(guest, call, mode, input.read, input.metadata)
+                .await
+        }.await;
+        self.finish_original_invocation(guest, result).await
+    }
+
     async fn observe_read_input<G: Guest<Self>>(
         &self,
         guest: &mut G,

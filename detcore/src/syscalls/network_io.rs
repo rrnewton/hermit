@@ -8,6 +8,8 @@
 
 //! Single guest-memory adapter for engine-owned network syscalls.
 
+mod native_poll;
+
 use std::io::IoSlice;
 use std::time::Duration;
 
@@ -2177,96 +2179,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .local_global_state()
             .and_then(|global| global.native_receive_mode());
         if let Some(mode) = native_mode {
-            // Range precedence belongs to the authenticated, still-stopped
-            // original Read. It grants neither mapped access nor a Store.
-            let range =
-                crate::tool_global::CheckedReadRange::inspect(guest, call, &read, metadata);
-            let checked_range = match range {
-                Ok(range) => range,
-                Err(primary) => {
-                    let cleanup = self
-                        .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
-                        .await;
-                    return finish_shadow_operation(Err(primary), cleanup);
-                }
-            };
-            let Some(global) = guest.local_global_state() else {
-                let cleanup = self
-                    .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
-                    .await;
-                return finish_shadow_operation(
-                    Err(engine_error("V4 receive lost actual local global state")),
-                    cleanup,
-                );
-            };
-            // The existing reader transfers through the actual local issuer.
-            // On failure, its consuming disposition owns all subsequent cleanup;
-            // an error does not authorize blindly finishing the old read again.
-            let tid = guest.tid();
-            let state = guest.thread_state();
-            let destination = call.buf().map_or(0, |address| address.as_raw()) as u64;
-            let admitted = match mode {
-                crate::network_replay::NetworkEngineMode::Record => {
-                    global
-                        .begin_private_receive_call(tid, state, read, destination, call.len())
-                        .await
-                }
-                crate::network_replay::NetworkEngineMode::Replay => {
-                    global.begin_replay_receive_call(tid, state, read, destination, call.len())
-                }
-            };
-            let admitted = match admitted {
-                Ok(admitted) => admitted,
-                Err(failure) => {
-                    let failure = global.cleanup_receive_admission_failure(failure).await;
-                    let primary = engine_rpc_error(failure.primary().clone());
-                    let cleanup = match failure.cleanup_diagnostic() {
-                        Some(error) => Err(engine_rpc_error(error.clone())),
-                        None => Ok(()),
-                    };
-                    return finish_shadow_operation(Err(primary), cleanup);
-                }
-            };
-            if let Err(primary) = global.bind_saved_receive_policy(
-                &checked_range, tid, state, call, admitted,
-            ) {
-                return self.finish_host_stream_call(
-                    guest,
-                    NetworkHostSocketPin {
-                        call: admitted.id,
-                        native: admitted.physical_pin_required,
-                        nonblocking,
-                    },
-                    Err(engine_rpc_error(primary)),
-                ).await;
-            }
-            let invocation = match mode {
-                crate::network_replay::NetworkEngineMode::Record => match global
-                    .bind_private_receive_invocation(checked_range, tid, state, call, admitted)
-                {
-                    Ok(invocation) => Some(invocation),
-                    Err(failure) => {
-                        let failure = global.cleanup_receive_admission_failure(failure).await;
-                        let primary = engine_rpc_error(failure.primary().clone());
-                        let cleanup = match failure.cleanup_diagnostic() {
-                            Some(error) => Err(engine_rpc_error(error.clone())),
-                            None => Ok(()),
-                        };
-                        return finish_shadow_operation(Err(primary), cleanup);
-                    }
-                },
-                crate::network_replay::NetworkEngineMode::Replay => None,
-            };
-            return self
-                .foreground_v4_receive_from_call(
-                    guest,
-                    call,
-                    admitted,
-                    mode,
-                    nonblocking,
-                    invocation,
-                )
-                .await;
+            return self.network_scalar_receive_from_admission(
+                guest, call.into(), mode, read, metadata,
+            ).await;
         }
         if self.shadow_socket_state(guest, open_file).await?.is_some() {
             let pin = self
@@ -2334,6 +2249,109 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
         }
+    }
+
+    /// Both scalar syscalls retain their exact original backend tuple while
+    /// sharing the existing bounded V4 issuer, publication and cleanup owners.
+    pub(crate) async fn network_scalar_receive_from_admission<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: crate::tool_global::ScalarReceive,
+        mode: crate::network_replay::NetworkEngineMode,
+        read: crate::network_replay::NetworkFdReadAdmission,
+        metadata: crate::tool_local::NetworkFdReadMetadata,
+    ) -> Result<i64, Error> {
+        // Range precedence belongs to the authenticated, still-stopped
+        // original Read/Recvfrom. It grants neither mapped access nor a Store.
+        let range =
+            crate::tool_global::CheckedReadRange::inspect(guest, call, &read, metadata);
+        let checked_range = match range {
+            Ok(range) => range,
+            Err(primary) => {
+                let cleanup = self
+                    .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                    .await;
+                return finish_shadow_operation(Err(primary), cleanup);
+            }
+        };
+        let Some(global) = guest.local_global_state() else {
+            let cleanup = self
+                .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                .await;
+            return finish_shadow_operation(
+                Err(engine_error("V4 receive lost actual local global state")),
+                cleanup,
+            );
+        };
+        // The existing reader transfers through the actual local issuer.
+        // On failure, its consuming disposition owns all subsequent cleanup;
+        // an error does not authorize blindly finishing the old read again.
+        let tid = guest.tid();
+        let state = guest.thread_state();
+        let destination = call.destination();
+        let nonblocking = metadata.nonblocking.expect("checked scalar receive retains original flags");
+        let admitted = match mode {
+            crate::network_replay::NetworkEngineMode::Record => {
+                global
+                    .begin_private_receive_call(tid, state, read, destination, call.admission_maximum())
+                    .await
+            }
+            crate::network_replay::NetworkEngineMode::Replay => {
+                global.begin_replay_receive_call(tid, state, read, destination, call.admission_maximum())
+            }
+        };
+        let admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(failure) => {
+                let failure = global.cleanup_receive_admission_failure(failure).await;
+                let primary = engine_rpc_error(failure.primary().clone());
+                let cleanup = match failure.cleanup_diagnostic() {
+                    Some(error) => Err(engine_rpc_error(error.clone())),
+                    None => Ok(()),
+                };
+                return finish_shadow_operation(Err(primary), cleanup);
+            }
+        };
+        if let Err(primary) = global.bind_saved_receive_policy(
+            &checked_range, tid, state, call, admitted,
+        ) {
+            return self.finish_host_stream_call(
+                guest,
+                NetworkHostSocketPin {
+                    call: admitted.id,
+                    native: admitted.physical_pin_required,
+                    nonblocking,
+                },
+                Err(engine_rpc_error(primary)),
+            ).await;
+        }
+        let invocation = match mode {
+            crate::network_replay::NetworkEngineMode::Record => match global
+                .bind_private_receive_invocation(checked_range, tid, state, call, admitted)
+            {
+                Ok(invocation) => Some(invocation),
+                Err(failure) => {
+                    let failure = global.cleanup_receive_admission_failure(failure).await;
+                    let primary = engine_rpc_error(failure.primary().clone());
+                    let cleanup = match failure.cleanup_diagnostic() {
+                        Some(error) => Err(engine_rpc_error(error.clone())),
+                        None => Ok(()),
+                    };
+                    return finish_shadow_operation(Err(primary), cleanup);
+                }
+            },
+            crate::network_replay::NetworkEngineMode::Replay => None,
+        };
+        self
+            .foreground_v4_receive_from_call(
+                guest,
+                call,
+                admitted,
+                mode,
+                nonblocking,
+                invocation,
+            )
+            .await
     }
 
     async fn capture_scalar_network_read<G: Guest<Self>>(
@@ -2972,6 +2990,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Recvfrom,
         policy: NetworkPolicy,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464): retain genuine scalar Recvfrom authority.
+        if guest.local_global_state().and_then(|global| global.native_receive_mode()).is_some() {
+            return self.handle_owned_recvfrom(guest, call).await;
+        }
         let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
         if self.shadow_socket_state(guest, open_file).await?.is_some() {
             if call.addr().is_some() || call.addr_len().is_some() {
@@ -4937,6 +4960,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(open_file) = self.network_open_file(guest, fd) else {
             return Ok(None);
         };
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464):
+        // V4 outbound replies are same-pin Connect observations, released
+        // only after establishment. Errors must not fall through to a real
+        // getpeername/getsockname on an unconnected Replay placeholder.
         let endpoint =
             match network_request(guest, NetworkRequest::AcceptedEndpoint { open_file, peer })
                 .await
@@ -6881,6 +6909,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         state: NetworkPollState,
         policy: NetworkPolicy,
     ) -> Result<i64, Error> {
+        if guest.local_global_state().is_some_and(|global| global.native_poll_enabled()) {
+            return self.native_poll_single_scan(guest, state, policy).await;
+        }
         let address = state.poll_address()?;
         let fds = read_pollfds(guest, address, state.count)?;
         // Preserve the prior explicit OOB/band limitation; do not quietly map it
@@ -9812,7 +9843,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn foreground_v4_receive_from_call<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Read,
+        call: crate::tool_global::ScalarReceive,
         admitted: crate::network_replay::NetworkStreamCall,
         mode: crate::network_replay::NetworkEngineMode,
         nonblocking: bool,
@@ -9869,18 +9900,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) async fn foreground_v4_receive_after_probe<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Read,
+        call: impl Into<crate::tool_global::ScalarReceive> + Send,
         admitted: crate::network_replay::NetworkStreamCall,
         (mode, nonblocking): (crate::network_replay::NetworkEngineMode, bool),
         prepared_probe: Result<Option<NetworkStreamLeaseId>, Error>,
         mut invocation: Option<crate::tool_global::CheckedReadInvocation>,
     ) -> Result<i64, Error> {
+        let call = call.into();
         let pin = NetworkHostSocketPin {
             call: admitted.id,
             native: admitted.physical_pin_required,
             nonblocking,
         };
-        let destination = call.buf().map_or(0, |address| address.as_raw()) as u64;
+        let destination = call.destination();
         // A failed retry transfers the Call to its own ordinary release; the
         // common release below must not submit a second one.
         let mut retry_owns_release = false;
@@ -9920,10 +9952,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         crate::network_replay::NetworkEngineMode::Record =>
                             global.prepare_private_receive(tid, state, admitted.id,
                                 probe.expect("Record owns its actual private probe"),
-                                call.len(), destination).await.map_err(engine_rpc_error)?,
+                                call.selected_maximum(), destination).await.map_err(engine_rpc_error)?,
                         crate::network_replay::NetworkEngineMode::Replay =>
                             global.prepare_replay_receive(tid, state, admitted.id,
-                                call.len(), destination, nonblocking).await.map_err(engine_rpc_error)?,
+                                call.selected_maximum(), destination, nonblocking).await.map_err(engine_rpc_error)?,
                     };
                     match selection {
                     crate::network_replay::ReceiveSelection::Bytes(permit) => {

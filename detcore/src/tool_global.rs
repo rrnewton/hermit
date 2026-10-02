@@ -10,6 +10,7 @@
 //! the Detcore tool.
 
 mod foreground_epoll;
+mod foreground_poll;
 mod foreground_store;
 mod original_connect;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
@@ -18,6 +19,7 @@ pub(crate) use foreground_store::CheckedReadRange;
 #[cfg(test)]
 pub(crate) use foreground_store::ReceiveRetryFailure;
 pub(crate) use foreground_store::SavedReceivePolicy;
+pub(crate) use foreground_store::ScalarReceive;
 mod original_installation;
 mod parked;
 use std::cmp::Ordering;

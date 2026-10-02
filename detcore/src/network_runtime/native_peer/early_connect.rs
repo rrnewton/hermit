@@ -13,74 +13,26 @@ use detcore_model::network_trace::NetworkAddressV2;
 #[derive(Debug, Clone)]
 pub(super) struct Completion {
     peer: NetworkAddressV2,
+    local: NetworkAddressV2,
 }
 
 impl Completion {
-    pub(super) fn observe(fd: BorrowedFd<'_>) -> io::Result<Self> {
+    pub(super) fn observe(fd: BorrowedFd<'_>, asynchronous: bool) -> io::Result<Self> {
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         if flags < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of_val(&address) as libc::socklen_t;
-        if unsafe {
-            libc::getpeername(
-                fd.as_raw_fd(),
-                std::ptr::from_mut(&mut address).cast(),
-                &mut length,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
+        let peer = endpoint(fd, true)?;
+        let local = endpoint(fd, false)?;
+        // A successful blocking Connect already supplies establishment. The
+        // preserved EINPROGRESS case additionally needs the existing genuine
+        // nonblocking/ESTABLISHED observation; no pending handshake is waited.
+        if asynchronous {
+            check_established(fd, flags)?;
         }
-        let peer = match i32::from(address.ss_family) {
-            libc::AF_INET if length as usize == std::mem::size_of::<libc::sockaddr_in>() => {
-                let address = unsafe { &*std::ptr::from_ref(&address).cast::<libc::sockaddr_in>() };
-                NetworkAddressV2::Inet4 {
-                    address: address.sin_addr.s_addr.to_ne_bytes(),
-                    port: u16::from_be(address.sin_port),
-                }
-            }
-            libc::AF_INET6 if length as usize == std::mem::size_of::<libc::sockaddr_in6>() => {
-                let address =
-                    unsafe { &*std::ptr::from_ref(&address).cast::<libc::sockaddr_in6>() };
-                NetworkAddressV2::Inet6 {
-                    address: address.sin6_addr.s6_addr,
-                    port: u16::from_be(address.sin6_port),
-                    flowinfo: address.sin6_flowinfo,
-                    scope_id: address.sin6_scope_id,
-                }
-            }
-            _ => {
-                return Err(io::Error::other(
-                    "early Connect peer has unsupported family/length",
-                ));
-            }
-        };
-        // TCP_INFO's first byte is tcpi_state. Unlike SO_ERROR this query does
-        // not consume a pending error. Check after getpeername so CLOSE_WAIT,
-        // SYN_SENT and failed connections cannot be promoted by a peer alone.
-        let mut state = 0u8;
-        let mut state_length = 1;
-        if unsafe {
-            libc::getsockopt(
-                fd.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_INFO,
-                std::ptr::from_mut(&mut state).cast(),
-                &mut state_length,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if state_length != 1 {
-            return Err(io::Error::other(
-                "early Connect TCP_INFO state length changed",
-            ));
-        }
-        check_state(flags, state)?;
-        Ok(Self { peer })
+        let observed = Self { peer, local };
+        observed.confirm(&observed.peer)?;
+        Ok(observed)
     }
 
     pub(super) fn confirm(&self, copied_peer: &NetworkAddressV2) -> io::Result<()> {
@@ -89,8 +41,91 @@ impl Completion {
                 "early Connect peer differs from original copied target",
             ));
         }
+        let same_family_and_port = match (&self.peer, &self.local) {
+            (NetworkAddressV2::Inet4 { .. }, NetworkAddressV2::Inet4 { port, .. })
+            | (NetworkAddressV2::Inet6 { .. }, NetworkAddressV2::Inet6 { port, .. }) => *port != 0,
+            _ => false,
+        };
+        if !same_family_and_port {
+            return Err(io::Error::other(
+                "Connect local endpoint changed family or has no assigned port",
+            ));
+        }
         Ok(())
     }
+
+    pub(super) fn local(&self) -> &NetworkAddressV2 {
+        &self.local
+    }
+}
+
+fn endpoint(fd: BorrowedFd<'_>, peer: bool) -> io::Result<NetworkAddressV2> {
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&address) as libc::socklen_t;
+    let result = unsafe {
+        let query = if peer {
+            libc::getpeername
+        } else {
+            libc::getsockname
+        };
+        query(
+            fd.as_raw_fd(),
+            std::ptr::from_mut(&mut address).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(match i32::from(address.ss_family) {
+        libc::AF_INET if length as usize == std::mem::size_of::<libc::sockaddr_in>() => {
+            let address = unsafe { &*std::ptr::from_ref(&address).cast::<libc::sockaddr_in>() };
+            NetworkAddressV2::Inet4 {
+                address: address.sin_addr.s_addr.to_ne_bytes(),
+                port: u16::from_be(address.sin_port),
+            }
+        }
+        libc::AF_INET6 if length as usize == std::mem::size_of::<libc::sockaddr_in6>() => {
+            let address = unsafe { &*std::ptr::from_ref(&address).cast::<libc::sockaddr_in6>() };
+            NetworkAddressV2::Inet6 {
+                address: address.sin6_addr.s6_addr,
+                port: u16::from_be(address.sin6_port),
+                flowinfo: address.sin6_flowinfo,
+                scope_id: address.sin6_scope_id,
+            }
+        }
+        _ => {
+            return Err(io::Error::other(
+                "Connect endpoint has unsupported family/length",
+            ));
+        }
+    })
+}
+
+fn check_established(fd: BorrowedFd<'_>, flags: i32) -> io::Result<()> {
+    // TCP_INFO's first byte is tcpi_state. Unlike SO_ERROR this query does
+    // not consume a pending error. Check after getpeername so CLOSE_WAIT,
+    // SYN_SENT and failed connections cannot be promoted by a peer alone.
+    let mut state = 0u8;
+    let mut state_length = 1;
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            std::ptr::from_mut(&mut state).cast(),
+            &mut state_length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if state_length != 1 {
+        return Err(io::Error::other(
+            "early Connect TCP_INFO state length changed",
+        ));
+    }
+    check_state(flags, state)
 }
 
 fn check_state(flags: i32, tcp_state: u8) -> io::Result<()> {
@@ -129,7 +164,7 @@ mod tests {
                 &mut length,
             )
         };
-        let observed = Completion::observe(socket.as_fd());
+        let observed = Completion::observe(socket.as_fd(), true);
         drop(socket);
         assert_eq!(queried, 0);
         assert_eq!(error, 0);
@@ -147,7 +182,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let socket = std::net::TcpStream::connect(address).unwrap();
         socket.set_nonblocking(true).unwrap();
-        let observed = Completion::observe(socket.as_fd());
+        let observed = Completion::observe(socket.as_fd(), true);
         drop(socket);
         drop(listener);
         let observed = observed.unwrap();
@@ -161,6 +196,54 @@ mod tests {
                 .confirm(&NetworkAddressV2::Inet4 {
                     address: [127, 0, 0, 2],
                     port: address.port(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn connected_endpoints_keep_actual_local_port_and_reject_wrong_family() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let remote = listener.local_addr().unwrap();
+        let socket = std::net::TcpStream::connect(remote).unwrap();
+        let actual_local = socket.local_addr().unwrap();
+        let observed = Completion::observe(socket.as_fd(), false);
+        drop(socket);
+        drop(listener);
+        let observed = observed.unwrap();
+        let peer = NetworkAddressV2::Inet4 {
+            address: [127, 0, 0, 1],
+            port: remote.port(),
+        };
+        assert!(observed.confirm(&peer).is_ok());
+        assert_eq!(
+            observed.local(),
+            &NetworkAddressV2::Inet4 {
+                address: [127, 0, 0, 1],
+                port: actual_local.port(),
+            }
+        );
+        assert_ne!(actual_local.port(), 0);
+        let mut wrong = observed.clone();
+        wrong.local = NetworkAddressV2::Inet6 {
+            address: [0; 16],
+            port: actual_local.port(),
+            flowinfo: 0,
+            scope_id: 0,
+        };
+        assert!(wrong.confirm(&peer).is_err());
+        wrong.local = NetworkAddressV2::Inet4 {
+            address: [127, 0, 0, 1],
+            port: 0,
+        };
+        assert!(wrong.confirm(&peer).is_err());
+        assert!(
+            observed
+                .confirm(&NetworkAddressV2::Inet6 {
+                    address: [0; 16],
+                    port: remote.port(),
+                    flowinfo: 0,
+                    scope_id: 0,
                 })
                 .is_err()
         );

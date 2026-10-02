@@ -47,6 +47,8 @@ pub struct Observation {
     pub(crate) helper_copy: Option<super::helper_receive::Completion>,
 }
 
+mod raw_poll;
+
 #[derive(Debug, Clone)]
 struct Pending {
     effect: Effect,
@@ -650,7 +652,7 @@ impl Calls {
         raw: i64,
     ) -> io::Result<()> {
         let early_pin = if admission.arguments.kind == crate::network_replay::original_connect::Kind::Connect
-            && raw == -i64::from(libc::EINPROGRESS)
+            && (raw == 0 || raw == -i64::from(libc::EINPROGRESS))
         {
             self.owned(owner, admission.call)?.original.clone()
         } else {
@@ -805,12 +807,12 @@ impl Calls {
             ));
         }
         if admission.arguments.kind == crate::network_replay::original_connect::Kind::Connect
-            && raw == -i64::from(libc::EINPROGRESS)
+            && (raw == 0 || raw == -i64::from(libc::EINPROGRESS))
         {
             state.early_connect = Some(early_pin
                 .as_ref()
                 .ok_or_else(|| io::Error::other("early Connect lost original retained pin"))
-                .and_then(|pin| early_connect::Completion::observe(pin.as_fd()))
+                .and_then(|pin| early_connect::Completion::observe(pin.as_fd(), raw != 0))
                 .map_err(|error| error.to_string()));
         }
         state.completion = Some(effect);
@@ -1098,6 +1100,9 @@ impl Calls {
                 ));
             }
             None => {}
+        }
+        if matches!(effect, Effect::PollState) {
+            raw_poll::validate(observed)?;
         }
         Ok(())
     }
@@ -1706,15 +1711,7 @@ fn execute(fd: BorrowedFd<'_>, effect: &Effect) -> Observation {
             observation(raw as i64, Vec::new(), |_| ResultValue::Unit)
         }
         Effect::PollState => {
-            let mut pfd = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLOUT | libc::POLLRDHUP,
-                revents: 0,
-            };
-            let raw = unsafe { libc::poll(&raw mut pfd, 1, 0) };
-            observation(raw as i64, Vec::new(), |_| ResultValue::PollState {
-                revents: pfd.revents,
-            })
+            raw_poll::observe(fd)
         }
         Effect::QueuedBytes => {
             let mut count = 0i32;
@@ -2831,12 +2828,12 @@ pub(crate) struct CompletedNativeConnect<'a> {
     call: &'a Call,
 }
 impl CompletedNativeConnect<'_> {
-    pub(crate) fn peer(
+    pub(crate) fn endpoints(
         &self,
         owner: NetworkStreamOwner,
         admission: &OriginalAdmission,
         returned: i64,
-    ) -> io::Result<detcore_model::network_trace::NetworkAddressV2> {
+    ) -> io::Result<(detcore_model::network_trace::NetworkAddressV2, detcore_model::network_trace::NetworkAddressV2)> {
         use detcore_model::network_trace::NetworkAddressV2;
         let call = self.call;
         let original = call
@@ -2929,13 +2926,11 @@ impl CompletedNativeConnect<'_> {
                 "V4 Connect completion changed TCP family or captured peer",
             )),
         }?;
-        if returned == -i64::from(libc::EINPROGRESS) {
-            original.early_connect.as_ref()
-                .ok_or_else(|| io::Error::other("early Connect has no retained state observation"))?
-                .as_ref().map_err(|error| io::Error::other(error.clone()))?
-                .confirm(&peer)?;
-        }
-        Ok(peer)
+        let observed = original.early_connect.as_ref()
+            .ok_or_else(|| io::Error::other("Connect has no retained endpoint observation"))?
+            .as_ref().map_err(|error| io::Error::other(error.clone()))?;
+        observed.confirm(&peer)?;
+        Ok((peer, observed.local().clone()))
     }
 }
 

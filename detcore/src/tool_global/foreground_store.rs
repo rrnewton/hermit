@@ -1,5 +1,8 @@
 //! Local foreground copy issuer. This is deliberately absent from NetworkRequest:
 //! serialized correlation cannot authorize a write or reconstruct its outcome.
+mod scalar_receive;
+pub(crate) use scalar_receive::ScalarReceive;
+
 use super::*;
 use crate::network_replay::ForegroundStore;
 use crate::network_replay::FullStoreCompletion;
@@ -77,9 +80,8 @@ impl SavedReceivePolicy {
     }
 
     pub(crate) fn matches_span(&self, maximum: usize, destination: u64) -> bool {
-        self.raw.0 == reverie::syscalls::Sysno::read
-            && self.raw.1.arg1 as u64 == destination
-            && self.raw.1.arg2 == maximum
+        ScalarReceive::from_syscall(reverie::syscalls::Syscall::from_raw(self.raw.0, self.raw.1))
+            .is_ok_and(|call| call.matches_selection(maximum, destination))
     }
 }
 /// Borrowed from this live callback and its currently held scheduler grant.
@@ -143,12 +145,12 @@ impl ReceiveRetryFailure {
 impl CheckedReadRange {
     pub(crate) fn inspect<T: crate::RecordOrReplay, G: reverie::Guest<crate::Detcore<T>>>(
         guest: &G,
-        call: reverie::syscalls::Read,
+        call: impl Into<ScalarReceive>,
         read: &crate::network_replay::NetworkFdReadAdmission,
         metadata: crate::tool_local::NetworkFdReadMetadata,
     ) -> Result<Self, reverie::Error> {
-        use reverie::syscalls::SyscallInfo;
-        match guest.inspect_original_read_range(call)? {
+        let call = call.into();
+        match call.inspect_original_range::<crate::Detcore<T>, G>(guest)? {
             reverie::OriginalReadRangeVerdict::Fault => return Err(Errno::EFAULT.into()),
             reverie::OriginalReadRangeVerdict::Allowed => {}
         }
@@ -206,9 +208,9 @@ impl CheckedReadRange {
         global: &GlobalState,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,
-        read: reverie::syscalls::Read,
+        read: impl Into<ScalarReceive>,
     ) -> Result<(), NetworkRpcError> {
-        use reverie::syscalls::SyscallInfo;
+        let read = read.into();
         let owner = self.root.owner();
         if !global.cfg.sequentialize_threads
             || tid != self.tid
@@ -334,7 +336,7 @@ impl GlobalState {
         range: &CheckedReadRange,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,
-        read: reverie::syscalls::Read,
+        read: impl Into<ScalarReceive>,
         call: crate::network_replay::NetworkStreamCall,
     ) -> Result<(), NetworkRpcError> {
         let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
@@ -398,11 +400,11 @@ impl GlobalState {
         &self,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,
-        read: reverie::syscalls::Read,
+        read: impl Into<ScalarReceive>,
         call: crate::network_replay::NetworkStreamCall,
         nonblocking: bool,
     ) -> Result<Option<Arc<SavedReceivePolicy>>, NetworkRpcError> {
-        use reverie::syscalls::SyscallInfo;
+        let read = read.into();
         let owner = NetworkStreamOwner {
             thread: state.dettid,
             mm: state.mm_id,
@@ -464,7 +466,7 @@ impl GlobalState {
         &self,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,
-        read: reverie::syscalls::Read,
+        read: impl Into<ScalarReceive>,
         invocation: &'a CheckedReadInvocation,
         grant: &'a crate::scheduler::ordinary_fd::OrdinaryFdObservation<'s>,
     ) -> Result<CheckedBlockingReadRetry<'a, 's>, NetworkRpcError> {
@@ -489,7 +491,7 @@ impl GlobalState {
         range: CheckedReadRange,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,
-        read: reverie::syscalls::Read,
+        read: impl Into<ScalarReceive>,
         call: crate::network_replay::NetworkStreamCall,
     ) -> Result<CheckedReadInvocation, Box<ReceiveAdmissionFailure>> {
         let owner = range.root.owner();
@@ -547,10 +549,11 @@ impl GlobalState {
         &self,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,
-        read: reverie::syscalls::Read,
+        read: impl Into<ScalarReceive> + Send,
         invocation: &mut CheckedReadInvocation,
         completed: crate::network_replay::CompletedNoStore,
     ) -> Result<(), Box<ReceiveRetryFailure>> {
+        let read = read.into();
         let owner = invocation.range.root.owner();
         let call = invocation.call.id;
         let mut retry = None;
@@ -759,10 +762,10 @@ pub(crate) struct ForegroundStorePermit<'a> {
 #[derive(Debug)]
 pub(crate) struct ReceiveAdmissionFailure {
     primary: NetworkRpcError,
-    cleanup: Option<NetworkRpcError>,
+    pub(super) cleanup: Option<NetworkRpcError>,
     owner: NetworkStreamOwner,
     engine: std::sync::Weak<Mutex<NetworkReplayEngine>>,
-    custody: ReceiveAdmissionCustody,
+    pub(super) custody: ReceiveAdmissionCustody,
 }
 #[derive(Debug)]
 pub(crate) enum ReceiveAdmissionCustody {
@@ -773,11 +776,11 @@ pub(crate) enum ReceiveAdmissionCustody {
 }
 #[derive(Debug)]
 pub(crate) struct RetainedReceiveAdmission {
-    call: crate::network_replay::NetworkStreamCallId,
-    stage: ReceiveAdmissionStage,
+    pub(super) call: crate::network_replay::NetworkStreamCallId,
+    pub(super) stage: ReceiveAdmissionStage,
 }
 #[derive(Debug)]
-enum ReceiveAdmissionStage {
+pub(super) enum ReceiveAdmissionStage {
     Unsubmitted(crate::network_runtime::JoinedNativePrefix),
     Capture,
     Replay(NetworkStreamLeaseId),
@@ -906,7 +909,7 @@ impl GlobalState {
 
     /// Called only after engine/runtime guards are dropped and an actual local
     /// release is known. Match the ordinary RPC's retired-port and waiter work.
-    fn finish_local_receive_release(&self) {
+    pub(super) fn finish_local_receive_release(&self) {
         let retired = self
             .network_engine
             .as_ref()
@@ -918,7 +921,7 @@ impl GlobalState {
         self.network_stream_changed.notify_waiters();
     }
 
-    fn receive_admission_failure(
+    pub(super) fn receive_admission_failure(
         &self,
         owner: NetworkStreamOwner,
         primary: NetworkRpcError,
