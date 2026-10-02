@@ -1610,6 +1610,26 @@ mod tests {
         assert!(prove_compression(&before, &b).is_err());
     }
 
+    fn normalized_bpf_debug_path_pool(pool: &[u8]) -> Result<()> {
+        ensure!(
+            pool.len() <= MAX_INPUT && pool.ends_with(b"\0"),
+            "BPF debug path pool is oversized or unterminated"
+        );
+        let (mut cwd, mut build, mut header) = (false, false, false);
+        for entry in pool[..pool.len() - 1].split(|byte| *byte == 0) {
+            ensure!(!entry.starts_with(b"/"), "BPF debug path is absolute");
+            ensure!(
+                !entry.split(|byte| *byte == b'/').any(|part| part == b".."),
+                "BPF debug path escapes its logical root"
+            );
+            cwd |= entry == b".";
+            build |= entry == b"./build";
+            header |= entry == b"vmlinux.h";
+        }
+        ensure!(cwd && build && header, "BPF debug path identity is incomplete");
+        Ok(())
+    }
+
     #[test]
     fn actual_compression_and_corruption_controls() {
         // These inputs are explicitly provided by the offline package test
@@ -1621,6 +1641,29 @@ mod tests {
         let before = read_regular(Path::new(&before), MAX_INPUT).unwrap();
         let after = read_regular(Path::new(&after), MAX_INPUT).unwrap();
         assert!(prove_compression(&before, &after).is_ok());
+        assert!(after.len() <= MAX_ARTIFACT);
+        // Inspect actual compiler output, not merely flag spelling. The full
+        // compression proof above carries these unchanged logical bytes into
+        // the packaged artifact. This is not a full DWARF-reference validator.
+        let raw = Elf::parse(&before).unwrap();
+        let paths = &raw.sections[*raw.named.get(".debug_line_str").unwrap()];
+        assert_eq!(paths.kind, 1);
+        assert_eq!(paths.flags & (2 | 4 | 0x800), 0);
+        let paths = normalized_bpf_debug_path_pool(&paths.data);
+        assert!(paths.is_ok(), "actual BPF debug paths: {paths:?}");
+        assert!(normalized_bpf_debug_path_pool(b".\0./build\0vmlinux.h\0").is_ok());
+        for invalid in [
+            b"".as_slice(),
+            b".\0./build\0vmlinux.h",
+            b"./build\0vmlinux.h\0",
+            b".\0vmlinux.h\0",
+            b".\0./build\0",
+            b".\0./build\0vmlinux.h\0/tmp/package\0",
+            b".\0./build\0vmlinux.h\0../build\0",
+            b".\0./build\0vmlinux.h\0build/../header\0",
+        ] {
+            assert!(normalized_bpf_debug_path_pool(invalid).is_err());
+        }
         let elf = Elf::parse(&after).unwrap();
         let header_at = u64_at(&after, 40).unwrap() as usize;
         let btf_index = elf.named[".BTF"];

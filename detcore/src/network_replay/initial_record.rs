@@ -9,13 +9,24 @@ use reverie::syscalls::Sysno;
 
 pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
     match call {
+        Syscall::Socketpair(pair) => pair.family() == libc::AF_UNIX
+            && pair.r#type() & !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) == libc::SOCK_STREAM
+            && pair.protocol() == 0,
         // A positive Socket must join the exact original installation and held
-        // profile. Non-TCP allocation is not activated through this route.
+        // profile. The one non-TCP creator below is allocation-only: its
+        // published OFD rejects communication before native submission.
         Syscall::Socket(socket) => {
-            matches!(socket.family(), libc::AF_INET | libc::AF_INET6)
+            (matches!(socket.family(), libc::AF_INET | libc::AF_INET6)
                 && socket.r#type() & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
                     == libc::SOCK_STREAM
-                && matches!(socket.protocol(), 0 | libc::IPPROTO_TCP)
+                && matches!(socket.protocol(), 0 | libc::IPPROTO_TCP))
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-3464): Keep the actual original Socket
+                // installation/Close, with no UDP communication permission.
+                // https://github.com/rrnewton/hermit/pull/3464
+                || super::original_installation::is_udp6_capability_probe(
+                    socket.family(), socket.r#type(), socket.protocol(),
+                )
         }
         Syscall::Fcntl(fcntl) => matches!(
             fcntl.cmd(),
@@ -112,6 +123,46 @@ mod tests {
             number,
             reverie::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
         )
+    }
+    #[test]
+    fn initial_record_admits_only_local_stream_socketpair_shape() {
+        let pair = |domain, kind, protocol| Syscall::from(
+            reverie::syscalls::Socketpair::new().with_family(domain)
+                .with_type(kind).with_protocol(protocol));
+        for flags in [0, libc::SOCK_NONBLOCK, libc::SOCK_CLOEXEC,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC] {
+            assert!(initial_record_call_supported(pair(libc::AF_UNIX,
+                libc::SOCK_STREAM | flags, 0)));
+        }
+        for (domain, kind, protocol) in [
+            (libc::AF_INET, libc::SOCK_STREAM, 0),
+            (libc::AF_INET6, libc::SOCK_STREAM, 0),
+            (libc::AF_UNIX, libc::SOCK_DGRAM, 0),
+            (libc::AF_UNIX, libc::SOCK_SEQPACKET, 0),
+            (libc::AF_UNIX, libc::SOCK_STREAM, libc::IPPROTO_TCP),
+            (libc::AF_UNIX, libc::SOCK_STREAM | 0x4000_0000, 0),
+        ] {
+            assert!(!initial_record_call_supported(pair(domain, kind, protocol)));
+        }
+        assert!(!initial_record_call_supported(raw(Sysno::socketpair)));
+    }
+
+    #[test]
+    fn initial_record_admits_only_exact_udp6_capability_probe() {
+        let socket = |domain, kind, protocol| Syscall::from(
+            reverie::syscalls::Socket::new().with_family(domain).with_type(kind).with_protocol(protocol)
+        );
+        assert!(initial_record_call_supported(socket(libc::AF_INET6, libc::SOCK_DGRAM, 0)));
+        for (domain, kind, protocol) in [
+            (libc::AF_INET, libc::SOCK_DGRAM, 0),
+            (libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+            (libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0),
+            (libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0),
+            (libc::AF_UNIX, libc::SOCK_STREAM, 0),
+            (libc::AF_INET6, libc::SOCK_RAW, 0),
+        ] {
+            assert!(!initial_record_call_supported(socket(domain, kind, protocol)));
+        }
     }
     #[test]
     fn initial_record_refuses_all_unjoined_descriptor_creators_and_table_changes() {

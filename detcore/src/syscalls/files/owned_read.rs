@@ -220,7 +220,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     | FdType::Userfaultfd
                     | FdType::Epoll => ReadWait::Current,
                     _ => {
-                        let internal = fd.ty() == FdType::Pipe;
+                        let internal = fd.ty() == FdType::Pipe || fd.is_local_socket_pair();
                         let action = ioaction_for_description(call.fd(), fd);
                         if !self.cfg.sequentialize_threads
                             || (self.cfg.recordreplay_modes && !internal)

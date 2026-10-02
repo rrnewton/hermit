@@ -1224,6 +1224,8 @@ impl NetworkReplayEngine {
         match (kind, &state.original) {
             (EntryKind::Connect { operation }, Some(original))
                 if original.native_entry_unsubmitted(operation) => {}
+            (EntryKind::Foreground { .. }, Some(original))
+                if original.native_send_entry_unsubmitted() => {}
             (EntryKind::Foreground { .. }, None)
                 if state.phase == StreamCallPhase::PinAcquireSubmitted
                     && state.physical_pin_required => {}
@@ -1335,14 +1337,17 @@ impl NetworkReplayEngine {
     /// Recheck an existing foreground Call under the current scheduler borrow,
     /// including after a worker join. Retained entry provenance alone does not
     /// establish that the original Normal grant is still open.
-    #[cfg(test)]
     pub(crate) fn validate_native_foreground_call(
         &self,
         call: NetworkStreamCallId,
         grant: &crate::scheduler::ordinary_fd::OrdinaryFdObservation<'_>,
         now: LogicalTime,
     ) -> Result<(), NetworkReplayError> {
-        let state = self.owned_stream_call(grant.owner(), call)?;
+        self.check_stream_owner(grant.owner())?;
+        let state = self.stream_calls.get(&call).ok_or(NetworkReplayError::UnknownStreamCall(call))?;
+        if state.owner != grant.owner() || state.abandoned || state.open_file.is_none()
+            || state.original.as_ref().is_some_and(|original| !original.is_native_send())
+        { return Err(invalid("foreground validation changed Call kind or owner")); }
         let entry = state
             .native_entry
             .as_ref()
@@ -1819,7 +1824,20 @@ impl NetworkReplayEngine {
     }
 }
 
-#[cfg(test)]
+fn original_send_output(offset: u64, ordinal: u64, returned: i64, bytes: &[u8])
+    -> Result<(NetworkOutputKindV2, NetworkProgressV4), NetworkReplayError>
+{
+    if (1..=512).contains(&returned) && bytes.len() == returned as usize {
+        Ok((NetworkOutputKindV2::StreamBytes { stream_offset: offset, bytes: bytes.to_vec() },
+            NetworkProgressV4::StreamPrefix { exclusive_offset: offset.checked_add(returned as u64).ok_or(NetworkReplayError::Overflow)? }))
+    } else if (-4095..=-1).contains(&returned) && bytes.is_empty() {
+        Ok((NetworkOutputKindV2::SocketError { stream_offset: offset, errno: (-returned) as i32 },
+            NetworkProgressV4::OutputError { output_ordinal: ordinal }))
+    } else {
+        Err(invalid("Sendto output lacks exact nonzero prefix or negative errno"))
+    }
+}
+
 fn native_stream_output_offset(
     trace: &NetworkTraceV4,
     channel: NetworkChannelId,
@@ -1855,6 +1873,82 @@ fn native_stream_output_offset(
 }
 
 impl NetworkReplayEngine {
+    /// Shape validation precedes the real original invocation. Physical file
+    /// flags/type are independently checked by its retained capture worker.
+    pub(crate) fn validate_native_sendto(&self, arguments: &original_connect::Arguments)
+        -> Result<NetworkChannelId, NetworkReplayError>
+    {
+        if arguments.kind != original_connect::Kind::Sendto
+            || !arguments.kind.valid_operands(arguments.address, arguments.length, arguments.original_count)
+        { return Err(invalid("unsupported original Sendto shape")); }
+        let file = arguments.binding.ok_or_else(|| invalid("Sendto lacks admitted OFD"))?.open_file;
+        let channel = self.bound_channel(file)?;
+        let definition = self.channel_definitions().iter().find(|d| d.id == channel)
+            .ok_or(NetworkReplayError::UnknownChannel(channel))?;
+        let EngineState::Native(native) = &self.mode else { return Err(NetworkReplayError::WrongMode); };
+        if native.mode() != NetworkEngineMode::Record
+            || definition.transport != NetworkTransportV2::Tcp
+            || definition.role != NetworkEndpointRoleV2::OutboundClient
+            || !native.trace.release_model.nodes().iter().any(|node| matches!(node.kind,
+                NetworkReleaseNodeKindV4::Progress { channel: c, milestone: NetworkProgressV4::Established { .. } } if c == channel))
+        { return Err(invalid("Sendto requires its established Record TCP channel")); }
+        native_stream_output_offset(&native.trace, channel)?;
+        Ok(channel)
+    }
+
+    pub(crate) fn publish_native_sent(
+        &mut self,
+        admission: &original_connect::Admission,
+        grant: &crate::scheduler::ordinary_fd::OrdinaryFdObservation<'_>,
+        completed: &crate::network_runtime::native_peer::CompletedNativeSend<'_>,
+        now: LogicalTime,
+    ) -> Result<(), NetworkReplayError> {
+        let owner = grant.owner();
+        let channel = self.validate_native_sendto(&admission.arguments)?;
+        self.validate_native_foreground_call(admission.call, grant, now)?;
+        let returned = self.original_native_sent(owner, admission)?;
+        let capture = completed.capture(owner, admission).map_err(|e| invalid(&e.to_string()))?;
+        if capture.returned() != returned { return Err(invalid("Sendto provider/backend returns differ")); }
+        let state = self.stream_calls.get(&admission.call).ok_or(NetworkReplayError::UnknownStreamCall(admission.call))?;
+        let entry = state.native_entry.as_ref().ok_or_else(|| invalid("Sendto has no entry"))?;
+        let EngineState::Native(native) = &self.mode else { return Err(NetworkReplayError::WrongMode); };
+        let stream_offset = native_stream_output_offset(&native.trace, channel)?;
+        let output_ordinal = u64::try_from(native.trace.outputs.len()).map_err(|_| NetworkReplayError::Overflow)?;
+        let (event, milestone) = original_send_output(stream_offset, output_ordinal, returned, capture.bytes())?;
+        let output = NetworkOutputEventV2 { channel, event };
+        let node = NetworkReleaseNodeV4 {
+            id: NetworkReleaseNodeIdV4(u64::try_from(native.trace.release_model.nodes().len()).map_err(|_| NetworkReplayError::Overflow)?),
+            kind: NetworkReleaseNodeKindV4::Progress { channel, milestone },
+            prerequisites: entry.release.prerequisites.clone(),
+        };
+        let mut candidate = native.trace.clone();
+        candidate.outputs.push(output.clone());
+        let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut candidate.release_model;
+        nodes.push(node.clone());
+        let shadow = self.shadow.as_ref().ok_or(NetworkReplayError::WrongMode)?;
+        candidate.fresh_stream_profiles = shadow.profiles.values().cloned().collect();
+        candidate.channel_socket_classes = shadow.channel_classes.iter().map(|(channel, key)| ChannelSocketClassV3 { channel: *channel, key: *key }).collect();
+        candidate.receive_environment = shadow.environment;
+        candidate.fresh_send_timeouts = native.fresh_send.iter().map(|(key, timeout)| FreshSendTimeoutV1 { key: *key, timeout: *timeout }).collect();
+        candidate.validate().map_err(|e| invalid(&e.to_string()))?;
+        let EngineState::Native(native) = &mut self.mode else { unreachable!() };
+        native.trace.outputs.push(output);
+        let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut native.trace.release_model;
+        nodes.push(node);
+        self.consume_native_entry(admission.call);
+        Ok(())
+    }
+
+    pub(in crate::network_replay) fn require_native_send_published(&self, owner: NetworkStreamOwner, call: NetworkStreamCallId)
+        -> Result<(), NetworkReplayError>
+    {
+        let state = self.stream_calls.get(&call).ok_or(NetworkReplayError::UnknownStreamCall(call))?;
+        if state.owner != owner || state.native_entry.as_ref().is_none_or(|entry| !entry.used) {
+            return Err(invalid("Sendto semantic retirement preceded trace publication"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn publish_native_connected(
         &mut self,
         owner: NetworkStreamOwner,

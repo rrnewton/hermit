@@ -89,6 +89,7 @@ enum ap_slot_state { AP_SLOT_FREE, AP_SLOT_RESERVED, AP_SLOT_ACTIVE, AP_SLOT_DIS
 
 struct ap_pending_command {
     struct ap_stream_copy_owned stream_copy;
+    struct ap_stream_tx_owned stream_tx;
     enum ap_slot_state state;
     struct ap_task_command submitted;
     struct ap_command_result receipt;
@@ -251,19 +252,24 @@ static int fd_accept_observer_ready_mode(struct ap_session *s,bool task_scoped_r
     }
     for(unsigned which=0;which<2;which++) {
         struct bpf_prog_info program={0};struct bpf_link_info link={0};
-        u64 address=0,cookie=0,expected_address=grouped_session_address(AP_SHARED_FDGET_COOKIE,s->group_anchor);
-        const u64 expected_cookie=AP_SHARED_FDGET_COOKIE;
-        link.kprobe_multi.addrs=(u64)(uintptr_t)&address;link.kprobe_multi.count=1;
-        link.kprobe_multi.cookies=(u64)(uintptr_t)&cookie;
+        u64 addresses[4]={0},cookies[4]={0};
+        const u64 expected_addresses[4]={grouped_session_address(AP_SHARED_FDGET_COOKIE,s->group_anchor),
+            grouped_session_address(AP_STREAM_TX_COOKIE,s->group_anchor),
+            grouped_session_address(AP_STREAM_TX_LOCK_COOKIE,s->group_anchor),
+            grouped_session_address(AP_STREAM_TX_UNLOCK_COOKIE,s->group_anchor)};
+        const u64 expected_cookies[4]={AP_SHARED_FDGET_COOKIE,AP_STREAM_TX_COOKIE,
+            AP_STREAM_TX_LOCK_COOKIE,AP_STREAM_TX_UNLOCK_COOKIE};
+        link.kprobe_multi.addrs=(u64)(uintptr_t)addresses;link.kprobe_multi.count=4;
+        link.kprobe_multi.cookies=(u64)(uintptr_t)cookies;
         unsigned ps=sizeof(program),ls=sizeof(link);
         if(bpf_obj_get_info_by_fd(s->fdget_shared_program[which],&program,&ps) ||
            bpf_obj_get_info_by_fd(s->fdget_shared_link[which],&link,&ls))return -1;
         int matches=task_scoped_receipt?
             ap_ftrace_task_scoped_kprobe_multi_link_matches(&program,ps,&link,ls,
-                &address,&cookie,&expected_address,&expected_cookie,1,
+                addresses,cookies,expected_addresses,expected_cookies,4,
                 which?BPF_F_KPROBE_MULTI_RETURN:0):
             ap_ftrace_kprobe_multi_link_matches(&program,ps,&link,ls,
-                &address,&cookie,&expected_address,&expected_cookie,1,
+                addresses,cookies,expected_addresses,expected_cookies,4,
                 which?BPF_F_KPROBE_MULTI_RETURN:0);
         if(!matches)return unavailable();
     }
@@ -605,8 +611,10 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
             static const unsigned long long inner_cookies[]={AP_CONNECT_SECURITY_COOKIE,
                 AP_CONNECT_AUDIT_COOKIE,AP_FDUPFD_ALLOC_COOKIE,AP_FILE_FDGET_COOKIE,
                 AP_READ_FDGET_COOKIE};
-            static const char *shared_symbols[]={AP_FDGET_SYMBOL};
-            static const unsigned long long shared_cookies[]={AP_SHARED_FDGET_COOKIE};
+            static const char *shared_symbols[]={AP_FDGET_SYMBOL,AP_STREAM_TX_SYMBOL,
+                AP_STREAM_TX_LOCK_SYMBOL,AP_STREAM_TX_UNLOCK_SYMBOL};
+            static const unsigned long long shared_cookies[]={AP_SHARED_FDGET_COOKIE,AP_STREAM_TX_COOKIE,
+                AP_STREAM_TX_LOCK_COOKIE,AP_STREAM_TX_UNLOCK_COOKIE};
             const unsigned long long retirement_cookie=retirement==0?AP_FILE_RETIRE_COOKIE:AP_EXEC_CLOSE_COOKIE;
 #endif
             struct ap_kprobe_multi_opts options={.sz=sizeof(options),.syms=symbols,
@@ -623,7 +631,7 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
                 options.cookies=fdget_group?inner_cookies:outer_cookies;
                 options.cnt=fdget_group?5:4;
             } else if(fdget_shared>=0) {
-                options.syms=shared_symbols;options.cookies=shared_cookies;options.cnt=1;
+                options.syms=shared_symbols;options.cookies=shared_cookies;options.cnt=4;
                 options.retprobe=fdget_shared==1;options.session=false;
             }
 #endif
@@ -1138,6 +1146,7 @@ int ap_close_grouped_startup_terminal(struct ap_session **owned,struct ap_groupe
 }
 #endif
 
+#include "stream-tx-driver.h"
 #include "stream-copy-driver.h"
 #include "fd-effects-driver.h"
 #include "epoll-ctl-copy-driver.h"

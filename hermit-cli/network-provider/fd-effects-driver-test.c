@@ -16,6 +16,7 @@ enum ap_slot_state { AP_SLOT_FREE, AP_SLOT_RESERVED, AP_SLOT_ACTIVE,
     AP_SLOT_DISARMING, AP_SLOT_COLLECTED, AP_SLOT_QUARANTINED };
 struct ap_pending_command {
     struct ap_stream_copy_owned stream_copy;
+    struct ap_stream_tx_owned stream_tx;
     enum ap_slot_state state;
     struct ap_task_command submitted;
     struct ap_command_result receipt;

@@ -635,6 +635,34 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    /// Check one real local-only zero-time poll while the existing reader
+    /// protects its exact slot. No new source, effect, or scheduling grant is
+    /// issued; callers recheck after the native probe before using its bits.
+    pub(crate) fn validate_local_pair_poll<T>(
+        &self,
+        state: &crate::tool_local::ThreadState<T>,
+        read: &crate::network_replay::NetworkFdReadAdmission,
+    ) -> Result<(), reverie::Error> {
+        let refuse = |message: &str| reverie::Error::Tool(anyhow::anyhow!(message.to_owned()));
+        let owner = NetworkStreamOwner { thread: state.dettid, mm: state.mm_id };
+        let sched = self.sched.lock().unwrap();
+        let root = self.network_runtime.as_ref()
+            .ok_or_else(|| refuse("local pair poll lacks original runtime"))?
+            .foreground_root(owner).map_err(|e| refuse(&e.to_string()))?;
+        sched.foreground_native_observation(owner, &root).map_err(|e| refuse(&e.to_string()))?;
+        if !root.matches_metadata(&state.file_metadata) || root.files() != read.publication.permit.files {
+            return Err(refuse("local pair poll changed original table"));
+        }
+        let mut local = state.file_metadata.lock().unwrap();
+        if !local.observe_read_descriptor(read)?.is_some_and(|fd| fd.is_local_socket_pair()) {
+            return Err(refuse("local pair poll changed exact local endpoint"));
+        }
+        let engine = self.network_engine.as_ref().ok_or_else(|| refuse("local pair poll lost engine"))?.lock().unwrap();
+        engine.validate_fd_metadata(owner, root.files(), &state.file_metadata, &local)
+            .map_err(|e| refuse(&e.to_string()))?;
+        engine.validate_fd_read_grant(owner, read).map_err(|e| refuse(&e.to_string()))
+    }
+
     /// Inspect the version and mode of this actual shared engine. Config policy
     /// alone cannot select a native receive path or create another engine.
     pub(crate) fn native_receive_mode(&self) -> Option<crate::network_replay::NetworkEngineMode> {
@@ -5517,7 +5545,8 @@ impl GlobalState {
                     NetworkRequest::FdMutation(
                         crate::network_replay::NetworkFdMutationRequest::Begin {
                             files,
-                            kind: crate::network_replay::NetworkFdMutationKind::PipePair { .. },
+                            kind: crate::network_replay::NetworkFdMutationKind::PipePair { .. }
+                                | crate::network_replay::NetworkFdMutationKind::SocketPair { .. },
                         },
                     ) => Some(*files),
                     NetworkRequest::FdMutation(
@@ -5620,13 +5649,13 @@ impl GlobalState {
                         .validate_fresh_pipe_fds(*fds),
                     NetworkRequest::FdMutation(
                         crate::network_replay::NetworkFdMutationRequest::PipeInstallation {
+                            permit,
                             changes,
                             ..
                         },
-                    ) => metadata_guard
-                        .as_deref()
-                        .expect("pipe metadata")
-                        .validate_pipe_installations(changes),
+                    ) => engine.validate_fd_pair_metadata(owner, *permit,
+                        metadata_guard.as_deref().expect("pair metadata"), changes)
+                        .map_err(|e| reverie::Error::Tool(anyhow::anyhow!(e.to_string()))),
                     _ => Ok(()),
                 };
                 if let Err(error) = pipe_metadata {

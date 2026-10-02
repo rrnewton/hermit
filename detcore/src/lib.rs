@@ -2227,6 +2227,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Result<i64, Error> {
         self.pre_handler_hook(guest, false).await;
 
+        // An admitted allocation-only socket must not reach any ordinary or
+        // network communication fallback, including scalar Read and Bind.
+        self.check_network_capability_probe_use(guest, call)?;
+
         // The authenticated initial census activates only this intercepted
         // original-operation set. No unjoined FD creator/alias/table mutation
         // may enter Linux and later be guessed from the resulting numeric FD.

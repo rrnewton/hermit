@@ -68,7 +68,7 @@ static inline u64 ap_stream_copy_linear_take(u64 source,u64 requested,u64 linear
  * impossible overlap, and 1 with a range bounded by BOTH frag->len and the
  * remaining request.  The BPF producer and host controls share this exact
  * arithmetic so a request can never extend into adjacent page-backed data. */
-static inline int ap_stream_copy_fragment_window(u64 start,u64 remaining,
+static __attribute__((always_inline)) inline int ap_stream_copy_fragment_window(u64 start,u64 remaining,
         u64 cursor,u64 fragment_length,u64 *within,u64 *take) {
     if(!remaining || !fragment_length || cursor>~0ULL-fragment_length)return 0;
     const u64 end=cursor+fragment_length;

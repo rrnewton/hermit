@@ -128,7 +128,9 @@ static const struct {const char *name;u64 image;} df_symbols[]={
     {"tcp_read_done",0xffffffff81e69440ULL},{"tcp_zerocopy_receive",0xffffffff81e6a2e0ULL},
     {"tcp_bpf_recvmsg",0xffffffff81e9c2c0ULL},{"tcp_bpf_recvmsg_parser",0xffffffff81e9c510ULL},
     {"unix_stream_splice_read",0xffffffff81eb56d0ULL},{"unix_stream_read_skb",0xffffffff81eb5750ULL},
-    {"unix_read_skb",0xffffffff81eb5df0ULL},{"unix_bpf_recvmsg",0xffffffff81eb6f10ULL}
+    {"unix_read_skb",0xffffffff81eb5df0ULL},{"unix_bpf_recvmsg",0xffffffff81eb6f10ULL},
+    {"tcp_sendmsg",0xffffffff81fbabf0ULL},{"lock_sock_nested",0xffffffff81fb70c0ULL},
+    {"release_sock",0xffffffff81f54820ULL}
 };
 static u64 df_address(const char *name) {
     for(unsigned i=0;i<DF_COUNT(df_symbols);i++)
@@ -348,8 +350,8 @@ struct bpf_link *bpf_program__attach_kprobe_multi_opts(const struct bpf_program 
     unsigned expected;bool session=false,ret=false;
     if(!strcmp(p->name,"fd_so")) {expected=4;session=true;}
     else if(!strcmp(p->name,"fd_si")) {expected=5;session=true;}
-    else if(!strcmp(p->name,"fd_s20e"))expected=1;
-    else if(!strcmp(p->name,"fd_s20x")) {expected=1;ret=true;}
+    else if(!strcmp(p->name,"fd_s20e"))expected=4;
+    else if(!strcmp(p->name,"fd_s20x")) {expected=4;ret=true;}
     else if(!strcmp(p->name,"fd_file_retired") || !strcmp(p->name,"fd_exec_closed_file"))expected=1;
     else if(!strcmp(p->name,"fd_stream_copy_protocol_enter"))expected=20;
     else if(!strcmp(p->name,"fd_stream_copy_protocol_exit")) {expected=4;ret=true;}

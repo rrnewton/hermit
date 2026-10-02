@@ -795,9 +795,9 @@ pub(crate) fn ioaction_for_description(fd: i32, detfd: &crate::fd::DetFd) -> IOA
 /// the sequentialized scheduler in record/replay, because a pipe reader and its paired
 /// writer are not independent.
 ///
-/// Sockets are intentionally NOT classified as internal here: there is no reliable
-/// internal-vs-external socket detection yet (loopback / AF_UNIX-to-another-guest vs a
-/// real host peer), so sockets conservatively remain external. Syscalls whose fd is not
+/// Only checked socketpair endpoints additionally qualify: both ends were
+/// created in this container. Other sockets remain external; AF_UNIX alone is
+/// not evidence that a connected peer belongs to this container. Syscalls whose fd is not
 /// directly extractable (e.g. poll/ppoll, which carry a pointer to an fd array) return
 /// false and keep their existing handling.
 pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
@@ -807,7 +807,7 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     match get_fd(call) {
         Some(fd) => guest
             .thread_state()
-            .with_detfd(fd, |detfd| matches!(detfd.ty(), FdType::Pipe))
+            .with_detfd(fd, |detfd| detfd.ty() == FdType::Pipe || detfd.is_local_socket_pair())
             .unwrap_or(false),
         None => false,
     }

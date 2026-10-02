@@ -1588,6 +1588,40 @@ impl FileMetadata {
         })
     }
 
+    /// Restrict only the private candidate's exact installed generation. The
+    /// original Socket publisher calls this before exposing its atomic batch.
+    pub(crate) fn restrict_network_capability_probe(
+        &mut self, binding: FdSlotBinding,
+    ) -> Result<(), Error> {
+        if self.descriptor_binding(binding.slot.fd).ok() != Some(binding)
+            || self.file_handles[&binding.slot.fd].ty() != FdType::Socket
+        {
+            return Err(fd_publication_error("capability probe changed its installed socket binding"));
+        }
+        self.file_handles[&binding.slot.fd].restrict_network_capability_probe();
+        Ok(())
+    }
+
+    pub(crate) fn has_network_capability_probe(&self) -> bool {
+        self.file_handles.values().any(DetFd::is_network_capability_probe)
+    }
+
+    /// The caller has retained the actual pair result and checked both native
+    /// profiles under the same table permit. Allocate non-external identities
+    /// while retaining Socket's ordinary flags and local I/O behavior.
+    pub(crate) fn add_local_socket_pair_fd(
+        &mut self, owner: DetTid, fd: RawFd, flags: OFlag, stat: Option<DetStat>,
+    ) -> Result<(), Errno> {
+        if self.file_handles.contains_key(&fd) {
+            return Err(Errno::EEXIST);
+        }
+        let id = self.allocate_open_file_id(owner, FdType::Regular);
+        let descriptor = DetFd::new(fd, flags, FdType::Socket, id).with_stat(stat);
+        descriptor.mark_local_socket_pair();
+        self.add_detfd(descriptor);
+        Ok(())
+    }
+
     /// Called while the original pipe's pre-call table permit remains held.
     /// A returned number is not permission to overwrite an existing slot.
     pub(crate) fn validate_fresh_pipe_fds(&self, fds: [i32; 2]) -> Result<(), Error> {
@@ -1608,12 +1642,19 @@ impl FileMetadata {
     pub(crate) fn validate_pipe_installations(
         &self,
         changes: &[NetworkFdSlotReplacement; 2],
+        kind: &crate::network_replay::NetworkFdMutationKind,
     ) -> Result<(), Error> {
         if self.pending_network_installations.as_slice() != changes.as_slice()
             || changes.iter().any(|change| {
                 change.after.is_none_or(|after| {
                     self.descriptor_binding(after.binding.slot.fd).ok() != Some(after.binding)
-                        || self.file_handles[&after.binding.slot.fd].ty() != FdType::Pipe
+                        || match kind {
+                            crate::network_replay::NetworkFdMutationKind::PipePair { .. } =>
+                                self.file_handles[&after.binding.slot.fd].ty() != FdType::Pipe,
+                            crate::network_replay::NetworkFdMutationKind::SocketPair { .. } =>
+                                !self.file_handles[&after.binding.slot.fd].is_local_socket_pair(),
+                            _ => true,
+                        }
                 })
             })
         {
@@ -1635,7 +1676,6 @@ impl FileMetadata {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn pending_network_installations(&self) -> &[NetworkFdSlotReplacement] {
         &self.pending_network_installations
     }
@@ -6483,6 +6523,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     | crate::network_replay::NetworkFdMutationKind::Openat
                     | crate::network_replay::NetworkFdMutationKind::EpollCreate
                     | crate::network_replay::NetworkFdMutationKind::PipePair { .. }
+                    | crate::network_replay::NetworkFdMutationKind::SocketPair { .. }
                     | crate::network_replay::NetworkFdMutationKind::Clone { .. }
                     | crate::network_replay::NetworkFdMutationKind::Exec { .. } => kind.clone(),
                     crate::network_replay::NetworkFdMutationKind::Alias {
@@ -6721,7 +6762,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let batch = {
             let mut table = table.lock().unwrap();
-            table.validate_pipe_installations(&changes)?;
+            table.validate_pipe_installations(&changes, &admission.kind)?;
             for (change, effect) in changes.into_iter().zip(effects) {
                 table.associate_network_installation(change.installation_generation, effect)?;
             }

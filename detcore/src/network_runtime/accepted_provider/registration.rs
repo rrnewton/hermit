@@ -335,6 +335,9 @@ impl Backend for Physical<'_> {
                 r.address,
                 r.original_count,
             ),
+            Kind::Sendto => self.0.prepare_original_sendto(
+                pidfd.as_fd(), r.call, r.mm, (r.fd, r.address, r.original_count, r.length),
+            ),
             Kind::EpollCtl => self.0.prepare_original_epoll_ctl(
                 pidfd.as_fd(),
                 (r.call, r.mm),

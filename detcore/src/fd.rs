@@ -138,6 +138,16 @@ struct OpenFileDescription {
     // Serialized metadata cannot mint or restore this physical authority.
     #[serde(skip)]
     native_file: Option<crate::network_runtime::original_installation::FileIdentity>,
+    /// A live network-only allocation probe may be closed or duplicated, but
+    /// never used for communication. This restriction follows real OFD aliases;
+    /// it is re-established by each actual Socket installation, not serialized
+    /// metadata or a numeric descriptor identity.
+    #[serde(skip)]
+    network_capability_probe: bool,
+    /// Both endpoints came from a checked, container-local socketpair. This
+    /// live classification follows OFD aliases, not a reused descriptor number.
+    #[serde(skip)]
+    local_socket_pair: bool,
     /// fd type
     ty: FdType,
     /// Process named by a pidfd created through `pidfd_open`.
@@ -279,6 +289,8 @@ impl DetFd {
             open_file: Arc::new(Mutex::new(OpenFileDescription {
                 id,
                 native_file: None,
+                network_capability_probe: false,
+                local_socket_pair: false,
                 ty,
                 pidfd_target: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
@@ -323,6 +335,25 @@ impl DetFd {
         &self,
     ) -> Option<crate::network_runtime::original_installation::FileIdentity> {
         self.description().native_file
+    }
+
+    pub(crate) fn restrict_network_capability_probe(&self) {
+        self.description().network_capability_probe = true;
+    }
+
+    pub(crate) fn is_network_capability_probe(&self) -> bool {
+        self.description().network_capability_probe
+    }
+
+    pub(crate) fn mark_local_socket_pair(&self) {
+        let mut description = self.description();
+        assert_eq!(description.ty, FdType::Socket);
+        assert!(!description.id.is_socket());
+        description.local_socket_pair = true;
+    }
+
+    pub(crate) fn is_local_socket_pair(&self) -> bool {
+        self.description().local_socket_pair
     }
 
     /// update fd
@@ -448,7 +479,8 @@ impl DetFd {
     /// this identity rather than the raw descriptor number.
     pub fn socket_open_file_id(&self) -> Option<OpenFileId> {
         let description = self.description();
-        (description.ty == FdType::Socket).then_some(description.id)
+        (description.ty == FdType::Socket && !description.local_socket_pair)
+            .then_some(description.id)
     }
 
     /// Number of modeled descriptor slots that retain this open file description.
@@ -1040,6 +1072,51 @@ mod tests {
             !duplicate.is_loopback_peer(),
             "reconnects through one alias must clear loopback state for every alias"
         );
+    }
+
+    #[test]
+    fn local_socket_pair_marker_follows_aliases_without_external_identity_or_fd_reuse() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(3, OFlag::O_RDWR, FdType::Socket, OpenFileId::new(owner, 0));
+        let duplicate = original.clone().with_fd(4).with_fd_flags(OFlag::O_CLOEXEC);
+        assert!(!original.is_local_socket_pair());
+        original.mark_local_socket_pair();
+        assert!(original.is_local_socket_pair());
+        assert!(duplicate.is_local_socket_pair());
+        assert_eq!(original.ty(), FdType::Socket);
+        assert!(!original.open_file_id().is_socket());
+        assert_eq!(original.socket_open_file_id(), None);
+        assert_eq!(duplicate.socket_open_file_id(), None);
+        assert_eq!(original.open_file_id(), duplicate.open_file_id());
+        duplicate.set_status_flags(OFlag::O_NONBLOCK.bits());
+        assert!(original.is_nonblocking());
+        assert!(!original.is_cloexec());
+        assert!(duplicate.is_cloexec());
+        drop(original);
+        assert!(duplicate.is_local_socket_pair());
+        let replacement = DetFd::new(3, OFlag::O_RDWR, FdType::Socket,
+            OpenFileId::new_socket(owner, 1));
+        assert!(!replacement.is_local_socket_pair());
+        assert_eq!(replacement.socket_open_file_id(), Some(replacement.open_file_id()));
+        assert_ne!(replacement.open_file_id(), duplicate.open_file_id());
+    }
+
+    #[test]
+    fn network_capability_probe_restriction_follows_aliases_not_fd_reuse() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(3, OFlag::O_RDWR, FdType::Socket, OpenFileId::new(owner, 0));
+        let duplicate = original.clone().with_fd(4).with_fd_flags(OFlag::O_CLOEXEC);
+        assert!(!original.is_network_capability_probe());
+        original.restrict_network_capability_probe();
+        assert!(original.is_network_capability_probe());
+        assert!(duplicate.is_network_capability_probe());
+        duplicate.set_status_flags(OFlag::O_NONBLOCK.bits());
+        assert!(original.is_network_capability_probe());
+        drop(original);
+        assert!(duplicate.is_network_capability_probe());
+        let replacement = DetFd::new(3, OFlag::O_RDWR, FdType::Socket, OpenFileId::new(owner, 1));
+        assert!(!replacement.is_network_capability_probe());
+        assert_ne!(duplicate.open_file_id(), replacement.open_file_id());
     }
 
     /// `flock(2)` locks belong to the open file description, so every `dup`

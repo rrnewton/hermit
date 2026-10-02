@@ -71,6 +71,11 @@ pub enum NetworkFdMutationKind {
         /// Descriptor flag requested for both endpoints.
         cloexec: bool,
     },
+    /// One checked native AF_UNIX/SOCK_STREAM pair, never external networking.
+    SocketPair {
+        /// Descriptor flag requested for both endpoints.
+        cloexec: bool,
+    },
 }
 
 /// One short table/OFD admission and physical submission identity.
@@ -776,6 +781,7 @@ impl NetworkReplayEngine {
             | NetworkFdMutationKind::Openat
             | NetworkFdMutationKind::EpollCreate
             | NetworkFdMutationKind::PipePair { .. }
+            | NetworkFdMutationKind::SocketPair { .. }
             | NetworkFdMutationKind::Clone { .. } => Ok(Some(Vec::new())),
             NetworkFdMutationKind::Exec { receipt } => {
                 if receipt.caller != owner.thread
@@ -1084,7 +1090,8 @@ impl NetworkReplayEngine {
                 "exec success requires authenticated backend lifecycle event",
             ));
         }
-        if matches!(state.admission.kind, NetworkFdMutationKind::PipePair { .. }) && result.is_ok()
+        if matches!(state.admission.kind,
+            NetworkFdMutationKind::PipePair { .. } | NetworkFdMutationKind::SocketPair { .. }) && result.is_ok()
         {
             return Err(protocol(
                 "pipe success requires its complete original descriptor pair",
@@ -1120,7 +1127,8 @@ impl NetworkReplayEngine {
             tid: owner.thread,
             mm: owner.mm,
         };
-        if !matches!(state.admission.kind, NetworkFdMutationKind::PipePair { .. })
+        if !matches!(state.admission.kind,
+            NetworkFdMutationKind::PipePair { .. } | NetworkFdMutationKind::SocketPair { .. })
             || !state.submitted
             || state.kernel_result.is_some()
             || state.pipe_fds.is_some()
@@ -1142,6 +1150,18 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
+    pub(crate) fn validate_fd_pair_metadata(
+        &self,
+        owner: NetworkStreamOwner,
+        permit: NetworkFdPublicationPermit,
+        metadata: &crate::tool_local::FileMetadata,
+        changes: &[NetworkFdSlotReplacement; 2],
+    ) -> Result<(), NetworkReplayError> {
+        let state = self.fd_mutation(owner, permit)?;
+        metadata.validate_pipe_installations(changes, &state.admission.kind)
+            .map_err(|e| protocol(&e.to_string()))
+    }
+
     pub(crate) fn confirm_fd_pipe_installation(
         &mut self,
         owner: NetworkStreamOwner,
@@ -1149,10 +1169,10 @@ impl NetworkReplayEngine {
         changes: [NetworkFdSlotReplacement; 2],
     ) -> Result<[NetworkFdEffectAssociation; 2], NetworkReplayError> {
         let state = self.fd_mutation(owner, permit)?;
-        let NetworkFdMutationKind::PipePair { cloexec } = state.admission.kind else {
-            return Err(protocol(
-                "pipe installation changed its original syscall family",
-            ));
+        let (cloexec, kind) = match state.admission.kind {
+            NetworkFdMutationKind::PipePair { cloexec } => (cloexec, NetworkFdInstallKind::PipePair),
+            NetworkFdMutationKind::SocketPair { cloexec } => (cloexec, NetworkFdInstallKind::SocketPair),
+            _ => return Err(protocol("pair installation changed its original syscall family")),
         };
         let fds = state
             .pipe_fds
@@ -1196,7 +1216,7 @@ impl NetworkReplayEngine {
         let effects = std::array::from_fn(|index| NetworkFdEffectAssociation {
             owner,
             lease: permit.lease,
-            kind: NetworkFdInstallKind::PipePair,
+            kind,
             result_index: index as u32,
             returned_fd: fds[index],
         });
@@ -1205,7 +1225,7 @@ impl NetworkReplayEngine {
             ConfirmedFdInstallation {
                 owner,
                 files: permit.files,
-                kind: NetworkFdInstallKind::PipePair,
+                kind,
                 returned_fds: fds.to_vec(),
                 installations: changes.to_vec(),
                 open_files,
@@ -1244,7 +1264,7 @@ impl NetworkReplayEngine {
             return Err(protocol("installation does not match confirmed result"));
         }
         let (kind, source) = match &state.admission.kind {
-            NetworkFdMutationKind::PipePair { .. } => {
+            NetworkFdMutationKind::PipePair { .. } | NetworkFdMutationKind::SocketPair { .. } => {
                 return Err(protocol(
                     "pipe requires a complete two-endpoint installation",
                 ));
@@ -1553,6 +1573,21 @@ impl NetworkReplayEngine {
             )?;
         }
         Ok(())
+    }
+
+    /// A capacity checkpoint is not a table retirement. Every effect must
+    /// already be published; live registered tasks and descriptors remain live.
+    pub(crate) fn fd_history_checkpoint_ready(&self) -> bool {
+        self.stream_calls.is_empty()
+            && self.socket_controls.is_empty()
+            && self.fd_lifecycle.mutations.is_empty()
+            && self.fd_installations.is_empty()
+            && self.fd_publications.values().all(|state| {
+                state.active.is_none()
+                    && state.pending.is_none()
+                    && state.enrollment.is_none()
+                    && state.reader.is_none()
+            })
     }
 
     pub(crate) fn finish_fd_mutations(&self) -> Result<(), NetworkReplayError> {
@@ -2453,8 +2488,129 @@ mod tests {
     }
 
     #[test]
+    fn local_socket_pair_requires_complete_nonexternal_atomic_publication() {
+        let (mut engine, owner, files) = setup();
+        let admission = admitted(&mut engine, owner, files,
+            NetworkFdMutationKind::SocketPair { cloexec: true });
+        let permit = admission.publication.permit;
+        let unchanged = format!("{engine:?}");
+        assert!(engine.confirm_fd_pipe_result(owner, permit, 0, [7, 8]).is_err());
+        assert_eq!(format!("{engine:?}"), unchanged);
+        engine.submit_fd_mutation(owner, permit).unwrap();
+        let unchanged = format!("{engine:?}");
+        assert!(engine.confirm_fd_mutation_result(owner, permit, Ok(0)).is_err());
+        for (raw, fds) in [(1, [7, 8]), (-i64::from(libc::EFAULT), [7, 8]),
+            (0, [7, 7]), (0, [-1, 8])] {
+            assert!(engine.confirm_fd_pipe_result(owner, permit, raw, fds).is_err());
+            assert_eq!(format!("{engine:?}"), unchanged);
+        }
+        let foreign = NetworkStreamOwner { mm: MmId::initial(DetTid::from_raw(62)), ..owner };
+        assert!(engine.confirm_fd_pipe_result(foreign, permit, 0, [7, 8]).is_err());
+        assert_eq!(format!("{engine:?}"), unchanged);
+        engine.confirm_fd_pipe_result(owner, permit, 0, [7, 8]).unwrap();
+        let changes = std::array::from_fn(|index| {
+            let mut after = slot(owner, 7 + index as i32, 1 + index as u64,
+                OpenFileId::new(owner.thread, 1 + index as u64));
+            after.cloexec = true;
+            NetworkFdSlotReplacement { files, installation_generation: after.binding.generation,
+                before: None, after: Some(after) }
+        });
+        let unchanged = format!("{engine:?}");
+        assert!(engine.confirm_fd_installation(owner, permit, changes[0]).is_err());
+        assert!(engine.confirm_fd_pipe_result(owner, permit, 0, [7, 8]).is_err());
+        for invalid in 0..8 {
+            let mut changed = changes;
+            match invalid {
+                0 => changed.swap(0, 1),
+                1 => changed[1].after = None,
+                2 => changed[1] = changed[0],
+                3 => changed[1].after.as_mut().unwrap().cloexec = false,
+                4 => changed[1].after.as_mut().unwrap().binding.open_file =
+                    changes[0].after.unwrap().binding.open_file,
+                5 => changed[1].after.as_mut().unwrap().binding.open_file =
+                    OpenFileId::new_socket(owner.thread, 2),
+                6 => changed[1].after.as_mut().unwrap().binding.slot.fd = 9,
+                _ => changed[1].before = changed[1].after,
+            }
+            assert!(engine.confirm_fd_pipe_installation(owner, permit, changed).is_err());
+            assert_eq!(format!("{engine:?}"), unchanged);
+        }
+        let effects = engine.confirm_fd_pipe_installation(owner, permit, changes).unwrap();
+        assert_eq!(effects.map(|effect| (effect.kind, effect.result_index, effect.returned_fd)),
+            [(NetworkFdInstallKind::SocketPair, 0, 7), (NetworkFdInstallKind::SocketPair, 1, 8)]);
+        let batch = NetworkFdPublicationBatch {
+            files, sequence: 1, previous_generation: 0, through_generation: 2,
+            entries: changes.into_iter().zip(effects)
+                .map(|(replacement, effect)| NetworkFdPublicationEntry { replacement, effect }).collect(),
+        };
+        let unchanged = format!("{engine:?}");
+        let mut partial = batch.clone();
+        partial.entries.pop();
+        assert!(matches!(engine.publish_fd_publication(owner, permit, &partial),
+            Err(NetworkReplayError::FdPublicationProtocol(message))
+                if message == "partial multi-result installation receipt"));
+        assert_eq!(format!("{engine:?}"), unchanged);
+        let mut duplicate = batch.clone();
+        duplicate.entries[1] = duplicate.entries[0].clone();
+        assert!(engine.publish_fd_publication(owner, permit, &duplicate).is_err());
+        assert_eq!(format!("{engine:?}"), unchanged);
+        let mut wrong_kind = batch.clone();
+        wrong_kind.entries[1].effect.kind = NetworkFdInstallKind::PipePair;
+        assert!(engine.publish_fd_publication(owner, permit, &wrong_kind).is_err());
+        assert_eq!(format!("{engine:?}"), unchanged);
+        let task = TaskOwner { tid: owner.thread, mm: owner.mm };
+        assert!(engine.lifetime.descriptor_binding(task, 7).is_err());
+        assert!(engine.lifetime.descriptor_binding(task, 8).is_err());
+        assert_eq!(engine.publish_fd_publication(owner, permit, &batch).unwrap(), batch);
+        assert!(!engine.fd_history_checkpoint_ready());
+        for change in changes {
+            let expected = change.after.unwrap();
+            assert!(!expected.binding.open_file.is_socket());
+            assert!(expected.cloexec);
+            assert_eq!(engine.lifetime.descriptor_binding(task, expected.binding.slot.fd).unwrap(),
+                expected.binding);
+        }
+        engine.acknowledge_fd_publication(owner, permit, &batch).unwrap();
+        assert!(engine.fd_installations.is_empty());
+        assert!(engine.fd_lifecycle.mutations.is_empty());
+        assert!(engine.confirm_fd_pipe_result(owner, permit, 0, [7, 8]).is_err());
+        engine.retire_fd_table_owner(owner);
+        engine.lifetime.finish().unwrap();
+        engine.finish_fd_mutations().unwrap();
+    }
+
+    #[test]
+    fn local_socket_pair_preserves_original_error_and_occupied_preimage() {
+        for errno in [libc::EINVAL, libc::EFAULT, libc::EMFILE, libc::ENFILE,
+            libc::EAFNOSUPPORT, libc::EPROTONOSUPPORT] {
+            let (mut engine, owner, files) = setup();
+            let occupied = socket(&mut engine, owner, files, 7, 1);
+            let admission = admitted(&mut engine, owner, files,
+                NetworkFdMutationKind::SocketPair { cloexec: false });
+            let permit = admission.publication.permit;
+            engine.submit_fd_mutation(owner, permit).unwrap();
+            let unchanged = format!("{engine:?}");
+            assert!(engine.confirm_fd_pipe_result(owner, permit, 0, [7, 8]).is_err());
+            assert_eq!(format!("{engine:?}"), unchanged);
+            engine.confirm_fd_mutation_result(owner, permit, Err(errno)).unwrap();
+            assert_eq!(engine.fd_lifecycle.mutations[&permit.lease].kernel_result, Some(Err(errno)));
+            assert!(engine.confirm_fd_pipe_result(owner, permit, 0, [8, 9]).is_err());
+            engine.finish_unchanged_fd_mutation(owner, permit).unwrap();
+            assert!(engine.fd_installations.is_empty());
+            assert!(engine.fd_lifecycle.mutations.is_empty());
+            let task = TaskOwner { tid: owner.thread, mm: owner.mm };
+            assert_eq!(engine.lifetime.descriptor_binding(task, 7).unwrap(), occupied.binding);
+            assert!(engine.lifetime.descriptor_binding(task, 8).is_err());
+            engine.retire_fd_table_owner(owner);
+            engine.lifetime.finish().unwrap();
+            engine.finish_fd_mutations().unwrap();
+        }
+    }
+
+    #[test]
     fn pipe_pair_requires_zero_complete_fresh_ordered_result_and_atomic_publication() {
         let (mut engine, owner, files) = setup();
+        assert!(engine.fd_history_checkpoint_ready());
         let admission = admitted(
             &mut engine,
             owner,
@@ -2462,6 +2618,7 @@ mod tests {
             NetworkFdMutationKind::PipePair { cloexec: false },
         );
         let permit = admission.publication.permit;
+        assert!(!engine.fd_history_checkpoint_ready());
         let unchanged = format!("{engine:?}");
         assert!(
             engine
@@ -2590,6 +2747,7 @@ mod tests {
                 .unwrap(),
             batch
         );
+        assert!(!engine.fd_history_checkpoint_ready());
         let task = TaskOwner {
             tid: owner.thread,
             mm: owner.mm,
@@ -2607,6 +2765,7 @@ mod tests {
         engine
             .acknowledge_fd_publication(owner, permit, &batch)
             .unwrap();
+        assert!(engine.fd_history_checkpoint_ready());
         assert!(engine.fd_installations.is_empty());
         assert!(engine.fd_lifecycle.mutations.is_empty());
         assert!(

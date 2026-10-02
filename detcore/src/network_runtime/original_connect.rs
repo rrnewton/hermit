@@ -1044,7 +1044,7 @@ impl NetworkRuntimeResources {
         let launched = self.start_native_worker(move || {
             // Close must not duplicate the file: an extra reference would
             // defer final fput/socket release and change flush/linger behavior.
-            let pin = if admitted.arguments.kind != Kind::Connect {
+            let pin = if !matches!(admitted.arguments.kind, Kind::Connect | Kind::Sendto) {
                 None
             } else {
                 match capture_socket(&capture_target, admitted.arguments.fd) {
@@ -1083,15 +1083,18 @@ impl NetworkRuntimeResources {
                 .lock()
                 .unwrap()
                 .original_reference(owner, admitted.call)?;
-            let classified = if admitted.arguments.kind != Kind::Connect {
+            let classified = if !matches!(admitted.arguments.kind, Kind::Connect | Kind::Sendto) {
                 if held.is_some() {
                     return Err(std::io::Error::other("close acquired a physical file pin"));
                 }
                 Ok(None)
             } else {
-                held.as_ref()
-                    .map_or(Ok(Pin::Empty), |pin| native_peer::classify_original(pin))
-                    .map(Some)
+                if admitted.arguments.kind == Kind::Sendto {
+                    held.as_ref().ok_or_else(|| std::io::Error::other("Sendto has no original pin"))
+                        .and_then(|pin| super::original_send::classify(pin)).map(Some)
+                } else {
+                    held.as_ref().map_or(Ok(Pin::Empty), |pin| native_peer::classify_original(pin)).map(Some)
+                }
             };
             drop(held);
             let result = classified.and_then(|pin| {
@@ -1227,7 +1230,7 @@ impl NetworkRuntimeResources {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("original closed without completion"))?
             .original;
-        let address = if result.security_returned == 1 {
+        let address = if admission.arguments.kind == Kind::Connect && result.security_returned == 1 {
             let length = usize::try_from(result.selection.address_length)
                 .map_err(|_| std::io::Error::other("negative captured sockaddr length"))?;
             Some(
@@ -1281,6 +1284,38 @@ impl NetworkRuntimeResources {
             ));
         }
         self.retire_original_connect(owner, admission, publication)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3464): Review this sole-root semantic boundary and
+    // the unchanged unpublished quota versus retained historical evidence.
+    // https://github.com/rrnewton/hermit/pull/3464
+    pub(crate) async fn checkpoint_completed_original_history(
+        &self,
+        owner: NetworkStreamOwner,
+        publication: &NativeCaptureRecovery,
+    ) -> std::io::Result<()> {
+        let Ok(root) = self.foreground_root(owner) else { return Ok(()); };
+        if !root.is_sole_initial_root(owner) {
+            return Ok(());
+        }
+        // The caller has retired this actual original Call and has not replied
+        // to its stopped guest. No engine/native lock crosses this async wait.
+        let mut journal = self.shared.fd_journal.lock().await;
+        let metadata = root.metadata()?;
+        let local = metadata.lock().unwrap();
+        let engine = publication.engine.lock().unwrap();
+        engine.validate_fd_metadata(owner, root.files(), &metadata, &local)
+            .map_err(std::io::Error::other)?;
+        let native = self.shared.native_streams.lock().unwrap();
+        if root.is_sole_initial_root(owner)
+            && engine.fd_history_checkpoint_ready()
+            && local.pending_network_installations().is_empty()
+            && native.settled().is_ok()
+        {
+            journal.checkpoint_after_semantic_retirement()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn retire_original_connect(
@@ -1409,6 +1444,7 @@ mod close_tests {
         accepted_provider::OriginalEffect {
             socket: None,
             read_copy: None,
+            send: None,
             command: ffi::CommandResult {
                 command: 17,
                 operation: 9,

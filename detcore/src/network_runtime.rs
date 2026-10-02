@@ -47,6 +47,7 @@ pub(crate) mod native_birth_outcome;
 mod native_copy_exclusion;
 mod openat_observation;
 pub(crate) mod original_connect;
+pub(crate) mod original_send;
 pub(crate) mod original_epoll_ctl;
 pub(crate) mod original_installation;
 pub(crate) mod original_read_copy;

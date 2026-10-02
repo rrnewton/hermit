@@ -329,6 +329,7 @@ const ACCEPTED_CONTROLS: &[&str] = &[
     "stream-copy-v5-driver-test.c",
     "stream-copy-fault-producer-test.c",
     "stream-membership-v5-test.c",
+    "stream-tx-test.c",
     "fd-journal-publish-test.c",
     "fd-shared-predicate-test.c",
     "grouped-recovery-test.c",
@@ -871,9 +872,9 @@ fn run() -> Result<()> {
     let started = Instant::now();
     let (parser, initial) = if accepted {
         let (wire, independent) = ACCEPTED_CONTROLS.split_last().context("missing controls")?;
-        ensure!(*wire == "grouped-wire-test.c" && independent.len() == 22,
+        ensure!(*wire == "grouped-wire-test.c" && independent.len() == 23,
             "initial control partition changed");
-        overlap_initial_gate(&AtomicBool::new(false), 0..=21,
+        overlap_initial_gate(&AtomicBool::new(false), 0..=22,
             || execute_logged_stage(&mut command, started, &stdout_path, &stderr_path),
             |index| accepted_control_sequence(independent[index as usize], &source, &output,
                 started, &stdout_path, &stderr_path))
@@ -1028,9 +1029,9 @@ mod initial_gate_batch_tests {
         assert_eq!(INITIAL_CONTROL_CONCURRENCY, 2);
         let (wire, independent) = ACCEPTED_CONTROLS.split_last().unwrap();
         assert_eq!(*wire, "grouped-wire-test.c");
-        assert_eq!(independent.len(), 22);
+        assert_eq!(independent.len(), 23);
         assert!(!independent.contains(&"grouped-wire-test.c"));
-        assert_eq!(expected_stage_count(true), 109);
+        assert_eq!(expected_stage_count(true), 111);
     }
 
     #[test]
@@ -1639,7 +1640,8 @@ raise SystemExit(status)
         let source_neighbor = plan.iter().find(|s| s.name == "neighbor:failed-prefix-SOURCE").unwrap();
         assert_eq!(source_neighbor.command.get_program(), "/output/stream-copy-fault-producer-test");
         assert_eq!(source_neighbor.command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>(), ["full"]);
-        assert_eq!(expected_stage_count(true), 53 + plan.len());
+        // The new TX compile/run pair precedes the unchanged postwire DAG.
+        assert_eq!(expected_stage_count(true), 55 + plan.len());
     }
 
     #[test]
@@ -1799,11 +1801,11 @@ raise SystemExit(status)
 #[cfg(test)]
 mod tests {
     #[test]
-    fn owned_controls_add_four_stages_without_replacing_the_original_population() {
-        assert_eq!(super::ACCEPTED_CONTROLS.len(), 23);
+    fn owned_and_tx_controls_preserve_the_original_population() {
+        assert_eq!(super::ACCEPTED_CONTROLS.len(), 24);
         assert_eq!(super::OWNED_DRIVER_CONTROLS,
             ["owned-inventory", "owned-identity", "owned-fault", "owned-gate"]);
-        assert_eq!(super::expected_stage_count(true), 109);
+        assert_eq!(super::expected_stage_count(true), 111);
         assert_eq!(super::expected_stage_count(false), 7);
     }
 
@@ -1811,12 +1813,14 @@ mod tests {
     fn exact_stage_completion_refuses_omitted_extra_and_failed_stages() {
         let good = serde_json::json!({"receipt":{"passed":true}});
         let expected = super::expected_stage_count(true);
-        assert!(super::stages_complete(&vec![good.clone(); 109], expected));
+        assert!(super::stages_complete(&vec![good.clone(); 111], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 108], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 109], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 110], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 112], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 105], expected));
-        let mut failed = vec![good; 109];
-        failed[108]["receipt"]["passed"] = serde_json::json!(false);
+        let mut failed = vec![good; 111];
+        failed[110]["receipt"]["passed"] = serde_json::json!(false);
         assert!(!super::stages_complete(&failed, expected));
     }
     use super::*;
@@ -1926,8 +1930,8 @@ mod tests {
             fs::write(case.path.join(name), name).unwrap();
         }
         let before = control_sources(&case.path, true).unwrap();
-        assert_eq!(ACCEPTED_CONTROLS.len(), 23);
-        assert_eq!(before.len(), 31);
+        assert_eq!(ACCEPTED_CONTROLS.len(), 24);
+        assert_eq!(before.len(), 32);
         assert_eq!(
             before.keys().map(String::as_str).collect::<Vec<_>>(),
             [
@@ -1961,6 +1965,7 @@ mod tests {
                 "stream-frontier-test.c",
                 "stream-membership-test.c",
                 "stream-membership-v5-test.c",
+                "stream-tx-test.c",
                 "test.rs"
             ]
         );
@@ -1996,7 +2001,7 @@ mod tests {
             fs::write(case.path.join(name), name).unwrap();
             assert_eq!(before, control_sources(&case.path, true).unwrap());
         }
-        for name in ["stream-frontier-test.c", "stream-copy-v5-driver-test.c", "stream-copy-fault-producer-test.c", "stream-membership-v5-test.c"] {
+        for name in ["stream-frontier-test.c", "stream-copy-v5-driver-test.c", "stream-copy-fault-producer-test.c", "stream-membership-v5-test.c", "stream-tx-test.c"] {
             fs::write(case.path.join(name), "changed frontier or copy-version assertion").unwrap();
             assert_ne!(before, control_sources(&case.path, true).unwrap());
             fs::remove_file(case.path.join(name)).unwrap();

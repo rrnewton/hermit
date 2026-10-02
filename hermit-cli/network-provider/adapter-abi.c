@@ -64,6 +64,11 @@ _Static_assert(offsetof(struct ap_fd_event,device_minor)==100,"event device mino
 _Static_assert(sizeof(struct ap_original_selection)==104,"original selection ABI");
 _Static_assert(offsetof(struct ap_original_selection,ready)==80,"original selection publication");
 _Static_assert(sizeof(struct ap_original_result)==320,"original result ABI");
+_Static_assert(sizeof(struct ap_stream_tx_summary)==64,"original Sendto summary ABI");
+_Static_assert(sizeof(struct ap_stream_tx_capture)==624,"original Sendto capture ABI");
+_Static_assert(offsetof(struct ap_stream_tx_capture,returned)==40,"Sendto actual return ABI");
+_Static_assert(offsetof(struct ap_stream_tx_capture,summary)==48,"Sendto summary offset ABI");
+_Static_assert(offsetof(struct ap_stream_tx_capture,bytes)==112,"Sendto accepted prefix ABI");
 _Static_assert(sizeof(struct ap_original_epoll_installation)==40,"original epoll installation overlay ABI");
 _Static_assert(offsetof(struct ap_original_epoll_installation,status_flags)==24,"original epoll OFD flag offset");
 _Static_assert(offsetof(struct ap_original_epoll_installation,descriptor_flags)==28,"original epoll descriptor flag offset");

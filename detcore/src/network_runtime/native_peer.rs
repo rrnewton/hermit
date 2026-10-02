@@ -163,6 +163,7 @@ impl OriginalConnect {
             original: terminal.original.clone(),
             socket: None,
             read_copy: None,
+            send: None,
         })
     }
 }
@@ -276,7 +277,8 @@ impl Calls {
         publication: super::NativeCaptureRecovery,
     ) -> io::Result<()> {
         let call = admission.call;
-        if admission.arguments.kind != crate::network_replay::original_connect::Kind::Connect
+        if !matches!(admission.arguments.kind, crate::network_replay::original_connect::Kind::Connect
+            | crate::network_replay::original_connect::Kind::Sendto)
             && pin.is_some()
         {
             return Err(io::Error::other(
@@ -389,7 +391,8 @@ impl Calls {
         pin: OriginalPin,
     ) -> io::Result<()> {
         let state = self.original(owner, call)?;
-        if state.admission.arguments.kind != crate::network_replay::original_connect::Kind::Connect
+        if !matches!(state.admission.arguments.kind, crate::network_replay::original_connect::Kind::Connect
+            | crate::network_replay::original_connect::Kind::Sendto)
             || state.pin.is_some()
             || state.admission.arguments.binding.is_none() != (pin == OriginalPin::Empty)
         {
@@ -592,6 +595,9 @@ impl Calls {
             // absent/O_PATH from readable descriptions before publication.
             // This transport layer never invents a selected file from a slot.
             (crate::network_replay::original_connect::Kind::Read, None) => {}
+            (crate::network_replay::original_connect::Kind::Sendto,
+                Some(OriginalPin::Socket { kind: libc::SOCK_STREAM, protocol: libc::IPPROTO_TCP, .. }))
+                if admission.arguments.binding.is_some() && selection.file != 0 => {}
             (
                 crate::network_replay::original_connect::Kind::Socket
                 | crate::network_replay::original_connect::Kind::Openat
@@ -668,6 +674,14 @@ impl Calls {
             ));
         }
         let path = match admission.arguments.kind {
+            crate::network_replay::original_connect::Kind::Sendto => {
+                effect.send.as_ref()
+                    .ok_or_else(|| io::Error::other("Sendto completion lacks captured skb bytes"))?
+                    .validate(&effect)?;
+                matches!(state.pin, Some(OriginalPin::Socket {
+                    kind: libc::SOCK_STREAM, protocol: libc::IPPROTO_TCP, ..
+                })) && admission.arguments.kind.valid_counted_result(raw, admission.arguments.original_count)
+            }
             crate::network_replay::original_connect::Kind::EpollCtl => {
                 let history = state
                     .control_history
@@ -2742,6 +2756,50 @@ impl super::NetworkRuntimeResources {
         engine
             .publish_native_connected(owner, admission, root, &completed, now)
             .map_err(io::Error::other)
+    }
+
+    pub(crate) fn publish_native_sent(
+        &self,
+        engine: &mut crate::network_replay::NetworkReplayEngine,
+        admission: &OriginalAdmission,
+        grant: &crate::scheduler::ordinary_fd::OrdinaryFdObservation<'_>,
+        now: detcore_model::time::LogicalTime,
+    ) -> io::Result<()> {
+        let calls = self.shared.native_streams.lock().unwrap();
+        let call = calls.calls.get(&admission.call)
+            .ok_or_else(|| io::Error::other("Sendto publication lost actual Call"))?;
+        engine.publish_native_sent(admission, grant, &CompletedNativeSend { call }, now)
+            .map_err(io::Error::other)
+    }
+}
+
+/// Only a borrow of the real runtime Call can supply bytes to the V4 writer.
+pub(crate) struct CompletedNativeSend<'a> { call: &'a Call }
+impl CompletedNativeSend<'_> {
+    pub(crate) fn capture(&self, owner: NetworkStreamOwner, admission: &OriginalAdmission)
+        -> io::Result<&super::original_send::Capture>
+    {
+        let call = self.call;
+        let original = call.invocation.as_ref()
+            .ok_or_else(|| io::Error::other("Sendto invocation absent"))?;
+        let effect = original.completion.as_ref()
+            .ok_or_else(|| io::Error::other("Sendto completion absent"))?;
+        if call.owner != owner || call.id != admission.call || original.admission != *admission
+            || admission.arguments.kind != crate::network_replay::original_connect::Kind::Sendto
+            || call.acquisition.is_err() || call.terminal.is_some() || !call.releasing
+            || call.original.is_some() || !call.leases.is_empty()
+            || call.release.is_none_or(|r| r.original == Some(libc::EBADF))
+            || !original.retired || !original.close_queued || original.canceled
+            || original.terminating || original.terminal.is_some()
+            || original.prepared.map(|p| p.1) != Some(effect.original.selection.command)
+            || original.selection.as_ref() != Some(&effect.original.selection)
+        {
+            return Err(io::Error::other("Sendto publication lacks original return/retirement"));
+        }
+        let capture = effect.send.as_ref()
+            .ok_or_else(|| io::Error::other("Sendto capture absent"))?;
+        capture.validate(effect)?;
+        Ok(capture)
     }
 }
 

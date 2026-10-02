@@ -97,6 +97,24 @@ int ap_prepare_original_recvmsg(struct ap_session *s,int pidfd,u64 call,u64 mm,
     int fd,u64 header,u64 count,int flags,u64 *command) {
     return prepare_original_receive(s,pidfd,call,mm,fd,header,count,flags,AP_ORIGINAL_RECVMSG_CALL,command);
 }
+int ap_prepare_original_sendto(struct ap_session *s,int pidfd,u64 call,u64 mm,
+        int fd,u64 buffer,u64 count,int flags,u64 *command) {
+    if(!s || !command || !call || fd<0 || !buffer || !count || count>AP_STREAM_COPY_BYTES ||
+       !ap_stream_tx_flags((u32)flags))return invalid();
+#ifndef AP_FTRACE_PROVIDER
+    (void)pidfd;(void)mm;return unavailable();
+#else
+    if(enter_commands(s))return -1;
+    struct ap_task_command c={.operation=AP_ORIGINAL_SENDTO_CALL,.expected_object=call,
+        .generation_before=buffer,.generation_after=mm,.expected_level=fd,
+        .expected_option=flags,.original_count=count};
+    int rc=stream_copy_observer_ready(s);
+    if(!rc)rc=fd_accept_observer_ready(s);
+    if(!rc)rc=submit(s,pidfd,&c);
+    if(!rc)*command=c.command;
+    leave_commands(s);return rc;
+#endif
+}
 int ap_prepare_original_file(struct ap_session *s,int pidfd,u64 call,u64 mm,
                              int fd,int syscall_nr,int file_command,u64 *command) {
     if(!s || !command || !call || !ap_original_file_shape((u64)syscall_nr,file_command))return invalid();
@@ -378,7 +396,7 @@ int ap_retire_dead_original(struct ap_session *s,int pidfd,u64 command,
             /* Read's address union is private iterator/copy custody until its
              * actual exit. The terminal path has no such completion and must
              * neither export borrowed pointers nor invent a copy commit. */
-            if(ap_original_receive(p->submitted.operation))
+            if(ap_original_receive(p->submitted.operation) || p->submitted.operation==AP_ORIGINAL_SENDTO_CALL)
                 memset(retained.original.address,0,sizeof(retained.original.address));
         } else if(errno!=ENOENT)goto done;
     } else { errno=EPROTO;goto done; }
@@ -417,7 +435,8 @@ static int read_original_selection_locked(struct ap_session *s,int pidfd,u64 com
     if(result.command!=command || result.operation!=p->submitted.operation ||
        result.original_count!=p->submitted.original_count ||
        ((p->submitted.operation==AP_ORIGINAL_CLOSE || ap_original_file_operation(p->submitted.operation) ||
-         ap_original_receive(p->submitted.operation) || p->submitted.operation==AP_ORIGINAL_EPOLL_CTL || ap_original_allocator(p->submitted.operation)) &&
+         ap_original_receive(p->submitted.operation) || p->submitted.operation==AP_ORIGINAL_SENDTO_CALL ||
+         p->submitted.operation==AP_ORIGINAL_EPOLL_CTL || ap_original_allocator(p->submitted.operation)) &&
         result.identity.provider!=p->submitted.provider) ||
        (result.phase!=AP_COMMAND_RUNNING && result.phase!=AP_COMMAND_DONE) ||
        !result.task || !result.start_boottime) { unavailable();goto done; }
@@ -492,6 +511,10 @@ int ap_collect_original_connect(struct ap_session *s,int pidfd,u64 command,
         errno=EAGAIN;goto done;
     }
     if(ap_original_receive(p->submitted.operation) && stream_copy_observer_ready(s))goto done;
+    if(p->submitted.operation==AP_ORIGINAL_SENDTO_CALL) {
+        if(!p->stream_tx.committed) {errno=EAGAIN;goto done;}
+        if(stream_copy_observer_ready(s))goto done;
+    }
     if(!p->original_selected) { unavailable();goto done; }
     int map=fd_map(s,"fd_calls");if(map<0)goto done;
     struct ap_invocation_key key={.task=observed.task,.start=observed.start_boottime};
@@ -500,6 +523,12 @@ int ap_collect_original_connect(struct ap_session *s,int pidfd,u64 command,
     *original=first.original;
     if(first.command!=command || first.operation!=p->submitted.operation ||
        !ap_original_result_matches(&p->submitted,&observed,original)) { unavailable();goto done; }
+    if(operation==AP_ORIGINAL_SENDTO_CALL &&
+       (p->stream_tx.capture.returned!=observed.returned ||
+        p->stream_tx.capture.task!=observed.task || p->stream_tx.capture.task_start!=observed.start_boottime ||
+        memcmp(&p->stream_tx.capture.summary,&original->stream_tx.summary,sizeof(struct ap_stream_tx_summary)))) {
+        unavailable();goto done;
+    }
     atomic_thread_fence(memory_order_acquire);
     if(bpf_map_lookup_elem(map,&key,&second))goto done;
     *original=second.original;
@@ -534,6 +563,7 @@ static int fd_ack_call_row(struct ap_session *s,struct ap_pending_command *p) {
 }
 static int fd_ack_original(struct ap_session *s,struct ap_pending_command *p) {
     if(!ap_original_operation(p->submitted.operation))return 0;
+    if(p->submitted.operation==AP_ORIGINAL_SENDTO_CALL && !p->stream_tx.read) {errno=EPROTO;return -1;}
     if(ap_original_receive(p->submitted.operation) &&
        (!p->stream_copy.manifest_read || p->stream_copy.delivered!=p->stream_copy.count)) {
         errno=EPROTO;return -1;

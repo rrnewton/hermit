@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Included after the existing session/pending-command definitions. All ring
  * records remain with that command through its ordinary collect/ACK owner. */
+#include "stream-tx-driver.h"
 static int stream_copy_record(void *raw,void *bytes,size_t length) {
     struct ap_session *s=raw;
     if(length!=sizeof(struct ap_stream_copy_record)) {s->stream_copy_error=EPROTO;return -EPROTO;}
@@ -8,6 +9,10 @@ static int stream_copy_record(void *raw,void *bytes,size_t length) {
     if(!record->command || record->provider!=s->incarnation || !record->call ||
        !record->task || !record->task_start) {s->stream_copy_error=EPROTO;return -EPROTO;}
     struct ap_pending_command *p=&s->pending[ap_command_slot(record->command)];
+    if(p->submitted.operation==AP_ORIGINAL_SENDTO_CALL) {
+        if(stream_tx_record(p,record)) {s->stream_copy_error=EPROTO;return -EPROTO;}
+        return 0;
+    }
     struct ap_stream_copy_owned *copy=&p->stream_copy;
     if(p->state!=AP_SLOT_ACTIVE || p->submitted.command!=record->command ||
        !ap_original_receive(p->submitted.operation) ||
@@ -213,7 +218,7 @@ int ap_drain_original_copy(struct ap_session *s) {
  * records from other tasks cannot extend this Call's finite drain target.
  * A libbpf consume that stops at BUSY does not certify an empty ring. */
 static int stream_copy_terminal_ready(struct ap_session *s,struct ap_pending_command *p) {
-    if(!ap_original_receive(p->submitted.operation))return 1;
+    if(!ap_original_receive(p->submitted.operation) && p->submitted.operation!=AP_ORIGINAL_SENDTO_CALL)return 1;
     struct ring *ring=ring_buffer__ring(s->stream_copy_ring,0);
     if(!ring)return -1;
     struct ap_stream_copy_owned *copy=&p->stream_copy;

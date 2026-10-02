@@ -10,12 +10,17 @@ pub(super) use transport::Journal;
 use super::accepted_provider::FdEvent;
 use super::accepted_provider::FdStatus;
 
-// Same maximum unresolved population as AP_FD_JOURNAL. Reclamation requires
-// a future semantic publication receipt; never discard evidence to admit more.
+// Same maximum UNPUBLISHED population as AP_FD_JOURNAL. Completed history is
+// still retained verbatim for provenance/interference queries, not discarded.
 const MAX_RETAINED: usize = 128;
+// Historical raw records have a separate finite budget, matching the existing
+// network trace payload ceiling. Neither budget authorizes semantic retirement.
+const MAX_HISTORY_ROWS: usize = detcore_model::network_trace::MAX_NETWORK_TRACE_PAYLOAD_BYTES as usize
+    / std::mem::size_of::<FdEvent>();
 #[derive(Debug, Default)]
 pub(super) struct History {
     rows: BTreeMap<u64, FdEvent>,
+    published_through: u64,
     status: Option<FdStatus>,
     failed: Option<String>,
 }
@@ -73,6 +78,47 @@ fn clean(e: &FdEvent) -> bool {
     e.previous_file == 0 && e.accept_command == 0
 }
 impl History {
+    fn unpublished_len(&self) -> usize {
+        self.rows.range((std::ops::Bound::Excluded(self.published_through), std::ops::Bound::Unbounded)).count()
+    }
+    fn require_capacity(&self) -> io::Result<()> {
+        if self.unpublished_len() >= MAX_RETAINED {
+            return Err(invalid("unpublished journal capacity exhausted"));
+        }
+        if self.rows.len() >= MAX_HISTORY_ROWS {
+            return Err(invalid("retained physical history budget exhausted"));
+        }
+        Ok(())
+    }
+
+    /// Called only after existing semantic retirement at a quiescent sole-root
+    /// boundary. A transport ACK alone never reaches this method. Keep every
+    /// row, including old origins and interference, and leave incomplete kernel
+    /// callback relations charged to the unchanged unpublished limit.
+    pub(super) fn checkpoint_closed_prefix(&mut self) -> io::Result<()> {
+        require(self.failed.is_none())?;
+        let mut open = std::collections::BTreeSet::new();
+        let mut through = self.published_through;
+        for (&sequence, row) in self.rows.range((std::ops::Bound::Excluded(through), std::ops::Bound::Unbounded)) {
+            match row.kind {
+                1 | 4 | 10 | 12 | 14 | 17 | 20 => { open.insert(sequence); }
+                2 | 3 | 6 | 11 | 13 | 16 | 19 | 22 if row.dependency != 0 => {
+                    let begin = if row.kind == 13 && row.returned == 1 {
+                        self.row(row.dependency, 9)?.dependency
+                    } else {
+                        row.dependency
+                    };
+                    require(open.remove(&begin))?;
+                }
+                _ => {}
+            }
+            if open.is_empty() {
+                through = sequence;
+            }
+        }
+        self.published_through = through;
+        Ok(())
+    }
     pub(super) fn next(&self) -> io::Result<u64> {
         self.rows.last_key_value().map_or(Ok(1), |(n, _)| {
             n.checked_add(1)
@@ -89,9 +135,7 @@ impl History {
         if let Some(old) = self.rows.get(&row.sequence) {
             return require(old == &row && self.status.as_ref() == Some(&status));
         }
-        if self.rows.len() >= MAX_RETAINED {
-            return Err(invalid("unpublished journal capacity exhausted"));
-        }
+        self.require_capacity()?;
         let monotonic = self.status.as_ref().is_none_or(|old| {
             status.next_event >= old.next_event
                 && status.next_file >= old.next_file
@@ -1179,6 +1223,70 @@ mod tests {
         assert!(retain(&mut h, e).is_err());
         assert_eq!(h.rows.len(), 128);
         assert!(h.transition(1).is_ok());
+    }
+
+    #[test]
+    fn completed_history_checkpoint_preserves_old_origins_and_unpublished_limit() {
+        let mut h = History::default();
+        let (begin, end) = install(1, 2, 1);
+        retain(&mut h, begin).unwrap();
+        retain(&mut h, end).unwrap();
+        for id in 3..=128 {
+            let mut e = event(id, 7);
+            e.table = 0;
+            e.file = 2;
+            retain(&mut h, e).unwrap();
+        }
+        let original = h.transition(2).unwrap();
+        assert!(h.require_capacity().is_err());
+        h.checkpoint_closed_prefix().unwrap();
+        assert_eq!(h.published_through, 128);
+        assert_eq!(h.rows.len(), 128);
+        assert_eq!(h.unpublished_len(), 0);
+        for id in 129..=256 {
+            let mut e = event(id, 7);
+            e.table = 0;
+            e.file = 2;
+            retain(&mut h, e).unwrap();
+        }
+        assert_eq!(h.unpublished_len(), 128);
+        assert!(h.require_capacity().is_err());
+        assert_eq!(h.transition(2).unwrap(), original);
+        assert_eq!(h.unique_selection_origin(256, 1, 3, 1).unwrap().sequence, 1);
+        assert!(h.contains_command(7).unwrap());
+        h.checkpoint_closed_prefix().unwrap();
+        assert_eq!(h.rows.len(), 256);
+        assert_eq!(h.next().unwrap(), 257);
+        assert!(h.require_capacity().is_ok());
+    }
+
+    #[test]
+    fn history_checkpoint_keeps_interleaved_incomplete_callbacks_unpublished() {
+        let mut h = History::default();
+        let (first_begin, first_end) = install(1, 3, 1);
+        let (second_begin, mut second_end) = install(2, 4, 2);
+        second_end.fd = second_begin.fd;
+        retain(&mut h, first_begin).unwrap();
+        retain(&mut h, second_begin).unwrap();
+        retain(&mut h, first_end).unwrap();
+        h.checkpoint_closed_prefix().unwrap();
+        assert_eq!(h.published_through, 0);
+        assert_eq!(h.unpublished_len(), 3);
+        retain(&mut h, second_end).unwrap();
+        h.checkpoint_closed_prefix().unwrap();
+        assert_eq!(h.published_through, 4);
+        assert!(h.transition(3).unwrap().is_some());
+        assert!(h.transition(4).unwrap().is_some());
+
+        // Validation failure cannot be cleared by a later semantic boundary.
+        let mut bad = event(5, 7);
+        bad.table = 0;
+        bad.file = 1;
+        bad.complete = 0;
+        assert!(retain(&mut h, bad).is_err());
+        assert!(h.checkpoint_closed_prefix().is_err());
+        assert_eq!(h.published_through, 4);
+        assert_eq!(h.rows.len(), 5);
     }
 }
 

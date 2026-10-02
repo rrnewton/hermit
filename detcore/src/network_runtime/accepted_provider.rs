@@ -175,6 +175,8 @@ pub(super) struct OriginalEffect {
     pub socket: Option<super::installation_observation::Capture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_copy: Option<super::original_read_copy::Manifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send: Option<super::original_send::Capture>,
 }
 impl From<ffi::OriginalEffect> for OriginalEffect {
     fn from(raw: ffi::OriginalEffect) -> Self {
@@ -183,6 +185,7 @@ impl From<ffi::OriginalEffect> for OriginalEffect {
             original: raw.original.into(),
             socket: None,
             read_copy: None,
+            send: None,
         }
     }
 }
@@ -710,7 +713,7 @@ fn retained_identity_refusals(
         }
     } else if !matches!(
         expected_operation,
-        4 | 7 | 8 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 21 | 22 | 23
+        4 | 7 | 8 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 21 | 22 | 23 | 24
     ) {
         if raw.identity.object == 0 {
             refusals.push("identity.object=0".into());
@@ -842,6 +845,25 @@ fn acknowledge_response(
         }
         return serde_json::to_vec(&CommandAcknowledgement::NotCollected).map_err(io::Error::other);
     }
+    if expected_operation == 24 {
+        let Reply::OriginalEffect(observed) = &reply else {
+            return Err(io::Error::other("Sendto ACK lacks its actual capture"));
+        };
+        if observed.status.returned == 0 && observed.status.errno.is_none() {
+            let Request::CollectOriginalConnect { call, command, .. } = serde_json::from_slice(&envelope.body)? else {
+                return Err(io::Error::other("Sendto ACK changed its collection request"));
+            };
+            let owner = envelope.owner.filter(|_| envelope.accept.is_none())
+                .ok_or_else(|| io::Error::other("Sendto ACK lost exact Call owner"))?;
+            if observed.raw.original.selection.call != call
+                || observed.raw.command.command != command
+                || observed.raw.original.selection.owner_mm != owner.mm.generation()
+            { return Err(io::Error::other("Sendto ACK changed retained Call/command/MM")); }
+            observed.raw.send.as_ref()
+                .ok_or_else(|| io::Error::other("Sendto ACK preceded capture consumption"))?
+                .validate(&observed.raw)?;
+        }
+    }
     let auxiliary = match &reply {
         Reply::OriginalEffect(observed) if observed.raw.socket.is_some() => {
             if observed.status.returned != 0 || expected_operation != 12 {
@@ -885,7 +907,7 @@ fn acknowledge_response(
             }
         }
         Reply::OriginalEffect(observation)
-            if matches!(expected_operation, 7 | 9 | 10 | 11 | 12 | 18 | 19 | 20) =>
+            if matches!(expected_operation, 7 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 24) =>
         {
             Observation {
                 status: observation.status,
@@ -1503,6 +1525,23 @@ impl Provider {
                         session.wire_format().copy_version(),
                     )?;
                     observed.raw.read_copy = Some(manifest);
+                }
+                return serde_json::to_vec(&reply).map_err(io::Error::other);
+            }
+            if matches!(serde_json::from_slice::<Request>(&envelope.body),
+                Ok(Request::CollectOriginalConnect {
+                    kind: crate::network_replay::original_connect::Kind::Sendto, ..
+                }))
+            {
+                let mut reply: Reply = serde_json::from_slice(&bytes)?;
+                let Reply::OriginalEffect(ref mut observed) = reply else {
+                    return Err(io::Error::other("Sendto collection changed physical response"));
+                };
+                if observed.status.returned == 0 && observed.status.errno.is_none() {
+                    let capture: super::original_send::Capture = session
+                        .original_sendto_capture(observed.raw.command.command)?.into();
+                    capture.validate(&observed.raw)?;
+                    observed.raw.send = Some(capture);
                 }
                 return serde_json::to_vec(&reply).map_err(io::Error::other);
             }
@@ -2816,6 +2855,41 @@ mod close_ack_tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod original_send_ack_tests {
+    use super::*;
+    #[test]
+    fn original_send_ack_requires_the_retained_exact_capture() {
+        let thread = crate::types::DetTid::from_raw(61);
+        let owner = NetworkStreamOwner { thread, mm: crate::types::MmId::initial(thread) };
+        let envelope = Envelope {
+            run: [1;16], sequence: 3, owner: Some(owner), accept: None,
+            operation: Operation::CollectOriginalConnect,
+            body: serde_json::to_vec(&Request::CollectOriginalConnect {
+                kind: crate::network_replay::original_connect::Kind::Sendto,
+                call: 19, command: 17, prepared_request: 1,
+            }).unwrap(),
+        };
+        let (mut effect, capture) = super::super::original_send::tests::fixture(3);
+        let body = |raw| serde_json::to_vec(&Reply::OriginalEffect(Observation {
+            status: CallStatus { operation: "ap_collect_original_connect".into(), returned: 0, errno: None }, raw,
+        })).unwrap();
+        assert!(acknowledge_response(&envelope, &body(effect.clone()), 5, |_| panic!("missing capture ACK")).is_err());
+        effect.send = Some(capture.clone());
+        let mut calls = 0;
+        let ack = acknowledge_response(&envelope, &body(effect.clone()), 5, |raw| {
+            calls += 1;
+            assert_eq!((raw.command, raw.operation, raw.returned), (17, 24, 3));
+            ffi::CallStatus { operation: "ap_ack_command", returned: 0, errno: None }
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert!(matches!(serde_json::from_slice::<CommandAcknowledgement>(&ack).unwrap(),
+            CommandAcknowledgement::Observed(CallStatus { returned: 0, errno: None, .. })));
+        effect.send.as_mut().unwrap().returned = 4;
+        assert!(acknowledge_response(&envelope, &body(effect), 5, |_| panic!("mismatched capture ACK")).is_err());
     }
 }
 

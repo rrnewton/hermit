@@ -3,6 +3,7 @@
 #define HERMIT_PROVIDER_FD_EFFECTS_H
 #include "provider.h"
 #include "stream-copy.h"
+#include "stream-tx.h"
 
 /* These are physical receipts consumed by the existing FilesId/slot/OFD
  * authority. There is no descriptor-alias count or semantic FD table here.
@@ -102,7 +103,8 @@ static __attribute__((always_inline)) inline int ap_original_recv_operands(const
 static inline int ap_original_operation(u64 operation) {
     return operation==AP_ORIGINAL_CONNECT || operation==AP_ORIGINAL_CLOSE ||
         ap_original_file_operation(operation) || ap_original_receive(operation) ||
-        operation==AP_ORIGINAL_EPOLL_CTL || ap_original_allocator(operation);
+        operation==AP_ORIGINAL_EPOLL_CTL || ap_original_allocator(operation) ||
+        operation==AP_ORIGINAL_SENDTO_CALL;
 }
 #define AP_NATIVE_BIRTH 8
 /* Exact x86-64 syscall shape retained from the original Tool invocation. */
@@ -226,7 +228,7 @@ struct ap_original_result {
         struct ap_original_openat_installation opened;
         struct ap_original_epoll_installation epoll;
         struct ap_original_epoll_ctl epoll_ctl;
-        struct ap_stream_copy_state stream_copy; };
+        struct ap_stream_copy_state stream_copy; struct ap_stream_tx_state stream_tx; };
     u64 copy_entered, copy_returned, copy_remaining;
     u64 audit_entered, audit_returned;
     u64 security_entered, security_returned, complete, problem;
@@ -410,6 +412,8 @@ static __attribute__((always_inline)) inline int ap_original_selection_matches(
        s->fdput_flags>1 || (!s->file && s->fdput_flags))return 0;
     u64 operation=submitted->operation;
     if(operation==AP_ORIGINAL_READ)return !submitted->expected_option;
+    if(operation==AP_ORIGINAL_SENDTO_CALL)
+        return ap_stream_tx_command(submitted) && s->file && !s->fdput_flags;
     /* Actual protocol-entry selection has no fdget flag/phase issuer. */
     if(ap_original_recv(operation))
         return ap_original_copy_disposition(operation,submitted->expected_option) &&
@@ -635,6 +639,26 @@ static __attribute__((always_inline)) inline int ap_original_file_result_matches
 static __attribute__((always_inline)) inline int ap_original_result_matches(
     const struct ap_task_command *submitted,const struct ap_command_result *result,
     const struct ap_original_result *original) {
+    if(submitted && submitted->operation==AP_ORIGINAL_SENDTO_CALL) {
+        if(!result || !original || !ap_original_selection_matches(submitted,&original->selection) ||
+           result->command!=submitted->command || result->operation!=submitted->operation ||
+           result->phase!=AP_COMMAND_DONE || result->identity.provider!=submitted->provider ||
+           result->identity.object || result->identity.namespace || result->creation || result->cookie ||
+           result->reserved ||
+           result->task!=original->selection.task || result->start_boottime!=original->selection.task_start ||
+           result->original_count!=submitted->original_count || result->returned!=original->returned ||
+           original->complete!=1 || original->problem || original->reserved ||
+           original->copy_entered || original->copy_returned || original->copy_remaining ||
+           original->audit_entered || original->audit_returned || original->audit_result ||
+           original->security_entered || original->security_returned || original->security_result ||
+           !ap_stream_tx_summary_valid(&original->stream_tx.summary,original->selection.file,
+               submitted->original_count,original->returned))return 0;
+        for(u32 i=sizeof(struct ap_stream_tx_summary);i<sizeof(original->address);i++)
+            if(original->address[i])return 0;
+        const unsigned char *state=(const unsigned char *)&result->state;
+        for(u32 i=0;i<sizeof(result->state);i++)if(state[i])return 0;
+        return 1;
+    }
     if(submitted && submitted->operation==AP_ORIGINAL_EPOLL_CTL)
         return ap_original_epoll_ctl_result_matches(submitted,result,original);
     if(submitted && ap_original_allocator(submitted->operation))

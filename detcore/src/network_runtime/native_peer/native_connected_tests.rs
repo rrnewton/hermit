@@ -91,6 +91,7 @@ impl NetworkRuntimeResources {
         let mut effect = OriginalEffect {
             socket: None,
             read_copy: None,
+            send: None,
             command: ffi::CommandResult {
                 command: selection.command,
                 operation: 7,

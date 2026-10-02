@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use super::*;
 
 impl NetworkReplayEngine {
-    #[expect(dead_code, reason = "unintegrated entrypoint; no qualification claim")]
     pub(crate) fn validate_replay_transmit_read(
         &self,
         owner: NetworkStreamOwner,

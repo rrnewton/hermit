@@ -54,7 +54,10 @@
     "stream-copy-unit-exit.inc",
     "stream-copy-fault.h",
     "stream-copy-fault.inc",
-    "fd-session-dispatch.inc"
+    "fd-session-dispatch.inc",
+    "stream-tx.h",
+    "stream-tx.bpf.h",
+    "stream-tx-driver.h"
   ],
   "hooks": {
     "fixup_exception": [[8, 4, 8, 8], 4, 4],

@@ -409,6 +409,49 @@ fn native_replay_cross_channel_prefix_requires_actual_matching_output() {
     );
     e.finish().unwrap();
 }
+
+#[test]
+fn original_send_output_requires_exact_actual_prefix_or_negative_errno() {
+    let (output, progress) = original_send_output(9, 4, 3, b"abc").unwrap();
+    assert_eq!(output, NetworkOutputKindV2::StreamBytes { stream_offset: 9, bytes: b"abc".to_vec() });
+    assert_eq!(progress, NetworkProgressV4::StreamPrefix { exclusive_offset: 12 });
+    let (output, progress) = original_send_output(12, 5, -i64::from(libc::EAGAIN), b"").unwrap();
+    assert_eq!(output, NetworkOutputKindV2::SocketError { stream_offset: 12, errno: libc::EAGAIN });
+    assert_eq!(progress, NetworkProgressV4::OutputError { output_ordinal: 5 });
+    for (returned, bytes) in [(4, b"abc".as_slice()), (2, b"abc"), (0, b""), (-4096, b""), (-14, b"x")] {
+        assert!(original_send_output(0, 0, returned, bytes).is_err());
+    }
+}
+
+#[test]
+fn original_send_replay_limits_memory_to_accepted_prefix_and_preserves_mismatch() {
+    let mut trace = cross_channel();
+    trace.outputs.push(NetworkOutputEventV2 {
+        channel: NetworkChannelId(1), event: NetworkOutputKindV2::SocketError { stream_offset: 25, errno: libc::EAGAIN },
+    });
+    progress(&mut trace, 1, NetworkProgressV4::OutputError { output_ordinal: 1 }, &[6]);
+    let now = trace.epoch_global_time().unwrap();
+    let mut engine = NetworkReplayEngine::replay_native_receive(trace).unwrap();
+    let first = bind(&mut engine, 1);
+    let second = bind(&mut engine, 2);
+    connected(&mut engine, first, now);
+    connected(&mut engine, second, now);
+    let before = format!("{engine:?}");
+    assert_eq!(engine.transmit_stream_read_limit(first, 4096).unwrap(), 25);
+    assert_eq!(engine.transmit_stream_read_limit(first, 3).unwrap(), 3);
+    assert_eq!(format!("{engine:?}"), before, "planning is not output consumption");
+    assert!(engine.transmit_stream(first, b"bad").is_err());
+    assert_eq!(format!("{engine:?}"), before);
+    assert_eq!(engine.transmit_stream(first, b"012").unwrap(), StreamTransmitOutcome::Accepted(3));
+    assert_eq!(engine.transmit_stream_read_limit(first, 4096).unwrap(), 22);
+    assert_eq!(engine.transmit_stream(first, b"3456789012345678901234").unwrap(), StreamTransmitOutcome::Accepted(22));
+    assert_eq!(engine.transmit_stream_read_limit(first, 4096).unwrap(), 0, "error result touches no guest payload");
+    assert_eq!(engine.transmit_stream(first, b"").unwrap(), StreamTransmitOutcome::Error(libc::EAGAIN));
+    assert!(engine.transmit_stream_read_limit(first, 1).is_err());
+    engine.release_eligible(now).unwrap();
+    assert_eq!(engine.receive_stream(second, 5, false).unwrap(), StreamReceiveOutcome::Bytes(b"reply".to_vec()));
+    engine.finish().unwrap();
+}
 #[test]
 fn native_replay_zero_datagram_advances_whole_packet_without_byte_progress() {
     let mut t = empty();

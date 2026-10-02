@@ -1412,6 +1412,9 @@ static void ecs_publish(struct ap_command_result *r) {
 static int fd_original_recv_syscall_entered(u64 *ctx,const struct ap_task_command *c) {
     (void)ctx;(void)c;assert(!"receive path outside epoll callback fixture");return -1;
 }
+static int fd_original_sendto_syscall_entered(u64 *ctx,const struct ap_task_command *c) {
+    (void)ctx;(void)c;assert(!"send path outside epoll callback fixture");return -1;
+}
 #include "epoll-ctl-copy.bpf.h"
 #undef pt_regs
 #undef task_struct

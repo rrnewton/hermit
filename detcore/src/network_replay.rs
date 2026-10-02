@@ -5252,6 +5252,28 @@ impl NetworkReplayEngine {
         outcome
     }
 
+    /// Inspect the next accepted prefix before touching the original guest
+    /// buffer. This consumes nothing; transmit_stream still checks every byte
+    /// and advances the same queue exactly once under the foreground turn.
+    pub(crate) fn transmit_stream_read_limit(
+        &self, open_file: OpenFileId, requested: usize,
+    ) -> Result<usize, NetworkReplayError> {
+        if self.mode() != NetworkEngineMode::Replay { return Err(NetworkReplayError::WrongMode); }
+        let channel = self.bound_channel(open_file)?;
+        let state = self.channels.get(&channel).ok_or(NetworkReplayError::UnknownChannel(channel))?;
+        if state.transport.is_datagram() || state.local_write_closed {
+            return Err(NetworkReplayError::TransportMismatch(channel));
+        }
+        match state.outbound.front() {
+            Some(OutboundOutcome::Error { stream_offset, .. }) if *stream_offset == state.transmitted => Ok(0),
+            Some(OutboundOutcome::Stream { ancillary: Some(_), .. }) => Err(NetworkReplayError::AncillaryRequiresMessageIo(channel)),
+            Some(OutboundOutcome::Stream { bytes, consumed, .. }) => Ok(requested.min(bytes.len() - *consumed)),
+            Some(_) => Err(NetworkReplayError::OperationOrderMismatch(channel)),
+            None if requested == 0 => Ok(0),
+            None => Err(NetworkReplayError::TraceExhausted(channel)),
+        }
+    }
+
     /// Validate one stream `sendmsg(2)` fragment and its ancillary metadata.
     pub fn transmit_stream_message(
         &mut self,

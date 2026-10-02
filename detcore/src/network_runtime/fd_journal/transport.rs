@@ -24,6 +24,17 @@ pub(in crate::network_runtime) struct Journal {
     failure: Option<String>,
 }
 impl Journal {
+    /// The runtime invokes this only after its existing semantic quiescence
+    /// checks. A canceled/failed transport read is not a completed prefix.
+    pub(in crate::network_runtime) fn checkpoint_after_semantic_retirement(&mut self) -> io::Result<()> {
+        if self.pending.is_some() || self.failure.is_some()
+            || self.final_request.is_some() || self.finished
+        {
+            return Err(io::Error::other("journal checkpoint has unresolved transport or terminal state"));
+        }
+        self.history.checkpoint_closed_prefix()
+    }
+
     pub(in crate::network_runtime) fn history(&self) -> &History {
         &self.history
     }
@@ -53,9 +64,7 @@ impl Journal {
             return Err(io::Error::other("invalid journal observation phase"));
         }
         while self.history.next()? <= end {
-            if self.history.rows.len() >= super::MAX_RETAINED {
-                return Err(io::Error::other("unpublished journal capacity exhausted"));
-            }
+            self.history.require_capacity()?;
             let ordinal = self.history.next()?;
             let pending = self.pending.get_or_insert(Pending { ordinal, owner });
             if pending.ordinal != ordinal {
@@ -158,6 +167,25 @@ mod tests {
     use super::super::super::accepted_transport::AcceptedSession;
     use super::super::super::accepted_transport::Received;
     use super::*;
+    #[test]
+    fn journal_checkpoint_refuses_unresolved_or_terminal_transport() {
+        let thread = crate::types::DetTid::from_raw(31);
+        let owner = NetworkStreamOwner { thread, mm: crate::types::MmId::initial(thread) };
+        for case in 0..4 {
+            let mut journal = Journal::default();
+            match case {
+                0 => journal.pending = Some(Pending { ordinal: 1, owner }),
+                1 => journal.failure = Some("retained failure".into()),
+                2 => journal.final_request = Some(1),
+                _ => journal.finished = true,
+            }
+            let before = format!("{journal:?}");
+            assert!(journal.checkpoint_after_semantic_retirement().is_err());
+            assert_eq!(format!("{journal:?}"), before);
+        }
+        Journal::default().checkpoint_after_semantic_retirement().unwrap();
+    }
+
     #[test]
     fn cancelled_journal_wait_recovers_exact_request_and_final_retirement() {
         let mut fds = [-1; 2];

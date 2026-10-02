@@ -27,6 +27,7 @@ static __attribute__((noinline)) int stream_copy_fault_arm(struct ap_fd_call *,s
 #include "stream-copy-custody.inc"
 
 #include "stream-copy-problem.inc"
+#include "stream-tx.bpf.h"
 
 static __attribute__((noinline)) struct ap_fd_call *stream_copy_call(void) {
     struct ap_task_command *c=command();

@@ -10,6 +10,91 @@ pub(super) enum EpollCtlTurn {
 }
 
 impl GlobalState {
+    pub(crate) fn replay_sendto_read_limit<T>(
+        &self, tid: Tid, state: &crate::tool_local::ThreadState<T>,
+        read: &crate::network_replay::NetworkFdReadAdmission, requested: usize,
+    ) -> Result<usize, NetworkRpcError> {
+        let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
+        let owner = NetworkStreamOwner { thread: state.dettid, mm: state.mm_id };
+        let runtime = self.network_runtime.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto Replay runtime absent"))?;
+        let root = runtime.foreground_root(owner).map_err(|e| fail(&e))?;
+        let scheduler = self.sched.lock().unwrap();
+        scheduler.foreground_native_observation(owner, &root).map_err(|e| fail(&e))?;
+        if !self.cfg.sequentialize_threads || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+            || tid.as_raw() != root.association().process() || state.detpid != Some(owner.thread)
+            || !root.matches_memory(&state.memory_metadata) || !root.matches_metadata(&state.file_metadata)
+        {
+            return Err(NetworkRpcError::internal("Sendto Replay lost exact Normal owner/MM"));
+        }
+        let mut metadata = state.file_metadata.lock().unwrap();
+        let engine = self.network_engine.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto Replay engine absent"))?.lock().unwrap();
+        let open_file = engine.validate_replay_transmit_read(owner, read, &state.file_metadata, &mut metadata).map_err(|e| fail(&e))?;
+        engine.transmit_stream_read_limit(open_file, requested).map_err(|e| fail(&e))
+    }
+
+    async fn begin_foreground_original_send(
+        &self, owner: NetworkStreamOwner,
+        arguments: crate::network_replay::original_connect::Arguments,
+    ) -> Result<(Admission, std::os::fd::OwnedFd), NetworkRpcError> {
+        let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
+        if !self.cfg.sequentialize_threads {
+            return Err(NetworkRpcError::internal("original Sendto requires strict foreground scheduling"));
+        }
+        let runtime = self.network_runtime.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto runtime absent"))?;
+        let shared = self.network_engine.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto engine absent"))?;
+        let root = runtime.foreground_root(owner).map_err(|e| fail(&e))?;
+        let actual = root.metadata().map_err(|e| fail(&e))?;
+        let epoch = {
+            let scheduler = self.sched.lock().unwrap();
+            scheduler.foreground_native_observation(owner, &root).map_err(|e| fail(&e))?.epoch()
+        };
+        let task = runtime.prepare_native_capture_task(owner).map_err(|e| fail(&e))?;
+        let joined = runtime.join_foreground_prefix(root.clone()).await.map_err(|e| fail(&e))?;
+        let scheduler = self.sched.lock().unwrap();
+        let grant = scheduler.foreground_native_observation(owner, &root).map_err(|e| fail(&e))?;
+        if grant.epoch() != epoch || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm) {
+            return Err(NetworkRpcError::internal("Sendto entry changed original Normal grant/MM"));
+        }
+        let metadata = actual.lock().unwrap();
+        let mut engine = shared.lock().unwrap();
+        engine.validate_fd_metadata(owner, arguments.files, &actual, &metadata).map_err(|e| fail(&e))?;
+        engine.validate_native_sendto(&arguments).map_err(|e| fail(&e))?;
+        let admission = runtime.with_foreground_prefix(&joined, |prefix| {
+            let admission = engine.begin_original_connect(owner, arguments).map_err(std::io::Error::other)?;
+            let stamped = (|| {
+                let mut attempt = engine.begin_native_entry_stamp(owner, admission.call)?;
+                let _retained = attempt.retain_unsubmitted_recovery(&joined)?;
+                engine.stamp_native_receive_entry(attempt, prefix, &grant, self.global_time.lock().unwrap().as_nanos())
+            })();
+            if let Err(error) = stamped {
+                // This synchronous prefix borrow excludes all native workers
+                // and Calls. No pin or provider submission has occurred.
+                engine.abort_original_before_provider(owner, &admission).map_err(std::io::Error::other)?;
+                return Err(std::io::Error::other(error));
+            }
+            Ok(admission)
+        }).map_err(|e| fail(&e))?;
+        Ok((admission, task))
+    }
+
+    pub(crate) fn publish_foreground_native_sent<T>(
+        &self, tid: Tid, state: &crate::tool_local::ThreadState<T>, admission: &Admission,
+    ) -> Result<(), NetworkRpcError> {
+        let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
+        let owner = NetworkStreamOwner { thread: state.dettid, mm: state.mm_id };
+        let runtime = self.network_runtime.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto runtime absent"))?;
+        let root = runtime.foreground_root(owner).map_err(|e| fail(&e))?;
+        let scheduler = self.sched.lock().unwrap();
+        let grant = scheduler.foreground_native_observation(owner, &root).map_err(|e| fail(&e))?;
+        if !self.cfg.sequentialize_threads || tid.as_raw() != root.association().process()
+            || state.detpid != Some(owner.thread) || !root.matches_memory(&state.memory_metadata)
+            || !root.matches_metadata(&state.file_metadata)
+            || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+        { return Err(NetworkRpcError::internal("Sendto publication changed actual root/MM")); }
+        let mut engine = self.network_engine.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto engine absent"))?.lock().unwrap();
+        runtime.publish_native_sent(&mut engine, admission, &grant, self.global_time.lock().unwrap().as_nanos()).map_err(|e| fail(&e))
+    }
+
     /// Scheduler authority for the two sides of the existing local syscall
     /// continuation. It is neither native completion nor selected-file proof.
     pub(super) fn require_original_epoll_ctl_turn(
@@ -160,6 +245,15 @@ impl GlobalState {
         };
         if let Some((arguments, read, source)) = begin {
             let recorded = source == crate::OriginalFileExecution::Recorded;
+            if arguments.kind == crate::network_replay::original_connect::Kind::Sendto {
+                if recorded || emulated || read.is_some() {
+                    return Err(NetworkRpcError::internal("Sendto cannot borrow a recorded/external producer"));
+                }
+                let (admission, task) = self.begin_foreground_original_send(owner, arguments.clone()).await?;
+                runtime.expect("Sendto entry required runtime")
+                    .prepare_original_connect(owner, admission.clone(), task, publication).await.map_err(physical)?;
+                return Ok(NetworkReply::OriginalConnectAdmission(admission));
+            }
             if !recorded
                 && !emulated
                 && arguments.kind == crate::network_replay::original_connect::Kind::Connect
@@ -398,6 +492,11 @@ impl GlobalState {
                         "original Connect lost owner before invocation admission",
                     ));
                 }
+                if admission.arguments.kind == crate::network_replay::original_connect::Kind::Sendto {
+                    let root = runtime.foreground_root(owner).map_err(physical)?;
+                    let grant = sched.foreground_native_observation(owner, &root).map_err(|e| NetworkRpcError::internal(e.to_string()))?;
+                    publication.engine().lock().unwrap().validate_native_foreground_call(admission.call, &grant, self.global_time.lock().unwrap().as_nanos()).map_err(fail)?;
+                }
                 publication
                     .engine()
                     .lock()
@@ -462,6 +561,10 @@ impl GlobalState {
             NetworkRequest::NativeRetireOriginalConnect { .. } => {
                 runtime
                     .retire_original_connect(owner, admission, &publication)
+                    .map_err(physical)?;
+                runtime
+                    .checkpoint_completed_original_history(owner, &publication)
+                    .await
                     .map_err(physical)?;
                 Ok(NetworkReply::Unit)
             }
@@ -552,6 +655,19 @@ impl GlobalState {
                 return Err("original Connect local admission changed");
             }
             if event == reverie::InjectedSyscallEvent::Prepared {
+                if local.arguments.kind == crate::network_replay::original_connect::Kind::Sendto {
+                    let runtime = self.network_runtime.as_ref().ok_or("Sendto runtime absent")?;
+                    let root = runtime.foreground_root(owner).map_err(|_| "Sendto root absent")?;
+                    let sched = self.sched.lock().unwrap();
+                    let grant = sched.foreground_native_observation(owner, &root).map_err(|_| "Sendto lost original Normal grant")?;
+                    if !root.matches_memory(&state.memory_metadata) || !root.matches_metadata(&state.file_metadata)
+                        || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+                        || raw[4] != 0 || raw[5] != 0
+                    { return Err("Sendto Prepared changed actual metadata/destination"); }
+                    self.network_engine.as_ref().ok_or("Sendto engine absent")?.lock().unwrap()
+                        .validate_native_foreground_call(admission.call, &grant, self.global_time.lock().unwrap().as_nanos())
+                        .map_err(|_| "Sendto Prepared changed entry frontier")?;
+                }
                 self.prepare_foreground_epoll_observation(owner, admission, state)
                     .map_err(|_| "foreground ctl changed actual grant/memory/FD preparation")?;
                 if local.arguments.kind.allocator()

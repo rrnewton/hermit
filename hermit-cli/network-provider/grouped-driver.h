@@ -48,6 +48,9 @@ static u64 grouped_session_address(u64 cookie,u64 anchor) {
     case AP_FDUPFD_ALLOC_COOKIE:image=0xffffffff821ba580ULL;break;
     case AP_EPOLL_CTL_COOKIE:image=0xffffffff81fb1ca0ULL;break;
     case AP_SHARED_FDGET_COOKIE:image=0xffffffff81fb0190ULL;break;
+    case AP_STREAM_TX_COOKIE:image=AP_STREAM_TX_IMAGE;break;
+    case AP_STREAM_TX_LOCK_COOKIE:image=AP_STREAM_TX_LOCK_IMAGE;break;
+    case AP_STREAM_TX_UNLOCK_COOKIE:image=AP_STREAM_TX_UNLOCK_IMAGE;break;
     case AP_FILE_FDGET_COOKIE:image=0xffffffff81faaca0ULL;break;
     case AP_READ_FDGET_COOKIE:image=0xffffffff81faede0ULL;break;
     default:return 0;

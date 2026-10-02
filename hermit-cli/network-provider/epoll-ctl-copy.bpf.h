@@ -193,6 +193,7 @@ static __attribute__((noinline)) int fd_epoll_ctl_entered(struct pt_regs *regs,
 SEC("tp_btf/sys_enter") int fd_epoll_ctl_syscall_entered(u64 *ctx) {
     struct ap_task_command *c=command();if(!c)return 0;
     if(ap_original_recv(c->operation))return fd_original_recv_syscall_entered(ctx,c);
+    if(c->operation==AP_ORIGINAL_SENDTO_CALL)return fd_original_sendto_syscall_entered(ctx,c);
     if(c->operation!=AP_EPOLL_CTL_COPY && c->operation!=AP_ORIGINAL_EPOLL_CTL)return 0;
     struct pt_regs *regs=(struct pt_regs *)ctx[0];
     if((s64)ctx[1]!=AP_EPOLL_CTL_SYSCALL)return 0; /* unrelated private syscall */

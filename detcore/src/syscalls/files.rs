@@ -141,6 +141,36 @@ fn check_native_pipe_pair(
     }
     Ok(())
 }
+
+fn local_stream_socketpair_shape(call: syscalls::Socketpair) -> bool {
+    call.family() == libc::AF_UNIX
+        && call.r#type() & !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) == libc::SOCK_STREAM
+        && call.protocol() == 0
+}
+
+fn check_native_local_socket_pair(
+    flags: i32,
+    stats: &[libc::stat; 2],
+    status: [i64; 2],
+    descriptor: [i64; 2],
+    profile: [[i32; 3]; 2],
+) -> Result<(), Error> {
+    // Unlike a pipe, a Unix pair has two different socket inodes. Its pair
+    // provenance is the successful two-result allocation under the complete
+    // sole-root table permit; these getters cannot establish arbitrary peers.
+    let expected = i64::from(libc::O_RDWR | (flags & libc::SOCK_NONBLOCK));
+    let cloexec = if flags & libc::SOCK_CLOEXEC != 0 { i64::from(libc::FD_CLOEXEC) } else { 0 };
+    if stats.iter().any(|s| s.st_mode & libc::S_IFMT != libc::S_IFSOCK)
+        || stats[0].st_dev != stats[1].st_dev
+        || stats[0].st_ino == stats[1].st_ino
+        || status != [expected; 2]
+        || descriptor != [cloexec; 2]
+        || profile != [[libc::AF_UNIX, libc::SOCK_STREAM, 0]; 2]
+    {
+        return Err(Error::Tool(anyhow::anyhow!("native socketpair changed its two local stream profiles/flags")));
+    }
+    Ok(())
+}
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-2150): Review timer-slack procfs parsing,
 // per-operation target checks, and scalar/vector I/O emulation.
@@ -4036,10 +4066,63 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             call
         };
-        let res = self.record_or_replay(guest, call2).await?;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3464): Reuse the exact two-result table owner;
+        // no scalar Socket receipt, peer lookup, or guest-memory pre-read.
+        // https://github.com/rrnewton/hermit/pull/3464
+        let tracked = self.network_fd_tracking_active(guest);
+        if tracked && (!local_stream_socketpair_shape(call)
+            || self.record_or_replay.original_file_execution(call2.into()) != crate::OriginalFileExecution::Native)
+        {
+            return Err(Error::Tool(anyhow::anyhow!("tracked socketpair requires its original local stream allocation")));
+        }
+        let admission = if tracked {
+            self.begin_network_fd_mutation(guest,
+                crate::network_replay::NetworkFdMutationKind::SocketPair {
+                    cloexec: call.r#type() & libc::SOCK_CLOEXEC != 0,
+                }).await?
+        } else { None };
+        let res = match self.record_or_replay(guest, call2).await {
+            Ok(res) => res,
+            Err(errno) => return self.observe_network_fd_result(guest, admission.as_ref(), Err(errno)).await,
+        };
         if let Some(usockvec) = call.usockvec() {
-            let memory = guest.memory();
-            let fds: [i32; 2] = memory.read_value(usockvec)?;
+            let fds: [i32; 2] = guest.memory().read_value(usockvec).map_err(|error| {
+                if admission.is_some() {
+                    Error::Tool(anyhow::anyhow!("successful socketpair output read failed with retained custody: {error}"))
+                } else { error.into() }
+            })?;
+            if let Some(admission) = &admission {
+                self.observe_network_pipe_result(guest, admission, res, fds).await?;
+                let checked = async {
+                    let stats = [self.inject_fstat(guest, fds[0]).await?, self.inject_fstat(guest, fds[1]).await?];
+                    let mut status = [0; 2];
+                    let mut descriptor = [0; 2];
+                    let mut profile = [[0; 3]; 2];
+                    for (index, fd) in fds.into_iter().enumerate() {
+                        status[index] = guest.inject(syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL)).await?;
+                        descriptor[index] = guest.inject(syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFD)).await?;
+                        for (at, option) in [libc::SO_DOMAIN, libc::SO_TYPE, libc::SO_PROTOCOL].into_iter().enumerate() {
+                            profile[index][at] = super::network_io::read_socket_i32(guest, fd, option).await?;
+                        }
+                    }
+                    check_native_local_socket_pair(call2.r#type(), &stats, status, descriptor, profile)?;
+                    Ok::<_, Error>(stats)
+                }.await.map_err(|error| Error::Tool(anyhow::anyhow!(
+                    "successful socketpair identity check failed with retained table custody: {error}")))?;
+                let owner = guest.thread_state().dettid;
+                {
+                    let mut metadata = guest.thread_state().file_metadata.lock().unwrap();
+                    for (fd, stat) in fds.into_iter().zip(checked) {
+                        metadata.add_local_socket_pair_fd(owner, fd, oflag_from_sock_bits(call.r#type()),
+                            guest.config().virtualize_metadata.then(|| stat.into()))?;
+                    }
+                }
+                self.maybe_set_nonblocking_fd(guest, fds[0]);
+                self.maybe_set_nonblocking_fd(guest, fds[1]);
+                self.complete_network_pipe_installation(guest, admission).await?;
+                return Ok(res);
+            }
 
             // Logical flags are as requested:
             self.add_fd(
@@ -4063,6 +4146,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             self.maybe_set_nonblocking_fd(guest, fds[0]);
             self.maybe_set_nonblocking_fd(guest, fds[1]);
+        } else if admission.is_some() {
+            return Err(Error::Tool(anyhow::anyhow!("successful socketpair lost its output address")));
         }
         Ok(res)
     }
@@ -5040,6 +5125,63 @@ mod test {
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
     use super::pipe_capacity_request_exceeds_ceiling;
+    #[test]
+    fn local_socket_pair_checks_actual_unix_stream_profiles_and_flags() {
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        for flags in [0, libc::SOCK_NONBLOCK, libc::SOCK_CLOEXEC,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC] {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX,
+                libc::SOCK_STREAM | flags, 0, fds.as_mut_ptr()) }, 0);
+            let owners = fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+            let mut stats: [libc::stat; 2] = unsafe { std::mem::zeroed() };
+            let stat_results = std::array::from_fn::<_, 2, _>(|i| unsafe {
+                libc::fstat(fds[i], &mut stats[i]) });
+            let status = fds.map(|fd| i64::from(unsafe { libc::fcntl(fd, libc::F_GETFL) }));
+            let descriptor = fds.map(|fd| i64::from(unsafe { libc::fcntl(fd, libc::F_GETFD) }));
+            let mut profile = [[-1; 3]; 2];
+            let mut option_results = [[(-1, 0); 3]; 2];
+            for (i, fd) in fds.into_iter().enumerate() {
+                for (j, name) in [libc::SO_DOMAIN, libc::SO_TYPE, libc::SO_PROTOCOL].into_iter().enumerate() {
+                    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+                    let result = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, name,
+                        (&mut profile[i][j] as *mut i32).cast(), &mut length) };
+                    option_results[i][j] = (result, length);
+                }
+            }
+            // All original endpoints are closed before profile acceptance.
+            drop(owners);
+            assert_eq!(stat_results, [0, 0]);
+            assert_eq!(option_results, [[(0, std::mem::size_of::<i32>() as libc::socklen_t); 3]; 2]);
+            super::check_native_local_socket_pair(flags, &stats, status, descriptor, profile).unwrap();
+            assert!(super::local_stream_socketpair_shape(reverie::syscalls::Socketpair::new()
+                .with_family(libc::AF_UNIX).with_type(libc::SOCK_STREAM | flags).with_protocol(0)));
+            for changed in [
+                [[libc::AF_INET, libc::SOCK_STREAM, 0], profile[1]],
+                [profile[0], [libc::AF_UNIX, libc::SOCK_DGRAM, 0]],
+                [profile[0], [libc::AF_UNIX, libc::SOCK_STREAM, libc::IPPROTO_TCP]],
+            ] {
+                assert!(super::check_native_local_socket_pair(flags, &stats, status, descriptor, changed).is_err());
+            }
+            let mut changed = stats;
+            changed[1].st_ino = changed[0].st_ino;
+            assert!(super::check_native_local_socket_pair(flags, &changed, status, descriptor, profile).is_err());
+            changed = stats;
+            changed[1].st_mode = libc::S_IFIFO;
+            assert!(super::check_native_local_socket_pair(flags, &changed, status, descriptor, profile).is_err());
+            changed = stats;
+            changed[1].st_dev = changed[0].st_dev.wrapping_add(1);
+            assert!(super::check_native_local_socket_pair(flags, &changed, status, descriptor, profile).is_err());
+            for changed in [[-1, status[1]], [status[0] ^ i64::from(libc::O_NONBLOCK), status[1]],
+                [i64::from(libc::O_RDONLY), status[1]]] {
+                assert!(super::check_native_local_socket_pair(flags, &stats, changed, descriptor, profile).is_err());
+            }
+            assert!(super::check_native_local_socket_pair(flags, &stats, status,
+                [descriptor[0], descriptor[1] ^ i64::from(libc::FD_CLOEXEC)], profile).is_err());
+        }
+    }
+
     #[test]
     fn pipe_pair_checks_actual_fifo_identity_access_order_and_flags() {
         use std::os::fd::FromRawFd;

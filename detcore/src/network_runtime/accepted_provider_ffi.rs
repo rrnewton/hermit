@@ -221,6 +221,23 @@ pub struct OriginalEffect {
     pub command: CommandResult,
     pub original: OriginalResult,
 }
+/// Exact op24 provider output, never a guest-memory snapshot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginalSendCapture {
+    pub provider: u64,
+    pub command: u64,
+    pub call: u64,
+    pub task: u64,
+    pub task_start: u64,
+    pub returned: i64,
+    pub summary: [u64; 8],
+    pub bytes: [u8; 512],
+}
+impl Default for OriginalSendCapture {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+const _: () = assert!(std::mem::size_of::<OriginalSendCapture>() == 624);
 /// Exact physical cleanup evidence, not an observed syscall result.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -603,6 +620,10 @@ struct Api {
     ) -> c_int,
     prepare_original_read:
         unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, u64, *mut u64) -> c_int,
+    prepare_original_sendto:
+        unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, u64, c_int, *mut u64) -> c_int,
+    original_sendto_capture:
+        unsafe extern "C" fn(SessionPtr, u64, *mut OriginalSendCapture) -> c_int,
     prepare_original_connect:
         unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, c_int, *mut u64) -> c_int,
     read_original_selection:
@@ -894,6 +915,14 @@ impl Library {
                     u64,
                     *mut u64,
                 ) -> c_int
+            ),
+            prepare_original_sendto: symbol!(
+                "ap_prepare_original_sendto",
+                unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, u64, c_int, *mut u64) -> c_int
+            ),
+            original_sendto_capture: symbol!(
+                "ap_original_sendto_capture",
+                unsafe extern "C" fn(SessionPtr, u64, *mut OriginalSendCapture) -> c_int
             ),
             prepare_original_close: symbol!(
                 "ap_prepare_original_close",
@@ -1675,6 +1704,25 @@ impl Session {
             status: CallStatus::capture("ap_prepare_original_read", rc),
             raw,
         }
+    }
+
+    pub fn prepare_original_sendto(
+        &mut self, target: BorrowedFd<'_>, call: u64, mm: u64,
+        operands: (i32, u64, u64, i32),
+    ) -> Observation<u64> {
+        let (fd, buffer, count, flags) = operands;
+        let mut raw = 0;
+        let rc = unsafe { (self.library.api.prepare_original_sendto)(
+            self.pointer(), target.as_raw_fd(), call, mm, fd, buffer, count, flags, &mut raw
+        ) };
+        Observation { status: CallStatus::capture("ap_prepare_original_sendto", rc), raw }
+    }
+
+    pub(super) fn original_sendto_capture(&mut self, command: u64) -> io::Result<OriginalSendCapture> {
+        let mut raw = OriginalSendCapture::default();
+        let rc = unsafe { (self.library.api.original_sendto_capture)(self.pointer(), command, &mut raw) };
+        if rc != 0 { return Err(io::Error::last_os_error()); }
+        Ok(raw)
     }
 
     pub fn cancel_uninvoked_birth(&mut self, pin: BorrowedFd<'_>, command: u64) -> CallStatus {

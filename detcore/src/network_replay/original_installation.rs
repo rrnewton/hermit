@@ -53,6 +53,13 @@ pub(crate) fn socket_installation_flags(creation_flags: i32) -> OFlag {
         | OFlag::from_bits_truncate(creation_flags & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
 }
 
+/// The allocation-only IPv6 capability check used by curl. This is not UDP
+/// transport admission; even other legal creation flags remain outside this
+/// initial operation profile.
+pub(crate) fn is_udp6_capability_probe(domain: i32, socket_type: i32, protocol: i32) -> bool {
+    domain == libc::AF_INET6 && socket_type == libc::SOCK_DGRAM && protocol == libc::IPPROTO_IP
+}
+
 /// Kernel-observed file class/status joined to an original Openat installation.
 /// The runtime authenticates its held file before the synchronous publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +392,11 @@ impl NetworkReplayEngine {
                     return Err(protocol(
                         "original Socket enrollment differs from its actual creation tuple",
                     ));
+                }
+                if !receipt.removed_before_publication()
+                    && is_udp6_capability_probe(args.fd, args.address as u32 as i32, args.length)
+                {
+                    candidate.restrict_network_capability_probe(binding).map_err(protocol)?;
                 }
                 EnrollmentKind::Socket(fresh)
             }
@@ -844,6 +856,15 @@ mod tests {
         NetworkFdMutationAdmission,
         Admission,
     ) {
+        setup_socket(libc::AF_INET, libc::SOCK_STREAM, 0)
+    }
+    fn setup_socket(domain: i32, socket_type: i32, protocol: i32) -> (
+        NetworkReplayEngine,
+        NetworkStreamOwner,
+        Arc<Mutex<FileMetadata>>,
+        NetworkFdMutationAdmission,
+        Admission,
+    ) {
         let thread = DetTid::from_raw(31);
         let owner = NetworkStreamOwner {
             thread,
@@ -871,9 +892,9 @@ mod tests {
             operation: ExternalOpId::new(thread, 10),
             files,
             binding: None,
-            fd: libc::AF_INET,
-            address: libc::SOCK_STREAM as u64,
-            length: 0,
+            fd: domain,
+            address: u64::from(socket_type as u32),
+            length: protocol,
             original_count: 0,
         };
         assert!(engine.begin_original_connect(owner, args.clone()).is_err());
@@ -1205,6 +1226,53 @@ mod tests {
         engine.stream_owner_gone(owner);
         engine.finish_fd_mutations().unwrap();
         assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+    }
+
+    #[test]
+    fn udp6_capability_probe_original_publication_restricts_exact_live_binding() {
+        let (mut engine, owner, actual, mutation, admission) =
+            setup_socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        complete(&mut engine, owner, &admission, 17);
+        let receipt = installation_fixture(owner, actual.clone(), mutation.publication.permit,
+            Source::Socket(admission.call), 71, 17, false);
+        engine.confirm_fd_mutation_result(owner, mutation.publication.permit, Ok(17)).unwrap();
+        let binding = engine.publish_original_installation(owner, &mutation.publication, &receipt,
+            (&actual, &mut actual.lock().unwrap()), (OFlag::O_RDWR, None, None), LogicalTime::ZERO).unwrap();
+        assert!(actual.lock().unwrap().has_network_capability_probe());
+        assert!(engine.stream_socket_state(binding.open_file).unwrap().is_none());
+        let mut wrong = binding;
+        wrong.generation += 1;
+        let before = format!("{:?}", actual.lock().unwrap());
+        assert!(actual.lock().unwrap().restrict_network_capability_probe(wrong).is_err());
+        assert_eq!(format!("{:?}", actual.lock().unwrap()), before);
+        engine.original_socket_publication_finished(owner, &admission, mutation.publication.permit).unwrap();
+        engine.finish_original_connect(owner, &admission).unwrap();
+        engine.retire_fd_table_owner(owner);
+        engine.stream_owner_gone(owner);
+        engine.finish_fd_mutations().unwrap();
+        assert!(actual.lock().unwrap().has_network_capability_probe());
+        assert_eq!(actual.lock().unwrap().descriptor_binding(17).unwrap(), binding);
+    }
+
+    #[test]
+    fn udp6_capability_probe_original_errors_keep_errno_and_leave_no_installation() {
+        for errno in [libc::EAFNOSUPPORT, libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EPERM] {
+            let (mut engine, owner, actual, mutation, admission) =
+                setup_socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+            complete(&mut engine, owner, &admission, -i64::from(errno));
+            let (observed, raw) = engine.original_socket_publication(owner, &admission).unwrap();
+            assert_eq!(observed, mutation);
+            assert_eq!(raw, -i64::from(errno));
+            engine.confirm_fd_mutation_result(owner, mutation.publication.permit, Err(errno)).unwrap();
+            engine.finish_unchanged_fd_mutation(owner, mutation.publication.permit).unwrap();
+            engine.original_socket_publication_finished(owner, &admission, mutation.publication.permit).unwrap();
+            engine.finish_original_connect(owner, &admission).unwrap();
+            engine.retire_fd_table_owner(owner);
+            engine.stream_owner_gone(owner);
+            engine.finish_fd_mutations().unwrap();
+            assert!(!actual.lock().unwrap().has_network_capability_probe());
+            assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        }
     }
     #[test]
     fn socket_publication_result_retry_uses_same_original_call_without_generic_duplicate_allowance()

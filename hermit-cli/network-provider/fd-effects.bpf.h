@@ -34,6 +34,13 @@ static long (*fd_read_kernel)(void *,u32,const void *)=(void *)BPF_FUNC_probe_re
 static u64 (*fd_function_ip)(void *)=(void *)BPF_FUNC_get_func_ip;
 static struct pt_regs *(*fd_task_regs)(struct task_struct *)=(void *)BPF_FUNC_task_pt_regs;
 static __attribute__((noinline)) void stream_copy_commit(struct ap_fd_call *,s64);
+#ifdef AP_FTRACE_PROVIDER
+static __attribute__((noinline)) int stream_tx_enter(struct pt_regs *);
+static __attribute__((noinline)) int stream_tx_exit(struct pt_regs *);
+static __attribute__((noinline)) int stream_tx_lock(struct pt_regs *,int);
+static __attribute__((noinline)) int stream_tx_unlock(struct pt_regs *,int);
+#endif
+static __attribute__((noinline)) int stream_tx_syscall_exit(u64 *,struct ap_task_command *);
 
 static __attribute__((noinline)) struct ap_fd_status *fd_stats(void) {
     u32 zero=0;return lookup(&fd_status,&zero);
@@ -216,7 +223,8 @@ static __attribute__((noinline)) int fd_original_selection_publish_physical(
     struct ap_command_result *r=claim_result(c);if(!r)return 0;
     struct ap_invocation_key key=fd_actor();
     struct files_struct *files=CORE(current_task()->files);
-    u64 table=fd_table(files,(c->operation==AP_AUXILIARY_FILE || ap_original_recv(c->operation))?AP_TABLE_NORMALIZE:AP_TABLE_ENROLLED_CREATE),provider=incarnation();
+    u64 table=fd_table(files,(c->operation==AP_AUXILIARY_FILE || ap_original_recv(c->operation) ||
+        c->operation==AP_ORIGINAL_SENDTO_CALL)?AP_TABLE_NORMALIZE:AP_TABLE_ENROLLED_CREATE),provider=incarnation();
     fresh->command=c->command;fresh->raw_table=(u64)files;
     fresh->file_entry_ip=entry_ip;
     fresh->original.selection.command=c->command;fresh->original.selection.call=c->expected_object;
@@ -224,8 +232,10 @@ static __attribute__((noinline)) int fd_original_selection_publish_physical(
     fresh->original.selection.task=key.task;fresh->original.selection.task_start=key.start;
     fresh->original.selection.table=table;
     __asm__ __volatile__("" : : "r"(fresh), "r"(&key) : "memory");
-    if(ap_original_allocator(fresh->operation) || ap_original_recv(fresh->operation)) {
-        if(ap_original_recv(fresh->operation))fresh->new_file=(u64)CORE(current_task()->mm);
+    if(ap_original_allocator(fresh->operation) || ap_original_recv(fresh->operation) ||
+       fresh->operation==AP_ORIGINAL_SENDTO_CALL) {
+        if(ap_original_recv(fresh->operation) || fresh->operation==AP_ORIGINAL_SENDTO_CALL)
+            fresh->new_file=(u64)CORE(current_task()->mm);
         if(!provider || provider!=c->provider || !table || !key.task || !key.start ||
            fresh->original.selection.requested_fd!=c->expected_level ||
            fresh->original.selection.user_address!=c->generation_before ||
@@ -268,7 +278,8 @@ static __attribute__((noinline)) int fd_original_selection_publish(
             entry_ip=fd_function_ip(ctx);
         }
 #endif
-    } else if(!ap_original_allocator(fresh->operation) && !ap_original_recv(fresh->operation)) {
+    } else if(!ap_original_allocator(fresh->operation) && !ap_original_recv(fresh->operation) &&
+              fresh->operation!=AP_ORIGINAL_SENDTO_CALL) {
         fd_problem(AP_FD_IDENTITY);return 0;
     }
     return fd_original_selection_publish_physical(
@@ -394,6 +405,17 @@ static __attribute__((noinline)) int fd_original_recv_syscall_entered(
         fd_problem(AP_FD_IDENTITY);return 0;
     }
     return fd_original_recv_entered(c);
+}
+static __attribute__((noinline)) int fd_original_sendto_syscall_entered(
+        u64 *ctx,const struct ap_task_command *c) {
+    if((s64)ctx[1]!=AP_SENDTO_SYSCALL)return 0;
+    struct pt_regs *regs=(struct pt_regs *)ctx[0];
+    if(!regs || CORE(regs->cs)!=0x33 || CORE(regs->orig_ax)!=AP_SENDTO_SYSCALL ||
+       !ap_stream_tx_operands(c,ctx[1],CORE(regs->di),CORE(regs->si),CORE(regs->dx),
+           CORE(regs->r10),CORE(regs->r8),CORE(regs->r9))) {
+        fd_problem(AP_FD_IDENTITY);return 0;
+    }
+    return fd_original_recv_entered(c); /* same zeroed original Call initializer */
 }
 #ifndef AP_FTRACE_PROVIDER
 static __attribute__((noinline)) int fd_original_read_pre(struct pt_regs *ctx) {
@@ -832,9 +854,15 @@ static __attribute__((always_inline,nodebug)) inline int fd_session_dispatch(str
  * KPROBE_MULTI session retains their exact cookies with one program/link. */
 #include "fd-session-dispatch.inc"
 SEC("kprobe.multi") __attribute__((nodebug)) int fd_s20e(struct pt_regs *ctx) {
+    if(fd_attach_cookie_raw(ctx)==AP_STREAM_TX_COOKIE)return stream_tx_enter(ctx);
+    if(fd_attach_cookie_raw(ctx)==AP_STREAM_TX_LOCK_COOKIE)return stream_tx_lock(ctx,0);
+    if(fd_attach_cookie_raw(ctx)==AP_STREAM_TX_UNLOCK_COOKIE)return stream_tx_unlock(ctx,0);
     return fd_shared_fdget_enter(ctx);
 }
 SEC("kprobe.multi") __attribute__((nodebug)) int fd_s20x(struct pt_regs *ctx) {
+    if(fd_attach_cookie_raw(ctx)==AP_STREAM_TX_COOKIE)return stream_tx_exit(ctx);
+    if(fd_attach_cookie_raw(ctx)==AP_STREAM_TX_LOCK_COOKIE)return stream_tx_lock(ctx,1);
+    if(fd_attach_cookie_raw(ctx)==AP_STREAM_TX_UNLOCK_COOKIE)return stream_tx_unlock(ctx,1);
     return fd_shared_fdget_exit(ctx);
 }
 #else
@@ -1524,6 +1552,7 @@ SEC("tp_btf/sys_exit") int fd_native_syscall_returned(u64 *ctx) {
     if(ap_original_file_operation(c->operation))return fd_original_file_returned(ctx,c);
     if(c->operation==AP_ORIGINAL_READ)return fd_original_read_returned(ctx,c);
     if(ap_original_recv(c->operation))return fd_original_recv_returned(ctx,c);
+    if(c->operation==AP_ORIGINAL_SENDTO_CALL)return stream_tx_syscall_exit(ctx,c);
     if(ap_original_allocator(c->operation))return fd_original_allocator_returned(ctx,c);
     if(c->operation!=AP_NATIVE_BIRTH)return 0;
     struct ap_command_result *r=result(c->command);

@@ -80,6 +80,13 @@ use crate::tool_global::thread_observe_time;
 use crate::types::LogicalTime;
 use crate::types::OpenFileId;
 
+fn original_sendto_shape(call: syscalls::Sendto) -> bool {
+    let (_, raw) = Syscall::from(call).into_parts();
+    (1..=512).contains(&call.size()) && raw.arg1 != 0
+        && matches!(call.flags() as i32, libc::MSG_NOSIGNAL | 0x4040)
+        && raw.arg4 == 0 && raw.arg5 == 0
+}
+
 fn engine_error(error: impl std::fmt::Display) -> Error {
     Error::Tool(anyhow::anyhow!(
         "shared network engine refused operation: {error}"
@@ -120,6 +127,90 @@ fn shutdown_direction(how: i32) -> Result<NetworkShutdownV2, Error> {
 // TODO-HUMAN-REVIEW(PR-3174): Review socket ownership and shared V3 receive dispatch.
 // https://github.com/rrnewton/hermit/pull/3174
 impl<T: RecordOrReplay> Detcore<T> {
+    fn network_fd_is_capability_probe<G: Guest<Self>>(&self, guest: &G, fd: i32) -> bool {
+        guest.thread_state().with_detfd(fd, |fd| fd.is_network_capability_probe()).unwrap_or(false)
+    }
+
+    /// A successful capability allocation proves an installed socket, not UDP
+    /// communication support. Check before guest payload access or injection.
+    /// The marker belongs to the OFD, so dup aliases cannot bypass this boundary.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3464): Review allocation-only IPv6 probe isolation.
+    // https://github.com/rrnewton/hermit/pull/3464
+    pub(crate) fn check_network_capability_probe_use<G: Guest<Self>>(
+        &self, guest: &mut G, call: Syscall,
+    ) -> Result<(), Error> {
+        use reverie::syscalls::Sysno;
+        if !matches!(guest.config().network_trace.policy, NetworkPolicy::Record | NetworkPolicy::Replay) {
+            return Ok(());
+        }
+        let forbidden_local = match call {
+            Syscall::Connect(c) => Some(c.fd()),
+            Syscall::Bind(c) => Some(c.fd()),
+            Syscall::Listen(c) => Some(c.fd()),
+            Syscall::Accept(c) => Some(c.sockfd()),
+            Syscall::Accept4(c) => Some(c.sockfd()),
+            Syscall::Sendmsg(c) => Some(c.fd()),
+            Syscall::Recvmsg(c) => Some(c.sockfd()),
+            Syscall::Sendmmsg(c) => Some(c.sockfd()),
+            Syscall::Recvmmsg(c) => Some(c.fd()),
+            Syscall::Sendto(c) if {
+                let (_, args) = Syscall::from(c).into_parts();
+                args.arg4 != 0 || args.arg5 != 0
+            } => Some(c.fd()),
+            _ => None,
+        };
+        if forbidden_local.is_some_and(|fd| guest.thread_state().with_detfd(fd,
+            |fd| fd.is_local_socket_pair()).unwrap_or(false))
+        {
+            return Err(engine_error("local socketpair does not authorize another endpoint or descriptor transfer"));
+        }
+        if !guest.thread_state().file_metadata.lock().unwrap().has_network_capability_probe() {
+            return Ok(());
+        }
+        let (number, args) = call.into_parts();
+        let blocked = match call {
+            Syscall::Fcntl(fcntl) => !matches!(fcntl.cmd(),
+                syscalls::FcntlCmd::F_GETFL | syscalls::FcntlCmd::F_GETFD
+                | syscalls::FcntlCmd::F_DUPFD(_) | syscalls::FcntlCmd::F_DUPFD_CLOEXEC(_))
+                && self.network_fd_is_capability_probe(guest, fcntl.fd()),
+            Syscall::Poll(poll) => read_pollfds(guest, poll.fds().map(|p| p.cast()), poll.nfds())
+                .is_ok_and(|fds| fds.iter().any(|p| self.network_fd_is_capability_probe(guest, p.fd))),
+            Syscall::Ppoll(poll) => read_pollfds(guest, poll.fds(), poll.nfds())
+                .is_ok_and(|fds| fds.iter().any(|p| self.network_fd_is_capability_probe(guest, p.fd))),
+            Syscall::Select(select) => read_select_state(guest, select.nfds(), select.readfds(),
+                select.writefds(), select.exceptfds(), None, SelectTimeoutAddress::None)
+                .is_ok_and(|state| (0..state.nfds).any(|fd| state.requested(fd)
+                    && self.network_fd_is_capability_probe(guest, fd))),
+            Syscall::Pselect6(select) => read_select_state(guest, select.nfds(), select.readfds(),
+                select.writefds(), select.exceptfds(), None, SelectTimeoutAddress::None)
+                .is_ok_and(|state| (0..state.nfds).any(|fd| state.requested(fd)
+                    && self.network_fd_is_capability_probe(guest, fd))),
+            _ => {
+                let descriptors = match number {
+                    Sysno::read | Sysno::readv | Sysno::pread64 | Sysno::preadv | Sysno::preadv2
+                    | Sysno::write | Sysno::writev | Sysno::pwrite64 | Sysno::pwritev | Sysno::pwritev2
+                    | Sysno::recvfrom | Sysno::recvmsg | Sysno::recvmmsg
+                    | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg
+                    | Sysno::connect | Sysno::bind | Sysno::listen | Sysno::accept | Sysno::accept4
+                    | Sysno::shutdown | Sysno::getsockname | Sysno::getpeername
+                    | Sysno::getsockopt | Sysno::setsockopt | Sysno::ioctl | Sysno::vmsplice =>
+                        [Some(args.arg0 as i32), None],
+                    Sysno::sendfile | Sysno::tee => [Some(args.arg0 as i32), Some(args.arg1 as i32)],
+                    Sysno::splice | Sysno::copy_file_range => [Some(args.arg0 as i32), Some(args.arg2 as i32)],
+                    Sysno::epoll_ctl => [Some(args.arg2 as i32), None],
+                    _ => [None, None],
+                };
+                descriptors.into_iter().flatten().any(|fd| self.network_fd_is_capability_probe(guest, fd))
+            }
+        };
+        if blocked {
+            Err(engine_error(format!("IPv6 capability probe does not authorize {number}")))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Classify engine-owned calls before the main syscall dispatcher moves the
     /// typed value. Descriptor-wide calls are owned only for socket OFDs.
     pub(crate) fn network_io_owns<G: Guest<Self>>(&self, guest: &mut G, call: Syscall) -> bool {
@@ -192,12 +283,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             return None;
         }
 
+        if let Err(error) = self.check_network_capability_probe_use(guest, call) {
+            return Some(Err(error));
+        }
+
         // Guest memory sampled before submission is not evidence of the bytes
         // Linux later commits, including partial faults or concurrent mutation.
         // Keep network output owned here and refuse before payload access or
         // native submission until the shared engine has an authenticated TX join.
         // Ordinary file/stdout writes and explicit live policy retain dispatch.
         if policy == NetworkPolicy::Record {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464): original nonblocking TCP Sendto capture.
+            if let Syscall::Sendto(send) = call
+                && original_sendto_shape(send)
+                && self.network_open_file(guest, send.fd()).is_some()
+                && guest.thread_state().with_detfd(send.fd(), |fd| fd.is_nonblocking()).unwrap_or(false)
+                && guest.local_global_state().and_then(|global| global.native_receive_mode())
+                    == Some(crate::network_replay::NetworkEngineMode::Record)
+            {
+                let result = self.network_original_sendto(guest, send).await;
+                return Some(self.finish_original_invocation(guest, result).await);
+            }
             let output_fd = match call {
                 Syscall::Write(call) => Some(call.fd()),
                 Syscall::Writev(call) => Some(call.fd()),
@@ -333,6 +440,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Socket,
         )
         .await?;
+        if crate::network_replay::original_installation::is_udp6_capability_probe(
+            call.family(), call.r#type(), call.protocol(),
+        ) {
+            guest.thread_state().with_detfd(fd, |fd| fd.restrict_network_capability_probe())?;
+        }
         self.enroll_fresh_stream_socket(guest, fd, call).await?;
         self.complete_network_fd_installation(guest, admission.as_ref(), fd)
             .await?;
@@ -1044,7 +1156,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 address,
                 length,
                 original_count: match kind {
-                    crate::network_replay::original_connect::Kind::Read => raw.arg2 as u64,
+                    crate::network_replay::original_connect::Kind::Read
+                    | crate::network_replay::original_connect::Kind::Sendto => raw.arg2 as u64,
                     crate::network_replay::original_connect::Kind::Openat => raw.arg3 as u64,
                     crate::network_replay::original_connect::Kind::EpollCtl => {
                         u64::from(raw.arg2 as u32)
@@ -2932,6 +3045,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    async fn network_original_sendto<G: Guest<Self>>(
+        &self, guest: &mut G, call: syscalls::Sendto,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::Kind;
+        let source = self.record_or_replay.original_file_execution(call.into());
+        if source != crate::OriginalFileExecution::Native || !original_sendto_shape(call) {
+            return Err(engine_error("original Sendto requires the supported actual native shape"));
+        }
+        let (_, raw) = Syscall::from(call).into_parts();
+        let admission = self.prepare_original_call_from(guest, call.into(), Kind::Sendto,
+            (call.fd(), raw.arg1 as u64, call.flags() as i32), source).await?;
+        self.mark_original_syscall_invoked(guest);
+        // The actual OFD was checked O_NONBLOCK before provider preparation.
+        // Preserve the current Normal turn, syscall accounting and common tail.
+        let result = self.record_or_replay_preserving_tool_errors(guest, call).await;
+        if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) { return result; }
+        let (_, _, result, _) = self.observe_original_call_result(guest, admission.clone(), result).await?;
+        guest.local_global_state().ok_or_else(|| engine_error("Sendto lost actual local global state"))?
+            .publish_foreground_native_sent(guest.tid(), guest.thread_state(), &admission)
+            .map_err(engine_rpc_error)?;
+        self.shadow_ack(guest, NetworkRequest::NativeRetireOriginalConnect { admission }).await?;
+        guest.thread_state_mut().original_connect = None;
+        result
+    }
+
     async fn network_sendto<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2944,6 +3082,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             ));
         }
         let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
+        if policy == NetworkPolicy::Replay
+            && guest.local_global_state().and_then(|global| global.native_receive_mode())
+                == Some(crate::network_replay::NetworkEngineMode::Replay)
+        {
+            let (_, raw) = Syscall::from(call).into_parts();
+            if call.size() == 0 || !matches!(call.flags() as i32, libc::MSG_NOSIGNAL | 0x4040) || raw.arg4 != 0 || raw.arg5 != 0
+                || !guest.thread_state().with_detfd(call.fd(), |fd| fd.is_nonblocking())?
+            { return Err(engine_error("V4 Sendto Replay requires nonblocking scalar MSG_NOSIGNAL")); }
+            let read = self.begin_network_fd_read(guest, call.fd()).await?;
+            let result = async {
+                let maximum = guest.local_global_state().unwrap().replay_sendto_read_limit(
+                    guest.tid(), guest.thread_state(), &read, call.size(),
+                ).map_err(engine_rpc_error)?;
+                let mut bytes = vec![0; maximum];
+                if !bytes.is_empty() {
+                    guest.memory().read_exact(call.buf().ok_or(Errno::EFAULT)?.cast::<u8>(), &mut bytes)?;
+                }
+                self.stream_transmit(guest, call.into(), open_file, bytes, policy).await
+            }.await;
+            let released = self.shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read }).await;
+            return finish_shadow_operation(result, released);
+        }
         let mut bytes = vec![0; call.size()];
         if !bytes.is_empty() {
             let address = call.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
@@ -6522,6 +6682,33 @@ impl<T: RecordOrReplay> Detcore<T> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Probe only the admitted local endpoint, never a Replay TCP placeholder.
+    /// The short reader and original sole-root grant protect numeric selection;
+    /// neither a copied local marker nor a native readiness bit grants a turn.
+    async fn probe_shadow_local_pair<G: Guest<Self>>(
+        &self, guest: &mut G, row: libc::pollfd,
+    ) -> Result<libc::pollfd, Error> {
+        let read = self.begin_network_fd_read(guest, row.fd).await?;
+        let operation = async {
+            guest.local_global_state().ok_or_else(|| engine_error("local pair poll lacks local global state"))?
+                .validate_local_pair_poll(guest.thread_state(), &read)?;
+            let mut stack = guest.stack().await;
+            let address = stack.reserve::<libc::pollfd>();
+            let timeout = stack.reserve::<syscalls::Timespec>();
+            let _guard = stack.commit()?;
+            guest.memory().write_value(address, &libc::pollfd { revents: 0, ..row })?;
+            guest.memory().write_value(timeout, &syscalls::Timespec { tv_sec: 0, tv_nsec: 0 })?;
+            let count = guest.inject(syscalls::Ppoll::new().with_fds(Some(address.cast()))
+                .with_nfds(1).with_timeout(Some(timeout)).with_sigmask(None).with_sigsetsize(0)).await?;
+            let observed = guest.memory().read_value(address)?;
+            guest.local_global_state().ok_or_else(|| engine_error("local pair poll lost local global state"))?
+                .validate_local_pair_poll(guest.thread_state(), &read)?;
+            checked_local_poll_result(row, observed, count)
+        }.await;
+        let cleanup = self.shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read }).await;
+        finish_shadow_operation(operation, cleanup)
+    }
+
     /// One scan lookup. Copying the poll/select input happens before entry;
     /// neither this short admission nor capture spans guest-memory access.
     async fn admit_shadow_poll_fd<G: Guest<Self>>(
@@ -6578,7 +6765,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut output = fds.to_vec();
                 let mut interests = Vec::new();
                 let mut ready = false;
-                for pollfd in &mut output {
+                // Observe local rows before acquiring external Call pins. Each
+                // reader is released before another table admission. Duplicate
+                // rows retain their own requested mask and Linux-ready count.
+                let mut local_rows = vec![false; output.len()];
+                for (index, row) in output.iter_mut().enumerate() {
+                    if row.fd >= 0 && guest.thread_state().with_detfd(row.fd,
+                        |fd| fd.is_local_socket_pair()).unwrap_or(false)
+                    {
+                        *row = self.probe_shadow_local_pair(guest, *row).await?;
+                        local_rows[index] = true;
+                        ready |= row.revents != 0;
+                    }
+                }
+                for (index, pollfd) in output.iter_mut().enumerate() {
+                    if local_rows[index] { continue; }
                     pollfd.revents = 0;
                     if pollfd.fd < 0 {
                         continue;
@@ -6755,7 +6956,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-async fn read_socket_i32<G, T>(guest: &mut G, fd: i32, name: i32) -> Result<i32, Error>
+fn checked_local_poll_result(
+    requested: libc::pollfd, observed: libc::pollfd, count: i64,
+) -> Result<libc::pollfd, Error> {
+    if observed.fd != requested.fd || observed.events != requested.events
+        || count != i64::from(observed.revents != 0)
+    {
+        return Err(engine_error("local poll changed its exact native row/count"));
+    }
+    Ok(observed)
+}
+
+pub(super) async fn read_socket_i32<G, T>(guest: &mut G, fd: i32, name: i32) -> Result<i32, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -6787,6 +6999,103 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn local_socket_pair_poll_authority_refuses_shared_root_after_selected_grant() {
+        // Exercise the exact scheduler/root predicate used by the local poll
+        // wrapper. Census and birth wire replies are the existing controlled
+        // fixture, not a native provider or a full mixed-poll execution.
+        let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let mut selected = None;
+        let fixture = crate::network_runtime::ForegroundRoot::controlled_shared_birth_after_entry(
+            raw, |_, root, _| {
+                let mut scheduler = crate::scheduler::Scheduler::new(&crate::Config::default());
+                scheduler.controlled_foreground_store_grant(root);
+                assert!(root.is_sole_initial_root(root.owner()));
+                assert!(scheduler.foreground_native_observation(root.owner(), root).is_ok());
+                selected = Some(scheduler);
+            }).await;
+        let scheduler = selected.unwrap();
+        let owner = fixture.parent.owner();
+        let current = fixture.parent.is_current(owner);
+        let sole = fixture.parent.is_sole_initial_root(owner);
+        let refusal = scheduler.foreground_native_observation(owner, &fixture.parent)
+            .err().map(|error| error.to_string());
+        drop(scheduler);
+        drop(fixture);
+        assert!(current, "birth does not invent an unrelated or stale root");
+        assert!(!sole);
+        assert_eq!(refusal.as_deref(), Some("native observation lacks unchanged sole initial root"));
+    }
+
+    #[test]
+    fn local_socket_pair_poll_preserves_real_empty_readable_hup_and_duplicate_masks() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        fn capture(fd: i32) -> (i32, [libc::pollfd; 3], [(libc::pollfd, i32); 3]) {
+            let requested = [libc::POLLIN, libc::POLLOUT, 0].map(|events|
+                libc::pollfd { fd, events, revents: 0 });
+            let timeout = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let mut together = requested;
+            let count = unsafe { libc::ppoll(together.as_mut_ptr(), together.len() as _,
+                &timeout, std::ptr::null()) };
+            let separate = requested.map(|mut row| {
+                let count = unsafe { libc::ppoll(&mut row, 1, &timeout, std::ptr::null()) };
+                (row, count)
+            });
+            (count, together, separate)
+        }
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let empty = capture(reader.as_raw_fd());
+        let write = writer.write(b"x");
+        let readable = capture(reader.as_raw_fd());
+        let mut byte = [0];
+        let read = reader.read(&mut byte);
+        drop(writer);
+        let closed = capture(reader.as_raw_fd());
+        drop(reader);
+        // Owned originals are closed before evaluating any readiness result.
+        assert_eq!(write.unwrap(), 1);
+        assert_eq!(read.unwrap(), 1);
+        assert_eq!(byte, *b"x");
+        for ((count, together, separate), expected) in [
+            (empty, [0, libc::POLLOUT, 0]),
+            (readable, [libc::POLLIN, libc::POLLOUT, 0]),
+            (closed, [libc::POLLIN | libc::POLLHUP, libc::POLLOUT | libc::POLLHUP, libc::POLLHUP]),
+        ] {
+            assert_eq!(together.map(|row| row.revents), expected);
+            assert_eq!(count as usize, expected.into_iter().filter(|bits| *bits != 0).count());
+            for (index, (observed, count)) in separate.into_iter().enumerate() {
+                let requested = libc::pollfd { revents: 0, ..together[index] };
+                let checked = super::checked_local_poll_result(requested, observed, i64::from(count)).unwrap();
+                assert_eq!((checked.fd, checked.events, checked.revents),
+                    (together[index].fd, together[index].events, together[index].revents));
+            }
+        }
+    }
+
+    #[test]
+    fn local_socket_pair_poll_rejects_changed_row_or_count_without_filtering_error_bits() {
+        let requested = libc::pollfd { fd: 7, events: 0, revents: 0 };
+        for bits in [0, libc::POLLERR, libc::POLLHUP, libc::POLLNVAL,
+            libc::POLLERR | libc::POLLHUP] {
+            let observed = libc::pollfd { revents: bits, ..requested };
+            let count = i64::from(bits != 0);
+            assert_eq!(super::checked_local_poll_result(requested, observed, count).unwrap().revents, bits);
+            assert!(super::checked_local_poll_result(requested, observed, count + 1).is_err());
+            assert!(super::checked_local_poll_result(requested, observed, -1).is_err());
+            assert!(super::checked_local_poll_result(requested,
+                libc::pollfd { fd: 8, ..observed }, count).is_err());
+            assert!(super::checked_local_poll_result(requested,
+                libc::pollfd { events: libc::POLLIN, ..observed }, count).is_err());
+        }
+    }
+
     #[test]
     fn typed_rpc_refusal_does_not_reclassify_adapter_protocol_or_errno_failures() {
         use detcore_model::network_trace::NetworkPolicy;
@@ -7441,6 +7750,95 @@ mod original_file_delegate_error_tests {
             panic!("unexpected stack")
         }
     }
+    // These controlled marked-OFD cases exercise the actual refusal helper and
+    // adapter. The strict Guest rejects memory, injection and scheduler access;
+    // they do not claim a native original-installation or close observation.
+    #[tokio::test]
+    async fn network_capability_probe_refuses_communication_before_guest_effects() {
+        for policy in [NetworkPolicy::Record, NetworkPolicy::Replay] {
+            let mut config = Config::default();
+            config.network_trace.policy = policy;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            thread.add_fd(77, OFlag::O_RDWR, FdType::Socket, None).unwrap();
+            thread.with_detfd(77, |fd| fd.restrict_network_capability_probe()).unwrap();
+            thread.dup_fd(77, 79, OFlag::O_CLOEXEC).unwrap();
+            let mut guest = DelegateGuest { config: &config, thread, requests: Mutex::new(vec![]) };
+            for fd in [77, 79] {
+                for number in [Sysno::read, Sysno::readv, Sysno::write, Sysno::writev,
+                    Sysno::recvfrom, Sysno::recvmsg, Sysno::recvmmsg, Sysno::sendto,
+                    Sysno::sendmsg, Sysno::sendmmsg, Sysno::connect, Sysno::bind,
+                    Sysno::listen, Sysno::accept, Sysno::accept4, Sysno::shutdown,
+                    Sysno::getsockopt, Sysno::setsockopt, Sysno::getsockname,
+                    Sysno::getpeername, Sysno::ioctl, Sysno::vmsplice] {
+                    let call = Syscall::from_raw(number,
+                        syscalls::SyscallArgs::new(fd, 0, 1, 0, 0, 0));
+                    let result = tool.try_handle_network_io(&mut guest, call).await
+                        .expect("probe use must not escape to the ordinary dispatcher");
+                    assert!(matches!(&result, Err(Error::Tool(_))));
+                    assert_eq!(result.unwrap_err().to_string(), format!(
+                        "shared network engine refused operation: IPv6 capability probe does not authorize {number}"));
+                }
+                for (number, args) in [
+                    (Sysno::sendfile, [78, fd, 0, 1, 0, 0]),
+                    (Sysno::tee, [78, fd, 1, 0, 0, 0]),
+                    (Sysno::splice, [78, 0, fd, 0, 1, 0]),
+                    (Sysno::copy_file_range, [78, 0, fd, 0, 1, 0]),
+                    (Sysno::epoll_ctl, [78, libc::EPOLL_CTL_ADD as usize, fd, 0, 0, 0]),
+                ] {
+                    let [a,b,c,d,e,f] = args;
+                    let call = Syscall::from_raw(number, syscalls::SyscallArgs::new(a,b,c,d,e,f));
+                    assert!(matches!(tool.check_network_capability_probe_use(&mut guest, call), Err(Error::Tool(_))));
+                }
+            }
+            assert!(guest.requests.lock().unwrap().is_empty());
+            assert_eq!(*guest.thread.as_ref(), 0);
+            assert!(guest.thread.original_connect.is_none());
+        }
+    }
+
+    #[test]
+    fn network_capability_probe_boundary_keeps_close_aliases_and_non_network_modes() {
+        for policy in [NetworkPolicy::Record, NetworkPolicy::Replay,
+            NetworkPolicy::Deny, NetworkPolicy::UnsafeLive] {
+            let mut config = Config::default();
+            config.network_trace.policy = policy;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let thread = tool.init_thread_state(tid, None);
+            thread.add_fd(77, OFlag::O_RDWR, FdType::Socket, None).unwrap();
+            thread.with_detfd(77, |fd| fd.restrict_network_capability_probe()).unwrap();
+            thread.add_fd(78, OFlag::O_RDWR, FdType::Socket, None).unwrap();
+            let mut guest = DelegateGuest { config: &config, thread, requests: Mutex::new(vec![]) };
+            for number in [Sysno::close, Sysno::dup, Sysno::dup2, Sysno::dup3, Sysno::fstat] {
+                let call = Syscall::from_raw(number, syscalls::SyscallArgs::new(77, 0, 0, 0, 0, 0));
+                assert!(tool.check_network_capability_probe_use(&mut guest, call).is_ok());
+            }
+            for cmd in [syscalls::FcntlCmd::F_GETFL, syscalls::FcntlCmd::F_GETFD] {
+                assert!(tool.check_network_capability_probe_use(&mut guest,
+                    syscalls::Fcntl::new().with_fd(77).with_cmd(cmd).into()).is_ok());
+            }
+            for fd in [78, -1] {
+                assert!(tool.check_network_capability_probe_use(&mut guest,
+                    syscalls::Connect::new().with_fd(fd).into()).is_ok());
+            }
+            let result = tool.check_network_capability_probe_use(&mut guest,
+                syscalls::Connect::new().with_fd(77).into());
+            assert_eq!(result.is_err(), matches!(policy, NetworkPolicy::Record | NetworkPolicy::Replay));
+            let result = tool.check_network_capability_probe_use(&mut guest,
+                syscalls::Fcntl::new().with_fd(77)
+                    .with_cmd(syscalls::FcntlCmd::F_SETFL(OFlag::O_NONBLOCK.bits())).into());
+            assert_eq!(result.is_err(), matches!(policy, NetworkPolicy::Record | NetworkPolicy::Replay));
+            guest.thread.remove_fd(77);
+            assert!(tool.check_network_capability_probe_use(&mut guest,
+                syscalls::Poll::new().into()).is_ok(),
+                "without a live probe, even poll must not access the strict fixture's memory");
+            assert!(guest.requests.lock().unwrap().is_empty());
+            assert_eq!(*guest.thread.as_ref(), 0);
+        }
+    }
+
     // Batch traffic must not fall through to the per-thread recorder/replayer
     // while the shared message engine lacks its typed partial-batch contract.
     // The strict Guest panics on memory access, injection, clock, or RPC. The

@@ -325,7 +325,8 @@ fn run() -> Result<()> {
     if accepted && !ftrace {
         names.extend(["stream-copy-custody.inc", "stream-copy-problem.inc",
             "stream-copy-unit-enter.inc", "stream-copy-emit.inc",
-            "stream-copy-unit-exit.inc"].map(str::to_owned));
+            "stream-copy-unit-exit.inc", "stream-tx.h", "stream-tx.bpf.h",
+            "stream-tx-driver.h"].map(str::to_owned));
     }
     names.extend([
         contract_name,
@@ -476,6 +477,10 @@ fn run() -> Result<()> {
     };
     let mut bpf = flags.clone();
     bpf.extend([
+        // Keep generated-header and compilation-directory DWARF independent
+        // of the package output path, without stripping debug or BTF sections.
+        os("-fdebug-compilation-dir=."),
+        OsString::from(format!("-ffile-prefix-map={}=./build", work.display())),
         os("-target"),
         os("bpf"),
         os("-D__BPF__"),
