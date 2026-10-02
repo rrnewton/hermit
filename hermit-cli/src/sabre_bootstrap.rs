@@ -16,6 +16,7 @@ use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::io::Read;
 use std::io::Write;
+use std::ops::BitAnd;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -91,6 +92,16 @@ fn word(bytes: &[u8], offset: usize) -> Result<usize> {
             .ok_or_else(|| anyhow!("short word"))?
             .try_into()?,
     ) as usize)
+}
+
+/// Whether ELF segment flags include `flag`. object 0.36 reports `p_flags` as
+/// `u32` and later releases as `object::elf::ProgramFlags`; comparing against
+/// the flag itself compiles with both.
+fn has_segment_flag<F>(p_flags: F, flag: F) -> bool
+where
+    F: Copy + BitAnd<Output = F> + PartialEq,
+{
+    p_flags & flag == flag
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -501,7 +512,7 @@ impl HeldObject {
                 let object::SegmentFlags::Elf { p_flags, .. } = segment.flags() else {
                     continue;
                 };
-                if p_flags & object::elf::PF_X == 0 {
+                if !has_segment_flag(p_flags, object::elf::PF_X) {
                     continue;
                 }
                 let (offset, size) = segment.file_range();
@@ -555,7 +566,7 @@ impl HeldObject {
                 let object::SegmentFlags::Elf { p_flags, .. } = segment.flags() else {
                     continue;
                 };
-                if p_flags & object::elf::PF_X == 0 {
+                if !has_segment_flag(p_flags, object::elf::PF_X) {
                     continue;
                 }
                 let (offset, size) = segment.file_range();
@@ -639,17 +650,17 @@ impl HeldObject {
                 };
                 let permissions = format!(
                     "{}{}{}p",
-                    if p_flags & object::elf::PF_R != 0 {
+                    if has_segment_flag(p_flags, object::elf::PF_R) {
                         'r'
                     } else {
                         '-'
                     },
-                    if p_flags & object::elf::PF_W != 0 {
+                    if has_segment_flag(p_flags, object::elf::PF_W) {
                         'w'
                     } else {
                         '-'
                     },
-                    if p_flags & object::elf::PF_X != 0 {
+                    if has_segment_flag(p_flags, object::elf::PF_X) {
                         'x'
                     } else {
                         '-'
@@ -714,7 +725,8 @@ impl HeldObject {
                 };
                 ensure!(
                     !readonly
-                        || (p_flags & object::elf::PF_R != 0 && p_flags & object::elf::PF_W == 0),
+                        || (has_segment_flag(p_flags, object::elf::PF_R)
+                            && !has_segment_flag(p_flags, object::elf::PF_W)),
                     "bootstrap descriptor is in a writable ELF load segment"
                 );
                 ensure!(found.is_none(), "ambiguous ELF file extent");
