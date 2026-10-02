@@ -78,6 +78,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "epoll_pwait_zero_timeout_progress",
             "--test",
+            "fifo_open_rendezvous",
+            "--test",
             "file_nr_determinism",
             "--test",
             "fp_reduction_determinism",
@@ -599,7 +601,11 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "185");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "191");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "fifo_open_rendezvous"])
+            );
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "reopened_pipe_progress"])
