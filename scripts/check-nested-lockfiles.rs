@@ -602,9 +602,13 @@ case $command_name in
         ;;
     metadata)
         printf 'generated-metadata\n' >>"${FIXTURE_JOURNAL:?}"
-        if [[ -n ${FIXTURE_EXACT_LIBC_PIN:-} ]]; then
-            printf '{"packages":[{"dependencies":[{"name":"libc","req":"=%s","source":"registry+https://github.com/rust-lang/crates.io-index"}]}]}\n' \
-                "$FIXTURE_EXACT_LIBC_PIN"
+        # FIXTURE_EXACT_PIN=NAME=VERSION: a script requires NAME =VERSION.
+        # FIXTURE_METADATA_BAD_REQ=1: valid JSON the requirement filter rejects.
+        if [[ ${FIXTURE_METADATA_BAD_REQ:-0} == 1 ]]; then
+            printf '{"packages":[{"dependencies":[{"name":"libc","req":5,"source":"registry+https://github.com/rust-lang/crates.io-index"}]}]}\n'
+        elif [[ -n ${FIXTURE_EXACT_PIN:-} ]]; then
+            printf '{"packages":[{"dependencies":[{"name":"%s","req":"=%s","source":"registry+https://github.com/rust-lang/crates.io-index"}]}]}\n' \
+                "${FIXTURE_EXACT_PIN%%=*}" "${FIXTURE_EXACT_PIN#*=}"
         else
             printf '{"packages":[{}]}\n'
         fi
@@ -626,6 +630,11 @@ case $command_name in
         fi
         if [[ ${FIXTURE_UNPINNED_ADDITION:-0} == 1 ]]; then
             printf '\n[[package]]\nname = "fixture-unpinned"\nversion = "2.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "fixture"\n' >>"$lock"
+        fi
+        # What a [patch] pointing libc at a local directory does to the lock:
+        # the package keeps its name and version and loses its source.
+        if [[ ${FIXTURE_LIBC_AS_PATH:-0} == 1 ]]; then
+            sed -i '/^name = "libc"$/,/^$/{/^source = /d;/^checksum = /d}' "$lock"
         fi
         : >"${CARGO_HOME:?}/generated-workspace-resolved"
         printf 'generated-resolve\n' >>"${FIXTURE_JOURNAL:?}"
@@ -875,9 +884,11 @@ esac
             .env("CARGO_HOME", &cargo_home);
         for key in [
             "FIXTURE_PROXY_JOURNAL",
-            "FIXTURE_EXACT_LIBC_PIN",
+            "FIXTURE_EXACT_PIN",
             "FIXTURE_RESOLVED_LIBC",
             "FIXTURE_UNPINNED_ADDITION",
+            "FIXTURE_LIBC_AS_PATH",
+            "FIXTURE_METADATA_BAD_REQ",
         ] {
             producer.env_remove(key);
         }
@@ -966,14 +977,23 @@ esac
         assert!(!candidate.contains("name = \"libc\""), "{candidate}");
     }
 
-    /// The fixture supplement plus a libc entry that differs from the
-    /// fixture Cargo.lock's 0.2.189.
-    fn supplement_with_libc_0_2_190() -> String {
+    /// The fixture supplement followed by one more registry entry.
+    fn supplement_with(name: &str, version: &str) -> String {
         format!(
-            "{FIXTURE_SUPPLEMENT}\n[[package]]\nname = \"libc\"\nversion = \"0.2.190\"\n\
+            "{FIXTURE_SUPPLEMENT}\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n\
              source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
              checksum = \"fixture\"\n"
         )
+    }
+
+    fn assert_refused_before_resolution(output: &std::process::Output, journal: &str) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("prepare-rust-scripts: REFUSED"), "{stderr}");
+        assert!(
+            !journal.lines().any(|line| line == "generated-resolve"),
+            "a refused supplement must be refused before Cargo resolves:\n{journal}"
+        );
     }
 
     #[test]
@@ -984,8 +1004,8 @@ esac
         let (output, journal) = run_prepare_fetch(
             &fixture,
             &[
-                ("FIXTURE_RESOLVED_LIBC", "0.2.190"),
-                ("FIXTURE_EXACT_LIBC_PIN", "0.2.190"),
+                ("FIXTURE_UNPINNED_ADDITION", "1"),
+                ("FIXTURE_EXACT_PIN", "fixture-unpinned=2.0.0"),
             ],
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -993,7 +1013,7 @@ esac
         assert!(stderr.contains("prepare-rust-scripts: REFUSED"), "{stderr}");
         assert!(
             stderr.contains(
-                "libc: generated 0.2.190; committed Cargo.lock 0.2.189; supplement absent"
+                "fixture-unpinned: generated 2.0.0; committed Cargo.lock absent; supplement absent"
             ),
             "{stderr}"
         );
@@ -1009,69 +1029,180 @@ esac
         let candidate =
             fs::read_to_string(candidate_supplement(&fixture)).expect("candidate supplement");
         assert!(
-            candidate.contains("name = \"libc\"\nversion = \"0.2.190\""),
+            candidate.contains("name = \"fixture-unpinned\"\nversion = \"2.0.0\""),
             "{candidate}"
         );
         assert!(!candidate.contains("fixture-script-only"), "{candidate}");
     }
 
     #[test]
-    fn production_prepare_accepts_a_supplement_entry_for_an_exact_script_pin() {
+    fn production_prepare_refuses_an_exact_script_pin_on_a_committed_crate() {
+        // A script that requires =0.2.190 of a crate Cargo.lock pins at 0.2.189
+        // would build the product crates it compiles against a libc the product
+        // never uses. There is no supplement route around this: Cargo.lock moves.
         let fixture = production_fixture(FetchMutation::None);
-        fs::write(
-            fixture.root.join("ci/rust-script-lock-supplement.toml"),
-            supplement_with_libc_0_2_190(),
-        )
-        .expect("write supplement with an exact script pin");
         let (output, journal) = run_prepare_fetch(
             &fixture,
             &[
                 ("FIXTURE_RESOLVED_LIBC", "0.2.190"),
-                ("FIXTURE_EXACT_LIBC_PIN", "0.2.190"),
+                ("FIXTURE_EXACT_PIN", "libc=0.2.190"),
             ],
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{output:?}\n{journal}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
         assert!(
-            stdout.contains(
-                "supplement entry libc 0.2.190 replaces Cargo.lock 0.2.189 in the generated \
-                 workspace because a script requires =0.2.190"
+            stderr.contains(
+                "libc: generated 0.2.190; committed Cargo.lock 0.2.189; supplement absent"
             ),
-            "{stdout}"
+            "{stderr}"
         );
-        // Seeding both versions would leave Cargo.lock's dependents locked to
-        // 0.2.189 while the script requires =0.2.190, which Cargo refuses.
-        journal_position(&journal, "seed-libc: 0.2.190");
-        journal_position(&journal, "generated-locked-fetch");
+        assert!(
+            stderr.contains("cargo update -p NAME --precise VERSION"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("Add its entry to the supplement"),
+            "a moved committed crate must not be steered to the supplement: {stderr}"
+        );
+        assert!(
+            !journal.lines().any(|line| line == "generated-locked-fetch"),
+            "a refused lock must not be fetched:\n{journal}"
+        );
         assert!(!candidate_supplement(&fixture).exists());
     }
 
     #[test]
     fn production_prepare_refuses_a_supplement_entry_that_moves_a_committed_crate() {
+        // Refused whether or not a script requires exactly that version.
+        for exact_pin in [None, Some("libc=0.2.190")] {
+            let fixture = production_fixture(FetchMutation::None);
+            fs::write(
+                fixture.root.join("ci/rust-script-lock-supplement.toml"),
+                supplement_with("libc", "0.2.190"),
+            )
+            .expect("write shadowing supplement");
+            let mut environment = vec![("FIXTURE_RESOLVED_LIBC", "0.2.190")];
+            environment.extend(exact_pin.map(|pin| ("FIXTURE_EXACT_PIN", pin)));
+            let (output, journal) = run_prepare_fetch(&fixture, &environment);
+            assert_refused_before_resolution(&output, &journal);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("may only add crates Cargo.lock does not pin"),
+                "{exact_pin:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains(
+                    "libc: supplement 0.2.190; committed Cargo.lock 0.2.189; source \
+                     registry+https://github.com/rust-lang/crates.io-index"
+                ),
+                "{exact_pin:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains("cargo update -p NAME --precise VERSION"),
+                "{exact_pin:?}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_prepare_refuses_two_supplement_entries_in_one_compatible_range() {
+        for (second, listed) in [("1.2.0", "1.0.0, 1.2.0"), ("1.0.0", "1.0.0, 1.0.0")] {
+            let fixture = production_fixture(FetchMutation::None);
+            fs::write(
+                fixture.root.join("ci/rust-script-lock-supplement.toml"),
+                supplement_with("fixture-script-only", second),
+            )
+            .expect("write duplicate supplement");
+            let (output, journal) = run_prepare_fetch(&fixture, &[]);
+            assert_refused_before_resolution(&output, &journal);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!(
+                    "fixture-script-only: supplement lists {listed} in one compatible range"
+                )),
+                "{second}: {stderr}"
+            );
+            assert!(stderr.contains("Keep one entry"), "{second}: {stderr}");
+        }
+    }
+
+    #[test]
+    fn production_prepare_accepts_two_supplement_versions_in_different_ranges() {
+        // 1.0.0 and 2.0.0 are not compatible, so one lock may hold both.
         let fixture = production_fixture(FetchMutation::None);
         fs::write(
             fixture.root.join("ci/rust-script-lock-supplement.toml"),
-            supplement_with_libc_0_2_190(),
+            supplement_with("fixture-script-only", "2.0.0"),
         )
-        .expect("write shadowing supplement");
+        .expect("write two-range supplement");
         let (output, journal) = run_prepare_fetch(&fixture, &[]);
+        assert!(output.status.success(), "{output:?}\n{journal}");
+        journal_position(&journal, "generated-locked-fetch");
+    }
+
+    #[test]
+    fn production_prepare_notes_a_supplement_entry_cargo_lock_already_has() {
+        let fixture = production_fixture(FetchMutation::None);
+        fs::write(
+            fixture.root.join("ci/rust-script-lock-supplement.toml"),
+            supplement_with("libc", "0.2.189"),
+        )
+        .expect("write redundant supplement");
+        let (output, journal) = run_prepare_fetch(&fixture, &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}\n{journal}");
+        assert!(
+            stdout.contains("supplement entry libc 0.2.189 is already in Cargo.lock"),
+            "{stdout}"
+        );
+        // The redundant entry is not seeded a second time.
+        journal_position(&journal, "seed-libc: 0.2.189");
+        journal_position(&journal, "generated-locked-fetch");
+    }
+
+    #[test]
+    fn production_prepare_refuses_a_path_package_in_place_of_a_pinned_crate() {
+        // A [patch] in a Cargo configuration outside the checkout can replace
+        // a pinned crate with a local directory. The lock then records libc
+        // with no source, so a check of registry entries alone never sees it.
+        let fixture = production_fixture(FetchMutation::None);
+        let (output, journal) = run_prepare_fetch(&fixture, &[("FIXTURE_LIBC_AS_PATH", "1")]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(2), "{stderr}");
         assert!(
-            stderr.contains("may only add crates Cargo.lock does not pin"),
+            stderr.contains(
+                "libc: generated 0.2.189; committed Cargo.lock 0.2.189; supplement absent; \
+                 source path"
+            ),
             "{stderr}"
         );
+        assert!(stderr.contains("[patch] or path override"), "{stderr}");
         assert!(
-            stderr.contains("libc: supplement 0.2.190; committed Cargo.lock 0.2.189"),
-            "{stderr}"
+            !journal.lines().any(|line| line == "generated-locked-fetch"),
+            "a refused lock must not be fetched:\n{journal}"
         );
+        assert!(!candidate_supplement(&fixture).exists());
+    }
+
+    #[test]
+    fn production_prepare_reports_an_unreadable_dependency_requirement() {
+        // Without a diagnostic, a failing filter under `set -e` would end the
+        // producer with jq's status and no line saying which step stopped.
+        let fixture = production_fixture(FetchMutation::None);
+        let (output, journal) = run_prepare_fetch(&fixture, &[("FIXTURE_METADATA_BAD_REQ", "1")]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
         assert!(
-            stderr.contains("only when a script requires exactly its version"),
+            stderr.contains(
+                "prepare-rust-scripts: cannot read the dependency requirements of the generated \
+                 workspace"
+            ),
             "{stderr}"
         );
+        assert!(stderr.contains("jq: error"), "{stderr}");
         assert!(
             !journal.lines().any(|line| line == "generated-resolve"),
-            "a shadowing supplement must be refused before Cargo resolves:\n{journal}"
+            "{journal}"
         );
     }
 

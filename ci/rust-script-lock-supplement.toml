@@ -10,10 +10,15 @@
 #   - Entries use the Cargo.lock [[package]] format: name, version, source,
 #     checksum and dependencies, copied from a lock Cargo produced.
 #   - Add only crates the root Cargo.lock does not pin. The script refuses an
-#     entry compatible with a different Cargo.lock version, because that would
-#     let the scripts build with a version the product does not use. The one
-#     exception is a version a script requires exactly with `=VERSION`: that
-#     script already chose it, and the entry here keeps the build working even
+#     entry compatible with a different Cargo.lock version, because the scripts
+#     would then build that crate, and the product crates they compile, with a
+#     version the product does not use. When a script needs another version of
+#     a crate Cargo.lock pins, move Cargo.lock instead
+#     (cargo update -p NAME --precise VERSION).
+#   - List one version per crate and compatible range; the script refuses two,
+#     because Cargo rather than this file would then choose between them.
+#   - A script that requires a version exactly with `=VERSION` still needs its
+#     entry here (or in Cargo.lock): a seeded entry keeps the build working even
 #     if crates.io yanks the release.
 #   - When the script refuses an unpinned crate it writes candidate entries to
 #     target/ci/rust-script-lock-supplement.candidate-fetch.toml (fetch mode)
@@ -51,19 +56,6 @@ dependencies = [
  "libc",
 ]
 
-# scripts/build-buck-release.rs requires flate2 =1.1.10 for a deterministic
-# archive writer; Cargo.lock has 1.1.9.
-[[package]]
-name = "flate2"
-version = "1.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
-dependencies = [
- "crc32fast",
- "miniz_oxide 0.9.1",
- "zlib-rs",
-]
-
 [[package]]
 name = "fs2"
 version = "0.4.3"
@@ -72,16 +64,6 @@ checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
 dependencies = [
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "miniz_oxide"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
-dependencies = [
- "adler2",
- "simd-adler32",
 ]
 
 [[package]]
@@ -104,9 +86,3 @@ dependencies = [
  "libc",
  "rustix",
 ]
-
-[[package]]
-name = "zlib-rs"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
