@@ -212,6 +212,16 @@ impl InodePool {
                     },
                 );
                 assert!(prev.is_none()); // Should not have been previously used.
+                // Names the host file behind each minted number, so a run pair
+                // whose deterministic inodes diverge can be traced to the host
+                // files involved (https://github.com/rrnewton/hermit/issues/2397).
+                // DEBUG, not INFO: strict verification compares every INFO
+                // record exactly, and host inode numbers differ between runs
+                // (a new pipe or socket gets a fresh one each time).
+                debug!(
+                    "minted deterministic inode {} for host device {:#x} inode {}",
+                    new, raw_inode.device, raw_inode.inode
+                );
                 (new, mtime)
             }
             Some(dino) => {
