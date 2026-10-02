@@ -127,13 +127,16 @@ Every test declares `requires`. The vocabulary is closed in
 `ci/manifest-plan/src/runner.rs`; an unknown token refuses manifest loading.
 Most tokens are descriptive prerequisites only and can never suppress a cell.
 The sole current host capability mapping is `cpuid` to `cpuid-faulting`.
+Independently of `requires`, a `kvm` backend cell needs the `kvm` capability:
+a missing `/dev/kvm` (ENOENT) is proof of absence even when the CPU advertises
+vmx or svm, which is what RE workers and containers show.
 One descriptive token is enforced at load time: a verify golden that prints
 the vDSO getrandom leg (`vdso-getrandom[`) can only be produced on a host
 kernel that exports `__vdso_getrandom` (Linux 6.11+ on x86-64), so its test
 must declare `vdso-getrandom`. The token is not probed; on an older kernel the
 cell runs and fails with that prerequisite named in its manifest.
 
-When that capability is provably absent, the harness records each selected cell
+When a needed capability is provably absent, the harness records each selected cell
 as `HOST-INAPPLICABLE` with the probe evidence. The cell stays in the selected
 denominator, has no invented command or attempt, and appears as JUnit `skipped`;
 it is never a pass. Probe failure or disagreement runs the cell. If every

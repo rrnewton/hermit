@@ -30,6 +30,7 @@ use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::SelectedCell;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
+use hermit_manifest_plan::runner::backend_capability;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
@@ -40,6 +41,7 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::validate_source_sha;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
@@ -94,6 +96,13 @@ Selection options:
   --include-manual                 Include manual cells; requires exact test and mode
   --probe-disabled                 Run one exact disabled cell
 
+Source options:
+  --repo-root <DIR>                Read manifests and programs from DIR and run hermit
+                                   there (default: the checkout this binary was built in)
+  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
+                                   metadata: record SHA as hermit_sha instead of asking
+                                   git (build, audit-compile, and run only)
+
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
   --diagnostic-results             Write dagrun structured-result schema 4, which
@@ -106,6 +115,8 @@ Execution and output options:
                                    a retry would hide the failure rate (run only)
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
+  --tpx-json <PATH>                Write one Tpx HPHP-JSON test_done line per final cell
+                                   to PATH (run only)
   --format <text|json>             Plan output format (default: text)
   --jobs <N>                       Prepare/run at most N tests/cells concurrently
   -h, --help                       Print this help";
@@ -165,6 +176,14 @@ const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
                                    Omit that backend's cells; may repeat
   --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat
   --exclude-category <CATEGORY>    Omit that manifest category's cells; may repeat";
+
+const REPO_ROOT_OPTION: &str =
+    "  --repo-root <DIR>                Read manifests and programs from DIR (default: the
+                                   checkout this binary was built in)";
+
+const SOURCE_SHA_OPTION: &str =
+    "  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
+                                   metadata: record SHA as hermit_sha instead of asking git";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -257,6 +276,7 @@ fn print_command_help(command: &str) -> bool {
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
              --junit <PATH>                   Write JUnit output to PATH\n  \
+             --tpx-json <PATH>                Write one Tpx HPHP-JSON test_done line per final cell\n  \
              --jobs <N>                       Run at most N cells concurrently",
             CommandEnvironment::Run,
         ),
@@ -270,17 +290,20 @@ fn print_command_help(command: &str) -> bool {
         }
         _ => return false,
     };
-    let options_marker = if filter_options || !options.is_empty() {
-        " [OPTIONS]"
-    } else {
-        ""
-    };
-    println!("Usage: test-harness {command}{options_marker}\n\n{summary}\n\nOptions:");
+    // Every command accepts --repo-root, so every usage line takes options.
+    println!("Usage: test-harness {command} [OPTIONS]\n\n{summary}\n\nOptions:");
     if filter_options {
         println!("{FILTER_OPTIONS}");
     }
     if !options.is_empty() {
         println!("{options}");
+    }
+    println!("{REPO_ROOT_OPTION}");
+    if matches!(
+        environment,
+        CommandEnvironment::Execution | CommandEnvironment::Run
+    ) {
+        println!("{SOURCE_SHA_OPTION}");
     }
     println!("  -h, --help                       Print this help");
     if matches!(
@@ -307,11 +330,25 @@ fn fail(message: impl std::fmt::Display) -> ! {
     std::process::exit(2);
 }
 
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
+/// The repository the manifests, programs and hermit's working directory come
+/// from: `--repo-root`, else the checkout this binary was compiled in.
+fn root(repo_root: Option<&Path>) -> PathBuf {
+    if let Some(root) = repo_root {
+        return root.canonicalize().unwrap_or_else(|error| {
+            fail(format!(
+                "--repo-root {} is unusable: {error}; name an existing Hermit source tree",
+                root.display()
+            ))
+        });
+    }
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    compiled.canonicalize().unwrap_or_else(|error| {
+        fail(format!(
+            "the checkout this test-harness was built in, {}, is unusable: {error}; \
+             pass --repo-root DIR naming a Hermit source tree",
+            compiled.display()
+        ))
+    })
 }
 
 #[derive(Default)]
@@ -325,6 +362,9 @@ struct Args {
     probe_disabled: bool,
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
+    tpx_json: Option<PathBuf>,
+    repo_root: Option<PathBuf>,
+    source_sha: Option<String>,
     format: String,
     jobs: Option<usize>,
 }
@@ -422,6 +462,16 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.results = Some(PathBuf::from(required_value(&mut values, "--results")))
             }
             "--junit" => args.junit = Some(PathBuf::from(required_value(&mut values, "--junit"))),
+            "--tpx-json" => {
+                args.tpx_json = Some(PathBuf::from(required_value(&mut values, "--tpx-json")))
+            }
+            "--repo-root" => {
+                let value = required_value(&mut values, "--repo-root");
+                if args.repo_root.replace(PathBuf::from(value)).is_some() {
+                    fail("--repo-root may be specified only once");
+                }
+            }
+            "--source-sha" => set_once(&mut args.source_sha, &mut values, "--source-sha"),
             "--format" => args.format = required_value(&mut values, "--format"),
             "--jobs" => {
                 let value = required_value(&mut values, "--jobs");
@@ -602,13 +652,17 @@ fn accumulate_cell_cpu_usage(
     }
 }
 
+/// Why a cell cannot run on this machine, if it cannot: a capability its
+/// `requires` tokens or its backend need is proven absent.
 fn host_inapplicable_reason(
     requires: &[String],
+    backend: Option<&str>,
     verdicts: &HostCapabilities,
 ) -> Option<(Vec<String>, String)> {
     let mut absent = requires
         .iter()
         .filter_map(|token| requires_capability(token).ok().flatten())
+        .chain(backend.and_then(backend_capability))
         .filter_map(|capability| {
             verdicts
                 .get(&capability)
@@ -751,6 +805,21 @@ fn validate_args(command: &str, args: &Args) {
     if command != "run" && args.retries == Retries::Off {
         fail("--no-retry is accepted by run only");
     }
+    if command != "run" && args.tpx_json.is_some() {
+        fail("--tpx-json is accepted by run only");
+    }
+    if let Some(sha) = args.source_sha.as_deref() {
+        if !matches!(command, "build" | "audit-compile" | "run") {
+            fail("--source-sha is accepted by build, audit-compile, and run only");
+        }
+        if args.repo_root.is_none() {
+            fail(
+                "--source-sha describes a --repo-root source snapshot; pass --repo-root DIR \
+                 naming the `git archive` of that commit",
+            );
+        }
+        validate_source_sha(sha).unwrap_or_else(|error| fail(error));
+    }
     if !matches!(command, "build" | "run") && args.jobs.is_some() {
         fail("--jobs is accepted by build and run only");
     }
@@ -810,9 +879,9 @@ fn main() -> ExitCode {
     let values = values.collect::<Vec<_>>();
     if command == "parity" {
         let request = parse_parity_compare(values);
-        let root = root();
+        let root = root(None);
         let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
-        run_manifest_plan(&root);
+        run_manifest_plan(&root, None);
         return parity_compare(&root, &manifests, &request);
     }
     if command == "selftest" {
@@ -823,12 +892,12 @@ fn main() -> ExitCode {
     }
     let args = parse(values.into_iter());
     validate_args(&command, &args);
-    let root = root();
+    let root = root(args.repo_root.as_deref());
     let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
     // One front-door schema/inventory authority governs every command, not
     // only the metadata gate. This prevents a direct/manual run from accepting
     // a recipe that the canonical manifest planner would refuse.
-    run_manifest_plan(&root);
+    run_manifest_plan(&root, args.source_sha.as_deref());
     match command.as_str() {
         "validate" => validate(&root, &manifests),
         "plan" => print_plan(&manifests, &args, Population::Required),
@@ -935,7 +1004,7 @@ fn run_tool_self_test(values: &[String]) -> ExitCode {
                 "unknown self-test {name}; expected one of: {names}"
             ))
         });
-    let root = root();
+    let root = root(None);
     let started = std::time::Instant::now();
     if let Some(triggers) = tool.run_when_changed {
         // The NOT RUN message is one line and the node's last, so the
@@ -1057,11 +1126,18 @@ fn audit_cli_brackets(root: &Path) {
     }
 }
 
-fn run_manifest_plan(root: &Path) {
+/// Run the canonical manifest planner over `root`. A `source_sha` means the
+/// root is a source snapshot, so the planner takes the test population from the
+/// files present instead of from Git.
+fn run_manifest_plan(root: &Path, source_sha: Option<&str>) {
     let manifest_plan =
         sibling_manifest_plan().unwrap_or_else(|| root.join("target/debug/hermit-manifest-plan"));
-    let status = Command::new(&manifest_plan)
-        .args(["--format", "json"])
+    let mut command = Command::new(&manifest_plan);
+    command.args(["--format", "json", "--root"]).arg(root);
+    if source_sha.is_some() {
+        command.arg("--source-snapshot");
+    }
+    let status = command
         .current_dir(root)
         .stdout(Stdio::null())
         .status()
@@ -1155,12 +1231,19 @@ fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
                 .iter()
                 .filter_map(|token| requires_capability(token).ok().flatten())
                 .collect::<BTreeSet<_>>();
+            // `requires` and the base (unmultiplied) timeouts let a consumer that
+            // cannot load the manifests, such as a Buck cell generator, route
+            // and budget each cell from this file alone.
             let mut row = serde_json::json!({
                 "test": cell.id.test,
                 "category": cell.category,
                 "lane": cell.test.lane,
                 "mode": cell.id.mode,
                 "backend": cell.id.backend,
+                "requires": cell.test.requires,
+                "timeout_seconds": cell.timeout_seconds,
+                "cpu_timeout_seconds": cell.cpu_timeout_seconds,
+                "classification": if is_diagnostic_cell(cell) { "diagnostic" } else { "required" },
             });
             if !capabilities.is_empty() {
                 row["requires_host_capabilities"] = serde_json::json!(capabilities);
@@ -2275,7 +2358,8 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         fail("filters selected no cells");
     }
     let capacity = build_worker_capacity(args);
-    let context = RunContext::from_env(root.to_path_buf(), false).unwrap_or_else(|e| fail(e));
+    let context = RunContext::from_env(root.to_path_buf(), false, args.source_sha.as_deref())
+        .unwrap_or_else(|e| fail(e));
     let mut seen = BTreeSet::new();
     let cells = cells
         .into_iter()
@@ -2321,7 +2405,8 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 }
 
 fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
-    let context = RunContext::from_env(root.to_path_buf(), false).unwrap_or_else(|e| fail(e));
+    let context = RunContext::from_env(root.to_path_buf(), false, args.source_sha.as_deref())
+        .unwrap_or_else(|e| fail(e));
     let mut checked = 0;
     let mut failed = false;
     for (category, inherited_timeout_seconds, inherited_cpu_timeout_seconds, test) in
@@ -2559,10 +2644,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let capacity = scheduled_worker_capacity(args);
     let planned_verify = planned_verify(&cells);
     let parity_scope = parity_scope(root, manifests, &planned_verify);
-    let context = RunContext::from_env(root.to_path_buf(), args.prebuilt)
-        .unwrap_or_else(|e| fail(e))
-        .with_scheduled_worker_capacity(capacity)
-        .with_parity_retained(parity::retention_closure(&parity_scope, &planned_verify));
+    let context = RunContext::from_env(
+        root.to_path_buf(),
+        args.prebuilt,
+        args.source_sha.as_deref(),
+    )
+    .unwrap_or_else(|e| fail(e))
+    .with_scheduled_worker_capacity(capacity)
+    .with_parity_retained(parity::retention_closure(&parity_scope, &planned_verify));
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -2601,9 +2690,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         capacity,
         |index, emit| {
             let cell = &cells[index];
-            if let Some((_, reason)) =
-                host_inapplicable_reason(&cell.test.requires, &context.host_capabilities)
-            {
+            if let Some((_, reason)) = host_inapplicable_reason(
+                &cell.test.requires,
+                cell.id.backend.as_deref(),
+                &context.host_capabilities,
+            ) {
                 let _ = emit(host_inapplicable_result(&context, cell, reason), false);
                 return;
             }
@@ -2759,6 +2850,13 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             }))
         })
         .collect::<Vec<_>>();
+    // Parallel to `results`: whether each final cell is an excused diagnostic.
+    let excused = indexed_results
+        .iter()
+        .map(|(index, result)| {
+            excused_diagnostic(args.diagnostic_results, result, &attempt_results[*index]).is_some()
+        })
+        .collect::<Vec<_>>();
     let results = indexed_results
         .into_iter()
         .map(|(_, result)| result)
@@ -2829,6 +2927,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         serde_json::to_vec_pretty(&summary).unwrap(),
     )
     .unwrap();
+    if let Some(path) = &args.tpx_json {
+        if let Err(error) = write_tpx_json(path, &results, &excused) {
+            eprintln!("test-harness: cannot write {}: {error}", path.display());
+            failed = true;
+        }
+    }
     let exit = if failed {
         ExitCode::FAILURE
     } else {
@@ -2844,6 +2948,52 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         &attempt_results,
     );
     exit
+}
+
+/// Write one Tpx HPHP-JSON `test_done` record per final cell, then `all_done`,
+/// so a Buck `type = "json"` test reports each cell as its own test case.
+///
+/// The status follows the run's own verdict: PASS is `passed`; a
+/// host-inapplicable cell ran nothing and an excused diagnostic failure does
+/// not fail the run, so both are `skipped`; any other outcome is `failed`.
+/// `details` carries the row's verdict fields, so a skip still says why.
+fn write_tpx_json(path: &Path, results: &[CellResult], excused: &[bool]) -> std::io::Result<()> {
+    let mut lines = String::new();
+    for (result, excused) in results.iter().zip(excused) {
+        let status = match result.outcome.as_str() {
+            "PASS" => "passed",
+            "HOST-INAPPLICABLE" => "skipped",
+            _ if *excused => "skipped",
+            _ => "failed",
+        };
+        let details = serde_json::json!({
+            "outcome": result.outcome,
+            "result": result.result,
+            "failure_class": result.failure_class,
+            "error_kind": result.error_kind,
+            "reason": result.reason,
+            "attempt": result.attempt,
+            "duration_ms": result.duration_ms,
+            "cpu_usage_usec": result.cpu_usage_usec,
+            "artifact_dir": result.artifact_dir,
+        });
+        let record = serde_json::json!({
+            "op": "test_done",
+            "test": format!(
+                "{}/{}@{}",
+                result.test,
+                result.mode,
+                result.backend.as_deref().unwrap_or("native")
+            ),
+            "status": status,
+            "details": details.to_string(),
+        });
+        lines.push_str(&record.to_string());
+        lines.push('\n');
+    }
+    lines.push_str(&serde_json::json!({ "op": "all_done" }).to_string());
+    lines.push('\n');
+    fs::write(path, lines)
 }
 
 /// The `(test, backend)` verify cells this process plans.
@@ -4482,7 +4632,7 @@ sys.exit(1 if failed else 0)
     #[test]
     fn the_full_profile_reports_each_selected_parity_cell_exactly_once() {
         use hermit_manifest_plan::parity;
-        let root = super::root();
+        let root = super::root(None);
         let manifests = ManifestSet::load(&root).unwrap();
         let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
             .expect("actual committed graph");
@@ -4560,7 +4710,7 @@ sys.exit(1 if failed else 0)
 
     #[test]
     fn generated_expected_plan_is_versioned_and_matches_the_tracked_file() {
-        let root = super::root();
+        let root = super::root(None);
         let manifests = ManifestSet::load(&root).unwrap();
         let generated = expected_plan_document(&root, &manifests);
         assert_eq!(generated["schema"], EXPECTED_PLAN_SCHEMA);
@@ -4873,13 +5023,14 @@ sys.exit(1 if failed else 0)
             },
         )]);
         let requires = vec!["linux".to_string(), "cpuid".to_string()];
-        let (capabilities, reason) = host_inapplicable_reason(&requires, &absent).unwrap();
+        let (capabilities, reason) =
+            host_inapplicable_reason(&requires, Some("ptrace"), &absent).unwrap();
         assert_eq!(capabilities, ["cpuid-faulting"]);
         assert!(reason.contains("NOT RUN, NOT a pass, no coverage"));
         assert!(reason.contains("planted absence"));
 
         let undeclared = vec!["linux".to_string(), "ptrace".to_string()];
-        assert!(host_inapplicable_reason(&undeclared, &absent).is_none());
+        assert!(host_inapplicable_reason(&undeclared, Some("ptrace"), &absent).is_none());
 
         let present = BTreeMap::from([(
             HostCapability::CpuidFaulting,
@@ -4888,7 +5039,35 @@ sys.exit(1 if failed else 0)
                 evidence: "planted presence".into(),
             },
         )]);
-        assert!(host_inapplicable_reason(&requires, &present).is_none());
+        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &present).is_none());
+    }
+
+    /// A kvm cell needs KVM whatever its `requires` say (the kvm backend cells do
+    /// not carry the `kvm` token), so proven absence withholds it; other
+    /// backends and a present device run.
+    #[test]
+    fn a_kvm_cell_is_withheld_where_kvm_is_proven_absent() {
+        let verdicts = |present| {
+            BTreeMap::from([(
+                HostCapability::Kvm,
+                HostCapabilityVerdict {
+                    present,
+                    evidence: "open(/dev/kvm, O_RDWR) = -1 errno=2".into(),
+                },
+            )])
+        };
+        let requires = vec![
+            "linux".to_string(),
+            "x86_64".to_string(),
+            "ptrace".to_string(),
+        ];
+        let (capabilities, reason) =
+            host_inapplicable_reason(&requires, Some("kvm"), &verdicts(false)).unwrap();
+        assert_eq!(capabilities, ["kvm"]);
+        assert!(reason.contains("errno=2"), "{reason}");
+        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &verdicts(false)).is_none());
+        assert!(host_inapplicable_reason(&requires, None, &verdicts(false)).is_none());
+        assert!(host_inapplicable_reason(&requires, Some("kvm"), &verdicts(true)).is_none());
     }
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
@@ -4901,7 +5080,7 @@ sys.exit(1 if failed else 0)
 
     #[test]
     fn workflow_outer_bounds_cover_constructed_graphs_and_setup() {
-        let root = super::root();
+        let root = super::root(None);
         let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
             .expect("actual committed graph");
         let portable = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
@@ -5041,7 +5220,7 @@ sys.exit(1 if failed else 0)
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
-        super::audit_budget_ordering(&super::root()).unwrap();
+        super::audit_budget_ordering(&super::root(None)).unwrap();
 
         let hosted_name = "test.hermit_unit_on_host";
         let host = *steps.get(hosted_name).unwrap();
@@ -6017,7 +6196,7 @@ sys.exit(1 if failed else 0)
     /// FAIL of an ordinary verify cell earns its retry.
     #[test]
     fn a_no_retry_cell_is_not_retried_after_a_product_failure() {
-        let manifests = ManifestSet::load(&super::root()).unwrap();
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
         let cell = |test: &str| {
             manifests
                 .select(&hermit_manifest_plan::runner::Selection {
@@ -6067,6 +6246,128 @@ sys.exit(1 if failed else 0)
             super::parse(["--no-retry".to_string()].into_iter()).retries,
             super::Retries::Off
         );
+    }
+
+    #[test]
+    fn source_snapshot_flags_parse_once() {
+        let args = super::parse(
+            [
+                "--repo-root",
+                "/snapshot",
+                "--source-sha",
+                "03bbb83581fad247251df6363f50e61e24c2957e",
+                "--tpx-json",
+                "/out/tpx.jsonl",
+            ]
+            .map(String::from)
+            .into_iter(),
+        );
+        assert_eq!(
+            args.repo_root.as_deref(),
+            Some(std::path::Path::new("/snapshot"))
+        );
+        assert_eq!(
+            args.source_sha.as_deref(),
+            Some("03bbb83581fad247251df6363f50e61e24c2957e")
+        );
+        assert_eq!(
+            args.tpx_json.as_deref(),
+            Some(std::path::Path::new("/out/tpx.jsonl"))
+        );
+        let defaults = super::parse(std::iter::empty());
+        assert!(defaults.repo_root.is_none() && defaults.source_sha.is_none());
+        assert!(defaults.tpx_json.is_none());
+    }
+
+    /// One HPHP record per final cell, named `test/mode@backend`, whose status
+    /// follows the run's verdict: an excused diagnostic or host-inapplicable
+    /// cell is skipped (never passed), and the record still says why.
+    #[test]
+    fn tpx_json_reports_each_final_cell_with_the_run_verdict() {
+        let rows = [
+            attempt_row("t/pass", 1, "PASS", None, "required", &[], None),
+            attempt_row(
+                "t/fail",
+                1,
+                "FAIL",
+                Some("product_failure"),
+                "required",
+                &[],
+                Some("diverged"),
+            ),
+            attempt_row(
+                "t/diag",
+                1,
+                "FAIL",
+                Some("product_failure"),
+                "diagnostic",
+                &[],
+                Some("bounded"),
+            ),
+            attempt_row(
+                "t/hi",
+                1,
+                "HOST-INAPPLICABLE",
+                Some("understood_prerequisite_failure"),
+                "required",
+                &[],
+                Some("no cpuid"),
+            ),
+            attempt_row(
+                "t/err",
+                1,
+                "ERROR",
+                Some("no_result"),
+                "required",
+                &[],
+                None,
+            ),
+        ];
+        let path = std::env::temp_dir().join(format!("tpx-json-{}.jsonl", std::process::id()));
+        super::write_tpx_json(&path, &rows, &[false, false, true, false, false]).unwrap();
+        let records = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        fs::remove_file(&path).unwrap();
+        let reported = records
+            .iter()
+            .filter(|record| record["op"] == "test_done")
+            .map(|record| {
+                let details: serde_json::Value =
+                    serde_json::from_str(record["details"].as_str().unwrap()).unwrap();
+                (
+                    record["test"].as_str().unwrap().to_string(),
+                    record["status"].as_str().unwrap().to_string(),
+                    details["outcome"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            ("t/pass/verify@ptrace", "passed", "PASS"),
+            ("t/fail/verify@ptrace", "failed", "FAIL"),
+            ("t/diag/verify@ptrace", "skipped", "FAIL"),
+            ("t/hi/verify@ptrace", "skipped", "HOST-INAPPLICABLE"),
+            ("t/err/verify@ptrace", "failed", "ERROR"),
+        ]
+        .map(|(test, status, outcome)| (test.to_string(), status.to_string(), outcome.to_string()));
+        assert_eq!(reported, expected);
+        assert_eq!(
+            records.last().unwrap(),
+            &serde_json::json!({"op": "all_done"})
+        );
+        // Only the keys TestX accepts: an unknown top-level key fails the whole Tpx run.
+        for record in &records[..records.len() - 1] {
+            let mut keys = record
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+            assert_eq!(keys, ["details", "op", "status", "test"]);
+        }
     }
 
     #[test]
