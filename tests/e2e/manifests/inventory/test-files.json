@@ -2149,6 +2149,12 @@
       "why": "tests/c/utimensat_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/utimensat_mtime.c",
+      "runner": "hermit-cli/tests/utimensat_mtime.rs",
+      "why": "tests/c/utimensat_mtime.c is owned by hermit-cli/tests/utimensat_mtime.rs: Guest that writes two files, then sets their mtimes through utimensat (explicit, UTIME_OMIT and a touch -r style copy), futimens and utimes, and checks each value with stat; a later write must still move the mtime. It passes natively, and the Rust integration test runs it natively and under hermit run --strict --verify --verify-strict, requiring bitwise parity with compared INFO messages. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/vectored_file_io.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

@@ -1585,6 +1585,9 @@ impl GlobalTool for GlobalState {
                 R::UnlinkInode(self.recv_unlink_inode(from, d_ino).await)
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
+            GlobalRequest::SetFileMtime(ino, mtime) => {
+                R::SetFileMtime(self.recv_set_file_mtime(from, ino, mtime).await)
+            }
             GlobalRequest::GlobalTimeLowerBound => {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
@@ -2594,6 +2597,24 @@ impl GlobalState {
             "[dtid {}] bumping mtime on file (rawinode {:?}) to {}",
             from, ino, mtime,
         );
+        self.set_inode_mtime(ino, mtime);
+    }
+
+    /// Set the virtual mtime to the time the guest asked for with utimensat
+    /// (or utime/utimes, which are routed through it). Without this, a file's
+    /// mtime is the time of its last write, so `tar` extraction, `cp -p` and
+    /// `touch -r` could not restore one, and `make` saw files ordered by when
+    /// they were unpacked.
+    async fn recv_set_file_mtime(&self, from: Tid, ino: RawInode, mtime: LogicalTime) {
+        let _sched = self.lock_rpc_scheduler(false).await;
+        trace!(
+            "[dtid {}] setting mtime on file (rawinode {:?}) to {}",
+            from, ino, mtime,
+        );
+        self.set_inode_mtime(ino, mtime);
+    }
+
+    fn set_inode_mtime(&self, ino: RawInode, mtime: LogicalTime) {
         let mut mg = self.inodes.lock().unwrap();
         let dino =
             if let Some(d) = mg.inodes.get(&ino) {
@@ -2990,6 +3011,9 @@ pub enum GlobalRequest {
     /// Bump mtime
     TouchFile(RawInode),
 
+    /// Set mtime to a guest-requested time (utimensat and friends).
+    SetFileMtime(RawInode, LogicalTime),
+
     /// Retrieve global time.
     GlobalTimeLowerBound,
 
@@ -3098,6 +3122,7 @@ pub enum GlobalResponse {
     ValidateMountIdOrder(bool),
     UnlinkInode(()),
     TouchFile(()),
+    SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
     TraceSchedEvent(TraceSchedEventResponse),
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3754,6 +3779,19 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::TouchFile(inode)).await;
     match resp.1 {
         GlobalResponse::TouchFile(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Set a file's virtual mtime to a guest-requested time.
+pub async fn set_file_mtime<G, T>(guest: &mut G, inode: RawInode, mtime: LogicalTime)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::SetFileMtime(inode, mtime)).await;
+    match resp.1 {
+        GlobalResponse::SetFileMtime(x) => x,
         _ => unreachable!(),
     }
 }

@@ -3925,7 +3925,68 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utimensat,
     ) -> Result<i64, Errno> {
-        self.record_or_replay(guest, call).await
+        let res = self.record_or_replay(guest, call).await?;
+        if !guest.config().virtualize_metadata {
+            return Ok(res);
+        }
+
+        // The kernel has applied the new times to the real file, but the guest
+        // observes the virtual mtime, which otherwise only moves on writes. Copy
+        // the requested mtime into it so that `tar` extraction, `cp -p` and
+        // `touch -r` restore a file's mtime and `make` compares the times the
+        // build asked for rather than the order in which files were unpacked.
+        // Reading the times back cannot fault: the kernel just read them.
+        let mtime = match call.times() {
+            None => libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+            Some(times) => {
+                let [_, mtime] = guest.memory().read_value(times)?;
+                libc::timespec {
+                    tv_sec: mtime.tv_sec,
+                    tv_nsec: mtime.tv_nsec,
+                }
+            }
+        };
+        if mtime.tv_nsec == libc::UTIME_OMIT {
+            return Ok(res);
+        }
+
+        // Find the raw inode the kernel just updated, with the same target
+        // selection: the descriptor itself for `futimens` (a NULL path), else a
+        // path walk honoring the flags utimensat accepts.
+        let mut stack = guest.stack().await;
+        let statptr: StatPtr = StatPtr(stack.reserve());
+        stack.commit()?;
+        let lookup = match call.path() {
+            None => Syscall::Fstat(
+                syscalls::Fstat::new()
+                    .with_fd(call.dirfd())
+                    .with_stat(Some(statptr)),
+            ),
+            Some(path) => {
+                let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+                Syscall::Newfstatat(
+                    syscalls::Newfstatat::new()
+                        .with_dirfd(call.dirfd())
+                        .with_path(Some(path))
+                        .with_stat(Some(statptr))
+                        .with_flags(AtFlags::from_bits_truncate(call.flags() & allowed)),
+                )
+            }
+        };
+        self.record_or_replay(guest, lookup).await?;
+        let raw_ino: RawInode = statptr.read(&guest.memory())?.st_ino;
+
+        if mtime.tv_nsec == libc::UTIME_NOW {
+            touch_file(guest, raw_ino).await;
+        } else {
+            let nanos = i128::from(mtime.tv_sec) * 1_000_000_000 + i128::from(mtime.tv_nsec);
+            let nanos = u64::try_from(nanos.max(0)).unwrap_or(u64::MAX);
+            set_file_mtime(guest, raw_ino, LogicalTime::from_nanos(nanos)).await;
+        }
+        Ok(res)
     }
 
     /// socket system call.
