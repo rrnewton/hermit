@@ -3169,7 +3169,7 @@ pub fn resolved_cell_timeouts(
     )
 }
 
-fn cell_timeouts(
+pub(crate) fn cell_timeouts(
     context: &RunContext,
     cell: &SelectedCell,
 ) -> Result<ResolvedTestTimeouts, String> {
@@ -6256,7 +6256,7 @@ fn observation_hash(observation: &Observation, attempt: &AttemptResult, dir: &Pa
     format!("{:x}", digest.finalize())
 }
 
-fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
+pub(crate) fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
     let bytes = if let Some(program) = &test.program {
         fs::read(root.join(program)).map_err(|e| e.to_string())?
     } else {

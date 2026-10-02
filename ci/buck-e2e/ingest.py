@@ -18,6 +18,9 @@ so the ledger, coverage and verdict consumers read a Buck run exactly as a cargo
 summary.json aggregates each cell's final execution: counts are summed and cell lists
 joined, which is what one harness process over the bucket writes. A host-inapplicable
 cell has no row, only its entry in summary.json's host_inapplicable_cells.
+summary.json's evidence_complete_cells lists each cell whose final execution's
+result.json (written by cell.sh) records complete evidence; `test-harness run` in
+import mode (E2E_IMPORT_RESULTS) refuses a PASS for any cell not listed.
 Tpx owns retries (cells run the harness with --no-retry): a cell's executions, in Tpx
 order, become attempts 1, 2, ..., so "passed only on rerun" stays visible as a failed
 attempt 1 followed by a passing attempt 2. Every plan cell must have a row; a cell with
@@ -103,11 +106,11 @@ def main():
                 rows = rows_of(os.path.join(d, rows_name)) if rows_name else []
                 summary_path = os.path.join(d, "summary.json")
                 summary = json.load(open(summary_path)) if os.path.exists(summary_path) else None
-                return cell, end, rows, summary
+                return cell, end, rows, summary, json.load(open(os.path.join(d, "result.json")))
         used_local["testx"] += 1
         names = [x["name"] for x in t.get("artifacts") or []]
         rows_name = next((n for n in ("results.jsonl", "results.jsonl.zst") if n in names), None)
-        wanted = [n for n in (rows_name, "summary.json") if n in names]
+        wanted = [n for n in (rows_name, "summary.json", "result.json") if n in names]
         d = os.path.join(work, re.sub(r"[^A-Za-z0-9._-]+", "_", f"{cell}__{tid}__{end}"))
         if wanted and not all(os.path.exists(os.path.join(d, n)) for n in wanted):
             args = ["artifacts", "get", f"{rid}.{tid}.{end}", "--output-dir", d]
@@ -116,15 +119,18 @@ def main():
             testx(*args)
         rows = rows_of(os.path.join(d, rows_name)) if rows_name else []
         summary = json.load(open(os.path.join(d, "summary.json"))) if "summary.json" in wanted else None
-        return cell, end, rows, summary
+        result = json.load(open(os.path.join(d, "result.json"))) if "result.json" in wanted else None
+        return cell, end, rows, summary, result
 
     with cf.ThreadPoolExecutor(a.j) as ex:
         fetched = list(ex.map(fetch, executions))
     per_cell = collections.defaultdict(list)
     final_summary = {}
-    for cell, end, rows, summary in sorted(fetched, key=lambda x: (x[0], x[1])):
+    final_result = {}
+    for cell, end, rows, summary, result in sorted(fetched, key=lambda x: (x[0], x[1])):
         per_cell[cell].append(rows)
         final_summary[cell] = summary
+        final_result[cell] = result
     def host_inapplicable(cell):
         return any("{}/{}@{}".format(h["test"], h["mode"], h.get("backend") or "native") == cell
                    for h in (final_summary.get(cell) or {}).get("host_inapplicable_cells", []))
@@ -134,12 +140,18 @@ def main():
         sys.exit(f"ingest: cells without rows: {missing[:20]} ({len(missing)}); unexpected cells: {extra[:20]} ({len(extra)})")
     buckets = collections.defaultdict(list)
     summaries = collections.defaultdict(list)
+    evidence_complete = collections.defaultdict(list)
     attempts = collections.Counter()
     final = collections.Counter()
     for cell, runs in per_cell.items():
         lane, category = want[cell]["lane"], want[cell]["category"]
         if final_summary.get(cell):
             summaries[(lane, category)].append(final_summary[cell])
+        result = final_result.get(cell) or {}
+        if result.get("cell") == cell and result.get("evidence_complete") is True:
+            c = want[cell]
+            evidence_complete[(lane, category)].append(
+                {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"]})
         attempt = 0
         for rows in runs:
             for row in rows:
@@ -163,11 +175,13 @@ def main():
                     total.setdefault(k, []).extend(v)
                 elif isinstance(v, (int, float)):
                     total[k] = total.get(k, 0) + v
+        total["evidence_complete_cells"] = sorted(evidence_complete[key], key=lambda c: (c["test"], c["mode"], c["backend"] or ""))
         with open(os.path.join(d, "summary.json"), "w") as f:
             json.dump(total, f, indent=2, sort_keys=True)
             f.write("\n")
     print(json.dumps({"sources": dict(used_local), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
-                      "attempts": dict(attempts), "final_outcomes": dict(final)}))
+                      "attempts": dict(attempts), "final_outcomes": dict(final),
+                      "evidence_complete_cells": sum(len(v) for v in evidence_complete.values())}))
 
 if __name__ == "__main__":
     main()
