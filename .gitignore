@@ -52,3 +52,5 @@ buck-out/
 /.buck2
 /ci/buck-e2e/staged/
 /shim/third-party/libunwind/staged/
+/shim/third-party/cmake/staged/
+/shim/third-party/xz/staged/

@@ -159,3 +159,31 @@ def homebrew_library(
         target_compatible_with = target_compatible_with,
         **kwargs,
     )
+
+def host_system_libraries(libraries, packages):
+    """System libraries, as pkg-config describes the host, except under the RE modes.
+
+    libraries maps a target name to (pkg-config name, linker flags). Under the RE modes
+    (shim/modes/hybrid and remote, which set hermit.rust_sysroot) links run on RE
+    workers, which lack the -devel packages; there each target links the host's library
+    files that shim/modes/stage-re-inputs copied into this package's staged/ directory,
+    using the given linker flags, and the files travel with the link as an input.
+    Otherwise each target is a pkgconfig_system_library, as before."""
+    if read_config("hermit", "rust_sysroot", ""):
+        native.export_file(
+            name = "staged",
+            src = "staged",
+        )
+        for name, (_pkgconfig_name, flags) in libraries.items():
+            native.prebuilt_cxx_library(
+                name = name,
+                exported_linker_flags = ["-L$(location :staged)"] + flags,
+                visibility = ["PUBLIC"],
+            )
+    else:
+        for name, (pkgconfig_name, _flags) in libraries.items():
+            pkgconfig_system_library(
+                name = name,
+                packages = packages,
+                pkgconfig_name = pkgconfig_name,
+            )

@@ -5,16 +5,15 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@//third-party:defs.bzl", "pkgconfig_system_library")
+load("@//third-party:defs.bzl", "host_system_libraries")
 
 oncall("open_source")
 
-pkgconfig_system_library(
-    name = "lzma",
+host_system_libraries(
+    libraries = {"lzma": ("liblzma", ["-llzma"])},
     packages = {
         "//os:linux-fedora": ["xz-devel"],
         "//os:linux-ubuntu": ["liblz4-dev"],
         "//os:macos-homebrew": ["liblzma"],
     },
-    pkgconfig_name = "liblzma",
 )
