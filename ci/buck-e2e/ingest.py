@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Rebuild the e2e result files of a Buck test run from its Tpx results.
 
-usage: ingest.py --plan ci/expected-e2e-plan.json --out E2E_RESULT_ROOT [--work DIR] TEST_RUN_ID...
+usage: ingest.py --plan ci/expected-e2e-plan.json --out E2E_RESULT_ROOT [--work DIR]
+                 [--local-artifacts BUCK_OUT_TEST_DIR --since EPOCH] TEST_RUN_ID...
 
 TEST_RUN_ID is what `buck2 test --write-test-id FILE` wrote (one per invocation; the
 hybrid run makes two, one for RE cells and one for local cells). Every cell execution
@@ -21,6 +22,13 @@ Tpx owns retries (cells run the harness with --no-retry): a cell's executions, i
 order, become attempts 1, 2, ..., so "passed only on rerun" stays visible as a failed
 attempt 1 followed by a passing attempt 2. Every plan cell must have a row; a cell with
 none, or an unexpected cell, is an error. Prints one JSON summary line.
+
+--local-artifacts: Buck materializes each test's artifact directory locally
+(buck-out/v2/test/execution/<cell>/<target hash>/<config hash>/default/artifacts_directory),
+keeping the newest execution per target. A cell's final execution is read from there
+when that directory was written by this run (result.json newer than --since and naming
+the same cell); every other execution, and any final one without a local copy, is
+fetched with testx.
 """
 import argparse, collections, concurrent.futures as cf, json, os, re, subprocess, sys, tempfile, time
 
@@ -47,6 +55,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--work", help="where fetched artifacts go (default: a temporary directory)")
     ap.add_argument("-j", type=int, default=32)
+    ap.add_argument("--local-artifacts", help="buck-out/v2/test/execution: read final executions from here when fresh")
+    ap.add_argument("--since", type=float, default=0.0, help="epoch seconds the Buck run started")
     ap.add_argument("run_ids", nargs="+")
     a = ap.parse_args()
     plan = json.load(open(a.plan))
@@ -61,8 +71,40 @@ def main():
             if " - " in name and not name.endswith(" - unmanaged"):
                 executions.append((name.split(" - ", 1)[1], (int(t["end_time"]), t["test_details"]["id"]), rid, t))
 
+    # The newest local artifact directory per cell, if this run wrote it.
+    local = {}
+    if a.local_artifacts:
+        for dirpath, dirnames, filenames in os.walk(a.local_artifacts):
+            if os.path.basename(dirpath) == "artifacts_directory" and "result.json" in filenames:
+                dirnames[:] = []
+                p = os.path.join(dirpath, "result.json")
+                mtime = os.path.getmtime(p)
+                if mtime < a.since:
+                    continue
+                try:
+                    cell = json.load(open(p))["cell"]
+                except (ValueError, KeyError):
+                    continue
+                if cell not in local or local[cell][0] < mtime:
+                    local[cell] = (mtime, dirpath)
+    final_key = {}
+    for cell, key, rid, t in executions:
+        if cell not in final_key or final_key[cell] < key:
+            final_key[cell] = key
+    used_local = collections.Counter()
+
     def fetch(item):
         cell, (end, tid), rid, t = item
+        if (end, tid) == final_key[cell] and cell in local:
+            d = local[cell][1]
+            rows_name = next((n for n in ("results.jsonl", "results.jsonl.zst") if os.path.exists(os.path.join(d, n))), None)
+            if rows_name or os.path.exists(os.path.join(d, "summary.json")):
+                used_local["local"] += 1
+                rows = rows_of(os.path.join(d, rows_name)) if rows_name else []
+                summary_path = os.path.join(d, "summary.json")
+                summary = json.load(open(summary_path)) if os.path.exists(summary_path) else None
+                return cell, end, rows, summary
+        used_local["testx"] += 1
         names = [x["name"] for x in t.get("artifacts") or []]
         rows_name = next((n for n in ("results.jsonl", "results.jsonl.zst") if n in names), None)
         wanted = [n for n in (rows_name, "summary.json") if n in names]
@@ -124,7 +166,7 @@ def main():
         with open(os.path.join(d, "summary.json"), "w") as f:
             json.dump(total, f, indent=2, sort_keys=True)
             f.write("\n")
-    print(json.dumps({"cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
+    print(json.dumps({"sources": dict(used_local), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final)}))
 
 if __name__ == "__main__":
