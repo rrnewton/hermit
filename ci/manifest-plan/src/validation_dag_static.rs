@@ -433,7 +433,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // instruction_map::tests::decodes_instructions_that_end_at_or_cross_a_4gib_host_address
     // (https://github.com/rrnewton/hermit/issues/3462) retains all 763 prior
     // identities.
-    ("test.hermit_unit", 764),
+    // version::tests::fbcode_version_leads_with_the_crate_version and
+    // version::tests::fbcode_version_marks_missing_build_facts_unknown
+    // (https://github.com/rrnewton/hermit/pull/3511) retain all 764 prior
+    // identities.
+    ("test.hermit_unit", 766),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -580,8 +584,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 177),
     // The host twin selects the same 4 GiB iced decode regression
-    // (https://github.com/rrnewton/hermit/issues/3462).
-    ("test.hermit_unit_on_host", 764),
+    // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
+    // version-format tests (https://github.com/rrnewton/hermit/pull/3511).
+    ("test.hermit_unit_on_host", 766),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
