@@ -1491,6 +1491,42 @@ impl NetworkReplayEngine {
             .uninvoked = false;
         Ok(())
     }
+    /// Optional native ENTRY observation for an exact non-Read invocation.
+    /// It records only the boundary: selection, result, provider retirement,
+    /// publication and scheduler ownership still require their original joins.
+    /// Read has a separate required transition and must not use this one.
+    pub(crate) fn original_non_read_entered(
+        &mut self,
+        owner: NetworkStreamOwner,
+        admission: &Admission,
+    ) -> Result<(), NetworkReplayError> {
+        let (state, original) = self.original_connect_state(owner, admission.call)?;
+        if state.abandoned
+            || original.arguments != admission.arguments
+            || original.arguments.kind == Kind::Read
+            || original.uninvoked
+            || original.command.is_none()
+            || original.backend_entered
+            || original.backend_result.is_some()
+            || original.final_wait
+            || original.provider_retired
+            || original.pin_released
+            || original.consumed
+            || original.cancel_requested
+            || original.cancel_disarmed
+        {
+            return Err(protocol("non-Read entry changed its prepared invocation"));
+        }
+        self.stream_calls
+            .get_mut(&admission.call)
+            .unwrap()
+            .original
+            .as_mut()
+            .unwrap()
+            .backend_entered = true;
+        Ok(())
+    }
+
     /// Synchronous backend ENTRY observation for the same prepared Read.
     /// It supplies neither fdget selection nor a result.
     pub(crate) fn original_read_entered(
@@ -2904,6 +2940,101 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn non_read_entry_changes_only_the_same_native_call_boundary() {
+        let (mut engine, owner, args) = fixture(false);
+        let admission = engine.begin_original_connect(owner, args).unwrap();
+        engine
+            .original_connect_provider_submitted(owner, &admission)
+            .unwrap();
+        engine
+            .original_connect_prepared(owner, &admission, Pin::Empty, 17)
+            .unwrap();
+        let before = format!("{engine:?}");
+        assert!(engine.original_non_read_entered(owner, &admission).is_err());
+        assert_eq!(
+            format!("{engine:?}"),
+            before,
+            "uninvoked entry mutated the Call"
+        );
+        engine.original_connect_invoked(owner, &admission).unwrap();
+        let mut expected = engine
+            .original_connect_state(owner, admission.call)
+            .unwrap()
+            .1
+            .clone();
+        assert!(expected.selected.is_none());
+        assert!(expected.backend_result.is_none());
+        assert!(!expected.backend_entered);
+        expected.backend_entered = true;
+        engine.original_non_read_entered(owner, &admission).unwrap();
+        assert_eq!(
+            format!(
+                "{:?}",
+                engine
+                    .original_connect_state(owner, admission.call)
+                    .unwrap()
+                    .1
+            ),
+            format!("{expected:?}"),
+            "entry changed something other than its existing boundary bit",
+        );
+        assert_eq!(
+            engine.original_connect_result(owner, &admission).unwrap(),
+            None
+        );
+        let before = format!("{engine:?}");
+        assert!(engine.original_non_read_entered(owner, &admission).is_err());
+        assert_eq!(
+            format!("{engine:?}"),
+            before,
+            "duplicate entry mutated the Call"
+        );
+    }
+
+    #[test]
+    fn non_read_entry_cannot_replace_the_required_read_transition() {
+        let (mut engine, owner, mut args) = fixture(false);
+        args.kind = Kind::Read;
+        args.length = 0;
+        args.original_count = 8;
+        let admission = engine.begin_original_connect(owner, args).unwrap();
+        engine
+            .original_connect_provider_submitted(owner, &admission)
+            .unwrap();
+        engine
+            .original_call_prepared(owner, &admission, None, 17)
+            .unwrap();
+        engine.original_connect_invoked(owner, &admission).unwrap();
+        engine
+            .original_read_metadata_prepared(
+                owner,
+                &admission,
+                &FileMetadataObservation {
+                    admission: admission.clone(),
+                    logical_nonblocking: None,
+                    status_flags: None,
+                },
+            )
+            .unwrap();
+        let before = format!("{engine:?}");
+        assert!(engine.original_non_read_entered(owner, &admission).is_err());
+        assert_eq!(format!("{engine:?}"), before);
+        engine.original_read_entered(owner, &admission).unwrap();
+        let before = format!("{engine:?}");
+        assert!(engine.original_read_entered(owner, &admission).is_err());
+        assert!(
+            engine
+                .original_read_interrupted_before_entry(owner, &admission)
+                .is_err()
+        );
+        assert_eq!(format!("{engine:?}"), before);
+        assert_eq!(
+            engine.original_connect_result(owner, &admission).unwrap(),
+            None
+        );
+    }
+
     fn epoll_arguments(mut args: Arguments) -> Arguments {
         args.kind = Kind::EpollCtl;
         args.binding = None;

@@ -24,6 +24,9 @@ use crate::network_replay::original_connect::Local;
 use crate::network_runtime::NativeCaptureRecovery;
 use crate::network_runtime::native_peer::native_connected_tests::ConnectCompletionChange;
 
+#[path = "native_connected/non_read_entry.rs"]
+mod non_read_entry;
+
 struct EntryFixture {
     config: Config,
     state: GlobalState,

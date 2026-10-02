@@ -646,6 +646,15 @@ impl GlobalState {
                     .ok_or("Read observation engine missing")?
                     .lock()
                     .unwrap();
+                if event == reverie::InjectedSyscallEvent::Entered
+                    && admission.arguments.kind
+                        != crate::network_replay::original_connect::Kind::Read
+                {
+                    engine
+                        .original_non_read_entered(owner, admission)
+                        .map_err(|_| "non-Read entry changed actual invocation custody")?;
+                    return Ok(None);
+                }
                 if event == reverie::InjectedSyscallEvent::Entered {
                     engine.original_read_entered(owner, admission)
                 } else {
