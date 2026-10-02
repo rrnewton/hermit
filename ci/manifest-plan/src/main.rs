@@ -51,7 +51,7 @@ const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
 const HELP: &str = "\
-Usage: hermit-manifest-plan [--format <FORMAT>] [--root <HERMIT_CHECKOUT>]
+Usage: hermit-manifest-plan [--format <FORMAT>] [--root <HERMIT_CHECKOUT>] [--source-snapshot]
 
 Validate the centralized end-to-end manifests and print their expanded plan.
 
@@ -60,6 +60,10 @@ Options:
                      host-requirements (default: text)
   --root <PATH>      Read manifests and inventory from this Hermit checkout
                      (default: the checkout used to build this helper)
+  --source-snapshot  The root is a clean `git archive` of one commit with no
+                     Git metadata (a Buck/RE cell's source input): take the
+                     tests/ population from the files present instead of
+                     `git ls-files`
   -h, --help         Print this help";
 
 /// Every `(capability, test-id)` pair whose manifest token has a reviewed
@@ -150,9 +154,19 @@ fn die(msg: impl std::fmt::Display) -> ! {
     panic!("manifest-plan: {msg}");
 }
 
-fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf)> {
+/// Where `validate_test_inventory` learns which files exist under `tests/`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestPopulation {
+    /// `git ls-files`: tracked plus untracked-but-not-ignored files.
+    Git,
+    /// Every file present: the root is a clean source snapshot with no `.git`.
+    Snapshot,
+}
+
+fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulation)> {
     let mut format = Format::Text;
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut population = TestPopulation::Git;
     if matches!(arguments.as_slice(), [flag] if is_help_flag(flag)) {
         println!("{HELP}");
         return None;
@@ -174,6 +188,10 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf)> {
             root = PathBuf::from(path);
             continue;
         }
+        if arg == "--source-snapshot" {
+            population = TestPopulation::Snapshot;
+            continue;
+        }
         let value = if arg == "--format" {
             args.next()
                 .unwrap_or_else(|| die("--format requires a value"))
@@ -191,7 +209,7 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf)> {
             _ => die(format!("unknown format: {value}")),
         };
     }
-    Some((format, root))
+    Some((format, root, population))
 }
 
 fn load_defaults(repo_root: &Path) -> (PathBuf, Value) {
@@ -209,7 +227,8 @@ fn load_defaults(repo_root: &Path) -> (PathBuf, Value) {
 }
 
 fn main() {
-    let Some((format, repo_root)) = parse_options(std::env::args().skip(1).collect()) else {
+    let Some((format, repo_root, population)) = parse_options(std::env::args().skip(1).collect())
+    else {
         return;
     };
     let (script_dir, defaults) = load_defaults(&repo_root);
@@ -352,7 +371,7 @@ fn main() {
     }
 
     let inventory = load_test_inventory(&repo_root);
-    validate_test_inventory(&repo_root, &inventory, &seen_programs);
+    validate_test_inventory(&repo_root, population, &inventory, &seen_programs);
     validate_retired_ids(&repo_root, &documents, &seen_ids);
     validate_front_door(&repo_root, &documents, &inventory);
     validate_ci_reason_baseline(&repo_root, &documents);
@@ -717,6 +736,7 @@ fn validate_retired_ids(repo_root: &Path, documents: &[Value], seen_ids: &BTreeS
 /// entries, so the writer and checker cannot disagree about what must be owned.
 fn validate_test_inventory(
     repo_root: &Path,
+    population: TestPopulation,
     inventory: &JsonValue,
     manifest_programs: &BTreeSet<String>,
 ) {
@@ -793,28 +813,10 @@ fn validate_test_inventory(
         ));
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args([
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            "tests",
-        ])
-        .output()
-        .unwrap_or_else(|error| die(format!("cannot enumerate tests/ with git: {error}")));
-    if !output.status.success() {
-        die(format!(
-            "cannot enumerate tests/ with git: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let present_text = String::from_utf8(output.stdout)
-        .unwrap_or_else(|_| die("git ls-files returned a non-UTF-8 test path"));
-    let present: BTreeSet<_> = present_text.lines().map(str::to_string).collect();
+    let present = match population {
+        TestPopulation::Git => git_test_population(repo_root),
+        TestPopulation::Snapshot => snapshot_test_population(repo_root),
+    };
     let unregistered: Vec<_> = present.difference(&registered).cloned().collect();
     let phantoms: Vec<_> = registered.difference(&present).cloned().collect();
     if !unregistered.is_empty() || !phantoms.is_empty() {
@@ -836,6 +838,76 @@ fn validate_test_inventory(
             "manifest programs and disposition=manifest-test inventory entries differ; missing={missing:?}, stale={stale:?}"
         ));
     }
+}
+
+/// The `tests/` population Git reports: tracked files plus untracked files that
+/// are not ignored.
+fn git_test_population(repo_root: &Path) -> BTreeSet<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "tests",
+        ])
+        .output()
+        .unwrap_or_else(|error| die(format!("cannot enumerate tests/ with git: {error}")));
+    if !output.status.success() {
+        die(format!(
+            "cannot enumerate tests/ with git: {}; if {} is a source snapshot \
+             without Git metadata, pass --source-snapshot",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            repo_root.display()
+        ));
+    }
+    let present_text = String::from_utf8(output.stdout)
+        .unwrap_or_else(|_| die("git ls-files returned a non-UTF-8 test path"));
+    present_text.lines().map(str::to_string).collect()
+}
+
+/// Every non-directory entry under `tests/`, as root-relative `/` paths: the
+/// same population `git ls-files` reports for a clean `git archive`, which
+/// carries neither ignored output nor untracked files.
+fn snapshot_test_population(repo_root: &Path) -> BTreeSet<String> {
+    let mut present = BTreeSet::new();
+    let mut pending = vec![repo_root.join("tests")];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).unwrap_or_else(|error| {
+            die(format!(
+                "cannot enumerate source snapshot directory {}: {error}",
+                directory.display()
+            ))
+        });
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|error| {
+                    die(format!("cannot read {}: {error}", directory.display()))
+                })
+                .path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .unwrap_or_else(|error| die(format!("cannot stat {}: {error}", path.display())));
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(repo_root)
+                .ok()
+                .and_then(Path::to_str)
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "source snapshot path is not UTF-8 under the root: {}",
+                        path.display()
+                    ))
+                });
+            present.insert(relative.to_string());
+        }
+    }
+    present
 }
 
 fn validate_front_door(repo_root: &Path, documents: &[Value], inventory: &JsonValue) {
@@ -1812,6 +1884,38 @@ fn mode_attempts(id: &str, mode: &str, spec_value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// For a clean snapshot the filesystem population is what `git ls-files`
+    /// reports: every file and symlink under tests/, as root-relative paths.
+    #[test]
+    fn snapshot_population_lists_every_file_under_tests() {
+        let root = std::env::temp_dir().join(format!("snapshot-population-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("tests/e2e/manifests")).unwrap();
+        std::fs::create_dir_all(root.join("tests/empty-dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("tests/a.c"), "").unwrap();
+        std::fs::write(root.join("tests/e2e/manifests/defaults.yaml"), "").unwrap();
+        std::fs::write(root.join("other/not-tests.txt"), "").unwrap();
+        std::os::unix::fs::symlink("a.c", root.join("tests/link.c")).unwrap();
+        let present = snapshot_test_population(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            present.into_iter().collect::<Vec<_>>(),
+            [
+                "tests/a.c",
+                "tests/e2e/manifests/defaults.yaml",
+                "tests/link.c"
+            ]
+        );
+    }
+
+    #[test]
+    fn source_snapshot_selects_the_filesystem_population() {
+        let (_, _, population) = parse_options(vec!["--source-snapshot".into()]).unwrap();
+        assert_eq!(population, TestPopulation::Snapshot);
+        let (_, _, population) = parse_options(vec![]).unwrap();
+        assert_eq!(population, TestPopulation::Git);
+    }
 
     fn parse_mode(text: &str) -> Value {
         manifest_value::from_toml(
@@ -2983,7 +3087,7 @@ mod runtime_root_tests {
                 format!("schema: 1\ntimeout_seconds: {timeout}\n"),
             )
             .unwrap();
-            let (format, selected) = parse_options(vec![
+            let (format, selected, population) = parse_options(vec![
                 "--format".into(),
                 "matrix-json".into(),
                 "--root".into(),
@@ -2991,11 +3095,12 @@ mod runtime_root_tests {
             ])
             .unwrap();
             assert_eq!(format, Format::MatrixJson);
+            assert_eq!(population, TestPopulation::Git);
             let (directory, defaults) = load_defaults(&selected);
             assert_eq!(directory, root.join("tests/e2e/manifests"));
             assert_eq!(defaults["timeout_seconds"].as_integer(), Some(timeout));
         }
-        let (_, default) = parse_options(vec![]).unwrap();
+        let (_, default, _) = parse_options(vec![]).unwrap();
         assert_eq!(
             default,
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

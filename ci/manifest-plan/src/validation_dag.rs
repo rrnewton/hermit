@@ -440,6 +440,20 @@ struct ExpectedCell {
     backend: String,
     #[serde(default)]
     requires_host_capabilities: Vec<String>,
+    /// Routing and budget fields for consumers outside the DAG (Buck cell
+    /// generation). Optional so plans retained before they existed still parse.
+    #[serde(default)]
+    #[allow(dead_code)]
+    requires: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cpu_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    classification: Option<String>,
 }
 
 impl From<ExpectedCell> for DagManifest {

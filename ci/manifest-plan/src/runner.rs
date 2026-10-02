@@ -123,6 +123,39 @@ pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
 pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
 pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
 
+/// The commit the cells' source came from and whether the tree is dirty: the
+/// named `source_sha` of a Git-less snapshot (clean by construction), else
+/// what Git reports for the checkout at `root`.
+fn source_identity(root: &Path, source_sha: Option<&str>) -> Result<(String, bool), String> {
+    match source_sha {
+        Some(sha) => {
+            validate_source_sha(sha)?;
+            Ok((sha.to_string(), false))
+        }
+        None => Ok((
+            git(root, &["rev-parse", "HEAD"])?,
+            !git(root, &["status", "--porcelain", "--untracked-files=no"])?.is_empty(),
+        )),
+    }
+}
+
+/// A `--source-sha` must name one commit exactly: 40 lowercase hex digits, the
+/// spelling `git rev-parse HEAD` records in `hermit_sha`.
+pub fn validate_source_sha(sha: &str) -> Result<(), String> {
+    if sha.len() == 40
+        && sha
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "--source-sha must be a full 40-digit lowercase commit sha, got {sha:?}; \
+             pass the output of `git rev-parse HEAD` for the archived commit"
+        ))
+    }
+}
+
 fn first_attempt() -> u64 {
     1
 }
@@ -206,6 +239,12 @@ pub fn validate_golden_kernel_floor(
         }
     }
     Ok(())
+}
+
+/// The host capability a backend itself needs, independent of any `requires`
+/// token: a kvm cell cannot run where KVM is proven absent.
+pub fn backend_capability(backend: &str) -> Option<HostCapability> {
+    (backend == "kvm").then_some(HostCapability::Kvm)
 }
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
@@ -2577,10 +2616,14 @@ impl RunContext {
         }
     }
 
-    pub fn from_env(root: PathBuf, prebuilt: bool) -> Result<Self, String> {
-        let source_sha = git(&root, &["rev-parse", "HEAD"])?;
-        let source_dirty =
-            !git(&root, &["status", "--porcelain", "--untracked-files=no"])?.is_empty();
+    /// `source_sha` names the commit a Git-less source snapshot at `root` was
+    /// archived from (`--source-sha`); without it, Git describes the checkout.
+    pub fn from_env(
+        root: PathBuf,
+        prebuilt: bool,
+        source_sha: Option<&str>,
+    ) -> Result<Self, String> {
+        let (source_sha, source_dirty) = source_identity(&root, source_sha)?;
         let result_root = std::env::var_os("E2E_RESULT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("ignored/e2e"));
@@ -6302,6 +6345,36 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    #[test]
+    fn source_sha_must_be_one_full_lowercase_commit() {
+        assert!(validate_source_sha("03bbb83581fad247251df6363f50e61e24c2957e").is_ok());
+        for refused in [
+            "03bbb835",
+            "03BBB83581FAD247251DF6363F50E61E24C2957E",
+            "03bbb83581fad247251df6363f50e61e24c2957e\n",
+            "g3bbb83581fad247251df6363f50e61e24c2957e",
+            "",
+        ] {
+            let error = validate_source_sha(refused).unwrap_err();
+            assert!(error.contains("git rev-parse HEAD"), "{error}");
+        }
+    }
+
+    /// A source snapshot names its commit; the run must not ask git, which a
+    /// `git archive` root cannot answer. Without the name, git stays the
+    /// authority and its failure is still an error.
+    #[test]
+    fn a_source_sha_replaces_git_for_a_snapshot_root() {
+        let root = std::env::temp_dir().join(format!("runner-snapshot-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let named = source_identity(&root, Some(sha));
+        let asked = source_identity(&root, None);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(named, Ok((sha.to_string(), false)));
+        assert!(asked.is_err(), "{asked:?}");
+    }
 
     /// The four outcomes of the verification-spelling probe.
     ///

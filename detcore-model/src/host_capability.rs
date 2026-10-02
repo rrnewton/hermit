@@ -183,8 +183,13 @@ fn cpuinfo_advertises_cpuid_fault() -> Option<bool> {
     Some(text.split_whitespace().any(|word| word == "cpuid_fault"))
 }
 
-pub fn kvm_absent(open: Result<(), i32>, advertised: Option<bool>) -> bool {
-    open == Err(libc::ENOENT) && advertised == Some(false)
+/// KVM is absent when `/dev/kvm` does not exist. That is proof on its own: a
+/// CPU that advertises vmx or svm still cannot run a KVM guest without the
+/// device (an RE worker or a container shows exactly that shape). Any other
+/// failure to open it -- a permissions or sandbox refusal -- is doubt about the
+/// probe, not proof, so the capability stays present and the cell runs.
+pub fn kvm_absent(open: Result<(), i32>) -> bool {
+    open == Err(libc::ENOENT)
 }
 
 fn probe_kvm() -> CapabilityVerdict {
@@ -200,7 +205,7 @@ fn probe_kvm() -> CapabilityVerdict {
         None => "/proc/cpuinfo could not be read",
     };
     CapabilityVerdict {
-        present: !kvm_absent(open, advertised),
+        present: !kvm_absent(open),
         evidence: format!("{open_text}; {cpuinfo_text}"),
     }
 }
@@ -236,6 +241,21 @@ mod tests {
         let report = HostCapabilitiesReport::probe();
         report.validate().unwrap();
         assert_eq!(report.host_capabilities.len(), HostCapability::ALL.len());
+    }
+
+    /// A missing `/dev/kvm` is absence even when /proc/cpuinfo advertises
+    /// vmx or svm; only a refused open is doubt.
+    #[test]
+    fn a_missing_kvm_device_is_proof_of_absence() {
+        assert!(kvm_absent(Err(libc::ENOENT)));
+        for doubt in [
+            Ok(()),
+            Err(libc::EACCES),
+            Err(libc::EPERM),
+            Err(libc::EBUSY),
+        ] {
+            assert!(!kvm_absent(doubt), "{doubt:?} must not read as absent");
+        }
     }
 
     #[test]
