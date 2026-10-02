@@ -1055,8 +1055,10 @@ mod tests {
             "functions of their controlled inputs",
             "`hermit run` starts it at the host's current time",
             "--epoch=2026-01-01T00:00:00Z",
-            "By default (`--network=local`)",
+            "In run mode, by default (`--network=local`)",
             "only a loopback interface",
+            "The DBT backend does not apply `--network` yet",
+            "Record mode has no `--network` flag: the guest uses the host network.",
             "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
             "`--data-dir` or `HERMIT_DATA_DIR`",
         ] {
@@ -1070,6 +1072,26 @@ mod tests {
             .find(|arg| arg.get_id() == "network")
             .expect("run --network");
         assert_eq!(network.get_default_values(), ["local"]);
+
+        // The help says record mode has no `--network` flag; if one is added,
+        // the help must say what it does.
+        fn network_args(command: &clap::Command) -> Vec<String> {
+            let mut found: Vec<String> = command
+                .get_arguments()
+                .filter(|arg| arg.get_long() == Some("network"))
+                .map(|_| command.get_name().to_string())
+                .collect();
+            for sub in command.get_subcommands() {
+                found.extend(network_args(sub));
+            }
+            found
+        }
+        let record = command.find_subcommand("record").unwrap();
+        assert_eq!(network_args(record), Vec::<String>::new());
+        assert_eq!(
+            network_args(command.find_subcommand("run").unwrap()),
+            ["run"]
+        );
     }
 
     #[test]

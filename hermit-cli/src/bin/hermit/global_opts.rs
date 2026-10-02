@@ -50,9 +50,13 @@ const CONTROLLER_TARGET: &str = "hermit::controller";
 /// next. Pass a fixed epoch (for example `--epoch=2026-01-01T00:00:00Z`) when
 /// two runs must produce identical time values.
 ///
-/// By default (`--network=local`) the guest gets its own network namespace with
-/// only a loopback interface. `--network=host` exposes the host network, which
-/// gives up isolation and reproducibility.
+/// In run mode, by default (`--network=local`), the guest gets its own network
+/// namespace with only a loopback interface. `--network=host` exposes the host
+/// network, which gives up isolation and reproducibility. The DBT backend does
+/// not apply `--network` yet: its guest sees the host network
+/// (https://github.com/rrnewton/hermit/issues/3543).
+///
+/// Record mode has no `--network` flag: the guest uses the host network.
 ///
 /// In record mode, the guest's system call results are saved so that
 /// `hermit replay` can reproduce the execution. Recordings are stored in

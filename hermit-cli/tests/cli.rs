@@ -1494,6 +1494,25 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     let recording = readonly_proc_command(&record_args).output().unwrap();
     assert_success(&recording, &record_args);
     let id = fs::read_to_string(data.path().join("last")).unwrap();
+
+    // The completion hint must name the data directory the recording went to.
+    // Without it the printed command looks in the default directory and finds
+    // nothing. Run the printed command itself, not a hand-built equivalent.
+    let record_stderr = strip_ansi_sgr(&stderr(&recording));
+    let hint = format!(
+        "hermit replay --autopilot --data-dir={} {}",
+        shell_words::quote(directory),
+        id.trim()
+    );
+    assert!(
+        record_stderr.contains(&hint),
+        "missing replay hint {hint:?}:\n{record_stderr}"
+    );
+    let hint_words = shell_words::split(&hint).unwrap();
+    let hint_args: Vec<&str> = hint_words[1..].iter().map(String::as_str).collect();
+    let hinted_replay = readonly_proc_command(&hint_args).output().unwrap();
+    assert_success(&hinted_replay, &hint_args);
+
     let metadata_path = data.path().join(id.trim()).join("metadata.json");
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
