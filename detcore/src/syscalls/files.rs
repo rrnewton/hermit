@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -417,6 +418,112 @@ fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd
         .any(|&held| held != fd && link(held).as_ref() == Some(&opened))
 }
 
+/// Which end of a named FIFO a blocking `openat` asks for. Linux makes such an
+/// open wait for the other end (fs/pipe.c `fifo_open`): a reader until some
+/// writer has opened the FIFO, a writer until a reader holds it open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FifoOpenEnd {
+    Reader,
+    Writer,
+}
+
+/// The end of a named FIFO that this open would wait for, or `None` when the
+/// open cannot block on a FIFO rendezvous: `O_NONBLOCK`, `O_PATH` and `O_RDWR`
+/// opens never wait, and neither does a reopened anonymous pipe
+/// (`/proc/self/fd/N`, `/dev/stdin`), which lives on pipefs. The path is looked
+/// up in the guest's own filesystem view through `/proc/<pid>/root`; an
+/// unresolved relative spelling yields `None` and keeps the plain open.
+fn blocking_fifo_open_end(pid: i32, observed_path: &Path, flags: OFlag) -> Option<FifoOpenEnd> {
+    const PIPEFS_MAGIC: libc::c_long = 0x5049_5045;
+    if flags.intersects(OFlag::O_NONBLOCK | OFlag::O_PATH) || !observed_path.is_absolute() {
+        return None;
+    }
+    let end = match flags & OFlag::O_ACCMODE {
+        OFlag::O_RDONLY => FifoOpenEnd::Reader,
+        OFlag::O_WRONLY => FifoOpenEnd::Writer,
+        _ => return None,
+    };
+    let mut host_path = std::ffi::OsString::from(format!("/proc/{pid}/root"));
+    host_path.push(observed_path.as_os_str());
+    if !std::fs::metadata(&host_path).is_ok_and(|metadata| metadata.file_type().is_fifo()) {
+        return None;
+    }
+    let host_path =
+        std::ffi::CString::new(std::os::unix::ffi::OsStringExt::into_vec(host_path)).ok()?;
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: a NUL-terminated path and a statfs buffer the kernel fills.
+    if unsafe { libc::statfs(host_path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statfs returned 0, so it initialised the buffer.
+    let on_pipefs = unsafe { fs.assume_init() }.f_type as libc::c_long == PIPEFS_MAGIC;
+    (!on_pipefs).then_some(end)
+}
+
+/// Has a writer opened the FIFO behind the guest's reader descriptor `fd`? The
+/// descriptor was opened `O_NONBLOCK`, which is the case where Linux records
+/// the FIFO's writer count at open time and reports `POLLHUP` only once a
+/// writer has come and gone. So a writer has been seen when the descriptor
+/// polls readable or hung up, or, failing both, when one is open right now;
+/// `tee(2)` tells the last case apart WITHOUT consuming data: it fails with
+/// `EAGAIN` while a writer is open and returns 0 when none is.
+///
+/// The probe runs on a duplicate of the guest's descriptor (`pidfd_getfd`),
+/// which shares its open file description, so the FIFO's reader and writer
+/// counts do not change. If the probe itself cannot run, report a partner,
+/// which degrades to returning from the open early instead of waiting forever.
+fn fifo_reader_has_partner(pid: i32, fd: RawFd) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+
+    let owned = |raw: libc::c_long| {
+        // SAFETY: a nonnegative return of pidfd_open/pidfd_getfd is a new fd
+        // that this function owns.
+        (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw as RawFd) })
+    };
+    // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
+    let Some(pidfd) = owned(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) }) else {
+        return true;
+    };
+    // SAFETY: pidfd_getfd takes a pidfd, a target fd and flags.
+    let Some(reader) =
+        owned(unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) })
+    else {
+        return true;
+    };
+    let mut pollfd = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialised pollfd, count 1, no timeout.
+    if unsafe { libc::poll(&mut pollfd, 1, 0) } < 0 {
+        return true;
+    }
+    if pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        return true;
+    }
+    let mut ends = [0 as RawFd; 2];
+    // SAFETY: pipe2 fills two fds.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return true;
+    }
+    // SAFETY: pipe2 succeeded, so both are new fds owned here.
+    let (_scratch_read, scratch_write) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    // SAFETY: tee between two pipe fds, at most one byte, nonblocking.
+    let teed = unsafe {
+        libc::tee(
+            reader.as_raw_fd(),
+            scratch_write.as_raw_fd(),
+            1,
+            libc::SPLICE_F_NONBLOCK,
+        )
+    };
+    teed != 0
+}
+
 /// The path the kernel resolved an open descriptor to, read from the guest's
 /// own `/proc/<pid>/fd/<fd>` link. This is the evidence authority for "which
 /// object was opened": it is produced by the kernel from the descriptor itself,
@@ -791,6 +898,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// Perform a blocking open of one end of a named FIFO without waiting in the
+    /// kernel. The open is issued with O_NONBLOCK and retried on deterministic
+    /// `InternalIOPolling` turns, so the guest that will open the other end gets
+    /// to run. It completes when Linux's blocking open would:
+    ///
+    /// - a writer once a reader holds the FIFO open: until then the
+    ///   nonblocking open fails with ENXIO;
+    /// - a reader once a writer has opened the FIFO. The nonblocking open
+    ///   succeeds at once, and the reader already counts as one, as a blocked
+    ///   reader does in Linux, so writers can complete their own opens; the
+    ///   wait is for [`fifo_reader_has_partner`].
+    ///
+    /// The returned descriptor keeps the kernel O_NONBLOCK; `handle_openat` types
+    /// it Pipe and virtualizes its guest-visible flags. A signal ends the wait
+    /// with ERESTARTSYS, as `fifo_open` returns from `wait_for_partner`.
+    async fn open_fifo_end<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        end: FifoOpenEnd,
+    ) -> Result<i64, Errno> {
+        let nonblocking = call.with_flags(call.flags() | OFlag::O_NONBLOCK);
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("openat(fifo)");
+        let mut opened = None;
+        loop {
+            if opened.is_none() {
+                match self
+                    .record_or_replay(guest, Syscall::Openat(nonblocking))
+                    .await
+                {
+                    Ok(fd) => opened = Some(fd),
+                    Err(Errno::ENXIO) if end == FifoOpenEnd::Writer => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(fd) = opened
+                && (end == FifoOpenEnd::Writer
+                    || fifo_reader_has_partner(guest.pid().as_raw(), fd as RawFd))
+            {
+                return Ok(fd);
+            }
+            rsrc.poll_attempt += 1;
+            trace!(
+                "openat: {:?} end of a FIFO waits for its partner, retry #{}",
+                end, rsrc.poll_attempt
+            );
+            if let ResumeStatus::Signaled(_) = resource_request(guest, rsrc.clone()).await {
+                if let Some(fd) = opened {
+                    let _ = guest
+                        .inject(syscalls::Close::new().with_fd(fd as RawFd))
+                        .await;
+                }
+                return Err(Errno::ERESTARTSYS);
+            }
+        }
+    }
+
     /// Inject an extra fstat to retrieve file metadata.
     ///
     /// The kernel needs a writable `struct stat` in the guest. It is staged
@@ -1006,7 +1172,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Ask for permission to resolve this path into a file:
         let request = guest.thread_state().mk_request(resource, Permission::R);
         resource_request(guest, request).await;
-        let res = self.record_or_replay(guest, Syscall::Openat(call)).await;
+        // A blocking open of a named FIFO waits in the kernel for the other end
+        // (a shell's `mkfifo f; cmd > f & read < f`, nixpkgs' audit-tmpdir.sh).
+        // Issued as is, it would wait while holding the scheduler turn and the
+        // other end never runs (https://github.com/rrnewton/hermit/issues/2203).
+        // Gated like the reopened-pipe treatment below.
+        let fifo_end = (self.cfg.sequentialize_threads
+            && self.cfg.use_nonblocking_sockets()
+            && !self.cfg.recordreplay_modes)
+            .then(|| blocking_fifo_open_end(guest.pid().as_raw(), &observed_path, call.flags()))
+            .flatten();
+        let res = match fifo_end {
+            Some(end) => self.open_fifo_end(guest, call, end).await,
+            None => self.record_or_replay(guest, Syscall::Openat(call)).await,
+        };
 
         match res {
             Ok(fd) => {
@@ -1028,7 +1207,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // same treatment as `handle_pipe2`: Pipe type plus a Detcore-internal
                 // physical O_NONBLOCK, which F_GETFL hides from the guest. Only a pipe
                 // this process already holds as scheduler-managed qualifies; a host
-                // pipe or a named FIFO keeps `deterministic_read`'s Regular handling.
+                // pipe or a named FIFO opened without blocking keeps
+                // `deterministic_read`'s Regular handling. A named FIFO that
+                // `open_fifo_end` opened is also a Pipe: it already holds the kernel
+                // O_NONBLOCK, and its other end is the guest the rendezvous waited for.
                 // Gated like the forced O_NONBLOCK in F_SETFL: Replayer's descriptor
                 // is an eventfd placeholder, so record and replay would not classify
                 // alike.
@@ -1036,13 +1218,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     && self.cfg.use_nonblocking_sockets()
                     && !self.cfg.recordreplay_modes
                     && !call.flags().contains(OFlag::O_PATH)
-                    && reopens_scheduler_managed_pipe(
-                        guest.pid().as_raw(),
-                        fd,
-                        &guest.thread_state().scheduler_managed_pipe_fds(),
-                    )
-                    && (call.flags().contains(OFlag::O_NONBLOCK)
-                        || self.inject_physical_nonblocking(guest, fd).await.is_ok())
+                    && (fifo_end.is_some()
+                        || (reopens_scheduler_managed_pipe(
+                            guest.pid().as_raw(),
+                            fd,
+                            &guest.thread_state().scheduler_managed_pipe_fds(),
+                        ) && (call.flags().contains(OFlag::O_NONBLOCK)
+                            || self.inject_physical_nonblocking(guest, fd).await.is_ok())))
                 {
                     FdType::Pipe
                 } else {
