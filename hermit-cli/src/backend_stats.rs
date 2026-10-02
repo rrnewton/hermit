@@ -98,6 +98,27 @@ impl BackendStatsSource for PtraceStatsSource {
     }
 }
 
+/// LiteInst's own statistics for one run, present only when they were requested.
+///
+/// The LiteInst runtime collects these only when asked, so a run without the
+/// request has no source. This wrapper still names the LiteInst snapshot type,
+/// which keeps [`report`]'s backend-wiring check running on every LiteInst run
+/// rather than only on runs that asked for statistics.
+pub(crate) struct LiteinstStatsSource(
+    pub(crate) Option<reverie_liteinst::LiteinstBackendStatsSource>,
+);
+
+impl BackendStatsSource for LiteinstStatsSource {
+    type Snapshot = reverie_liteinst::LiteinstBackendStatsSnapshot;
+
+    fn backend_stats(&self) -> Self::Snapshot {
+        self.0
+            .as_ref()
+            .expect("LiteInst statistics are collected whenever the request enables them")
+            .backend_stats()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -226,5 +247,28 @@ mod tests {
         };
 
         report(Backend::Liteinst, BackendStatsRequest::DISABLED, &source);
+    }
+
+    /// A LiteInst run that did not ask for statistics has no source, so the
+    /// report must pass the wiring check and return without a snapshot.
+    #[test]
+    fn liteinst_report_without_requested_stats_does_not_snapshot() {
+        report(
+            Backend::Liteinst,
+            BackendStatsRequest::DISABLED,
+            &LiteinstStatsSource(None),
+        );
+    }
+
+    /// The wrapper names the real LiteInst snapshot type, so the wiring check
+    /// still rejects it under another backend when nothing was collected.
+    #[test]
+    #[should_panic(expected = "backend statistics source does not match selected backend")]
+    fn liteinst_source_is_rejected_for_another_backend_without_stats() {
+        report(
+            Backend::Ptrace,
+            BackendStatsRequest::DISABLED,
+            &LiteinstStatsSource(None),
+        );
     }
 }
