@@ -232,6 +232,12 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
     );
 }
 
+/// Where a failed LiteInst `--verify` comparison in these tests keeps both
+/// runs' logs, as `hermit/verify-failures/` beneath it.
+fn liteinst_verify_failure_state_home() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-verify-failures")
+}
+
 /// The LiteInst command that runs `program`, with an isolated HOME that must
 /// outlive the run.
 fn liteinst_guest_command(
@@ -246,7 +252,17 @@ fn liteinst_guest_command(
     fs::create_dir_all(&xdg_config_home).expect("failed to create isolated XDG config directory");
     let mut command = liteinst_command_at_epoch("info", epoch);
     if verify {
-        command.arg("--verify");
+        // Both settings reach Hermit only: the guest gets `--base-env=minimal`
+        // plus the `--env` entries below. `detcore::tool_global` logs each
+        // deterministic inode it mints, with the host device and inode, at
+        // DEBUG; the comparison reads only INFO records. A failed comparison
+        // keeps both runs' logs under `$XDG_STATE_HOME/hermit/verify-failures`,
+        // which must outlive the temporary HOME. A passing one writes nothing
+        // there. `--keep-logs` is not used because it keeps passing logs too.
+        command
+            .arg("--verify")
+            .env("RUST_LOG", "detcore::tool_global=debug")
+            .env("XDG_STATE_HOME", liteinst_verify_failure_state_home());
     }
     command
         .arg(format!("--env=HOME={}", home.path().display()))
