@@ -92,6 +92,12 @@ outlined on that page and do not file a public issue.
 
 Follow the automatic `rustfmt` configuration.
 
+## Coding Agents
+
+Agents working in the development workspace should also read the
+[agent quick start](docs/AGENT_QUICKSTART.md) for the workspace's bounded-run
+wrapper and experiment conventions.
+
 ## License
 
 By contributing to Hermit, you agree that your contributions will be

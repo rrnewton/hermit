@@ -50,10 +50,16 @@ Clone the maintained fork and install the CLI into Cargo's binary directory,
 normally `~/.cargo/bin`:
 
 ```bash
-git clone https://github.com/rrnewton/hermit.git
+git clone --recurse-submodules https://github.com/rrnewton/hermit
 cd hermit
-cargo install --path hermit-cli
+cargo install --locked --path hermit-cli
 hermit --version
+```
+
+If you already cloned the repository, initialize its submodules before building:
+
+```bash
+git submodule update --init --recursive
 ```
 
 To build without installing:
@@ -63,13 +69,15 @@ cargo build --workspace
 ./target/debug/hermit --version
 ```
 
-An optimized workspace build also assembles every backend runtime into one
-installation staging directory:
+An optimized workspace build also stages the backend runtime resources:
 
 ```bash
-cargo build --release
+cargo build --release --workspace
 ./target/install_pkg/hermit --version
 ```
+
+Staging resources does not enable optional backends in the CLI. See
+[Execution Backends](#execution-backends) for the feature-enabled build.
 
 `target/install_pkg/rsrcs/` contains the SaBRe and e9patch rewriters, Detcore
 backend shared libraries, the DynamoRIO launcher/runtime, and its relocatable
@@ -80,9 +88,6 @@ a dereferencing copy such as `cp -aL target/install_pkg/ DESTINATION` when
 making a standalone installation or archive.
 
 ## Quick Start
-
-Coding agents running experiments from the `dev-hermit` workspace should first
-read the [Hermit quick start for coding agents](docs/AGENT_QUICKSTART.md).
 
 Run a command deterministically by placing `hermit run --` before it:
 
@@ -100,6 +105,10 @@ stronger mode:
 ```bash
 hermit run --strict -- /bin/echo hello
 ```
+
+For programs that read the clock, also fix `--epoch` to reproduce the starting
+time. Without it, each invocation captures the current host time. See the
+[date example](examples/README.md#examples).
 
 ### Execution Backends
 
@@ -150,22 +159,30 @@ useful diagnostic, but it is not strict determinism. Strict verification require
 `--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
 compared-message counts.
 Guests may create threads and child processes: `clone`, `clone3` and `fork` run
-under the ordinary ptrace lifecycle. Hook installation is single-task only,
-though -- the patch helper runs on a process-global stack and the installer is
-not re-entrant across tasks -- so the hook set freezes at the first
-task-creating syscall while the tasks themselves keep running. `vfork` still
-fails closed with `EOPNOTSUPP`, and `exec` is also unsupported, because neither
-can preserve the preload runtime after the address space is replaced. RCB preemption and CPUID/RDTSC interception use the ptrace host
-and retain its PMU and CPU capability requirements.
+under the ordinary ptrace lifecycle. Installation of new hooks stops at the
+first task-creating syscall, while existing hooks and tasks keep running.
+An activated process leader may `exec` a new dynamically linked program; the
+new image must retain the inherited runtime environment and activate the
+LiteInst runtime again. `vfork` and `exec` from a thread other than the process
+leader remain unsupported and are refused. RCB preemption and CPUID/RDTSC
+interception use the ptrace host and retain its PMU and CPU capability
+requirements.
 The default Hermit namespace path is supported; `--no-namespace` remains an
 explicit option for trusted guests. The in-guest patch runtime is experimental
 and continues to receive compatibility and lifecycle improvements.
-The release installation package supplies the DynamoRIO, SaBRe, LiteInst, and
-e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
-guest-kernel Linux ABI.
+The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
+well as runtime resources. Build both with:
 
-SaBRe is built only with the non-default `third-party-backends` feature. Its
-measured post-0.2 `Stripped` envelope, build instructions, and explicit
+```bash
+cargo build --release --workspace --features hermit/third-party-backends
+./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
+```
+
+Use the staged executable for these backends; a default `cargo install` does
+not enable them. KVM requires read-write `/dev/kvm` access plus its guest-kernel
+Linux ABI.
+
+SaBRe's measured post-0.2 `Stripped` envelope, build instructions, and explicit
 unsupported cases are documented in
 [SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
 
@@ -184,7 +201,9 @@ remain unsupported even when present in the offline map because this initial
 integration installs empty trampolines. Privilege-bearing executables fail
 closed rather than losing set-ID or file-capability semantics. This
 establishes the cached-rewrite pipeline but does not yet reduce ptrace events.
-Install `e9tool` in `PATH` or set `HERMIT_E9TOOL` to its executable.
+The workspace installation package includes `rsrcs/e9tool`; no separate install
+is needed when using that package. For a custom installation, put `e9tool` in
+`PATH` or set `HERMIT_E9TOOL` to its executable.
 Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
 through the ptrace correctness path.
 
@@ -200,16 +219,16 @@ Hermit configuration are unchanged.
 
 ## Compatibility
 
-Hermit can run substantial multi-process applications, but unsupported
-syscalls and host-specific CPU behavior remain. One compatibility milestone is
-booting a minimal x86_64 Linux system under QEMU TCG. The working profile uses
-QEMU's instruction-counting clock and lets QEMU's host threads run
-concurrently:
+The [latest compatibility scorecard](https://rrnewton.github.io/hermit/compatibility/latest/)
+records results for specific workloads, execution backends, and modes. A
+passing version probe does not establish support for an application's other
+workflows. Check the recorded command and configuration, then test the workload
+you depend on. Run and record/replay have different compatibility limits.
 
-- [Booting Linux with QEMU under Hermit](docs/QEMU_BOOT.md)
-
-That profile is a boot compatibility demonstration, not a fully deterministic
-virtual-machine configuration.
+[SCORECARD.md](SCORECARD.md) lists which tests apply to each backend; it is a
+selection catalogue, not a pass/fail report. For a larger example, the
+[QEMU boot guide](docs/QEMU_BOOT.md) describes deterministic and relaxed Linux
+boot configurations and their limits.
 
 ## Key Workflows
 
@@ -229,13 +248,30 @@ hermit record start -- /bin/echo recorded
 hermit replay --autopilot
 ```
 
+Recordings are stored in `$XDG_CACHE_HOME/hermit`, normally `~/.cache/hermit`.
+Use `--data-dir=DIR` or `HERMIT_DATA_DIR` to select another directory.
+
 ### Debug Adapter Protocol
+
+The DAP adapter is experimental. End-to-end attach and reverse replay are
+currently broken with GDB 17.2: an attached session can report that its thread
+has terminated, and reverse replay fails while loading the adapter's Python
+extension. No working GDB version is established by this guide. The examples
+below describe the interface; use ordinary GDB debugging or replay with
+`--autopilot` when these adapter failures affect you.
 
 Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
 `hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
 system root configured so GDB does not request shared libraries from Hermit's
 remote server. A GDB build with the DAP interpreter is required. Use `--gdb`
-when that executable is not `/usr/bin/gdb`:
+when that executable is not `/usr/bin/gdb`. To identify the default GDB:
+
+```bash
+/usr/bin/gdb --interpreter=dap --version
+```
+
+A version string alone does not establish a working DAP session. To build
+the adapter and start a remote target:
 
 ```bash
 cargo build -p hermit --bin hermit --bin hermit-dap
@@ -302,10 +338,10 @@ adding the recording arguments to `spawnConfig`:
 }
 ```
 
-In this mode the adapter advertises `supportsStepBack` and implements DAP
-`stepBack` and `reverseContinue` by restarting the deterministic replay and
-running forward to the requested earlier source position. This first
-implementation favors correctness over speed.
+When its extension loads successfully, the adapter advertises `supportsStepBack`
+and implements DAP `stepBack` and `reverseContinue` by restarting the
+deterministic replay and running forward to the requested earlier source
+position. This first implementation favors correctness over speed.
 
 ```bash
 dapper proxy --control-port 4711 from-config hermit-dap-replay.json
@@ -374,31 +410,6 @@ chroot may expose an order-preserving subset of a captured mount table; those
 rows retain their positions in the captured identity order, including gaps.
 If a new mount namespace exposes a mount ID absent from the captured order, a
 mountinfo read refuses instead of assigning a plausible but unproved identity.
-
-## Compatibility
-
-The following matrix summarizes unmodified host-binary testing on x86-64 Linux
-as of 2026-07-21. "Verified" describes the named probe, not every workflow a
-program supports. Run and record/replay results are intentionally separate.
-
-Some launch probes disabled CPUID virtualization and PMU preemption to match
-the test host's capabilities; the linked report records the exact flags.
-
-| Program or workload | Deterministic run | Record/replay | Scope |
-| --- | --- | --- | --- |
-| `/bin/echo` | Verified | Verified | Output and exit status match |
-| `ls`, `cat`, `grep`, `sed`, `awk`, `sort`, `wc` | Verified | Verified for tested file fixtures | Inputs must remain stable and visible in the guest |
-| `sh -c` shell built-ins | Verified | Verified | Child-process pipelines have additional limitations |
-| System Python 3 | Verified for `print` and tested file/JSON work | Verified for simple `print`; limited for complex imports and subprocesses | Some recording paths remain incomplete |
-| Node.js 16 | Verified for `console.log` | Limited; tested record/replay hangs | Basic launch works; this is not full Node compatibility |
-| OpenJDK 8 | Verified for `java -version` | Limited; replay hangs | Version probe only |
-| curl, wget, Git, GCC | Verified for version probes | Verified for version probes; functional workflows vary | External network and child-process behavior need separate testing |
-| SQLite | Verified for an in-memory query | Limited; replay diverges | Filesystem-event replay remains incomplete |
-
-See the full [arbitrary binary compatibility matrix](ai_docs/arbitrary-binary-matrix.md)
-for exact commands, host details, functional workloads, and linked issues.
-Compatibility evolves with syscall coverage, so validate the smallest real
-workload you depend on rather than relying on a version probe alone.
 
 ## Performance
 
@@ -480,8 +491,9 @@ and licensing guidelines.
 
 ## More Documentation
 
-- [Compatibility scorecard](SCORECARD.md): the current green/red totals by
-  backend and the commands that verify or pressure-test them.
+- [Compatibility results](https://rrnewton.github.io/hermit/compatibility/latest/):
+  measured outcomes by workload, backend, and mode.
+- [Test selection catalogue](SCORECARD.md): which tests apply to each backend.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
 - [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
   record/replay internals.
