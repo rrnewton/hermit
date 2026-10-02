@@ -136,6 +136,7 @@ const FTRACE_SOURCES: &[&str] = &[
     "stream-copy-unit-exit.inc",
     "stream-copy-fault.h",
     "stream-copy-fault.inc",
+    "fd-session-dispatch.inc",
 ];
 
 pub fn validate(contract: &Contract) -> Result<()> {
@@ -445,7 +446,7 @@ mod tests {
         let classic_sources = classic["source_files"].as_array().unwrap();
         let selected_sources = selected["source_files"].as_array().unwrap();
         assert_eq!(classic_sources.len(), 23);
-        assert_eq!(selected_sources.len(), 46);
+        assert_eq!(selected_sources.len(), 47);
         assert_eq!(&selected_sources[..23], classic_sources);
         assert_eq!(&selected_sources[23..], &[
             json!("ftrace-coverage.h"),json!("driver-grouped.c"),json!("grouped-driver.h"),
@@ -461,8 +462,9 @@ mod tests {
             json!("stream-copy-unit-exit.inc"),
             json!("stream-copy-fault.h"),
             json!("stream-copy-fault.inc"),
+            json!("fd-session-dispatch.inc"),
         ]);
-        assert_eq!(parsed.source_files.len(), 46);
+        assert_eq!(parsed.source_files.len(), 47);
     }
 
     #[test]
@@ -485,7 +487,7 @@ mod tests {
             refuses(&changed);
         }
         let count=selected["source_files"].as_array().unwrap().len();
-        assert_eq!(count,46);
+        assert_eq!(count,47);
         for index in 0..count {
             let mut changed = selected.clone();
             changed["source_files"].as_array_mut().unwrap().remove(index);

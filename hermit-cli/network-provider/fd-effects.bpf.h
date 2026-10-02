@@ -799,6 +799,7 @@ static __attribute__((noinline)) int fd_read_fdget_session(struct pt_regs *ctx) 
     }
     fd_selected_file(call,0,1);return 0;
 }
+#ifndef AP_FTRACE_PROVIDER
 static __attribute__((always_inline,nodebug)) inline int fd_session_dispatch(struct pt_regs *ctx) {
     u64 kind=fd_attach_cookie(ctx);
 #ifdef AP_GROUPED_PROVIDER
@@ -824,16 +825,12 @@ static __attribute__((always_inline,nodebug)) inline int fd_session_dispatch(str
     }
     return fd_connect_session(ctx);
 }
+#endif
 #ifdef AP_FTRACE_PROVIDER
 /* Outer functions and their nested callees need independent recursion state.
  * The five inner sites do not nest each other on the admitted image, so one
  * KPROBE_MULTI session retains their exact cookies with one program/link. */
-SEC("kprobe.session") __attribute__((nodebug)) int fd_so(struct pt_regs *ctx) {
-    return fd_session_dispatch(ctx);
-}
-SEC("kprobe.session") __attribute__((nodebug)) int fd_si(struct pt_regs *ctx) {
-    return fd_session_dispatch(ctx);
-}
+#include "fd-session-dispatch.inc"
 SEC("kprobe.multi") __attribute__((nodebug)) int fd_s20e(struct pt_regs *ctx) {
     return fd_shared_fdget_enter(ctx);
 }

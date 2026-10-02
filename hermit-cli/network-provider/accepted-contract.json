@@ -53,7 +53,8 @@
     "stream-copy-emit.inc",
     "stream-copy-unit-exit.inc",
     "stream-copy-fault.h",
-    "stream-copy-fault.inc"
+    "stream-copy-fault.inc",
+    "fd-session-dispatch.inc"
   ],
   "hooks": {
     "fixup_exception": [[8, 4, 8, 8], 4, 4],

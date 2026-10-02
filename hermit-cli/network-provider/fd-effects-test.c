@@ -1857,6 +1857,9 @@ static void typed_receive_predicates(void) {
     assert(checks==45);printf("typed helper receive operands/issuer/copy version: %u checks\n",checks);
 #undef RECV_CHECK
 }
+#ifdef AP_FTRACE_PROVIDER
+void fd_session_dispatch_controls(void);
+#endif
 int main(void) {
 #ifdef AP_FTRACE_PROVIDER
     (void)ecs_attach_cookie;
@@ -2066,6 +2069,9 @@ int main(void) {
         HELD_CHECK(!ap_socket_file_observation_command(&changed));
     }
     assert(held_checks==11);printf("held socket observation command: %u checks\n",held_checks);
+#ifdef AP_FTRACE_PROVIDER
+    fd_session_dispatch_controls();
+#endif
     return 0;
 }
 #endif

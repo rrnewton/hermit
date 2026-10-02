@@ -375,6 +375,7 @@ const DRIVER_FTRACE_CONTROL_INPUTS: &[&str] = &[
     "driver-ftrace-facade.h", "driver-ftrace-process.rs", "test.rs",
     "legacy-id-probe.h", "owned-metadata-driver.h", "owned-metadata.h",
     "provider-open-observation.h",
+    "fd-session-dispatch-test.c",
 ];
 const OWNED_DRIVER_CONTROLS: &[&str] = &[
     "owned-inventory", "owned-identity", "owned-fault", "owned-gate",
@@ -696,8 +697,12 @@ fn postwire_plan(source: &Path, output: &Path) -> Vec<PostwireStage> {
         let executable = output.join(format!("ftrace-production-{label}"));
         let mut compile = Command::new("clang");
         compile.args(["-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG", "-DAP_FTRACE_PROVIDER=1"]);
-        if name == "fd-effects-test.c" { compile.arg("-DAP_NATIVE_COPY_VERSION=5ULL"); }
-        compile.arg("-I").arg(source).arg(source.join(name)).arg("-o").arg(&executable);
+        if name == "fd-effects-test.c" {
+            compile.args(["-DAP_NATIVE_COPY_VERSION=5ULL", "-DAP_FD_SESSION_DISPATCH_EMBEDDED=1"]);
+        }
+        compile.arg("-I").arg(source).arg(source.join(name));
+        if name == "fd-effects-test.c" { compile.arg(source.join("fd-session-dispatch-test.c")); }
+        compile.arg("-o").arg(&executable);
         let compiled = push_postwire(&mut stages, format!("compile:ftrace-production-{label}"),
             compile, true, None, false);
         push_postwire(&mut stages, format!("test:ftrace-production-{label}"),
@@ -1590,8 +1595,9 @@ raise SystemExit(status)
         assert_eq!(plan.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), names);
         // Independently derived from all 56 actual 1027 post-wire start
         // records, normalized only for source/output roots and restored to
-        // canonical old order. The timed-out run is NOT passing evidence;
-        // these exact argv/env bytes are a command-preservation oracle.
+        // canonical old order. The timed-out run is NOT passing evidence.
+        // Require the exact additive dispatcher TU/define below, then retain
+        // the old whole-plan oracle after removing only those two arguments.
         let descriptors: Vec<Value> = plan.iter().map(|node| {
             assert!(node.command.get_current_dir().is_none());
             json!([node.command.get_program().to_str().unwrap(),
@@ -1599,7 +1605,17 @@ raise SystemExit(status)
                 node.command.get_envs().map(|(key, value)|
                     [key.to_str().unwrap(), value.unwrap().to_str().unwrap()]).collect::<Vec<_>>()])
         }).collect();
-        assert_eq!(digest(&serde_json::to_vec(&descriptors).unwrap()),
+        assert_eq!(descriptors[0], json!(["clang", [
+            "-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG", "-DAP_FTRACE_PROVIDER=1",
+            "-DAP_NATIVE_COPY_VERSION=5ULL", "-DAP_FD_SESSION_DISPATCH_EMBEDDED=1",
+            "-I", "/source", "/source/fd-effects-test.c", "/source/fd-session-dispatch-test.c",
+            "-o", "/output/ftrace-production-fd"
+        ], []]));
+        let mut historical_descriptors = descriptors.clone();
+        let args = historical_descriptors[0][1].as_array_mut().unwrap();
+        assert_eq!(args.remove(11), json!("/source/fd-session-dispatch-test.c"));
+        assert_eq!(args.remove(7), json!("-DAP_FD_SESSION_DISPATCH_EMBEDDED=1"));
+        assert_eq!(digest(&serde_json::to_vec(&historical_descriptors).unwrap()),
             "19061778cd36b86f313a851fb8fd5adcafdb468a242df59a3e4795af5aa07e6e");
         let mut outputs = Vec::new();
         for (index, node) in plan.iter().enumerate() {
@@ -1911,7 +1927,7 @@ mod tests {
         }
         let before = control_sources(&case.path, true).unwrap();
         assert_eq!(ACCEPTED_CONTROLS.len(), 23);
-        assert_eq!(before.len(), 30);
+        assert_eq!(before.len(), 31);
         assert_eq!(
             before.keys().map(String::as_str).collect::<Vec<_>>(),
             [
@@ -1924,6 +1940,7 @@ mod tests {
                 "fd-enrollment-driver-test.c",
                 "fd-enrollment-test.c",
                 "fd-journal-publish-test.c",
+                "fd-session-dispatch-test.c",
                 "fd-shared-predicate-test.c",
                 "fd-table-test.c",
                 "ftrace-coverage-test.c",
@@ -1948,7 +1965,8 @@ mod tests {
             ]
         );
         for name in ["driver-ftrace-test.c", "driver-ftrace-facade.h", "driver-ftrace-process.rs", "test.rs",
-            "legacy-id-probe.h", "owned-metadata-driver.h", "owned-metadata.h", "provider-open-observation.h"] {
+            "legacy-id-probe.h", "owned-metadata-driver.h", "owned-metadata.h", "provider-open-observation.h",
+            "fd-session-dispatch-test.c"] {
             fs::write(case.path.join(name), "changed facade or closed import fence").unwrap();
             assert_ne!(before, control_sources(&case.path, true).unwrap());
             fs::remove_file(case.path.join(name)).unwrap();
