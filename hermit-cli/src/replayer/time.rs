@@ -21,9 +21,13 @@ impl Replayer {
         guest: &mut G,
         syscall: ClockGettime,
     ) -> Result<i64, Errno> {
-        let addr = syscall.tp().ok_or(Errno::EFAULT)?;
-
+        // Consume the recorded event before inspecting the arguments. The
+        // recorder stores the kernel's result for every call, including a
+        // NULL tp (EFAULT) or an invalid clock id (EINVAL, checked first by
+        // Linux), so replay returns that errno and stays aligned with the
+        // event stream.
         next_event!(guest, Timespec).and_then(|event| {
+            let addr = syscall.tp().ok_or(Errno::EFAULT)?;
             guest.memory().write_value(addr, &event.timespec)?;
 
             // clock_gettime always returns 0 on success.
