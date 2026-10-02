@@ -14,9 +14,15 @@ load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
 load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
-load("//platforms:defs.bzl", "hermit_input_rust_toolchain")
+load("//platforms:defs.bzl", "hermit_input_rust_toolchain", "remote_linking_cxx_toolchain")
 
 oncall("open_source")
+
+# hermit.rust_sysroot names a directory under shim/ holding hermit's pinned rust
+# toolchain (staged by shim/modes/stage-rust-sysroot). When set (the RE modes,
+# shim/modes/hybrid and remote), rustc travels with every action as an input, which
+# Remote Execution needs; otherwise the system (rustup) rustc on PATH is used, as before.
+_RUST_SYSROOT = read_config("hermit", "rust_sysroot", "")
 
 # These flags reproduce Cargo's default release profile (the workspace
 # declares no [profile.release]) for the target dependency closure, while host
@@ -64,8 +70,19 @@ platform(
     visibility = ["PUBLIC"],
 )
 
+# Under the RE modes (hermit.rust_sysroot set) links and archives may run remotely too;
+# see remote_linking_cxx_toolchain.
+[
+    remote_linking_cxx_toolchain(
+        name = "cxx",
+        base = ":cxx-system",
+        visibility = ["PUBLIC"],
+    )
+    for _ in ([None] if _RUST_SYSROOT else [])
+]
+
 system_cxx_toolchain(
-    name = "cxx",
+    name = "cxx-system" if _RUST_SYSROOT else "cxx",
     compiler = "gcc",
     # `compiler_type = "gcc"` is required in addition to the compiler
     # binary names. The prelude gates many flags on `compiler_type`
@@ -126,11 +143,6 @@ _RUST_RELEASE_FLAGS = select({
     "DEFAULT": [],
 })
 
-# hermit.rust_sysroot names a directory under shim/ holding hermit's pinned rust
-# toolchain (staged by shim/modes/stage-rust-sysroot). When set, rustc travels with
-# every action as an input, which Remote Execution needs; otherwise the system
-# (rustup) rustc on PATH is used, as before.
-_RUST_SYSROOT = read_config("hermit", "rust_sysroot", "")
 
 [
     export_file(
