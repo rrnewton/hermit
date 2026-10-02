@@ -695,11 +695,10 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
     // The fetch below contacts `remote`, and what it brings back is the graph
     // every ancestry answer is read from. Same authority, same check -- asked
     // of the cache repository the fetch runs in, so its own config counts too.
-    refuse_rewritten_authority_url(remote)?;
     under_git_env(|| {
         let mut git = authority_git_command()?;
         git.arg("--git-dir").arg(&graph.git_dir);
-        refuse_config_rewritten_authority_url(remote, git)
+        refuse_redirected_authority(remote, git)
     })?;
     // `--filter=blob:none` is a BANDWIDTH optimization, not a correctness
     // requirement: ancestry needs commits, never blobs. It is also not
@@ -887,8 +886,7 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
 fn query_main(remote: &str) -> Result<String, String> {
     // The tip this returns IS the authority: every later comparison is against
     // it. Prove the URL is the one named before asking it anything.
-    refuse_rewritten_authority_url(remote)?;
-    under_git_env(|| refuse_config_rewritten_authority_url(remote, authority_git_command()?))?;
+    under_git_env(|| refuse_redirected_authority(remote, authority_git_command()?))?;
     let output = under_git_env(|| {
         authority_git_command()?
             .args(["ls-remote", "--exit-code", remote, MAIN_REF])
@@ -1047,6 +1045,8 @@ fn authority_git_command() -> Result<Command, String> {
     // Set after environment isolation so the effective override cannot be
     // cleared or inherited from a caller. No repository/global config changes.
     command.env("GIT_GRAFT_FILE", "/dev/null");
+    #[cfg(test)]
+    tests::apply_test_global_config(&mut command);
     Ok(command)
 }
 
@@ -1134,9 +1134,10 @@ fn rewritten_remote(remote: &str, rewrites: &[(String, String)]) -> Option<Strin
 ///
 /// ⚠️ This sees the ENVIRONMENT only. A rewrite in system, global or repository
 /// config passes it untouched, and one did on a real host
-/// (https://github.com/rrnewton/hermit/issues/3499). Every caller must also run
-/// `refuse_config_rewritten_authority_url`, which asks Git itself; this check is
-/// kept because its refusal names the GIT_CONFIG_* variable responsible.
+/// (https://github.com/rrnewton/hermit/issues/3499). Callers therefore use
+/// [`refuse_redirected_authority`], which runs this and then asks Git itself;
+/// this check is kept because its refusal names the GIT_CONFIG_* variable
+/// responsible.
 fn refuse_rewritten_authority_url(remote: &str) -> Result<(), String> {
     if let Some(rewritten) = rewritten_remote(remote, &env_url_rewrites()) {
         return Err(format!(
@@ -1163,6 +1164,16 @@ fn refuse_rewritten_authority_url(remote: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// THE guard for the Reverie authority URL, and the only one a query site
+/// calls. `git` must be the command the query itself would run, so that the
+/// repository-scope config it sees is the query's own. Pinned at both call
+/// sites by `query_main_refuses_a_config_redirected_authority` and
+/// `reverie_graph_refuses_a_cache_config_redirected_authority`.
+fn refuse_redirected_authority(remote: &str, git: Command) -> Result<(), String> {
+    refuse_rewritten_authority_url(remote)?;
+    refuse_config_rewritten_authority_url(remote, git)
 }
 
 /// Refuse an authority URL that Git's CONFIG, rather than its environment,
@@ -3696,12 +3707,14 @@ mod tests {
         };
         let floor = head();
         let checkout = temp_path("admitted-checkout");
-        let cloned = fixture_git()
-            .args(["clone", "--quiet"])
-            .arg(&origin)
-            .arg(&checkout)
-            .output()
-            .unwrap();
+        let cloned = under_git_env(|| {
+            fixture_git()
+                .args(["clone", "--quiet"])
+                .arg(&origin)
+                .arg(&checkout)
+                .output()
+        })
+        .unwrap();
         assert!(
             cloned.status.success(),
             "{}",
@@ -4923,20 +4936,18 @@ mod tests {
     /// [`under_git_env`], and readers still run concurrently with each other --
     /// the file is not serialised.
     ///
-    /// COVERAGE, counted rather than asserted. At the time of writing this file
-    /// forks 27 child processes; 23 of them are `git` and 4 are not (`cargo` x2,
-    /// `/bin/sh`, `env`, none of which read `GIT_CONFIG_*`). **22 of the 23 git
-    /// forks run inside `under_git_env`.** The 23rd is the
+    /// COVERAGE, counted rather than asserted. Recounted for
+    /// https://github.com/rrnewton/hermit/pull/3500 as `.output()` / `.status()`
+    /// call sites: this file has 33 fork sites; 29 of them are `git` and 4 are
+    /// not (`cargo` x2, `/bin/sh`, `env`, none of which read `GIT_CONFIG_*`).
+    /// **28 of the 29 git sites run inside `under_git_env`** -- one of them, the
+    /// `ls-remote --get-url` in `refuse_config_rewritten_authority_url`, inside
+    /// the guard its every caller holds. The 29th is the
     /// `git rev-parse --local-env-vars` call in `git_local_env_vars`, which runs
     /// UNDERNEATH the guard and so cannot take it; that one is made immune by
     /// stripping `GIT_CONFIG_COUNT` from the child instead. See the comment
-    /// there.
-    ///
-    /// Since then, https://github.com/rrnewton/hermit/issues/3499 added two git
-    /// forks: the `ls-remote --get-url` in
-    /// `refuse_config_rewritten_authority_url` and the `init --bare` in its
-    /// cache-repository test. Both run inside `under_git_env`. The totals above
-    /// were not recounted when they were added.
+    /// there. The recount found one test clone outside the guard; it is now
+    /// inside it.
     ///
     /// ⚠️ An earlier revision of this change guarded ONE of the 23 and said in a
     /// comment that it had guarded them all. Do not restate the coverage without
@@ -5204,6 +5215,142 @@ mod tests {
             "the refusal must name the URL actually contacted: {error}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    thread_local! {
+        /// A stand-in for `~/.gitconfig`, applied by `authority_git_command` on
+        /// THIS thread only. A thread-local rather than the process environment
+        /// because the body it wraps runs git, and the process-environment path
+        /// (`with_config_override`) holds the write lock that git's read lock
+        /// would then wait on forever.
+        static TEST_GLOBAL_CONFIG: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn apply_test_global_config(command: &mut Command) {
+        TEST_GLOBAL_CONFIG.with(|global| {
+            if let Some(path) = global.borrow().as_ref() {
+                command.env("GIT_CONFIG_GLOBAL", path);
+            }
+        });
+    }
+
+    /// Run `body` with every authority git command on this thread reading
+    /// `global` as its global config, and clear it again whatever happens.
+    fn with_test_global_config<T>(global: &Path, body: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_GLOBAL_CONFIG.with(|global| global.borrow_mut().take());
+            }
+        }
+        TEST_GLOBAL_CONFIG.with(|slot| *slot.borrow_mut() = Some(global.to_path_buf()));
+        let _reset = Reset;
+        body()
+    }
+
+    /// A fixture repository whose `main` holds one commit, returned with that
+    /// commit's SHA.
+    fn fixture_main(label: &str) -> (PathBuf, String) {
+        let repo = temp_path(label);
+        init_fixture_repo(&repo);
+        let sha = commit_file(&repo, label, label);
+        assert!(
+            git_in(&repo, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        (repo, sha)
+    }
+
+    /// The guard is pinned THROUGH `query_main`, not only as a function: with
+    /// its call deleted from `query_main`, this test fails, because the query
+    /// then returns the mirror's tip as though it were the authority's.
+    ///
+    /// The rewrite is in GLOBAL config, the scope of
+    /// https://github.com/rrnewton/hermit/issues/3499, which the environment
+    /// check cannot see.
+    #[test]
+    fn query_main_refuses_a_config_redirected_authority() {
+        let (authority, authority_main) = fixture_main("qm-authority");
+        let (mirror, mirror_main) = fixture_main("qm-mirror");
+        let authority_url = authority.to_str().expect("UTF-8 fixture path");
+        let mirror_url = mirror.to_str().expect("UTF-8 fixture path");
+        let global = temp_path("qm-gitconfig");
+        fs::write(&global, "").expect("write an empty global config");
+
+        // Control: without the rule, the authority answers with its own tip.
+        let tip = with_test_global_config(&global, || query_main(authority_url))
+            .expect("an unredirected authority must be queried");
+        assert_eq!(tip, authority_main);
+
+        fs::write(
+            &global,
+            format!("[url \"{mirror_url}\"]\n\tinsteadOf = {authority_url}\n"),
+        )
+        .expect("write the redirecting global config");
+        let outcome = with_test_global_config(&global, || query_main(authority_url));
+        assert_ne!(
+            outcome.as_deref(),
+            Ok(mirror_main.as_str()),
+            "query_main reported the MIRROR's tip as the authority's main"
+        );
+        let error = outcome.expect_err("a config-redirected authority must be refused");
+        assert!(
+            error.contains("REFUSING to resolve the Reverie authority")
+                && error.contains(mirror_url),
+            "the refusal must come from the guard and name the contacted URL: {error}"
+        );
+        for path in [&authority, &mirror, &global] {
+            let _ = fs::remove_dir_all(path);
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// The same, THROUGH `reverie_graph`, and in the scope only its guard can
+    /// see: the cache repository's own config. With the guard's call deleted
+    /// from `reverie_graph`, or with `--git-dir` dropped from it, this test
+    /// fails, because the fetch then fills the graph from the mirror.
+    #[test]
+    fn reverie_graph_refuses_a_cache_config_redirected_authority() {
+        let (product, _) = fixture_main("rg-product");
+        let (authority, _) = fixture_main("rg-authority");
+        let (mirror, mirror_main) = fixture_main("rg-mirror");
+        let authority_url = authority.to_str().expect("UTF-8 fixture path");
+        let mirror_url = mirror.to_str().expect("UTF-8 fixture path");
+        let cache = product.join("target/ci/reverie-graph.git");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        let init = under_git_env(|| {
+            isolated_git_command()
+                .expect("build an isolated git command")
+                .args(["init", "--bare", "--quiet"])
+                .arg(&cache)
+                .status()
+        })
+        .expect("run git init --bare");
+        assert!(init.success(), "git init --bare must succeed");
+        let rule = format!("url.{mirror_url}.insteadOf");
+        let config = git_in(&cache, &["config", &rule, authority_url]).unwrap();
+        assert!(config.status.success(), "write the cache's redirect rule");
+
+        let outcome = reverie_graph(&product, authority_url);
+        if let Ok(graph) = &outcome {
+            let fetched = graph.run(&["rev-parse", "refs/heads/main"]).unwrap();
+            panic!(
+                "reverie_graph fetched through the redirect; the graph's main is {} (mirror {mirror_main})",
+                String::from_utf8_lossy(&fetched.stdout).trim()
+            );
+        }
+        let error = outcome.err().expect("checked above");
+        assert!(
+            error.contains("REFUSING to resolve the Reverie authority")
+                && error.contains(mirror_url),
+            "the refusal must come from the guard and name the contacted URL: {error}"
+        );
+        for path in [&product, &authority, &mirror] {
+            let _ = fs::remove_dir_all(path);
+        }
     }
 
     /// ITEM 2. A replacement ref re-parents a commit, and that changes the
