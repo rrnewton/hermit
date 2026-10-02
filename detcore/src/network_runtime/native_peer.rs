@@ -24,6 +24,7 @@ use crate::network_replay::NetworkStreamPhysicalEffect as Effect;
 use crate::network_replay::NetworkStreamPhysicalResult as ResultValue;
 
 mod copy_exclusion;
+mod early_connect;
 pub(crate) use copy_exclusion::ConfirmedNoStore;
 
 const PUBLICATION_UNIT: usize = 1024;
@@ -137,6 +138,10 @@ pub(super) struct OriginalConnect {
     pub control_history: Option<Result<super::original_epoll_ctl::HistoricalPair, String>>,
     pub completion_request: Option<u64>,
     pub completion: Option<super::accepted_provider::OriginalEffect>,
+    // Private, non-serialized observation of the same still-retained original
+    // pin. An error remains available through normal physical retirement and
+    // refuses semantic publication; it never changes the guest's raw result.
+    early_connect: Option<Result<early_connect::Completion, String>>,
     pub copy_requests: Vec<(u64, u64)>,
     pub copy_end: Option<super::original_read_copy::End>,
     pub copy_custody: std::sync::Arc<super::original_read_copy::ReadCopyCustody>,
@@ -337,6 +342,7 @@ impl Calls {
                     control_history: None,
                     completion_request: None,
                     completion: None,
+                    early_connect: None,
                     copy_requests: Vec::new(),
                     copy_end: None,
                     copy_custody: Default::default(),
@@ -643,6 +649,13 @@ impl Calls {
         effect: super::accepted_provider::OriginalEffect,
         raw: i64,
     ) -> io::Result<()> {
+        let early_pin = if admission.arguments.kind == crate::network_replay::original_connect::Kind::Connect
+            && raw == -i64::from(libc::EINPROGRESS)
+        {
+            self.owned(owner, admission.call)?.original.clone()
+        } else {
+            None
+        };
         let state = self.original(owner, admission.call)?;
         let r = &effect.original;
         if let Some(observation) = &effect.socket {
@@ -790,6 +803,15 @@ impl Calls {
             return Err(io::Error::other(
                 "original path observation UNKNOWN; native return does not prove missing hook absence",
             ));
+        }
+        if admission.arguments.kind == crate::network_replay::original_connect::Kind::Connect
+            && raw == -i64::from(libc::EINPROGRESS)
+        {
+            state.early_connect = Some(early_pin
+                .as_ref()
+                .ok_or_else(|| io::Error::other("early Connect lost original retained pin"))
+                .and_then(|pin| early_connect::Completion::observe(pin.as_fd()))
+                .map_err(|error| error.to_string()));
         }
         state.completion = Some(effect);
         Ok(())
@@ -2813,6 +2835,7 @@ impl CompletedNativeConnect<'_> {
         &self,
         owner: NetworkStreamOwner,
         admission: &OriginalAdmission,
+        returned: i64,
     ) -> io::Result<detcore_model::network_trace::NetworkAddressV2> {
         use detcore_model::network_trace::NetworkAddressV2;
         let call = self.call;
@@ -2843,9 +2866,10 @@ impl CompletedNativeConnect<'_> {
             || original.prepared.map(|p| p.1) != Some(raw.selection.command)
             || original.selection.as_ref() != Some(&raw.selection)
             || effect.command.operation != 7
-            || effect.command.returned != 0
+            || (returned != 0 && returned != -i64::from(libc::EINPROGRESS))
+            || i64::from(effect.command.returned) != returned
             || effect.command.phase != 1
-            || raw.returned != 0
+            || i64::from(raw.returned) != returned
             || raw.complete != 1
             || raw.problem != 0
             || raw.selection.file == 0
@@ -2870,7 +2894,7 @@ impl CompletedNativeConnect<'_> {
             .get(..2)
             .map(|b| i32::from(u16::from_ne_bytes([b[0], b[1]])))
             .ok_or_else(|| io::Error::other("Connect sockaddr has no family"))?;
-        match (family, original.pin) {
+        let peer = match (family, original.pin) {
             (
                 libc::AF_INET,
                 Some(OriginalPin::Socket {
@@ -2904,7 +2928,14 @@ impl CompletedNativeConnect<'_> {
             _ => Err(io::Error::other(
                 "V4 Connect completion changed TCP family or captured peer",
             )),
+        }?;
+        if returned == -i64::from(libc::EINPROGRESS) {
+            original.early_connect.as_ref()
+                .ok_or_else(|| io::Error::other("early Connect has no retained state observation"))?
+                .as_ref().map_err(|error| io::Error::other(error.clone()))?
+                .confirm(&peer)?;
         }
+        Ok(peer)
     }
 }
 

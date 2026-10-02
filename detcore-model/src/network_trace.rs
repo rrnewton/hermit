@@ -720,7 +720,8 @@ pub struct NetworkDatagramExactV2 {
 pub enum NetworkConnectionResultV2 {
     /// Operation completed successfully.
     Connected,
-    /// Operation failed with this positive Linux errno.
+    /// Original operation returned this positive Linux errno, including
+    /// EINPROGRESS when a separate completion follows in a V4 trace.
     Error(i32),
 }
 
@@ -760,6 +761,9 @@ pub enum NetworkInputKindV2 {
     },
     /// One complete datagram with exact socket-address lengths.
     DatagramExact(NetworkDatagramExactV2),
+    /// V4-only completed handshake after an original Connect(EINPROGRESS).
+    /// Appended so every existing input discriminant retains its encoding.
+    ConnectEstablished,
 }
 
 /// One globally ordered observation with schedule-independent release gates.
@@ -1404,6 +1408,12 @@ impl NetworkTraceV2 {
     /// Validate all identities, stream offsets, datagram boundaries, ancillary
     /// relocations, release gates, and terminal states before runtime use.
     pub fn validate(&self) -> Result<(), NetworkTraceValidationError> {
+        self.validate_payload(false)
+    }
+
+    // Only the V4 payload projection admits a separately observed handshake.
+    // Legacy V2/V3 decoders still refuse that new input rather than infer it.
+    fn validate_payload(&self, early_connect: bool) -> Result<(), NetworkTraceValidationError> {
         let epoch = self.epoch_global_time()?;
         let mut channels = BTreeMap::new();
         for channel in &self.channels {
@@ -1437,6 +1447,7 @@ impl NetworkTraceV2 {
             last_release_time: Option<LogicalTime>,
             last_release_output: u64,
             connect_seen: bool,
+            connect_in_progress: bool,
         }
         let mut progress: BTreeMap<_, Progress> = channels
             .keys()
@@ -1555,7 +1566,18 @@ impl NetworkTraceV2 {
                     state.connect_seen = true;
                     if let NetworkConnectionResultV2::Error(errno) = result {
                         validate_errno(*errno)?;
+                        state.connect_in_progress = *errno == libc::EINPROGRESS;
                     }
+                }
+                NetworkInputKindV2::ConnectEstablished => {
+                    if !early_connect
+                        || channel.transport != NetworkTransportV2::Tcp
+                        || channel.role != NetworkEndpointRoleV2::OutboundClient
+                        || !state.connect_in_progress
+                    {
+                        return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                    }
+                    state.connect_in_progress = false;
                 }
                 NetworkInputKindV2::Accept {
                     accepted,
@@ -1636,6 +1658,10 @@ impl NetworkTraceV2 {
                 // An empty state is a meaningful readiness-clear transition.
                 NetworkInputKindV2::Readiness(_) => {}
             }
+        }
+
+        if early_connect && progress.values().any(|state| state.connect_in_progress) {
+            return Err(NetworkTraceValidationError::InvalidChannelRelationship);
         }
 
         Ok(())

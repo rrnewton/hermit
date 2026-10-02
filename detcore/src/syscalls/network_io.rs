@@ -1459,9 +1459,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .binding
                         .ok_or_else(|| engine_error("selected socket lost its admitted OFD"))?
                         .open_file;
-                    if native_record && returned != 0 {
-                        // V4 has no Connect error-result issuer. Refuse before
-                        // the engine acquires a channel for this endpoint.
+                    if native_record && returned != 0 && returned != -i64::from(libc::EINPROGRESS) {
+                        // Only the original -EINPROGRESS plus an independently
+                        // observed, already-established retained pin is added.
+                        // Other failures and pending handshakes remain refused.
                         return Err(engine_error(
                             "V4 Record Connect error result has no native publisher",
                         ));

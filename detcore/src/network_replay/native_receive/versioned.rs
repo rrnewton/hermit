@@ -55,6 +55,7 @@ pub(super) struct NativePollWitness {
 struct NativeReplay {
     released: Vec<bool>,
     connected: BTreeSet<NetworkChannelId>,
+    connect_in_progress_delivered: BTreeSet<NetworkChannelId>,
     consumed_eof: BTreeSet<u64>,
 }
 impl NativeState {
@@ -482,6 +483,8 @@ impl NetworkReplayEngine {
             !matches!(
                 input.event,
                 NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected)
+                    | NetworkInputKindV2::Connect(NetworkConnectionResultV2::Error(libc::EINPROGRESS))
+                    | NetworkInputKindV2::ConnectEstablished
                     | NetworkInputKindV2::StreamBytes { .. }
                     | NetworkInputKindV2::PeerShutdown {
                         direction: NetworkShutdownV2::Write,
@@ -538,6 +541,7 @@ impl NetworkReplayEngine {
             replay: Some(NativeReplay {
                 released,
                 connected: BTreeSet::new(),
+                connect_in_progress_delivered: BTreeSet::new(),
                 consumed_eof: BTreeSet::new(),
             }),
             fresh_send,
@@ -1417,6 +1421,10 @@ impl NetworkReplayEngine {
                         let input = &native.trace.inputs[n];
                         replay.released[n] && match &input.event {
                             NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected) => replay.connected.contains(&input.channel),
+                            NetworkInputKindV2::Connect(NetworkConnectionResultV2::Error(libc::EINPROGRESS)) =>
+                                replay.connect_in_progress_delivered.contains(&input.channel),
+                            NetworkInputKindV2::ConnectEstablished => replay.connected.contains(&input.channel)
+                                && replay.connect_in_progress_delivered.contains(&input.channel),
                             NetworkInputKindV2::StreamBytes { stream_offset, bytes } =>
                                 self.channels[&input.channel].inbound_consumed >= *stream_offset + bytes.len() as u64,
                             NetworkInputKindV2::PeerShutdown { direction: NetworkShutdownV2::Write, .. } =>
@@ -1474,10 +1482,17 @@ impl NetworkReplayEngine {
         // set is independent of whether a released row was consumed this turn.
         for n in selected {
             let input = &native.trace.inputs[n];
-            self.channels
-                .get_mut(&input.channel)
-                .unwrap()
-                .release_at(input.ordinal, input.event.clone());
+            if input.event == NetworkInputKindV2::ConnectEstablished {
+                // Apply the separately observed state, not a second syscall
+                // result. Completion of its producer still requires delivery
+                // of the actual preceding EINPROGRESS outcome.
+                replay.connected.insert(input.channel);
+            } else {
+                self.channels
+                    .get_mut(&input.channel)
+                    .unwrap()
+                    .release_at(input.ordinal, input.event.clone());
+            }
             replay.released[n] = true;
             ready.insert(input.channel);
         }
@@ -1515,13 +1530,18 @@ impl NetworkReplayEngine {
         channel: NetworkChannelId,
         outcome: &ConnectionOutcome,
     ) {
-        if matches!(
-            outcome,
-            ConnectionOutcome::Connect(NetworkConnectionResultV2::Connected)
-        ) && let EngineState::Native(native) = &mut self.mode
+        if let EngineState::Native(native) = &mut self.mode
             && let Some(replay) = &mut native.replay
         {
-            replay.connected.insert(channel);
+            match outcome {
+                ConnectionOutcome::Connect(NetworkConnectionResultV2::Connected) => {
+                    replay.connected.insert(channel);
+                }
+                ConnectionOutcome::Connect(NetworkConnectionResultV2::Error(libc::EINPROGRESS)) => {
+                    replay.connect_in_progress_delivered.insert(channel);
+                }
+                _ => {}
+            }
         }
     }
     pub(in crate::network_replay) fn finish_native_replay(&self) -> Result<(), NetworkReplayError> {
@@ -1957,9 +1977,9 @@ impl NetworkReplayEngine {
         completed: &crate::network_runtime::native_peer::CompletedNativeConnect<'_>,
         now: LogicalTime,
     ) -> Result<(), NetworkReplayError> {
-        let open_file = self.original_native_connected(owner, admission)?;
+        let (open_file, returned) = self.original_native_connected(owner, admission)?;
         let peer = completed
-            .peer(owner, admission)
+            .peer(owner, admission, returned)
             .map_err(|e| invalid(&e.to_string()))?;
         let channel = self.bound_channel(open_file)?;
         let definition = self
@@ -2000,7 +2020,12 @@ impl NetworkReplayEngine {
             u64::try_from(native.trace.inputs.len()).map_err(|_| NetworkReplayError::Overflow)?;
         let first = u64::try_from(native.trace.release_model.nodes().len())
             .map_err(|_| NetworkReplayError::Overflow)?;
-        let established = first.checked_add(1).ok_or(NetworkReplayError::Overflow)?;
+        let asynchronous = returned == -i64::from(libc::EINPROGRESS);
+        let completion_ordinal = ordinal.checked_add(u64::from(asynchronous))
+            .ok_or(NetworkReplayError::Overflow)?;
+        let completion_node = first.checked_add(u64::from(asynchronous))
+            .ok_or(NetworkReplayError::Overflow)?;
+        let established = completion_node.checked_add(1).ok_or(NetworkReplayError::Overflow)?;
         established
             .checked_add(1)
             .ok_or(NetworkReplayError::Overflow)?;
@@ -2008,14 +2033,18 @@ impl NetworkReplayEngine {
             ordinal,
             channel,
             release: release.clone(),
-            event: NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected),
+            event: NetworkInputKindV2::Connect(if asynchronous {
+                NetworkConnectionResultV2::Error(libc::EINPROGRESS)
+            } else {
+                NetworkConnectionResultV2::Connected
+            }),
         };
         let input_node = NetworkReleaseNodeV4 {
             id: NetworkReleaseNodeIdV4(first),
             kind: NetworkReleaseNodeKindV4::Input {
                 input_ordinal: ordinal,
             },
-            prerequisites: release.prerequisites,
+            prerequisites: release.prerequisites.clone(),
         };
         let progress = NetworkReleaseNodeV4 {
             id: NetworkReleaseNodeIdV4(established),
@@ -2023,19 +2052,35 @@ impl NetworkReplayEngine {
                 channel,
                 milestone: NetworkProgressV4::Established {
                     source: NetworkEstablishmentV4::ConnectedInput {
-                        input_ordinal: ordinal,
+                        input_ordinal: completion_ordinal,
                     },
                 },
             },
-            prerequisites: vec![NetworkReleaseNodeIdV4(first)],
+            prerequisites: (first..=completion_node).map(NetworkReleaseNodeIdV4).collect(),
         };
         let EngineState::Native(native) = &mut self.mode else {
             unreachable!();
         };
         native.trace.inputs.push(input);
+        if asynchronous {
+            native.trace.inputs.push(NetworkInputEventV4 {
+                ordinal: completion_ordinal,
+                channel,
+                release: release.clone(),
+                event: NetworkInputKindV2::ConnectEstablished,
+            });
+        }
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
             &mut native.trace.release_model;
-        nodes.extend([input_node, progress]);
+        nodes.push(input_node);
+        if asynchronous {
+            nodes.push(NetworkReleaseNodeV4 {
+                id: NetworkReleaseNodeIdV4(completion_node),
+                kind: NetworkReleaseNodeKindV4::Input { input_ordinal: completion_ordinal },
+                prerequisites: release.prerequisites,
+            });
+        }
+        nodes.push(progress);
         self.consume_native_entry(admission.call);
         Ok(())
     }

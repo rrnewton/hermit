@@ -5733,6 +5733,9 @@ impl ChannelState {
                 errno,
             }),
             NetworkInputKindV2::Readiness(readiness) => self.explicit_readiness = readiness,
+            // V4's typed release applies this state without enqueuing another
+            // Connect result. Legacy validators reject it before reaching here.
+            NetworkInputKindV2::ConnectEstablished => unreachable!("V4-only establishment input"),
         }
         self.refresh_readiness();
     }

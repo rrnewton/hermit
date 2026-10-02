@@ -5345,7 +5345,7 @@ impl NetworkReplayEngine {
         &self,
         owner: NetworkStreamOwner,
         admission: &Admission,
-    ) -> Result<OpenFileId, NetworkReplayError> {
+    ) -> Result<(OpenFileId, i64), NetworkReplayError> {
         let (state, original) = self.original_connect_state(owner, admission.call)?;
         if original.arguments != admission.arguments
             || original.arguments.kind != Kind::Connect
@@ -5353,7 +5353,7 @@ impl NetworkReplayEngine {
             || state.final_wait
             || original.final_wait
             || original.uninvoked
-            || original.backend_result != Some(0)
+            || original.backend_result.is_none_or(|raw| raw != 0 && raw != -i64::from(libc::EINPROGRESS))
             || !original.provider_submitted
             || !original.provider_retired
             || !original.pin_released
@@ -5371,6 +5371,7 @@ impl NetworkReplayEngine {
         }
         state
             .open_file
+            .map(|file| (file, original.backend_result.unwrap()))
             .ok_or_else(|| protocol("V4 Connect has no exact selected OFD"))
     }
 }

@@ -27,6 +27,9 @@ use crate::network_runtime::native_peer::native_connected_tests::ConnectCompleti
 #[path = "native_connected/non_read_entry.rs"]
 mod non_read_entry;
 
+#[path = "native_connected/early_completion.rs"]
+mod early_completion;
+
 struct EntryFixture {
     config: Config,
     state: GlobalState,

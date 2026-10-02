@@ -144,6 +144,17 @@ impl NetworkRuntimeResources {
         owner: NetworkStreamOwner,
         admission: &OriginalAdmission,
     ) -> io::Result<()> {
+        self.controlled_connect_retirement_with_return(owner, admission, 0)
+    }
+
+    /// Same controlled ACK input for the separately observed nonzero return.
+    /// The old success-only fixture continues to supply exactly zero above.
+    pub(crate) fn controlled_connect_retirement_with_return(
+        &self,
+        owner: NetworkStreamOwner,
+        admission: &OriginalAdmission,
+        returned: i64,
+    ) -> io::Result<()> {
         let publication = {
             let mut calls = self.shared.native_streams.lock().unwrap();
             let original = calls.original(owner, admission.call)?;
@@ -158,7 +169,7 @@ impl NetworkRuntimeResources {
             .engine
             .lock()
             .unwrap()
-            .original_connect_provider_retired(owner, admission, 0)
+            .original_connect_provider_retired(owner, admission, returned)
             .map_err(io::Error::other)?;
         self.shared
             .native_streams

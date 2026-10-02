@@ -365,7 +365,7 @@ impl NetworkTraceV4 {
                 .collect(),
             outputs: self.outputs.clone(),
         };
-        payload.validate()?;
+        payload.validate_payload(true)?;
         drop(payload);
         for c in &self.channels {
             validate_channel_creation(c)?;
@@ -590,7 +590,7 @@ impl NetworkTraceV4 {
                     if state.retired.is_some() {
                         return Err(Invalid::EventAfterRetirement);
                     }
-                    if !matches!(input.event, NetworkInputKindV2::Connect(_)) {
+                    if !matches!(input.event, NetworkInputKindV2::Connect(_) | NetworkInputKindV2::ConnectEstablished) {
                         let established = state.established.ok_or(Invalid::MissingProducer)?;
                         edges.insert((established, n));
                     }
@@ -625,10 +625,9 @@ impl NetworkTraceV4 {
                                     let i = index(*input_ordinal, self.inputs.len())?;
                                     if definition.role != NetworkEndpointRoleV2::OutboundClient
                                         || self.inputs[i].channel != *channel
-                                        || self.inputs[i].event
-                                            != NetworkInputKindV2::Connect(
-                                                NetworkConnectionResultV2::Connected,
-                                            )
+                                        || !matches!(self.inputs[i].event,
+                                            NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected)
+                                                | NetworkInputKindV2::ConnectEstablished)
                                     {
                                         return Err(Invalid::InvalidProgress);
                                     }
