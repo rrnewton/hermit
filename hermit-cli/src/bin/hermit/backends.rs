@@ -82,6 +82,8 @@ use super::verify::DbtCountedBranchComparison;
 #[cfg(feature = "dbt")]
 use super::verify::LogCompareStrictness;
 #[cfg(feature = "dbt")]
+use super::verify::SecondRun;
+#[cfg(feature = "dbt")]
 use super::verify::Verdict;
 #[cfg(feature = "dbt")]
 use super::verify::VerificationOutcome;
@@ -1280,7 +1282,12 @@ pub(super) fn run_dbt(
          was given, so a divergence confined to a buffer whose length is stable \
          would not have been seen; drop that flag to include it."
     };
-    announce_verification_outcome(&outcome, success_message, "Failure: nondeterministic.");
+    announce_verification_outcome(
+        &outcome,
+        SecondRun::Rerun,
+        success_message,
+        "Failure: nondeterministic.",
+    );
     if !outcome.verified() {
         return outcome.into_exit_status();
     }

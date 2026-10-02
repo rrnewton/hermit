@@ -71,6 +71,7 @@ use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
+use super::verify::SecondRun;
 use super::verify::VerificationReport;
 use super::verify::VerificationRun;
 use super::verify::VerificationRuntime;
@@ -4960,7 +4961,7 @@ impl RunOpts {
         if skid_overshoots > 0 {
             return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
         }
-        announce_verification_outcome(&outcome, success_message, failure_message);
+        announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -5698,9 +5699,15 @@ mod tests {
 
     #[test]
     fn verification_report_is_published_before_success_is_announced() {
-        let source = include_str!("run.rs");
+        // Search only the code before this test module. Searching the whole
+        // file let the literals below match themselves, so the ordering check
+        // passed whatever the code did.
+        let source = include_str!("run.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module")
+            .0;
         let verification = source
-            .split_once("let outcome = compare_two_runs(")
+            .split_once("let mut outcome = compare_two_runs(")
             .expect("verification comparison")
             .1;
         let publish = verification
@@ -5710,6 +5717,11 @@ mod tests {
             .find("announce_verification_outcome(&outcome")
             .expect("verification announcement");
         assert!(publish < announce);
+        // Run mode compares two independent runs, never a replay, so its match
+        // line must not use the replay wording for the time note.
+        let call = &verification[announce..];
+        let call = &call[..call.find(");").expect("end of announcement call")];
+        assert!(call.contains("SecondRun::Rerun"), "{call}");
     }
 
     #[test]

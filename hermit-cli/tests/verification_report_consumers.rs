@@ -400,15 +400,18 @@ fn every_named_consumer_delegates_to_the_shared_typed_reader() {
         );
         // A canonical-match reader can only be satisfied by a canonical
         // comparison, which a plain `--verify` never runs. The flag must be on
-        // the `run` invocation itself; a comment that mentions it does not count.
+        // the line that builds the verifying `run` command (`verify_command=(`);
+        // a comment or a message elsewhere that mentions it does not count.
         assert!(
             consumer.requirement != "canonical-match"
                 || source.lines().any(|line| {
-                    !line.trim_start().starts_with('#')
+                    let line = line.trim_start();
+                    let line = line.strip_prefix("local ").unwrap_or(line);
+                    line.starts_with("verify_command=(")
                         && line.contains(" run ")
                         && line.contains("--verify-strict")
                 }),
-            "{} requires canonical-match but its `run` invocation never requests --verify-strict",
+            "{} requires canonical-match but its verify_command=( line never requests --verify-strict",
             consumer.path
         );
         assert!(
