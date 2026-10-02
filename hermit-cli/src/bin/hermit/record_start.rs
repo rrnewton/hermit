@@ -420,6 +420,19 @@ impl StartOpts {
         })
     }
 
+    /// A replay served to gdb runs on the host network, where the gdb client
+    /// can reach its gdbserver port, so the recording it checks must too.
+    fn check_gdb_replay_network(&self) -> Result<(), Error> {
+        if self.replays_under_gdb() && self.network() == NetworkingMode::Local {
+            anyhow::bail!(
+                "--verify-with-gdbex replays under a gdbserver that the gdb client reaches \
+                 on the host network, so the recording must use the same network; \
+                 --network local is not supported with it"
+            );
+        }
+        Ok(())
+    }
+
     fn configured_container(
         &self,
         network: NetworkingMode,
@@ -655,13 +668,7 @@ impl StartOpts {
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        if self.network() == NetworkingMode::Local {
-            anyhow::bail!(
-                "--verify-with-gdbex replays under a gdbserver that the gdb client reaches \
-                 on the host network, so the recording must use the same network; \
-                 --network local is not supported with it"
-            );
-        }
+        self.check_gdb_replay_network()?;
         let (mut container, identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
@@ -875,6 +882,47 @@ mod tests {
             ]),
             NetworkingMode::Local
         );
+    }
+
+    #[test]
+    fn a_gdb_checked_recording_refuses_local_networking() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let check = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .check_gdb_replay_network()
+        };
+        let refused = check(&[
+            "start",
+            "--network",
+            "local",
+            "--verify-with-gdbex",
+            "continue",
+            "/bin/true",
+        ])
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("--network local is not supported"),
+            "{refused:#}"
+        );
+        check(&["start", "--verify-with-gdbex", "continue", "/bin/true"]).unwrap();
+        check(&[
+            "start",
+            "--network",
+            "host",
+            "--verify-with-gdbex",
+            "continue",
+            "/bin/true",
+        ])
+        .unwrap();
+        check(&["start", "--network", "local", "/bin/true"]).unwrap();
     }
 
     #[test]

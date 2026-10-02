@@ -17535,6 +17535,11 @@ test:
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+        # --require-small-determinized asserts strict mode's sorted directory
+        # order. A recording keeps the host's order and replay reproduces it,
+        # so replay checks replay fidelity with the guest's report-only form.
+        guest_args:
+          ptrace: []
       chaos:
         ci: false
         backends_enabled: []

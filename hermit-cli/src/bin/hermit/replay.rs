@@ -66,26 +66,18 @@ impl ReplayOpts {
                 .context("Failed to find last recording ID")?,
         };
 
-        // Syscalls the replayer does not serve from the recording are executed
-        // for real, so an autopilot replay runs in the network the recording
-        // used. Recordings that predate the stored choice ran on the host
-        // network. A served replay must use the host network: its gdbserver port
-        // has to be reachable from a gdb client outside the container.
         let recorded_local = hermit.recording_metadata(id)?.local_networking == Some(true);
-        if recorded_local && !self.autopilot {
+        let network = replay_network(self.autopilot, recorded_local);
+        if recorded_local && network == NetworkingMode::Host {
+            // Same override, and same warning, as `hermit run --gdbserver`.
             eprintln!(
-                "hermit replay: recording {id} used --network local, but a gdb-served \
-                 replay runs on the host network; syscalls replayed by re-execution \
-                 may see different interfaces and ports"
+                "hermit replay: WARNING: recording {id} used --network local, but a \
+                 gdb-served replay runs on the host network; syscalls replayed by \
+                 re-execution may see different interfaces and ports"
             );
         }
         if self.autopilot || self.serve_only {
             let (mut container, identity) = deterministic_container()?;
-            let network = if self.autopilot && recorded_local {
-                NetworkingMode::Local
-            } else {
-                NetworkingMode::Host
-            };
             network.configure(&mut container, false);
             let options = self.clone();
             let global = global.clone();
@@ -193,5 +185,31 @@ impl ReplayOpts {
         } else {
             hermit.replay_with_gdbserver(id, self.gdbserver_port)
         }
+    }
+}
+
+/// The network a replay runs in. Syscalls the replayer does not serve from
+/// the recording are executed for real, so an autopilot replay uses the
+/// network the recording used; recordings that predate the stored choice ran
+/// on the host network. A replay served to gdb uses the host network so the
+/// gdb client can reach its gdbserver port, as `hermit run --gdbserver` does.
+fn replay_network(autopilot: bool, recorded_local: bool) -> NetworkingMode {
+    if autopilot && recorded_local {
+        NetworkingMode::Local
+    } else {
+        NetworkingMode::Host
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_autopilot_replay_of_a_local_recording_is_local() {
+        assert_eq!(replay_network(true, true), NetworkingMode::Local);
+        assert_eq!(replay_network(true, false), NetworkingMode::Host);
+        assert_eq!(replay_network(false, true), NetworkingMode::Host);
+        assert_eq!(replay_network(false, false), NetworkingMode::Host);
     }
 }
