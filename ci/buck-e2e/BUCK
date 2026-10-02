@@ -18,8 +18,9 @@ oncall("hermit")
 ]
 
 # Which hermit the cells run (-c hermit_e2e.hermit=...):
-#   release  //hermit-cli:hermit-release, the feature-complete release build (default; needs
-#            the -c hermit_release.* provenance values, see scripts/build-buck-release.rs)
+#   release  //hermit-cli:hermit-release, the feature-complete release build (default;
+#            ./run builds it with -c hermit_release.unstamped=true, so it carries no
+#            commit hash and stays cached across commits that change no compiled source)
 #   debug    //hermit-cli:hermit (default features only: no dbt/sabre/e9patch backends)
 #   staged   the staged cargo-built hermit, e.g. to compare against a cargo build
 _HERMIT = {
