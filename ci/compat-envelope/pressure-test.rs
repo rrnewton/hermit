@@ -287,6 +287,20 @@ Commands:
   emit-series --results DIR
       Re-read a completed run and append its per-cell results to the parent
       series store. Requires DEV_HERMIT_PARENT and does not run a guest.
+  verdicts --rows DIR --repetitions COUNT
+      Give each cell the repeated-run verdicts summarize prints (Terminal and
+      clean passes, failure classes, Sample classification, CLEAN/FLAKY/
+      FAILING/INCOMPLETE) from test-harness result rows that another runner
+      retained, such as a Buck/Tpx `--stress-runs` collection. DIR holds
+      cells/<lane-category-test-mode-backend>-repetition-NNNN/ directories,
+      each with that repetition's results.jsonl and, when the harness wrote one,
+      summary.json. A missing repetition directory counts as a missing
+      repetition. Repetitions must be independent observations of one commit:
+      a run id retained twice, or rows naming another commit, make that
+      repetition an infrastructure error. Rows only: the verify logs, runner
+      evidence, and plan that summarize also checks are not read, so a
+      rows-only CLEAN is weaker evidence than a summarized one. Needs no Hermit
+      checkout. Writes DIR/verdicts.json.
   self-test
       Test pressure-runner selection, timeout, execution-plan, and retained-
       evidence checks without running a guest.
@@ -2190,6 +2204,11 @@ fn run() -> Result<(), String> {
         print!("{USAGE}");
         return Ok(());
     }
+    if command == "verdicts" {
+        // Reads only the rows under --rows; it needs no Hermit checkout.
+        let (rows, repetitions) = verdicts_options(&mut args)?;
+        return verdicts(&rows, repetitions);
+    }
     let root = repo_root()?;
     match command.as_str() {
         "plan" => {
@@ -2369,6 +2388,350 @@ fn run() -> Result<(), String> {
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
     }
     Ok(())
+}
+
+fn verdicts_options(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<(PathBuf, usize), String> {
+    let (mut rows, mut repetitions) = (None, None);
+    while let Some(option) = args.next() {
+        if !matches!(option.as_str(), "--rows" | "--repetitions") {
+            return Err(format!("verdicts does not accept {option}\n\n{USAGE}"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("verdicts {option} requires a value"))?;
+        let duplicate = if option == "--rows" {
+            rows.replace(PathBuf::from(value)).is_some()
+        } else {
+            let count = value
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or("verdicts --repetitions must be a positive integer")?;
+            repetitions.replace(count).is_some()
+        };
+        if duplicate {
+            return Err(format!("verdicts {option} may be given only once"));
+        }
+    }
+    match (rows, repetitions) {
+        (Some(rows), Some(repetitions)) => Ok((rows, repetitions)),
+        _ => Err("verdicts requires --rows DIR and --repetitions COUNT".into()),
+    }
+}
+
+/// One retained repetition read from result rows alone.
+struct RowsRepetition {
+    dir: PathBuf,
+    /// The cell the rows name, when it is the cell their directory names.
+    cell: Option<CellId>,
+    rows: Vec<CellResult>,
+    result: &'static str,
+    row_valid: bool,
+    evidence_errors: Vec<String>,
+    sample_evidence_errors: Vec<String>,
+    prepared_empty_result_file: bool,
+    rejected_result_history: bool,
+    retained_prerequisite: bool,
+}
+
+/// Read DIR/cells/<slug>-repetition-NNNN/results.jsonl. The result is the
+/// framework's recorded one; everything `summarize` would also check against
+/// runner evidence and artifacts is outside a rows-only reading.
+fn read_rows_repetition(dir: &Path, slug: &str) -> RowsRepetition {
+    let path = dir.join("results.jsonl");
+    let mut repetition = RowsRepetition {
+        dir: dir.to_path_buf(),
+        cell: None,
+        rows: Vec::new(),
+        result: "infrastructure-error",
+        row_valid: false,
+        evidence_errors: Vec::new(),
+        sample_evidence_errors: Vec::new(),
+        prepared_empty_result_file: false,
+        rejected_result_history: false,
+        retained_prerequisite: false,
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            // An empty history names no cell; `verdicts` asks the harness
+            // summary whether it was host-inapplicable.
+            repetition.prepared_empty_result_file = true;
+            return repetition;
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) | Err(_) => {
+            repetition
+                .sample_evidence_errors
+                .push(format!("missing result row {}", path.display()));
+            return repetition;
+        }
+    }
+    let rows = match read_current_result_rows(&path) {
+        Ok(rows) => rows,
+        Err(error) => {
+            repetition.rejected_result_history = true;
+            repetition.evidence_errors.push(error);
+            return repetition;
+        }
+    };
+    let cell = CellId {
+        lane: rows[0].lane.clone(),
+        category: rows[0].category.clone(),
+        test: rows[0].test.clone(),
+        mode: rows[0].mode.clone(),
+        backend: rows[0]
+            .backend
+            .clone()
+            .unwrap_or_else(|| "native".to_string()),
+    };
+    if base_cell_slug(&cell) == slug {
+        repetition.cell = Some(cell);
+    } else {
+        repetition.evidence_errors.push(format!(
+            "{} holds rows for `{}`, not for its directory's cell {slug}",
+            path.display(),
+            display_id(&cell)
+        ));
+    }
+    match cell_result_after_retries(&rows) {
+        Ok(row) => match (row.result, row.failure_class) {
+            (Some(recorded), class) if class == recorded.failure_class() => {
+                repetition.result = recorded.as_str();
+                repetition.row_valid = true;
+            }
+            (Some(recorded), class) => repetition.evidence_errors.push(format!(
+                "framework result {} carries failure_class {:?}, expected {:?}",
+                recorded.as_str(),
+                class,
+                recorded.failure_class()
+            )),
+            // An ERROR whose evidence named no product result (backend
+            // unavailable, launch refused, infrastructure, no result) is still
+            // a typed row; classify_nonpassing_repetition reads its class.
+            (None, Some(_)) => repetition.row_valid = true,
+            (None, None) => repetition.evidence_errors.push(format!(
+                "{} terminal attempt {} records neither a result nor a failure class",
+                path.display(),
+                row.attempt
+            )),
+        },
+        Err(error) => repetition.evidence_errors.push(error),
+    }
+    if !repetition.evidence_errors.is_empty() {
+        repetition.result = "infrastructure-error";
+        repetition.row_valid = false;
+    }
+    repetition.rows = rows;
+    repetition
+}
+
+/// The cell a slug names, recovered from a harness summary that reports it
+/// host-inapplicable: such a repetition writes no result row to name it.
+fn host_inapplicable_cell(dir: &Path, slug: &str) -> Option<CellId> {
+    let summary: JsonValue =
+        serde_json::from_str(&fs::read_to_string(dir.join("summary.json")).ok()?).ok()?;
+    let entry = summary
+        .get("host_inapplicable_cells")?
+        .as_array()?
+        .first()?;
+    let (test, mode) = (entry.get("test")?.as_str()?, entry.get("mode")?.as_str()?);
+    let backend = entry
+        .get("backend")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("native");
+    let suffix = format!("-{}", sanitize(&format!("{test}-{mode}-{backend}")));
+    let (lane, rest) = ["portable", "privileged"]
+        .into_iter()
+        .find_map(|lane| Some((lane, slug.strip_prefix(&format!("{lane}-"))?)))?;
+    let category = rest.strip_suffix(&suffix)?;
+    let cell = CellId {
+        lane: lane.into(),
+        category: category.into(),
+        test: test.into(),
+        mode: mode.into(),
+        backend: backend.into(),
+    };
+    (base_cell_slug(&cell) == slug).then_some(cell)
+}
+
+/// `verdicts`: fold rows retained by another runner (a Buck/Tpx stress
+/// collection) through the same per-repetition fold and table as summarize.
+fn verdicts(dir: &Path, repetitions: usize) -> Result<(), String> {
+    let cells_dir = dir.join("cells");
+    let mut by_slug = BTreeMap::<String, BTreeMap<usize, PathBuf>>::new();
+    for entry in fs::read_dir(&cells_dir)
+        .map_err(|error| format!("cannot read {}: {error}", cells_dir.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("cannot read {}: {error}", cells_dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let parsed = name
+            .rsplit_once("-repetition-")
+            .filter(|(_, number)| number.len() == 4)
+            .and_then(|(slug, number)| Some((slug.to_string(), number.parse::<usize>().ok()?)))
+            .filter(|(_, number)| (1..=repetitions).contains(number));
+        let Some((slug, number)) = parsed else {
+            return Err(format!(
+                "{} is not a <cell>-repetition-NNNN directory for repetitions 1..={repetitions}",
+                entry.path().display()
+            ));
+        };
+        by_slug
+            .entry(slug)
+            .or_default()
+            .insert(number, entry.path());
+    }
+    if by_slug.is_empty() {
+        return Err(format!(
+            "{} holds no <cell>-repetition-NNNN directory; there is nothing to judge",
+            cells_dir.display()
+        ));
+    }
+    let mut cells = Vec::new();
+    let mut repeated = BTreeMap::<CellId, RepeatedCellTally>::new();
+    let mut errors = BTreeMap::<CellId, BTreeSet<String>>::new();
+    let mut unidentified = Vec::new();
+    // Repetitions must be independent observations of one source tree: every
+    // run id is retained once, and every row names the same commit.
+    let mut run_ids = BTreeMap::<String, String>::new();
+    let mut source: Option<(String, bool)> = None;
+    for (slug, retained) in &by_slug {
+        let samples = (1..=repetitions)
+            .map(|number| {
+                let dir = retained
+                    .get(&number)
+                    .cloned()
+                    .unwrap_or_else(|| cells_dir.join(format!("{slug}-repetition-{number:04}")));
+                (number, read_rows_repetition(&dir, slug))
+            })
+            .collect::<Vec<_>>();
+        let cell = samples
+            .iter()
+            .find_map(|(_, sample)| sample.cell.clone())
+            .or_else(|| {
+                samples.iter().find_map(|(_, sample)| {
+                    sample
+                        .prepared_empty_result_file
+                        .then(|| host_inapplicable_cell(&sample.dir, slug))
+                        .flatten()
+                })
+            });
+        let Some(cell) = cell else {
+            unidentified.push(slug.clone());
+            continue;
+        };
+        let tally = repeated.entry(cell.clone()).or_default();
+        for (number, mut sample) in samples {
+            if sample.prepared_empty_result_file {
+                // As in summarize, only the harness summary proves an empty
+                // history host-inapplicable (here without runner evidence).
+                match retained_host_inapplicable(&sample.dir, &cell) {
+                    Ok(true) => sample.retained_prerequisite = true,
+                    Ok(false) => sample.evidence_errors.push(format!(
+                        "{} has an empty result history and no host-inapplicable harness summary",
+                        sample.dir.display()
+                    )),
+                    Err(error) => sample.evidence_errors.push(error),
+                }
+            }
+            for row in &sample.rows {
+                let here = format!("{slug} repetition {number}");
+                if let Some(other) = run_ids.insert(row.run_id.clone(), here.clone()) {
+                    if other != here {
+                        sample.evidence_errors.push(format!(
+                            "run id {} was already retained by {other}; repetitions must be independent",
+                            row.run_id
+                        ));
+                    }
+                }
+                let named = (row.hermit_sha.clone(), row.source_tree_dirty);
+                match &source {
+                    None => source = Some(named),
+                    Some(expected) if *expected != named => sample.evidence_errors.push(format!(
+                        "row names hermit {} (dirty: {}), but the collection is {} (dirty: {})",
+                        named.0, named.1, expected.0, expected.1
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if !sample.evidence_errors.is_empty() {
+                sample.result = "infrastructure-error";
+                sample.row_valid = false;
+            }
+            let retained_attempts = sample
+                .rows
+                .iter()
+                .map(|row| row.attempt as usize)
+                .max()
+                .unwrap_or(1);
+            fold_repetition(
+                tally,
+                &RepetitionSample {
+                    result: sample.result,
+                    rows: &sample.rows,
+                    retained_attempts,
+                    row_valid: sample.row_valid,
+                    evidence_error_count: sample.evidence_errors.len(),
+                    typed_no_comparison_refusal: false,
+                    prepared_empty_result_file: sample.prepared_empty_result_file,
+                    initial_evidence_valid: true,
+                    rejected_result_history: sample.rejected_result_history,
+                    proven_timeout: false,
+                    proven_oom: false,
+                    retained_prerequisite: sample.retained_prerequisite,
+                },
+                &mut sample.sample_evidence_errors,
+            );
+            errors.entry(cell.clone()).or_default().extend(
+                sample
+                    .evidence_errors
+                    .into_iter()
+                    .chain(sample.sample_evidence_errors),
+            );
+        }
+        cells.push(cell);
+    }
+    cells.sort();
+    let retried: usize = repeated.values().map(|tally| tally.retried).sum();
+    let retries = if retried == 0 {
+        "not recorded by result rows; no retained repetition needed a framework retry".to_string()
+    } else {
+        format!(
+            "not recorded by result rows; {retried} retained repetition(s) needed a framework retry"
+        )
+    };
+    let mut repeated_cells = print_repeated_cell_table(&cells, &repeated, &retries);
+    // Why a repetition was not a clean, trusted observation, per cell.
+    for (summary, cell) in repeated_cells.iter_mut().zip(&cells) {
+        summary["evidence_errors"] = json!(errors.get(cell).cloned().unwrap_or_default());
+    }
+    let output = dir.join("verdicts.json");
+    let document = json!({
+        "schema": 1,
+        "evidence": "result rows only (no verify logs, runner evidence, or plan)",
+        "repetitions": repetitions,
+        "hermit_sha": source.as_ref().map(|(sha, _)| sha),
+        "source_tree_dirty": source.as_ref().map(|(_, dirty)| dirty),
+        "retried_repetitions": retried,
+        "cells": repeated_cells,
+        "unidentified_cells": unidentified,
+    });
+    fs::write(
+        &output,
+        serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
+    println!("Wrote {}", output.display());
+    if unidentified.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "no repetition of {} retained a row or host-inapplicable summary naming its cell; it has no verdict",
+            unidentified.join(", ")
+        ))
+    }
 }
 
 fn print_sample(metadata: &RunMetadata) {
@@ -6526,6 +6889,190 @@ fn repeated_run_has_unacceptable_product_result(
     repetitions.is_some() && !repeated_red && (total == 0 || clean_passes != total || retried > 0)
 }
 
+/// One cell's repeated-run evidence, accumulated one repetition at a time.
+#[derive(Clone, Copy, Debug, Default)]
+struct RepeatedCellTally {
+    terminal_passes: usize,
+    clean_passes: usize,
+    infrastructure_errors: usize,
+    retried: usize,
+    total: usize,
+    counts: RepeatedOutcomeCounts,
+}
+
+/// What one repetition's retained evidence established, as `fold_repetition`
+/// needs it. `summarize` derives it from the full retained run (runner
+/// evidence, artifacts, rows); `verdicts` from result rows alone.
+struct RepetitionSample<'a> {
+    result: &'a str,
+    rows: &'a [CellResult],
+    retained_attempts: usize,
+    row_valid: bool,
+    evidence_error_count: usize,
+    typed_no_comparison_refusal: bool,
+    prepared_empty_result_file: bool,
+    initial_evidence_valid: bool,
+    rejected_result_history: bool,
+    proven_timeout: bool,
+    proven_oom: bool,
+    retained_prerequisite: bool,
+}
+
+/// Fold one repetition into its cell's tally: the one place a repetition
+/// becomes terminal/clean/qualifying passes or a failure class. An inner
+/// result history that cannot be parsed is appended to
+/// `sample_evidence_errors`, which the caller also reports.
+fn fold_repetition(
+    tally: &mut RepeatedCellTally,
+    sample: &RepetitionSample<'_>,
+    sample_evidence_errors: &mut Vec<String>,
+) {
+    let RepetitionSample {
+        result,
+        rows,
+        retained_attempts,
+        row_valid,
+        evidence_error_count,
+        typed_no_comparison_refusal,
+        prepared_empty_result_file,
+        initial_evidence_valid,
+        rejected_result_history,
+        proven_timeout,
+        proven_oom,
+        retained_prerequisite,
+    } = *sample;
+    tally.total += 1;
+    tally.terminal_passes += usize::from(result == "pass");
+    tally.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
+    tally.infrastructure_errors +=
+        usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
+    tally.retried += usize::from(retained_attempts > 1);
+    let counts = &mut tally.counts;
+    counts.expected_repetitions += 1;
+    counts.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
+    counts.retried_repetitions += usize::from(retained_attempts > 1);
+    let inner_history = if rows.is_empty() {
+        None
+    } else {
+        Some(inner_pressure_history(rows))
+    };
+    // A typed NoResult stamp legitimately has no comparison. Only
+    // that one verified reader refusal may be explained here; missing
+    // captures, golden output or other artifact errors stay incomplete.
+    let sample_artifacts_valid =
+        evidence_error_count == 0 || (typed_no_comparison_refusal && evidence_error_count == 1);
+    counts.unknown_history_repetitions += usize::from(
+        inner_history
+            .as_ref()
+            .is_some_and(|history| history.is_err())
+            || (row_valid && !sample_artifacts_valid),
+    );
+    if let Some(Err(error)) = &inner_history {
+        sample_evidence_errors.push(error.clone());
+    }
+    if result == "pass" {
+        counts.observed_repetitions += 1;
+        counts.terminal_passes += 1;
+        counts.qualifying_passes += usize::from(
+            evidence_error_count == 0
+                && sample_evidence_errors.is_empty()
+                && repetition_qualifies_for_promotion(result, rows),
+        );
+    } else {
+        let classification = if !sample_evidence_errors.is_empty() && !row_valid {
+            RepetitionClassification::Missing
+        } else {
+            let outer = classify_nonpassing_repetition(
+                result,
+                rows,
+                row_valid,
+                if prepared_empty_result_file {
+                    initial_evidence_valid
+                } else {
+                    sample_artifacts_valid
+                },
+                rejected_result_history,
+                proven_timeout,
+                proven_oom,
+                retained_prerequisite,
+            );
+            match &inner_history {
+                Some(Ok(inner)) => fold_pressure_history(outer, inner),
+                _ => outer,
+            }
+        };
+        match classification {
+            RepetitionClassification::ProductFailure => counts.product_failures += 1,
+            RepetitionClassification::InfrastructureFailure => counts.infrastructure_failures += 1,
+            RepetitionClassification::PrerequisiteFailure => counts.prerequisite_failures += 1,
+            RepetitionClassification::NoResult => counts.no_results += 1,
+            RepetitionClassification::Mixed => counts.mixed_repetitions += 1,
+            RepetitionClassification::Missing => counts.missing_repetitions += 1,
+        }
+        counts.observed_repetitions +=
+            usize::from(classification != RepetitionClassification::Missing);
+    }
+}
+
+/// Print the per-cell repeated-run table and the flake-verdict line, and return
+/// each cell's summary.json entry.
+fn print_repeated_cell_table(
+    cells: &[CellId],
+    repeated: &BTreeMap<CellId, RepeatedCellTally>,
+    retries: &str,
+) -> Vec<JsonValue> {
+    println!("Retries: {retries}");
+    println!();
+    println!(
+        "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |");
+    let mut verdicts = BTreeMap::<&'static str, usize>::new();
+    let mut repeated_cells = Vec::new();
+    for cell in cells {
+        let RepeatedCellTally {
+            terminal_passes,
+            clean_passes,
+            infrastructure_errors,
+            retried,
+            total,
+            counts,
+        } = repeated.get(cell).copied().unwrap_or_default();
+        let result = repeated_result_description(
+            terminal_passes,
+            clean_passes,
+            infrastructure_errors,
+            retried,
+            total,
+        );
+        let verdict = flake_verdict(counts);
+        *verdicts.entry(verdict).or_default() += 1;
+        println!(
+            "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
+            display_id(cell),
+            counts.product_failures,
+            counts.infrastructure_failures,
+            counts.prerequisite_failures,
+            counts.no_results,
+            counts.mixed_repetitions + counts.missing_repetitions,
+            counts.unknown_history_repetitions,
+            classify_pressure_sample(counts).as_str(),
+        );
+        repeated_cells.push(repeated_cell_summary(cell, counts, result));
+    }
+    println!();
+    println!(
+        "Flake verdicts over {} cell(s): {} CLEAN, {} FLAKY, {} FAILING, {} INCOMPLETE.",
+        cells.len(),
+        verdicts.get("CLEAN").copied().unwrap_or(0),
+        verdicts.get("FLAKY").copied().unwrap_or(0),
+        verdicts.get("FAILING").copied().unwrap_or(0),
+        verdicts.get("INCOMPLETE").copied().unwrap_or(0),
+    );
+    println!();
+    repeated_cells
+}
+
 fn repeated_cell_summary(cell: &CellId, counts: RepeatedOutcomeCounts, result: &str) -> JsonValue {
     let classification = classify_pressure_sample(counts);
     json!({
@@ -7004,12 +7551,7 @@ fn summarize(
     }
 
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut sample_counts = BTreeMap::<CellId, RepeatedOutcomeCounts>::new();
-    let mut repeated_terminal_passes = BTreeMap::<CellId, usize>::new();
-    let mut repeated_clean_passes = BTreeMap::<CellId, usize>::new();
-    let mut repeated_infrastructure_errors = BTreeMap::<CellId, usize>::new();
-    let mut repeated_totals = BTreeMap::<CellId, usize>::new();
-    let mut retried_by_cell = BTreeMap::<CellId, usize>::new();
+    let mut repeated = BTreeMap::<CellId, RepeatedCellTally>::new();
     let mut retried_repetitions = 0usize;
     let mut attempted = 0usize;
     let mut passing = Vec::new();
@@ -7423,93 +7965,28 @@ fn summarize(
                 .entry(result.to_string())
                 .or_default() += 1;
             if metadata.repetitions.is_some() {
-                *repeated_totals.entry(cell.clone()).or_default() += 1;
-                if result == "pass" {
-                    *repeated_terminal_passes.entry(cell.clone()).or_default() += 1;
-                }
-                if repetition_passed_cleanly(result, &result_rows_for_history) {
-                    *repeated_clean_passes.entry(cell.clone()).or_default() += 1;
-                }
-                if matches!(result, "infrastructure-error" | "sandbox-denied") {
-                    *repeated_infrastructure_errors
-                        .entry(cell.clone())
-                        .or_default() += 1;
-                }
-                let counts = sample_counts.entry(cell.clone()).or_default();
-                counts.expected_repetitions += 1;
-                counts.clean_passes +=
-                    usize::from(repetition_passed_cleanly(result, &result_rows_for_history));
-                counts.retried_repetitions += usize::from(retained_attempts > 1);
-                let inner_history = if result_rows_for_history.is_empty() {
-                    None
-                } else {
-                    Some(inner_pressure_history(&result_rows_for_history))
-                };
-                // A typed NoResult stamp legitimately has no comparison. Only
-                // that one verified reader refusal may be explained here; missing
-                // captures, golden output or other artifact errors stay incomplete.
-                let sample_artifacts_valid = evidence_errors.is_empty()
-                    || (typed_no_comparison_refusal && evidence_errors.len() == 1);
-                counts.unknown_history_repetitions += usize::from(
-                    inner_history
-                        .as_ref()
-                        .is_some_and(|history| history.is_err())
-                        || (row_valid && !sample_artifacts_valid),
+                fold_repetition(
+                    repeated.entry(cell.clone()).or_default(),
+                    &RepetitionSample {
+                        result,
+                        rows: &result_rows_for_history,
+                        retained_attempts,
+                        row_valid,
+                        evidence_error_count: evidence_errors.len(),
+                        typed_no_comparison_refusal,
+                        prepared_empty_result_file,
+                        initial_evidence_valid,
+                        rejected_result_history,
+                        proven_timeout,
+                        proven_oom,
+                        retained_prerequisite,
+                    },
+                    &mut sample_evidence_errors,
                 );
-                if let Some(Err(error)) = &inner_history {
-                    sample_evidence_errors.push(error.clone());
-                }
-                if result == "pass" {
-                    counts.observed_repetitions += 1;
-                    counts.terminal_passes += 1;
-                    counts.qualifying_passes += usize::from(
-                        evidence_errors.is_empty()
-                            && sample_evidence_errors.is_empty()
-                            && repetition_qualifies_for_promotion(result, &result_rows_for_history),
-                    );
-                } else {
-                    let classification = if !sample_evidence_errors.is_empty() && !row_valid {
-                        RepetitionClassification::Missing
-                    } else {
-                        let outer = classify_nonpassing_repetition(
-                            result,
-                            &result_rows_for_history,
-                            row_valid,
-                            if prepared_empty_result_file {
-                                initial_evidence_valid
-                            } else {
-                                sample_artifacts_valid
-                            },
-                            rejected_result_history,
-                            proven_timeout,
-                            proven_oom,
-                            retained_prerequisite,
-                        );
-                        match &inner_history {
-                            Some(Ok(inner)) => fold_pressure_history(outer, inner),
-                            _ => outer,
-                        }
-                    };
-                    match classification {
-                        RepetitionClassification::ProductFailure => counts.product_failures += 1,
-                        RepetitionClassification::InfrastructureFailure => {
-                            counts.infrastructure_failures += 1
-                        }
-                        RepetitionClassification::PrerequisiteFailure => {
-                            counts.prerequisite_failures += 1
-                        }
-                        RepetitionClassification::NoResult => counts.no_results += 1,
-                        RepetitionClassification::Mixed => counts.mixed_repetitions += 1,
-                        RepetitionClassification::Missing => counts.missing_repetitions += 1,
-                    }
-                    counts.observed_repetitions +=
-                        usize::from(classification != RepetitionClassification::Missing);
-                }
                 if retained_attempts > 1 {
                     retried_repetitions = retried_repetitions
                         .checked_add(1)
                         .ok_or("pressure retried-repetition count overflowed usize")?;
-                    *retried_by_cell.entry(cell.clone()).or_default() += 1;
                 }
             }
             if result == "pass" && metadata.repetitions.is_none() {
@@ -7735,19 +8212,19 @@ fn summarize(
         println!();
     }
     let mut repeated_cells = Vec::new();
-    let repeated_terminal_pass_count: usize = repeated_terminal_passes.values().sum();
-    let repeated_clean_pass_count: usize = repeated_clean_passes.values().sum();
-    let repeated_total_count: usize = repeated_totals.values().sum();
+    let repeated_terminal_pass_count: usize = repeated.values().map(|t| t.terminal_passes).sum();
+    let repeated_clean_pass_count: usize = repeated.values().map(|t| t.clean_passes).sum();
+    let repeated_total_count: usize = repeated.values().map(|t| t.total).sum();
     let repeated_result = if metadata.repetitions.is_some() && metadata.is_exact() {
         let cell = &metadata.cells[0];
-        let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
-        let clean_passes = repeated_clean_passes.get(cell).copied().unwrap_or(0);
-        let infrastructure_errors = repeated_infrastructure_errors
-            .get(cell)
-            .copied()
-            .unwrap_or(0);
-        let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
-        let total = repeated_totals.get(cell).copied().unwrap_or(0);
+        let RepeatedCellTally {
+            terminal_passes,
+            clean_passes,
+            infrastructure_errors,
+            retried,
+            total,
+            counts,
+        } = repeated.get(cell).copied().unwrap_or_default();
         let result = top_level_repeated_result_description(
             &metadata,
             terminal_passes,
@@ -7767,7 +8244,6 @@ fn summarize(
                 total,
             )
         );
-        let counts = sample_counts.get(cell).copied().unwrap_or_default();
         println!(
             "Sample classification for `{}`: {}; {}/{} qualifying first attempts.",
             display_id(cell),
@@ -7778,65 +8254,16 @@ fn summarize(
         repeated_cells.push(repeated_cell_summary(cell, counts, result));
         Some(result)
     } else if metadata.repetitions.is_some() {
-        println!(
-            "Retries: {}",
+        repeated_cells = print_repeated_cell_table(
+            &metadata.cells,
+            &repeated,
             if metadata.no_retry {
                 "off (--no-retry): every repetition is one first-attempt observation"
             } else {
                 "framework retry on; clean passes count first attempts"
-            }
+            },
         );
-        println!();
-        println!(
-            "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
-        );
-        println!(
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
-        );
-        let mut verdicts = BTreeMap::<&'static str, usize>::new();
-        for cell in &metadata.cells {
-            let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
-            let clean_passes = repeated_clean_passes.get(cell).copied().unwrap_or(0);
-            let infrastructure_errors = repeated_infrastructure_errors
-                .get(cell)
-                .copied()
-                .unwrap_or(0);
-            let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
-            let total = repeated_totals.get(cell).copied().unwrap_or(0);
-            let result = repeated_result_description(
-                terminal_passes,
-                clean_passes,
-                infrastructure_errors,
-                retried,
-                total,
-            );
-            let counts = sample_counts.get(cell).copied().unwrap_or_default();
-            let verdict = flake_verdict(counts);
-            *verdicts.entry(verdict).or_default() += 1;
-            println!(
-                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
-                display_id(cell),
-                counts.product_failures,
-                counts.infrastructure_failures,
-                counts.prerequisite_failures,
-                counts.no_results,
-                counts.mixed_repetitions + counts.missing_repetitions,
-                counts.unknown_history_repetitions,
-                classify_pressure_sample(counts).as_str(),
-            );
-            repeated_cells.push(repeated_cell_summary(cell, counts, result));
-        }
-        println!();
-        println!(
-            "Flake verdicts over {} cell(s): {} CLEAN, {} FLAKY, {} FAILING, {} INCOMPLETE.",
-            metadata.cells.len(),
-            verdicts.get("CLEAN").copied().unwrap_or(0),
-            verdicts.get("FLAKY").copied().unwrap_or(0),
-            verdicts.get("FAILING").copied().unwrap_or(0),
-            verdicts.get("INCOMPLETE").copied().unwrap_or(0),
-        );
-        println!();
-        let infrastructure_errors: usize = repeated_infrastructure_errors.values().sum();
+        let infrastructure_errors: usize = repeated.values().map(|t| t.infrastructure_errors).sum();
         let result = top_level_repeated_result_description(
             &metadata,
             repeated_terminal_pass_count,
@@ -13872,6 +14299,147 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     if read_current_result_rows(&appended_results)?.len() != 2 {
         return Err("the existing current retry history lost strict admission".into());
+    }
+    // `verdicts` folds rows another runner retained through the same fold as
+    // summarize. Fixture repetitions use distinct run ids: repetitions must be
+    // independent observations.
+    {
+        let rows_root = scratch.join("verdicts-rows");
+        let argv = [
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            "fixture",
+        ];
+        let write = |root: &Path, cell: &CellId, number: usize, rows: &[CellResult]| {
+            let dir = root
+                .join("cells")
+                .join(format!("{}-repetition-{number:04}", base_cell_slug(cell)));
+            fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            let text = rows
+                .iter()
+                .map(|row| serde_json::to_string(row).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n");
+            fs::write(dir.join("results.jsonl"), format!("{text}\n"))
+                .map_err(|e| format!("cannot write verdicts fixture: {e}"))
+        };
+        let observation = |row: &CellResult, cell: &CellId, run: &str| {
+            let mut row = row.clone();
+            row.test = cell.test.clone();
+            row.run_id = run.into();
+            row.artifact_dir = format!("/retained/runs/{run}/cell");
+            row
+        };
+        let pass = matched_pass_row(&result_row, &argv, 0, (0, 0), None)?;
+        let mut error = first_row.clone();
+        error.outcome = "ERROR".into();
+        error.result = None;
+        error.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        error.error_kind = Some("infrastructure".into());
+        let sample_c = CellId {
+            test: "sample/c".into(),
+            ..sample_a.clone()
+        };
+        // a: a clean pass, a divergence, and a repetition never retained.
+        write(
+            &rows_root,
+            &sample_a,
+            1,
+            &[observation(&pass, &sample_a, "a1")],
+        )?;
+        write(
+            &rows_root,
+            &sample_a,
+            2,
+            &[observation(&first_row, &sample_a, "a2")],
+        )?;
+        // b: three clean passes; c: three typed infrastructure ERRORs.
+        for number in 1..=3 {
+            write(
+                &rows_root,
+                &sample_b,
+                number,
+                &[observation(&pass, &sample_b, &format!("b{number}"))],
+            )?;
+            write(
+                &rows_root,
+                &sample_c,
+                number,
+                &[observation(&error, &sample_c, &format!("c{number}"))],
+            )?;
+        }
+        verdicts(&rows_root, 3)?;
+        let written: JsonValue = serde_json::from_str(
+            &fs::read_to_string(rows_root.join("verdicts.json"))
+                .map_err(|e| format!("cannot read verdicts.json: {e}"))?,
+        )
+        .map_err(|e| format!("invalid verdicts.json: {e}"))?;
+        let cell = |test: &str| {
+            written["cells"]
+                .as_array()
+                .and_then(|cells| {
+                    cells
+                        .iter()
+                        .find(|cell| cell["cell"]["test"] == json!(test))
+                })
+                .cloned()
+                .unwrap_or(JsonValue::Null)
+        };
+        let (a, b, c) = (cell("sample/a"), cell("sample/b"), cell("sample/c"));
+        let expect = |summary: &JsonValue, field: &str, value: JsonValue| summary[field] == value;
+        if written["cells"].as_array().map(Vec::len) != Some(3)
+            || written["hermit_sha"] != json!(sample_metadata.hermit_sha)
+            || !expect(&a, "verdict", json!("FLAKY"))
+            || !expect(&a, "passes", json!(1))
+            || !expect(&a, "clean_passes", json!(1))
+            || !expect(&a, "terminal_product_failures", json!(1))
+            || !expect(&a, "missing_repetitions", json!(1))
+            || !expect(&a, "total", json!(3))
+            || !expect(&b, "verdict", json!("CLEAN"))
+            || !expect(&b, "clean_passes", json!(3))
+            || !expect(&b, "observed_repetitions", json!(3))
+            || !expect(&b, "unknown_history_repetitions", json!(0))
+            || !expect(&b, "evidence_errors", json!([]))
+            || !expect(&c, "verdict", json!("INCOMPLETE"))
+            || !expect(&c, "infrastructure_failures", json!(3))
+            || !expect(&c, "missing_repetitions", json!(0))
+        {
+            return Err(format!(
+                "rows-only verdicts misfolded retained repetitions: {written}"
+            ));
+        }
+        // A copied row is not a second observation.
+        let copies = scratch.join("verdicts-copies");
+        let copied = observation(&pass, &sample_b, "same");
+        write(&copies, &sample_b, 1, std::slice::from_ref(&copied))?;
+        write(&copies, &sample_b, 2, std::slice::from_ref(&copied))?;
+        verdicts(&copies, 2)?;
+        let written: JsonValue = serde_json::from_str(
+            &fs::read_to_string(copies.join("verdicts.json"))
+                .map_err(|e| format!("cannot read verdicts.json: {e}"))?,
+        )
+        .map_err(|e| format!("invalid verdicts.json: {e}"))?;
+        if written["cells"][0]["verdict"] == json!("CLEAN")
+            || !written["cells"][0]["evidence_errors"]
+                .to_string()
+                .contains("already retained")
+        {
+            return Err(format!("verdicts counted a copied row twice: {written}"));
+        }
+        // Nothing to judge, or a directory that names no repetition, refuses.
+        let empty = scratch.join("verdicts-empty");
+        fs::create_dir_all(empty.join("cells"))
+            .map_err(|e| format!("cannot create empty fixture: {e}"))?;
+        fs::create_dir_all(rows_root.join("cells").join("not-a-repetition"))
+            .map_err(|e| format!("cannot create malformed fixture: {e}"))?;
+        if verdicts(&empty, 3).is_ok() || verdicts(&rows_root, 3).is_ok() {
+            return Err("verdicts accepted an empty or malformed rows directory".into());
+        }
     }
     let historical_results = scratch.join("historical-timeout-results.jsonl");
     let mut historical_rows = appended.clone();
