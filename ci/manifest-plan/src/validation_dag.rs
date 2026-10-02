@@ -21,6 +21,7 @@ use dagrun::model::DagConfig;
 use dagrun::model::DagManifest;
 use dagrun::model::ResultManifest;
 use dagrun::model::Step;
+use dagrun::model::StructuredTestResultsManifest;
 use dagrun::model::result_manifest_owner;
 use dagrun::select_steps_by_labels;
 use serde::Deserialize;
@@ -63,6 +64,10 @@ const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
 const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
+const NETWORK_HTTP_TEST: &str = "applications/network-only-curl-http";
+const NETWORK_HTTP_HOST: &str = "privileged-e2e.network_http_on_host";
+const NETWORK_HTTP_POINTER: &str = "target/ci/hermit-network-e2e-artifact.path";
+const HOST_ARTIFACT_POINTER: &str = "target/ci/hermit-host-e2e-artifact.path";
 const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 8),
     ("e2e.manifest_backend_parity_c", "manifest_guest", 8, 8),
@@ -160,8 +165,8 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 275,
-        selected_steps: 276,
+        direct_steps: 276,
+        selected_steps: 286,
     },
     Profile {
         label: "portable",
@@ -180,8 +185,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: "privileged",
-        direct_steps: 11,
-        selected_steps: 19,
+        direct_steps: 12,
+        selected_steps: 29,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -190,8 +195,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
-        direct_steps: 12,
-        selected_steps: 12,
+        direct_steps: 13,
+        selected_steps: 16,
     },
 ];
 
@@ -854,6 +859,100 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// The HTTP cell uses the actual host systemd provider and host curl. Forwarding
+/// deployment paths into the network-disabled pinned root is insufficient: that
+/// root has neither the host manager nor host-visible helper executable paths.
+/// Keep every other application on its existing route, without dropping a cell.
+fn materialize_network_http_host(cfg: &mut DagConfig) -> Result<(), String> {
+    // Full now selects both host and pinned producers. They must not replace
+    // each other's pointer (in particular, binary-only vs complete resources).
+    let hosted = select_steps_by_labels(cfg, &[HOSTED_PRIVILEGED_LABEL.into()])?
+        .steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    for step in &mut cfg.steps {
+        if hosted.contains(&step.tag()) && step.cmd.contains("./ci/run-with-hermit-e2e-artifact.sh ") {
+            step.env.insert("HERMIT_E2E_ARTIFACT_POINTER".into(), HOST_ARTIFACT_POINTER.into());
+        }
+        if step.tag() == "privileged-only-build.privileged_tests_on_host" {
+            if step.cmd.matches("target/ci/hermit-e2e-artifact.path").count() != 1 {
+                return Err("host producer lost its exact artifact publication pointer".into());
+            }
+            step.cmd = step.cmd.replace("target/ci/hermit-e2e-artifact.path", HOST_ARTIFACT_POINTER);
+        }
+    }
+    let mut http = cfg.steps.iter()
+        .find(|step| step.tag() == "privileged-only-e2e.manifest_applications_on_host")
+        .cloned().ok_or("missing host privileged application launcher")?;
+    const SELECTOR: &str = "--category applications --ci-only";
+    for tag in [
+        "privileged-e2e.manifest_applications",
+        "privileged-only-e2e.manifest_applications",
+        "privileged-only-e2e.manifest_applications_on_host",
+    ] {
+        let step = cfg.steps.iter_mut().find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("missing application launcher {tag}"))?;
+        if step.cmd.matches(SELECTOR).count() != 1 {
+            return Err(format!("{tag} lost its exact application selection"));
+        }
+        step.cmd = step.cmd.replace(SELECTOR,
+            "--category applications --test applications/kvm-shell-environment --ci-only");
+        step.manifest.as_mut().ok_or("application launcher lacks selector")?.test =
+            Some("applications/kvm-shell-environment".into());
+    }
+    http.group = "privileged-e2e".into();
+    http.job = "network_http_on_host".into();
+    http.labels = vec!["full".into(), "privileged".into(), HOSTED_PRIVILEGED_LABEL.into()];
+    http.desc = "Host-managed provider: required HTTP Record/offline Replay cell".into();
+    http.description = "Uses the existing host privileged launcher, verified CLI/provider snapshot and externally provisioned deployment roots. Only this HTTP cell leaves the pinned root; CPU/wall/output/comparison limits and the required cell population are unchanged.".into();
+    http.cmd = http.cmd.replace(SELECTOR,
+        &format!("--category applications --test {NETWORK_HTTP_TEST} --ci-only"))
+        .replace("/privileged/manifest_applications/", "/privileged/network_http/");
+    http.manifest.as_mut().ok_or("host application launcher lacks selector")?.test =
+        Some(NETWORK_HTTP_TEST.into());
+    http.env.insert("HERMIT_E2E_ARTIFACT_POINTER".into(), NETWORK_HTTP_POINTER.into());
+    http.deps.push("build.network_http_artifact_on_host".into());
+    http.fail_fast_family = Some(http.tag());
+    http.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
+        StructuredTestResultsManifest::current(NETWORK_HTTP_HOST),
+    )]);
+
+    // Reuse the ordinary publisher and prepared rust-script action. Providers
+    // have separate 120-second nodes, matching each action's existing deadline;
+    // unrelated consumers keep their existing artifact and dependencies.
+    let base = cfg.steps.iter().find(|step| step.tag() == "build.e2e_artifact")
+        .cloned().ok_or("missing ordinary artifact publisher")?;
+    let prefix = base.cmd.split_once("./ci/publish-hermit-e2e-artifact.sh")
+        .ok_or("artifact publisher command changed")?.0.to_owned();
+    let mut package_tags = Vec::new();
+    for component in ["accepted", "unix-guard"] {
+        let mut package = base.clone();
+        package.job = format!("network_http_{}_on_host", component.replace('-', "_"));
+        package.labels.clear();
+        package.desc = format!("Prepare existing offline {component} provider for HTTP");
+        package.description = "Existing offline package action only; does not load/attach BPF or run helpers. Retains its 120-second deadline and refuses stale or failed output rather than replacing it.".into();
+        package.cmd = format!("{prefix}./hermit-cli/network-provider/package.rs --component {component} --source-dir \"$PWD/hermit-cli/network-provider\" --output-dir \"$VALIDATE_RUN_STATE/network-http-provider/{component}\"");
+        package.deps = vec!["build.rust_scripts_on_host".into(), "gate.manifest_on_host".into()];
+        package.env.clear();
+        package.timeout = 120;
+        package.fail_fast_family = Some(package.tag());
+        package_tags.push(package.tag());
+        cfg.steps.push(package);
+    }
+    let mut publisher = base;
+    publisher.job = "network_http_artifact_on_host".into();
+    publisher.labels.clear();
+    publisher.desc = "Snapshot the verified host CLI with both prepared network providers".into();
+    publisher.description = "Consumes the existing verified host CLI artifact and explicit offline provider outputs; publishes a separate HTTP-only pointer through the ordinary snapshot/hash mechanism. BOUND MEASURED 2026-10-02: the real 628-MB CLI plus accepted and unix-guard packages published and verified in 3.49 seconds under a 20-second outer bound (16.51 seconds observed headroom). This is snapshot-workload evidence, not provider ABI or HTTP qualification. Existing publishers, package compile deadlines and the 2160-second privileged launcher are unchanged.".into();
+    publisher.cmd = format!("{prefix}bundle=$(./ci/verify-hermit-e2e-artifact.sh {HOST_ARTIFACT_POINTER}) && ./ci/publish-hermit-e2e-artifact.sh --network-provider \"$VALIDATE_RUN_STATE/network-http-provider\" \"$bundle/hermit\" target/ci/hermit-e2e-artifacts {NETWORK_HTTP_POINTER}");
+    publisher.deps = package_tags;
+    publisher.deps.push("privileged-only-build.privileged_tests_on_host".into());
+    publisher.env.clear();
+    publisher.timeout = 20;
+    publisher.fail_fast_family = Some(publisher.tag());
+    cfg.steps.push(publisher);
+    cfg.steps.push(http);
+    Ok(())
+}
+
 // These six shared ancestors need separate immutable IDs because quick/super
 // use the measured 1200-second Rust-script CPU budget, while the other profiles
 // keep the established 7200-second cold-build budget. This is generation, not
@@ -912,6 +1011,8 @@ fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
 /// selection cannot drop their source/gate ordering. Pinned preparation retains
 /// its original pin/fetch prerequisites and can overlap the manifest audit.
 fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
+    let hosted_privileged = select_steps_by_labels(cfg, &[HOSTED_PRIVILEGED_LABEL.into()])?
+        .steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
     for (labels, gate, pin, manifest_producer) in [
         (
             vec![
@@ -957,6 +1058,12 @@ fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
         for step in &mut cfg.steps {
             let tag = step.tag();
             if !executable_tags.contains(&tag) {
+                continue;
+            }
+            // HTTP is selected by full as well, but its host ancestors retain
+            // their existing host preflight. Cross-linking the two preflights
+            // would create a dependency cycle and pull pinned work onto host.
+            if gate == "gate.manifest" && hosted_privileged.contains(&tag) {
                 continue;
             }
             let pinned_preparation =
@@ -1181,7 +1288,10 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
         let mut owned = if let Some(selector) = &step.manifest {
             cells
                 .iter()
-                .filter(|cell| cell.lane == selector.lane && cell.category == selector.category)
+                .filter(|cell| cell.lane == selector.lane && cell.category == selector.category
+                    && selector.test.as_ref().is_none_or(|test| cell.test.as_ref() == Some(test))
+                    && selector.mode.as_ref().is_none_or(|mode| cell.mode.as_ref() == Some(mode))
+                    && selector.backend.as_ref().is_none_or(|backend| cell.backend.as_ref() == Some(backend)))
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
@@ -1220,9 +1330,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 111 {
+    if expected.len() != 112 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 111",
+            "structured result producer registry has {} entries, expected 112",
             expected.len()
         ));
     }
@@ -1357,7 +1467,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [72, 33, 2, 2, 2] {
+    if actual_group_counts != [72, 34, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1653,9 +1763,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1611 {
+    if cfg.steps.len() != 1615 {
         return Err(format!(
-            "superset has {} steps, expected 1611",
+            "superset has {} steps, expected 1615",
             cfg.steps.len()
         ));
     }
@@ -2001,10 +2111,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         }
         if profile.label == HOSTED_PRIVILEGED_LABEL {
             let expected = [
+                "build.network_http_accepted_on_host",
+                "build.network_http_artifact_on_host",
+                "build.network_http_unix_guard_on_host",
                 "build.rust_scripts_on_host",
                 "gate.manifest_on_host",
                 "pre.reverie_pin_on_host",
                 "privileged-build.manifest_guests_on_host",
+                "privileged-e2e.network_http_on_host",
                 "privileged-only-build.privileged_tests_on_host",
                 "privileged-only-cpuid.faulting_on_host",
                 "privileged-only-e2e.manifest_applications_on_host",
@@ -2028,6 +2142,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 ));
             }
             let expected_cpu = [
+                ("build.network_http_accepted_on_host", 7200),
+                ("build.network_http_artifact_on_host", 7200),
+                ("build.network_http_unix_guard_on_host", 7200),
+                ("privileged-e2e.network_http_on_host", 7200),
                 ("pre.reverie_pin_on_host", 300),
                 ("build.rust_scripts_on_host", 7200),
                 ("setup.manifest_plan_on_host", 7200),
@@ -2065,9 +2183,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 return Err("hosted privileged graph gained an unmeasured resource demand".into());
             }
             let critical = critical_path_wall_seconds(&selected)?;
-            if critical != 2100 {
+            if critical != 2120 {
                 return Err(format!(
-                    "hosted privileged critical path differs from 2100 seconds with the measured rust-script wall bound: {critical}"
+                    "hosted privileged critical path differs from 2120 seconds including the measured new 20-second provider snapshot publication (all existing node bounds unchanged): {critical}"
                 ));
             }
         }
@@ -2191,6 +2309,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_network_http_host(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -2224,6 +2343,82 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_http_host_launch_and_packages_are_required_exactly_once() {
+        let cfg = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let http_cell = cells.iter().find(|cell| cell.test.as_deref() == Some(NETWORK_HTTP_TEST)).unwrap();
+        for profile in ["full", "privileged", HOSTED_PRIVILEGED_LABEL] {
+            let selected = select_steps_by_labels(&cfg, &[profile.into()]).unwrap();
+            let owners = selected.steps.iter().filter(|step| {
+                step.effective_result_manifests().iter().any(|cell| result_identity(cell) == result_identity(http_cell))
+            }).collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1, "{profile}");
+            let http = owners[0];
+            assert_eq!(http.tag(), NETWORK_HTTP_HOST);
+            assert!(!http.cmd.contains("run-in-pinned-root.sh"));
+            assert!(http.cmd.contains(&format!("--test {NETWORK_HTTP_TEST} --ci-only")));
+            assert_eq!(http.env["HERMIT_E2E_ARTIFACT_POINTER"], NETWORK_HTTP_POINTER);
+            assert_eq!((http.timeout, http.cpu_timeout), (600, 7200));
+            let prerequisites = dagrun::select_steps_by_tags(&cfg, &[http.tag()], false).unwrap();
+            for component in ["accepted", "unix_guard"] {
+                let tag = format!("build.network_http_{component}_on_host");
+                let producer = prerequisites.steps.iter().find(|step| step.tag() == tag).unwrap();
+                assert_eq!(producer.timeout, 120);
+                assert!(producer.cmd.contains(&format!("package.rs --component {}", component.replace('_', "-"))));
+                assert!(producer.cmd.contains("$VALIDATE_RUN_STATE/network-http-provider/"));
+                assert!(!producer.cmd.contains("run-in-pinned-root.sh"));
+            }
+            let kvm = selected.steps.iter().find(|step| {
+                step.manifest.as_ref().is_some_and(|m| m.test.as_deref() == Some("applications/kvm-shell-environment"))
+            }).unwrap();
+            assert_eq!(kvm.cmd.contains("run-in-pinned-root.sh"), profile != HOSTED_PRIVILEGED_LABEL);
+            let kvm_deps = dagrun::select_steps_by_tags(&cfg, &[kvm.tag()], false).unwrap();
+            assert!(!kvm_deps.steps.iter().any(|step| step.job.starts_with("network_http_")));
+        }
+        for profile in ["portable", "quick", "super", HOSTED_PORTABLE_LABEL] {
+            let selected = select_steps_by_labels(&cfg, &[profile.into()]).unwrap();
+            assert!(!selected.steps.iter().any(|step| step.job.starts_with("network_http_")));
+        }
+        let producer = cfg.steps.iter().find(|step| step.tag() == "privileged-only-build.privileged_tests_on_host").unwrap();
+        assert!(producer.cmd.contains(HOST_ARTIFACT_POINTER));
+        assert!(!producer.cmd.contains("target/ci/hermit-e2e-artifact.path"));
+        let publisher = cfg.steps.iter().find(|step| step.tag() == "build.network_http_artifact_on_host").unwrap();
+        assert_eq!(publisher.timeout, 20);
+        assert!(publisher.cmd.contains(&format!("verify-hermit-e2e-artifact.sh {HOST_ARTIFACT_POINTER}")));
+        assert!(publisher.cmd.contains("--network-provider \"$VALIDATE_RUN_STATE/network-http-provider\""));
+    }
+
+    #[test]
+    fn network_http_host_command_preserves_deployment_paths_and_failure_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut cfg = crate::validation_dag_static::config();
+        materialize_network_http_host(&mut cfg).unwrap();
+        let http = cfg.steps.iter().find(|step| step.tag() == NETWORK_HTTP_HOST).unwrap();
+        let scratch = Scratch::create().unwrap();
+        let root = scratch.0.join("host checkout with spaces");
+        fs::create_dir_all(root.join("ci")).unwrap();
+        let wrapper = root.join("ci/run-with-hermit-e2e-artifact.sh");
+        fs::write(&wrapper, "#!/bin/bash\nprintf '%s\\0' \"$HERMIT_E2E_ARTIFACT_POINTER\" \"$HERMIT_PREPARED_NETWORK_GUARD_BPFFS\" \"$HERMIT_PREPARED_NETWORK_GUARD_RECOVERY\" \"$HERMIT_PREPARED_NETWORK_ACCEPTED_RECOVERY\" \"$@\" >\"$CAPTURE\"\nexit 23\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = root.join("capture");
+        let output = Command::new("timeout").args(["--kill-after=1s", "5s", "bash", "-c"])
+            .arg(&http.cmd).current_dir(&root).envs(&http.env)
+            .env("CAPTURE", &capture).env("E2E_RESULT_ROOT", "/host results")
+            .env("HERMIT_PREPARED_NETWORK_GUARD_BPFFS", "/host deployment/bpffs")
+            .env("HERMIT_PREPARED_NETWORK_GUARD_RECOVERY", "/host deployment/guard")
+            .env("HERMIT_PREPARED_NETWORK_ACCEPTED_RECOVERY", "/host deployment/accepted")
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(23), "{output:?}");
+        let bytes = fs::read(capture).unwrap();
+        let fields = bytes.split(|byte| *byte == 0).filter(|field| !field.is_empty())
+            .map(|field| std::str::from_utf8(field).unwrap()).collect::<Vec<_>>();
+        assert_eq!(fields, [NETWORK_HTTP_POINTER, "/host deployment/bpffs", "/host deployment/guard", "/host deployment/accepted",
+            "target/debug/test-harness", "run", "--lane", "privileged", "--category", "applications", "--test", NETWORK_HTTP_TEST,
+            "--ci-only", "--allow-empty", "--prebuilt", "--results", "/host results/privileged/network_http/results.jsonl",
+            "--junit", "/host results/privileged/network_http/junit.xml"]);
+    }
 
     #[test]
     fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {

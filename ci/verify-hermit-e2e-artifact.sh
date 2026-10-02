@@ -75,7 +75,24 @@ elif [[ -e $bundle/install || -e $bundle/resources.sha256 ]]; then
     fail "binary-only artifact unexpectedly contains an unverified resource bundle: $bundle"
 fi
 
-identity=$(printf '%s\n%s\n%s\n' "$kind" "$actual_binary_hash" "$resource_hash" | sha256sum | cut -d' ' -f1)
+network_hash=
+if [[ -e $bundle/network-provider || -L $bundle/network-provider || -e $bundle/network-provider.sha256 || -L $bundle/network-provider.sha256 ]]; then
+    [[ -d $bundle/network-provider && ! -L $bundle/network-provider && -f $bundle/network-provider.sha256 && ! -L $bundle/network-provider.sha256 && -s $bundle/network-provider.sha256 ]] ||
+        fail "published network providers lack their directory or hash manifest: $bundle"
+    for component in accepted unix-guard; do
+        [[ -f $bundle/network-provider/$component/manifest.json && -s $bundle/network-provider/$component/manifest.json ]] ||
+            fail "published network provider lacks its manifest: $component"
+    done
+    [[ -z $(find "$bundle/network-provider" -type l -print -quit) ]] ||
+        fail "published network providers contain a symlink: $bundle"
+    generated=${generated:-$(mktemp)}
+    trap 'rm -f "$generated"' EXIT
+    tree_manifest "$bundle/network-provider" >"$generated"
+    cmp -s "$bundle/network-provider.sha256" "$generated" || fail "published network provider hash manifest does not match: $bundle"
+    network_hash=$(sha256sum "$bundle/network-provider.sha256" | cut -d' ' -f1)
+fi
+
+identity=$({ printf '%s\n%s\n%s\n' "$kind" "$actual_binary_hash" "$resource_hash"; if [[ -n $network_hash ]]; then printf '%s\n' "$network_hash"; fi; } | sha256sum | cut -d' ' -f1)
 [[ ${bundle##*/} == "$identity" ]] ||
     fail "content-addressed artifact identity mismatch: expected directory $identity, got ${bundle##*/}"
 printf '%s\n' "$bundle"

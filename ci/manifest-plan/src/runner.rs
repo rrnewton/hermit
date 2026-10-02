@@ -4323,6 +4323,20 @@ impl NetworkHttpDeployment {
         Self::from_paths(&paths)
     }
 
+    fn require_packages(hermit: &Path) -> Result<(), String> {
+        let packages = hermit.parent().ok_or("network HTTP Hermit path has no parent")?
+            .join("network-provider");
+        for component in ["accepted", "unix-guard"] {
+            let manifest = packages.join(component).join("manifest.json");
+            let metadata = fs::metadata(&manifest)
+                .map_err(|error| format!("network HTTP requires prepared {component} beside its verified Hermit artifact: {error}"))?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return Err(format!("network HTTP prepared {component} manifest is not a nonempty file"));
+            }
+        }
+        Ok(())
+    }
+
     fn apply(&self, spec: &mut CellRunSpec) -> Result<(), String> {
         let end = spec.argv.iter().position(|arg| arg == "--").ok_or("network run lacks guest separator")?;
         spec.argv.splice(end..end, self.args.clone());
@@ -4555,6 +4569,12 @@ fn run_cell_inner(
     let timeouts = cell_timeouts(context, cell)?;
     let deployment = cell.test.modes[&cell.id.mode].scenario
         .map(|_| NetworkHttpDeployment::from_env()).transpose()?;
+    if deployment.is_some() {
+        // The artifact wrapper verifies every package byte. Require both
+        // executable-relative packages here before preparing or starting the
+        // HTTP server; unrelated manifest cells need neither package.
+        NetworkHttpDeployment::require_packages(&context.hermit_bin)?;
+    }
     let preparation_deadline =
         execution_deadline_after_preparation(started, timeouts.wall_seconds)?;
     let binary_before = fs::read(&context.hermit_bin)
@@ -6039,6 +6059,68 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         assert!(wait_network_http_ready(&directory.path().join("missing"), &AtomicBool::new(true), Instant::now() + Duration::from_secs(1)).is_err());
         assert!(wait_network_http_ready(&directory.path().join("missing"), &AtomicBool::new(false), Instant::now()).is_err());
+    }
+
+    #[test]
+    fn network_http_artifact_snapshots_and_verifies_both_packages() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        fs::create_dir(root.join("ci")).unwrap();
+        for name in ["publish-hermit-e2e-artifact.sh", "verify-hermit-e2e-artifact.sh"] {
+            fs::copy(repo.join("ci").join(name), root.join("ci").join(name)).unwrap();
+            fs::set_permissions(root.join("ci").join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let binary = root.join("hermit");
+        // This fake binary is only snapshotted, never executed. These are
+        // artifact/launch-premise controls, not provider ABI or native tests.
+        fs::write(&binary, "#!/bin/sh\nexit 97\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let packages = root.join("prepared packages");
+        let ordinary = root.join("ordinary.path");
+        let network = root.join("network.path");
+        let publish = |provider: Option<&Path>, pointer: &Path| {
+            let mut command = Command::new("timeout");
+            command.args(["--kill-after=1s", "5s", "bash"])
+                .arg(root.join("ci/publish-hermit-e2e-artifact.sh"));
+            if let Some(provider) = provider { command.arg("--network-provider").arg(provider); }
+            command.arg(&binary).arg(root.join("bundles")).arg(pointer).output().unwrap()
+        };
+        let verify = |pointer: &Path| Command::new("timeout")
+            .args(["--kill-after=1s", "5s", "bash"])
+            .arg(root.join("ci/verify-hermit-e2e-artifact.sh")).arg(pointer).output().unwrap();
+        let output = publish(None, &ordinary);
+        assert!(output.status.success(), "{output:?}");
+        let ordinary_bundle = PathBuf::from(fs::read_to_string(&ordinary).unwrap().trim());
+        assert_eq!(ordinary_bundle.file_name().unwrap().to_str().unwrap(),
+            hex_digest(format!("binary-only\n{}\nnone\n", hex_digest(&fs::read(&binary).unwrap())).as_bytes()));
+        assert!(NetworkHttpDeployment::require_packages(&ordinary_bundle.join("hermit")).is_err());
+        assert!(!publish(Some(&packages), &network).status.success());
+        assert!(!network.exists());
+        for component in ["accepted", "unix-guard"] {
+            fs::create_dir_all(packages.join(component)).unwrap();
+            fs::write(packages.join(component).join("manifest.json"), "{}\n").unwrap();
+            fs::write(packages.join(component).join("provider.bpf.o"), component).unwrap();
+            if component == "accepted" {
+                assert!(!publish(Some(&packages), &network).status.success());
+                assert!(!network.exists());
+            }
+        }
+        let output = publish(Some(&packages), &network);
+        assert!(output.status.success(), "{output:?}");
+        let bundle = PathBuf::from(fs::read_to_string(&network).unwrap().trim());
+        assert_ne!(bundle, ordinary_bundle);
+        NetworkHttpDeployment::require_packages(&bundle.join("hermit")).unwrap();
+        for component in ["accepted", "unix-guard"] {
+            assert_eq!(fs::read(bundle.join("network-provider").join(component).join("provider.bpf.o")).unwrap(), component.as_bytes());
+        }
+        fs::write(packages.join("accepted/provider.bpf.o"), "later mutable build").unwrap();
+        assert!(verify(&network).status.success());
+        fs::write(bundle.join("network-provider/accepted/provider.bpf.o"), "corruption").unwrap();
+        let corrupt = verify(&network);
+        assert!(!corrupt.status.success());
+        assert!(String::from_utf8_lossy(&corrupt.stderr).contains("network provider hash manifest does not match"));
+        assert!(verify(&ordinary).status.success());
     }
 
     fn network_log_report() -> LogDiffReport {

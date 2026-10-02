@@ -37,8 +37,15 @@ function require_complete_resources {
     done
 }
 
+source_network_provider=
+if [[ ${1:-} == --network-provider ]]; then
+    [[ $# -ge 2 ]] || fail "--network-provider requires its prepared package directory"
+    source_network_provider=$2
+    [[ -n $source_network_provider ]] || fail "prepared package directory is empty"
+    shift 2
+fi
 [[ $# == 3 || $# == 4 ]] ||
-    fail "usage: $0 SOURCE-BINARY BUNDLE-ROOT POINTER [SOURCE-INSTALL-DIR]"
+    fail "usage: $0 [--network-provider PREPARED-PACKAGES] SOURCE-BINARY BUNDLE-ROOT POINTER [SOURCE-INSTALL-DIR]"
 source_binary=$1
 bundle_root=$2
 pointer=$3
@@ -92,7 +99,26 @@ if [[ $kind == complete ]]; then
     resource_hash=$(sha256sum "$stage/resources.sha256" | cut -d' ' -f1)
 fi
 
-identity=$(printf '%s\n%s\n%s\n' "$kind" "$published_binary_hash" "$resource_hash" | sha256sum | cut -d' ' -f1)
+network_hash=
+if [[ -n $source_network_provider ]]; then
+    for component in accepted unix-guard; do
+        [[ -s $source_network_provider/$component/manifest.json && -f $source_network_provider/$component/manifest.json ]] ||
+            fail "prepared network provider is missing its manifest: $source_network_provider/$component"
+    done
+    tree_manifest "$source_network_provider" >"$before_manifest"
+    mkdir -p "$stage/network-provider"
+    cp -aL "$source_network_provider/." "$stage/network-provider/"
+    tree_manifest "$source_network_provider" >"$after_manifest"
+    cmp -s "$before_manifest" "$after_manifest" || fail "prepared network providers changed during publication"
+    tree_manifest "$stage/network-provider" >"$stage/network-provider.sha256"
+    cmp -s "$before_manifest" "$stage/network-provider.sha256" || fail "published network providers differ from prepared bytes"
+    [[ -z $(find "$stage/network-provider" -type l -print -quit) ]] ||
+        fail "published network providers retained a symlink instead of an immutable copy"
+    network_hash=$(sha256sum "$stage/network-provider.sha256" | cut -d' ' -f1)
+fi
+
+# Preserve the established identity of artifacts without provider packages.
+identity=$({ printf '%s\n%s\n%s\n' "$kind" "$published_binary_hash" "$resource_hash"; if [[ -n $network_hash ]]; then printf '%s\n' "$network_hash"; fi; } | sha256sum | cut -d' ' -f1)
 published="$bundle_root/$identity"
 if [[ -e $published ]]; then
     "$VERIFY" "$published" >/dev/null

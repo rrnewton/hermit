@@ -180,6 +180,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "e2e.manifest_util_c",
     "e2e.manifest_util_c_on_host",
     "privileged-e2e.manifest_applications",
+    "privileged-e2e.network_http_on_host",
     "privileged-e2e.manifest_backend_parity_c",
     "privileged-only-e2e.manifest_applications",
     "privileged-only-e2e.manifest_applications_on_host",

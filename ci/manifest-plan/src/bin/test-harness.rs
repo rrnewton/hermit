@@ -3998,7 +3998,20 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .iter()
                 .filter(|step| command_runs_exactly(&step.cmd, &inner))
                 .collect::<Vec<_>>();
-            assert_eq!(matches.len(), 2, "{lane}: host and pinned build commands");
+            let expected = if lane == "privileged" {
+                // The required HTTP cell now uses the existing host producer;
+                // KVM retains both original source/pinned build definitions.
+                vec![
+                    "privileged-build.manifest_guests",
+                    "privileged-build.manifest_guests_in_pinned_root",
+                    "privileged-build.manifest_guests_on_host",
+                ]
+            } else {
+                vec!["build.manifest_guests", "build.manifest_guests_in_pinned_root"]
+            };
+            assert_eq!(matches.iter().map(|step| step.tag()).collect::<std::collections::BTreeSet<_>>(),
+                expected.into_iter().map(str::to_owned).collect::<std::collections::BTreeSet<_>>(),
+                "{lane}: exact source, pinned and selected host build commands");
             let pinned = matches
                 .iter()
                 .find(|step| step.cmd.starts_with(PINNED_COMMAND_PREFIX))

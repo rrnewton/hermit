@@ -9311,10 +9311,11 @@
       "labels": [
         "full"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --test applications/kvm-shell-environment --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
       "manifest": {
         "lane": "privileged",
-        "category": "applications"
+        "category": "applications",
+        "test": "applications/kvm-shell-environment"
       },
       "result_manifests": [
         {
@@ -9323,13 +9324,6 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "applications",
-          "test": "applications/network-only-curl-http",
-          "mode": "custom",
-          "backend": "ptrace"
         },
         {
           "kind": "structured-test-results",
@@ -13750,10 +13744,11 @@
       "labels": [
         "privileged"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --test applications/kvm-shell-environment --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
       "manifest": {
         "lane": "privileged",
-        "category": "applications"
+        "category": "applications",
+        "test": "applications/kvm-shell-environment"
       },
       "result_manifests": [
         {
@@ -13762,13 +13757,6 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "applications",
-          "test": "applications/network-only-curl-http",
-          "mode": "custom",
-          "backend": "ptrace"
         },
         {
           "kind": "structured-test-results",
@@ -21501,7 +21489,7 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-host-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged",
       "result_manifests": [],
       "deps": [
         "gate.manifest_on_host",
@@ -21687,10 +21675,11 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --test applications/kvm-shell-environment --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"",
       "manifest": {
         "lane": "privileged",
-        "category": "applications"
+        "category": "applications",
+        "test": "applications/kvm-shell-environment"
       },
       "result_manifests": [
         {
@@ -21699,13 +21688,6 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "applications",
-          "test": "applications/network-only-curl-http",
-          "mode": "custom",
-          "backend": "ptrace"
         },
         {
           "kind": "structured-test-results",
@@ -21721,7 +21703,9 @@
         "privileged-only-build.privileged_tests_on_host",
         "setup.manifest_plan_on_host"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_E2E_ARTIFACT_POINTER": "target/ci/hermit-host-e2e-artifact.path"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -21789,7 +21773,9 @@
         "privileged-only-build.privileged_tests_on_host",
         "setup.manifest_plan_on_host"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_E2E_ARTIFACT_POINTER": "target/ci/hermit-host-e2e-artifact.path"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -69709,6 +69695,161 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "compat.free_on_host"
+    },
+    {
+      "group": "build",
+      "job": "network_http_accepted_on_host",
+      "desc": "Prepare existing offline accepted provider for HTTP",
+      "description": "Existing offline package action only; does not load/attach BPF or run helpers. Retains its 120-second deadline and refuses stale or failed output rather than replacing it.",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./hermit-cli/network-provider/package.rs --component accepted --source-dir \"$PWD/hermit-cli/network-provider\" --output-dir \"$VALIDATE_RUN_STATE/network-http-provider/accepted\"",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts_on_host",
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 120,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20.0,
+        "rss_baseline_bytes": 536870912,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.network_http_accepted_on_host"
+    },
+    {
+      "group": "build",
+      "job": "network_http_unix_guard_on_host",
+      "desc": "Prepare existing offline unix-guard provider for HTTP",
+      "description": "Existing offline package action only; does not load/attach BPF or run helpers. Retains its 120-second deadline and refuses stale or failed output rather than replacing it.",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./hermit-cli/network-provider/package.rs --component unix-guard --source-dir \"$PWD/hermit-cli/network-provider\" --output-dir \"$VALIDATE_RUN_STATE/network-http-provider/unix-guard\"",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts_on_host",
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 120,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20.0,
+        "rss_baseline_bytes": 536870912,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.network_http_unix_guard_on_host"
+    },
+    {
+      "group": "build",
+      "job": "network_http_artifact_on_host",
+      "desc": "Snapshot the verified host CLI with both prepared network providers",
+      "description": "Consumes the existing verified host CLI artifact and explicit offline provider outputs; publishes a separate HTTP-only pointer through the ordinary snapshot/hash mechanism. BOUND MEASURED 2026-10-02: the real 628-MB CLI plus accepted and unix-guard packages published and verified in 3.49 seconds under a 20-second outer bound (16.51 seconds observed headroom). This is snapshot-workload evidence, not provider ABI or HTTP qualification. Existing publishers, package compile deadlines and the 2160-second privileged launcher are unchanged.",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; bundle=$(./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-host-e2e-artifact.path) && ./ci/publish-hermit-e2e-artifact.sh --network-provider \"$VALIDATE_RUN_STATE/network-http-provider\" \"$bundle/hermit\" target/ci/hermit-e2e-artifacts target/ci/hermit-network-e2e-artifact.path",
+      "result_manifests": [],
+      "deps": [
+        "build.network_http_accepted_on_host",
+        "build.network_http_unix_guard_on_host",
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-only-build.privileged_tests_on_host"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 20,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20.0,
+        "rss_baseline_bytes": 536870912,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.network_http_artifact_on_host"
+    },
+    {
+      "group": "privileged-e2e",
+      "job": "network_http_on_host",
+      "desc": "Host-managed provider: required HTTP Record/offline Replay cell",
+      "description": "Uses the existing host privileged launcher, verified CLI/provider snapshot and externally provisioned deployment roots. Only this HTTP cell leaves the pinned root; CPU/wall/output/comparison limits and the required cell population are unchanged.",
+      "labels": [
+        "full",
+        "privileged",
+        "hosted-privileged"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --test applications/network-only-curl-http --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/network_http/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/network_http/junit.xml\"",
+      "manifest": {
+        "lane": "privileged",
+        "category": "applications",
+        "test": "applications/network-only-curl-http"
+      },
+      "result_manifests": [
+        {
+          "lane": "privileged",
+          "category": "applications",
+          "test": "applications/network-only-curl-http",
+          "mode": "custom",
+          "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-e2e.network_http_on_host"
+        }
+      ],
+      "deps": [
+        "build.network_http_artifact_on_host",
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-build.manifest_guests_on_host",
+        "privileged-only-build.privileged_tests_on_host",
+        "setup.manifest_plan_on_host"
+      ],
+      "env": {
+        "HERMIT_E2E_ARTIFACT_POINTER": "target/ci/hermit-network-e2e-artifact.path"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 90.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-e2e.network_http_on_host"
     },
     {
       "group": "setup",
