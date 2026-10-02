@@ -1032,6 +1032,47 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_states_what_the_defaults_actually_are() {
+        let mut command = command_without_epoch_env();
+        // Compare whitespace-normalized text so terminal wrapping cannot matter.
+        let help = command
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The old text promised identical output with no epoch caveat, said
+        // networking was disallowed, and named a ~/.hermit store nothing uses.
+        for stale in [
+            "networking is disallowed",
+            "bitwise identical",
+            "~/.hermit",
+            "content addressible",
+        ] {
+            assert!(!help.contains(stale), "stale claim {stale:?} in:\n{help}");
+        }
+        for claim in [
+            "functions of their controlled inputs",
+            "`hermit run` starts it at the host's current time",
+            "--epoch=2026-01-01T00:00:00Z",
+            "By default (`--network=local`)",
+            "only a loopback interface",
+            "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
+            "`--data-dir` or `HERMIT_DATA_DIR`",
+        ] {
+            assert!(help.contains(claim), "missing {claim:?} in:\n{help}");
+        }
+
+        // The help names `local` as the default; keep that tied to the parser.
+        let run = command.find_subcommand_mut("run").unwrap();
+        let network = run
+            .get_arguments()
+            .find(|arg| arg.get_id() == "network")
+            .expect("run --network");
+        assert_eq!(network.get_default_values(), ["local"]);
+    }
+
+    #[test]
     fn run_epoch_environment_and_cli_precedence() {
         const CHILD: &str = "HERMIT_EPOCH_PRECEDENCE_TEST_CHILD";
         const ENV_EPOCH: &str = "2000-12-31T23:59:59.123456789Z";

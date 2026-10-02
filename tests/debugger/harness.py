@@ -226,8 +226,8 @@ def record(hermit: Path, guest: Path, data_dir: Path) -> str:
     out = r.stdout.decode(errors="replace")
     if r.returncode != 0:
         raise RuntimeError(f"hermit record failed:\n{out}")
-    # Output contains: "hermit replay <32-hex-id>"
-    m = re.search(r"hermit replay\s+([0-9a-f]{16,})", out)
+    # Output contains "hermit replay [--autopilot] [--data-dir=DIR] <32-hex-id>".
+    m = re.search(r"hermit replay(?:\s+-\S+)*\s+([0-9a-f]{16,})", out)
     if not m:
         raise RuntimeError(f"could not parse recording id from:\n{out}")
     return m.group(1)

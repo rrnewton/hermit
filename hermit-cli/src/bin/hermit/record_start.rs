@@ -530,12 +530,16 @@ impl StartOpts {
             )?;
             let recording = hermit.commit_recording(data, exit_status)?;
 
-            eprintln!(
-                "\n{message}:\n\n    {command} {id}\n",
-                message = "RECORDING COMPLETE! To replay, run".yellow().bold(),
-                command = "hermit replay".blue().bold(),
-                id = recording.id.to_string().bold()
-            );
+            eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
+            for (label, command) in
+                replay_hint_commands(&recording.id.to_string(), self.data_dir.as_deref())
+            {
+                eprintln!(
+                    "{}:\n\n    {}\n",
+                    label.yellow().bold(),
+                    command.blue().bold()
+                );
+            }
 
             Ok(recording.exit_status)
         }
@@ -800,9 +804,71 @@ impl StartOpts {
     }
 }
 
+/// The replay commands offered after a successful `hermit record start`, as
+/// `(label, command)` pairs in the order they are printed.
+///
+/// Plain playback comes first because a bare `hermit replay` starts an
+/// interactive GDB session (see `ReplayOpts::main`), which is a debugging
+/// tool, not the way to watch a recording run again. `--autopilot` replays to
+/// the end without a debugger. A recording made with `--data-dir` (or
+/// `HERMIT_DATA_DIR`) is only found by a replay given the same directory, so
+/// the directory is repeated in both commands.
+fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 2] {
+    let data_dir = data_dir.map_or_else(String::new, |dir| {
+        format!(" --data-dir={}", shell_words::quote(&dir.to_string_lossy()))
+    });
+    [
+        (
+            "To replay it to the end",
+            format!("hermit replay --autopilot{data_dir} {id}"),
+        ),
+        (
+            "To replay it under GDB for debugging",
+            format!("hermit replay{data_dir} {id}"),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_hint_offers_plain_playback_before_the_gdb_session() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let [(plain_label, plain), (gdb_label, gdb)] = replay_hint_commands(id, None);
+        assert_eq!(plain, format!("hermit replay --autopilot {id}"));
+        assert_eq!(plain_label, "To replay it to the end");
+        assert_eq!(gdb, format!("hermit replay {id}"));
+        assert!(gdb_label.contains("GDB"), "{gdb_label}");
+
+        let [(_, plain), (_, gdb)] =
+            replay_hint_commands(id, Some(Path::new("/data/my recordings")));
+        assert_eq!(
+            plain,
+            format!("hermit replay --autopilot --data-dir='/data/my recordings' {id}")
+        );
+        assert_eq!(
+            gdb,
+            format!("hermit replay --data-dir='/data/my recordings' {id}")
+        );
+
+        // Both offered commands must parse as real `hermit replay` invocations,
+        // and only the plain one may select autopilot (no GDB).
+        use clap::CommandFactory;
+        for (command, autopilot) in [(&plain, true), (&gdb, false)] {
+            let matches = crate::Args::command()
+                .try_get_matches_from(shell_words::split(command).unwrap())
+                .unwrap_or_else(|e| panic!("{command}: {e}"));
+            let replay = matches.subcommand_matches("replay").expect(command);
+            assert_eq!(replay.get_flag("autopilot"), autopilot, "{command}");
+            assert_eq!(
+                replay.get_one::<PathBuf>("data_dir"),
+                Some(&PathBuf::from("/data/my recordings")),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn replay_report_is_published_before_success_is_announced() {
