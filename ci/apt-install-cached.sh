@@ -19,12 +19,16 @@
 #
 #   prepare  Create the runner-owned archive directory and print the cache key:
 #            the runner image (ImageOS, ImageVersion), the dpkg architecture,
-#            and a hash of the sorted, de-duplicated package list.
+#            a hash of the sorted, de-duplicated package list, and a hash of
+#            this script (see cache_key).
 #   install  CACHE HIT: install exactly the restored .deb files with
 #            `--no-download`, then confirm every requested package is
 #            installed. No mirror is contacted at all, not even for
-#            `apt-get update`. If that fails for any reason, fall back to the
-#            miss path below rather than failing the job.
+#            `apt-get update`. A hit whose archive is empty because the image
+#            already had every requested package installs nothing. If the hit
+#            cannot be used for any reason, warn with the remedy (see
+#            unusable_hit_warning) and fall back to the miss path below rather
+#            than failing the job.
 #            CACHE MISS: `apt-get update`, then `apt-get install --download-only`
 #            into the archive directory, each under its own per-attempt timeout.
 #            If either fails, the attempt is retried from `update`, so a
@@ -75,7 +79,10 @@ set -uo pipefail
 # workspace: apt fetches as the unprivileged `_apt` user, which must be able to
 # traverse every parent directory, and the workspace is wiped by checkout.
 : "${HERMIT_APT_CACHE_ROOT:=/var/cache/hermit-ci-apt}"
-# Bump to invalidate every saved archive if the directory layout changes.
+# Bump to invalidate every saved archive at once, for example to evict a
+# broken entry without deleting it by hand. Editing this script for any other
+# reason (apt-get options, archive layout) already changes every key, because
+# cache_key hashes the script itself.
 readonly KEY_VERSION=v1
 
 die() {
@@ -115,8 +122,14 @@ read_packages() {
     (( ${#PACKAGES[@]} > 0 )) || die "APT_PACKAGES is empty"
 }
 
+# The key names everything that decides which .deb files a miss downloads: the
+# runner image, the architecture, the package list, and this script, whose
+# apt-get options and archive layout shape the saved closure. Hashing the script
+# means an edit to those options starts fresh entries instead of letting hit
+# jobs install a closure built under the old options while miss jobs build a
+# different one.
 cache_key() {
-    local image_os=${ImageOS:-} image_version=${ImageVersion:-unknown} arch list_hash
+    local image_os=${ImageOS:-} image_version=${ImageVersion:-unknown} arch list_hash script_hash
     if [[ -z $image_os ]]; then
         # GitHub's hosted images export ImageOS and ImageVersion. Elsewhere
         # (the self-test) fall back to os-release so the key still names an OS.
@@ -126,7 +139,10 @@ cache_key() {
     fi
     arch=$(dpkg --print-architecture 2>/dev/null) || arch=$(uname -m)
     list_hash=$(printf '%s\n' "${PACKAGES[@]}" | sha256sum | cut -c1-16) || return 1
-    printf 'apt-debs-%s-%s-%s-%s-%s\n' "$KEY_VERSION" "$image_os" "$image_version" "$arch" "$list_hash"
+    script_hash=$(sha256sum <"${BASH_SOURCE[0]}" | cut -c1-8) || return 1
+    [[ $script_hash =~ ^[0-9a-f]{8}$ ]] || return 1
+    printf 'apt-debs-%s-%s-%s-%s-%s-s%s\n' "$KEY_VERSION" "$image_os" "$image_version" "$arch" \
+        "$list_hash" "$script_hash"
 }
 
 emit_output() {
@@ -194,6 +210,19 @@ missing_packages() {
     done
 }
 
+# unusable_hit_warning <title> <what went wrong>
+#
+# An exact hit that cannot be used is never replaced by itself: the save step
+# skips hits, and an entry is immutable for its key and branch scope. Every
+# later job on the key would repeat the fallback, and pay the mirror again,
+# until the runner image rotates. So the warning names the key and the two ways
+# to clear it.
+unusable_hit_warning() {
+    local key
+    key=$(cache_key) || key='(key unavailable)'
+    echo "::warning title=$1::$2; falling back to the mirror. Cache entries are immutable, so every job on key $key will repeat this fallback until the key changes: delete the entry (gh cache delete $key${GITHUB_REPOSITORY:+ --repo $GITHUB_REPOSITORY}) or bump KEY_VERSION in ci/apt-install-cached.sh."
+}
+
 # Cache hit: install exactly the restored files. Never contacts a mirror.
 install_from_archive() {
     local dir=$1 rc missing
@@ -203,12 +232,14 @@ install_from_archive() {
     rc=0
     sudo apt-get install -y --no-download -o "Dir::Cache::Archives=$dir/" "${debs[@]}" || rc=$?
     if (( rc != 0 )); then
-        echo "::warning title=apt cache not usable::installing the ${#debs[@]} restored .deb files failed (exit $rc); falling back to the mirror. apt's output is above."
+        unusable_hit_warning "apt cache not usable" \
+            "installing the ${#debs[@]} restored .deb files failed (exit $rc; apt's output is above)"
         return "$rc"
     fi
     missing=$(missing_packages)
     if [[ -n $missing ]]; then
-        echo "::warning title=apt cache incomplete::the restored .deb files did not install: $(tr '\n' ' ' <<<"$missing"); falling back to the mirror."
+        unusable_hit_warning "apt cache incomplete" \
+            "the restored .deb files did not install: $(tr '\n' ' ' <<<"$missing")"
         return 1
     fi
 }
@@ -268,7 +299,7 @@ seal_archive() {
 }
 
 install_main() {
-    local dir started t0 rc=0 path before_n before_b after_n after_b
+    local dir started t0 rc=0 path missing before_n before_b after_n after_b
     check_numbers
     read_packages
     dir=$(archive_dir) || exit 2
@@ -284,6 +315,22 @@ install_main() {
             path=cache
             INSTALL_SECONDS=$(( SECONDS - t0 ))
         else
+            path=mirror-after-unusable-cache
+            install_from_mirror "$dir" || rc=$?
+        fi
+    elif [[ ${APT_CACHE_HIT:-} == true ]]; then
+        # An empty archive under an exact key: the job that saved it downloaded
+        # nothing, which on the same image means every requested package was
+        # already installed at its candidate version. When that holds here too
+        # (checked, not assumed) there is nothing to install and no reason to
+        # contact the mirror. When it does not, the entry is broken in a way
+        # the save step will never repair, so say so and take the miss path.
+        missing=$(missing_packages)
+        if [[ -z $missing ]]; then
+            path=cache-preinstalled
+        else
+            unusable_hit_warning "apt cache empty" \
+                "the restored archive has no .deb files but these packages are not installed: $(tr '\n' ' ' <<<"$missing")"
             path=mirror-after-unusable-cache
             install_from_mirror "$dir" || rc=$?
         fi
