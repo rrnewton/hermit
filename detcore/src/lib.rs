@@ -2441,56 +2441,35 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
+                // Without virtual time the guest reads the host clock. Each of these
+                // must have a record/replay handler: a recording captures the value
+                // the guest observed, and replay returns it without reading the host.
                 Syscall::Gettimeofday(s) => {
                     if virtualize_time {
                         self.handle_gettimeofday(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
-                        .await
+                        self.passthrough(guest, call).await
                     }
                 }
                 Syscall::Time(s) => {
                     if virtualize_time {
                         self.handle_time(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
-                        .await
+                        self.passthrough(guest, call).await
                     }
                 }
                 Syscall::ClockGettime(s) => {
                     if virtualize_time {
                         self.handle_clock_gettime(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
-                        .await
+                        self.passthrough(guest, call).await
                     }
                 }
                 Syscall::ClockGetres(s) => {
                     if virtualize_time {
                         self.handle_clock_getres(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
-                        .await
+                        self.passthrough(guest, call).await
                     }
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED

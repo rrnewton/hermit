@@ -489,6 +489,7 @@ impl Tool for Replayer {
                     .await
             }
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
+            Syscall::ClockGetres(syscall) => self.handle_clock_getres(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,

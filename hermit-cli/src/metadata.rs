@@ -149,7 +149,12 @@ impl RecordVersion {
 // instant rather than from the clock minus uptime. Detcore recomputes these
 // fields over the recorded procfs bytes during recording and replay, so an older
 // stream replayed under the new projection could show the guest different bytes.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11c);
+// 0x11c -> 0x11d: with time not virtualized, which is always the case for
+// record/replay, detcore passes clock reads to record/replay instead of refusing
+// them. Streams now carry Timespec and Timeofday events for clock_gettime,
+// gettimeofday and time, and clock_getres gains a recorder event (Timespec, or
+// Return for a NULL `res`). An older reader would desynchronize on these events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -174,7 +179,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

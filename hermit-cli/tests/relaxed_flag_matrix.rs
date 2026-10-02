@@ -41,7 +41,6 @@ struct Configuration {
     name: String,
     args: Vec<&'static str>,
     verify: bool,
-    strict_without_virtual_time: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -131,8 +130,6 @@ fn matrix_configurations() -> Vec<Configuration> {
                                 ),
                                 args,
                                 verify,
-                                strict_without_virtual_time: strict
-                                    && matches!(time_metadata, TimeMetadata::Neither),
                             });
                         }
                     }
@@ -146,19 +143,16 @@ fn matrix_configurations() -> Vec<Configuration> {
             name: "strace-only_verify-off".to_owned(),
             args: vec!["run", "--strace-only"],
             verify: false,
-            strict_without_virtual_time: false,
         },
         Configuration {
             name: "strace-only_verify-on".to_owned(),
             args: vec!["run", "--strace-only", "--verify"],
             verify: true,
-            strict_without_virtual_time: false,
         },
         Configuration {
             name: "namespace-only_verify-off".to_owned(),
             args: vec!["run", "--namespace-only"],
             verify: false,
-            strict_without_virtual_time: false,
         },
     ]);
     configurations
@@ -298,18 +292,7 @@ fn run_case(configuration: &Configuration, program: Program<'_>) -> (String, u12
         );
     }
 
-    // https://github.com/rrnewton/hermit/issues/1176: strict mode currently
-    // turns the opted-out clock syscall into an opaque container exit. Keep
-    // the waiver pinned to the exact configuration, workload, and signature.
-    let known_issue_1176 = configuration.strict_without_virtual_time
-        && program.name == "threaded-observation"
-        && !output.status.success()
-        && combined.contains("Sandbox container exited unexpectedly")
-        && (configuration.verify || combined.contains("inbound syscall: clock_gettime"));
-
-    let outcome = if known_issue_1176 {
-        "expected-failure-1176"
-    } else if output.status.success() {
+    let outcome = if output.status.success() {
         if configuration.verify {
             assert!(
                 combined.contains(DETERMINISM_MARKER),
@@ -458,7 +441,6 @@ fn meaningful_flag_combinations_run_without_crashing() {
     let mut deterministic = 0;
     let mut nondeterministic = 0;
     let mut completed = 0;
-    let mut expected_failure_1176 = 0;
     for configuration in &configurations {
         for program in programs {
             let (outcome, elapsed_ms) = run_case(configuration, program);
@@ -466,7 +448,6 @@ fn meaningful_flag_combinations_run_without_crashing() {
                 "deterministic" => deterministic += 1,
                 "nondeterministic" => nondeterministic += 1,
                 "completed" => completed += 1,
-                "expected-failure-1176" => expected_failure_1176 += 1,
                 unexpected => panic!("unexpected matrix outcome {unexpected}"),
             }
             writeln!(
@@ -480,14 +461,9 @@ fn meaningful_flag_combinations_run_without_crashing() {
     }
 
     let total = deterministic + nondeterministic + completed;
-    assert_eq!(expected_failure_1176, 4, "update issue #1176 expectations");
-    assert_eq!(
-        total + expected_failure_1176,
-        configurations.len() * programs.len()
-    );
+    assert_eq!(total, configurations.len() * programs.len());
     println!(
-        "flag matrix: {} cases classified (completed={completed}, deterministic={deterministic}, explicit-nondeterminism={nondeterministic}, expected-failure-1176={expected_failure_1176}); report={}",
-        total + expected_failure_1176,
+        "flag matrix: {total} cases classified (completed={completed}, deterministic={deterministic}, explicit-nondeterminism={nondeterministic}); report={}",
         path.display(),
     );
 }

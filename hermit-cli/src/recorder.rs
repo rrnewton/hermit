@@ -437,6 +437,7 @@ impl Tool for Recorder {
             Sysno::socket,
             Sysno::pidfd_getfd,
             Sysno::clock_gettime,
+            Sysno::clock_getres,
             Sysno::gettimeofday,
             Sysno::settimeofday,
             Sysno::time,
@@ -570,6 +571,7 @@ impl Tool for Recorder {
             // the fd side effect was neither recorded nor replayed.
             Syscall::PidfdOpen(_) => self.handle_simple(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
+            Syscall::ClockGetres(syscall) => self.handle_clock_getres(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,

@@ -260,8 +260,8 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
     use reverie::syscalls::Sysno::*;
     Some(match sysno {
         close | fchdir | dup | time | unlink => 1,
-        access | stat | fstat | lstat | dup2 | clock_gettime | gettimeofday | settimeofday
-        | mkdir | statfs | fstatfs | ftruncate | kill | listen | rt_sigpending => 2,
+        access | stat | fstat | lstat | dup2 | clock_gettime | clock_getres | gettimeofday
+        | settimeofday | mkdir | statfs | fstatfs | ftruncate | kill | listen | rt_sigpending => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
         | readlink | unlinkat | open | execve | close_range | tgkill => 3,
