@@ -13639,6 +13639,8 @@ pub enum NetworkFdInstallKind {
     RegularReplacement,
     /// Original accepted-child installation, bound to the same accept receipt.
     Accept,
+    /// Both nonnetwork endpoints from one successful native pipe/pipe2.
+    PipePair,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Exact confirmed physical effect associated with one local installation.

@@ -23,10 +23,27 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 | reverie::syscalls::FcntlCmd::F_GETFD
                 | reverie::syscalls::FcntlCmd::F_SETFL(_)
         ),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3464): These two output-only terminal queries
+        // retain handle_ioctl's ordinary syscall/output/error path. Neither
+        // changes descriptor flags or consumes/transmits network data. Do not
+        // admit arbitrary ioctl commands, including descriptor/control changes.
+        // https://github.com/rrnewton/hermit/pull/3464
+        Syscall::Ioctl(ioctl) => matches!(
+            ioctl.request(),
+            reverie::syscalls::ioctl::Request::TCGETS(_)
+                | reverie::syscalls::ioctl::Request::TIOCGWINSZ(_)
+        ),
         _ => matches!(
             call.number(),
             Sysno::read | Sysno::pread64 | Sysno::write | Sysno::close
                 | Sysno::dup | Sysno::dup2 | Sysno::dup3
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-3464): Pipe uses one original physical
+                // table transaction, checked native FIFO endpoints and a
+                // complete two-result publication. Socketpair is not implied.
+                // https://github.com/rrnewton/hermit/pull/3464
+                | Sysno::pipe | Sysno::pipe2
                 | Sysno::connect | Sysno::bind | Sysno::listen
                 | Sysno::accept | Sysno::accept4 | Sysno::shutdown
                 | Sysno::getsockname | Sysno::getpeername
@@ -39,6 +56,14 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 // or consumes network data, so no installation join is needed.
                 // https://github.com/rrnewton/hermit/pull/3464
                 | Sysno::statfs | Sysno::fstatfs
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-3464): Preserve handle_getdents64's
+                // strict metadata sorting/inode virtualization, guest copy,
+                // directory offset, EOF and Linux errors. This reads an
+                // existing directory; it does not install descriptors or
+                // consume/transmit a network stream.
+                // https://github.com/rrnewton/hermit/pull/3464
+                | Sysno::getdents64
                 | Sysno::brk | Sysno::mmap | Sysno::mprotect | Sysno::munmap
                 | Sysno::madvise | Sysno::arch_prctl
                 | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::rt_sigreturn
@@ -94,8 +119,6 @@ mod tests {
             Sysno::open,
             Sysno::openat2,
             Sysno::creat,
-            Sysno::pipe,
-            Sysno::pipe2,
             Sysno::socketpair,
             Sysno::recvmsg,
             Sysno::recvmmsg,
@@ -156,11 +179,72 @@ mod tests {
         }
     }
     #[test]
+    fn initial_record_admits_existing_directory_read_without_other_fd_creators() {
+        assert!(initial_record_call_supported(raw(Sysno::getdents64)));
+        // Classification leaves bad descriptors/pointers and buffer sizes to
+        // the unchanged ordinary handler rather than manufacturing a result.
+        assert!(initial_record_call_supported(Syscall::from_raw(
+            Sysno::getdents64,
+            reverie::syscalls::SyscallArgs::new(usize::MAX, 0, 0, 0, 0, 0),
+        )));
+        for number in [
+            Sysno::getdents,
+            Sysno::openat2,
+            Sysno::creat,
+            Sysno::eventfd2,
+        ] {
+            assert!(!initial_record_call_supported(raw(number)), "{number:?}");
+        }
+    }
+    #[test]
+    fn initial_record_admits_only_exact_terminal_query_ioctls() {
+        let ioctl = |request, fd, address| {
+            Syscall::from_raw(
+                Sysno::ioctl,
+                reverie::syscalls::SyscallArgs::new(fd, request, address, 0, 0, 0),
+            )
+        };
+        for request in [libc::TCGETS, libc::TIOCGWINSZ] {
+            for (fd, address) in [(0, 4096), (1, 8192), (usize::MAX, 0)] {
+                assert!(initial_record_call_supported(ioctl(
+                    request as usize,
+                    fd,
+                    address,
+                )));
+            }
+        }
+        // Neighboring setters, FD flag/allocator operations, other observations
+        // and unknown commands remain refused even with a valid-looking pointer.
+        for request in [
+            0,
+            libc::TCSETS,
+            libc::TIOCSWINSZ,
+            libc::FIONBIO,
+            libc::FIOCLEX,
+            libc::FIONCLEX,
+            libc::FIONREAD,
+            0x5441, // TIOCGPTPEER installs a new descriptor.
+            0xffff_ffff,
+        ] {
+            assert!(
+                !initial_record_call_supported(ioctl(request as usize, 1, 4096)),
+                "ioctl request {request:#x}",
+            );
+        }
+    }
+    #[test]
     fn initial_record_admits_exactly_joined_descriptor_aliases() {
         for number in [Sysno::dup, Sysno::dup2, Sysno::dup3] {
             assert!(initial_record_call_supported(raw(number)), "{number:?}");
         }
-        for number in [Sysno::pipe, Sysno::pipe2, Sysno::socketpair] {
+        assert!(!initial_record_call_supported(raw(Sysno::socketpair)));
+    }
+    #[test]
+    fn initial_record_admits_only_joined_pipe_pair_creators() {
+        for number in [Sysno::pipe, Sysno::pipe2] {
+            assert!(initial_record_call_supported(raw(number)), "{number:?}");
+        }
+        for number in [Sysno::socketpair, Sysno::eventfd2, Sysno::recvmsg] {
             assert!(!initial_record_call_supported(raw(number)), "{number:?}");
         }
     }

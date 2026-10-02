@@ -1588,6 +1588,42 @@ impl FileMetadata {
         })
     }
 
+    /// Called while the original pipe's pre-call table permit remains held.
+    /// A returned number is not permission to overwrite an existing slot.
+    pub(crate) fn validate_fresh_pipe_fds(&self, fds: [i32; 2]) -> Result<(), Error> {
+        if !self.track_network_lifetime
+            || !self.pending_network_installations.is_empty()
+            || fds[0] < 0
+            || fds[1] < 0
+            || fds[0] == fds[1]
+            || fds.iter().any(|fd| self.file_handles.contains_key(fd))
+        {
+            return Err(fd_publication_error(
+                "pipe outputs are not two fresh protected slots",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_pipe_installations(
+        &self,
+        changes: &[NetworkFdSlotReplacement; 2],
+    ) -> Result<(), Error> {
+        if self.pending_network_installations.as_slice() != changes.as_slice()
+            || changes.iter().any(|change| {
+                change.after.is_none_or(|after| {
+                    self.descriptor_binding(after.binding.slot.fd).ok() != Some(after.binding)
+                        || self.file_handles[&after.binding.slot.fd].ty() != FdType::Pipe
+                })
+            })
+        {
+            return Err(fd_publication_error(
+                "pipe pair differs from exact local metadata",
+            ));
+        }
+        Ok(())
+    }
+
     fn network_descriptor_slot(&self, fd: RawFd) -> Option<NetworkFdSlot> {
         let detfd = self.file_handles.get(&fd)?;
         if !self.track_network_lifetime {
@@ -6446,6 +6482,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     crate::network_replay::NetworkFdMutationKind::Socket
                     | crate::network_replay::NetworkFdMutationKind::Openat
                     | crate::network_replay::NetworkFdMutationKind::EpollCreate
+                    | crate::network_replay::NetworkFdMutationKind::PipePair { .. }
                     | crate::network_replay::NetworkFdMutationKind::Clone { .. }
                     | crate::network_replay::NetworkFdMutationKind::Exec { .. } => kind.clone(),
                     crate::network_replay::NetworkFdMutationKind::Alias {
@@ -6614,6 +6651,93 @@ impl<T: RecordOrReplay> Detcore<T> {
             table.associate_network_installation(change.installation_generation, effect)?;
             table.publication_snapshot(&admission.publication)?
         };
+        self.publish_completed_fd_batch(guest, admission, table, batch)
+            .await
+    }
+
+    /// Retain the actual zero result and the complete output before fstat or
+    /// capacity helpers. Positive cancellation remains unresolved until both
+    /// physically checked endpoints have been published and acknowledged.
+    pub(crate) async fn observe_network_pipe_result<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: &crate::network_replay::NetworkFdMutationAdmission,
+        returned: i64,
+        fds: [i32; 2],
+    ) -> Result<(), Error> {
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .unwrap()
+            .validate_fresh_pipe_fds(fds)?;
+        if self
+            .fd_mutation_request(
+                guest,
+                Q::PipeResult {
+                    permit: admission.publication.permit,
+                    returned,
+                    fds,
+                },
+            )
+            .await?
+            != P::Unit
+        {
+            return Err(fd_publication_error("pipe result acknowledgement changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn complete_network_pipe_installation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: &crate::network_replay::NetworkFdMutationAdmission,
+    ) -> Result<(), Error> {
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let table = guest.thread_state().file_metadata.clone();
+        let changes: [NetworkFdSlotReplacement; 2] = table
+            .lock()
+            .unwrap()
+            .pending_network_installations
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                fd_publication_error("pipe publication is not exactly two installations")
+            })?;
+        let P::PipeInstallation(effects) = self
+            .fd_mutation_request(
+                guest,
+                Q::PipeInstallation {
+                    permit: admission.publication.permit,
+                    changes: Box::new(changes),
+                },
+            )
+            .await?
+        else {
+            return Err(fd_publication_error("pipe installation receipt mismatch"));
+        };
+        let batch = {
+            let mut table = table.lock().unwrap();
+            table.validate_pipe_installations(&changes)?;
+            for (change, effect) in changes.into_iter().zip(effects) {
+                table.associate_network_installation(change.installation_generation, effect)?;
+            }
+            table.publication_snapshot(&admission.publication)?
+        };
+        self.publish_completed_fd_batch(guest, admission, table, batch)
+            .await
+    }
+
+    async fn publish_completed_fd_batch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: &crate::network_replay::NetworkFdMutationAdmission,
+        table: Arc<Mutex<FileMetadata>>,
+        batch: crate::network_replay::NetworkFdPublicationBatch,
+    ) -> Result<(), Error> {
         let mut rpc = GuestFdPublicationRpc::<G, T> {
             guest,
             tool: std::marker::PhantomData,

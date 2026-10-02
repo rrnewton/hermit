@@ -103,6 +103,44 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 use crate::network_runtime::required_initial_metadata;
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+
+/// A pipe output array is only a candidate. Under the retained complete table
+/// exclusion, real per-fd queries must identify the two ends of the same pipe.
+/// This does not assume that the guest output mapping cannot be modified.
+fn check_native_pipe_pair(
+    fds: [i32; 2],
+    flags: OFlag,
+    stats: &[libc::stat; 2],
+    status: [i64; 2],
+    descriptor: [i64; 2],
+) -> Result<(), Error> {
+    let nonblock = flags.bits() & libc::O_NONBLOCK;
+    let expected_status = [
+        i64::from(libc::O_RDONLY | nonblock),
+        i64::from(libc::O_WRONLY | nonblock | (flags.bits() & libc::O_DIRECT)),
+    ];
+    let cloexec = if flags.contains(OFlag::O_CLOEXEC) {
+        i64::from(libc::FD_CLOEXEC)
+    } else {
+        0
+    };
+    if fds[0] < 0
+        || fds[1] < 0
+        || fds[0] == fds[1]
+        || stats
+            .iter()
+            .any(|stat| stat.st_mode & libc::S_IFMT != libc::S_IFIFO)
+        || stats[0].st_dev != stats[1].st_dev
+        || stats[0].st_ino != stats[1].st_ino
+        || status != expected_status
+        || descriptor != [cloexec; 2]
+    {
+        return Err(Error::Tool(anyhow::anyhow!(
+            "native pipe outputs do not identify the exact ordered FIFO pair/flags"
+        )));
+    }
+    Ok(())
+}
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-2150): Review timer-slack procfs parsing,
 // per-operation target checks, and scalar/vector I/O emulation.
@@ -3663,6 +3701,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             call
         };
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3464): the native pair uses the existing table
+        // transaction; it never interprets pipe's zero return as an fd.
+        // https://github.com/rrnewton/hermit/pull/3464
+        if self.network_fd_tracking_active(guest)
+            && self
+                .record_or_replay
+                .original_file_execution(injected.into())
+                != crate::OriginalFileExecution::Native
+        {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "tracked pipe requires its original native allocation"
+            )));
+        }
+        let admission = self
+            .begin_network_fd_mutation(
+                guest,
+                crate::network_replay::NetworkFdMutationKind::PipePair {
+                    cloexec: call.flags().contains(OFlag::O_CLOEXEC),
+                },
+            )
+            .await?;
         // NO PRE-CALL READ OF `pipefd`. This is load-bearing on three backends, not a style
         // choice. `record_or_replay` below returns early on failure, so every guest memory
         // access AFTER it runs only when pipe2 SUCCEEDED -- and a successful pipe2 means the
@@ -3675,11 +3735,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         // argument-validation precedence intact -- flags are checked before the pointer, so a
         // bad pointer with bad flags is EINVAL and with good flags EFAULT.
         // A C guest asserting that precedence directly is being added separately.
-        let res = self.record_or_replay(guest, injected).await?;
-        let memory = guest.memory();
+        let physical = self.record_or_replay(guest, injected).await;
+        let res = match physical {
+            Ok(result) => result,
+            Err(errno) => {
+                return self
+                    .observe_network_fd_result(guest, admission.as_ref(), Err(errno))
+                    .await;
+            }
+        };
 
         if let Some(pipefd) = call.pipefd() {
-            let fds: [i32; 2] = memory.read_value(pipefd)?;
+            let observed: Result<[i32; 2], _> = guest.memory().read_value(pipefd);
+            let fds =
+                if admission.is_some() {
+                    observed.map_err(|error| Error::Tool(anyhow::anyhow!(
+                    "successful original pipe output read failed with retained custody: {error}"
+                )))?
+                } else {
+                    observed?
+                };
+            let stats = if let Some(admission) = &admission {
+                self.observe_network_pipe_result(guest, admission, res, fds)
+                    .await?;
+                // Both fds were absent from the protected complete preimage.
+                // Query the real task, not recorded metadata or pipefd again.
+                let checked = async {
+                    let stats = [
+                        self.inject_fstat(guest, fds[0]).await?,
+                        self.inject_fstat(guest, fds[1]).await?,
+                    ];
+                    let status = [
+                        guest
+                            .inject(syscalls::Fcntl::new().with_fd(fds[0]).with_cmd(F_GETFL))
+                            .await?,
+                        guest
+                            .inject(syscalls::Fcntl::new().with_fd(fds[1]).with_cmd(F_GETFL))
+                            .await?,
+                    ];
+                    let descriptor = [
+                        guest
+                            .inject(syscalls::Fcntl::new().with_fd(fds[0]).with_cmd(F_GETFD))
+                            .await?,
+                        guest
+                            .inject(syscalls::Fcntl::new().with_fd(fds[1]).with_cmd(F_GETFD))
+                            .await?,
+                    ];
+                    check_native_pipe_pair(fds, injected.flags(), &stats, status, descriptor)?;
+                    Ok::<_, Error>(stats)
+                }
+                .await
+                .map_err(|error| {
+                    Error::Tool(anyhow::anyhow!(
+                        "successful pipe identity check failed with retained table custody: {error}"
+                    ))
+                })?;
+                Some(checked)
+            } else {
+                None
+            };
             if internally_nonblocking {
                 let capacity_result = guest
                     .inject(
@@ -3720,14 +3834,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                     unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
                 }
             }
-            self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
-                .await?;
-            self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
-                .await?;
+            if let Some(stats) = stats {
+                for (fd, stat) in fds.into_iter().zip(stats) {
+                    let stat = guest.config().virtualize_metadata.then(|| stat.into());
+                    guest
+                        .thread_state()
+                        .add_fd(fd, call.flags(), FdType::Pipe, stat)?;
+                }
+            } else {
+                self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
+                    .await?;
+                self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
+                    .await?;
+            }
             if internally_nonblocking {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
             }
+            if let Some(admission) = &admission {
+                self.complete_network_pipe_installation(guest, admission)
+                    .await?;
+            }
+        } else if admission.is_some() {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "successful original pipe lost its output address"
+            )));
         }
 
         Ok(res)
@@ -4909,6 +5040,70 @@ mod test {
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
     use super::pipe_capacity_request_exceeds_ceiling;
+    #[test]
+    fn pipe_pair_checks_actual_fifo_identity_access_order_and_flags() {
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        for flags in [
+            OFlag::empty(),
+            OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            OFlag::O_NONBLOCK | OFlag::O_DIRECT,
+        ] {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), flags.bits()) }, 0);
+            let owners = fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+            let mut stats: [libc::stat; 2] = unsafe { std::mem::zeroed() };
+            let stat_results =
+                std::array::from_fn::<_, 2, _>(|i| unsafe { libc::fstat(fds[i], &mut stats[i]) });
+            let status = fds.map(|fd| i64::from(unsafe { libc::fcntl(fd, libc::F_GETFL) }));
+            let descriptor = fds.map(|fd| i64::from(unsafe { libc::fcntl(fd, libc::F_GETFD) }));
+            // Close the actual originals before evaluating the semantic oracle.
+            drop(owners);
+            assert_eq!(stat_results, [0, 0]);
+            super::check_native_pipe_pair(fds, flags, &stats, status, descriptor).unwrap();
+            assert!(
+                super::check_native_pipe_pair([fds[0]; 2], flags, &stats, status, descriptor)
+                    .is_err()
+            );
+            assert!(
+                super::check_native_pipe_pair(
+                    fds,
+                    flags,
+                    &stats,
+                    [status[1], status[0]],
+                    descriptor
+                )
+                .is_err()
+            );
+            assert!(
+                super::check_native_pipe_pair(fds, flags, &stats, [-1, status[1]], descriptor)
+                    .is_err()
+            );
+            let mut changed = stats;
+            changed[1].st_ino = changed[1].st_ino.wrapping_add(1);
+            assert!(
+                super::check_native_pipe_pair(fds, flags, &changed, status, descriptor).is_err()
+            );
+            changed = stats;
+            changed[1].st_mode = libc::S_IFSOCK;
+            assert!(
+                super::check_native_pipe_pair(fds, flags, &changed, status, descriptor).is_err()
+            );
+            let mut changed_descriptor = descriptor;
+            changed_descriptor[1] ^= i64::from(libc::FD_CLOEXEC);
+            assert!(
+                super::check_native_pipe_pair(fds, flags, &stats, status, changed_descriptor)
+                    .is_err()
+            );
+            let mut changed_status = status;
+            changed_status[0] ^= i64::from(libc::O_NONBLOCK);
+            assert!(
+                super::check_native_pipe_pair(fds, flags, &stats, changed_status, descriptor)
+                    .is_err()
+            );
+        }
+    }
+
     /// The ceiling is inclusive. A guest that reads the advertised
     /// `pipe-max-size` and asks for exactly that must be allowed to have it;
     /// refusing at the boundary would advertise a size that cannot be set.

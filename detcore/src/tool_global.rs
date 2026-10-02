@@ -5510,6 +5510,49 @@ impl GlobalState {
                         "stream operation without a network engine",
                     )));
                 };
+                // A pipe holds this existing short table permit across its
+                // original syscall/copyout. Do not enable the single-root
+                // adapter after any sibling or replacement has been admitted.
+                let pipe_files = match &request {
+                    NetworkRequest::FdMutation(
+                        crate::network_replay::NetworkFdMutationRequest::Begin {
+                            files,
+                            kind: crate::network_replay::NetworkFdMutationKind::PipePair { .. },
+                        },
+                    ) => Some(*files),
+                    NetworkRequest::FdMutation(
+                        crate::network_replay::NetworkFdMutationRequest::PipeResult {
+                            permit, ..
+                        }
+                        | crate::network_replay::NetworkFdMutationRequest::PipeInstallation {
+                            permit,
+                            ..
+                        },
+                    ) => Some(permit.files),
+                    _ => None,
+                };
+                if let Some(files) = pipe_files {
+                    let checked = self
+                        .network_runtime
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("pipe pair lacks native runtime"))
+                        .and_then(|runtime| runtime.foreground_root(owner))
+                        .and_then(|root| {
+                            if !self.cfg.sequentialize_threads || root.files() != files {
+                                return Err(std::io::Error::other(
+                                    "pipe pair changed sole-root table",
+                                ));
+                            }
+                            sched
+                                .foreground_native_observation(owner, &root)
+                                .map(|_| ())
+                        });
+                    if let Err(error) = checked {
+                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                            error.to_string(),
+                        )));
+                    }
+                }
                 // Obtain only an Arc under engine, then drop that guard before
                 // taking metadata. Revalidate below after reacquiring engine:
                 // lookup/upgrade alone never authorizes a reader.
@@ -5518,6 +5561,13 @@ impl GlobalState {
                     | NetworkRequest::BeginOrdinaryFdRead { files, .. } => Some(*files),
                     NetworkRequest::FdMutation(
                         crate::network_replay::NetworkFdMutationRequest::Installation {
+                            permit,
+                            ..
+                        }
+                        | crate::network_replay::NetworkFdMutationRequest::PipeResult {
+                            permit, ..
+                        }
+                        | crate::network_replay::NetworkFdMutationRequest::PipeInstallation {
                             permit,
                             ..
                         },
@@ -5561,6 +5611,29 @@ impl GlobalState {
                             error.to_string(),
                         )));
                     }
+                let pipe_metadata = match &request {
+                    NetworkRequest::FdMutation(
+                        crate::network_replay::NetworkFdMutationRequest::PipeResult { fds, .. },
+                    ) => metadata_guard
+                        .as_deref()
+                        .expect("pipe metadata")
+                        .validate_fresh_pipe_fds(*fds),
+                    NetworkRequest::FdMutation(
+                        crate::network_replay::NetworkFdMutationRequest::PipeInstallation {
+                            changes,
+                            ..
+                        },
+                    ) => metadata_guard
+                        .as_deref()
+                        .expect("pipe metadata")
+                        .validate_pipe_installations(changes),
+                    _ => Ok(()),
+                };
+                if let Err(error) = pipe_metadata {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        error.to_string(),
+                    )));
+                }
                 let observed_at = self.global_time.lock().unwrap().as_nanos();
                 // Shared child creation becomes eligible before an inheritable
                 // guest mutation can commit at this logical cut. No accepter is
@@ -5590,6 +5663,18 @@ impl GlobalState {
                                         .expect("installation metadata guard"),
                                     slot.binding,
                                 )?;
+                            }
+                            if let crate::network_replay::NetworkFdMutationRequest::PipeInstallation {
+                                changes, ..
+                            } = request {
+                                for change in changes.iter() {
+                                    engine.note_epoll_published_metadata(
+                                        owner,
+                                        metadata.as_ref().expect("pipe metadata"),
+                                        metadata_guard.as_deref().expect("pipe metadata guard"),
+                                        change.after.expect("confirmed complete pipe pair").binding,
+                                    )?;
+                                }
                             }
                             if let crate::network_replay::NetworkFdMutationRequest::Unchanged {
                                 permit,
