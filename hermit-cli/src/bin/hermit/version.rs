@@ -37,10 +37,10 @@ impl Version {
             let revision = Some(BuildInfo::get_revision()).filter(|s| !s.is_empty());
             let pkg_version = Some(BuildInfo::get_package_version()).filter(|s| !s.is_empty());
 
-            Self(format!(
-                "fbsource: {}, fbpkg: hermit:{}",
-                revision.unwrap_or("unknown"),
-                pkg_version.unwrap_or("unknown")
+            Self(fbcode_version(
+                option_env!("CARGO_PKG_VERSION"),
+                revision,
+                pkg_version,
             ))
         }
 
@@ -60,6 +60,23 @@ impl Version {
     }
 }
 
+/// Formats an fbcode build's version, for example
+/// `0.4.0 (fbsource: abc123, fbpkg: hermit:1407)`. Buck sets
+/// `CARGO_PKG_VERSION` only when the target asks for it.
+#[cfg(any(fbcode_build, test))]
+fn fbcode_version(
+    crate_version: Option<&str>,
+    revision: Option<&str>,
+    pkg_version: Option<&str>,
+) -> String {
+    format!(
+        "{} (fbsource: {}, fbpkg: hermit:{})",
+        crate_version.unwrap_or("unknown"),
+        revision.unwrap_or("unknown"),
+        pkg_version.unwrap_or("unknown")
+    )
+}
+
 #[derive(Debug, Args)]
 pub struct VersionOpts {
     /// Emit the producer-owned build facts as one JSON object.
@@ -77,5 +94,26 @@ impl VersionOpts {
             writeln!(stdout, "hermit {}", Version::get())?;
         }
         Ok(ExitStatus::Exited(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fbcode_version;
+
+    #[test]
+    fn fbcode_version_leads_with_the_crate_version() {
+        assert_eq!(
+            fbcode_version(Some("0.4.0"), Some("abc123"), Some("1407")),
+            "0.4.0 (fbsource: abc123, fbpkg: hermit:1407)"
+        );
+    }
+
+    #[test]
+    fn fbcode_version_marks_missing_build_facts_unknown() {
+        assert_eq!(
+            fbcode_version(None, None, None),
+            "unknown (fbsource: unknown, fbpkg: hermit:unknown)"
+        );
     }
 }
