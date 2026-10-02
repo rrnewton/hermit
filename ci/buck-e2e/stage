@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stage the e2e inputs Buck does not build yet into ci/buck-e2e/staged/ (gitignored),
+# from a cargo-built harness bundle (the layout of tools/mk_bundle.sh: bin/, build/,
+# src/, run-state/, hermit/{hermit,install}/, PROVENANCE.json). Cells use the Buck-built
+# //hermit-cli:hermit unless -c hermit_e2e.hermit=staged. Reflinks when it can.
+# usage: ci/buck-e2e/stage BUNDLE_DIR
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+bundle=$(realpath "${1:?usage: stage BUNDLE_DIR}")
+staged=$here/staged
+rm -rf "${staged:?}"
+mkdir -p "$staged"
+for part in bin build src run-state; do
+    cp -a --reflink=auto "$bundle/$part" "$staged/$part"
+done
+cp -a --reflink=auto "$bundle/hermit/install" "$staged/install"
+cp -a --reflink=auto "$bundle/hermit/hermit" "$staged/hermit"
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$bundle/PROVENANCE.json" >"$staged/SOURCE_SHA"
+echo "staged $(du -sh "$staged" | cut -f1) from $bundle (source $(cat "$staged/SOURCE_SHA"))"
