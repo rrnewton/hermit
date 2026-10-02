@@ -14800,8 +14800,7 @@
         "x86_64",
         "userns",
         "ptrace",
-        "cc",
-        "vdso-getrandom"
+        "cc"
       ],
       "test": "c-programs/random-sources-root-only",
       "timeout_seconds": 57
@@ -14818,8 +14817,7 @@
         "x86_64",
         "userns",
         "ptrace",
-        "cc",
-        "vdso-getrandom"
+        "cc"
       ],
       "test": "c-programs/random-sources-root-only",
       "timeout_seconds": 57
