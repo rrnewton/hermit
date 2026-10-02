@@ -1143,6 +1143,17 @@ else
         echo "check-shard-coverage.sh: FAIL — workflow guard accepted btrfs-progs outside the apt-install action" >&2
         status=1
     fi
+    # A trailing ` # ...` is a YAML comment the action never receives, so a
+    # btrfs-progs that survives only there is not installed. This exercises
+    # the comment stripping in workflow_job_apt_packages.
+    btrfs_package_commented=${workflow_text/"$btrfs_package_line"/"${btrfs_package_line/ btrfs-progs/} # btrfs-progs"}
+    if [[ $btrfs_package_commented == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — btrfs-progs comment mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_wiring_contract "$btrfs_package_commented"; then
+        echo "check-shard-coverage.sh: FAIL — workflow guard accepted btrfs-progs named only in a trailing YAML comment" >&2
+        status=1
+    fi
 fi
 btrfs_slug="        if: matrix.slug == 'system_utils'"
 wrong_btrfs_slug=${workflow_text/"$btrfs_slug"/"        if: matrix.slug == 'applications'"}

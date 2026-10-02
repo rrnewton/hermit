@@ -38,6 +38,7 @@ check() {
 }
 is() { if [[ $1 == "$2" ]]; then echo 0; else echo 1; fi; }
 has() { if grep -q -- "$2" "$1"; then echo 0; else echo 1; fi; }
+hasf() { if grep -qF -- "$2" "$1"; then echo 0; else echo 1; fi; }
 lacks() { if grep -q -- "$2" "$1"; then echo 1; else echo 0; fi; }
 
 work=$(mktemp -d)
@@ -166,13 +167,21 @@ k2=$(key_of "  zstd
 bc   jq jq ")
 check "key is independent of package order, duplicates and whitespace" "$(is "$k1" "$k2")"
 check "key has the documented shape" \
-    "$([[ $k1 =~ ^apt-debs-v1-ubuntu24-20260928\.1-amd64-[0-9a-f]{16}$ ]] && echo 0 || echo 1)"
+    "$([[ $k1 =~ ^apt-debs-v1-ubuntu24-20260928\.1-amd64-[0-9a-f]{16}-s[0-9a-f]{8}$ ]] && echo 0 || echo 1)"
 k3=$(key_of "jq zstd bc gdb")
 check "key changes when the package list changes" "$([[ $k1 != "$k3" ]] && echo 0 || echo 1)"
 fresh; export ImageVersion=20261005.2
 APT_PACKAGES="jq zstd bc" run prepare >/dev/null 2>&1
 k4=$(sed -n 's/^key=//p' "$work/out")
 check "key changes when the runner image version changes" "$([[ -n $k4 && $k1 != "$k4" ]] && echo 0 || echo 1)"
+# An edit to the script (say, a new apt-get option) must start fresh entries.
+cp "$script" "$work/edited-apt-install-cached.sh"
+printf '# an edit that changes nothing but the bytes\n' >>"$work/edited-apt-install-cached.sh"
+fresh
+APT_PACKAGES="jq zstd bc" PATH="$work/bin:$PATH" "$work/edited-apt-install-cached.sh" prepare >/dev/null 2>&1
+k5=$(sed -n 's/^key=//p' "$work/out")
+check "key changes when ci/apt-install-cached.sh changes" "$([[ -n $k5 && $k1 != "$k5" ]] && echo 0 || echo 1)"
+check "  ...and only in its script-hash part" "$(is "${k5%-s*}" "${k1%-s*}")"
 fresh
 APT_PACKAGES="jq" run prepare >/dev/null 2>&1
 check "prepare creates the archive directory and partial/" \
@@ -284,18 +293,22 @@ check "hit: installs every restored file by path" \
     "$(has "$work/state/calls" "^cachefile install -y --no-download -o Dir::Cache::Archives=$archive/ $archive/jq_1.0_amd64.deb $archive/zstd_1.0_amd64.deb$")"
 check "hit: reports path=cache" "$(has "$work/log" "path=cache rc=0")"
 
-seed; rc=0
+seed; rc=0; seeded_key=$(sed -n 's/^key=//p' "$work/out")
 STUB_CACHEFILE=fail:100 APT_CACHE_HIT=true APT_PACKAGES="jq zstd" run install >"$work/log" 2>&1 || rc=$?
 check "unusable hit: falls back and succeeds" "$(is "$rc" 0)"
 check "unusable hit: falls back to update, download, install" \
     "$(is "$(cut -d' ' -f1 "$work/state/calls" | tr '\n' ' ')" "cachefile update download install ")"
 check "unusable hit: warns that the cache was not usable" "$(has "$work/log" "::warning title=apt cache not usable::")"
+check "unusable hit: the warning names the restored key" "$(hasf "$work/log" "every job on key $seeded_key will repeat")"
+check "unusable hit: the warning names both remedies" \
+    "$([[ $(hasf "$work/log" "gh cache delete $seeded_key") == 0 && $(hasf "$work/log" "bump KEY_VERSION in ci/apt-install-cached.sh") == 0 ]] && echo 0 || echo 1)"
 check "unusable hit: reports path=mirror-after-unusable-cache" "$(has "$work/log" "path=mirror-after-unusable-cache rc=0")"
 
 seed; rc=0
 STUB_CACHEFILE_SKIP=zstd APT_CACHE_HIT=true APT_PACKAGES="jq zstd" run install >"$work/log" 2>&1 || rc=$?
 check "incomplete hit: a package still missing after the cache install falls back" \
     "$(has "$work/log" "::warning title=apt cache incomplete::the restored .deb files did not install: zstd")"
+check "incomplete hit: the warning names a remedy" "$(hasf "$work/log" "gh cache delete apt-debs-v1-")"
 check "incomplete hit: the fallback succeeds" "$(is "$rc:$(count install)" "0:1")"
 
 seed; rc=0
@@ -303,10 +316,27 @@ STUB_CACHEFILE=fail:100 STUB_UPDATE=fail:100 HERMIT_APT_ATTEMPTS=1 APT_CACHE_HIT
     APT_PACKAGES="jq zstd" run install >"$work/log" 2>&1 || rc=$?
 check "unusable hit whose fallback also fails: the step fails" "$(is "$rc" 100)"
 
+# An empty archive under an exact key is what a list the image already fully
+# provides saves. With every package installed it needs nothing at all; with
+# one missing it is a broken entry that only a remedy can clear.
+fresh; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
+echo jq >"$work/state/installed"
+APT_CACHE_HIT=true APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
+check "empty hit, all preinstalled: succeeds without calling apt-get at all" \
+    "$([[ $rc == 0 && ! -e $work/state/calls ]] && echo 0 || echo 1)"
+check "empty hit, all preinstalled: reports path=cache-preinstalled" "$(has "$work/log" "path=cache-preinstalled rc=0")"
+
 fresh; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
 APT_CACHE_HIT=true APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
-check "hit with an empty archive: takes the miss path" "$(is "$rc:$(count cachefile):$(count update)" "0:0:1")"
-check "hit with an empty archive: reports path=mirror" "$(has "$work/log" "path=mirror rc=0")"
+check "empty hit, package missing: takes the miss path" "$(is "$rc:$(count cachefile):$(count update):$(count install)" "0:0:1:1")"
+check "empty hit, package missing: warns and names a remedy" \
+    "$([[ $(has "$work/log" "::warning title=apt cache empty::") == 0 && $(hasf "$work/log" "gh cache delete apt-debs-v1-") == 0 ]] && echo 0 || echo 1)"
+check "empty hit, package missing: reports path=mirror-after-unusable-cache" \
+    "$(has "$work/log" "path=mirror-after-unusable-cache rc=0")"
+
+fresh; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
+APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
+check "miss with nothing restored: no cache warning" "$(lacks "$work/log" "::warning title=apt cache")"
 
 if (( failures )); then echo "apt-install-cached-test: $failures FAILED"; exit 1; fi
 echo "apt-install-cached-test: all checks passed"
