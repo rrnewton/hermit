@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 
-const EXPECTED_FILES: usize = 931;
+const EXPECTED_FILES: usize = 932;
 const CRATE_RELATIVE: &str = "reverie-dbt";
 const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.4.0";
 const TARGET_NAME: &str = "reverie-dbt-0.4-materialized-manifest";
@@ -146,7 +146,7 @@ fn verified_files(root: &Path) -> Result<Vec<String>, String> {
         // Cargo's vendoring contract rewrites Cargo.toml into its normalized
         // publish form. Reindeer has already verified that packaged file
         // against Cargo.lock and .cargo-checksum.json; every other one of the
-        // 931 pinned source files must remain byte-for-byte identical.
+        // 932 pinned source files must remain byte-for-byte identical.
         if relative == "Cargo.toml" {
             continue;
         }
