@@ -7634,6 +7634,1598 @@
       "lane": "portable",
       "mode": "verify",
       "test": "compat/zstd-roundtrip"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/acct-refusal-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/add-key-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/aio-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/arch-prctl-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/bind-getsockname"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/bpf-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/child-subreaper-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/clone"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/copy-file-range-refusal-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/cpu-virtualization"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-copied-tiocgpgrp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-exec-failure"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-execveat-unsupported"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-mmap-exec"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-prlimit-self"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-self-sigqueue"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-wait-accounting"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/dbt-wait-lifecycle"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/epoll-pwait2"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/epoll-readiness"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/eventfd-semantics"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/file-io-roundtrip"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/fork-exec-pipeline"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/fp-reduction-nondeterminism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/futex-requeue-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/futex-waitv-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/futex-wake-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/get-robust-list-child"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/get-robust-list-thread"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/getcpu"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/getcpu-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/getitimer-determinism-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/getpriority-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/getrusage-self-accounting"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/getsockopt-null"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/hardware-trap-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/hello-alarm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/hello-nostdlib"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/hello-signals"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/host-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/inline-syscall-sites"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/inotify-watch"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/io-uring-fallback"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/io-uring-ring-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ioctl-fionread"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ioctl-siocethtool"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/just-spin"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/kcmp-eperm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/kcmp-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/keyctl-passthrough"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/lsm-get-self-attr-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/lsm-list-modules-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/lsm-set-self-attr-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/map-shadow-stack-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mce-kill-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/membarrier-query"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/memfd-create"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/memfd-secret-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/meminfo-available-deterministic"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/meminfo-cached-deterministic"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/meminfo-free-deterministic"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/memorypress"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mempolicy-default"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mincore-residency"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mixed-inline-and-libc-syscalls"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mmap-determinism-heap"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mmap-determinism-shared"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/mmap-stress-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/name-to-handle-at-eopnotsupp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/name-to-handle-directory-eopnotsupp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/name-to-handle-empty-path-eopnotsupp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/name-to-handle-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/name-to-handle-regular-eopnotsupp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/nanosleep-par"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/nanosleep-threads-nocrash"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/netlink-autobind-generic"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/netlink-autobind-route"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/netlink-autobind-usersock"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/netns-cookie-tcp4"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/netns-cookie-tcp6"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/netns-cookie-udp4"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/no-new-privs-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/numa-node-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/o-tmpfile-anon"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/openat2-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pause-alarm-interrupt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/perf-event-hardware-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/perf-event-open-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/perf-event-software-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/perf-event-watchpoint-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/periodic-setitimer-delivery"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/personality-domain"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pid-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pidfd-open-self"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pidfd-open-self-pair"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pidfd-poll-self"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pidfd-waitid-child"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pipe-capacity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pipe-capacity-pin"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pipe-ipc"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pipe-multiwriter-ordering"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pipe2-errno-precedence"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pipe2-flags"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ppoll-readv"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ppoll-simulation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/prctl-dumpable"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/prctl-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/prctl-option-policy"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/prctl-pdeathsig"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pread64-nostdlib"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/print-memaddrs"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/printf-with-threads"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/proc-fd-link-aliases"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/proc-fdinfo"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/proc-locks"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/process-mrelease-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/process-vm-readv-refusal-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/process-vm-writev-refusal-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/procfs-positioned-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/prodcons-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pthread-lifecycle"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ptrace-attach-eperm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ptrace-eperm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ptrace-seize-eperm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ptrace-traceme-eperm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pty-nr-count"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/racewrite-nostdlib"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/random-sources"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/random-sources-root-only"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/rcx-canonicalization"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/record-replay-fd-close"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/recvmsg-scm-rights-mmap"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/remap-file-pages-anonymous-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/remap-file-pages-memfd-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/request-key-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/resource-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/rlimit-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/robust-list"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sched-getaffinity-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sched-setattr-batch"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sched-setattr-idle"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sched-setattr-other"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sched-yield-progress"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/scheduler-policy-queries"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/seccomp-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/session-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/set-tid-address"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/setitimer-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/short-io-split-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/shutdown-socketpair"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigaction-state"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigaltstack-state"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigmask-preemption"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/signal-delivery-sequence"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/signal-disposition"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/signal-waitstatus-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/signalfd-create"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigpipe-siginfo"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigprocmask-state"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigtimedwait-no-timeout"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigtimedwait-timeout-0s"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sigtimedwait-timeout-1s"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/so-incoming-cpu-udp4"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/socket-cookie-tcp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/socket-cookie-udp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/socket-cookie-unix"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/socket-options"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/socketpair-flags"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sockname-unnamed"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/splice-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/stat-metadata-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/statfs-free-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/static-nolibc-syscall-sites"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/statmount-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/syscall-file-io"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/syscall-file-metadata"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/syscall-quick-wins"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sysfs-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sysinfo"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sysinfo-uptime"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/syslog-deterministic"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sysv-ipc-refusal"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sysv-sem-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/sysv-shm-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/tee-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/thp-disable"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/thread-self-procfs-handoff"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/threadexhaustion"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/timer-create-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/uname"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/uname-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/unix-autobind-dgram"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/unix-autobind-seqpacket"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/unix-autobind-stream"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ustat-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/vectored-io"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/vforkexec"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/vmsplice-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/wait-on-child"
+    },
+    {
+      "backend": "ptrace",
+      "category": "chaos-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "chaos-c/lock-granularity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "debugger-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "debugger-c/debuggee"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/fork-tree"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/lock-free"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/mmap-fork-shared"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/pid-tid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/pid-tid-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/pipe-chain"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/pipe-prefill"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/producer-consumer"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/signal-order"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/thread-stress"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/cat-file-read"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/du-tree-summary"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/echo-stdout"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/file-timestamp-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/printf-argument-forwarding"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/shm-coherency-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/startup-surface-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/startup-tls-guards"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/true-exit-zero"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "privileged",
+      "mode": "replay",
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/cpuid-probe"
     }
   ],
   "schema": 1

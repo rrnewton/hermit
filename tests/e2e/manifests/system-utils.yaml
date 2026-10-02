@@ -1359,10 +1359,9 @@ test:
           sabre: Qualify recursive du independently against the new ptrace golden baseline
           liteinst: Qualify recursive du independently against the new ptrace golden baseline
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1507,13 +1506,12 @@ test:
           ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
           sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of file timestamps is a separate contract
           kvm: Record/replay identity of file timestamps is a separate contract
           liteinst: Record/replay identity of file timestamps is a separate contract
-          ptrace: Record/replay identity of file timestamps is a separate contract
           sabre: Record/replay identity of file timestamps is a separate contract
   - id: system-utils/startup-surface-identity
     description: argv, environ order, the full auxv vector (incl. AT_RANDOM bytes and the raw vDSO base) and initial stack layout are identical across repeated Hermit runs
@@ -1569,13 +1567,12 @@ test:
           ptrace: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
           sabre: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           kvm: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           liteinst: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
-          ptrace: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           sabre: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
   - id: system-utils/startup-tls-guards
     description: the x86-64 glibc TLS stack canary and pointer guard initialized before main are identical across repeated runs
@@ -1638,14 +1635,12 @@ test:
           ptrace: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
           sabre: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
       replay:
-        ci: false
-        ci_disabled_reason: Record/replay ownership of startup TLS guards is a separate contract from repeated-run verification
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay ownership of startup TLS guards is a separate contract
           kvm: Record/replay ownership of startup TLS guards is a separate contract
           liteinst: Record/replay ownership of startup TLS guards is a separate contract
-          ptrace: Record/replay ownership of startup TLS guards is a separate contract
           sabre: Record/replay ownership of startup TLS guards is a separate contract
   - id: system-utils/shm-coherency-identity
     description: what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates
@@ -1703,13 +1698,12 @@ test:
           ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
           sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of shared-memory observation is a separate contract
           kvm: Record/replay identity of shared-memory observation is a separate contract
           liteinst: Record/replay identity of shared-memory observation is a separate contract
-          ptrace: Record/replay identity of shared-memory observation is a separate contract
           sabre: Record/replay identity of shared-memory observation is a separate contract
   - id: system-utils/clock-exec-continuity
     description: Guest clock keeps advancing across execs and is never rebased onto a round origin
@@ -2181,11 +2175,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2249,11 +2241,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2314,11 +2304,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2450,11 +2438,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
