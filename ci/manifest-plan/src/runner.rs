@@ -2669,6 +2669,23 @@ impl RunContext {
         prebuilt: bool,
         source_sha: Option<&str>,
     ) -> Result<Self, String> {
+        Self::from_env_probing(root, prebuilt, source_sha, true)
+    }
+
+    /// The context of a run that executes no cell: `E2E_IMPORT_RESULTS`
+    /// re-publishes rows another harness process wrote. Nothing launches the
+    /// Hermit binary, so it is neither required nor probed; the binary-derived
+    /// fields stay empty and every other field is read as `from_env` reads it.
+    pub fn for_import(root: PathBuf, source_sha: Option<&str>) -> Result<Self, String> {
+        Self::from_env_probing(root, true, source_sha, false)
+    }
+
+    fn from_env_probing(
+        root: PathBuf,
+        prebuilt: bool,
+        source_sha: Option<&str>,
+        probe_hermit: bool,
+    ) -> Result<Self, String> {
         let (source_sha, source_dirty) = source_identity(&root, source_sha)?;
         let result_root = std::env::var_os("E2E_RESULT_ROOT")
             .map(PathBuf::from)
@@ -2720,14 +2737,16 @@ impl RunContext {
         // Ask the binary where it came from, the same way this function already
         // asks it what flags it supports. `source_sha` above describes the
         // checkout; only the binary can describe the binary.
-        let binary_build_sha = probe_binary_build_sha(&hermit_bin);
+        let binary_build_sha = probe_hermit
+            .then(|| probe_binary_build_sha(&hermit_bin))
+            .flatten();
         // Published main still exposes the legacy `--verify-strict` spelling;
         // the canonical-only cutover removes it and makes bare `--verify`
         // canonical.  Detect the running binary rather than keying behavior to
         // a source SHA.  Whichever spelling executes is retained verbatim in
         // the result row, so this bridge cannot hide the comparison policy.
-        let run_verify_strict =
-            command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict")?;
+        let run_verify_strict = probe_hermit
+            && command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict")?;
         let isolated_workdir = match std::env::var_os(ISOLATED_WORKDIR_ENV) {
             None => None,
             Some(value) if value == HERMETIC_TEST_WORKDIR => {
@@ -2740,11 +2759,12 @@ impl RunContext {
                 ));
             }
         };
-        let record_verify_strict = command_help_contains(
-            &hermit_bin,
-            &["record", "start", "--help"],
-            "--verify-strict",
-        )?;
+        let record_verify_strict = probe_hermit
+            && command_help_contains(
+                &hermit_bin,
+                &["record", "start", "--help"],
+                "--verify-strict",
+            )?;
         Ok(Self {
             root,
             hermit_bin,
