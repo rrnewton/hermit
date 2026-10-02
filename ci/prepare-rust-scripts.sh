@@ -270,6 +270,14 @@ workspace_manifest=$packages/Cargo.toml
     printf '  "%s",\n' "${keys[@]}"
     printf ']\n\n[profile.release]\nstrip = true\n'
 } >"$workspace_manifest"
+# Seed the lockfile from the committed one. Scripts that path-depend on
+# workspace crates (hermit-detcore, hermit-manifest-plan) must compile them
+# against the same dependency versions the product build uses; resolving from
+# scratch takes the newest registry release instead. libc 0.2.190 made glibc
+# siginfo_t non-Send, so a fresh resolution stops hermit-detcore compiling.
+# Cargo keeps every seeded version the generated workspace still uses, adds
+# what only the scripts need, and drops the rest.
+cat -- "$ROOT_DIR/Cargo.lock" >"$packages/Cargo.lock"
 metadata=$packages/metadata.json
 output=$packages/workspace.output
 if ! cargo metadata --format-version 1 --no-deps --manifest-path "$workspace_manifest" \
@@ -290,6 +298,10 @@ if [[ $mode == fetch ]]; then
     # one while the network is available, then make the download itself obey
     # that exact lock. The later pinned-root producer runs offline against this
     # CARGO_HOME; it must never depend on an unrelated warm host cache.
+    # This resolution replaces the seeded lockfile with the newest releases,
+    # which only widens what is downloaded: the versions the seed pins are
+    # fetched from the committed root lockfile, and the offline build resolves
+    # from the seed again.
     output=$packages/workspace.output
     if ! cargo generate-lockfile --manifest-path "$workspace_manifest" >"$output" 2>&1; then
         report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \

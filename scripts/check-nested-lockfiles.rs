@@ -346,6 +346,8 @@ mod tests {
         source.replacen(needle, replacement, 1)
     }
 
+    const ROOT_LOCK_FIXTURE: &str = "version = 4\n# committed root lockfile fixture\n";
+
     fn production_fixture(mutation: FetchMutation) -> ProductionFixture {
         let source_root = source_repo_root();
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -446,6 +448,7 @@ mod tests {
         fs::write(root.join("ci/expected-e2e-plan.json"), "{}\n").expect("write plan fixture");
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n")
             .expect("write root manifest fixture");
+        fs::write(root.join("Cargo.lock"), ROOT_LOCK_FIXTURE).expect("write root lockfile fixture");
         fs::write(
             root.join("liteinst-runtime-build/Cargo.toml"),
             "[workspace]\nmembers = []\n",
@@ -781,6 +784,64 @@ esac
             assert!(!published.join("stamp").exists());
             assert!(!published.join("manifest.tsv").exists());
         }
+    }
+
+    #[test]
+    fn production_prepare_checks_against_the_committed_lockfile() {
+        let fixture = production_fixture(FetchMutation::None);
+        write_executable(
+            &fixture.fake_bin.join("cargo"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+command_name=${1:?}
+shift
+manifest=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --manifest-path) manifest=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case $command_name in
+    metadata)
+        for package_manifest in "${manifest%/*}"/*/Cargo.toml; do
+            jq -n --arg manifest "$package_manifest" \
+                '{packages: [{manifest_path: $manifest, targets: [{kind: ["bin"], name: "fixture"}]}]}'
+        done
+        ;;
+    clippy)
+        [[ -n $manifest ]] || exit 0
+        printf 'clippy-lock:' >>"${FIXTURE_JOURNAL:?}"
+        cat "${manifest%/*}/Cargo.lock" >>"$FIXTURE_JOURNAL"
+        exit 1
+        ;;
+    *) echo "unexpected fixture cargo command: $command_name" >&2; exit 99 ;;
+esac
+"#,
+        );
+        let path = env::join_paths(
+            std::iter::once(fixture.fake_bin.clone())
+                .chain(env::split_paths(&env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut producer = Command::new(fixture.root.join("ci/prepare-rust-scripts.sh"));
+        let output = without_repository_location(&mut producer)
+            .current_dir(&fixture.root)
+            .env("PATH", path)
+            .env(
+                "HERMIT_REAL_RUST_SCRIPT",
+                fixture.fake_bin.join("rust-script"),
+            )
+            .env("FIXTURE_JOURNAL", &fixture.journal)
+            .output()
+            .expect("run real producer with lock-recording cargo fixture");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        let journal = fs::read_to_string(&fixture.journal).unwrap_or_default();
+        assert!(
+            journal.contains(&format!("clippy-lock:{ROOT_LOCK_FIXTURE}")),
+            "the generated workspace must resolve from the committed lockfile: {journal}"
+        );
     }
 
     #[test]
