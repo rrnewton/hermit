@@ -3997,8 +3997,8 @@ fn compile_clock_fixture(root: &Path, evidence_dir: &Path) -> Result<PathBuf, St
 
 /// The parity verdict is the strict leg's fixed-epoch clock trajectory. The
 /// `/bin/true` record leg is a record/replay smoke case only: record mode reports
-/// no runtime and currently refuses the fixture's clock_gettime, so it cannot
-/// carry clock evidence.
+/// no runtime and leaves time real (record/replay does not virtualize time), so
+/// it cannot carry fixed-epoch clock evidence.
 fn behavioral_parity(
     root: &Path,
     safehermit: &Path,

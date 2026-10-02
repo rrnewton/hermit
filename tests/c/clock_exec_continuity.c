@@ -43,7 +43,8 @@
  * guard a source of false reds rather than a detector of the defect. For the
  * same reason the work segments only assert that time advanced: exact costs
  * depend on the epoch, the timeslice, and the backend, none of which this
- * program controls. (Record mode currently refuses its clock_gettime.) Exact
+ * program controls. (Record mode leaves time real, so its reads are host time
+ * that replay returns from the recording.) Exact
  * virtual-time relations between segments belong to callers that pin those
  * inputs and compare whole trajectories.
  *

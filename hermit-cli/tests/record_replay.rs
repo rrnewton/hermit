@@ -2129,6 +2129,20 @@ fn record_timer_slack_proc_read_write() {
     );
 }
 
+/// Record mode leaves time real, so the guest prints host clock values. Strict
+/// parity therefore requires every gettimeofday, time and clock_gettime syscall
+/// to be recorded and served back by the replayer rather than refused or
+/// re-executed live.
+#[test]
+fn record_raw_clock_syscalls_replay_recorded_values() {
+    let _guard = hermit_record_lock();
+    record_replay_strict_command(
+        "raw clock syscalls",
+        &workload("c_record_replay_clock_reads").path,
+        &[],
+    );
+}
+
 macro_rules! record_replay_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(

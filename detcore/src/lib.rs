@@ -373,6 +373,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// Services a clock read when Detcore does not virtualize time.
+    ///
+    /// Record/replay leaves time real by design (see `record_or_replay_config`
+    /// in hermit-cli). The recorder captures the value the guest observed and
+    /// the replayer returns it, so these reads go to that layer like any other
+    /// passthrough syscall. Without record/replay there is nothing to make the
+    /// host value reproducible, and the unsupported-syscall policy applies.
+    async fn handle_unvirtualized_clock_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        dettid: DetTid,
+        panic_on_unsupported_syscalls: bool,
+    ) -> Result<i64, Error> {
+        if self.cfg.recordreplay_modes {
+            self.passthrough(guest, call).await
+        } else {
+            self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
+                .await
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-643): Review unsupported-syscall reporting and fail-fast behavior.
     /// Applies the legacy policy to an explicitly listed but unsupported syscall.
@@ -2445,7 +2467,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_gettimeofday(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
+                        self.handle_unvirtualized_clock_read(
                             guest,
                             call,
                             dettid,
@@ -2458,7 +2480,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_time(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
+                        self.handle_unvirtualized_clock_read(
                             guest,
                             call,
                             dettid,
@@ -2471,7 +2493,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_clock_gettime(guest, s).await
                     } else {
-                        self.handle_unsupported_syscall(
+                        self.handle_unvirtualized_clock_read(
                             guest,
                             call,
                             dettid,
@@ -2481,7 +2503,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     }
                 }
                 Syscall::ClockGetres(s) => {
-                    if virtualize_time {
+                    // The reported resolution is a constant that reads no
+                    // clock, so record and replay compute the same value
+                    // without a recorded event.
+                    if virtualize_time || self.cfg.recordreplay_modes {
                         self.handle_clock_getres(guest, s).await
                     } else {
                         self.handle_unsupported_syscall(

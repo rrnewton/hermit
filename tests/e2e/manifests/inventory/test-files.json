@@ -1430,6 +1430,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_clock_reads.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_clock_reads.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this guest and requires strict record/replay parity while it prints host gettimeofday, time and clock_gettime values, so every raw clock syscall must be recorded and served back by the replayer."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_deep_fork_chain.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_deep_fork_chain.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and asserts recording-stream behavior across a deep fork chain, including lifecycle setup not represented by a generic manifest row."
