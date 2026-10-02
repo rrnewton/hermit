@@ -5123,7 +5123,7 @@ async fn guest_v4_replay_reentry_rechecks_registered_mm_root_and_normal_grant() 
                 format!(
                     "shared network engine refused operation: {}",
                     if variant == 1 {
-                        "foreground ctl requires unchanged single-root lineage"
+                        "foreground ctl lineage was revoked by an unsupported physical owner"
                     } else {
                         "Replay selection changed actual task/MM metadata"
                     }

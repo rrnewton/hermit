@@ -646,7 +646,8 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let path = root.join(format!(
-            "process-group-{}-{}",
+            "process-group-{}-{}-{}",
+            module_path!(),
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

@@ -536,7 +536,9 @@ fn foreground_epoll_requires_actual_normal_grant_and_unchanged_initial_projectio
         .unwrap()
         .birth_sequences
         .insert((owner.thread, owner.mm), 1);
-    assert!(s.foreground_epoll_observation(owner, &root).is_err());
+    // Birth history disqualifies V4's sole-root policy, not the unchanged
+    // generic task projection. The separate projection controls cover epoll.
+    assert!(s.foreground_native_observation(owner, &root).is_err());
     s.thread_tree
         .process_wait
         .get_mut(&owner.thread)
@@ -545,6 +547,122 @@ fn foreground_epoll_requires_actual_normal_grant_and_unchanged_initial_projectio
         .clear();
     post(&mut s, owner, Resources::new(owner.thread));
     assert!(s.foreground_epoll_observation(owner, &root).is_err());
+}
+
+#[test]
+fn foreground_epoll_refuses_missing_or_changed_current_task_projection() {
+    use crate::network_runtime::native_birth_outcome::NativeTaskProjection;
+
+    // These are controlled census mutations, not observed kernel births. Each
+    // case retains the actual grant/registration and changes only its projection.
+    for field in ["missing", "provider", "task", "start"] {
+        let (mut s, root, _metadata, _memory) = native_capture_entry_fixture();
+        let owner = root.owner();
+        let response = post(&mut s, owner, Resources::new(owner.thread));
+        grant(&mut s, owner);
+        assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+        let epoch = s
+            .foreground_epoll_observation(owner, &root)
+            .unwrap()
+            .epoch();
+        assert!(s.foreground_native_observation(owner, &root).is_ok());
+        let before = (s.turn, s.committed_time);
+        let saved = s
+            .thread_tree
+            .process_wait
+            .get_mut(&owner.thread)
+            .unwrap()
+            .native_projections
+            .pop()
+            .unwrap();
+        assert!(
+            s.thread_tree.process_wait[&owner.thread]
+                .native_projections
+                .is_empty()
+        );
+        if field != "missing" {
+            let changed = crate::network_runtime::changed_initial_root_fixture(
+                root.association(),
+                field,
+            );
+            let registration = crate::scheduler::InitialRootRegistration {
+                owner,
+                process: s.registered_process(owner.thread).unwrap(),
+                raw_process: root.process(),
+                _pin: &s.physical_thread_pidfds[&owner.thread].3,
+            };
+            let changed =
+                NativeTaskProjection::from_initial_root(&changed, &registration).unwrap();
+            assert_eq!(changed.thread(), owner.thread);
+            assert!(!changed.matches_foreground_identity(owner, root.native_identity()));
+            s.thread_tree
+                .process_wait
+                .get_mut(&owner.thread)
+                .unwrap()
+                .native_projections
+                .push(changed);
+        }
+        assert_eq!(s.ordinary_fd_observation(owner).unwrap().epoch(), epoch);
+        assert_eq!(
+            s.foreground_epoll_observation(owner, &root)
+                .unwrap_err()
+                .to_string(),
+            "native observation lacks an unchanged task projection",
+            "projection {field}",
+        );
+        assert_eq!((s.turn, s.committed_time), before);
+        let projections = &mut s
+            .thread_tree
+            .process_wait
+            .get_mut(&owner.thread)
+            .unwrap()
+            .native_projections;
+        projections.clear();
+        projections.push(saved);
+        assert_eq!(
+            s.foreground_epoll_observation(owner, &root)
+                .unwrap()
+                .epoch(),
+            epoch
+        );
+        assert!(s.foreground_native_observation(owner, &root).is_ok());
+        assert_eq!((s.turn, s.committed_time), before);
+    }
+}
+
+#[test]
+fn foreground_epoll_birth_bookkeeping_never_lends_v4_sole_root_authority() {
+    let (mut s, root, _metadata, _memory) = native_capture_entry_fixture();
+    let owner = root.owner();
+    let response = post(&mut s, owner, Resources::new(owner.thread));
+    grant(&mut s, owner);
+    assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+    let epoch = s
+        .foreground_epoll_observation(owner, &root)
+        .unwrap()
+        .epoch();
+    assert!(
+        s.foreground_native_observation(owner, &root)
+            .unwrap()
+            .admits_sole_initial_root(&root)
+    );
+    let before = (s.turn, s.committed_time);
+    s.thread_tree
+        .process_wait
+        .get_mut(&owner.thread)
+        .unwrap()
+        .birth_sequences
+        .insert((owner.thread, owner.mm), 1);
+    let generic = s.foreground_epoll_observation(owner, &root).unwrap();
+    assert_eq!(generic.epoch(), epoch);
+    assert!(!generic.admits_sole_initial_root(&root));
+    assert_eq!(
+        s.foreground_native_observation(owner, &root)
+            .unwrap_err()
+            .to_string(),
+        "native observation lacks unchanged sole initial root",
+    );
+    assert_eq!((s.turn, s.committed_time), before);
 }
 
 fn native_capture_entry_fixture() -> (
