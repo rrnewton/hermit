@@ -158,6 +158,22 @@ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+/// Runs a DBT cell's harness as uid 0 in a user namespace of its own, which
+/// owns a mount namespace of its own: the same shape as canonical validation's
+/// rootless `podman run --privileged` pinned root.
+///
+/// Every cell requests a fresh [`HERMETIC_TEST_WORKDIR`]. The other backends
+/// mount that tmpfs inside Hermit's own container. The DBT adapter refuses
+/// `--mount`, and Hermit mounts the tmpfs itself in a new mount namespace
+/// (`common/test-workdir`, `with_isolated_workdir`), which needs CAP_SYS_ADMIN
+/// in the user namespace that owns the caller. Run directly on the host, every
+/// DBT cell failed before its guest started with "unshare mount namespace:
+/// Operation not permitted" (289 of 289 cells;
+/// https://github.com/rrnewton/hermit/issues/3392). Without `--fork`, `unshare`
+/// replaces itself with the harness in the same process, so its cgroup,
+/// timeout and kill path are unchanged. Unlike podman it maps only uid and gid
+/// 0, and `/test` must already exist on the host.
+const DBT_NAMESPACE_WRAPPER: &str = "unshare --user --map-root-user --mount --";
 const DEFAULT_MANIFEST_GUEST_CAP: i64 = 4;
 const DEFAULT_KVM_GUEST_CAP: i64 = 4;
 const PORTABLE_CELL_MEMORY_BYTES: i64 = 3 * 1024 * 1024 * 1024;
@@ -779,6 +795,16 @@ fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The prefix a cell's harness command starts with: [`DBT_NAMESPACE_WRAPPER`]
+/// for a DBT cell, nothing for any other backend.
+fn dbt_namespace_prefix(backend: &str) -> String {
+    if backend == "dbt" {
+        format!("{DBT_NAMESPACE_WRAPPER} ")
+    } else {
+        String::new()
+    }
 }
 
 fn population_label(green: bool, probe_disabled: bool) -> &'static str {
@@ -4512,6 +4538,7 @@ fn write_plan_after_scorecard_check(
             } else {
                 ""
             };
+            let namespaces = dbt_namespace_prefix(&cell.backend);
             let harness = if selection.is_exact() {
                 let prebuilt = if selection.uses_shared_preparation() {
                     " --prebuilt"
@@ -4519,7 +4546,7 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "{hermit_bin} target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{hermit_bin} {namespaces}target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     hermit_bin = EXACT_CELL_HERMIT_BIN,
                     selector = selector,
                     prebuilt = prebuilt,
@@ -4532,7 +4559,7 @@ fn write_plan_after_scorecard_check(
                 )
             } else {
                 format!(
-                    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{namespaces}./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
                     no_retry = no_retry,
                     test = shell_quote(&cell.test),
@@ -9522,6 +9549,163 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
     Ok(())
 }
 
+/// A DBT cell's harness, and no other cell's, starts under
+/// [`DBT_NAMESPACE_WRAPPER`], in both harness forms: an exact cell launches
+/// `target/debug/test-harness` directly, and a batch launches it through
+/// `ci/run-with-hermit-e2e-artifact.sh`. Every cell still requests the
+/// hermetic workdir, so the wrapper supplies the capability that request needs
+/// instead of replacing it.
+fn dbt_namespace_wrapper_self_test(
+    root: &Path,
+    checked_scorecard: &CheckedScorecard<'_>,
+    scratch: &Path,
+    green_batch_dag: &DagConfig,
+) -> Result<(), String> {
+    for backend in ["ptrace", "kvm", "liteinst", "sabre", "native"] {
+        if !dbt_namespace_prefix(backend).is_empty() {
+            return Err(format!(
+                "a {backend} cell would run under the DBT namespace wrapper"
+            ));
+        }
+    }
+    if dbt_namespace_prefix("dbt") != format!("{DBT_NAMESPACE_WRAPPER} ") {
+        return Err("a DBT cell no longer runs under the namespace wrapper".into());
+    }
+    let wrapped_exact =
+        format!("{EXACT_CELL_HERMIT_BIN} {DBT_NAMESPACE_WRAPPER} target/debug/test-harness run ");
+    let wrapped_batch = format!(
+        "{DBT_NAMESPACE_WRAPPER} ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run "
+    );
+    let check = |step: &Step, wrapped_form: &str, dbt: bool| -> Result<(), String> {
+        let wrapped =
+            step.cmd.contains(wrapped_form) && step.cmd.matches(DBT_NAMESPACE_WRAPPER).count() == 1;
+        let unwrapped = !step.cmd.contains("unshare");
+        let workdir = step.env.get(HERMETIC_TEST_WORKDIR_ENV).map(String::as_str)
+            == Some(HERMETIC_TEST_WORKDIR);
+        if (if dbt { wrapped } else { unwrapped }) && workdir {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} {} the DBT namespace wrapper or lost {HERMETIC_TEST_WORKDIR_ENV}={HERMETIC_TEST_WORKDIR}: {}",
+                step.tag(),
+                if dbt { "lacks" } else { "carries" },
+                step.cmd
+            ))
+        }
+    };
+    let one_cell_step = |name: &str, dag: &DagConfig| -> Result<Step, String> {
+        let cells: Vec<_> = dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .collect();
+        match cells.as_slice() {
+            [step] => Ok((*step).clone()),
+            _ => Err(format!("{name} has {} cell steps, not one", cells.len())),
+        }
+    };
+    let batch_is_dbt = |step: &Step| step.cmd.contains("--backend 'dbt'");
+    // One verify cell of each kind, red when the red population has one and
+    // green otherwise, so the check does not depend on how many DBT cells are
+    // green today.
+    let red = pressure_cells(root, &CellSelection::default())?;
+    let green = pressure_cells(
+        root,
+        &CellSelection {
+            green: true,
+            repetitions: Some(1),
+            ..CellSelection::default()
+        },
+    )?;
+    for dbt in [true, false] {
+        let (cell, green_population) = red
+            .selected
+            .iter()
+            .map(|cell| (cell, false))
+            .chain(green.selected.iter().map(|cell| (cell, true)))
+            .find(|(cell, _)| cell.id.mode == "verify" && (cell.id.backend == "dbt") == dbt)
+            .ok_or_else(|| {
+                format!(
+                    "self-test needs one executable {} verify cell, red or green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                )
+            })?;
+        let plan = |form: &str, selection: &CellSelection| {
+            let results = scratch.join(format!("namespace-wrapper-{form}-{}", cell.id.backend));
+            write_plan_after_scorecard_check(
+                checked_scorecard,
+                &results,
+                &results.join("dag.json"),
+                selection,
+            )
+            .map(|(_, dag)| dag)
+        };
+        let exact = plan(
+            "exact",
+            &CellSelection {
+                green: green_population,
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: Some(cell.id.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                ..CellSelection::default()
+            },
+        )?;
+        let label = display_id(&cell.id);
+        check(
+            &one_cell_step(&format!("exact plan for {label}"), &exact)?,
+            &wrapped_exact,
+            dbt,
+        )?;
+        if green_population {
+            // Every green cell is in the green batch, which is checked below.
+            if !green_batch_dag
+                .steps
+                .iter()
+                .any(|step| step.group == "cell" && batch_is_dbt(step) == dbt)
+            {
+                return Err(format!(
+                    "green batch has no {} cell step, although {label} is green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                ));
+            }
+        } else {
+            let cells_file = scratch.join(format!("namespace-wrapper-{}.jsonl", cell.id.backend));
+            fs::write(
+                &cells_file,
+                canonical_cells_jsonl(std::slice::from_ref(&cell.id))?,
+            )
+            .map_err(|error| error.to_string())?;
+            let batch = plan(
+                "batch",
+                &CellSelection {
+                    cells_file: Some(cells_file),
+                    repetitions: Some(1),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )?;
+            let step = one_cell_step(&format!("cells-file plan for {label}"), &batch)?;
+            if batch_is_dbt(&step) != dbt {
+                return Err(format!(
+                    "cells-file plan for {label} selected another backend"
+                ));
+            }
+            check(&step, &wrapped_batch, dbt)?;
+        }
+    }
+    // The complete green batch: every backend and mode.
+    for step in green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+    {
+        check(step, &wrapped_batch, batch_is_dbt(step))?;
+    }
+    Ok(())
+}
+
 fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
     let tracked = load_tracked_cells(root)?;
     let budgets = load_budgets(root)?;
@@ -12907,6 +13091,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    dbt_namespace_wrapper_self_test(root, &checked_scorecard, &scratch, &green_batch_dag)?;
     let mut missing_green_artifact = green_batch_dag.clone();
     missing_green_artifact
         .steps
