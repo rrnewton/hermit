@@ -157,6 +157,8 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     if routing not in ["hybrid", "local"]:
         fail("-c hermit_e2e.routing must be hybrid or local, got " + routing)
     pmu_on_re = read_root_config("hermit_e2e", "pmu_on_re", "true") == "true"
+    # -c hermit_e2e.nonce=X gives every cell a fresh action digest: a cache-busting rerun.
+    nonce = read_root_config("hermit_e2e", "nonce", "")
     if plan["schema"] != 1:
         fail("expected-e2e-plan.json schema must be 1")
     by_route = {"local": [], "re": []}
@@ -170,10 +172,10 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
             runner = runner,
             args = [cell["test"], cell["mode"], cell["backend"]],
             bundle = bundle,
-            env = {
+            env = dict({
                 "HERMIT_E2E_ROUTE": where,
                 "HERMIT_E2E_ROUTE_REASON": reason,
-            },
+            }, **({"HERMIT_E2E_NONCE": nonce} if nonce else {})),
             labels = [
                 "tpx-enable-artifact-reporting",
                 "hermit_e2e",

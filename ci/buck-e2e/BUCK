@@ -17,12 +17,16 @@ oncall("hermit")
     for part in ["bin", "build", "hermit", "install", "run-state", "src", "SOURCE_SHA"]
 ]
 
-# -c hermit_e2e.hermit=staged runs the cells with the staged (cargo-built) hermit instead
-# of //hermit-cli:hermit, e.g. to compare against a cargo validate profile build.
+# Which hermit the cells run (-c hermit_e2e.hermit=...):
+#   release  //hermit-cli:hermit-release, the feature-complete release build (default; needs
+#            the -c hermit_release.* provenance values, see scripts/build-buck-release.rs)
+#   debug    //hermit-cli:hermit (default features only: no dbt/sabre/e9patch backends)
+#   staged   the staged cargo-built hermit, e.g. to compare against a cargo build
 _HERMIT = {
-    "buck": "//hermit-cli:hermit",
+    "debug": "//hermit-cli:hermit",
+    "release": "//hermit-cli:hermit-release",
     "staged": ":staged-hermit",
-}[read_root_config("hermit_e2e", "hermit", "buck")]
+}[read_root_config("hermit_e2e", "hermit", "release")]
 
 hermit_e2e_bundle(
     name = "bundle",
