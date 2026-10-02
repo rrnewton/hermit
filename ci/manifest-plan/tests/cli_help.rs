@@ -35,7 +35,18 @@ fn run_from(binary: &str, arguments: &[&str], current_dir: Option<&Path>) -> Out
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
-    command.output().expect("failed to execute manifest CLI")
+    // A test that copies an executable and runs it can see ETXTBSY: while the
+    // copy is open for writing, a sibling test's fork briefly holds that
+    // descriptor until its child execs. The window closes within milliseconds.
+    for _ in 0..100 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            output => return output.expect("failed to execute manifest CLI"),
+        }
+    }
+    panic!("{binary} stayed busy (ETXTBSY) for a second");
 }
 
 fn assert_help(binary: &str, name: &str, current_dir: &Path) {
@@ -336,6 +347,81 @@ fn help_does_not_turn_missing_or_unknown_arguments_into_success() {
             "{args:?}: {output:?}"
         );
     }
+}
+
+/// The source-snapshot flags redirect a caller who uses them where they do not
+/// apply, and --repo-root reaches expected-plan too, from a Git-less snapshot.
+#[test]
+fn test_harness_source_snapshot_flags_redirect_misuse() {
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+    for (arguments, expected) in [
+        (vec!["plan", "--source-sha", sha], "pass --repo-root DIR"),
+        (
+            vec!["run", "--repo-root", ".", "--source-sha", "03bbb835"],
+            "--source-sha must be a full 40-digit",
+        ),
+        (
+            vec!["plan", "--tpx-json", "/nonexistent/tpx.jsonl"],
+            "--tpx-json is accepted by run only",
+        ),
+        (
+            vec!["expected-plan", "--format", "json"],
+            "expected-plan accepts only --repo-root DIR and --source-sha SHA",
+        ),
+        (
+            vec!["plan", "--repo-root", "/nonexistent-hermit-root"],
+            "name an existing Hermit source tree",
+        ),
+    ] {
+        let output = run(harness, &arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
+    }
+    let root = env!("CARGO_MANIFEST_DIR").to_string() + "/../..";
+    let default = run(harness, &["expected-plan"]);
+    let rooted = run(harness, &["expected-plan", "--repo-root", &root]);
+    assert!(
+        default.status.success() && rooted.status.success(),
+        "{default:?} {rooted:?}"
+    );
+    assert_eq!(default.stdout, rooted.stdout);
+
+    // A `git archive` of HEAD has no .git: without --source-sha the planner's
+    // inventory check redirects to it; with it, the plan is printed.
+    let snapshot = non_repository_dir("source-snapshot-plan");
+    let archived = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "git -C '{root}' archive HEAD | tar x -C '{}'",
+            snapshot.display()
+        ))
+        .status()
+        .expect("run git archive");
+    assert!(archived.success());
+    let head = std::process::Command::new("git")
+        .args(["-C", &root, "rev-parse", "HEAD"])
+        .output()
+        .expect("run git rev-parse");
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    let snapshot_root = snapshot.to_str().unwrap();
+    let refused = run(harness, &["expected-plan", "--repo-root", snapshot_root]);
+    let planned = run(
+        harness,
+        &[
+            "expected-plan",
+            "--repo-root",
+            snapshot_root,
+            "--source-sha",
+            &head,
+        ],
+    );
+    std::fs::remove_dir_all(&snapshot).expect("remove snapshot");
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("pass --source-snapshot"));
+    assert!(planned.status.success(), "{planned:?}");
+    assert!(String::from_utf8_lossy(&planned.stdout).contains("\"cells\""));
 }
 
 /// `run --parity-reference ptrace` used to add a ptrace reference run whose

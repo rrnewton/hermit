@@ -100,8 +100,8 @@ Source options:
   --repo-root <DIR>                Read manifests and programs from DIR and run hermit
                                    there (default: the checkout this binary was built in)
   --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
-                                   metadata: record SHA as hermit_sha instead of asking
-                                   git (build, audit-compile, and run only)
+                                   metadata: take the test inventory from its files and
+                                   record SHA as hermit_sha instead of asking git
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
@@ -183,7 +183,8 @@ const REPO_ROOT_OPTION: &str =
 
 const SOURCE_SHA_OPTION: &str =
     "  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
-                                   metadata: record SHA as hermit_sha instead of asking git";
+                                   metadata: take the test inventory from its files and
+                                   record SHA as hermit_sha instead of asking git";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -298,13 +299,7 @@ fn print_command_help(command: &str) -> bool {
     if !options.is_empty() {
         println!("{options}");
     }
-    println!("{REPO_ROOT_OPTION}");
-    if matches!(
-        environment,
-        CommandEnvironment::Execution | CommandEnvironment::Run
-    ) {
-        println!("{SOURCE_SHA_OPTION}");
-    }
+    println!("{REPO_ROOT_OPTION}\n{SOURCE_SHA_OPTION}");
     println!("  -h, --help                       Print this help");
     if matches!(
         environment,
@@ -809,9 +804,6 @@ fn validate_args(command: &str, args: &Args) {
         fail("--tpx-json is accepted by run only");
     }
     if let Some(sha) = args.source_sha.as_deref() {
-        if !matches!(command, "build" | "audit-compile" | "run") {
-            fail("--source-sha is accepted by build, audit-compile, and run only");
-        }
         if args.repo_root.is_none() {
             fail(
                 "--source-sha describes a --repo-root source snapshot; pass --repo-root DIR \
@@ -887,8 +879,12 @@ fn main() -> ExitCode {
     if command == "selftest" {
         return run_tool_self_test(&values);
     }
-    if command == "expected-plan" && !values.is_empty() {
-        fail("expected-plan accepts no options");
+    if command == "expected-plan"
+        && !values.chunks(2).all(
+            |pair| matches!(pair, [flag, _] if flag == "--repo-root" || flag == "--source-sha"),
+        )
+    {
+        fail("expected-plan accepts only --repo-root DIR and --source-sha SHA");
     }
     let args = parse(values.into_iter());
     validate_args(&command, &args);
