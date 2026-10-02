@@ -79,6 +79,16 @@ struct Call {
     terminal: Option<crate::network_replay::native_terminal::Admission>,
 }
 
+// An explicit component-test provider premise on this non-Clone runtime.
+// Keep the slot after taking its engine so neither rearming nor reuse works.
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct ControlledPrivateDrain {
+    owner: NetworkStreamOwner,
+    call: NetworkStreamCallId,
+    engine: Option<std::sync::Arc<std::sync::Mutex<crate::network_replay::NetworkReplayEngine>>>,
+}
+
 type OriginalAdmission = crate::network_replay::original_connect::Admission;
 type OriginalPin = crate::network_replay::original_connect::Pin;
 
@@ -2414,6 +2424,30 @@ impl super::NetworkRuntimeResources {
         &self,
         full: crate::network_replay::FullStoreCompletion,
     ) -> io::Result<Observation> {
+        #[cfg(test)]
+        {
+            let engine = {
+                let mut fixture = self.controlled_private_drain.lock().unwrap();
+                match fixture.as_mut() {
+                    None => None,
+                    Some(fixture) => {
+                        if fixture.owner != full.store().owner()
+                            || fixture.call != full.store().call()
+                        {
+                            return Err(io::Error::other("controlled Drain changed owner/Call"));
+                        }
+                        Some(fixture.engine.take().ok_or_else(|| {
+                            io::Error::other("controlled Drain was already consumed")
+                        })?)
+                    }
+                }
+            }; // Never hold the fixture mutex across the real worker/join.
+            if let Some(engine) = engine {
+                return self
+                    .controlled_private_drain(full, engine, 5, "none", true)
+                    .await;
+            }
+        }
         self.shared.execute_private_receive_drain(full).await
     }
 
@@ -2517,6 +2551,55 @@ impl ConfirmedPrivateDrain<'_> {
 
 #[cfg(test)]
 impl super::NetworkRuntimeResources {
+    /// Opt in once for this actual held Call. This supplies only controlled
+    /// provider geometry; the existing helper still performs the real Drain,
+    /// retains its exact result and joins its original worker.
+    pub(crate) fn arm_controlled_private_drain(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        engine: std::sync::Arc<std::sync::Mutex<crate::network_replay::NetworkReplayEngine>>,
+    ) -> io::Result<()> {
+        let mut fixture = self.controlled_private_drain.lock().unwrap();
+        if fixture.is_some() {
+            return Err(io::Error::other("controlled Drain cannot be rearmed"));
+        }
+        let mut calls = self.shared.native_streams.lock().unwrap();
+        let actual = calls.owned(owner, call)?;
+        if actual.original.is_none()
+            || actual.releasing
+            || actual.release.is_some()
+            || actual.terminal.is_some()
+            || actual
+                .publication
+                .as_ref()
+                .is_none_or(|publication| !std::ptr::eq(publication.engine(), engine.as_ref()))
+        {
+            return Err(io::Error::other(
+                "controlled Drain lacks its held Call/engine",
+            ));
+        }
+        *fixture = Some(ControlledPrivateDrain {
+            owner,
+            call,
+            engine: Some(engine),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn controlled_private_drain_consumed(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> io::Result<bool> {
+        let fixture = self.controlled_private_drain.lock().unwrap();
+        let fixture = fixture
+            .as_ref()
+            .filter(|fixture| fixture.owner == owner && fixture.call == call)
+            .ok_or_else(|| io::Error::other("controlled Drain lacks its exact fixture"))?;
+        Ok(fixture.engine.is_none())
+    }
+
     pub(crate) fn private_receive_original_fixture_fd(
         &self,
         owner: NetworkStreamOwner,

@@ -136,15 +136,11 @@ impl NetworkReplayEngine {
         if self.stream_role(channel)? == NetworkEndpointRoleV2::Listener {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
-        // General low-water/timeout handling needs a partial-completion
-        // transaction for EOF, error, deadline and signal, not just a readiness
-        // threshold. Until that is qualified, refuse before selecting or
-        // reserving a source (including direct reservation and revalidation).
-        let socket = self.stream_call_socket_state(owner, call)?;
-        if socket.options.receive_low_water != 1
-            || socket.options.receive_timeout
-                != detcore_model::network_trace::ReceiveTimeoutV3::Infinite
-        {
+        // Finite timeout admission requires the original Call's privately
+        // issued low-water-one policy. Unqualified model callers retain the
+        // old low-water-one/infinite-only contract. General low-water handling
+        // still needs partial-completion authority, not just readiness.
+        if !self.receive_profile_qualified(owner, call)? {
             return Err(invalid(
                 "Replay scalar store requires its qualified low-water/timeout profile",
             ));
@@ -155,6 +151,7 @@ impl NetworkReplayEngine {
         Ok((open_file, channel))
     }
 
+    #[cfg(test)]
     pub(crate) fn plan_replay_receive(
         &self,
         owner: NetworkStreamOwner,
@@ -162,10 +159,21 @@ impl NetworkReplayEngine {
         maximum: usize,
         nonblocking: bool,
     ) -> Result<ReplayReceivePlan, NetworkReplayError> {
+        self.plan_replay_receive_at(owner, call, maximum, nonblocking, None)
+    }
+
+    pub(crate) fn plan_replay_receive_at(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        maximum: usize,
+        nonblocking: bool,
+        now: Option<LogicalTime>,
+    ) -> Result<ReplayReceivePlan, NetworkReplayError> {
         let (_, channel) = self.check_replay_receive_call(owner, call, maximum)?;
         let bytes = plain_prefix(&self.channels[&channel], maximum)?;
         if bytes.is_empty() {
-            self.plan_replay_no_store(owner, call, maximum, nonblocking)
+            self.plan_replay_no_store(owner, call, maximum, nonblocking, now)
         } else {
             Ok(ReplayReceivePlan::Bytes(ReplayBytesPlan {
                 owner,

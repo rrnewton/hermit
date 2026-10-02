@@ -242,6 +242,75 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
+    pub(crate) fn bind_saved_receive_policy(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        policy: Arc<crate::tool_global::SavedReceivePolicy>,
+    ) -> Result<(), NetworkReplayError> {
+        self.check_native_retirement()?;
+        let state = self.owned_stream_call(owner, call)?;
+        let open_file = self.stream_call_open_file(owner, call)?;
+        if !self.native_receive_version()
+            || state.phase != StreamCallPhase::Active
+            || state.abandoned
+            || state.final_wait
+            || state.terminal_evidence.is_some()
+            || state.capture_publication.is_some()
+            || state.capture_control.is_some()
+            || state.original.is_some()
+            || state.receive_policy.is_some()
+            || state.helper_copy.is_some()
+            || !state.native_receive.is_empty()
+            || state.private_receive.is_some()
+            || state.record_no_store.is_some()
+            || state.no_store_completed
+            || state.replay_receive.is_some()
+            || state.foreground_store.is_some()
+            || state.private_drain.is_some()
+            || !policy.matches(owner, call, open_file)
+            || self.shadow_probes.values().any(|probe| probe.call == call)
+        {
+            return Err(invalid(
+                "saved receive policy requires its untouched original Call",
+            ));
+        }
+        self.stream_calls.get_mut(&call).unwrap().receive_policy = Some(policy);
+        Ok(())
+    }
+
+    pub(crate) fn saved_receive_policy(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<Option<Arc<crate::tool_global::SavedReceivePolicy>>, NetworkReplayError> {
+        let state = self.owned_stream_call(owner, call)?;
+        let open_file = self.stream_call_open_file(owner, call)?;
+        if state
+            .receive_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.matches(owner, call, open_file))
+        {
+            return Err(invalid("saved receive policy lost its original Call/root"));
+        }
+        Ok(state.receive_policy.clone())
+    }
+
+    /// Legacy direct model callers retain their original restrictive contract.
+    /// Only the actual local issuer can admit a saved finite policy.
+    pub(super) fn receive_profile_qualified(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<bool, NetworkReplayError> {
+        if self.saved_receive_policy(owner, call)?.is_some() {
+            return Ok(true);
+        }
+        let socket = self.stream_call_socket_state(owner, call)?;
+        Ok(socket.options.receive_low_water == 1
+            && socket.options.receive_timeout == ReceiveTimeoutV3::Infinite)
+    }
+
     /// A completed canonical empty attempt is the sole predecessor for rearm.
     /// The initial-entry marker remains spent for the entire Call lifetime.
     pub(crate) fn validate_native_receive_retry(
@@ -262,7 +331,6 @@ impl NetworkReplayEngine {
             .open_file
             .ok_or_else(|| invalid("receive retry lost held OFD"))?;
         let channel = &self.channels[&self.bound_channel(open_file)?];
-        let socket = self.stream_call_socket_state(retry.owner(), retry.call())?;
         if self.stream_calls.len() != 1
             || state.phase != StreamCallPhase::Active
             || !state.physical_pin_required
@@ -299,8 +367,7 @@ impl NetworkReplayEngine {
             || channel.local_read_shutdown
             || channel.peer_write_closed
             || !channel.inbound.is_empty()
-            || socket.options.receive_low_water != 1
-            || socket.options.receive_timeout != ReceiveTimeoutV3::Infinite
+            || !self.receive_profile_qualified(retry.owner(), retry.call())?
         {
             return Err(invalid(
                 "receive retry changed its exact completed empty Call/root/entry",

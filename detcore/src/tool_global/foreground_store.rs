@@ -24,6 +24,64 @@ pub(crate) struct CheckedReadInvocation {
     call: crate::network_replay::NetworkStreamCall,
     failure: Option<NetworkRpcError>,
 }
+
+/// Immutable policy of one actual local Read admission. Numeric socket options
+/// alone cannot construct this permission to use the finite-timeout path.
+#[derive(Debug)]
+pub(crate) struct SavedReceivePolicy {
+    owner: NetworkStreamOwner,
+    call: crate::network_replay::NetworkStreamCallId,
+    open_file: OpenFileId,
+    root: Arc<crate::network_runtime::ForegroundRoot>,
+    raw: (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs),
+    nonblocking: bool,
+    started: LogicalTime,
+    deadline: Option<LogicalTime>,
+}
+
+impl PartialEq for SavedReceivePolicy {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for SavedReceivePolicy {}
+
+impl SavedReceivePolicy {
+    pub(crate) fn matches(
+        &self,
+        owner: NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        open_file: OpenFileId,
+    ) -> bool {
+        self.owner == owner
+            && self.call == call
+            && self.open_file == open_file
+            && self.root.is_current(owner)
+            && self.root.is_sole_initial_root(owner)
+    }
+
+    pub(crate) fn deadline(&self) -> Option<LogicalTime> {
+        self.deadline
+    }
+
+    pub(crate) fn expired(&self, now: LogicalTime) -> bool {
+        self.deadline.is_some_and(|end| now >= end)
+    }
+
+    pub(crate) fn started(&self) -> LogicalTime {
+        self.started
+    }
+
+    pub(crate) fn nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+
+    pub(crate) fn matches_span(&self, maximum: usize, destination: u64) -> bool {
+        self.raw.0 == reverie::syscalls::Sysno::read
+            && self.raw.1.arg1 as u64 == destination
+            && self.raw.1.arg2 == maximum
+    }
+}
 /// Borrowed from this live callback and its currently held scheduler grant.
 /// Only the checked blocking issuer below can construct it; a completed empty
 /// helper or joined prefix alone grants no authority to rearm the engine.
@@ -195,6 +253,18 @@ impl CheckedReadRange {
 
 #[cfg(test)]
 impl GlobalState {
+    /// Controlled original-range premise, followed by the production issuer.
+    /// Used only before the fixture creates its first physical probe.
+    pub(super) fn controlled_bind_receive_policy<T>(
+        &self,
+        invocation: &CheckedReadInvocation,
+        tid: Tid,
+        state: &crate::tool_local::ThreadState<T>,
+        read: reverie::syscalls::Read,
+    ) -> Result<(), NetworkRpcError> {
+        self.bind_saved_receive_policy(&invocation.range, tid, state, read, invocation.call)
+    }
+
     /// Controlled callback/range/flags premise for the actual helper transaction
     /// controls. This is not native backend original-entry evidence.
     pub(super) fn controlled_receive_invocation<T>(
@@ -256,6 +326,140 @@ impl GlobalState {
 }
 
 impl GlobalState {
+    /// Bind only after the actual original range, FD reader and local Call have
+    /// joined, and before the first helper probe or Replay selection. No RPC
+    /// carries this authority and no caller supplies the logical start time.
+    pub(crate) fn bind_saved_receive_policy<T>(
+        &self,
+        range: &CheckedReadRange,
+        tid: Tid,
+        state: &crate::tool_local::ThreadState<T>,
+        read: reverie::syscalls::Read,
+        call: crate::network_replay::NetworkStreamCall,
+    ) -> Result<(), NetworkRpcError> {
+        let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
+        range.check(self, tid, state, read)?;
+        let owner = range.root.owner();
+        let scheduler = self.sched.lock().unwrap();
+        let grant = scheduler
+            .foreground_native_observation(owner, &range.root)
+            .map_err(|e| fail(&e))?;
+        if grant.epoch() != range.epoch || call.open_file != range.open_file {
+            return Err(NetworkRpcError::internal(
+                "receive policy crossed original grant/OFD",
+            ));
+        }
+        let mut engine = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| NetworkRpcError::internal("receive policy engine absent"))?
+            .lock()
+            .unwrap();
+        let socket = engine
+            .stream_call_socket_state(owner, call.id)
+            .map_err(|e| fail(&e))?;
+        if socket.options.receive_low_water != 1 {
+            return Err(NetworkRpcError::internal(
+                "saved receive policy requires low-water one",
+            ));
+        }
+        let started = self.global_time.lock().unwrap().as_nanos();
+        let deadline = socket
+            .options
+            .receive_timeout
+            .duration(socket.normalization.hz)
+            .map(|duration| {
+                let nanos = u64::try_from(duration.as_nanos())
+                    .map_err(|_| NetworkRpcError::internal("receive timeout duration overflow"))?;
+                started
+                    .as_nanos()
+                    .checked_add(nanos)
+                    .filter(|end| *end != LogicalTime::INDEFINITE.as_nanos())
+                    .map(LogicalTime::from_nanos)
+                    .ok_or_else(|| NetworkRpcError::internal("receive deadline overflow"))
+            })
+            .transpose()?;
+        let policy = Arc::new(SavedReceivePolicy {
+            owner,
+            call: call.id,
+            open_file: call.open_file,
+            root: range.root.clone(),
+            raw: range.raw,
+            nonblocking: range.nonblocking,
+            started,
+            deadline,
+        });
+        engine
+            .bind_saved_receive_policy(owner, call.id, policy)
+            .map_err(|e| fail(&e))
+    }
+
+    pub(crate) fn saved_receive_policy<T>(
+        &self,
+        tid: Tid,
+        state: &crate::tool_local::ThreadState<T>,
+        read: reverie::syscalls::Read,
+        call: crate::network_replay::NetworkStreamCall,
+        nonblocking: bool,
+    ) -> Result<Option<Arc<SavedReceivePolicy>>, NetworkRpcError> {
+        use reverie::syscalls::SyscallInfo;
+        let owner = NetworkStreamOwner {
+            thread: state.dettid,
+            mm: state.mm_id,
+        };
+        let policy = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| NetworkRpcError::internal("receive policy engine absent"))?
+            .lock()
+            .unwrap()
+            .saved_receive_policy(owner, call.id)
+            .map_err(|e| NetworkRpcError::internal(e.to_string()))?;
+        if let Some(policy) = &policy
+            && (policy.raw != read.into_parts()
+                || policy.nonblocking != nonblocking
+                || !policy.matches(owner, call.id, call.open_file)
+                || tid.as_raw() != policy.root.association().process()
+                || !policy.root.matches_memory(&state.memory_metadata)
+                || !policy.root.matches_metadata(&state.file_metadata)
+                || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm))
+        {
+            return Err(NetworkRpcError::internal(
+                "saved receive policy changed original Read",
+            ));
+        }
+        Ok(policy)
+    }
+
+    pub(crate) fn receive_policy_expired(
+        &self,
+        policy: &Arc<SavedReceivePolicy>,
+    ) -> Result<bool, NetworkRpcError> {
+        let saved = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| NetworkRpcError::internal("receive policy engine absent"))?
+            .lock()
+            .unwrap()
+            .saved_receive_policy(policy.owner, policy.call)
+            .map_err(|e| NetworkRpcError::internal(e.to_string()))?;
+        if saved
+            .as_ref()
+            .is_none_or(|saved| !Arc::ptr_eq(saved, policy))
+        {
+            return Err(NetworkRpcError::internal(
+                "receive deadline lost its exact saved policy",
+            ));
+        }
+        let now = self.global_time.lock().unwrap().as_nanos();
+        if now < policy.started {
+            return Err(NetworkRpcError::internal(
+                "receive deadline clock precedes original start",
+            ));
+        }
+        Ok(policy.expired(now))
+    }
+
     fn checked_blocking_read_retry<'a, 's, T>(
         &self,
         tid: Tid,
@@ -888,11 +1092,29 @@ impl GlobalState {
                 .foreground_native_observation(owner, &root)
                 .map_err(|e| fail(&e))?;
             check_local()?;
+            if engine
+                .lock()
+                .unwrap()
+                .saved_receive_policy(owner, call)
+                .map_err(|e| fail(&e))?
+                .as_ref()
+                .is_some_and(|policy| {
+                    !policy.matches_span(maximum, destination)
+                        || policy.nonblocking() != nonblocking
+                })
+            {
+                return Err(NetworkRpcError::internal(
+                    "Replay selection changed saved Read span/flags",
+                ));
+            }
             (
                 engine
                     .lock()
                     .unwrap()
-                    .plan_replay_receive(owner, call, maximum, nonblocking)
+                    .plan_replay_receive_at(
+                        owner, call, maximum, nonblocking,
+                        Some(self.global_time.lock().unwrap().as_nanos()),
+                    )
                     .map_err(|e| fail(&e))?,
                 grant.epoch(),
             )
@@ -950,7 +1172,10 @@ impl GlobalState {
                     runtime
                         .with_foreground_prefix(&joined, |admission| {
                             engine
-                                .commit_replay_no_store(plan, admission, &root)
+                                .commit_replay_no_store(
+                                    plan, admission, &root,
+                                    self.global_time.lock().unwrap().as_nanos(),
+                                )
                                 .map_err(std::io::Error::other)
                         })
                         .map_err(|e| fail(&e))?
@@ -1924,6 +2149,21 @@ impl GlobalState {
             thread: state.dettid,
             mm: state.mm_id,
         };
+        if self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| NetworkRpcError::internal("private engine absent"))?
+            .lock()
+            .unwrap()
+            .saved_receive_policy(owner, call)
+            .map_err(|e| NetworkRpcError::internal(e.to_string()))?
+            .as_ref()
+            .is_some_and(|policy| !policy.matches_span(maximum, destination))
+        {
+            return Err(NetworkRpcError::internal(
+                "Record selection changed saved Read span",
+            ));
+        }
         let no_store = self
             .network_engine
             .as_ref()

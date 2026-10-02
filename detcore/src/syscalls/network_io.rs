@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Single guest-memory adapter for engine-owned network syscalls.
 
@@ -2164,19 +2164,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(mode) = native_mode {
             // Range precedence belongs to the authenticated, still-stopped
             // original Read. It grants neither mapped access nor a Store.
-            let range = match mode {
-                crate::network_replay::NetworkEngineMode::Record => {
-                    crate::tool_global::CheckedReadRange::inspect(guest, call, &read, metadata)
-                        .map(Some)
-                }
-                crate::network_replay::NetworkEngineMode::Replay => {
-                    match guest.inspect_original_read_range(call) {
-                        Ok(reverie::OriginalReadRangeVerdict::Allowed) => Ok(None),
-                        Ok(reverie::OriginalReadRangeVerdict::Fault) => Err(Errno::EFAULT.into()),
-                        Err(error) => Err(error),
-                    }
-                }
-            };
+            let range =
+                crate::tool_global::CheckedReadRange::inspect(guest, call, &read, metadata);
             let checked_range = match range {
                 Ok(range) => range,
                 Err(primary) => {
@@ -2223,9 +2212,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return finish_shadow_operation(Err(primary), cleanup);
                 }
             };
-            let invocation = match checked_range {
-                Some(range) => match global
-                    .bind_private_receive_invocation(range, tid, state, call, admitted)
+            if let Err(primary) = global.bind_saved_receive_policy(
+                &checked_range, tid, state, call, admitted,
+            ) {
+                return self.finish_host_stream_call(
+                    guest,
+                    NetworkHostSocketPin {
+                        call: admitted.id,
+                        native: admitted.physical_pin_required,
+                        nonblocking,
+                    },
+                    Err(engine_rpc_error(primary)),
+                ).await;
+            }
+            let invocation = match mode {
+                crate::network_replay::NetworkEngineMode::Record => match global
+                    .bind_private_receive_invocation(checked_range, tid, state, call, admitted)
                 {
                     Ok(invocation) => Some(invocation),
                     Err(failure) => {
@@ -2238,7 +2240,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return finish_shadow_operation(Err(primary), cleanup);
                     }
                 },
-                None => None,
+                crate::network_replay::NetworkEngineMode::Replay => None,
             };
             return self
                 .foreground_v4_receive_from_call(
@@ -5905,6 +5907,15 @@ enum NetworkShadowWaitOutcome {
     Signaled { entered_zero_wait: bool },
 }
 
+enum NetworkShadowWaitProgress {
+    /// The clock observation expired the deadline before requesting a turn.
+    DeadlineWithoutWait,
+    /// The actual timer reported EINTR, but its continuation resumed Normal.
+    /// This is a fresh foreground grant, unlike scheduler SignalResume.
+    InterruptedAfterNormal,
+    Wait(NetworkShadowWaitOutcome),
+}
+
 // No RX/control/delivery receipt may be held when calling this helper.
 // The only Record background syscall is an effect-free nfds=0 timer; all
 // network observations occur after its matching continuation regains a turn.
@@ -5962,11 +5973,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         policy: NetworkPolicy,
         zero_receive_call: Option<NetworkStreamCallId>,
     ) -> Result<NetworkShadowWaitOutcome, Error> {
+        Ok(
+            match self
+                .wait_shadow_network_progress(
+                    guest,
+                    interests,
+                    deadline,
+                    interrupt_errno,
+                    policy,
+                    zero_receive_call,
+                )
+                .await?
+            {
+                NetworkShadowWaitProgress::DeadlineWithoutWait => NetworkShadowWaitOutcome::Ready {
+                    entered_zero_wait: false,
+                },
+                NetworkShadowWaitProgress::InterruptedAfterNormal => {
+                    NetworkShadowWaitOutcome::Signaled {
+                        entered_zero_wait: false,
+                    }
+                }
+                NetworkShadowWaitProgress::Wait(outcome) => outcome,
+            },
+        )
+    }
+
+    async fn wait_shadow_network_progress<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        interests: Vec<(NetworkStreamCallId, NetworkWaitKind)>,
+        deadline: Option<LogicalTime>,
+        interrupt_errno: Errno,
+        policy: NetworkPolicy,
+        zero_receive_call: Option<NetworkStreamCallId>,
+    ) -> Result<NetworkShadowWaitProgress, Error> {
         let now = thread_observe_time(guest).await;
         if deadline.is_some_and(|end| now >= end) {
-            return Ok(NetworkShadowWaitOutcome::Ready {
-                entered_zero_wait: false,
-            });
+            return Ok(NetworkShadowWaitProgress::DeadlineWithoutWait);
         }
         // This observes the modeled wait decision. In Record it does not
         // assert that the later injected timer has entered the kernel.
@@ -5994,11 +6037,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             resources.set_signal_interrupt_errno(interrupt_errno);
             let resumed = resource_request(guest, resources).await;
             let entered_zero_wait = self.inspect_shadow_zero_wait(guest, zero_wait).await?;
-            return Ok(if matches!(resumed, ResumeStatus::Signaled(_)) {
+            return Ok(NetworkShadowWaitProgress::Wait(if matches!(resumed, ResumeStatus::Signaled(_)) {
                 NetworkShadowWaitOutcome::Signaled { entered_zero_wait }
             } else {
                 NetworkShadowWaitOutcome::Ready { entered_zero_wait }
-            });
+            }));
         }
         // This is an observation-latency bound, never a virtual-clock tick.
         // Do not increment logical time by this value or by an attempt count.
@@ -6036,7 +6079,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             ResumeStatus::Signaled(_)
         ) {
             let entered_zero_wait = self.inspect_shadow_zero_wait(guest, zero_wait).await?;
-            return Ok(NetworkShadowWaitOutcome::Signaled { entered_zero_wait });
+            return Ok(NetworkShadowWaitProgress::Wait(NetworkShadowWaitOutcome::Signaled { entered_zero_wait }));
         }
         let result = guest
             .inject(
@@ -6057,11 +6100,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         continuation.fyi("network observation timer");
         let resumed = resource_request(guest, continuation).await;
         let entered_zero_wait = self.inspect_shadow_zero_wait(guest, zero_wait).await?;
-        if matches!(resumed, ResumeStatus::Signaled(_)) || result == Err(Errno::EINTR) {
-            return Ok(NetworkShadowWaitOutcome::Signaled { entered_zero_wait });
+        if matches!(resumed, ResumeStatus::Signaled(_)) {
+            return Ok(NetworkShadowWaitProgress::Wait(
+                NetworkShadowWaitOutcome::Signaled { entered_zero_wait },
+            ));
+        }
+        if result == Err(Errno::EINTR) {
+            if zero_receive_call.is_none() {
+                return Ok(NetworkShadowWaitProgress::InterruptedAfterNormal);
+            }
+            return Ok(NetworkShadowWaitProgress::Wait(
+                NetworkShadowWaitOutcome::Signaled { entered_zero_wait },
+            ));
         }
         match result {
-            Ok(0) => Ok(NetworkShadowWaitOutcome::Ready { entered_zero_wait }),
+            Ok(0) => Ok(NetworkShadowWaitProgress::Wait(NetworkShadowWaitOutcome::Ready { entered_zero_wait })),
             Ok(value) => Err(engine_error(format!(
                 "nfds=0 observation timer returned {value}"
             ))),
@@ -9472,11 +9525,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             native: admitted.physical_pin_required,
             nonblocking,
         };
-        let prepared = match mode {
-            crate::network_replay::NetworkEngineMode::Record => {
+        // Production may not probe or select through the old controlled
+        // unqualified-profile path. This is the original Call's saved policy,
+        // not a new option snapshot on each retry.
+        let policy = guest
+            .local_global_state()
+            .ok_or_else(|| engine_error("V4 receive lost its local policy issuer"))
+            .and_then(|global| {
+                global
+                    .saved_receive_policy(
+                        guest.tid(),
+                        guest.thread_state(),
+                        call,
+                        admitted,
+                        nonblocking,
+                    )
+                    .map_err(engine_rpc_error)
+            })
+            .and_then(|policy| {
+                policy.ok_or_else(|| engine_error("V4 receive lacks its original saved policy"))
+            });
+        let prepared = match (policy, mode) {
+            (Err(error), _) => Err(error),
+            (Ok(_), crate::network_replay::NetworkEngineMode::Record) => {
                 self.prepare_v4_private_probe(guest, &pin).await.map(Some)
             }
-            crate::network_replay::NetworkEngineMode::Replay => Ok(None),
+            (Ok(_), crate::network_replay::NetworkEngineMode::Replay) => Ok(None),
         };
         self.foreground_v4_receive_after_probe(
             guest,
@@ -9513,7 +9587,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // common release below must not submit a second one.
         let mut retry_owns_release = false;
         let work = async {
+            let policy = guest.local_global_state()
+                .ok_or_else(|| engine_error("V4 receive lost its local policy issuer"))?
+                .saved_receive_policy(
+                    guest.tid(), guest.thread_state(), call, admitted, nonblocking,
+                ).map_err(engine_rpc_error)?;
+            let deadline = policy.as_ref().and_then(|policy| policy.deadline());
+            let interrupt_errno = if deadline.is_some() {
+                Errno::EINTR
+            } else {
+                call.signal_interrupt_errno()
+            };
             let mut probe = prepared_probe?;
+            let mut interrupted_after_normal = false;
             loop {
                 let mut empty = None;
                 if mode == crate::network_replay::NetworkEngineMode::Replay {
@@ -9568,6 +9654,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             crate::network_replay::NoStoreReturn::WouldBlock if nonblocking =>
                                 return Err(Errno::EAGAIN.into()),
                             crate::network_replay::NoStoreReturn::WouldBlock
+                                if completed.replay_timed_out() =>
+                                return Err(Errno::EAGAIN.into()),
+                            crate::network_replay::NoStoreReturn::WouldBlock
                                 if mode == crate::network_replay::NetworkEngineMode::Replay =>
                                 return Err(engine_error(
                                     "V4 Replay blocking empty attempt completed without a logical wait")),
@@ -9578,26 +9667,48 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
                 if let Some(completed) = empty {
+                    // Only THIS canonical empty result may end an elapsed
+                    // finite wait. A Ready wake still takes a fresh probe first,
+                    // so new data/EOF wins even when the deadline has elapsed.
+                    if let Some(policy) = &policy {
+                        let global = guest.local_global_state().ok_or_else(||
+                            engine_error("V4 receive lost its local policy clock"))?;
+                        if global.receive_policy_expired(policy).map_err(engine_rpc_error)? {
+                            return Err(Errno::EAGAIN.into());
+                        }
+                    }
+                    if interrupted_after_normal {
+                        return Err(interrupt_errno.into());
+                    }
                     // Blocking Record EAGAIN: the kernel would sleep in this
                     // same read. Use the existing Record observation timer,
                     // then rearm the SAME Call under a new Normal grant. The
                     // timer is an observation-latency bound, not a timeout.
                     let invocation = invocation.as_mut().ok_or_else(|| engine_error(
                         "V4 Record blocking retry lacks its authenticated original invocation"))?;
-                    match self.wait_shadow_network(
+                    match self.wait_shadow_network_progress(
                         guest,
                         vec![(pin.call, NetworkWaitKind::ReadableAtLeast(1))],
-                        None,
-                        call.signal_interrupt_errno(),
+                        deadline,
+                        interrupt_errno,
                         NetworkPolicy::Record,
                         None,
                     ).await? {
-                        NetworkShadowWaitOutcome::Ready { entered_zero_wait: false } => {}
+                        NetworkShadowWaitProgress::DeadlineWithoutWait =>
+                            return Err(Errno::EAGAIN.into()),
+                        NetworkShadowWaitProgress::InterruptedAfterNormal if deadline.is_some() =>
+                            interrupted_after_normal = true,
+                        NetworkShadowWaitProgress::InterruptedAfterNormal =>
+                            return Err(interrupt_errno.into()),
+                        NetworkShadowWaitProgress::Wait(NetworkShadowWaitOutcome::Ready { entered_zero_wait: false }) => {}
                         // Dropping the unconsumed token leaves the Call to the
                         // ordinary release below; the read restarts or fails
                         // with its own interrupt errno, as Linux would.
-                        NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false } =>
-                            return Err(call.signal_interrupt_errno().into()),
+                        NetworkShadowWaitProgress::Wait(NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false })
+                            if deadline.is_some() =>
+                            return Err(engine_error("finite receive SignalResume lacks a fresh observation grant")),
+                        NetworkShadowWaitProgress::Wait(NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false }) =>
+                            return Err(interrupt_errno.into()),
                         _ => return Err(engine_error(
                             "nonzero V4 Record receive acquired a zero-wait receipt")),
                     }
@@ -9630,19 +9741,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if nonblocking {
                     return Err(engine_error("V4 nonblocking selection unexpectedly requested a wait"));
                 }
-                // Replay selection has already checked low-water=1/infinite timeout.
+                // Replay selection has checked the saved low-water-one policy
+                // or the unchanged controlled infinite profile.
                 // Retain the same logical Call; no source, permit or exclusion is held.
                 match self.wait_shadow_network(
                     guest,
                     vec![(pin.call, NetworkWaitKind::ReadableAtLeast(1))],
-                    None,
-                    call.signal_interrupt_errno(),
+                    deadline,
+                    interrupt_errno,
                     NetworkPolicy::Replay,
                     None,
                 ).await? {
                     NetworkShadowWaitOutcome::Ready { entered_zero_wait: false } => {}
+                    NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false } if deadline.is_some() =>
+                        return Err(engine_error("finite receive SignalResume lacks a fresh observation grant")),
                     NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false } =>
-                        return Err(call.signal_interrupt_errno().into()),
+                        return Err(interrupt_errno.into()),
                     _ => return Err(engine_error(
                         "nonzero V4 Replay receive acquired a zero-wait receipt")),
                 }

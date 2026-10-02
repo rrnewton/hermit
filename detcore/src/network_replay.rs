@@ -512,6 +512,7 @@ struct StreamCallState {
     private_drain: Option<native_receive::PrivateDrain>,
     native_entry_attempted: Option<std::sync::Arc<native_receive::NativeEntryMarker>>,
     native_entry: Option<native_receive::NativeEntry>,
+    receive_policy: Option<std::sync::Arc<crate::tool_global::SavedReceivePolicy>>,
 }
 
 /// Short reader admission from the existing table and OFD authorities. This is
@@ -935,6 +936,7 @@ impl NetworkReplayEngine {
                 private_drain: None,
                 native_entry_attempted: None,
                 native_entry: None,
+                receive_policy: None,
                 capture_publication,
                 capture_control: capture_publication
                     .filter(|_| physical_pin_required)

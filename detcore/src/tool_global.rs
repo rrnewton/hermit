@@ -16,6 +16,7 @@ pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
 pub(crate) use foreground_store::ReceiveRetryFailure;
+pub(crate) use foreground_store::SavedReceivePolicy;
 mod original_installation;
 mod parked;
 use std::cmp::Ordering;

@@ -104,6 +104,8 @@ pub struct NetworkRuntimeResources {
     shared: std::sync::Arc<RuntimeShared>,
     #[cfg(test)]
     drops: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    controlled_private_drain: Mutex<Option<native_peer::ControlledPrivateDrain>>,
 }
 
 /// Controller-side recovery owner, created after container clone. It is kept
@@ -1075,6 +1077,7 @@ impl NetworkRuntimeResources {
                 native_terminal_failure: Mutex::default(),
             }),
             drops: None,
+            controlled_private_drain: Mutex::default(),
         }
     }
 
@@ -1132,6 +1135,8 @@ impl NetworkRuntimeResources {
                 shared,
                 #[cfg(test)]
                 drops: None,
+                #[cfg(test)]
+                controlled_private_drain: Mutex::default(),
             },
         )
     }
@@ -1177,6 +1182,8 @@ impl NetworkRuntimeResources {
                 shared,
                 #[cfg(test)]
                 drops: None,
+                #[cfg(test)]
+                controlled_private_drain: Mutex::default(),
             },
         )
     }
@@ -2764,6 +2771,7 @@ mod tests {
                     native_terminal_failure: Mutex::default(),
                 }),
                 drops: Some(drops.clone()),
+                controlled_private_drain: Mutex::default(),
             },
             drops,
         )

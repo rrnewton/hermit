@@ -3760,6 +3760,10 @@ struct ScalarForegroundGuest<'a> {
     record_timer: Option<Box<[u8; 64]>>,
     // Controlled host-signal premise: the kernel interrupts that ppoll.
     record_timer_eintr: bool,
+    // Opt-in controlled provider rows for an ACTUAL same-OFD retry Peek. The
+    // old fixtures keep the production provider-controller refusal unchanged.
+    controlled_retry_call: Option<NetworkStreamCallId>,
+    record_timer_arrival: Option<(std::os::unix::net::UnixStream, bool)>,
 }
 impl ScalarForegroundGuest<'_> {
     fn enable_record_timer(&mut self) {
@@ -3837,7 +3841,65 @@ impl GlobalRPC<GlobalState> for ScalarForegroundGuest<'_> {
         message: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
         self.requests.lock().unwrap().push(message.2.clone());
-        let response = self.global.receive_rpc(self.tid, message).await;
+        let controlled_peek = match (&message.2, self.controlled_retry_call) {
+            (
+                GlobalRequest::Network(NetworkRequest::NativeStreamEffect { lease, effect }),
+                Some(call),
+            ) if matches!(effect, NetworkStreamPhysicalEffect::Peek { .. }) => {
+                Some((call, *lease, effect.clone()))
+            }
+            _ => None,
+        };
+        let response = if let Some((call, lease, effect)) = controlled_peek {
+            assert_eq!(effect, NetworkStreamPhysicalEffect::Peek { maximum: 1024 });
+            let owner = NetworkStreamOwner {
+                thread: self.thread.dettid,
+                mm: self.thread.mm_id,
+            };
+            let runtime = self.global.network_runtime.as_ref().unwrap();
+            let engine = self.global.network_engine.as_ref().unwrap();
+            let root = runtime.foreground_root(owner).unwrap();
+            assert!(
+                self.global
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .foreground_native_observation(owner, &root)
+                    .is_ok()
+            );
+            engine
+                .lock()
+                .unwrap()
+                .submit_retained_stream_physical(owner, lease, effect.clone())
+                .unwrap();
+            let observed = runtime
+                .controlled_receive_retry_peek(owner, call, lease, engine.clone())
+                .await
+                .unwrap();
+            observed
+                .helper_copy
+                .as_ref()
+                .unwrap()
+                .joined_worker()
+                .unwrap();
+            runtime
+                .preflight_native_stream(owner, lease, &effect, &observed)
+                .unwrap();
+            engine
+                .lock()
+                .unwrap()
+                .confirm_retained_stream_physical(owner, lease, &observed)
+                .unwrap();
+            runtime
+                .confirm_native_stream(owner, lease, &effect, &observed)
+                .unwrap();
+            (
+                None,
+                GlobalResponse::Network(Ok(NetworkReply::NativeStreamObservation(observed))),
+            )
+        } else {
+            self.global.receive_rpc(self.tid, message).await
+        };
         if self
             .replace_metadata_after_normal
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -3956,6 +4018,11 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
         );
         self.memory_events.lock().unwrap().push("timer-ppoll");
         if self.record_timer_eintr {
+            if let Some((mut peer, eof)) = self.record_timer_arrival.take() {
+                use std::io::Write;
+                if eof { peer.shutdown(std::net::Shutdown::Write).unwrap(); }
+                else { peer.write_all(b"abc").unwrap(); }
+            }
             return Err(Errno::EINTR);
         }
         // The same real nfds=0 kernel timer, issued by this test thread.
@@ -3998,6 +4065,8 @@ fn scalar_foreground_guest<'a>(
         range_verdict: reverie::OriginalReadRangeVerdict::Allowed,
         record_timer: None,
         record_timer_eintr: false,
+        controlled_retry_call: None,
+        record_timer_arrival: None,
     }
 }
 
@@ -6589,9 +6658,18 @@ fn no_store_duplicate_actual_original(f: &Fixture) -> std::os::fd::OwnedFd {
 }
 
 async fn no_store_same_ofd_successor(
-    mut f: Fixture,
+    f: Fixture,
     original: std::os::fd::OwnedFd,
 ) -> NativeNoStoreFixture {
+    no_store_same_ofd_successor_policy(f, original, None).await
+}
+
+async fn no_store_same_ofd_successor_policy(
+    mut f: Fixture,
+    original: std::os::fd::OwnedFd,
+    finite_microseconds: Option<i64>,
+) -> NativeNoStoreFixture {
+    use std::os::fd::AsRawFd;
     let owner = f.root.owner();
     let runtime = f.state.network_runtime.as_ref().unwrap();
     let engine = f.state.network_engine.as_ref().unwrap();
@@ -6604,6 +6682,72 @@ async fn no_store_same_ofd_successor(
         native_release_rpc(&f).await,
         GlobalResponse::Network(Ok(NetworkReply::Unit))
     );
+    if let Some(microseconds) = finite_microseconds {
+        // Actual held OFD option, read back before its next original Call.
+        // The following ordinary modeled option transaction is still an
+        // explicit socket-profile premise, not a claimed provider observation.
+        let timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: microseconds,
+        };
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    original.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&timeout as *const libc::timeval).cast(),
+                    std::mem::size_of_val(&timeout) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let mut readback = libc::timeval {
+            tv_sec: -1,
+            tv_usec: -1,
+        };
+        let mut length = std::mem::size_of_val(&readback) as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    original.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&mut readback as *mut libc::timeval).cast(),
+                    &mut length,
+                )
+            },
+            0
+        );
+        assert_eq!(length, std::mem::size_of_val(&readback) as libc::socklen_t);
+        assert!(readback.tv_sec >= 0 && readback.tv_usec >= 0);
+        assert!(readback.tv_sec != 0 || readback.tv_usec != 0);
+        let mut e = engine.lock().unwrap();
+        let control = e.begin_socket_controls(owner, vec![ofd]).unwrap()[0].1;
+        e.submit_stream_physical(
+            owner,
+            control,
+            NetworkStreamPhysicalEffect::SetSocketOption {
+                option: crate::network_replay::NetworkStreamSocketOption::ReceiveTimeout {
+                    seconds: readback.tv_sec,
+                    microseconds: readback.tv_usec,
+                },
+            },
+        )
+        .unwrap();
+        e.confirm_stream_physical(
+            owner,
+            control,
+            NetworkStreamPhysicalResult::SocketOption { result: Ok(()) },
+        )
+        .unwrap();
+        e.finish_socket_control(
+            owner,
+            control,
+            crate::network_replay::NetworkSocketControlFinish::Unchanged,
+        )
+        .unwrap();
+    }
     // The explicitly held modeled guest FD keeps this actual same OFD alive.
     let prefix = runtime
         .join_foreground_prefix(f.root.clone())
@@ -6650,6 +6794,15 @@ async fn no_store_same_ofd_successor(
         .await
         .unwrap();
     f.call = admitted.id;
+    if finite_microseconds.is_some() {
+        let read = scalar_read(17, f.pages.at(128), 8);
+        let invocation = f
+            .state
+            .controlled_receive_invocation(f.tid, &f.thread, read, admitted, false);
+        f.state
+            .controlled_bind_receive_policy(&invocation, f.tid, &f.thread, read)
+            .unwrap();
+    }
     let effect = NetworkStreamPhysicalEffect::Peek { maximum: 1024 };
     f.lease = {
         let mut e = engine.lock().unwrap();
@@ -6682,10 +6835,19 @@ async fn no_store_same_ofd_successor(
         .unwrap()
         .submit_stream_physical(owner, f.lease, effect.clone())
         .unwrap();
-    let observed = runtime
-        .controlled_existing_no_store_peek(owner, f.call, f.lease, engine.clone())
-        .await
-        .unwrap();
+    let observed = if finite_microseconds.is_some() {
+        // The finite fixture retains a live, empty peer, not EOF. This helper
+        // performs the actual same-OFD probe and retains its joined worker;
+        // finite_record_fixture's unchanged confirm(false) requires EAGAIN.
+        runtime
+            .controlled_receive_retry_peek(owner, f.call, f.lease, engine.clone())
+            .await
+    } else {
+        runtime
+            .controlled_existing_no_store_peek(owner, f.call, f.lease, engine.clone())
+            .await
+    }
+    .unwrap();
     runtime
         .preflight_native_stream(owner, f.lease, &effect, &observed)
         .unwrap();
@@ -9811,4 +9973,1185 @@ async fn guest_v4_record_blocking_retry_refusal_uses_retry_cleanup_not_second_re
     );
     drop(guest);
     native_release_peer_eof(&mut f.fixture);
+}
+
+// Uses the existing modeled socket-option transaction, not a new timeout or
+// receive-policy constructor. This setup and the regression compile on the
+// pre-fix source; the actual owned-Read dispatcher must issue its own policy.
+fn finite_replay_fixture_timeout(f: &ReplayIssuerFixture, seconds: i64, microseconds: i64) {
+    let mut engine = f.state.network_engine.as_ref().unwrap().lock().unwrap();
+    engine.finish_fd_read(f.root.owner(), f.read.clone()).unwrap();
+    let control = engine.begin_socket_controls(f.root.owner(), vec![f.binding.open_file])
+        .unwrap()[0].1;
+    engine.submit_stream_physical(
+        f.root.owner(), control, NetworkStreamPhysicalEffect::SetSocketOption {
+            option: crate::network_replay::NetworkStreamSocketOption::ReceiveTimeout {
+                seconds, microseconds,
+            },
+        },
+    ).unwrap();
+    engine.confirm_stream_physical(
+        f.root.owner(), control,
+        NetworkStreamPhysicalResult::SocketOption { result: Ok(()) },
+    ).unwrap();
+    engine.finish_socket_control(
+        f.root.owner(), control,
+        crate::network_replay::NetworkSocketControlFinish::Unchanged,
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn guest_v4_finite_replay_positive_precedes_due_deadline() {
+    // Negative seconds normalize to FiniteTicks(0), not Infinite. Available
+    // bytes precede this already-due deadline as well as a future finite one.
+    for (seconds, microseconds) in [(-1, 0), (0, 5_000)] {
+        let f = ReplayIssuerFixture::new().await;
+        finite_replay_fixture_timeout(&f, seconds, microseconds);
+        let engine = f.state.network_engine.as_ref().unwrap();
+        let before_trace = engine.lock().unwrap().native_trace_fixture();
+        let before_runtime = f.state.network_runtime.as_ref().unwrap()
+            .private_publication_runtime_fixture_state();
+        let tool: Detcore = Detcore::new(f.tid, &f.config);
+        let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+        let read = reverie::syscalls::Read::new()
+            .with_fd(f.binding.slot.fd)
+            .with_buf(reverie::syscalls::AddrMut::from_raw(f.pages.at(128) as usize))
+            .with_len(5);
+        let result = tool.handle_owned_read(&mut guest, read).await;
+        // Both the before refusal and the fixed completion must release the
+        // original reader/Call before the same semantic assertion is reached.
+        assert_eq!(engine.lock().unwrap().native_capture_fixture_counts(f.binding.open_file),
+            (0, 0, 0, 0));
+        assert_eq!(f.state.network_runtime.as_ref().unwrap()
+            .private_publication_runtime_fixture_state(), before_runtime);
+        assert!(matches!(result, Ok(5)), "finite Read must return queued bytes: {result:?}");
+        assert_eq!(f.pages.bytes(128, 5), b"abcde");
+        assert_eq!(f.pages.bytes(0, 128), vec![0xa5; 128]);
+        assert_eq!(f.pages.bytes(133, 8192 - 133), vec![0xa5; 8192 - 133]);
+        assert_eq!(engine.lock().unwrap().controlled_replay_delivery_state(f.binding.open_file),
+            (5, vec![b"fgh".to_vec()], vec![0, 1, 2]));
+        assert_eq!(engine.lock().unwrap().native_trace_fixture(), before_trace);
+        assert_eq!(*guest.memory_events.lock().unwrap(), ["access-check", "native-write"]);
+        assert!(!guest.requests.lock().unwrap().iter()
+            .any(|request| matches!(request, GlobalRequest::RequestResources(..))));
+    }
+}
+
+#[tokio::test]
+async fn guest_v4_finite_replay_empty_deadlines_repeat_exactly_on_same_trace() {
+    let (trace, input_time) = future_replay_trace();
+    let mut repetitions = vec![];
+    for _ in 0..2 {
+        let (f, mut committed) = ReplayIssuerFixture::new_trace(false, trace.clone(), false).await;
+        finite_replay_fixture_timeout(&f, 0, 5_000);
+        let owner = f.root.owner();
+        let engine = f.state.network_engine.as_ref().unwrap();
+        let before_trace = engine.lock().unwrap().native_trace_fixture();
+        let before_runtime = f
+            .state
+            .network_runtime
+            .as_ref()
+            .unwrap()
+            .private_publication_runtime_fixture_state();
+        let tool: Detcore = Detcore::new(f.tid, &f.config);
+        let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+        let requests = guest.requests.clone();
+        let mut trajectory = vec![];
+        // A later Read gets a new original deadline. An empty retry of the
+        // same Read never does. No timeout/empty row is added to the trace.
+        for _ in 0..2 {
+            let start = f.state.global_time.lock().unwrap().as_nanos();
+            let deadline = start + LogicalTime::from_nanos(5_000_000);
+            assert!(deadline < input_time);
+            let result;
+            let call;
+            {
+                let mut pending = std::pin::pin!(tool.handle_owned_read(
+                    &mut guest,
+                    scalar_read(f.binding.slot.fd, f.pages.at(128), 5),
+                ));
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                let (expected, response) = {
+                    let all = requests.lock().unwrap();
+                    let GlobalRequest::RequestResources(actual, process) = all.last().unwrap()
+                    else {
+                        panic!("finite Read did not publish its actual wait: {all:?}");
+                    };
+                    assert_eq!(*process, owner.thread);
+                    assert_eq!(actual.resources.len(), 1);
+                    let (resource, permission) = actual.resources.iter().next().unwrap();
+                    let ResourceID::NetworkCallWaitSet {
+                        interests,
+                        deadline: actual_end,
+                        zero_wait,
+                    } = resource
+                    else {
+                        panic!("finite Read used a different resource: {resource:?}");
+                    };
+                    assert_eq!(*permission, Permission::R);
+                    assert_eq!(*actual_end, Some(deadline));
+                    assert!(zero_wait.is_none());
+                    assert_eq!(interests.len(), 1);
+                    call = interests[0].0;
+                    assert_eq!(
+                        interests[0].1,
+                        crate::resources::NetworkWaitKind::ReadableAtLeast(1)
+                    );
+                    let mut expected = Resources::new(owner.thread);
+                    expected.insert(resource.clone(), Permission::R);
+                    expected.set_signal_interrupt_errno(Errno::EINTR);
+                    assert_eq!(*actual, expected);
+                    let scheduler = f.state.sched.lock().unwrap();
+                    let next = &scheduler.next_turns[&owner.thread];
+                    assert_eq!(next.req.try_read().unwrap().unwrap(), expected);
+                    assert_eq!(next.protocol.origin.as_ref().unwrap().mm, owner.mm);
+                    assert!(next.resp.try_read().is_none());
+                    (expected, next.resp.clone())
+                };
+                let saved = engine
+                    .lock()
+                    .unwrap()
+                    .saved_receive_policy(owner, call)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.started(), start);
+                assert_eq!(saved.deadline(), Some(deadline));
+                assert!(!saved.nonblocking());
+                let before_engine = format!("{:?}", engine.lock().unwrap());
+                assert!(
+                    engine
+                        .lock()
+                        .unwrap()
+                        .bind_saved_receive_policy(owner, call, saved.clone())
+                        .is_err(),
+                    "duplicate policy issuance must refuse"
+                );
+                let admitted = crate::network_replay::NetworkStreamCall {
+                    id: call,
+                    open_file: f.binding.open_file,
+                    physical_pin_required: false,
+                };
+                assert!(
+                    f.state
+                        .saved_receive_policy(
+                            f.tid,
+                            &f.thread,
+                            scalar_read(f.binding.slot.fd + 1, f.pages.at(128), 5),
+                            admitted,
+                            false
+                        )
+                        .is_err()
+                );
+                assert!(
+                    f.state
+                        .saved_receive_policy(
+                            Tid::from_raw(f.tid.as_raw() + 1),
+                            &f.thread,
+                            scalar_read(f.binding.slot.fd, f.pages.at(128), 5),
+                            admitted,
+                            false
+                        )
+                        .is_err()
+                );
+                assert_eq!(format!("{:?}", engine.lock().unwrap()), before_engine);
+                let parked = crate::scheduler::do_a_turn_blocking(
+                    f.state.sched.clone(),
+                    f.state.global_time.clone(),
+                    &Ok(committed),
+                )
+                .await;
+                assert!(parked.is_err());
+                assert!(response.try_read().is_none());
+                let idle = crate::scheduler::do_a_turn_blocking(
+                    f.state.sched.clone(),
+                    f.state.global_time.clone(),
+                    &parked,
+                )
+                .await;
+                assert!(idle.is_err());
+                assert_eq!(f.state.global_time.lock().unwrap().as_nanos(), deadline);
+                assert!(response.try_read().is_none());
+                committed = crate::scheduler::do_a_turn_blocking(
+                    f.state.sched.clone(),
+                    f.state.global_time.clone(),
+                    &idle,
+                )
+                .await
+                .unwrap();
+                assert_eq!(committed, expected);
+                assert!(matches!(
+                    response.try_read(),
+                    Some(crate::scheduler::SchedResponse::Go(None))
+                ));
+                // These selection negatives require the actual new Normal
+                // grant. The parked request correctly has no such authority.
+                // Do not resume the original pending callback until all three
+                // exact span/flags refusals have left engine state unchanged.
+                let before_engine = format!("{:?}", engine.lock().unwrap());
+                for (maximum, destination, nonblocking) in [
+                    (4, f.pages.at(128), false),
+                    (5, f.pages.at(129), false),
+                    (5, f.pages.at(128), true),
+                ] {
+                    let Err(error) = f
+                        .state
+                        .prepare_replay_receive(
+                            f.tid,
+                            &f.thread,
+                            call,
+                            maximum,
+                            destination,
+                            nonblocking,
+                        )
+                        .await
+                    else {
+                        panic!("changed original span/flags acquired a selection");
+                    };
+                    assert_eq!(
+                        error,
+                        NetworkRpcError::internal("Replay selection changed saved Read span/flags")
+                    );
+                }
+                assert_eq!(format!("{:?}", engine.lock().unwrap()), before_engine);
+                assert!(Arc::ptr_eq(
+                    &saved,
+                    &engine
+                        .lock()
+                        .unwrap()
+                        .saved_receive_policy(owner, call)
+                        .unwrap()
+                        .unwrap()
+                ));
+                result = pending.await;
+                assert!(
+                    f.state.receive_policy_expired(&saved).is_err(),
+                    "released policy is stale"
+                );
+            }
+            // Check actual Call/owner cleanup before the result oracle.
+            assert_eq!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .native_capture_fixture_counts(f.binding.open_file),
+                (0, 0, 0, 0)
+            );
+            assert!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .stream_call_open_file(owner, call)
+                    .is_err()
+            );
+            assert_exact_call_release(&guest, call);
+            assert!(
+                matches!(result, Err(reverie::Error::Errno(Errno::EAGAIN))),
+                "{result:?}"
+            );
+            let end = f.state.global_time.lock().unwrap().as_nanos();
+            assert_eq!(end, deadline);
+            trajectory.push((start, deadline, end, Errno::EAGAIN.into_raw()));
+            assert_eq!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .controlled_replay_delivery_state(f.binding.open_file),
+                (0, vec![], vec![0, 1])
+            );
+            assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+            assert!(guest.memory_events.lock().unwrap().is_empty());
+            assert_eq!(engine.lock().unwrap().native_trace_fixture(), before_trace);
+            assert_eq!(
+                f.state
+                    .network_runtime
+                    .as_ref()
+                    .unwrap()
+                    .private_publication_runtime_fixture_state(),
+                before_runtime
+            );
+            guest.requests.lock().unwrap().clear();
+            guest.responses.lock().unwrap().clear();
+        }
+        repetitions.push(trajectory);
+    }
+    assert_eq!(
+        repetitions[0], repetitions[1],
+        "same trace must repeat full deadline/clock/results"
+    );
+}
+
+#[tokio::test]
+async fn guest_v4_finite_replay_immediate_empty_and_eof_keep_exact_no_store_effects() {
+    for eof in [false, true] {
+        let trace = if eof {
+            scalar_eof_trace(false, false, false).0
+        } else {
+            future_replay_trace().0
+        };
+        let (f, _) = ReplayIssuerFixture::new_trace(false, trace, false).await;
+        finite_replay_fixture_timeout(&f, -1, 0);
+        let engine = f.state.network_engine.as_ref().unwrap();
+        let before_trace = engine.lock().unwrap().native_trace_fixture();
+        let before_clock = f.state.global_time.lock().unwrap().as_nanos();
+        let runtime = f.state.network_runtime.as_ref().unwrap();
+        let before_runtime = runtime.private_publication_runtime_fixture_state();
+        let tool: Detcore = Detcore::new(f.tid, &f.config);
+        let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+        let result = tool
+            .handle_owned_read(&mut guest, scalar_read(f.binding.slot.fd, 0, 5))
+            .await;
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .native_capture_fixture_counts(f.binding.open_file),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            runtime.private_publication_runtime_fixture_state(),
+            before_runtime
+        );
+        if eof {
+            assert!(matches!(result, Ok(0)), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(reverie::Error::Errno(Errno::EAGAIN))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(f.state.global_time.lock().unwrap().as_nanos(), before_clock);
+        assert_scalar_no_store_rpc(&guest);
+        assert!(guest.memory_events.lock().unwrap().is_empty());
+        assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+        let after = engine
+            .lock()
+            .unwrap()
+            .replay_no_store_fixture_state(f.binding.open_file);
+        assert_eq!(after.consumed, 0);
+        assert!(after.bytes.is_empty());
+        assert_eq!(after.peer_closed, eof);
+        assert_eq!(after.consume_epoch, usize::from(eof) as u64);
+        assert_eq!(engine.lock().unwrap().native_trace_fixture(), before_trace);
+        if eof {
+            finish_scalar_replay_after_owner_exit(&f.state, &f.config, f.tid, f.root.owner()).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn guest_v4_finite_nonblocking_empty_never_waits_or_advances_clock() {
+    let (f, _) = ReplayIssuerFixture::new_trace(false, future_replay_trace().0, false).await;
+    finite_replay_fixture_timeout(&f, 0, 5_000);
+    f.thread
+        .with_detfd(f.binding.slot.fd, |fd| fd.set_nonblocking(true))
+        .unwrap();
+    let start = f.state.global_time.lock().unwrap().as_nanos();
+    let tool: Detcore = Detcore::new(f.tid, &f.config);
+    let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+    let result = tool
+        .handle_owned_read(&mut guest, scalar_read(f.binding.slot.fd, 0, 5))
+        .await;
+    assert_eq!(
+        f.state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .native_capture_fixture_counts(f.binding.open_file),
+        (0, 0, 0, 0)
+    );
+    assert!(
+        matches!(result, Err(reverie::Error::Errno(Errno::EAGAIN))),
+        "{result:?}"
+    );
+    assert_scalar_no_store_rpc(&guest);
+    assert_eq!(f.state.global_time.lock().unwrap().as_nanos(), start);
+    assert!(guest.memory_events.lock().unwrap().is_empty());
+    assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+}
+
+#[tokio::test]
+async fn guest_v4_finite_policy_refuses_low_water_before_available_bytes() {
+    let f = ReplayIssuerFixture::new().await;
+    finite_replay_fixture_timeout(&f, 0, 5_000);
+    let engine = f.state.network_engine.as_ref().unwrap();
+    {
+        let mut e = engine.lock().unwrap();
+        let timeout = e
+            .stream_socket_state(f.binding.open_file)
+            .unwrap()
+            .unwrap()
+            .options
+            .receive_timeout;
+        let control = e
+            .begin_socket_controls(f.root.owner(), vec![f.binding.open_file])
+            .unwrap()[0]
+            .1;
+        // The Replay fixture already has ingress. Explicitly user-lock its
+        // modeled buffer through the existing setter before normalizing LOWAT;
+        // do not bypass the unresolved-autotuning guard or query a host socket.
+        for option in [
+            crate::network_replay::NetworkStreamSocketOption::ReceiveBuffer(131072),
+            crate::network_replay::NetworkStreamSocketOption::ReceiveLowWater(2),
+        ] {
+            e.submit_stream_physical(
+                f.root.owner(),
+                control,
+                NetworkStreamPhysicalEffect::SetSocketOption { option },
+            )
+            .unwrap();
+            e.confirm_stream_physical(
+                f.root.owner(),
+                control,
+                NetworkStreamPhysicalResult::SocketOption { result: Ok(()) },
+            )
+            .unwrap();
+        }
+        e.finish_socket_control(
+            f.root.owner(),
+            control,
+            crate::network_replay::NetworkSocketControlFinish::Unchanged,
+        )
+        .unwrap();
+        let socket = e.stream_socket_state(f.binding.open_file).unwrap().unwrap();
+        assert!(socket.options.receive_buffer.user_locked);
+        assert_eq!(socket.options.receive_low_water, 2);
+        assert_eq!(socket.options.receive_timeout, timeout);
+    }
+    let before = engine
+        .lock()
+        .unwrap()
+        .controlled_replay_delivery_state(f.binding.open_file);
+    let tool: Detcore = Detcore::new(f.tid, &f.config);
+    let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+    let result = tool
+        .handle_owned_read(
+            &mut guest,
+            scalar_read(f.binding.slot.fd, f.pages.at(128), 5),
+        )
+        .await;
+    assert_eq!(
+        engine
+            .lock()
+            .unwrap()
+            .native_capture_fixture_counts(f.binding.open_file),
+        (0, 0, 0, 0)
+    );
+    let Err(reverie::Error::Tool(error)) = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        error.root_cause().to_string(),
+        "saved receive policy requires low-water one"
+    );
+    assert_eq!(
+        engine
+            .lock()
+            .unwrap()
+            .controlled_replay_delivery_state(f.binding.open_file),
+        before
+    );
+    assert!(guest.memory_events.lock().unwrap().is_empty());
+    assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+    assert!(!guest.requests.lock().unwrap().iter().any(|r| matches!(
+        r,
+        GlobalRequest::RequestResources(..)
+            | GlobalRequest::Network(NetworkRequest::ReleaseEligible(_))
+    )));
+}
+
+#[tokio::test]
+async fn guest_v4_finite_deadline_rejects_sentinel_and_overflow_after_call_cleanup() {
+    for excess in 0..3u64 {
+        let f = ReplayIssuerFixture::new().await;
+        finite_replay_fixture_timeout(&f, 0, 5_000);
+        let tool: Detcore = Detcore::new(f.tid, &f.config);
+        let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+        let start = LogicalTime::from_nanos(u64::MAX - 5_000_001 + excess);
+        guest.thread.thread_logical_time.advance_to(start);
+        f.state.global_time.lock().unwrap().update_global_time(
+            f.root.owner().thread,
+            start,
+            guest.thread.thread_logical_time.inherited_nanos(),
+        );
+        assert_eq!(f.state.global_time.lock().unwrap().as_nanos(), start);
+        let result = tool
+            .handle_owned_read(
+                &mut guest,
+                scalar_read(f.binding.slot.fd, f.pages.at(128), 5),
+            )
+            .await;
+        let engine = f.state.network_engine.as_ref().unwrap();
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .native_capture_fixture_counts(f.binding.open_file),
+            (0, 0, 0, 0)
+        );
+        if excess == 0 {
+            assert!(
+                matches!(result, Ok(5)),
+                "finite MAX-1 must remain valid: {result:?}"
+            );
+            assert_eq!(f.pages.bytes(128, 5), b"abcde");
+        } else {
+            let Err(reverie::Error::Tool(error)) = result else {
+                panic!("{result:?}");
+            };
+            assert_eq!(error.root_cause().to_string(), "receive deadline overflow");
+            assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+            assert!(guest.memory_events.lock().unwrap().is_empty());
+        }
+    }
+}
+
+async fn finite_record_fixture() -> NativeNoStoreFixture {
+    let first = NativeNoStoreFixture::new(false, 5, true).await;
+    first.confirm(false);
+    let duplicate = no_store_duplicate_actual_original(&first.fixture);
+    assert_eq!(
+        first.complete().await,
+        crate::network_replay::NoStoreReturn::WouldBlock
+    );
+    let next = no_store_same_ofd_successor_policy(first.fixture, duplicate, Some(5_000)).await;
+    next.confirm(false);
+    next
+}
+
+#[tokio::test]
+async fn guest_v4_finite_record_empty_expiry_before_or_during_clock_rpc_does_not_rearm() {
+    for during_rpc in [false, true] {
+        let mut f = finite_record_fixture().await;
+        let q = &f.fixture;
+        let owner = q.root.owner();
+        let before = f.trace();
+        let engine = q.state.network_engine.as_ref().unwrap();
+        let saved = engine
+            .lock()
+            .unwrap()
+            .saved_receive_policy(owner, q.call)
+            .unwrap()
+            .unwrap();
+        let deadline = saved.deadline().unwrap();
+        let (read, invocation) = retry_invocation(&f, false);
+        let admitted = crate::network_replay::NetworkStreamCall {
+            id: q.call,
+            open_file: engine
+                .lock()
+                .unwrap()
+                .stream_call_open_file(owner, q.call)
+                .unwrap(),
+            physical_pin_required: true,
+        };
+        let tool: Detcore = Detcore::new(q.tid, &q.state.cfg);
+        let mut guest = scalar_foreground_guest(&q.state, &q.state.cfg, q.thread.clone(), q.tid);
+        // A real request carries this thread's unreported logical progress.
+        // No fake grant, timer result or synthesized kernel errno is installed.
+        guest.thread.thread_logical_time.advance_to(deadline);
+        if !during_rpc {
+            q.state.global_time.lock().unwrap().update_global_time(
+                owner.thread,
+                deadline,
+                guest.thread.thread_logical_time.inherited_nanos(),
+            );
+        } else {
+            assert!(q.state.global_time.lock().unwrap().as_nanos() < deadline);
+        }
+        let prepared = tool
+            .complete_v4_private_probe_observation(q.lease, f.observed.clone())
+            .map(Some);
+        let result = tool
+            .foreground_v4_receive_after_probe(
+                &mut guest,
+                read,
+                admitted,
+                crate::network_replay::NetworkEngineMode::Record,
+                false,
+                prepared,
+                Some(invocation),
+            )
+            .await;
+        assert!(
+            engine
+                .lock()
+                .unwrap()
+                .stream_call_open_file(owner, q.call)
+                .is_err()
+        );
+        assert_eq!(q.pages.bytes(0, 8192), vec![0xa5; 8192]);
+        assert_eq!(f.trace(), before);
+        let names = record_blocking_request_names(
+            &guest,
+            crate::resources::ExternalOpId::new(owner.thread, q.thread.stats.syscall_count),
+        );
+        assert_eq!(
+            names,
+            if during_rpc {
+                vec!["global-time", "release"]
+            } else {
+                vec!["release"]
+            }
+        );
+        assert!(guest.memory_events.lock().unwrap().is_empty());
+        assert_eq!(q.state.global_time.lock().unwrap().as_nanos(), deadline);
+        drop(guest);
+        native_release_peer_eof(&mut f.fixture);
+        assert!(
+            matches!(result, Err(reverie::Error::Errno(Errno::EAGAIN))),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn guest_v4_finite_record_interrupted_timer_reprobes_before_data_eof_or_errno() {
+    for case in 0..6 {
+        let mut f = finite_record_fixture().await;
+        let q = &f.fixture;
+        let owner = q.root.owner();
+        let before = f.trace();
+        let engine = q.state.network_engine.as_ref().unwrap();
+        let (read, invocation) = retry_invocation(&f, false);
+        let admitted = crate::network_replay::NetworkStreamCall {
+            id: q.call,
+            open_file: engine
+                .lock()
+                .unwrap()
+                .stream_call_open_file(owner, q.call)
+                .unwrap(),
+            physical_pin_required: true,
+        };
+        let tool: Detcore = Detcore::new(q.tid, &q.state.cfg);
+        let mut guest = scalar_foreground_guest(&q.state, &q.state.cfg, q.thread.clone(), q.tid);
+        guest.enable_record_timer();
+        guest.record_timer_eintr = true; // Explicit modeled EINTR; not native signal delivery.
+        guest.controlled_retry_call = Some(q.call);
+        if case % 3 == 1 {
+            let runtime = q.state.network_runtime.as_ref().unwrap();
+            runtime
+                .arm_controlled_private_drain(owner, q.call, engine.clone())
+                .unwrap();
+            assert!(
+                runtime
+                    .arm_controlled_private_drain(owner, q.call, engine.clone())
+                    .is_err()
+            );
+            assert!(
+                !runtime
+                    .controlled_private_drain_consumed(owner, q.call)
+                    .unwrap()
+            );
+        }
+        if case % 3 != 0 {
+            guest.record_timer_arrival = Some((
+                q._peer.as_ref().unwrap().try_clone().unwrap(),
+                case % 3 == 2,
+            ));
+        }
+        let operation =
+            crate::resources::ExternalOpId::new(owner.thread, q.thread.stats.syscall_count);
+        let prepared = tool
+            .complete_v4_private_probe_observation(q.lease, f.observed.clone())
+            .map(Some);
+        let result;
+        {
+            let mut pending = std::pin::pin!(tool.foreground_v4_receive_after_probe(
+                &mut guest,
+                read,
+                admitted,
+                crate::network_replay::NetworkEngineMode::Record,
+                false,
+                prepared,
+                Some(invocation)
+            ));
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            {
+                let sched = q.state.sched.lock().unwrap();
+                let request = sched.next_turns[&owner.thread]
+                    .req
+                    .try_read()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.resources.len(), 1);
+                assert!(
+                    request
+                        .resources
+                        .contains_key(&ResourceID::BlockingNetworkCapture(operation))
+                );
+                assert_eq!(
+                    request.signal_interrupt_errno(),
+                    Some(Errno::EINTR.into_raw())
+                );
+            }
+            let selected = q.state.sched.lock().unwrap().select_test_turn().unwrap();
+            assert!(
+                crate::scheduler::finish_selected_turn(
+                    q.state.sched.clone(),
+                    q.state.global_time.clone(),
+                    selected.0,
+                    selected.1,
+                    selected.2
+                )
+                .await
+                .is_err()
+            );
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            {
+                let mut sched = q.state.sched.lock().unwrap();
+                let request = sched.next_turns[&owner.thread]
+                    .req
+                    .try_read()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.resources.len(), 1);
+                assert!(
+                    request
+                        .resources
+                        .contains_key(&ResourceID::BlockedExternalContinue(operation))
+                );
+                assert_eq!(
+                    request.signal_interrupt_errno(),
+                    Some(Errno::EINTR.into_raw())
+                );
+                assert!(sched.harvest_external_io_for_test().is_ok());
+            }
+            if case >= 3 {
+                let deadline = engine
+                    .lock()
+                    .unwrap()
+                    .saved_receive_policy(owner, q.call)
+                    .unwrap()
+                    .unwrap()
+                    .deadline()
+                    .unwrap();
+                let mut time = q.state.global_time.lock().unwrap();
+                let now = time.as_nanos();
+                assert!(now < deadline);
+                time.add_extra_time(deadline.duration_since(now)); // Controlled elapsed-idle premise.
+            }
+            let selected = q.state.sched.lock().unwrap().select_test_turn().unwrap();
+            assert!(
+                crate::scheduler::finish_selected_turn(
+                    q.state.sched.clone(),
+                    q.state.global_time.clone(),
+                    selected.0,
+                    selected.1,
+                    selected.2
+                )
+                .await
+                .is_ok()
+            );
+            result = pending.await;
+        }
+        assert!(
+            engine
+                .lock()
+                .unwrap()
+                .stream_call_open_file(owner, q.call)
+                .is_err(),
+            "finite timer case {case}: Call retained after result {result:?}"
+        );
+        if case % 3 == 1 {
+            let runtime = q.state.network_runtime.as_ref().unwrap();
+            assert!(
+                runtime
+                    .controlled_private_drain_consumed(owner, q.call)
+                    .unwrap()
+            );
+            assert!(
+                runtime
+                    .arm_controlled_private_drain(owner, q.call, engine.clone())
+                    .is_err()
+            );
+        }
+        let after = f.trace();
+        if case % 3 == 1 {
+            assert_eq!(q.pages.bytes(128, 3), b"abc");
+            assert_eq!(q.pages.bytes(0, 128), vec![0xa5; 128]);
+            assert_eq!(q.pages.bytes(131, 8192 - 131), vec![0xa5; 8192 - 131]);
+            assert_eq!(
+                *guest.memory_events.lock().unwrap(),
+                [
+                    "timer-reserve",
+                    "timer-write",
+                    "timer-ppoll",
+                    "access-check",
+                    "native-write"
+                ]
+            );
+        } else {
+            assert_eq!(q.pages.bytes(0, 8192), vec![0xa5; 8192]);
+            assert_eq!(
+                *guest.memory_events.lock().unwrap(),
+                ["timer-reserve", "timer-write", "timer-ppoll"]
+            );
+        }
+        assert_eq!(&after.inputs[..before.inputs.len()], before.inputs);
+        assert_eq!(
+            after.inputs.len(),
+            before.inputs.len() + usize::from(case % 3 != 0)
+        );
+        if case % 3 == 0 {
+            assert_eq!(after, before);
+        }
+        after.validate().unwrap();
+        assert_eq!(
+            record_blocking_request_names(&guest, operation),
+            [
+                "global-time",
+                "timer-begin",
+                "timer-continue",
+                "probe-begin",
+                "cursor-read",
+                "peek",
+                "release"
+            ]
+        );
+        drop(guest);
+        native_release_peer_eof(&mut f.fixture);
+        match case % 3 {
+            1 => assert!(
+                matches!(result, Ok(3)),
+                "partial bytes precede interruption/deadline: {result:?}"
+            ),
+            2 => assert!(
+                matches!(result, Ok(0)),
+                "EOF precedes interruption/deadline: {result:?}"
+            ),
+            _ if case >= 3 => assert!(
+                matches!(result, Err(reverie::Error::Errno(Errno::EAGAIN))),
+                "{result:?}"
+            ),
+            _ => assert!(
+                matches!(result, Err(reverie::Error::Errno(Errno::EINTR))),
+                "{result:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn finite_record_two_completed_empties_retain_original_policy_and_deadline() {
+    let mut f = finite_record_fixture().await;
+    let q = &f.fixture;
+    let owner = q.root.owner();
+    let engine = q.state.network_engine.as_ref().unwrap().clone();
+    let saved = engine
+        .lock()
+        .unwrap()
+        .saved_receive_policy(owner, q.call)
+        .unwrap()
+        .unwrap();
+    let (read, mut invocation) = retry_invocation(&f, false);
+    let before = f.trace();
+    let completed = retry_complete(&f).await;
+    retry_next_turn(q, false).await;
+    q.state
+        .resume_private_receive_call(q.tid, &q.thread, read, &mut invocation, completed)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &saved,
+        &engine
+            .lock()
+            .unwrap()
+            .saved_receive_policy(owner, q.call)
+            .unwrap()
+            .unwrap()
+    ));
+    retry_probe(&mut f).await;
+    assert_eq!(f.observed.errno, Some(libc::EAGAIN));
+    assert_eq!(
+        retry_complete(&f).await.into_outcome(),
+        crate::network_replay::NoStoreReturn::WouldBlock
+    );
+    assert_eq!(f.trace(), before);
+    assert_eq!(f.frontier(), (0, 0, 0, 0, false, false, 0, 0));
+    assert_eq!(f.fixture.pages.bytes(0, 8192), vec![0xa5; 8192]);
+    let retained = engine
+        .lock()
+        .unwrap()
+        .saved_receive_policy(owner, f.fixture.call)
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&saved, &retained));
+    assert_eq!(saved.deadline(), retained.deadline());
+    f.assert_release().await;
+}
+
+// Controlled signal arrival replaces the actual pending request; only the
+// real scheduler issues Signaled. It supplies no Normal observation grant.
+async fn select_finite_signal(
+    state: &GlobalState,
+    root: &Arc<crate::network_runtime::ForegroundRoot>,
+) {
+    let owner = root.owner();
+    let mut inbound = Resources::new(owner.thread);
+    inbound.insert(
+        ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+        Permission::W,
+    );
+    inbound.set_signal_interrupt_errno(Errno::EINTR);
+    let response = {
+        let mut sched = state.sched.lock().unwrap();
+        let next = sched.next_turns.get_mut(&owner.thread).unwrap();
+        assert_eq!(
+            next.req
+                .try_read()
+                .unwrap()
+                .unwrap()
+                .signal_interrupt_errno(),
+            Some(Errno::EINTR.into_raw())
+        );
+        next.req = Ivar::full(Ok(inbound.clone()));
+        next.resp.clone()
+    };
+    let selected = state.sched.lock().unwrap().select_test_turn().unwrap();
+    assert_eq!(
+        crate::scheduler::finish_selected_turn(
+            state.sched.clone(),
+            state.global_time.clone(),
+            selected.0,
+            selected.1,
+            selected.2
+        )
+        .await
+        .unwrap(),
+        inbound
+    );
+    assert!(
+        matches!(response.try_read(), Some(crate::scheduler::SchedResponse::Signaled(Some(signals)))
+        if signals == vec![SigWrapper::from(Signal::SIGUSR1)])
+    );
+    assert!(
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .foreground_native_observation(owner, root)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn guest_v4_finite_actual_signaled_refuses_without_normal_grant_in_record_and_replay() {
+    {
+        let mut f = finite_record_fixture().await;
+        let q = &f.fixture;
+        let engine = q.state.network_engine.as_ref().unwrap();
+        let before = f.trace();
+        let (read, invocation) = retry_invocation(&f, false);
+        let admitted = crate::network_replay::NetworkStreamCall {
+            id: q.call,
+            open_file: engine
+                .lock()
+                .unwrap()
+                .stream_call_open_file(q.root.owner(), q.call)
+                .unwrap(),
+            physical_pin_required: true,
+        };
+        let tool: Detcore = Detcore::new(q.tid, &q.state.cfg);
+        let mut guest = scalar_foreground_guest(&q.state, &q.state.cfg, q.thread.clone(), q.tid);
+        guest.enable_record_timer();
+        let prepared = tool
+            .complete_v4_private_probe_observation(q.lease, f.observed.clone())
+            .map(Some);
+        let result;
+        {
+            let mut pending = std::pin::pin!(tool.foreground_v4_receive_after_probe(
+                &mut guest,
+                read,
+                admitted,
+                crate::network_replay::NetworkEngineMode::Record,
+                false,
+                prepared,
+                Some(invocation)
+            ));
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            select_finite_signal(&q.state, &q.root).await;
+            result = pending.await;
+        }
+        assert!(
+            engine
+                .lock()
+                .unwrap()
+                .stream_call_open_file(q.root.owner(), q.call)
+                .is_err()
+        );
+        assert_eq!(f.trace(), before);
+        assert_eq!(q.pages.bytes(0, 8192), vec![0xa5; 8192]);
+        assert_eq!(
+            *guest.memory_events.lock().unwrap(),
+            ["timer-reserve", "timer-write"]
+        );
+        drop(guest);
+        native_release_peer_eof(&mut f.fixture);
+        let Err(reverie::Error::Tool(error)) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(
+            error.root_cause().to_string(),
+            "shared network engine refused operation: finite receive SignalResume lacks a fresh observation grant"
+        );
+    }
+    {
+        let (f, _) = ReplayIssuerFixture::new_trace(false, future_replay_trace().0, false).await;
+        finite_replay_fixture_timeout(&f, 0, 5_000);
+        let engine = f.state.network_engine.as_ref().unwrap();
+        let before = engine.lock().unwrap().native_trace_fixture();
+        let tool: Detcore = Detcore::new(f.tid, &f.config);
+        let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+        let result;
+        {
+            let mut pending = std::pin::pin!(tool.handle_owned_read(
+                &mut guest,
+                scalar_read(f.binding.slot.fd, f.pages.at(128), 5)
+            ));
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            select_finite_signal(&f.state, &f.root).await;
+            result = pending.await;
+        }
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .native_capture_fixture_counts(f.binding.open_file),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(engine.lock().unwrap().native_trace_fixture(), before);
+        assert!(guest.memory_events.lock().unwrap().is_empty());
+        assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+        let Err(reverie::Error::Tool(error)) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(
+            error.root_cause().to_string(),
+            "shared network engine refused operation: finite receive SignalResume lacks a fresh observation grant"
+        );
+    }
+}
+
+#[tokio::test]
+async fn guest_v4_finite_replay_input_before_equal_after_deadline_repeats_exactly() {
+    for offset in [-1i64, 0, 1] {
+        let mut trace = NetworkReplayEngine::controlled_replay_two_row_trace();
+        let epoch = trace.epoch_global_time().unwrap();
+        let deadline = epoch + LogicalTime::from_nanos(5_000_000);
+        let input_time = LogicalTime::from_nanos((deadline.as_nanos() as i64 + offset) as u64);
+        for input in &mut trace.inputs[1..] {
+            input.release.not_before_global_time = input_time;
+        }
+        trace.validate().unwrap();
+        let mut outcomes = vec![];
+        for _ in 0..2 {
+            let (f, committed) = ReplayIssuerFixture::new_trace(false, trace.clone(), false).await;
+            finite_replay_fixture_timeout(&f, 0, 5_000);
+            assert_eq!(f.state.global_time.lock().unwrap().as_nanos(), epoch);
+            let tool: Detcore = Detcore::new(f.tid, &f.config);
+            let mut guest = scalar_foreground_guest(&f.state, &f.config, f.thread.clone(), f.tid);
+            let requests = guest.requests.clone();
+            let result;
+            let call;
+            {
+                let mut pending = std::pin::pin!(tool.handle_owned_read(
+                    &mut guest,
+                    scalar_read(f.binding.slot.fd, f.pages.at(128), 5)
+                ));
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                let expected = {
+                    let all = requests.lock().unwrap();
+                    let GlobalRequest::RequestResources(request, _) = all.last().unwrap() else {
+                        panic!("missing wait");
+                    };
+                    assert_eq!(request.resources.len(), 1);
+                    let (resource, permission) = request.resources.iter().next().unwrap();
+                    assert_eq!(*permission, Permission::R);
+                    let ResourceID::NetworkCallWaitSet {
+                        interests,
+                        deadline: end,
+                        zero_wait,
+                    } = resource
+                    else {
+                        panic!("wrong wait: {request:?}");
+                    };
+                    assert_eq!(*end, Some(deadline));
+                    assert!(zero_wait.is_none());
+                    assert_eq!(interests.len(), 1);
+                    call = interests[0].0;
+                    assert_eq!(
+                        interests[0].1,
+                        crate::resources::NetworkWaitKind::ReadableAtLeast(1)
+                    );
+                    assert_eq!(
+                        request.signal_interrupt_errno(),
+                        Some(Errno::EINTR.into_raw())
+                    );
+                    request.clone()
+                };
+                let parked = crate::scheduler::do_a_turn_blocking(
+                    f.state.sched.clone(),
+                    f.state.global_time.clone(),
+                    &Ok(committed),
+                )
+                .await;
+                assert!(parked.is_err());
+                let idle = crate::scheduler::do_a_turn_blocking(
+                    f.state.sched.clone(),
+                    f.state.global_time.clone(),
+                    &parked,
+                )
+                .await;
+                assert!(idle.is_err());
+                assert_eq!(
+                    f.state.global_time.lock().unwrap().as_nanos(),
+                    std::cmp::min(input_time, deadline)
+                );
+                let selected = crate::scheduler::do_a_turn_blocking(
+                    f.state.sched.clone(),
+                    f.state.global_time.clone(),
+                    &idle,
+                )
+                .await
+                .unwrap();
+                assert_eq!(selected, expected);
+                result = pending.await;
+            }
+            let engine = f.state.network_engine.as_ref().unwrap();
+            assert_eq!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .native_capture_fixture_counts(f.binding.open_file),
+                (0, 0, 0, 0)
+            );
+            assert_exact_call_release(&guest, call);
+            let raw = match result {
+                Ok(n) => n,
+                Err(reverie::Error::Errno(errno)) => -i64::from(errno.into_raw()),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                raw,
+                if offset <= 0 {
+                    5
+                } else {
+                    -i64::from(libc::EAGAIN)
+                }
+            );
+            if offset <= 0 {
+                assert_eq!(f.pages.bytes(128, 5), b"abcde");
+            } else {
+                assert_eq!(f.pages.bytes(0, 8192), vec![0xa5; 8192]);
+            }
+            assert_eq!(engine.lock().unwrap().native_trace_fixture(), trace);
+            outcomes.push((
+                raw,
+                deadline,
+                f.state.global_time.lock().unwrap().as_nanos(),
+            ));
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
 }

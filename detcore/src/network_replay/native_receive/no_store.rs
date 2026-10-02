@@ -98,6 +98,7 @@ impl RecordNoStore {
 pub(crate) struct CompletedNoStore {
     outcome: NoStoreReturn,
     record_empty: Option<CompletedRecordEmptyAttempt>,
+    replay_timed_out: bool,
 }
 impl CompletedNoStore {
     pub(crate) fn into_outcome(self) -> NoStoreReturn {
@@ -107,6 +108,9 @@ impl CompletedNoStore {
     /// for the one-use same-Call retry after the caller's real wait.
     pub(crate) fn outcome(&self) -> NoStoreReturn {
         self.outcome
+    }
+    pub(crate) fn replay_timed_out(&self) -> bool {
+        self.replay_timed_out
     }
     pub(crate) fn into_record_empty(
         self,
@@ -227,6 +231,7 @@ impl CompletedNoStore {
     pub(crate) fn duplicate_retry_fixture(&self) -> Self {
         Self {
             outcome: self.outcome,
+            replay_timed_out: self.replay_timed_out,
             record_empty: self
                 .record_empty
                 .as_ref()
@@ -323,7 +328,6 @@ impl NetworkReplayEngine {
         use detcore_model::network_trace::NetworkReleaseNodeIdV4;
         use detcore_model::network_trace::NetworkReleaseNodeKindV4;
         use detcore_model::network_trace::NetworkReleaseNodeV4;
-        use detcore_model::network_trace::ReceiveTimeoutV3;
         let binding = source.completion().binding();
         let owner = binding.owner();
         let call = binding.call();
@@ -384,8 +388,7 @@ impl NetworkReplayEngine {
             || origin.physical_observed.bytes != channel.inbound_consumed
             || frontier.stream_offset != channel.inbound_consumed
             || (source.outcome == NoStoreReturn::WouldBlock
-                && (socket.options.receive_low_water != 1
-                    || socket.options.receive_timeout != ReceiveTimeoutV3::Infinite))
+                && !self.receive_profile_qualified(owner, call)?)
             || !confirmed.matches(source, origin.identity, probe.original_cursor)
             || probe.peek
                 != Some(match source.outcome {
@@ -517,6 +520,7 @@ impl NetworkReplayEngine {
         state.no_store_completed = true;
         Ok(CompletedNoStore {
             outcome: source.outcome,
+            replay_timed_out: false,
             record_empty: (source.outcome == NoStoreReturn::WouldBlock).then(|| {
                 CompletedRecordEmptyAttempt {
                     source: source.clone(),
@@ -658,6 +662,7 @@ pub(crate) enum ReceiveSelection<P> {
 enum ReplayNoStoreKind {
     Eof { ordinal: u64, repeated: bool },
     WouldBlock,
+    TimedOut,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReplayNoStorePlan {
@@ -672,6 +677,7 @@ pub(crate) struct ReplayNoStorePlan {
     consume_epoch: u64,
     cursor: Option<i32>,
     kind: ReplayNoStoreKind,
+    policy: Option<Arc<crate::tool_global::SavedReceivePolicy>>,
 }
 
 impl NetworkReplayEngine {
@@ -681,11 +687,21 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
         maximum: usize,
         nonblocking: bool,
+        now: Option<LogicalTime>,
     ) -> Result<super::replay_store::ReplayReceivePlan, NetworkReplayError> {
         use super::replay_store::ReplayReceivePlan;
         let (open_file, channel) = self.check_replay_receive_call(owner, call, maximum)?;
         let queue = &self.channels[&channel];
         let socket = self.stream_call_socket_state(owner, call)?;
+        let policy = self.saved_receive_policy(owner, call)?;
+        if policy
+            .as_ref()
+            .is_some_and(|saved| saved.nonblocking() != nonblocking)
+        {
+            return Err(invalid(
+                "Replay empty selection changed original nonblocking flag",
+            ));
+        }
         if queue.local_read_shutdown || queue.transport.is_datagram() {
             return Err(invalid(
                 "Replay no-store requires an open stream receive side",
@@ -723,6 +739,9 @@ impl NetworkReplayEngine {
                 }
             }
             None if nonblocking => ReplayNoStoreKind::WouldBlock,
+            None if policy.as_ref().is_some_and(|saved|
+                now.is_some_and(|now| now >= saved.started() && saved.expired(now))) =>
+                ReplayNoStoreKind::TimedOut,
             None => return Ok(ReplayReceivePlan::Wait),
             _ => {
                 return Err(invalid(
@@ -742,6 +761,7 @@ impl NetworkReplayEngine {
             consume_epoch: socket.consume_epoch,
             cursor: socket.options.peek_offset,
             kind,
+            policy,
         }))
     }
 
@@ -753,14 +773,20 @@ impl NetworkReplayEngine {
         plan: ReplayNoStorePlan,
         admission: &crate::network_runtime::ForegroundEntryAdmission<'_>,
         root: &Arc<ForegroundRoot>,
+        now: LogicalTime,
     ) -> Result<CompletedNoStore, NetworkReplayError> {
         if !Arc::ptr_eq(admission.root(), root) || !root.is_current(plan.owner) {
             return Err(invalid(
                 "Replay no-store lost exact held native admission/root",
             ));
         }
-        let super::replay_store::ReplayReceivePlan::NoStore(current) =
-            self.plan_replay_no_store(plan.owner, plan.call, plan.maximum, plan.nonblocking)?
+        let super::replay_store::ReplayReceivePlan::NoStore(current) = self.plan_replay_no_store(
+            plan.owner,
+            plan.call,
+            plan.maximum,
+            plan.nonblocking,
+            Some(now),
+        )?
         else {
             return Err(invalid("Replay no-store selection changed before commit"));
         };
@@ -785,7 +811,7 @@ impl NetworkReplayEngine {
         };
         let outcome = match plan.kind {
             ReplayNoStoreKind::Eof { .. } => NoStoreReturn::Eof,
-            ReplayNoStoreKind::WouldBlock => NoStoreReturn::WouldBlock,
+            ReplayNoStoreKind::WouldBlock | ReplayNoStoreKind::TimedOut => NoStoreReturn::WouldBlock,
         };
         // All fallible validation precedes the first semantic mutation. Empty
         // attempts/repeated EOF do not manufacture queue or epoch progress.
@@ -814,6 +840,7 @@ impl NetworkReplayEngine {
         Ok(CompletedNoStore {
             outcome,
             record_empty: None,
+            replay_timed_out: matches!(plan.kind, ReplayNoStoreKind::TimedOut),
         })
     }
 
