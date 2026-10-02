@@ -10,6 +10,11 @@ Audited revisions:
 - Hermit [`065980ea`](https://github.com/rrnewton/hermit/tree/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9)
 - Reverie [`37f04b76`](https://github.com/rrnewton/reverie/tree/37f04b7661a4f77955ba2fce7d3c9e8f1886631d)
 
+The `liteinst` feature rows, the backend matrix, and the release-contract text
+describe the tree after [#3516](https://github.com/rrnewton/hermit/pull/3516),
+which postdates the audited Hermit revision. The cfg occurrence counts in the
+Conditional Compilation Audit are still those of the audited revision.
+
 ## Hermit Features
 
 All Hermit-local features belong to the `hermit` package and are declared in
@@ -21,7 +26,8 @@ All Hermit-local features belong to the `hermit` package and are declared in
 | `dbt` | Off | Optional `detcore-dbt` and `reverie-dbt` dependencies plus DBT dispatch, runtime callbacks, tests, and imports. |
 | `sabre` | Off | SaBRe runtime availability and its enabled-path test. The external loader and plugin are staged separately. |
 | `e9patch` | Off | e9patch runtime availability. The preprocessing module remains compiled because it shares parser and instruction-map machinery with core code. |
-| `third-party-backends` | Off | Aggregate enabling `dbt`, `sabre`, and `e9patch`; it has no direct source cfg. |
+| `liteinst` | Off | Optional `reverie-liteinst` dependency plus LiteInst dispatch and availability; a build without it refuses `--backend=liteinst`. |
+| `third-party-backends` | Off | Aggregate enabling `dbt`, `sabre`, `e9patch`, and `liteinst`; it has no direct source cfg. |
 
 The workspace's
 [`default-members`](https://github.com/rrnewton/hermit/blob/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9/Cargo.toml)
@@ -57,9 +63,9 @@ the repeated name is intentional rather than a shared feature.
 
 The intended split is a core Cargo release containing ptrace and KVM, and a
 developer build that explicitly enables and stages all third-party
-backends. Draft PR
-[#1433](https://github.com/rrnewton/hermit/pull/1433) makes plain `make` the
-all-backend developer build while keeping `make release-core` feature-free.
+backends. Plain `make` is that all-backend developer build
+(`-p hermit --features third-party-backends`), and `make release-core` stays
+feature-free.
 
 This matches the release plan only if "single static core binary" means one
 Hermit executable with no third-party backend features. It is not currently a
