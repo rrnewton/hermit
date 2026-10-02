@@ -18,6 +18,54 @@ pub type RawFd = std::os::unix::io::RawFd;
 /// Nondeterministic "physical" inode
 pub type RawInode = u64;
 
+/// Nondeterministic "physical" identity of a file: the raw device number and
+/// inode number exactly as one kernel interface reported them.
+///
+/// An inode number alone is not a file identity. Linux numbers inodes per
+/// filesystem, so unrelated files on different filesystems share numbers, and
+/// whether two of them coincide depends on host counters: fresh tmpfs mounts
+/// all start at 1, the internal shm mount hands memfds per-CPU batches, and
+/// pipes, sockets and procfs entries draw from `get_next_ino`. When
+/// deterministic inodes were keyed on the inode alone, a coincidence present in
+/// one run but not the other made the two runs mint different values for every
+/// later file (<https://github.com/rrnewton/hermit/issues/3307>).
+///
+/// The device is the one `stat` reports for the file. Linux does not always
+/// report one device per file across interfaces: on btrfs, `stat` reports a
+/// per-subvolume device while `/proc/*/maps` reports the superblock device,
+/// and on overlayfs maps reports the lower file's device. This type does not
+/// guess that such devices are equal; a caller holding another interface's
+/// pair must find `stat`'s identity for the same file or key on the pair it
+/// has, accepting that the two views mint different values. Detcore's
+/// `mapping_stat_identity` does the former for a maps line from the `fstat`
+/// identity recorded when the guest mapped the file, or else by resolving the
+/// line's path, and keys on the maps pair only when neither names the file.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+pub struct RawFileId {
+    /// Raw device number (`st_dev`, or the device column of a maps line).
+    pub device: u64,
+    /// Raw inode number on that device.
+    pub inode: RawInode,
+}
+
+impl RawFileId {
+    /// Pair a raw device with a raw inode reported by the same interface.
+    pub const fn new(device: u64, inode: RawInode) -> Self {
+        Self { device, inode }
+    }
+}
+
 /// Deterministic "virtual" inode.
 ///
 /// Deliberately a newtype rather than an alias for [`RawInode`]. As an alias
