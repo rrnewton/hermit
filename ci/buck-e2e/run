@@ -35,6 +35,7 @@ done
 [[ -d $here/staged ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
 mkdir -p "$out" "$work"
 extra=("$@")
+started=$(date +%s)
 tpx=(-- --retry 1 --no-retry-on-skip)
 
 invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
@@ -69,4 +70,5 @@ for r in "${runs[@]}"; do
     fi
     ids+=("$(cat "$work/$r.test_id")")
 done
-python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" "${ids[@]}"
+python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
+    --local-artifacts "$root/buck-out/v2/test/execution" --since "$started" "${ids[@]}"
