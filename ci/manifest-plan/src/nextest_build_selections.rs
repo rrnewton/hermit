@@ -597,7 +597,7 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "177");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "179");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])

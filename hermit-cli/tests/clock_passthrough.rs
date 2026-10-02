@@ -23,7 +23,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 /// Clock reads plus the lseek witness after each printed value.
-const CLOCK_DETLOG_LINES: usize = 8 + 13;
+const CLOCK_DETLOG_LINES: usize = 10 + 15;
 
 fn build_guest() -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))

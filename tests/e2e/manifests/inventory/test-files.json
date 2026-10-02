@@ -325,6 +325,12 @@
       "why": "tests/c/clock_exec_continuity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: regression guard for the PR #1095 clock freeze; reads the virtual clock repeatedly inside each generation and re-execs itself, asserting the clock is never rebased onto a round origin, never resets across exec, and is never coarsened -- the axis a first-sample comparison cannot see, which is how #1095 passed review"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/clock_passthrough.c",
+      "runner": "hermit-cli/tests/clock_passthrough.rs",
+      "why": "tests/c/clock_passthrough.c is owned by hermit-cli/tests/clock_passthrough.rs: Guest that reads every clock syscall Detcore virtualizes through raw syscalls, including a NULL-timespec clock_gettime that must fail with EFAULT, and passes each value as an lseek offset so a replay that observed a different value diverges at that syscall's argument check. The Rust integration test records it and replays it twice, comparing stdout and the clock DETLOG exactly, and also runs it under --no-virtualize-time. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/clone.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

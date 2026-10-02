@@ -22,14 +22,15 @@ impl Replayer {
         guest: &mut G,
         syscall: ClockGettime,
     ) -> Result<i64, Errno> {
+        // Consume the recorded event before validating `tp`: the recorder logs
+        // an `Err(EFAULT)` event for a NULL `tp`, and returning before reading
+        // it would hand that error to the next syscall that reads an event.
+        let event = next_event!(guest, Timespec)?;
         let addr = syscall.tp().ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(addr, &event.timespec)?;
 
-        next_event!(guest, Timespec).and_then(|event| {
-            guest.memory().write_value(addr, &event.timespec)?;
-
-            // clock_gettime always returns 0 on success.
-            Ok(0)
-        })
+        // clock_gettime always returns 0 on success.
+        Ok(0)
     }
 
     pub(super) async fn handle_clock_getres<G: Guest<Self>>(

@@ -82,6 +82,17 @@ int main(void) {
   // A NULL resolution pointer only validates the clock id.
   check("clock_getres(NULL)", syscall(SYS_clock_getres, CLOCK_REALTIME, NULL));
 
+  // A NULL timespec pointer fails with EFAULT, and the recording logs that
+  // failure as an event. The clock read after it checks that replay consumed
+  // the failed call's event rather than handing it to the next syscall.
+  errno = 0;
+  long null_tp = syscall(SYS_clock_gettime, CLOCK_REALTIME, NULL);
+  if (null_tp != -1 || errno != EFAULT) {
+    fprintf(stderr, "clock_gettime(NULL) returned %ld: %s\n", null_tp, strerror(errno));
+    return 1;
+  }
+  read_clock("after_null_tp", CLOCK_MONOTONIC);
+
   printf("clock-passthrough-ok\n");
   return 0;
 }

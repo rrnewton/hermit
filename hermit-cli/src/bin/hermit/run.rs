@@ -431,7 +431,9 @@ pub struct RunOpts {
     pub(crate) det_opts: DetOptions,
 
     /// Require Hermit's deterministic defaults and reject incompatible opt-outs. Unsupported
-    /// syscalls already fail closed in ordinary runs.
+    /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is still accepted:
+    /// clock syscalls then return host time, so the run is not reproducible unless it is being
+    /// recorded or replayed, and `--verify` reports the difference.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
@@ -1231,9 +1233,11 @@ fn emulator_uses_instruction_count_clock(args: &[String]) -> bool {
 /// remedies. Measured on 2026-08-21 with hermit `f05bf04e4f`, a busybox guest at
 /// one vCPU and no `-icount`, that option changes nothing about this failure:
 /// the run with it and the run without it both panic in guest timer setup and
-/// both produce a 9,233-byte console. Combined with `--strict` it is worse than
-/// useless — strict mode rejects the now-unvirtualized `gettimeofday` and Hermit
-/// exits 1 before the guest starts. Recommending it sent readers down a dead end
+/// both produce a 9,233-byte console. At the time, combined with `--strict` it
+/// was worse than useless — strict mode rejected the unvirtualized
+/// `gettimeofday` and Hermit exited 1 before the guest started (clock syscalls
+/// now pass through to the host clock instead; see
+/// https://github.com/rrnewton/hermit/issues/1176). Recommending it sent readers down a dead end
 /// at the moment they were most likely to follow the advice, so the message now
 /// names only remedies that were measured to reach a booted guest.
 fn vmm_time_virtualization_warning(
