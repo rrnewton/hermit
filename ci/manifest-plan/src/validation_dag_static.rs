@@ -626,7 +626,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording
     // (https://github.com/rrnewton/reverie/pull/885) retain all 103 prior
     // selected CLI identities.
-    ("test.cli", 105),
+    // hermit_dap_replay_refusal_reaches_the_client,
+    // hermit_dap_replay_steps_back_through_stops_off_line_breakpoints and
+    // hermit_dap_replay_steps_back_through_repeated_and_shared_addresses
+    // (https://github.com/rrnewton/hermit/pull/3545) retain all 105 prior
+    // selected CLI identities.
+    ("test.cli", 108),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -660,7 +665,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 102.
     // The same two hermit-dap
     // end-to-end tests as test.cli; all 103 prior identities retained.
-    ("test.cli_on_host", 105),
+    // The same two hermit-dap
+    // end-to-end tests as test.cli; all 102 prior identities retained. The
+    // same three hermit-dap replay tests from
+    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 105 prior
+    // identities retained.
+    ("test.cli_on_host", 108),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),

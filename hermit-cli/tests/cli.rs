@@ -6223,6 +6223,13 @@ fn hermit_dap_rejects_replay_options_without_replay() {
 /// is missing, lacks a DAP interpreter, or is refused by managed replay.
 const HERMIT_REQUIRE_DAP_GDB: &str = "HERMIT_REQUIRE_DAP_GDB";
 
+/// The start of managed replay's refusal of a GDB whose DAP internals it
+/// cannot hook. The replay tests skip on it like on a GDB with no DAP
+/// interpreter: both are host-tool limits, and the pinned validation image,
+/// which ships the tested GDB 17.2, sets [`HERMIT_REQUIRE_DAP_GDB`] so that a
+/// refusal there fails instead.
+const DAP_GDB_REFUSAL: &str = "managed replay does not support this GDB";
+
 /// How long one DAP exchange may take before the test fails rather than hangs.
 /// A reverse request restarts the replay and runs it forward, so it gets more.
 const DAP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -6302,9 +6309,15 @@ fn dap_gdb_skip(test: &str, reason: &str) {
 /// source and program paths. Each test passes its own directory: nextest runs
 /// tests in separate processes, so a shared output file would race.
 fn dap_guest(directory: &Path) -> (PathBuf, PathBuf) {
-    let source = directory.join("squares.c");
-    fs::write(&source, DAP_GUEST_SOURCE).expect("failed to write the hermit-dap guest source");
-    let program = directory.join("squares");
+    dap_compile(directory, "squares", DAP_GUEST_SOURCE)
+}
+
+/// Writes `text` to `directory/name.c` and compiles it, unoptimized and at a
+/// fixed address so the tests' line numbers map to stable instructions.
+fn dap_compile(directory: &Path, name: &str, text: &str) -> (PathBuf, PathBuf) {
+    let source = directory.join(format!("{name}.c"));
+    fs::write(&source, text).expect("failed to write the hermit-dap guest source");
+    let program = directory.join(name);
     let output = Command::new("cc")
         .args(["-g", "-O0", "-fno-pie", "-no-pie"])
         .arg(&source)
@@ -6319,6 +6332,87 @@ fn dap_guest(directory: &Path) -> (PathBuf, PathBuf) {
         String::from_utf8_lossy(&output.stderr),
     );
     (source, program)
+}
+
+/// A second guest for managed replay, shaped to put two kinds of arrival in
+/// the recorded history that [`DAP_GUEST_SOURCE`] does not:
+///
+/// - `countdown`'s loop branches back to the first instruction of line 4, the
+///   address its line breakpoint sits on, so the history holds consecutive
+///   arrivals at one pc and one source line, each a separate point in time.
+/// - `twice` is written under `#line 2`, so its first statement (line 2) and
+///   its opening line (8) resolve to one breakpoint address while GDB reports
+///   a stop there as line 2. The line breakpoint that records the arrival is
+///   line 8's, so the recorded entry and the stop name different lines.
+const DAP_LOOPS_SOURCE: &str = r#"#include <stdio.h>
+
+static int countdown(int n) {
+  do { n--; } while (n > 0);
+  return n;
+}
+
+static int twice(int x) {
+#line 2
+  return x + x;
+#line 12
+}
+
+int main(void) {
+  int left = countdown(3);
+  int sum = twice(1) + twice(2);
+  printf("left=%d sum=%d\n", left, sum);
+  return 0;
+}
+"#;
+/// `countdown`'s loop, its call in `main`, `twice`'s body (renumbered to 2)
+/// and closing brace, and the line in `main` that calls `twice`.
+const DAP_LOOPS_COUNTDOWN_LINE: u64 = 4;
+const DAP_LOOPS_COUNTDOWN_CALL_LINE: u64 = 15;
+const DAP_LOOPS_TWICE_BODY_LINE: u64 = 2;
+const DAP_LOOPS_TWICE_END_LINE: u64 = 12;
+const DAP_LOOPS_TWICE_CALL_LINE: u64 = 16;
+// ⚠️ THE FIVE LINE NUMBERS ABOVE ARE THIS LAYOUT. Keep them in step.
+
+/// The `for` line of [`DAP_GUEST_SOURCE`]'s loop in `main`.
+const DAP_GUEST_LOOP_LINE: u64 = 10;
+
+/// Records `program` with `hermit record start` under `data_dir`, requires
+/// `expected` in its stdout, and returns the recording id.
+fn dap_record(program: &Path, data_dir: &Path, expected: &str) -> String {
+    let program_arg = program.to_str().expect("guest path should be UTF-8");
+    let recorded = hermit_command(&["record", "start", "--", program_arg])
+        .env("HERMIT_DATA_DIR", data_dir)
+        .output()
+        .expect("failed to run hermit record start");
+    assert!(
+        recorded.status.success() && String::from_utf8_lossy(&recorded.stdout).contains(expected),
+        "hermit record start: {}\nstdout:\n{}\nstderr:\n{}",
+        recorded.status,
+        String::from_utf8_lossy(&recorded.stdout),
+        stderr(&recorded)
+    );
+    fs::read_to_string(data_dir.join("last"))
+        .expect("hermit record start wrote no `last` recording id")
+        .trim()
+        .to_owned()
+}
+
+/// hermit-dap serving `recording` from `data_dir` through `gdb`.
+fn dap_replay_adapter(
+    hermit_dap: &Path,
+    gdb: &Path,
+    recording: &str,
+    data_dir: &Path,
+    port: u16,
+) -> Command {
+    let mut adapter = Command::new(hermit_dap);
+    adapter
+        .arg("--gdb")
+        .arg(gdb)
+        .args(["--replay", recording, "--data-dir"])
+        .arg(data_dir)
+        .args(["--gdbserver-port", &port.to_string()]);
+    adapter
 }
 
 /// A loopback port nothing is listening on right now.
@@ -6514,9 +6608,10 @@ impl DapClient {
         response
     }
 
-    /// Sends `initialize`. If the adapter exits first because managed replay
-    /// refused this GDB, returns that refusal instead of failing.
-    fn initialize(&mut self) -> Result<serde_json::Value, String> {
+    /// Sends `initialize` and returns its response, successful or not. The
+    /// adapter closing its output first fails the test: a startup refusal
+    /// must reach the client as this response, not only as stderr text.
+    fn initialize_response(&mut self) -> serde_json::Value {
         let seq = self.request(
             "initialize",
             serde_json::json!({
@@ -6526,41 +6621,49 @@ impl DapClient {
                 "pathFormat": "path",
             }),
         );
-        let deadline = Instant::now() + DAP_TIMEOUT;
+        self.wait_for("the initialize response", DAP_TIMEOUT, |message| {
+            message["type"] == "response" && message["request_seq"] == seq
+        })
+    }
+
+    /// Sends `initialize`, which must succeed, except that a managed-replay
+    /// refusal of this GDB is returned as `Err(message)` for the caller to
+    /// skip on. Any other failure fails the test.
+    fn initialize(&mut self) -> Result<serde_json::Value, String> {
+        let response = self.initialize_response();
+        if response["success"] == true {
+            return Ok(response);
+        }
+        match response["message"].as_str() {
+            Some(message) if message.contains(DAP_GDB_REFUSAL) => Err(message.to_owned()),
+            _ => self.fail(&format!("initialize failed: {response}")),
+        }
+    }
+
+    /// Waits up to `timeout` for the adapter to exit and returns its status.
+    fn exit_status(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.messages.recv_timeout(remaining) {
-                Ok(Ok(message)) => {
-                    self.transcript.push(format!("<- {message}"));
-                    if message["type"] == "response" && message["request_seq"] == seq {
-                        if message["success"] != true {
-                            self.fail(&format!("initialize failed: {message}"));
-                        }
-                        return Ok(message);
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let exit_deadline = Instant::now() + Duration::from_secs(10);
-                    while self.adapter.0.try_wait().ok().flatten().is_none()
-                        && Instant::now() < exit_deadline
-                    {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    let stderr = self.adapter_stderr();
-                    if let Some(line) = stderr
-                        .lines()
-                        .find(|line| line.contains("managed replay does not support this GDB"))
-                    {
-                        return Err(line.to_owned());
-                    }
-                    self.fail("hermit-dap closed its output before answering initialize")
-                }
-                Ok(Err(problem)) => self.fail(&format!("waiting for initialize: {problem}")),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.fail("timed out waiting for the initialize response")
-                }
+            match self.adapter.0.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => self.fail(&format!("hermit-dap did not exit within {timeout:?}")),
+                Err(error) => self.fail(&format!("failed to poll hermit-dap: {error}")),
             }
         }
+    }
+
+    /// Sends `command` for `thread`, which must succeed, and returns the body
+    /// of the `stopped` event that follows.
+    fn resume(
+        &mut self,
+        command: &str,
+        thread: &serde_json::Value,
+        what: &str,
+        timeout: Duration,
+    ) -> serde_json::Value {
+        self.call(command, serde_json::json!({"threadId": thread}), timeout);
+        self.stopped(what, timeout)
     }
 
     /// Attaches to `target`, sets one breakpoint at `line` of `source`, finishes
@@ -6831,9 +6934,11 @@ fn hermit_dap_attach_keeps_the_thread_across_continue_and_stack_trace() {
 /// renamed to `_send_event` (AttributeError). Repairing that exposed further
 /// defects that this test also pins: stepBack moved FORWARD in time (lines 3
 /// and 4 resolve to one breakpoint address, so each arrival was recorded twice
-/// and the occurrence count overshot), `readelf` output truncated without
-/// `--wide` silently dropped every line breakpoint, and GDB's DAP frame cache
-/// survived the replay restart ("Frame is invalid.").
+/// and the occurrence count overshot), and `readelf` output truncated without
+/// `--wide` silently dropped every line breakpoint. The frame cache surviving
+/// a restart to the replay's entry is pinned by
+/// `hermit_dap_replay_steps_back_through_stops_off_line_breakpoints`; this
+/// test's restarts all resume the replay, which drops the cache anyway.
 ///
 /// The expected positions are the guest's real history: the second hit of
 /// `square` has x = 1, one source line earlier is the call in `main` with
@@ -6850,32 +6955,11 @@ fn hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording() {
     let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the hermit-dap work dir");
     let (source, program) = dap_guest(work.path());
-    let program_arg = program.to_str().expect("guest path should be UTF-8");
     let data_dir = work.path().join("recordings");
-
-    let recorded = hermit_command(&["record", "start", "--", program_arg])
-        .env("HERMIT_DATA_DIR", &data_dir)
-        .output()
-        .expect("failed to run hermit record start");
-    assert!(
-        recorded.status.success() && String::from_utf8_lossy(&recorded.stdout).contains("total=5"),
-        "hermit record start: {}\nstdout:\n{}\nstderr:\n{}",
-        recorded.status,
-        String::from_utf8_lossy(&recorded.stdout),
-        stderr(&recorded)
-    );
-    let recording = fs::read_to_string(data_dir.join("last"))
-        .expect("hermit record start wrote no `last` recording id");
-    let recording = recording.trim();
+    let recording = dap_record(&program, &data_dir, "total=5");
 
     let port = unused_local_port();
-    let mut adapter = Command::new(hermit_dap);
-    adapter
-        .arg("--gdb")
-        .arg(&gdb)
-        .args(["--replay", recording, "--data-dir"])
-        .arg(&data_dir)
-        .args(["--gdbserver-port", &port.to_string()]);
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
     let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
     let initialized = match dap.initialize() {
         Ok(response) => response,
@@ -6939,6 +7023,349 @@ fn hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording() {
         "breakpoint",
         &in_square,
         ("x", "0"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A managed-replay startup refusal must reach the DAP client as a failed
+/// response to its first request, and must also be written to stderr.
+///
+/// GDB's DAP interpreter points its descriptors 1 and 2 at internal pipes
+/// before the replay extension runs, and drains them only once its server
+/// loop starts. Before the fix, the extension wrote its refusal with
+/// `gdb.write` and exited: measured with GDB 17.2, zero bytes reached either
+/// stream, and the client saw only a closed connection.
+///
+/// Two refusals are driven through a real GDB: a GDB whose DAP module lacks
+/// `gdb.dap.frames._clear_frame_ids` (simulated by deleting it in an earlier
+/// init command, after GDB has loaded its DAP server), and a PATH with no
+/// readelf. The PATH case runs first: if the real GDB is itself refused, the
+/// test skips like the other replay tests (or fails under
+/// `HERMIT_REQUIRE_DAP_GDB`).
+#[test]
+fn hermit_dap_replay_refusal_reaches_the_client() {
+    const TEST: &str = "hermit_dap_replay_refusal_reaches_the_client";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    // Nothing is replayed: both refusals happen before the replay starts.
+    let data_dir = work.path().join("recordings");
+
+    let empty_path = work.path().join("empty-path");
+    fs::create_dir(&empty_path).expect("failed to create an empty PATH directory");
+    let mut adapter = dap_replay_adapter(
+        hermit_dap,
+        &gdb,
+        "no-such-recording",
+        &data_dir,
+        unused_local_port(),
+    );
+    adapter.env("PATH", &empty_path);
+    let mut dap = DapClient::spawn(adapter, work.path().join("no-readelf.stderr"));
+    let response = dap.initialize_response();
+    let message = response["message"].as_str().unwrap_or_default().to_owned();
+    // This GDB's own support check runs before the tool check. If the real GDB
+    // is refused, the hookless case below would prove nothing either.
+    if message.contains(DAP_GDB_REFUSAL) {
+        dap_gdb_skip(TEST, &message);
+        return;
+    }
+    if response["success"] != false
+        || !message.contains("managed replay requires readelf and setpriv on PATH")
+        || !message.contains("readelf")
+        || response["body"]["error"]["showUser"] != true
+    {
+        dap.fail(&format!(
+            "initialize must fail, shown to the user, naming the missing tool: {response}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() || !dap.adapter_stderr().contains(&message) {
+        dap.fail(&format!(
+            "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
+        ));
+    }
+
+    let hookless_gdb = work.path().join("gdb-without-clear-frame-ids");
+    fs::write(
+        &hookless_gdb,
+        format!(
+            "#!/bin/sh\nexec '{}' '--init-eval-command=python import gdb.dap.frames; \
+             del gdb.dap.frames._clear_frame_ids' \"$@\"\n",
+            gdb.display()
+        ),
+    )
+    .expect("failed to write the GDB wrapper");
+    fs::set_permissions(&hookless_gdb, fs::Permissions::from_mode(0o755))
+        .expect("failed to make the GDB wrapper executable");
+    let adapter = dap_replay_adapter(
+        hermit_dap,
+        &hookless_gdb,
+        "no-such-recording",
+        &data_dir,
+        unused_local_port(),
+    );
+    let mut dap = DapClient::spawn(adapter, work.path().join("hookless.stderr"));
+    let refusal = match dap.initialize() {
+        Err(refusal) => refusal,
+        Ok(response) => dap.fail(&format!(
+            "a GDB without _clear_frame_ids must be refused: {response}"
+        )),
+    };
+    if !refusal.contains("gdb.dap.frames lacks _clear_frame_ids") {
+        dap.fail(&format!(
+            "the refusal must name the missing hook: {refusal}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() || !dap.adapter_stderr().contains(&refusal) {
+        dap.fail(&format!(
+            "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
+        ));
+    }
+}
+
+/// stepBack must land at the right point in time when the history holds stops
+/// at addresses no line breakpoint covers, and reverseContinue with no earlier
+/// breakpoint hit must stop at the replay's entry with a usable stack.
+///
+/// A stepOut lands on the call's return address, and a `next` from there on
+/// the loop's increment; neither is the first instruction of a source line,
+/// so no line breakpoint records arrivals there. Before the fix, stepBack
+/// chose which arrival to restart to by counting the history's entries at the
+/// target address, which held only the arrivals the client happened to stop
+/// at. Measured before the fix on the sequence below: the second stepBack
+/// landed in `main` with i = 0 instead of i = 1.
+///
+/// The restart to the replay's entry is the one reverse request that does not
+/// resume the replay, so GDB's DAP frame cache, which it drops only on resume,
+/// still held the killed replay's frames; the extension drops it after each
+/// restart.
+///
+/// The expected positions are the guest's real history: the stepOut from the
+/// second call returns to `main` with i = 1, one source line before the third
+/// call is the call line with i = 2, and one before that is the return from
+/// the second call, which is also one source line before the loop increment
+/// that follows it.
+#[test]
+fn hermit_dap_replay_steps_back_through_stops_off_line_breakpoints() {
+    const TEST: &str = "hermit_dap_replay_steps_back_through_stops_off_line_breakpoints";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "total=5");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_GUEST_BREAK_LINE,
+    );
+    let in_square = [
+        ("square", DAP_GUEST_BREAK_LINE),
+        ("main", DAP_GUEST_CALL_LINE),
+    ];
+    let at_call = [("main", DAP_GUEST_CALL_LINE)];
+
+    let what = "the first breakpoint hit";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "breakpoint", &in_square, ("x", "0"));
+
+    // No breakpoint hit precedes this one, so reverseContinue restarts the
+    // replay and stops at its entry, before main has run.
+    let what = "reverseContinue to the replay's entry";
+    let stop = dap.resume("reverseContinue", &thread, what, DAP_REVERSE_TIMEOUT);
+    if stop["reason"] != "entry" || stop["threadId"] != thread {
+        dap.fail(&format!(
+            "{what}: expected an entry stop of thread {thread}, got {stop}"
+        ));
+    }
+    let threads = dap.call("threads", serde_json::json!({}), DAP_TIMEOUT);
+    if !threads["body"]["threads"]
+        .as_array()
+        .is_some_and(|threads| threads.iter().any(|entry| entry["id"] == thread))
+    {
+        dap.fail(&format!(
+            "{what}: thread {thread} is missing from {threads}"
+        ));
+    }
+    let trace = dap.call(
+        "stackTrace",
+        serde_json::json!({"threadId": thread}),
+        DAP_TIMEOUT,
+    );
+    let names: Vec<String> = trace["body"]["stackFrames"]
+        .as_array()
+        .map(|frames| {
+            frames
+                .iter()
+                .map(|frame| frame["name"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() || names.iter().any(|name| name == "square" || name == "main") {
+        dap.fail(&format!(
+            "{what}: the stack must be the fresh replay's, before main: {names:?}"
+        ));
+    }
+
+    for x in ["0", "1"] {
+        let what = format!("the breakpoint hit with x = {x} after the restart");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_square, ("x", x));
+    }
+    let what = "stepOut of the second call";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "1"));
+    let what = "the breakpoint hit with x = 2";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "breakpoint", &in_square, ("x", "2"));
+
+    let what = "stepBack from the third call";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "2"));
+    let what = "stepBack to the stepOut's stop";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "1"));
+
+    // The same target with no recorded line arrival after it: stepBack must
+    // first run the replay forward to one. Counting to the replay's exit
+    // instead would also count the third call's return, and land at i = 2.
+    let what = "next to the loop increment";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("main", DAP_GUEST_LOOP_LINE)],
+        ("i", "1"),
+    );
+    let what = "stepBack to the second call's return";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "1"));
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// stepBack must count every arrival at an address once, including
+/// consecutive arrivals at the same source line and arrivals recorded under a
+/// different line than the stop reports.
+///
+/// The recorded history once dropped an arrival when the previous entry had
+/// the same pc and line, which erases all but one pass of a loop whose body
+/// starts at its breakpoint address, and merged a stop into the entry just
+/// recorded only when both named the same line, which records an arrival
+/// twice where two source lines share an address (see [`DAP_LOOPS_SOURCE`]).
+/// Either one makes stepBack restart to the wrong arrival.
+///
+/// The expected positions are the guest's real history: before the loop's
+/// third pass (n = 1) is its second (n = 2), and one source line before the
+/// second call of `twice` (x = 2) is the end of its first call (x = 1).
+#[test]
+fn hermit_dap_replay_steps_back_through_repeated_and_shared_addresses() {
+    const TEST: &str = "hermit_dap_replay_steps_back_through_repeated_and_shared_addresses";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_compile(work.path(), "loops", DAP_LOOPS_SOURCE);
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "left=0 sum=6");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_LOOPS_COUNTDOWN_LINE,
+    );
+    let in_countdown = [
+        ("countdown", DAP_LOOPS_COUNTDOWN_LINE),
+        ("main", DAP_LOOPS_COUNTDOWN_CALL_LINE),
+    ];
+
+    for n in ["3", "2", "1"] {
+        let what = format!("the loop's pass with n = {n}");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_countdown, ("n", n));
+    }
+    let what = "stepBack to the loop's previous pass";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &in_countdown, ("n", "2"));
+
+    let breakpoints = dap.call(
+        "setBreakpoints",
+        serde_json::json!({
+            "source": {"path": source},
+            "breakpoints": [{"line": DAP_LOOPS_TWICE_BODY_LINE}],
+        }),
+        DAP_TIMEOUT,
+    );
+    if breakpoints["body"]["breakpoints"][0]["verified"] != true {
+        dap.fail(&format!(
+            "the breakpoint at line {DAP_LOOPS_TWICE_BODY_LINE} must resolve: {breakpoints}"
+        ));
+    }
+    let in_twice = [
+        ("twice", DAP_LOOPS_TWICE_BODY_LINE),
+        ("main", DAP_LOOPS_TWICE_CALL_LINE),
+    ];
+    for x in ["1", "2"] {
+        let what = format!("the call of twice with x = {x}");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_twice, ("x", x));
+    }
+    let what = "stepBack to the end of the first call of twice";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[
+            ("twice", DAP_LOOPS_TWICE_END_LINE),
+            ("main", DAP_LOOPS_TWICE_CALL_LINE),
+        ],
+        ("x", "1"),
     );
 
     dap.call(

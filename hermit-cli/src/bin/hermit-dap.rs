@@ -10,6 +10,10 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::IntoRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -148,6 +152,32 @@ fn replay_command(options: &ReplayOptions) -> Result<Vec<String>, String> {
     Ok(serialized)
 }
 
+/// Inheritable duplicates of this process's stdin, stdout and stderr, as a
+/// Python tuple literal, or `None` if any duplicate fails.
+///
+/// GDB's DAP interpreter redirects its own descriptors 0, 1 and 2 to internal
+/// pipes before it runs the replay extension, and drains them only after
+/// startup. A startup refusal written through them never reaches the client,
+/// so the extension writes it through these duplicates instead. They survive
+/// the exec below on purpose; the extension closes them once startup
+/// succeeds.
+fn client_fds() -> String {
+    let duplicate = |fd: BorrowedFd<'_>| nix::unistd::dup(fd).ok();
+    match (
+        duplicate(io::stdin().as_fd()),
+        duplicate(io::stdout().as_fd()),
+        duplicate(io::stderr().as_fd()),
+    ) {
+        (Some(input), Some(output), Some(error)) => format!(
+            "({}, {}, {})",
+            input.into_raw_fd(),
+            output.into_raw_fd(),
+            error.into_raw_fd()
+        ),
+        _ => "None".to_string(),
+    }
+}
+
 fn main() -> ExitCode {
     let options = match parse_options(env::args_os().skip(1)) {
         Ok(Some(options)) => options,
@@ -178,9 +208,11 @@ fn main() -> ExitCode {
             }
         };
         let replay_target = format!("127.0.0.1:{}", replay.gdbserver_port);
+        let client_fds = client_fds();
         let extension = format!(
             "python HERMIT_REPLAY_COMMAND = {replay_command}; \
-             HERMIT_REPLAY_TARGET = {replay_target:?}; exec({REVERSE_DAP:?})"
+             HERMIT_REPLAY_TARGET = {replay_target:?}; \
+             HERMIT_CLIENT_FDS = {client_fds}; exec({REVERSE_DAP:?})"
         );
         gdb_command.arg(format!("--init-eval-command={extension}"));
     }

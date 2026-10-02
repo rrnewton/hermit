@@ -270,11 +270,15 @@ Use `--data-dir=DIR` or `HERMIT_DATA_DIR` to select another directory.
 The DAP adapter is experimental. It is tested end to end with GDB 17.2 on a
 single-threaded C program: attaching to `run --gdbserver`, hitting a source
 breakpoint, continuing, reading the stack and evaluating variables, and, for a
-recording, `stepBack` and `reverseContinue` (the `hermit_dap_*` tests in
-`hermit-cli/tests/cli.rs`). Other GDB versions are not tested. Reverse replay
-patches GDB's DAP server internals, so it refuses to start, naming the missing
-hook, under a GDB whose DAP server lacks them; it also requires `readelf` and
-`setpriv` on `PATH`. Multithreaded guests are not yet covered by these tests.
+recording, `stepBack` and `reverseContinue`, including `stepBack` after a
+`stepOut` or `next` and a `reverseContinue` back to the replay's entry (the
+`hermit_dap_*` tests in `hermit-cli/tests/cli.rs`). Other GDB versions are not
+tested. Reverse replay patches GDB's DAP server internals, so under a GDB whose
+DAP server lacks them it refuses to start: the client's first request gets a
+failed response naming the missing hook, and the adapter writes the same
+message to its stderr and exits. It refuses the same way when `readelf` or
+`setpriv` is missing from `PATH`. Multithreaded guests are not yet covered by
+these tests.
 
 Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
 `hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
@@ -357,7 +361,12 @@ adding the recording arguments to `spawnConfig`:
 When its extension loads successfully, the adapter advertises `supportsStepBack`
 and implements DAP `stepBack` and `reverseContinue` by restarting the
 deterministic replay and running forward to the requested earlier source
-position. This first implementation favors correctness over speed.
+position. `stepBack` returns to the previous source line the replay passed or
+the previous place the client stopped, whichever came later. When that place
+does not start a source line, such as the return address a `stepOut` stops at,
+`stepBack` restarts the replay once more to count the earlier passes through
+it, and may first run the current replay forward to the next source line. This
+first implementation favors correctness over speed.
 
 ```bash
 dapper proxy --control-port 4711 from-config hermit-dap-replay.json
