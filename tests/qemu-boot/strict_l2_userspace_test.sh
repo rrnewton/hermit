@@ -5,7 +5,8 @@
 # runs a single freestanding init). A freestanding launcher init
 # (qemu_exec_init.c) fork()/execve()s a target program, wait4()s it, prints the
 # captured exit status, and powers off. Two scenarios are exercised, each proven
-# at L2 (hermit run --strict --verify, bitwise-identical repeat run):
+# at L2 (hermit run --strict --verify --verify-strict, bitwise-identical
+# repeat run required by `verification-report canonical-match`):
 #
 #   hello   : a statically linked glibc program (qemu_hello.c) -> exit 7
 #   busybox : the host's static busybox running `sh -c 'echo ...; exit 5'`
@@ -140,7 +141,8 @@ guest_command_for() {
 
 # run_scenario <name> <initramfs_image> <marker> [<marker> ...]
 # Boots the guest once under strict mode asserting every marker, then reruns the
-# exact command under --verify for the L2 comparison.
+# exact command under --verify --verify-strict for the canonical (bitwise) L2
+# comparison.
 run_scenario() {
   local name=$1
   local initramfs_image=$2
@@ -157,7 +159,7 @@ run_scenario() {
 
   guest_command_for "$initramfs_image"
   local boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
-  local verify_command=("$hermit_bin" --log info run --strict --verify \
+  local verify_command=("$hermit_bin" --log info run --strict --verify --verify-strict \
     --verify-json "$verify_report" -- "${guest_command[@]}")
 
   printf '\n=== scenario: %s ===\n' "$name"
@@ -242,8 +244,11 @@ run_scenario() {
   if ((status != 0)); then
     fail "[$name] strict L2 verification exited with status $status"
   fi
-  "$VERIFICATION_REPORT_BIN" matched "$verify_report" || \
-    fail "[$name] typed verification report did not match"
+  [[ -s $verify_report ]] || fail "[$name] Hermit published no typed verification report"
+  "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report" || {
+    cat "$verify_report" >&2
+    fail "[$name] typed verification report did not establish non-vacuous bitwise parity"
+  }
   stop_active_group
 
   printf '[%s] QEMU strict L2 userspace program passed.\n' "$name"

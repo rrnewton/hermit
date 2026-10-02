@@ -488,7 +488,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // version::tests::cargo_version_of_an_unstamped_build_says_dev_build
     // (https://github.com/rrnewton/hermit/pull/3547) retain all 785 prior
     // identities.
-    ("test.hermit_unit", 787),
+    // verify::tests::stripped_success_does_not_claim_bitwise_parity_but_strict_success_does
+    // (newcomer-audit verify-claim wording) retains all 766 prior identities.
+    ("test.hermit_unit", 788),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -648,14 +650,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.hermit_integration_on_host", 179),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
-    // version-format tests (https://github.com/rrnewton/hermit/pull/3511).
+    // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
+    // and the verify-claim wording test.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3580 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/issues/3537 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3598 test,
     // and the two Cargo version-format tests
     // (https://github.com/rrnewton/hermit/pull/3547).
-    ("test.hermit_unit_on_host", 787),
+    ("test.hermit_unit_on_host", 788),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
