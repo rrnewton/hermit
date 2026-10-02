@@ -55,6 +55,7 @@ use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::SecondRun;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::emit_compared_guest_output;
@@ -659,6 +660,7 @@ impl StartOpts {
         }
         announce_verification_outcome(
             &outcome,
+            SecondRun::Replay,
             "Success: replay matched recording.",
             "Recording output did not match replay output!",
         );
@@ -816,6 +818,11 @@ mod tests {
             .find("announce_verification_outcome(")
             .expect("verification announcement");
         assert!(publish < announce);
+        // The second half of record-mode verification is a replay, so its match
+        // line must use the replay wording for the time note.
+        let call = &verification[announce..];
+        let call = &call[..call.find(");").expect("end of announcement call")];
+        assert!(call.contains("SecondRun::Replay"), "{call}");
     }
 
     fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {

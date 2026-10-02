@@ -1625,6 +1625,7 @@ fn comparison_evidence_line(comparison: &ComparisonSpec) -> Option<String> {
 /// before `write_verification_json` replaced the pending `no_result` report.
 pub fn announce_verification_outcome(
     outcome: &VerificationOutcome,
+    second_run: SecondRun,
     success_message: &str,
     failure_message: &str,
 ) {
@@ -1633,9 +1634,22 @@ pub fn announce_verification_outcome(
     let _ = write_verification_announcement(
         &mut io::stderr().lock(),
         outcome,
+        second_run,
         success_message,
         failure_message,
     );
+}
+
+/// What the second half of a verification was, which decides what a match
+/// without virtual time does and does not show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecondRun {
+    /// A second, independent execution of the guest (`hermit run --verify`
+    /// and the DBT arm).
+    Rerun,
+    /// A replay of the first execution's recording
+    /// (`hermit record start --verify`).
+    Replay,
 }
 
 /// The phrase that claims bitwise parity on the console. It is printed only
@@ -1656,6 +1670,7 @@ pub(crate) const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
 fn write_verification_announcement(
     out: &mut impl io::Write,
     outcome: &VerificationOutcome,
+    second_run: SecondRun,
     success_message: &str,
     failure_message: &str,
 ) -> io::Result<()> {
@@ -1668,7 +1683,11 @@ fn write_verification_announcement(
     match outcome.verdict {
         Verdict::Matched => {
             writeln!(out, ":: {}", success_message.green().bold())?;
-            writeln!(out, ":: {}", matched_comparison_qualifier(outcome))?;
+            writeln!(
+                out,
+                ":: {}",
+                matched_comparison_qualifier(outcome, second_run)
+            )?;
         }
         Verdict::Diverged => writeln!(out, ":: {}", failure_message.red().bold())?,
         Verdict::NoResult => writeln!(
@@ -1696,9 +1715,9 @@ fn write_verification_announcement(
 /// the machine-readable report cannot disagree. Stdout and stderr are always
 /// compared byte for byte by [`compare_two_runs`]; the guest's log records are
 /// compared only when `compare_logs` is set, under the spec's strictness and
-/// only within its `log_scope`. When time was not virtualized (record mode), a
-/// match shows only that the second run reproduced the first.
-fn matched_comparison_qualifier(outcome: &VerificationOutcome) -> String {
+/// only within its `log_scope`. When time was not virtualized, the line also
+/// says what that leaves unshown, which depends on `second_run`.
+fn matched_comparison_qualifier(outcome: &VerificationOutcome, second_run: SecondRun) -> String {
     let comparison = &outcome.comparison;
     let scope = match comparison.log_scope {
         ComparedLogScope::Deterministic => {
@@ -1737,19 +1756,26 @@ fn matched_comparison_qualifier(outcome: &VerificationOutcome) -> String {
             comparison.display_name
         )
     };
-    if comparison.virtualize_time {
-        compared
-    } else {
-        format!("{compared} {TIME_NOT_VIRTUALIZED_NOTE}")
+    match (comparison.virtualize_time, second_run) {
+        (true, _) => compared,
+        (false, SecondRun::Replay) => format!("{compared} {TIME_NOT_VIRTUALIZED_NOTE}"),
+        (false, SecondRun::Rerun) => format!("{compared} {RERUN_TIME_NOT_VIRTUALIZED_NOTE}"),
     }
 }
 
-/// Appended to every match whose comparison ran without virtual time, which is
-/// what `hermit record start --verify` does (see
+/// Appended to a replay's match when time was not virtualized, which is what
+/// `hermit record start --verify` always does (see
 /// [`ComparisonSpec::virtualize_time`]). Without it, a record-mode
 /// `bitwise parity established` would read as a determinism result.
 pub(crate) const TIME_NOT_VIRTUALIZED_NOTE: &str = "Time was not virtualized, so this shows \
     that the second run reproduced the first, not that separate runs of the guest agree.";
+
+/// Appended to a rerun's match when time was not virtualized, for example
+/// `hermit run --no-virtualize-time --verify`. Both runs are independent
+/// executions, so the match is real, but the guest read the host's clock.
+pub(crate) const RERUN_TIME_NOT_VIRTUALIZED_NOTE: &str = "Time was not virtualized: the guest \
+    read the host's clock, so these two runs matched, but a guest whose output depends on the \
+    time can differ from one run to the next.";
 
 fn display_diff(left: &str, right: &str) {
     for result in diff::lines(left, right) {
@@ -2750,17 +2776,19 @@ mod tests {
     #[test]
     fn stripped_success_does_not_claim_bitwise_parity_but_strict_success_does() {
         const SUCCESS: &str = "Success: deterministic. Determinism verified.";
-        let announce = |outcome: &VerificationOutcome| {
+        let announce_as = |outcome: &VerificationOutcome, second_run: SecondRun| {
             let mut bytes = Vec::new();
             write_verification_announcement(
                 &mut bytes,
                 outcome,
+                second_run,
                 SUCCESS,
                 "Failure: nondeterministic.",
             )
             .unwrap();
             String::from_utf8(bytes).unwrap()
         };
+        let announce = |outcome: &VerificationOutcome| announce_as(outcome, SecondRun::Rerun);
         let out = output(0, b"hello\n", b"");
 
         let (log1, log2) = empty_logs();
@@ -2785,6 +2813,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
 
         let (log1, log2) = empty_logs();
         fs::write(&log1, detlog_with_value(100)).unwrap();
@@ -2805,23 +2834,57 @@ mod tests {
         );
         assert!(!text.contains("not a bitwise comparison"), "{text}");
         assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        // With virtual time on, a replay's match carries no time note either.
+        let text = announce_as(&canonical, SecondRun::Replay);
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
 
         // `record start --verify --verify-strict` compares with virtual time
         // off. Parity can still hold, but the line must say that the match is
         // replay fidelity, not agreement between separate runs.
-        let record_mode = VerificationOutcome {
+        let time_off = VerificationOutcome {
             comparison: ComparisonSpec {
                 virtualize_time: false,
                 ..canonical.comparison
             },
             ..canonical.clone()
         };
-        assert!(verification_report(&record_mode).bitwise_parity);
-        let text = announce(&record_mode);
+        assert!(verification_report(&time_off).bitwise_parity);
+        let text = announce_as(&time_off, SecondRun::Replay);
         assert!(
             text.contains(&format!(
                 "{BITWISE_PARITY_CLAIM}. {TIME_NOT_VIRTUALIZED_NOTE}"
             )),
+            "{text}"
+        );
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+
+        // `run --no-virtualize-time --verify-strict` compares two independent
+        // runs, so the replay wording ("the second run reproduced the first")
+        // would be false there. It says instead that the guest read the
+        // host's clock.
+        let text = announce_as(&time_off, SecondRun::Rerun);
+        assert!(
+            text.contains(&format!(
+                "{BITWISE_PARITY_CLAIM}. {RERUN_TIME_NOT_VIRTUALIZED_NOTE}"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains("reproduced the first"), "{text}");
+
+        // A full-trace comparison names the whole log as its scope.
+        let full_trace = VerificationOutcome {
+            comparison: ComparisonSpec {
+                log_scope: ComparedLogScope::FullTrace,
+                ..canonical.comparison
+            },
+            ..canonical.clone()
+        };
+        let text = announce(&full_trace);
+        assert!(
+            text.contains("every record of the guest's log (1 vs 1)"),
             "{text}"
         );
 
