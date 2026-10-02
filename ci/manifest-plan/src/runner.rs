@@ -560,38 +560,80 @@ impl ExpectedGuestExit {
     }
 }
 
-/// The declared guest disposition for a selected cell; only verify cells carry one.
+/// The recipes a cell reads its guest inputs and expectations from, most
+/// specific first.
+///
+/// `record start --verify` records and replays the same program that
+/// `run --verify` checks, so a replay cell inherits each guest input (argv,
+/// workdir, environment) from its verify recipe unless the replay recipe
+/// declares that field itself. Every other mode reads only its own recipe. The
+/// runner and the cell metadata both read through this; the expectations a
+/// replay cell inherits are in [`expectation_recipe`].
+fn inherited_recipes(cell: &SelectedCell) -> impl Iterator<Item = &ModeRecipe> {
+    let verify = (cell.id.mode == "replay")
+        .then(|| cell.test.modes.get("verify"))
+        .flatten();
+    cell.test.modes.get(&cell.id.mode).into_iter().chain(verify)
+}
+
+/// The first value `pick` finds in [`inherited_recipes`].
+fn inherited<'a, T>(
+    cell: &'a SelectedCell,
+    pick: impl FnMut(&'a ModeRecipe) -> Option<T>,
+) -> Option<T> {
+    inherited_recipes(cell).find_map(pick)
+}
+
+/// The recipe whose declared guest exit and stdout a cell's verdict checks.
+///
+/// Validation admits those declarations only on a verify recipe, so a replay
+/// cell reads its verify recipe's, and no other mode has any; the same field
+/// on another mode's recipe is not authority for a pass there.
+fn expectation_recipe(cell: &SelectedCell) -> Option<&ModeRecipe> {
+    matches!(cell.id.mode.as_str(), "verify" | "replay")
+        .then(|| cell.test.modes.get("verify"))
+        .flatten()
+}
+
+/// The guest arguments a selected cell runs on `backend`.
+pub(crate) fn cell_guest_args(cell: &SelectedCell, backend: &str) -> Vec<String> {
+    inherited(cell, |recipe| recipe.guest_args.get(backend).cloned()).unwrap_or_default()
+}
+
+/// The guest working directory a selected cell names, if any.
+pub(crate) fn cell_workdir(cell: &SelectedCell) -> Option<String> {
+    inherited(cell, |recipe| recipe.workdir.clone())
+}
+
+/// The guest environment variables a selected cell adds after the runner's own.
+fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
+    inherited(cell, |recipe| {
+        (!recipe.env.is_empty()).then(|| recipe.env.clone())
+    })
+    .unwrap_or_default()
+}
+
+/// The declared guest disposition for a selected verify or replay cell.
 fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
-    (cell.id.mode == "verify")
-        .then(|| cell.test.modes.get(&cell.id.mode))
-        .flatten()
-        .and_then(|recipe| recipe.expected_guest_exit.clone())
+    expectation_recipe(cell)?.expected_guest_exit.clone()
 }
 
-/// The exact stdout a selected verify cell requires, if its backend declares one.
+/// The exact stdout a selected verify or replay cell requires, if its backend declares one.
 fn cell_expected_stdout(cell: &SelectedCell) -> Option<String> {
-    (cell.id.mode == "verify")
-        .then(|| cell.test.modes.get(&cell.id.mode))
-        .flatten()
-        .and_then(|recipe| {
-            cell.id
-                .backend
-                .as_ref()
-                .and_then(|backend| recipe.expected_stdout.get(backend).cloned())
-        })
+    let backend = cell.id.backend.as_ref()?;
+    expectation_recipe(cell)?
+        .expected_stdout
+        .get(backend)
+        .cloned()
 }
 
-/// The stdout text a selected verify cell must contain, if its backend declares one.
+/// The stdout text a selected verify or replay cell must contain, if its backend declares one.
 fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
-    (cell.id.mode == "verify")
-        .then(|| cell.test.modes.get(&cell.id.mode))
-        .flatten()
-        .and_then(|recipe| {
-            cell.id
-                .backend
-                .as_ref()
-                .and_then(|backend| recipe.expected_stdout_contains.get(backend).cloned())
-        })
+    let backend = cell.id.backend.as_ref()?;
+    expectation_recipe(cell)?
+        .expected_stdout_contains
+        .get(backend)
+        .cloned()
 }
 
 /// A per-backend stdout assertion is verify-only and keyed by enabled backends.
@@ -2912,8 +2954,7 @@ fn prepare_test_until(
         copy_tree(&source, &destination)?;
     }
     let backend = cell.id.backend.as_deref().unwrap_or("native");
-    let mode = cell.test.modes.get(&cell.id.mode).unwrap();
-    let guest_args = mode.guest_args.get(backend).cloned().unwrap_or_default();
+    let guest_args = cell_guest_args(cell, backend);
     let mut guest = match (&cell.test.program, &cell.test.direct) {
         (Some(program), None) if program.ends_with(".c") => {
             let output = dir.join("fixtures/program");
@@ -3243,6 +3284,8 @@ pub fn build_spec(
             cell.id.mode
         ));
     }
+    // `record start` has no `--bind`, so outside the hermetic path a replay cell
+    // runs in its manifest workdir or the runner's working directory.
     let bound_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
         && backend != "dbt")
         .then_some(fixed_workdir_source.as_path());
@@ -3251,139 +3294,36 @@ pub fn build_spec(
     let mut verification_log_dir = None;
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
-        "verify" => {
-            let mut argv = vec![
-                context.hermit_bin.to_string_lossy().into_owned(),
-                "--log".into(),
-                "info".into(),
-                "--backend".into(),
-                backend.into(),
-                "run".into(),
-                "--base-env=minimal".into(),
-                "--strict".into(),
-            ];
-            if context.run_verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
-                argv.push("--verify-strict".into());
-            }
-            argv.extend(mode_recipe.hermit_args.iter().cloned());
-            if mode_recipe.compare_io_buffers == Some(false) {
-                argv.push("--no-detlog-io-buffers".into());
-            }
-            if mode_recipe.rcb_time == Some(false) {
-                argv.push("--no-rcb-time".into());
-            }
-            argv.push("--verify".into());
-            if mode_recipe.expected_guest_exit.is_some() {
-                // The exact disposition is enforced on the report after the
-                // comparison; this only lets a failing first run be compared.
-                argv.push("--verify-allow=failure".into());
-            }
-            argv.extend([
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-            ]);
-            if context.retains_verify_logs(&cell.id.test, backend) {
+        mode @ ("verify" | "replay" | "chaos") => {
+            let invocation = match mode {
+                "verify" => VerifiedInvocation::Verify,
+                "replay" => VerifiedInvocation::Replay {
+                    data_dir: dir.join("recording"),
+                    record_timeout_seconds: timeout_seconds,
+                },
+                _ => VerifiedInvocation::Chaos {
+                    seed: seed.ok_or_else(|| "chaos attempt requires a seed".to_string())?,
+                },
+            };
+            if matches!(invocation, VerifiedInvocation::Verify)
+                && context.retains_verify_logs(&cell.id.test, backend)
+            {
                 let logs = dir.join(format!("verify-logs/verify-{attempt}"));
                 fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
-                argv.extend([
-                    "--keep-logs".into(),
-                    "--verify-log-dir".into(),
-                    logs.to_string_lossy().into_owned(),
-                ]);
                 verification_log_dir = Some(logs);
             }
-            append_execution_root_args(
-                &mut argv,
+            let argv = verified_invocation_argv(VerifiedInvocationArgs {
+                context,
+                cell,
                 backend,
-                context.isolated_workdir.as_deref(),
-                mode_recipe.workdir.as_deref(),
+                invocation,
+                verdict: &verdict,
+                verification_log_dir: verification_log_dir.as_deref(),
                 bound_workdir_source,
-            );
-            if equalized_inputs {
-                append_equalized_input_binds(&mut argv, &dir);
-                append_guest_env_args(&mut argv, &equalized_guest_env(&env), isolated);
-            } else {
-                append_guest_env_args(&mut argv, &env, isolated);
-            }
-            for (name, value) in &mode_recipe.env {
-                argv.extend(["--env".into(), format!("{name}={value}")]);
-            }
-            argv.push("--".into());
-            argv.extend(guest_argv.clone());
-            (argv, Some(verdict))
-        }
-        "replay" => {
-            let mut argv = vec![
-                context.hermit_bin.to_string_lossy().into_owned(),
-                "--log".into(),
-                "info".into(),
-                "--backend".into(),
-                backend.into(),
-                "record".into(),
-                "start".into(),
-                "--strict".into(),
-            ];
-            if isolated {
-                argv.push("--base-env=minimal".into());
-            }
-            if context.record_verify_strict {
-                argv.push("--verify-strict".into());
-            }
-            argv.extend([
-                "--verify".into(),
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-                "--data-dir".into(),
-                dir.join("recording").to_string_lossy().into_owned(),
-                "--record-timeout".into(),
-                timeout_seconds.to_string(),
-            ]);
-            append_execution_root_args(
-                &mut argv,
-                backend,
-                context.isolated_workdir.as_deref(),
-                mode_recipe.workdir.as_deref(),
-                bound_workdir_source,
-            );
-            append_guest_env_args(&mut argv, &env, isolated);
-            argv.push("--".into());
-            argv.extend(guest_argv.clone());
-            (argv, Some(verdict))
-        }
-        "chaos" => {
-            let seed = seed.ok_or_else(|| "chaos attempt requires a seed".to_string())?;
-            let mut argv = vec![
-                context.hermit_bin.to_string_lossy().into_owned(),
-                "--log".into(),
-                "info".into(),
-                "--backend".into(),
-                backend.into(),
-                "run".into(),
-                "--base-env=minimal".into(),
-                "--strict".into(),
-            ];
-            if context.run_verify_strict {
-                argv.push("--verify-strict".into());
-            }
-            argv.extend([
-                "--verify".into(),
-                "--verify-allow=both".into(),
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-                "--chaos".into(),
-                "--sched-heuristic=random".into(),
-                format!("--seed={seed}"),
-            ]);
-            append_execution_root_args(
-                &mut argv,
-                backend,
-                context.isolated_workdir.as_deref(),
-                mode_recipe.workdir.as_deref(),
-                bound_workdir_source,
-            );
-            append_guest_env_args(&mut argv, &env, isolated);
-            argv.push("--".into());
-            argv.extend(guest_argv.clone());
+                equalized_inputs_dir: equalized_inputs.then_some(dir.as_path()),
+                env: &env,
+                guest_argv: &guest_argv,
+            });
             (argv, Some(verdict))
         }
         "custom" => {
@@ -3440,6 +3380,147 @@ pub fn build_spec(
         fixed_workdir_source,
         normalize_ptrace_golden: context.keep_logs,
     })
+}
+
+/// The Hermit subcommand a verified cell runs and the arguments only it takes.
+enum VerifiedInvocation {
+    /// `hermit run --verify`: two runs compared.
+    Verify,
+    /// `hermit record start --verify`: a recording and its replay compared.
+    Replay {
+        data_dir: PathBuf,
+        record_timeout_seconds: u64,
+    },
+    /// `hermit run --verify --chaos`: two runs under one random schedule.
+    Chaos { seed: i64 },
+}
+
+struct VerifiedInvocationArgs<'a> {
+    context: &'a RunContext,
+    cell: &'a SelectedCell,
+    backend: &'a str,
+    invocation: VerifiedInvocation,
+    verdict: &'a Path,
+    verification_log_dir: Option<&'a Path>,
+    bound_workdir_source: Option<&'a Path>,
+    /// The cell directory whose inputs are bound at their guest paths, for an
+    /// equalized cell.
+    equalized_inputs_dir: Option<&'a Path>,
+    env: &'a BTreeMap<String, String>,
+    guest_argv: &'a [String],
+}
+
+/// The one argv builder for verify, replay and chaos cells.
+///
+/// The three modes run the same guest under the same base environment,
+/// strictness, execution root and guest environment; only the subcommand and
+/// the arguments in [`VerifiedInvocation`] differ. Building them in one place is
+/// what keeps a replay cell from silently running a different guest than the
+/// verify cell it records.
+fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
+    let VerifiedInvocationArgs {
+        context,
+        cell,
+        backend,
+        invocation,
+        verdict,
+        verification_log_dir,
+        bound_workdir_source,
+        equalized_inputs_dir,
+        env,
+        guest_argv,
+    } = args;
+    let mode_recipe = &cell.test.modes[&cell.id.mode];
+    let mut argv = vec![
+        context.hermit_bin.to_string_lossy().into_owned(),
+        "--log".into(),
+        "info".into(),
+        "--backend".into(),
+        backend.into(),
+    ];
+    let verify_strict = match invocation {
+        VerifiedInvocation::Replay { .. } => {
+            argv.extend(["record".into(), "start".into()]);
+            context.record_verify_strict
+        }
+        VerifiedInvocation::Verify | VerifiedInvocation::Chaos { .. } => {
+            argv.push("run".into());
+            context.run_verify_strict
+        }
+    };
+    argv.extend(["--base-env=minimal".into(), "--strict".into()]);
+    if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
+        argv.push("--verify-strict".into());
+    }
+    // Validation admits these relaxations only on a verify recipe, and a
+    // replay cell does not inherit them: `record start` has no such flags.
+    argv.extend(mode_recipe.hermit_args.iter().cloned());
+    if mode_recipe.compare_io_buffers == Some(false) {
+        argv.push("--no-detlog-io-buffers".into());
+    }
+    if mode_recipe.rcb_time == Some(false) {
+        argv.push("--no-rcb-time".into());
+    }
+    argv.push("--verify".into());
+    match &invocation {
+        VerifiedInvocation::Chaos { .. } => argv.push("--verify-allow=both".into()),
+        // The exact disposition is enforced on the report after the
+        // comparison; this only lets a failing first run be compared.
+        // `record start --verify` always compares and returns the guest's
+        // status on a match, so it needs no allowance.
+        VerifiedInvocation::Verify if cell_expected_guest_exit(cell).is_some() => {
+            argv.push("--verify-allow=failure".into());
+        }
+        VerifiedInvocation::Verify | VerifiedInvocation::Replay { .. } => {}
+    }
+    argv.extend([
+        "--verify-json".into(),
+        verdict.to_string_lossy().into_owned(),
+    ]);
+    if let Some(logs) = verification_log_dir {
+        argv.extend([
+            "--keep-logs".into(),
+            "--verify-log-dir".into(),
+            logs.to_string_lossy().into_owned(),
+        ]);
+    }
+    match invocation {
+        VerifiedInvocation::Verify => {}
+        VerifiedInvocation::Replay {
+            data_dir,
+            record_timeout_seconds,
+        } => argv.extend([
+            "--data-dir".into(),
+            data_dir.to_string_lossy().into_owned(),
+            "--record-timeout".into(),
+            record_timeout_seconds.to_string(),
+        ]),
+        VerifiedInvocation::Chaos { seed } => argv.extend([
+            "--chaos".into(),
+            "--sched-heuristic=random".into(),
+            format!("--seed={seed}"),
+        ]),
+    }
+    append_execution_root_args(
+        &mut argv,
+        backend,
+        context.isolated_workdir.as_deref(),
+        cell_workdir(cell).as_deref(),
+        bound_workdir_source,
+    );
+    let isolated = context.isolated_workdir.is_some();
+    if let Some(cell_dir) = equalized_inputs_dir {
+        append_equalized_input_binds(&mut argv, cell_dir);
+        append_guest_env_args(&mut argv, &equalized_guest_env(env), isolated);
+    } else {
+        append_guest_env_args(&mut argv, env, isolated);
+    }
+    for (name, value) in cell_mode_env(cell) {
+        argv.extend(["--env".into(), format!("{name}={value}")]);
+    }
+    argv.push("--".into());
+    argv.extend(guest_argv.iter().cloned());
+    argv
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
@@ -11054,7 +11135,15 @@ backends_disabled:
         assert!(replay.argv.windows(2).any(|window| {
             window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
         }));
-        assert!(!replay.argv.iter().any(|arg| arg.starts_with("--base-env")));
+        // Replay runs under the same minimal base environment as verify.
+        assert_eq!(
+            replay
+                .argv
+                .iter()
+                .filter(|arg| arg.starts_with("--base-env"))
+                .collect::<Vec<_>>(),
+            ["--base-env=minimal"]
+        );
         assert_eq!(
             guest_env_args(&replay.argv),
             vec![
@@ -13154,6 +13243,99 @@ cp "{}" "$verdict"
             assert_eq!(cell_expected_guest_exit(&other), None, "{mode}");
         }
         assert_eq!(cell_expected_guest_exit(&ptrace_cell("verify")), None);
+    }
+
+    /// A test with both a verify and a replay recipe, selected as its replay cell.
+    fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
+        let mut cell = ptrace_cell("replay");
+        cell.test.modes.insert("verify".into(), verify);
+        cell.test.modes.insert("replay".into(), replay);
+        cell
+    }
+
+    /// A replay cell records the program its verify cell checks: it inherits
+    /// verify's guest inputs and expectations, and a guest input it declares
+    /// itself wins.
+    #[test]
+    fn a_replay_cell_inherits_its_verify_guest_inputs_and_expectations() {
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.guest_args = BTreeMap::from([("ptrace".into(), vec!["workdir".into()])]);
+        verify.workdir = Some("/srv".into());
+        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.expected_guest_exit = Some(expected_exit(Some(3), None));
+        verify.expected_stdout = BTreeMap::from([("ptrace".into(), "p\n".into())]);
+        verify.expected_stdout_contains = BTreeMap::from([("ptrace".into(), "ok".into())]);
+        let inherited = replay_cell_with_verify(verify.clone(), base.clone());
+        assert_eq!(cell_guest_args(&inherited, "ptrace"), ["workdir"]);
+        assert_eq!(cell_guest_args(&inherited, "dbt"), Vec::<String>::new());
+        assert_eq!(cell_workdir(&inherited).as_deref(), Some("/srv"));
+        assert_eq!(cell_mode_env(&inherited), verify.env);
+        assert_eq!(
+            cell_expected_guest_exit(&inherited),
+            Some(expected_exit(Some(3), None))
+        );
+        assert_eq!(cell_expected_stdout(&inherited).as_deref(), Some("p\n"));
+        assert_eq!(
+            cell_expected_stdout_contains(&inherited).as_deref(),
+            Some("ok")
+        );
+
+        let mut replay = base;
+        replay.guest_args = BTreeMap::from([("ptrace".into(), vec!["--record".into()])]);
+        replay.workdir = Some("/own".into());
+        let overridden = replay_cell_with_verify(verify.clone(), replay);
+        assert_eq!(cell_guest_args(&overridden, "ptrace"), ["--record"]);
+        assert_eq!(cell_workdir(&overridden).as_deref(), Some("/own"));
+
+        // Chaos keeps reading only its own recipe.
+        let mut chaos = ptrace_cell("chaos");
+        chaos.test.modes.insert("verify".into(), verify);
+        assert_eq!(cell_guest_args(&chaos, "ptrace"), Vec::<String>::new());
+        assert_eq!(cell_workdir(&chaos), None);
+        assert_eq!(cell_expected_guest_exit(&chaos), None);
+    }
+
+    /// Verify, replay and chaos argv come from one builder: replay runs the
+    /// same guest environment and mode environment, and differs only in its
+    /// subcommand and recording arguments.
+    #[test]
+    fn replay_argv_carries_the_inherited_verify_environment() {
+        let context = run_context(Path::new("/repo"));
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.workdir = Some("/srv".into());
+        let cell = replay_cell_with_verify(verify, base);
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/replay-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert_eq!(&spec.argv[5..7], ["record", "start"]);
+        assert!(spec.argv.iter().any(|arg| arg == "MODE=x"));
+        assert!(
+            spec.argv
+                .windows(2)
+                .any(|window| window[0] == "--workdir" && window[1] == "/srv")
+        );
+        assert!(
+            spec.argv
+                .windows(2)
+                .any(|window| window[0] == "--record-timeout" && window[1] == "15")
+        );
+        assert!(
+            !spec
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--verify-allow"))
+        );
+        assert_eq!(spec.argv.last().map(String::as_str), Some("/bin/true"));
     }
 
     /// A canonical matched report whose two runs printed `first` and

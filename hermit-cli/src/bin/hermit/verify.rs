@@ -757,6 +757,24 @@ pub fn write_pending_verification_json(path: &Path) -> Result<(), Error> {
 /// Execute one real verification run and replace the pending stamp only when
 /// the container classifier established an unexpected child exit. Neither a
 /// returned guest Output nor an unclassified error is that observation.
+/// Forward the first compared run's guest output to Hermit's own stdout and
+/// stderr, as an unverified run would. It is written when the comparison
+/// verified, or when both runs' outputs agree: a disagreement was already
+/// reported as a labelled diff, and printing one side would choose for the
+/// reader. `run --verify` and `record start --verify` both emit through this.
+pub(crate) fn emit_compared_guest_output(
+    verified: bool,
+    first: &Output,
+    second: &Output,
+) -> io::Result<()> {
+    use std::io::Write;
+    if verified || (first.stdout == second.stdout && first.stderr == second.stderr) {
+        std::io::stdout().write_all(&first.stdout)?;
+        std::io::stderr().write_all(&first.stderr)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_verification_execution<T>(
     path: Option<&Path>,
     run: VerificationRun,
