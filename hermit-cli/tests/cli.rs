@@ -406,6 +406,48 @@ fn liteinst_runtime_cache_requires_the_current_revision() {
     ));
 }
 
+/// A regular build embeds no source revision; only `HERMIT_STAMP_GIT_SHA=1`
+/// stamps one. Both `--version` and `version --json` must say which.
+#[test]
+fn version_names_a_revision_only_when_the_build_was_stamped() {
+    let text = hermit(&["--version"]);
+    assert!(text.status.success(), "hermit --version failed: {text:?}");
+    let text = String::from_utf8(text.stdout).expect("--version is not UTF-8");
+    let json = hermit(&["version", "--json"]);
+    assert!(
+        json.status.success(),
+        "hermit version --json failed: {json:?}"
+    );
+    let info: detcore_model::build_info::BuildInfo =
+        serde_json::from_slice(&json.stdout).expect("version --json is not BuildInfo");
+
+    if option_env!("HERMIT_STAMP_GIT_SHA") == Some("1") {
+        let sha = info.git_sha.strip_suffix("-dirty").unwrap_or(&info.git_sha);
+        assert!(
+            sha.len() == 12 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "a stamped build must embed a 12-hex revision, got {:?}",
+            info.git_sha
+        );
+        assert!(
+            text.trim_end().ends_with(&format!(", g{})", info.git_sha)),
+            "--version must name the stamped revision: {text:?}"
+        );
+    } else {
+        assert_eq!(
+            info.git_sha, "unknown",
+            "a regular build embedded a revision"
+        );
+        assert!(
+            text.trim_end().ends_with(", dev build)"),
+            "--version of a regular build must say dev build: {text:?}"
+        );
+        assert!(
+            !text.contains(", g"),
+            "--version names a revision: {text:?}"
+        );
+    }
+}
+
 #[cfg(feature = "liteinst")]
 fn liteinst_inert_runtime() -> &'static Path {
     LITEINST_INERT_RUNTIME.get_or_init(|| {

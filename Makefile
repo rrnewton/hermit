@@ -81,8 +81,10 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin policy)
 	@./scripts/setup-hooks.sh
 
+# A release build stamps the source revision into `hermit --version`; regular
+# builds do not (see hermit-cli/build_support.rs, `HERMIT_STAMP_GIT_SHA`).
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm)
-	$(CARGO) build --release --locked -p hermit
+	HERMIT_STAMP_GIT_SHA=1 $(CARGO) build --release --locked -p hermit
 
 # `make build` produces target/debug/hermit but never rebuilds an existing
 # target/release/hermit. A release binary left over from an earlier
@@ -93,8 +95,10 @@ release-core: check-submodules ## Build the lean core-only release binary (ptrac
 # release binary (rebuild-or-remove: rebuild explicitly with `make release-core`).
 # "Current" means the embedded --version SHA equals HEAD's `git rev-parse
 # --short=12` on a clean worktree with no `-dirty` marker, matching how
-# hermit-cli/build.rs stamps the binary. A dirty worktree can't be verified, so
-# any existing release binary is treated as stale and removed.
+# `make release-core` stamps the binary. A dirty worktree can't be verified, so
+# any existing release binary is treated as stale and removed. So is an
+# unstamped binary (a plain `cargo build --release`, whose --version says
+# `dev build`), because nothing in it names the commit it was built from.
 prune-stale-release: ## Remove target/release/hermit if stale (not built from current HEAD/worktree)
 	@bin=target/release/hermit; \
 	if [ ! -x "$$bin" ]; then \
@@ -108,6 +112,8 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 	elif [ -n "$$head" ] && printf '%s' "$$ver" | grep -q "$$head" && ! printf '%s' "$$ver" | grep -q -- '-dirty'; then \
 		echo "make: prune-stale-release: kept $$bin (built from current HEAD, worktree clean)"; \
 		exit 0; \
+	elif printf '%s' "$$ver" | grep -q 'dev build'; then \
+		reason="unstamped '$$ver' cannot be checked against HEAD g$$head"; \
 	else \
 		reason="built from '$$ver', HEAD is g$$head"; \
 	fi; \

@@ -49,8 +49,10 @@ non-host platform targets that the default Hermit binary does not use.
 
 The feature-complete release target is shadow-only: Cargo remains the
 authoritative binary and install/resource producer. First run the existing
-`build.runtime_release` command, then invoke the guarded wrapper with explicit
-absolute paths:
+`build.runtime_release` command with `HERMIT_STAMP_GIT_SHA=1` in its
+environment: the wrapper requires the Cargo binary to name the 12-character
+`HEAD` revision, and only a stamped build embeds one. Then invoke the guarded
+wrapper with explicit absolute paths:
 
 ```sh
 ./scripts/build-buck-release.rs \

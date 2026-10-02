@@ -76,6 +76,14 @@ cargo build --release --workspace
 ./target/install_pkg/hermit --version
 ```
 
+A regular build does not embed the Git revision, so `hermit --version` reports
+`hermit 0.4.0 (2026-10-02, dev build)` and `hermit version --json` reports
+`"git_sha": "unknown"`. This keeps a commit that does not change Hermit's
+source from rebuilding it. To stamp the revision, as a release build does, set
+`HERMIT_STAMP_GIT_SHA=1` when building; the version then reads
+`hermit 0.4.0 (2026-10-02, g0123456789ab)`, with a `-dirty` suffix when tracked
+files differed from that commit. `make release-core` sets it for you.
+
 Staging resources does not enable optional backends in the CLI. See
 [Execution Backends](#execution-backends) for the feature-enabled build.
 

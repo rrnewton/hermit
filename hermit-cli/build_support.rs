@@ -12,14 +12,79 @@ use std::process::Command;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-/// Short git revision of the working tree, with a `-dirty` suffix when tracked
-/// or index changes exist. Untracked output does not alter source provenance.
-/// Falls back to `unknown` outside a git checkout (for example, a source
-/// tarball).
-pub fn git_short_sha() -> String {
-    git_short_sha_in(Path::new("."))
+/// Opt-in that makes a Cargo build embed the source revision. Release builds
+/// set it to `1`; regular builds leave it unset.
+///
+/// A regular build must not depend on Git state: an embedded revision makes
+/// every commit, including a documentation-only one, rerun this script and
+/// produce a different `hermit` binary, which defeats build and test caching
+/// across commits.
+pub const STAMP_GIT_SHA_ENV: &str = "HERMIT_STAMP_GIT_SHA";
+
+/// The revision a build embeds when it is not stamped.
+/// `src/bin/hermit/version.rs` prints `dev build` for this value.
+pub const UNSTAMPED_GIT_SHA: &str = "unknown";
+
+/// The revision to embed for the given `HERMIT_STAMP_GIT_SHA` value: `None`
+/// for a regular build, the revision of `root` for a stamped one.
+///
+/// Only `1` opts in, and unset, empty, or `0` opts out. Any other value is an
+/// error so that a misspelled opt-in cannot quietly produce an unstamped
+/// release. A stamped build outside a Git checkout is also an error rather
+/// than a release that reports `unknown`.
+pub fn embedded_git_sha_in(root: &Path, stamp: Option<&str>) -> Result<Option<String>, String> {
+    match stamp {
+        None | Some("" | "0") => Ok(None),
+        Some("1") => {
+            let sha = git_short_sha_in(root);
+            if sha == UNSTAMPED_GIT_SHA {
+                Err(format!(
+                    "{STAMP_GIT_SHA_ENV}=1 requires a Git checkout, but `git rev-parse HEAD` failed in {}",
+                    root.display()
+                ))
+            } else {
+                Ok(Some(sha))
+            }
+        }
+        Some(other) => Err(format!(
+            "{STAMP_GIT_SHA_ENV} must be 1 (stamp the revision) or unset; got {other:?}"
+        )),
+    }
 }
 
+/// Emit `HERMIT_BUILD_GIT_SHA` and the rerun triggers it needs.
+///
+/// A regular build runs no Git command and registers no Git watch, so moving
+/// HEAD or the index cannot rerun the script or change the binary. A stamped
+/// build watches the Git metadata that can change the revision or dirty
+/// state, as before.
+pub fn emit_git_revision() {
+    println!("cargo:rerun-if-env-changed={STAMP_GIT_SHA_ENV}");
+    let stamp = std::env::var_os(STAMP_GIT_SHA_ENV).map(|value| {
+        value
+            .into_string()
+            .unwrap_or_else(|value| panic!("{STAMP_GIT_SHA_ENV} is not UTF-8: {value:?}"))
+    });
+    match embedded_git_sha_in(Path::new("."), stamp.as_deref()) {
+        Ok(None) => println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={UNSTAMPED_GIT_SHA}"),
+        Ok(Some(sha)) => {
+            println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={sha}");
+            // Arbitrary tracked worktree files are intentionally not watched:
+            // avoiding one Cargo dependency per file keeps incremental builds
+            // fast, and staging an edit refreshes the dirty marker through the
+            // watched index.
+            for path in git_watch_paths() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// Short git revision of the working tree at `root`, with a `-dirty` suffix
+/// when tracked or index changes exist. Untracked output does not alter source
+/// provenance. Falls back to `unknown` outside a git checkout (for example, a
+/// source tarball).
 pub fn git_short_sha_in(root: &Path) -> String {
     let Some(sha) = git(root, &["rev-parse", "--short=12", "HEAD"]) else {
         return "unknown".to_owned();

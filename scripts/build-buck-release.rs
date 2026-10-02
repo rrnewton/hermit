@@ -328,7 +328,7 @@ where
             "missing --dotslash; provide the absolute public DotSlash 0.5.9 path".to_owned()
         })?,
         cargo_binary: cargo_binary.ok_or_else(|| {
-            "missing --cargo-binary; first build Cargo release with third-party-backends".to_owned()
+            "missing --cargo-binary; first build Cargo release with third-party-backends and HERMIT_STAMP_GIT_SHA=1".to_owned()
         })?,
         install_bundle: install_bundle.ok_or_else(|| {
             "missing --install-bundle; first build the authoritative hermit-install bundle"
@@ -613,6 +613,11 @@ fn validate_build_info(
         e9patch: true,
         sabre: true,
     };
+    if info.git_sha == "unknown" {
+        return Err(format!(
+            "{description} names no revision: regular builds do not stamp one; build Cargo with HERMIT_STAMP_GIT_SHA=1, or Buck with -c hermit_release.hermit_sha=<12-hex HEAD>"
+        ));
+    }
     if info.version != expected_version
         || info.git_sha != expected_sha
         || info.git_sha.len() != 12
@@ -8108,6 +8113,7 @@ mod tests {
             ("internal-whitespace", good.replacen("0.2.0", "0.2. 0", 1)),
             ("bad-date", good.replacen("2026-09-22", "2026-02-30", 1)),
             ("bad-sha", good.replacen("0123456789ab", "0123456789AB", 1)),
+            ("unstamped", good.replacen("0123456789ab", "unknown", 1)),
             (
                 "feature-disabled",
                 good.replacen(r#""sabre":true"#, r#""sabre":false"#, 1),
@@ -8118,6 +8124,10 @@ mod tests {
                 "accepted {name}: {value}"
             );
         }
+        let unstamped = good.replacen("0123456789ab", "unknown", 1);
+        let error = decode_build_info(&unstamped, "0.2.0", "0123456789ab", "fixture")
+            .expect_err("an unstamped build has no provenance to compare");
+        assert!(error.contains("HERMIT_STAMP_GIT_SHA=1"), "{error}");
     }
 
     #[test]
