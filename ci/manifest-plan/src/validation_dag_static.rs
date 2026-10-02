@@ -421,7 +421,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_replay_cell_inherits_its_verify_guest_inputs_and_expectations and
     // replay_argv_carries_the_inherited_verify_environment) that retain all
     // 778 prior identities.
-    ("test.regular_crates", 781),
+    // ci/manifest-plan dagrun_pin every_dagrun_dependency_uses_the_agent_utils_gitlink
+    // retains all 778 prior identities.
+    ("test.regular_crates", 782),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -680,7 +682,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 13 Buck/RE harness tests (https://github.com/rrnewton/hermit/pull/3507)
     // retain all 765 prior identities.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
-    ("test.regular_crates_on_host", 781),
+    // The dagrun pin guard retains all 778 prior identities.
+    ("test.regular_crates_on_host", 782),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

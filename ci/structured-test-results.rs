@@ -3,7 +3,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { path = "../agent-utils/rs/dagrun" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d510a54892c6380bee1817f11c282777debd8801" }
 //! serde_json = "1"
 //! ```
 
