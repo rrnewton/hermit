@@ -210,6 +210,7 @@ static __attribute__((always_inline)) inline int ap_exec_close_site(
 }
 #define AP_KERNEL_BUILD_ID_HEX "c9407892acd301146191b00f423f2612bf8b2d6a"
 #ifndef __BPF__
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -249,6 +250,28 @@ static int ap_check_kernel_notes(const unsigned char *bytes,size_t size) {
     if(matches!=1) { errno=ENODATA;return -1; }
     return 0;
 }
+/* Recognize only the complete, ordinary three-field row. Everything else
+ * still uses the original scanf grammar, including module tails, unusual
+ * whitespace and over-width fields. Locale classification matches scanf;
+ * no file access, scan extent, target predicate or error policy is changed. */
+static inline int sub_retirement_fields_fast(const char *line,size_t size,
+        char address[17],char *type,char symbol[512]) {
+    if(size<21 || size>531 || line[size-1]!='\n' || line[16]!=' ' ||
+       line[18]!=' ' || !line[17] || isspace((unsigned char)line[17]))return 0;
+    for(size_t i=0;i<16;i++) {
+        unsigned char c=(unsigned char)line[i];
+        if(!((c>='0' && c<='9') || (c>='a' && c<='f') ||
+             (c>='A' && c<='F')))return 0;
+    }
+    size_t length=size-20;
+    for(size_t i=0;i<length;i++) {
+        unsigned char c=(unsigned char)line[19+i];
+        if(!c || isspace(c))return 0;
+    }
+    memcpy(address,line,16);address[16]=0;*type=line[17];
+    memcpy(symbol,line+19,length);symbol[length]=0;
+    return 1;
+}
 /* Addresses may be masked by kptr_restrict; only the kernel's exact symbol
  * name is passed back to its resolver. Duplicate/alternate implementations
  * fail before load; module symbols cannot replace this core-kernel function. */
@@ -259,7 +282,9 @@ static int ap_check_retirement_symbols(FILE *input) {
         if(!size || line[size-1]!='\n' || size>16*1024*1024-bytes) { errno=EOVERFLOW;return -1; }
         bytes+=size;
         char address[17],type,symbol[512],extra;
-        int fields=sscanf(line,"%16[0123456789abcdefABCDEF] %c %511s %c",address,&type,symbol,&extra);
+        int fields=sub_retirement_fields_fast(line,size,address,&type,symbol)?3:
+            sscanf(line,"%16[0123456789abcdefABCDEF] %c %511s %c",
+                address,&type,symbol,&extra);
         if(fields<3 || strlen(address)!=16) { errno=EPROTO;return -1; }
         if(!strcmp(symbol,"ptrace_request")) {
             if(fields!=3 || type!='t' || ++enrollment_matches!=1) { errno=ESTALE;return -1; }

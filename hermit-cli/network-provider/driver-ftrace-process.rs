@@ -24,6 +24,7 @@ pub(super) const LIMITS: Limits = Limits {
 pub(super) const DRIVER_FTRACE_IMPORT_FENCE: &str = r#"
 import subprocess, sys
 allowed = set('''__assert_fail __errno_location __isoc99_sscanf __isoc23_sscanf
+__ctype_b_loc
 sscanf abort fprintf printf stderr memcmp memcpy memmove memset strcmp strlen strncmp
 bcmp __stack_chk_fail _GLOBAL_OFFSET_TABLE_'''.split())
 text = subprocess.check_output(['nm', '-u', '--', sys.argv[1]], text=True)
