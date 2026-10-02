@@ -115,6 +115,19 @@ pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
 pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
     "76980bac89901c3ecefbefc816ed47bcf099eda6";
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 189;
+/// Ptrace replay cells selected for the tests whose replay cell passed in every
+/// one of four measured runs over the 548 selected ptrace verify tests: once at
+/// 97ae0ccef94164f71512cae0031ca16d2a2cd069 and three times at the evidence SHA,
+/// each through `test-harness run --prebuilt --probe-disabled --mode replay
+/// --backend ptrace` (verdict matched, bitwise parity, canonical strictness).
+/// 288 tests passed all four; two of them were already selected, so 227
+/// hand-written cells and 59 compat corpus rows are new. The largest of the 864
+/// evidence-SHA samples took 4840 ms of wall time and 4654 ms of CPU time, so
+/// the ordinary 22 s CPU and 57 s wall bounds cover them without an override.
+pub const REPLAY_2026_10_02_EVIDENCE_SHA: &str = "abab0a225fa72b3d83004620983ee23759696f3d";
+pub const REPLAY_2026_10_02_SELECTED_CI_CELL_COUNT: usize = 286;
+pub const REPLAY_2026_10_02_MAX_MEASURED_CPU_MILLIS: u64 = 4654;
+pub const REPLAY_2026_10_02_MAX_MEASURED_WALL_MILLIS: u64 = 4840;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1937,6 +1950,20 @@ mod tests {
             );
             assert!(
                 DBT_MATRIX_2026_09_29_MAX_MEASURED_WALL_MILLIS
+                    < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
+            );
+        }
+        assert_eq!(
+            REPLAY_2026_10_02_EVIDENCE_SHA,
+            "abab0a225fa72b3d83004620983ee23759696f3d"
+        );
+        assert_eq!(REPLAY_2026_10_02_SELECTED_CI_CELL_COUNT, 286);
+        const {
+            assert!(
+                REPLAY_2026_10_02_MAX_MEASURED_CPU_MILLIS < DEFAULT_TEST_CPU_TIMEOUT_SECONDS * 1000
+            );
+            assert!(
+                REPLAY_2026_10_02_MAX_MEASURED_WALL_MILLIS
                     < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
             );
         }

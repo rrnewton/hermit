@@ -58,6 +58,75 @@ corpus:
       top: live process-table reads differ on the GitHub-managed portable runner
       zstd: timed out on the GitHub-managed portable no-PMU runner
       zstd-roundtrip: timed out on the GitHub-managed portable no-PMU runner
+  replay:
+    reason: >-
+      These rows passed hermit record start --verify --verify-strict
+      (verdict matched, bitwise parity, canonical strictness) in all four
+      runs measured on 2026-10-02 at Hermit 97ae0ccef941 and abab0a225fa7.
+      Replay runs without the verify hermit_args, env and comparator above:
+      record start accepts none of them. The other rows fail replay today,
+      mostly because record refuses clock syscalls (gettimeofday,
+      clock_gettime) while time is not virtualized
+    rows:
+      - arch
+      - b2sum
+      - base32
+      - base64
+      - basename
+      - bracket
+      - cat
+      - cksum
+      - dirname
+      - du
+      - echo
+      - expr
+      - findmnt
+      - free
+      - getopt
+      - groups
+      - head
+      - hostname
+      - id
+      - ionice
+      - kill
+      - ls
+      - lsirq
+      - lsmod
+      - md5sum
+      - nice
+      - nohup
+      - nproc
+      - numactl-hardware
+      - numastat
+      - numfmt
+      - openssl
+      - pinky
+      - pr
+      - printenv
+      - printf
+      - pwd
+      - readlink
+      - realpath
+      - sha1sum
+      - sha224sum
+      - sha256sum
+      - sha384sum
+      - sha512sum
+      - sleep
+      - stat
+      - stdbuf
+      - sum
+      - sysctl-random-uuid
+      - test
+      - "true"
+      - uname
+      - uptime
+      - users
+      - vmstat
+      - vmstat-disk
+      - wc
+      - wc-lines
+      - whoami
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}

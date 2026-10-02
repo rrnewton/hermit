@@ -105,6 +105,8 @@ use crate::timeouts::MANIFEST_SCHEMA;
 use crate::timeouts::NON_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::REPLAY_2026_10_02_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
 use crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
@@ -7059,9 +7061,12 @@ mod tests {
                 population: Some(Population::Required),
                 ..Selection::default()
             })
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|cell| cell.id.mode == "verify")
+            .collect::<Vec<_>>();
         let [cell] = cells.as_slice() else {
-            panic!("compat/cat must have exactly one CI cell: {cells:?}");
+            panic!("compat/cat must have exactly one verify CI cell: {cells:?}");
         };
         assert_eq!(
             (cell.id.mode.as_str(), cell.id.backend.as_deref()),
@@ -7888,6 +7893,7 @@ mod tests {
                 + 3 // the exact RNG identities asserted above
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
+                + REPLAY_2026_10_02_SELECTED_CI_CELL_COUNT
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new

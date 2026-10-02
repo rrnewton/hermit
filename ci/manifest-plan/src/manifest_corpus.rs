@@ -34,7 +34,18 @@ struct Corpus {
     /// Rows whose measured failure is a non-blocking diagnostic.
     #[serde(default)]
     diagnostic: Option<CorpusRowPolicy>,
+    /// Rows whose replay cell is selected on the corpus backend.
+    #[serde(default)]
+    replay: Option<CorpusReplay>,
     rows: Vec<CorpusRow>,
+}
+
+/// The rows whose replay cell is selected, and why those rows.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusReplay {
+    reason: String,
+    rows: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +190,29 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
     if let Some(diagnostic) = &corpus.diagnostic {
         policy_rows("diagnostic", &diagnostic.rows)?;
     }
+    let mut replay_rows = BTreeSet::new();
+    if let Some(replay) = &corpus.replay {
+        nonempty(bucket, "replay reason", &replay.reason)?;
+        if corpus.backend != "ptrace" {
+            return Err(format!(
+                "{bucket}: corpus replay rows need backend ptrace, not `{}`",
+                corpus.backend
+            ));
+        }
+        if replay.rows.is_empty() {
+            return Err(format!("{bucket}: corpus replay names no rows"));
+        }
+        for label in &replay.rows {
+            if !labels.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus replay names `{label}`, which is no row"
+                ));
+            }
+            if !replay_rows.insert(label.as_str()) {
+                return Err(format!("{bucket}: corpus replay repeats `{label}`"));
+            }
+        }
+    }
     let disabled = |reason: &str| -> Value {
         mapping(
             BACKENDS
@@ -190,6 +224,10 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
     let per_backend = |value: Value| mapping([(corpus.backend.as_str(), value)]);
     let off_reason = format!(
         "A {bucket} corpus row runs only its lane's verify cell on {}",
+        corpus.backend
+    );
+    let replay_off_reason = format!(
+        "A {bucket} corpus row's selected replay cell runs only on {}",
         corpus.backend
     );
     let mut tests = Vec::with_capacity(corpus.rows.len());
@@ -253,6 +291,20 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         }
         let mut modes = vec![("verify", mapping(verify))];
         for mode in NON_VERIFY_MODES {
+            if mode == "replay" && replay_rows.contains(row.label.as_str()) {
+                modes.push((
+                    mode,
+                    mapping([
+                        ("ci", Value::Bool(true)),
+                        (
+                            "backends_enabled",
+                            strings(std::slice::from_ref(&corpus.backend)),
+                        ),
+                        ("backends_disabled", disabled(&replay_off_reason)),
+                    ]),
+                ));
+                continue;
+            }
             let backends_disabled = if mode == "naked" {
                 mapping([("native", string(&off_reason))])
             } else {
@@ -486,6 +538,53 @@ mod tests {
         // A document without the section is unchanged.
         let plain: Value = serde_yaml::from_str("schema: 3\nbucket: plain\ntest: []").unwrap();
         assert_eq!(expand_corpus(plain.clone()).unwrap(), plain);
+    }
+
+    const REPLAY: &str = r#"
+  replay:
+    reason: fixture replay measurement
+    rows: [echo, "g++"]
+"#;
+
+    #[test]
+    fn a_replay_row_selects_only_its_replay_cell_on_the_corpus_backend() {
+        let expanded = expand_corpus(document(&format!("{CORPUS}{REPLAY}"))).unwrap();
+        let tests = tests_of(&expanded);
+        for test in &tests[..2] {
+            let replay = &test["modes"]["replay"];
+            assert_eq!(replay["ci"], true);
+            assert!(replay.get("ci_disabled_reason").is_none());
+            assert_eq!(
+                replay["backends_enabled"],
+                serde_yaml::from_str::<Value>("[ptrace]").unwrap()
+            );
+            assert!(replay["backends_disabled"].get("ptrace").is_none());
+            for backend in ["dbt", "kvm", "sabre", "liteinst"] {
+                assert!(
+                    replay["backends_disabled"][backend].as_str().is_some(),
+                    "{backend}"
+                );
+            }
+            for mode in ["naked", "chaos", "custom"] {
+                assert_eq!(test["modes"][mode]["ci"], false, "{mode}");
+            }
+        }
+        // A row the replay list does not name keeps its replay cell off.
+        assert_eq!(tests[2]["modes"]["replay"]["ci"], false);
+    }
+
+    #[test]
+    fn a_malformed_replay_list_is_refused() {
+        let refused = |from: &str, to: &str| {
+            let corpus = format!("{CORPUS}{REPLAY}");
+            assert!(corpus.contains(from), "{from}");
+            expand_corpus(document(&corpus.replace(from, to))).unwrap_err()
+        };
+        assert!(refused("[echo, \"g++\"]", "[echo, absent]").contains("which is no row"));
+        assert!(refused("[echo, \"g++\"]", "[echo, echo]").contains("repeats `echo`"));
+        assert!(refused("[echo, \"g++\"]", "[]").contains("names no rows"));
+        assert!(refused("fixture replay measurement", "' '").contains("nonempty and trimmed"));
+        assert!(refused("backend: ptrace", "backend: dbt").contains("need backend ptrace"));
     }
 
     #[test]

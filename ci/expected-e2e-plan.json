@@ -9226,6 +9226,419 @@
         "cpuid-faulting"
       ],
       "test": "c-programs/cpuid-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/arch"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/b2sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/base32"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/base64"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/basename"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/bracket"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/cat"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/cksum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/dirname"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/du"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/echo"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/expr"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/findmnt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/free"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/getopt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/groups"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/head"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/hostname"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/id"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/ionice"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/kill"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/ls"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/lsirq"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/lsmod"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/md5sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/nice"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/nohup"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/nproc"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/numactl-hardware"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/numastat"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/numfmt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/openssl"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/pinky"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/pr"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/printenv"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/printf"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/pwd"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/readlink"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/realpath"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sha1sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sha224sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sha256sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sha384sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sha512sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sleep"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/stat"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/stdbuf"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sum"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/sysctl-random-uuid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/test"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/true"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/uname"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/uptime"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/users"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/vmstat"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/vmstat-disk"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/wc"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/wc-lines"
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "compat/whoami"
     }
   ],
   "schema": 1

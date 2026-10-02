@@ -7889,6 +7889,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/arch",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/arch",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -7910,7 +7917,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/b2sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/b2sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base32",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -7924,7 +7945,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/base64",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base64",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/basename",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -7946,6 +7981,13 @@
           "category": "compat",
           "test": "compat/bc",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/bracket",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -7987,6 +8029,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/cat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cat",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8009,6 +8058,13 @@
           "category": "compat",
           "test": "compat/chrt",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cksum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8148,6 +8204,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/dirname",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/dirname",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8155,7 +8218,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/du",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/du",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/echo",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8197,6 +8274,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/expr",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/expr",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8232,6 +8316,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/findmnt",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/findmnt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8260,6 +8351,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/free",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/free",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8275,6 +8373,13 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/getopt",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8309,6 +8414,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/groups",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/groups",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8337,6 +8449,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/head",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/head",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8345,6 +8464,13 @@
           "category": "compat",
           "test": "compat/hexdump",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/hostname",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8365,6 +8491,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/id",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/id",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8373,6 +8506,13 @@
           "category": "compat",
           "test": "compat/install",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ionice",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8414,6 +8554,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/kill",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8449,6 +8596,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/ls",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ls",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8463,7 +8617,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/lsirq",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8499,6 +8667,13 @@
           "category": "compat",
           "test": "compat/make",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/md5sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8561,6 +8736,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/nice",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nice",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8582,7 +8764,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/nohup",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nohup",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nproc",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8596,6 +8792,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/numactl-hardware",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8603,7 +8806,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/numastat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numfmt",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8632,6 +8849,13 @@
           "category": "compat",
           "test": "compat/od",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/openssl",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8680,6 +8904,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pinky",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8701,6 +8932,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pr",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pr",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8708,7 +8946,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/printenv",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printenv",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printf",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8730,6 +8982,13 @@
           "category": "compat",
           "test": "compat/ptx",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pwd",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8764,7 +9023,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/readlink",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/readlink",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/realpath",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8827,7 +9100,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha1sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha1sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha224sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8841,6 +9128,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha256sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha256sum",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -8848,7 +9142,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha384sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha384sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha512sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8877,6 +9185,13 @@
           "category": "compat",
           "test": "compat/size",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sleep",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8918,7 +9233,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/stat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stat",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stdbuf",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -8946,7 +9275,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9002,6 +9345,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/test",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/test",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9037,6 +9387,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/true",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/true",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9052,6 +9409,13 @@
           "category": "compat",
           "test": "compat/tty",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uname",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9079,7 +9443,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/uptime",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uptime",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/users",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9093,7 +9471,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/vmstat-disk",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat-disk",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9107,7 +9499,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/wc-lines",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc-lines",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9122,6 +9528,13 @@
           "category": "compat",
           "test": "compat/wget-localhost",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/whoami",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9264,6 +9677,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/arch",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/arch",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9285,7 +9705,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/b2sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/b2sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base32",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9299,7 +9733,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/base64",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base64",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/basename",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9321,6 +9769,13 @@
           "category": "compat",
           "test": "compat/bc",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/bracket",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9362,6 +9817,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/cat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cat",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9384,6 +9846,13 @@
           "category": "compat",
           "test": "compat/chrt",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cksum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9523,6 +9992,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/dirname",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/dirname",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9530,7 +10006,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/du",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/du",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/echo",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9572,6 +10062,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/expr",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/expr",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9607,6 +10104,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/findmnt",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/findmnt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9635,6 +10139,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/free",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/free",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9650,6 +10161,13 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/getopt",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9684,6 +10202,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/groups",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/groups",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9712,6 +10237,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/head",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/head",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9720,6 +10252,13 @@
           "category": "compat",
           "test": "compat/hexdump",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/hostname",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9740,6 +10279,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/id",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/id",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9748,6 +10294,13 @@
           "category": "compat",
           "test": "compat/install",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ionice",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9789,6 +10342,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/kill",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9824,6 +10384,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/ls",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ls",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9838,7 +10405,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/lsirq",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9874,6 +10455,13 @@
           "category": "compat",
           "test": "compat/make",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/md5sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9936,6 +10524,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/nice",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nice",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9957,7 +10552,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/nohup",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nohup",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nproc",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -9971,6 +10580,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/numactl-hardware",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9978,7 +10594,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/numastat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numfmt",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10007,6 +10637,13 @@
           "category": "compat",
           "test": "compat/od",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/openssl",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10055,6 +10692,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pinky",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -10076,6 +10720,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pr",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pr",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -10083,7 +10734,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/printenv",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printenv",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printf",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10105,6 +10770,13 @@
           "category": "compat",
           "test": "compat/ptx",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pwd",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10139,7 +10811,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/readlink",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/readlink",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/realpath",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10202,7 +10888,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha1sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha1sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha224sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10216,6 +10916,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha256sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha256sum",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -10223,7 +10930,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha384sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha384sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha512sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10252,6 +10973,13 @@
           "category": "compat",
           "test": "compat/size",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sleep",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10293,7 +11021,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/stat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stat",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stdbuf",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10321,7 +11063,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10377,6 +11133,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/test",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/test",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -10412,6 +11175,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/true",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/true",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -10427,6 +11197,13 @@
           "category": "compat",
           "test": "compat/tty",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uname",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10454,7 +11231,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/uptime",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uptime",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/users",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10468,7 +11259,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/vmstat-disk",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat-disk",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10482,7 +11287,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/wc-lines",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc-lines",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10497,6 +11316,13 @@
           "category": "compat",
           "test": "compat/wget-localhost",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/whoami",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -24776,6 +25602,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/arch",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/arch",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -24797,7 +25630,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/b2sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/b2sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base32",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -24811,7 +25658,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/base64",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base64",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/basename",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -24833,6 +25694,13 @@
           "category": "compat",
           "test": "compat/bc",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/bracket",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -24874,6 +25742,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/cat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cat",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -24896,6 +25771,13 @@
           "category": "compat",
           "test": "compat/chrt",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cksum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25035,6 +25917,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/dirname",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/dirname",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25042,7 +25931,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/du",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/du",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/echo",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25084,6 +25987,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/expr",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/expr",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25119,6 +26029,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/findmnt",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/findmnt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25147,6 +26064,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/free",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/free",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25162,6 +26086,13 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/getopt",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25196,6 +26127,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/groups",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/groups",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25224,6 +26162,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/head",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/head",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25232,6 +26177,13 @@
           "category": "compat",
           "test": "compat/hexdump",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/hostname",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25252,6 +26204,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/id",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/id",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25260,6 +26219,13 @@
           "category": "compat",
           "test": "compat/install",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ionice",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25301,6 +26267,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/kill",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25336,6 +26309,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/ls",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ls",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25350,7 +26330,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/lsirq",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25386,6 +26380,13 @@
           "category": "compat",
           "test": "compat/make",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/md5sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25448,6 +26449,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/nice",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nice",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25469,7 +26477,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/nohup",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nohup",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/nproc",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25483,6 +26505,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/numactl-hardware",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25490,7 +26519,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/numastat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numfmt",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25519,6 +26562,13 @@
           "category": "compat",
           "test": "compat/od",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/openssl",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25567,6 +26617,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pinky",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25588,6 +26645,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pr",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pr",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25595,7 +26659,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/printenv",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printenv",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printf",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25617,6 +26695,13 @@
           "category": "compat",
           "test": "compat/ptx",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pwd",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25651,7 +26736,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/readlink",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/readlink",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/realpath",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25714,7 +26813,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha1sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha1sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha224sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25728,6 +26841,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha256sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha256sum",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25735,7 +26855,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sha384sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha384sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha512sum",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25764,6 +26898,13 @@
           "category": "compat",
           "test": "compat/size",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sleep",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25805,7 +26946,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/stat",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stat",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stdbuf",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25833,7 +26988,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/sum",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sum",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25889,6 +27058,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/test",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/test",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25924,6 +27100,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/true",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/true",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -25939,6 +27122,13 @@
           "category": "compat",
           "test": "compat/tty",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uname",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25966,7 +27156,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/uptime",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uptime",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/users",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25980,7 +27184,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/vmstat-disk",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat-disk",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -25994,7 +27212,21 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/wc-lines",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc-lines",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -26009,6 +27241,13 @@
           "category": "compat",
           "test": "compat/wget-localhost",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/whoami",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
