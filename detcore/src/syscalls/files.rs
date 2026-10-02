@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -403,6 +404,13 @@ const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 ///
 /// `None` when the link cannot be read (the descriptor is gone, or procfs is
 /// unavailable), in which case the lexical result stands unchanged.
+/// Does the guest descriptor name a FIFO: an anonymous pipe or a named one?
+/// `metadata` follows the `/proc/<pid>/fd/<fd>` link to the pipe inode itself.
+fn opened_descriptor_is_fifo(pid: i32, fd: RawFd) -> bool {
+    std::fs::metadata(format!("/proc/{pid}/fd/{fd}"))
+        .is_ok_and(|metadata| metadata.file_type().is_fifo())
+}
+
 fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
     let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     // A deleted or anonymous target is not a stable object name.
@@ -757,6 +765,27 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest, so the same fstat is repeated with its buffer in a transient
     /// private page that is unmapped before the guest resumes
     /// (<https://github.com/rrnewton/hermit/issues/3328>).
+    /// Set the kernel's O_NONBLOCK on `fd`'s open file description, keeping its
+    /// other status flags. The caller records the change with
+    /// `maybe_set_nonblocking_fd`; the guest-visible flags are unchanged.
+    async fn inject_physical_nonblocking<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Errno> {
+        let flags = guest
+            .inject(syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL))
+            .await?;
+        guest
+            .inject(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_SETFL(flags as i32 | OFlag::O_NONBLOCK.bits())),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -971,7 +1000,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                         FdType::Regular
                     }
                 });
+                // A pipe reopened by path (`/dev/stdin`, `/proc/self/fd/N`, bash's
+                // `< <(cmd)` as `/dev/fd/63`) or a named FIFO is a NEW open file
+                // description of a pipe, so it carries neither the Pipe type nor the
+                // physical O_NONBLOCK that `handle_pipe2` gave the original. Left as a
+                // physically blocking Regular fd, a read that waits for a writer blocks
+                // in the kernel while holding the scheduler turn, and the writer never
+                // runs (https://github.com/rrnewton/hermit/issues/1850). Give it the
+                // same treatment as `handle_pipe2`: Pipe type plus a Detcore-internal
+                // physical O_NONBLOCK, which F_GETFL hides from the guest. Gated like
+                // the forced O_NONBLOCK in F_SETFL: Replayer's descriptor is an eventfd
+                // placeholder, so record and replay would not classify alike.
+                let fd_type = if fd_type == FdType::Regular
+                    && self.cfg.use_nonblocking_sockets()
+                    && !self.cfg.recordreplay_modes
+                    && !call.flags().contains(OFlag::O_PATH)
+                    && opened_descriptor_is_fifo(guest.pid().as_raw(), fd)
+                    && (call.flags().contains(OFlag::O_NONBLOCK)
+                        || self.inject_physical_nonblocking(guest, fd).await.is_ok())
+                {
+                    FdType::Pipe
+                } else {
+                    fd_type
+                };
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
+                if fd_type == FdType::Pipe {
+                    self.maybe_set_nonblocking_fd(guest, fd);
+                }
                 // Classify the spelling the guest used FIRST. Several kinds are
                 // defined by that spelling and MUST keep it: `/proc/self/...`,
                 // `/proc/thread-self/...` and the mountinfo aliases all resolve
