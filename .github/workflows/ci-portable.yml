@@ -921,7 +921,7 @@ jobs:
       #
       # Compiling the driver instead of installing the interpreter is not an
       # option here: validate.rs carries an embedded `//! ```cargo` manifest and
-      # depends on `dagrun` from the agent-utils submodule, so plain
+      # depends on `dagrun` (a git dependency on agent-utils), so plain
       # `rustc` cannot build it the way the check.skill_discovery node builds its
       # std-only script.
       #
