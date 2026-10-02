@@ -51,3 +51,4 @@ buck-out/
 /shim/rust-sysroot/
 /.buck2
 /ci/buck-e2e/staged/
+/shim/third-party/libunwind/staged/
