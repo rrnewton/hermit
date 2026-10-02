@@ -432,8 +432,9 @@ pub struct RunOpts {
 
     /// Require Hermit's deterministic defaults and reject incompatible opt-outs. Unsupported
     /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is still accepted:
-    /// clock syscalls then return host time, so the run is not reproducible unless it is being
-    /// recorded or replayed, and `--verify` reports the difference.
+    /// clock syscalls then return host time, so the run is not reproducible; record it with
+    /// `hermit record` to reproduce it. `--verify --verify-strict` reports the difference; plain
+    /// `--verify` reports it only when host time reaches the guest's output.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
