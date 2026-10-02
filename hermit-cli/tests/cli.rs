@@ -30,6 +30,9 @@ mod kvm_signal_retirement;
 #[path = "common/kvm_synchronous_fault.rs"]
 mod kvm_synchronous_fault;
 
+// Its runtime-staging helpers are used only by the LiteInst run tests, which
+// a build without the `liteinst` feature leaves out.
+#[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
@@ -82,6 +85,7 @@ static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -402,6 +406,7 @@ fn liteinst_runtime_cache_requires_the_current_revision() {
     ));
 }
 
+#[cfg(feature = "liteinst")]
 fn liteinst_inert_runtime() -> &'static Path {
     LITEINST_INERT_RUNTIME.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2574,6 +2579,7 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-736): Review the real LiteInst Detcore CLI assertion.
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_verifies_detcore_backend() {
     liteinst_runtime::ensure_liteinst_runtime();
     let args = [
@@ -2730,6 +2736,7 @@ fn inherited_container_output_does_not_expose_capture_offset() {
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create false LiteInst runtime directory");
@@ -2756,6 +2763,7 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
     let args = [
         "--backend",
@@ -2777,6 +2785,35 @@ fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
     );
     assert!(!stderr.contains("activation verified"), "{stderr}");
     assert!(!stderr.contains("Success: deterministic"), "{stderr}");
+}
+
+/// A build without the `liteinst` feature has no LiteInst backend, so
+/// `--backend liteinst` must refuse before any guest runs and say which build
+/// flag is missing -- not fall back to another backend, and not blame the host.
+#[test]
+#[cfg(not(feature = "liteinst"))]
+fn run_liteinst_without_the_feature_refuses_and_names_the_flag() {
+    let args = [
+        "--backend",
+        "liteinst",
+        "run",
+        "--strict",
+        "--",
+        "/bin/echo",
+        "liteinst-guest-ran",
+    ];
+    let output = hermit(&args);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("this build was compiled without the liteinst backend"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--features liteinst"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("liteinst-guest-ran"),
+        "the guest must not run under a backend this build does not have: {output:?}"
+    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

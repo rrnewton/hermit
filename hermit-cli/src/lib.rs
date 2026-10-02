@@ -1000,6 +1000,21 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     ))
 }
 
+#[cfg(feature = "liteinst")]
+fn liteinst_unavailable_reason() -> Option<String> {
+    liteinst_runtime_unavailable_reason()
+}
+
+// LiteInst is an experimental backend whose architecture is not settled, so the
+// published crate leaves it out: `reverie-liteinst` (and through it `liteinst2`)
+// is an optional dependency behind the `liteinst` feature, which
+// `third-party-backends` enables for every validation build.
+#[cfg(not(feature = "liteinst"))]
+fn liteinst_unavailable_reason() -> Option<String> {
+    Some("this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned())
+}
+
+#[cfg(feature = "liteinst")]
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_runtime_library_path().err().map(|error| {
         format!(
@@ -1139,7 +1154,7 @@ impl Backend {
                 .err()
                 .map(|error| error.to_string()),
             Self::Dbt => dbt_unavailable_reason(),
-            Self::Liteinst => liteinst_runtime_unavailable_reason(),
+            Self::Liteinst => liteinst_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
@@ -2480,6 +2495,7 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
 // "simplify" this by assuming the two agree; the `122..=127` bound here is still
 // hard-coded and still needs a human to widen it if the reserved set grows
 // again.
+#[cfg(feature = "liteinst")]
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     match status {
         // A real signal death: the process never chose a status at all.
@@ -2598,20 +2614,28 @@ async fn dispatch_backend(
         .status);
     }
     if backend == Backend::Liteinst {
-        let preload = liteinst_runtime_library_path()?;
-        let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                command, config, preload,
-            )
-            .await?;
-        if liteinst_requires_forced_shutdown(exit_status) {
-            global_state.force_shutdown_with_error();
-            global_state.cancel_internal_scheduler().await;
+        #[cfg(feature = "liteinst")]
+        {
+            let preload = liteinst_runtime_library_path()?;
+            let (exit_status, mut global_state) =
+                reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                    command, config, preload,
+                )
+                .await?;
+            if liteinst_requires_forced_shutdown(exit_status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            return Ok(exit_status);
         }
-        global_state
-            .clean_up(print_summary, print_summary_to_json_file)
-            .await;
-        return Ok(exit_status);
+        #[cfg(not(feature = "liteinst"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("LiteInst availability must fail when the feature is disabled");
+        }
     }
     ensure_backend_dispatch(backend)?;
 
@@ -2848,26 +2872,34 @@ async fn dispatch_output_backend(
         .await;
     }
     if backend == Backend::Liteinst {
-        command.stdin(output_backend_stdin()?);
-        let preload = liteinst_runtime_library_path()?;
-        let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                command, config, preload,
-            )
-            .await?;
-        let status = output.status;
-        if liteinst_requires_forced_shutdown(status) {
-            global_state.force_shutdown_with_error();
-            global_state.cancel_internal_scheduler().await;
+        #[cfg(feature = "liteinst")]
+        {
+            command.stdin(output_backend_stdin()?);
+            let preload = liteinst_runtime_library_path()?;
+            let (output, mut global_state) =
+                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+                    command, config, preload,
+                )
+                .await?;
+            let status = output.status;
+            if liteinst_requires_forced_shutdown(status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            return Ok(Output {
+                status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
         }
-        global_state
-            .clean_up(print_summary, print_summary_to_json_file)
-            .await;
-        return Ok(Output {
-            status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
+        #[cfg(not(feature = "liteinst"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("LiteInst availability must fail when the feature is disabled");
+        }
     }
     ensure_backend_dispatch(backend)?;
 
@@ -3661,6 +3693,7 @@ mod tests {
     /// The 130 and 143 rows are the ones with teeth: revert the predicate to the
     /// bare range and they fail.
     #[test]
+    #[cfg(feature = "liteinst")]
     fn liteinst_forced_shutdown_covers_every_status_hermit_reserves() {
         // The signal band. Not `Signaled`: hermit CHOSE these codes, because a
         // namespace init cannot produce a genuine signalled wait status.
@@ -3805,6 +3838,8 @@ mod tests {
             (Backend::Sabre, "sabre"),
             #[cfg(not(feature = "e9patch"))]
             (Backend::E9patch, "e9patch"),
+            #[cfg(not(feature = "liteinst"))]
+            (Backend::Liteinst, "liteinst"),
         ];
 
         for &(backend, feature) in feature_disabled_backends {
@@ -3859,9 +3894,10 @@ mod tests {
     #[cfg(feature = "dbt")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
+    #[cfg(feature = "liteinst")]
     use super::liteinst_requires_forced_shutdown;
     #[cfg(feature = "dbt")]
-    use super::liteinst_runtime_unavailable_reason;
+    use super::liteinst_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
     use super::reserve_output_stdin_snapshot;
@@ -4014,6 +4050,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "liteinst")]
     fn liteinst_reserved_failures_require_scheduler_cancellation() {
         for status in 122..=127 {
             assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(
@@ -4259,7 +4296,7 @@ mod tests {
         );
         assert_eq!(
             available.contains(&Backend::Liteinst),
-            liteinst_runtime_unavailable_reason().is_none()
+            liteinst_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Sabre),
@@ -4480,7 +4517,7 @@ mod tests {
         }
         assert_eq!(
             Backend::Liteinst.ensure_available().is_ok(),
-            liteinst_runtime_unavailable_reason().is_none()
+            liteinst_unavailable_reason().is_none()
         );
 
         match Backend::Kvm.ensure_available() {

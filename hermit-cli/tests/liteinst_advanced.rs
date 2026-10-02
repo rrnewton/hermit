@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// LiteInst is an optional backend: without the `liteinst` feature (which
+// `third-party-backends` enables for every validation build) this binary has
+// no tests, because there is no backend for them to exercise.
+#![cfg(feature = "liteinst")]
+
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 

@@ -20,8 +20,8 @@ exclude = ["agent-utils"]
 # The three third-party-dependency crates -- `detcore-dbt` and `hermit-install`
 # (pull `reverie-dbt`/DynamoRIO) and `detcore-sabre` (pulls `reverie-sabre`) --
 # are deliberately excluded so the default developer build produces the
-# `hermit` binary (ptrace/kvm/liteinst) with no DynamoRIO/e9patch/SaBRe
-# third-party dependencies. CI opts them back in with `--workspace` plus
+# `hermit` binary (ptrace/kvm) with no DynamoRIO/e9patch/SaBRe third-party
+# dependencies; LiteInst is likewise behind hermit-cli's `liteinst` feature. CI opts them back in with `--workspace` plus
 # `cargo ... -p hermit --features third-party-backends`.
 default-members = [
   "common/test-allocator",

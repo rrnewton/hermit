@@ -51,6 +51,9 @@ rust_library(
     ),
     crate = "hermit",
     env = hermit_build_env,
+    # LiteInst is an optional cargo feature so the published crate leaves out
+    # reverie-liteinst; the internal build keeps the backend.
+    features = ["liteinst"],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     deps = [
@@ -145,6 +148,7 @@ rust_library(
         "buck-release-provenance",
         "dbt",
         "e9patch",
+        "liteinst",
         "sabre",
     ],
     preferred_linkage = "static",
@@ -190,6 +194,7 @@ rust_binary(
         "buck-release-provenance",
         "dbt",
         "e9patch",
+        "liteinst",
         "sabre",
     ],
     link_style = "static_pic",
