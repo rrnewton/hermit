@@ -206,16 +206,39 @@ jobs:
 
         python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
 
+        # One GitHub API request, tried at most three times
+        # (https://github.com/rrnewton/hermit/issues/3466). Each attempt
+        # rewrites the output file from empty, so a failed attempt's partial
+        # response never reaches the checks below, which are unchanged. The
+        # third failure returns non-zero and `set -e` stops the step, as one
+        # failed request did before. Keep this after the publisher's validate:
+        # the contract checks that no `gh api` precedes it.
+        github_api() {
+          local output=$1 attempt
+          shift
+          for attempt in 1 2 3; do
+            if gh api "$@" > "$output"; then
+              return 0
+            fi
+            echo "GitHub API request failed (attempt $attempt of 3): $*" >&2
+            if (( attempt < 3 )); then
+              sleep $(( attempt * 15 ))
+            fi
+          done
+          return 1
+        }
+
         # Scheduled rebuilds and manual immutable handoffs share the same
         # digest/history gates. Neither starts Hermit validation or PR tests.
         # Always preserve the registry already served by Pages, even on an
         # ordinary manual docs rebuild with no new compatibility artifact.
-        pages_sha=$(gh api repos/rrnewton/hermit/git/ref/heads/gh-pages --jq .object.sha)
-        gh api "repos/rrnewton/hermit/contents/compatibility?ref=$pages_sha" > "$scratch/served.json"
+        github_api "$scratch/pages-ref" repos/rrnewton/hermit/git/ref/heads/gh-pages --jq .object.sha
+        pages_sha=$(cat "$scratch/pages-ref")
+        github_api "$scratch/served.json" "repos/rrnewton/hermit/contents/compatibility?ref=$pages_sha"
         previous="$scratch/previous.json"
         if jq -e 'any(.[]; .name == "releases.json" and .type == "file")' "$scratch/served.json" >/dev/null; then
-          gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/rrnewton/hermit/contents/compatibility/releases.json?ref=$pages_sha" > "$previous"
+          github_api "$previous" -H 'Accept: application/vnd.github.raw+json' \
+            "repos/rrnewton/hermit/contents/compatibility/releases.json?ref=$pages_sha"
         else
           # One-time adoption of the old checked-in registry is allowed only
           # when it accounts for every already-public content-addressed tree.
@@ -230,8 +253,8 @@ jobs:
           [[ "$NIGHTLY_REGISTRY_ASSET" =~ ^[0-9]{1,20}$ ]]
           [[ "$NIGHTLY_REGISTRY_SHA256" =~ ^[0-9a-f]{64}$ ]]
           requested="$scratch/requested-registry.json"
-          gh api -H 'Accept: application/octet-stream' \
-            "repos/rrnewton/hermit/releases/assets/$NIGHTLY_REGISTRY_ASSET" > "$requested"
+          github_api "$requested" -H 'Accept: application/octet-stream' \
+            "repos/rrnewton/hermit/releases/assets/$NIGHTLY_REGISTRY_ASSET"
           printf '%s  %s\n' "$NIGHTLY_REGISTRY_SHA256" "$requested" | sha256sum -c -
           selection+=("$requested")
         fi
@@ -258,7 +281,7 @@ jobs:
           release_json="$scratch/release-$identity.json"
           archive="$archives/$asset"
 
-          gh api "repos/$release_repository/releases/tags/$tag" > "$release_json"
+          github_api "$release_json" "repos/$release_repository/releases/tags/$tag"
           asset_id=$(
             jq -er \
               --arg tag "$tag" \
@@ -282,10 +305,9 @@ jobs:
                   else error("release asset metadata disagrees with the pin") end
               ' "$release_json"
           )
-          gh api \
+          github_api "$archive" \
             -H 'Accept: application/octet-stream' \
-            "repos/$release_repository/releases/assets/$asset_id" \
-            > "$archive"
+            "repos/$release_repository/releases/assets/$asset_id"
 
           python3 .github/scripts/publish-compatibility-site.py extract "$archive" \
             "target/doc/compatibility/$identity" "$pins" "$index"
