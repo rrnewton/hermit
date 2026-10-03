@@ -725,7 +725,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // selected identities (`cargo nextest list --profile ci` measured the +1
     // when the change was written, not on this base). It needs no PMU:
     // without perf counters the run continues with --max-timeslice=disabled.
-    ("test.cli", 119),
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths
+    // (https://github.com/rrnewton/hermit/pull/3564) retains all 119 prior
+    // selected CLI identities.
+    ("test.cli", 120),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
