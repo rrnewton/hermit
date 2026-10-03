@@ -1628,6 +1628,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "kvm"
@@ -1846,6 +1853,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -5296,6 +5310,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -6118,6 +6146,13 @@
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -13393,7 +13428,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "828",
+        "NEXTEST_EXPECTED_EXECUTED": "829",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -13442,7 +13477,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "815",
+        "NEXTEST_EXPECTED_EXECUTED": "816",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -13491,7 +13526,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "876",
+        "NEXTEST_EXPECTED_EXECUTED": "906",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -13741,7 +13776,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "193",
+        "NEXTEST_EXPECTED_EXECUTED": "196",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"clock_passthrough\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"dispatch_stats\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"first_seen_mtime\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"reopened_pipe_progress\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"verify_claim_names_its_limit\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
@@ -15371,6 +15406,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -15442,6 +15484,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -16722,6 +16771,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -17017,6 +17080,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timerfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -20850,6 +20920,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "liteinst"
@@ -21026,6 +21103,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -23538,6 +23622,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -24129,6 +24227,13 @@
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -34266,7 +34371,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "828",
+        "NEXTEST_EXPECTED_EXECUTED": "829",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -34312,7 +34417,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "815",
+        "NEXTEST_EXPECTED_EXECUTED": "816",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -34358,7 +34463,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "876",
+        "NEXTEST_EXPECTED_EXECUTED": "906",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -34596,7 +34701,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "193",
+        "NEXTEST_EXPECTED_EXECUTED": "196",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"clock_passthrough\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"dispatch_stats\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"first_seen_mtime\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"reopened_pipe_progress\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"verify_claim_names_its_limit\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
