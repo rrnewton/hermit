@@ -34,6 +34,7 @@ mod metadata;
 /// Owned external network-service startup; ordinary FD capability remains inactive.
 pub mod network_container;
 pub mod network_provider_package;
+pub mod network_recovery;
 mod ptrace_completion;
 pub mod run_evidence;
 pub mod unix_guard;

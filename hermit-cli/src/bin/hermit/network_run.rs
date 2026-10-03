@@ -780,6 +780,15 @@ fn run_owned(
     // before fallible preparation; early return leaves original custody pending.
     let publication = super::accepted_completion::begin_aggregate()?;
     check_recovery_routing(roots, accepted_root, use_guard, use_accepted)?;
+    // Only explicit invocation configuration may identify a recovery peer.
+    // The shared root descriptions remain in the accepted owner until its
+    // actual publication/failure; admission never follows a certificate path.
+    let resource_recovery = match (roots, accepted_root) {
+        (Some((pins, unix)), Some(accepted)) if use_accepted => Some(std::sync::Arc::new(
+            hermit::network_recovery::ResourceRecoveryContext::open(accepted, unix, pins)?,
+        )),
+        _ => None,
+    };
     hermit::unix_guard_terminal::prepare_command_parent()?;
     // All fallible package/log preparation precedes launching either service.
     // Accepted-only Record authenticates the recovery root without requiring bpffs.
@@ -800,7 +809,11 @@ fn run_owned(
             root.require_disjoint(guard.recovery.as_fd(), &guard.writable_paths[1])?;
             root.require_disjoint(guard.bpffs.as_fd(), &guard.writable_paths[0])?;
         }
-        Some(AcceptedStartup::retain(root))
+        let mut startup = AcceptedStartup::retain(root);
+        if let Some(context) = &resource_recovery {
+            startup.receipts.set_resource_recovery(context.clone())?;
+        }
+        Some(startup)
     } else {
         None
     };
@@ -814,7 +827,9 @@ fn run_owned(
     let guard_preparation = (|| -> Result<_, Error> {
         let mut guard_context = None;
         let prepared = if let Some(roots) = guard_roots {
-            roots.admit_launch().map_err(refusal)?;
+            roots
+                .admit_launch_with_recovery(resource_recovery.as_deref())
+                .map_err(refusal)?;
             let package =
                 PackagedUnixGuard::discover(&std::env::current_exe()?).map_err(refusal)?;
             let identity = uuid::Uuid::new_v4().simple().to_string();

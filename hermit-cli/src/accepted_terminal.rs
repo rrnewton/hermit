@@ -1504,6 +1504,7 @@ impl AcceptedParentFinalizer {
 /// Actual accepted receipt files and their private root, retained before I/O.
 /// Serialized observations never substitute for the live finalizer's custody.
 pub struct AcceptedRecovery {
+    resource_recovery: Option<std::sync::Arc<crate::network_recovery::ResourceRecoveryContext>>,
     grouped_root: Option<crate::unix_guard_package::RecoveryDeploymentRoot>,
     grouped_parent: Option<File>,
     grouped_attempted: bool,
@@ -1978,6 +1979,7 @@ impl AcceptedRecovery {
     /// Move the actual root into a recovery scope before any fallible creation.
     pub fn retain(root: crate::unix_guard_package::RecoveryDeploymentRoot, label: String) -> Self {
         Self {
+            resource_recovery: None,
             grouped_root: None,
             grouped_parent: None,
             grouped_attempted: false,
@@ -1991,6 +1993,20 @@ impl AcceptedRecovery {
             failed: false,
             finished: false,
         }
+    }
+    /// Retain the invocation's actual configured peer roots and shared locks.
+    /// This must precede admission; a certificate cannot configure its peers.
+    pub fn set_resource_recovery(
+        &mut self,
+        context: std::sync::Arc<crate::network_recovery::ResourceRecoveryContext>,
+    ) -> io::Result<()> {
+        if self.attempted || self.resource_recovery.is_some() {
+            return Err(io::Error::other(
+                "resource recovery context is late or repeated",
+            ));
+        }
+        self.resource_recovery = Some(context);
+        Ok(())
     }
     /// Create exactly three retained files relative to the held directory.
     pub fn initialize(&mut self, artifact: ProviderArtifact) -> io::Result<()> {
@@ -2009,7 +2025,8 @@ impl AcceptedRecovery {
     fn initialize_once(&mut self, artifact: ProviderArtifact) -> io::Result<()> {
         receipt_label(&self.label)?;
         self.root.identity()?;
-        admit_accepted_launch(&self.root)?;
+        crate::network_recovery::lock_launch_directory(self.root.directory.as_fd())?;
+        admit_accepted_launch(&self.root, self.resource_recovery.as_deref())?;
         self.artifact = Some(artifact);
         for (i, name) in receipt_names(&self.label).iter().enumerate() {
             // Retain each actual description before validating metadata or
@@ -2952,6 +2969,7 @@ fn accepted_labels(names: &BTreeSet<String>) -> io::Result<BTreeMap<String, BTre
 /// authenticated terminal receipt. This admission check never deletes evidence.
 fn admit_accepted_launch(
     root: &crate::unix_guard_package::RecoveryDeploymentRoot,
+    resource_recovery: Option<&crate::network_recovery::ResourceRecoveryContext>,
 ) -> io::Result<()> {
     let identity = root.identity()?;
     let names = accepted_directory_names(root)?;
@@ -2989,7 +3007,11 @@ fn admit_accepted_launch(
         } else {
             false
         };
-        if !completed {
+        let resources_absent = !completed
+            && roles == complete_roles
+            && resource_recovery
+                .is_some_and(|proof| proof.accepted_resolved(root.directory.as_fd(), &label));
+        if !completed && !resources_absent {
             unresolved = unresolved
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("accepted unresolved population overflow"))?;

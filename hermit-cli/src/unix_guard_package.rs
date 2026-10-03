@@ -248,6 +248,16 @@ impl GuardDeploymentRoots {
     /// Refuse another privileged load at the durable unresolved-attempt bound.
     /// This never removes pins, receipts or units.
     pub fn admit_launch(&self) -> io::Result<()> {
+        self.admit_launch_with_recovery(None)
+    }
+    /// Admission-only resource proof from this invocation's configured peers.
+    /// Normal guard terminal validation remains unchanged.
+    pub fn admit_launch_with_recovery(
+        &self,
+        resource_recovery: Option<&crate::network_recovery::ResourceRecoveryContext>,
+    ) -> io::Result<()> {
+        crate::network_recovery::lock_launch_directory(self.bpffs.as_fd())?;
+        crate::network_recovery::lock_launch_directory(self.recovery.as_fd())?;
         let uid = unsafe { libc::getuid() };
         let bpffs = open_private_directory(&self.writable_paths[0], uid, true)?;
         let recovery = open_private_directory(&self.writable_paths[1], uid, false)?;
@@ -256,13 +266,23 @@ impl GuardDeploymentRoots {
         {
             return Err(io::Error::other("guard deployment root identity changed"));
         }
-        let before = guard_admission_census(self.bpffs.as_fd(), self.recovery.as_fd(), uid)?;
+        let before = guard_admission_census_with_recovery(
+            self.bpffs.as_fd(),
+            self.recovery.as_fd(),
+            uid,
+            resource_recovery,
+        )?;
         if before.unresolved.len() >= MAX_UNRESOLVED_GUARD_LAUNCHES {
             return Err(io::Error::other(
                 "Unix guard unresolved launch admission bound reached",
             ));
         }
-        let after = guard_admission_census(self.bpffs.as_fd(), self.recovery.as_fd(), uid)?;
+        let after = guard_admission_census_with_recovery(
+            self.bpffs.as_fd(),
+            self.recovery.as_fd(),
+            uid,
+            resource_recovery,
+        )?;
         if before != after
             || directory_identity(bpffs.as_fd())? != directory_identity(self.bpffs.as_fd())?
             || directory_identity(recovery.as_fd())? != directory_identity(self.recovery.as_fd())?
@@ -539,10 +559,19 @@ struct GuardAdmissionCensus {
     unresolved: BTreeSet<String>,
     journals: BTreeMap<String, KeeperJournal>,
 }
+#[cfg(test)]
 fn guard_admission_census(
     bpffs: BorrowedFd<'_>,
     recovery: BorrowedFd<'_>,
     uid: u32,
+) -> io::Result<GuardAdmissionCensus> {
+    guard_admission_census_with_recovery(bpffs, recovery, uid, None)
+}
+fn guard_admission_census_with_recovery(
+    bpffs: BorrowedFd<'_>,
+    recovery: BorrowedFd<'_>,
+    uid: u32,
+    resource_recovery: Option<&crate::network_recovery::ResourceRecoveryContext>,
 ) -> io::Result<GuardAdmissionCensus> {
     let pins = directory_names(bpffs, 64)?;
     let receipt_names = directory_names(recovery, 384)?;
@@ -652,7 +681,11 @@ fn guard_admission_census(
         } else {
             false
         };
-        if !complete {
+        let resources_absent = !complete
+            && complete_roles
+            && resource_recovery
+                .is_some_and(|proof| proof.unix_resolved(recovery, bpffs, &identity));
+        if !complete && !resources_absent {
             unresolved.insert(prefix.to_owned());
         }
     }
@@ -874,6 +907,70 @@ mod recovery_root_tests {
     fn private_file(path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[test]
+    fn normal_guard_terminal_does_not_accept_resource_proof_tails() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RecoveryDeploymentRoot::open_at(temp.path()).unwrap();
+        let name = "guard-b1-00000000000000010000000000000001.terminal.jsonl";
+        let normal = b"{\"schema\":1,\"stage\":\"terminal\",\"guard\":{\"incarnation\":1}}\n";
+        private_file(&temp.path().join(name), normal);
+        assert!(
+            guard_terminal_complete(
+                root.directory.as_fd(),
+                name,
+                1,
+                unsafe { libc::getuid() },
+                None
+            )
+            .unwrap()
+        );
+        // Use the actual paired writer with its documented controlled BPF,
+        // privilege and actor premises, not a fabricated success-shaped row.
+        let fixture = temp.path().join("writer-fixture");
+        let output = std::process::Command::new("python3")
+            .arg("-B")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/test_network_recovery.py"))
+            .arg("--fixture")
+            .arg(&fixture)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(metadata["native_recovery_evidence"], false);
+        let label = metadata["unix_label"].as_str().unwrap();
+        let root =
+            RecoveryDeploymentRoot::open_at(Path::new(metadata["unix_root"].as_str().unwrap()))
+                .unwrap();
+        let incarnation = u64::from_str_radix(&label[..16], 16).unwrap();
+        let name = format!("guard-b1-{label}.terminal.jsonl");
+        let before = std::fs::read(root.writable_path.join(&name)).unwrap();
+        let journal = guard_keeper_journal(
+            root.directory.as_fd(),
+            &format!("ugb1-{}", &label[..16]),
+            incarnation,
+            unsafe { libc::getuid() },
+        )
+        .unwrap();
+        assert!(
+            !guard_terminal_complete(
+                root.directory.as_fd(),
+                &name,
+                incarnation,
+                unsafe { libc::getuid() },
+                Some(&journal)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(root.writable_path.join(name)).unwrap(),
+            before
+        );
     }
 
     #[test]
