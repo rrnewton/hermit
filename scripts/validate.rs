@@ -5989,7 +5989,7 @@ fn super_plan_bracket() -> Result<(), String> {
         "super.build_release_hermit",
         "super.sqlite_veryquick_strict_determinism",
         "super.pmu_analyze_hello_race_stress_calibrated_skid",
-        "superstress.ptrace_strict_verify_01",
+        "superstress.ptrace_strict_verify",
         "superstress.kvm_available",
         "super-compatprep.fixtures",
         "compat.rustc",
@@ -5997,6 +5997,33 @@ fn super_plan_bracket() -> Result<(), String> {
         if !tags.contains(want) {
             return Err(format!("super plan: node {want} is missing"));
         }
+    }
+    // Each stress probe is one node whose repetitions are rows of its
+    // structured test results; the pass-rate table reads nothing else.
+    let stress: Vec<_> = plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| step.group == "superstress" && !step.job.ends_with("_available"))
+        .collect();
+    let reporting = stress
+        .iter()
+        .filter(|step| {
+            step.result_manifests.iter().flatten().any(|manifest| {
+                matches!(
+                    manifest,
+                    ResultManifest::StructuredTestResults(structured)
+                        if structured.owner == step.tag()
+                )
+            })
+        })
+        .count();
+    if stress.len() != validate_super::STRESS_PROBES.len() || reporting != stress.len() {
+        return Err(format!(
+            "super plan: want one result-reporting node per stress probe ({}), found {} node(s), {reporting} reporting",
+            validate_super::STRESS_PROBES.len(),
+            stress.len()
+        ));
     }
     if !plan.super_mode {
         return Err("super plan: super_mode must be set so the stress table is printed".into());
@@ -13429,9 +13456,9 @@ fn outcome_is_failure(outcome: &StepOutcome) -> bool {
 /// Compatibility rows have their own policy classification, so only their
 /// separately counted blocking rows plus failures outside the matrix belong in
 /// the total. Every other profile already counts its failed DAG nodes in
-/// `blocking_failure_nodes`. In particular, the super stress table groups those
-/// same failed repetition nodes by probe for display; adding that grouped count
-/// here would count one failure once as a node and again as a probe.
+/// `blocking_failure_nodes`. In particular, the super stress table counts the
+/// failed repetition rows inside those same failed probe nodes; adding that
+/// count here would count one failure once as a node and again as rows.
 fn effective_failure_count(
     compat: Option<CompatMode>,
     blocking_failure_nodes: usize,
@@ -26665,10 +26692,10 @@ fn run(
     // Super stress pass rates, from typed outcomes rather than a scraped report.
     if plan.super_mode {
         let reps = validate_super::repetitions();
-        let rates = validate_classification::stress_rates(&classification, reps);
-        // This is a per-PROBE display summary. The failed repetition nodes are
-        // already in `blocking_failures`, so the grouped count must not be added
-        // to the final node count.
+        let rates = validate_classification::stress_rates(&classification, &outcomes, reps);
+        // This is a per-PROBE display summary of repetition rows. A probe node
+        // with a failed repetition is already in `blocking_failures`, so the
+        // row count must not be added to the final node count.
         print_super_stress_verdict(&rates, reps, jobs, host_cpus);
     }
 

@@ -399,10 +399,12 @@ const PROFILES: [Profile; 11] = [
         direct_steps: 21,
         selected_steps: 22,
     },
+    // 56/57 since the 100 superstress repetition nodes became one node per
+    // probe (5), each running its 20 repetitions: 151/152 before.
     Profile {
         label: "super",
-        direct_steps: 151,
-        selected_steps: 152,
+        direct_steps: 56,
+        selected_steps: 57,
     },
     Profile {
         label: "privileged",
@@ -1689,7 +1691,10 @@ fn refresh_generated_partitions(
         // by the static node rrcompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::RrCompat, 1usize),
         (GeneratedPartition::SuperCompat, 5usize),
-        (GeneratedPartition::SuperStress, 102usize),
+        // 7 since each stress probe's 20 repetition nodes became one node that
+        // runs the repetitions and reports each as a structured test result:
+        // the 2 availability nodes plus 5 probe nodes.
+        (GeneratedPartition::SuperStress, 7usize),
     ] {
         let actual = replacements.get(&partition).map_or(0, Vec::len);
         if actual != expected {
@@ -1786,15 +1791,17 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    // 113 since rrcompat.manifest_compat, the rr lane's bucket, joined them;
+    // 118 since the five super stress probe nodes, each writing one row per
+    // repetition, joined them; 113 since rrcompat.manifest_compat, the rr
+    // lane's bucket, joined them;
     // 112 since strictcompat.manifest_compat, the strict lane's bucket, joined
     // them; 111 since sabrecompat.manifest_compat, the SaBRe lane's bucket, joined
     // them; 110 since portablecompat.manifest_compat, the focused lane's corpus
     // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
     // joined the test-harness producers (2026-10-01).
-    if expected.len() != 113 {
+    if expected.len() != 118 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 113",
+            "structured result producer registry has {} entries, expected 118",
             expected.len()
         ));
     }
@@ -1933,8 +1940,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // 37 with the focused lane's portablecompat.manifest_compat, and 38 with
     // the SaBRe lane's sabrecompat.manifest_compat, and 39 with the strict
     // lane's strictcompat.manifest_compat, and 40 with the rr lane's
-    // rrcompat.manifest_compat.
-    if actual_group_counts != [69, 40, 2, 2] {
+    // rrcompat.manifest_compat. Envelope 2 -> 7 with the five super stress
+    // probe nodes.
+    if actual_group_counts != [69, 40, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2463,9 +2471,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // strictcompat.manifest_compat (840 - 193 + 1).
     // 510 since the 139 rrcompat.<program> probes became the one bucket
     // rrcompat.manifest_compat (648 - 139 + 1).
-    if cfg.steps.len() != 510 {
+    // 415 since the 100 superstress repetition nodes became one node per
+    // probe (510 - 100 + 5).
+    if cfg.steps.len() != 415 {
         return Err(format!(
-            "superset has {} steps, expected 510",
+            "superset has {} steps, expected 415",
             cfg.steps.len()
         ));
     }
