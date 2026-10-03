@@ -1048,6 +1048,7 @@ mod tests {
             "bitwise identical",
             "~/.hermit",
             "content addressible",
+            "Record mode has no `--network` flag",
         ] {
             assert!(!help.contains(stale), "stale claim {stale:?} in:\n{help}");
         }
@@ -1055,10 +1056,11 @@ mod tests {
             "functions of their controlled inputs",
             "`hermit run` starts it at the host's current time",
             "--epoch=2026-01-01T00:00:00Z",
-            "In run mode, by default (`--network=local`)",
+            "In run and record mode, by default (`--network=local`)",
             "only a loopback interface",
+            "A recording stores its choice",
+            "`hermit record start --verify-with-gdbex` defaults to, and requires, `--network=host`",
             "The DBT backend does not apply `--network` yet",
-            "Record mode has no `--network` flag: the guest uses the host network.",
             "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
             "`--data-dir` or `HERMIT_DATA_DIR`",
         ] {
@@ -1073,8 +1075,10 @@ mod tests {
             .expect("run --network");
         assert_eq!(network.get_default_values(), ["local"]);
 
-        // The help says record mode has no `--network` flag; if one is added,
-        // the help must say what it does.
+        // The help describes `--network` for run and record mode only; if
+        // another subcommand gains one, the help must say what it does. The
+        // record default is tied to the parser by
+        // record_start::tests::record_networking_defaults_to_local_like_run.
         fn network_args(command: &clap::Command) -> Vec<String> {
             let mut found: Vec<String> = command
                 .get_arguments()
@@ -1087,7 +1091,8 @@ mod tests {
             found
         }
         let record = command.find_subcommand("record").unwrap();
-        assert_eq!(network_args(record), Vec::<String>::new());
+        // `hermit record PROGRAM` is shorthand for `hermit record start PROGRAM`.
+        assert_eq!(network_args(record), ["record", "start"]);
         assert_eq!(
             network_args(command.find_subcommand("run").unwrap()),
             ["run"]
