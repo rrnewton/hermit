@@ -28,6 +28,7 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -198,34 +199,44 @@ fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bo
 
 // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
 /// Replay sockets whose connection state cannot match the recording: placeholders
-/// reserved for accepted sockets, and sockets whose `connect` was replayed. A
-/// state-dependent call such as `setsockopt(IPV6_ADDRFORM)`, `bind` or `listen`
-/// on one returns its recorded result instead of running live. Keyed by inode,
-/// so the mark follows the socket through `dup`, `fork` and SCM_RIGHTS. An
-/// inode Linux reuses after the socket closes keeps the mark, which only
-/// replaces that socket's live check with its recorded result.
+/// reserved for accepted sockets, and sockets that replay connected, or sent
+/// to an address, without doing so live. A state-dependent call such as
+/// `setsockopt(IPV6_ADDRFORM)`, `bind` or `listen` on one returns its recorded
+/// result instead of running live. Keyed by inode, so the mark follows the
+/// socket through `dup`, `fork` and SCM_RIGHTS.
+///
+/// Marking is always safe, which is why the set is process-wide and never
+/// shrinks: a mark only replaces a live check with the recorded result, and
+/// every observer of socket state is itself replayed. A socket whose inode
+/// Linux reuses after an earlier one closed therefore loses only that check.
 static DETACHED_SOCKETS: OnceLock<Mutex<BTreeSet<ReplayFileIdentity>>> = OnceLock::new();
 
-fn guest_fd_identity(pid: Pid, fd: libc::c_int) -> Option<ReplayFileIdentity> {
-    std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw()))
-        .ok()
-        .map(|metadata| ReplayFileIdentity::from_metadata(&metadata))
+fn guest_fd_metadata(pid: Pid, fd: libc::c_int) -> Option<std::fs::Metadata> {
+    std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()
 }
 
+/// Mark the guest's fd detached if it is a live socket. Any other fd is
+/// already treated as detached by `socket_is_detached`.
 fn mark_detached_socket(pid: Pid, fd: libc::c_int) {
-    let identity = guest_fd_identity(pid, fd)
-        .unwrap_or_else(|| panic!("replay socket fd {fd} of {pid} has no identity"));
+    let Some(metadata) = guest_fd_metadata(pid, fd).filter(|m| m.file_type().is_socket()) else {
+        return;
+    };
     DETACHED_SOCKETS
         .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(identity);
+        .insert(ReplayFileIdentity::from_metadata(&metadata));
 }
 
+/// Whether a socket call on the guest's fd must return its recorded result.
+/// True for marked sockets, and for an fd that is not a live socket in
+/// replay, such as the eventfd placeholder for a descriptor received through
+/// SCM_RIGHTS, or a virtual fd: there a live call could only fail.
 fn socket_is_detached(pid: Pid, fd: libc::c_int) -> bool {
-    let Some(identity) = guest_fd_identity(pid, fd) else {
-        return false;
+    let Some(metadata) = guest_fd_metadata(pid, fd).filter(|m| m.file_type().is_socket()) else {
+        return true;
     };
+    let identity = ReplayFileIdentity::from_metadata(&metadata);
     DETACHED_SOCKETS.get().is_some_and(|sockets| {
         sockets
             .lock()
@@ -554,8 +565,8 @@ impl Tool for Replayer {
             }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(call) => self.handle_connect(guest, call).await,
-            Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Sendto(call) => self.handle_send(guest, syscall, call.fd()).await,
+            Syscall::Sendmsg(call) => self.handle_send(guest, syscall, call.fd()).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
             // bind and listen still run live in replay because setsockopt does:
@@ -579,7 +590,10 @@ impl Tool for Replayer {
             Syscall::Accept4(call) => self.handle_accept(guest, syscall, call).await,
             Syscall::Socketpair(call) => self.handle_socketpair(guest, call).await,
             Syscall::Recvmmsg(call) => self.handle_recvmmsg(guest, call).await,
-            Syscall::Sendmmsg(call) => self.handle_sendmmsg(guest, call).await,
+            Syscall::Sendmmsg(call) => {
+                mark_detached_socket(guest.pid(), call.sockfd());
+                self.handle_sendmmsg(guest, call).await
+            }
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
@@ -2080,18 +2094,30 @@ impl Replayer {
     }
 
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
-    /// Replay `connect` without connecting. A socket the recording connected,
-    /// or began connecting, is marked detached.
+    /// Replay `connect` without connecting. Whatever it returned, the recorded
+    /// call may have changed the socket's state, so the socket is marked
+    /// detached.
     async fn handle_connect<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: reverie::syscalls::Connect,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
-        if matches!(recorded, Ok(_) | Err(Errno::EINPROGRESS)) {
-            mark_detached_socket(guest.pid(), call.fd());
-        }
+        mark_detached_socket(guest.pid(), call.fd());
         recorded
+    }
+
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    /// Replay a send without sending. A send to an address can bind the socket
+    /// or, with MSG_FASTOPEN, connect it, so the socket is marked detached.
+    async fn handle_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        fd: libc::c_int,
+    ) -> Result<i64, Errno> {
+        mark_detached_socket(guest.pid(), fd);
+        self.handle_simple(guest, syscall).await
     }
 
     async fn handle_dup2<G: Guest<Self>>(

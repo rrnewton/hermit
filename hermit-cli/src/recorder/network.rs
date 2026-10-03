@@ -10,6 +10,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls::Accept4;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
@@ -132,31 +133,36 @@ fn read_readable_mmsghdrs<M: MemoryAccess>(
     headers
 }
 
-/// Write `length` to the `msg_len` field of `mmsghdr` entry `index`.
-fn write_mmsg_len<M: MemoryAccess>(
+/// Write `bytes` to guest `address` with the page permissions the guest's own
+/// stores, and so Linux's copy-out, would have. A plain debugger write can
+/// store through a read-only page.
+fn write_as_guest<M: MemoryAccess>(
     memory: &mut M,
-    base: usize,
-    index: usize,
-    length: u32,
+    address: usize,
+    bytes: &[u8],
 ) -> Result<(), Errno> {
-    let field = mmsghdr_entry(base, index)?
-        .checked_add(std::mem::offset_of!(libc::mmsghdr, msg_len))
-        .and_then(AddrMut::<u32>::from_raw)
-        .ok_or(Errno::EFAULT)?;
-    memory.write_value(field, &length)
+    let address = AddrMut::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
+    match memory.write_with_user_access(address, bytes) {
+        Ok(written) if written == bytes.len() => Ok(()),
+        Ok(_) => Err(Errno::EFAULT),
+        // Recording always runs on ptrace, which supports this.
+        Err(Errno::ENOSYS) => panic!("recording needs permission-checked guest writes"),
+        Err(errno) => Err(errno),
+    }
 }
 
-/// Read the `msg_len` field of `mmsghdr` entry `index`.
-fn read_mmsg_len<M: MemoryAccess>(memory: &M, base: usize, index: usize) -> Result<u32, Errno> {
-    let field = mmsghdr_entry(base, index)?
-        .checked_add(std::mem::offset_of!(libc::mmsghdr, msg_len))
-        .and_then(Addr::<u32>::from_raw)
-        .ok_or(Errno::EFAULT)?;
-    memory.read_value(field)
+/// Whether Linux could write back to `mmsghdr` entry `index` at `base`.
+/// Writing back the bytes just read leaves guest memory as it was.
+fn mmsghdr_is_writable<M: MemoryAccess>(memory: &mut M, base: usize, index: usize) -> bool {
+    let mut bytes = [0u8; std::mem::size_of::<libc::mmsghdr>()];
+    mmsghdr_entry(base, index)
+        .and_then(|entry| {
+            let entry = Addr::<u8>::from_raw(entry).ok_or(Errno::EFAULT)?;
+            memory.read_exact(entry, &mut bytes)?;
+            write_as_guest(memory, entry.as_raw(), &bytes)
+        })
+        .is_ok()
 }
-
-/// A `msg_len` Linux never writes: it stores a nonnegative `int` there.
-const UNRECEIVED_MSG_LEN: u32 = u32::MAX;
 
 /// Query the domain, type and protocol of the guest's socket `fd`.
 fn guest_socket_shape(pid: reverie::Pid, fd: libc::c_int) -> Option<SocketShape> {
@@ -481,102 +487,126 @@ impl Recorder {
         // Linux silently clamps vlen to UIO_MAXIOV.
         let vlen = (syscall.vlen() as usize).min(libc::UIO_MAXIOV as usize);
         let base = syscall.mmsg().map(|address| address.as_raw());
-        // Only the readable prefix matters: Linux stops at the first header it
-        // cannot read. Reduced to plain values so no raw pointer is held
-        // across the await, which would make this future non-`Send`.
-        let input: Vec<(usize, usize, u32)> = base
-            .map(|base| read_readable_mmsghdrs(&guest.memory(), base, vlen))
-            .unwrap_or_default()
-            .iter()
-            .map(|header| {
-                (
-                    header.msg_hdr.msg_namelen as usize,
-                    header.msg_hdr.msg_controllen,
-                    header.msg_len,
-                )
-            })
-            .collect();
-
-        // With a timeout, Linux can receive messages and then fail to write
-        // the remaining time back, returning EFAULT without the count. Mark
-        // every msg_len so the received prefix can still be found.
-        let mut marked = 0;
-        if let (Some(base), Some(_)) = (base, syscall.timeout()) {
-            while marked < input.len()
-                && write_mmsg_len(&mut guest.memory(), base, marked, UNRECEIVED_MSG_LEN).is_ok()
-            {
-                marked += 1;
-            }
-        }
-
-        let result = guest.inject(syscall).await;
-
-        let received = match (result, base) {
-            (Ok(received), _) => usize::try_from(received).ok(),
-            (Err(Errno::EFAULT), Some(base)) if marked != 0 => Some(
-                (0..marked)
-                    .take_while(|index| {
-                        read_mmsg_len(&guest.memory(), base, *index)
-                            .is_ok_and(|length| length != UNRECEIVED_MSG_LEN)
-                    })
+        // Reduced to plain capacities inside this block so no raw pointer is
+        // held across an await, which would make this future non-`Send`.
+        let (readable, writable, input) = {
+            // Linux stops at the first header it cannot read, without side
+            // effects.
+            let headers = base
+                .map(|base| read_readable_mmsghdrs(&guest.memory(), base, vlen))
+                .unwrap_or_default();
+            // But it receives into a header before writing results back to it,
+            // so a header it can read but not write loses a message. Offer
+            // Linux only the writable prefix, and refuse below if that could
+            // have mattered.
+            let writable = match base {
+                Some(base) => headers
+                    .iter()
+                    .enumerate()
+                    .take_while(|(index, _)| mmsghdr_is_writable(&mut guest.memory(), base, *index))
                     .count(),
-            ),
-            _ => None,
-        };
-        // Put back the msg_len of every marked entry Linux did not receive into.
-        if let Some(base) = base {
-            for (index, (_, _, length)) in input
+                None => 0,
+            };
+            let input: Vec<(usize, usize)> = headers[..writable]
                 .iter()
-                .enumerate()
-                .take(marked)
-                .skip(received.unwrap_or(0))
-            {
-                write_mmsg_len(&mut guest.memory(), base, index, *length)
-                    .expect("restoring a msg_len this handler wrote");
+                .map(|header| {
+                    (
+                        header.msg_hdr.msg_namelen as usize,
+                        header.msg_hdr.msg_controllen,
+                    )
+                })
+                .collect();
+            (headers.len(), writable, input)
+        };
+        let clamped = writable < readable;
+        let refusal = |index: usize| -> ! {
+            panic!(
+                "recvmmsg entry {index} can be read but not written: Linux would receive \
+                 into it and then fail, which cannot be recorded \
+                 (https://github.com/rrnewton/hermit/issues/3583)"
+            )
+        };
+        if clamped && writable == 0 {
+            refusal(0);
+        }
+        let call = if clamped {
+            syscall.with_vlen(writable as u32)
+        } else {
+            syscall
+        };
+
+        // Linux writes the remaining timeout back only after receiving, and a
+        // failed write turns the count into EFAULT. Give it a scratch copy and
+        // write the remainder back here, so the received messages are known.
+        let timeout = syscall
+            .timeout()
+            .map(|address| guest.memory().read_value(address));
+        let (mut result, remaining) = match timeout {
+            Some(Ok(timeout)) => {
+                let mut stack = guest.stack().await;
+                let scratch = stack.push(timeout);
+                let _guard = stack.commit()?;
+                let result = guest.inject(call.with_timeout(Some(scratch))).await;
+                let remaining: Timespec = guest.memory().read_value(scratch)?;
+                let mut bytes = [0u8; std::mem::size_of::<Timespec>()];
+                guest
+                    .memory()
+                    .read_exact(scratch.cast::<u8>(), &mut bytes)?;
+                (result, Some((remaining, bytes)))
             }
+            // An unreadable timeout fails before any receive.
+            Some(Err(_)) | None => (guest.inject(call).await, None),
+        };
+        if clamped && result == Ok(writable as i64) {
+            refusal(writable);
+        }
+        // Capture the messages before writing the timeout back: Linux writes it
+        // last, so a timeout aliasing a header overwrites that header's result.
+        let messages = result.and_then(|received| {
+            let received = usize::try_from(received).map_err(|_| Errno::EINVAL)?;
+            assert!(received <= input.len());
+            let address = base.ok_or(Errno::EFAULT)?;
+            let output = read_mmsghdrs(&guest.memory(), address, received)?;
+            input
+                .iter()
+                .zip(&output)
+                .map(|((name_capacity, control_capacity), output)| {
+                    capture_recvmsg(
+                        &guest.memory(),
+                        *name_capacity,
+                        *control_capacity,
+                        &output.msg_hdr,
+                        i64::from(output.msg_len),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        });
+        // Linux writes the remaining time back only after receiving something.
+        let remaining = remaining.filter(|_| matches!(result, Ok(received) if received > 0));
+        let mut timeout_fault = false;
+        if let Some((_, bytes)) = &remaining {
+            let address = syscall
+                .timeout()
+                .expect("a remaining timeout needs a timeout");
+            timeout_fault = write_as_guest(&mut guest.memory(), address.as_raw(), bytes).is_err();
         }
 
-        let event = match (result, received) {
-            (Ok(_), Some(received)) => Ok((received, false)),
-            (Err(Errno::EFAULT), Some(received)) if received != 0 => Ok((received, true)),
-            (Ok(_), None) => Err(Errno::EINVAL),
-            (Err(error), _) => Err(error),
-        };
         self.record_event(
             guest,
-            event.and_then(|(received, timeout_fault)| {
-                assert!(received <= input.len());
-                let address = base.ok_or(Errno::EFAULT)?;
-                let output = read_mmsghdrs(&guest.memory(), address, received)?;
-                let messages = input
-                    .iter()
-                    .zip(&output)
-                    .map(|((name_capacity, control_capacity, _), output)| {
-                        capture_recvmsg(
-                            &guest.memory(),
-                            *name_capacity,
-                            *control_capacity,
-                            &output.msg_hdr,
-                            i64::from(output.msg_len),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let timeout = if timeout_fault {
-                    None
-                } else {
-                    syscall
-                        .timeout()
-                        .map(|address| guest.memory().read_value(address))
-                        .transpose()?
-                };
-                Ok(SyscallEvent::Recvmmsg(RecvmmsgEvent {
+            messages.map(|messages| {
+                SyscallEvent::Recvmmsg(RecvmmsgEvent {
                     messages,
-                    timeout,
+                    timeout: remaining
+                        .map(|(remaining, _)| remaining)
+                        .filter(|_| !timeout_fault),
                     timeout_fault,
-                }))
+                })
             }),
         );
 
+        if timeout_fault {
+            result = Err(Errno::EFAULT);
+        }
         result
     }
 

@@ -149,7 +149,8 @@ pub struct AcceptEvent {
 pub struct RecvmmsgEvent {
     /// One entry per received message; `RecvmsgEvent::result` is its `msg_len`.
     pub messages: Vec<RecvmsgEvent>,
-    /// The remaining timeout written back, if the guest passed one.
+    /// The remaining timeout Linux wrote back: only when the guest passed one
+    /// and at least one message arrived.
     pub timeout: Option<Timespec>,
     /// Linux received `messages` but could not write the remaining timeout
     /// back, so the call returned EFAULT after its side effects.

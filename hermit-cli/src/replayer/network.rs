@@ -381,7 +381,7 @@ impl Replayer {
             assert!(syscall.timeout().is_some());
             return Err(Errno::EFAULT);
         }
-        assert_eq!(event.timeout.is_some(), syscall.timeout().is_some());
+        assert!(event.timeout.is_none() || syscall.timeout().is_some());
         if let Some(timeout) = event.timeout {
             let address = AddrMut::<Timespec>::from_raw(syscall.timeout().unwrap().as_raw())
                 .ok_or(Errno::EFAULT)?;

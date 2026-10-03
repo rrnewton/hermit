@@ -152,10 +152,12 @@ static int partial_side_effects(void) {
   printf("recvmmsg unmapped tail %d errno %d lens %u %u data %.2s %.2s\n",
          received, received < 0 ? errno : 0, tail[0].msg_len, tail[1].msg_len,
          buffers[0], buffers[1]);
+  CHECK(received == 2 && tail[0].msg_len == 2 && tail[1].msg_len == 2);
   /* Linux reports the fault on the next receive. */
   char next[8];
   ssize_t result = recv(sv[1], next, sizeof next, MSG_DONTWAIT);
   printf("next recv %zd errno %d\n", result, result < 0 ? errno : 0);
+  CHECK(result == -1 && errno == EFAULT);
   close(sv[0]);
   close(sv[1]);
 
@@ -178,6 +180,9 @@ static int partial_side_effects(void) {
       received, received < 0 ? errno : 0, messages[0].msg_len,
       messages[1].msg_len, messages[2].msg_len, message_buffers[0],
       message_buffers[1]);
+  CHECK(received == -1 && errno == EFAULT);
+  CHECK(messages[0].msg_len == 2 && messages[1].msg_len == 2 &&
+        messages[2].msg_len == 77);
   close(sv[0]);
   close(sv[1]);
   CHECK(munmap(pages, 2 * page) == 0);
@@ -257,19 +262,31 @@ static int connected_state_options(void) {
   int on_accepted =
       setsockopt(accepted, IPPROTO_IPV6, IPV6_ADDRFORM, &inet, sizeof inet);
   int accepted_errno = on_accepted < 0 ? errno : 0;
+  if (accepted_errno == ENOPROTOOPT) {
+    printf("ipv6 addrform unsupported\n");
+    close(accepted);
+    close(client);
+    close(listener);
+    return 0;
+  }
   int on_client =
       setsockopt(client, IPPROTO_IPV6, IPV6_ADDRFORM, &inet, sizeof inet);
   int client_errno = on_client < 0 ? errno : 0;
   int on_listener =
       setsockopt(listener, IPPROTO_IPV6, IPV6_ADDRFORM, &inet, sizeof inet);
+  int listener_errno = on_listener < 0 ? errno : 0;
   printf("ipv6_addrform accepted %d errno %d client %d errno %d listener %d "
          "errno %d\n",
          on_accepted, accepted_errno, on_client, client_errno, on_listener,
-         on_listener < 0 ? errno : 0);
+         listener_errno);
+  /* ADDRFORM needs a connected socket mapped to IPv4. */
+  CHECK(on_accepted == 0 && on_client == 0);
+  CHECK(on_listener == -1 && listener_errno == ENOTCONN);
   /* Linux refuses listen on a connected socket. */
   int relisten = listen(accepted, 1);
   printf("listen on accepted %d errno %d\n", relisten,
          relisten < 0 ? errno : 0);
+  CHECK(relisten == -1 && errno == EINVAL);
   close(accepted);
   close(client);
   close(listener);
