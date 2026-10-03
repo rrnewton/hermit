@@ -850,7 +850,7 @@ impl Recorder {
         result
     }
 
-    // TODO-HUMAN-REVIEW(#3591)
+    // TODO-HUMAN-REVIEW(PR-3601)
     /// Records an xattr query. A sized query records the bytes the kernel
     /// copied out, whose count is the return value. A zero-size query copies
     /// nothing and returns the length the value needs, so that is recorded

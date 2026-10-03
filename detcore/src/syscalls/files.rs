@@ -1790,7 +1790,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Zero-count reads only serve to detect errors. Their result goes
             // through record/replay: a replayed descriptor may be a placeholder
             // whose own zero-count read fails differently.
-            // TODO-HUMAN-REVIEW(#3591)
+            // TODO-HUMAN-REVIEW(PR-3601)
             return self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;
@@ -1896,7 +1896,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.len() == 0 {
             // Zero-count reads only serve to detect errors; as for read, the
             // result goes through record/replay.
-            // TODO-HUMAN-REVIEW(#3591)
+            // TODO-HUMAN-REVIEW(PR-3601)
             return self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;

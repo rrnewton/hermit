@@ -1180,7 +1180,7 @@ impl Replayer {
         Ok(buf.len() as i64)
     }
 
-    // TODO-HUMAN-REVIEW(#3591)
+    // TODO-HUMAN-REVIEW(PR-3601)
     /// Replays an xattr query from the recording without asking the replay
     /// process: its descriptor may be a placeholder and its paths live in the
     /// replay chroot. A sized query writes back the recorded value bytes; a
