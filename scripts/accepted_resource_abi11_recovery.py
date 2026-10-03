@@ -277,9 +277,13 @@ def inspect_locked(args, root, deadline):
     deadline.remaining()
     stable = ["hermit-accepted-abi11-resource-plan-v1", boot, args.owner_uid, source, DEPENDENCY_SHA256,
               str(root.path), original, actor_authority(before)]
+    # main's JSON output may reorder object keys; the plan digest must survive
+    # that round trip. Keep certificate row serialization separate and unchanged.
+    stable_bytes = json.dumps(stable, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True).encode() + b"\n"
     return {"schema": "hermit-accepted-abi11-resource-inspection-v1", "outcome": "inspected",
             "execution_success": False, "admission_authority": False, "mutations_performed": False,
-            "resource_recovery_complete": False, "plan_sha256": nr.digest(nr.wire(stable)),
+            "resource_recovery_complete": False, "plan_sha256": nr.digest(stable_bytes),
             "plan": stable, "actor_observations_before": before, "actor_observations_after": after,
             "trust_premise": "private owner evidence and conforming trusted manager; no migration or unit recreation"}
 

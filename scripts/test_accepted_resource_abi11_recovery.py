@@ -9,6 +9,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -257,6 +258,26 @@ class InspectorTests(unittest.TestCase):
         path.symlink_to(Path(nr.__file__))
         with self.assertRaises(OSError):
             ar.load_dependency(path)
+
+    def test_actual_main_inspection_digest_survives_json_output(self):
+        before = self.census()
+        output = io.StringIO()
+        argv = ["accepted_resource_abi11_recovery.py", "inspect",
+                "--accepted-root", str(self.f.path), "--accepted-label", LABEL,
+                "--accepted-package", "/controlled/package", "--owner-uid", str(os.getuid())]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(output), \
+                mock.patch.object(ar, "expected_package", return_value=self.artifact), \
+                mock.patch.object(ar, "manager_query", side_effect=lambda unit, _: (0, properties(unit))), \
+                mock.patch.object(ar, "cgroup_absent", return_value=errno.ENOENT), \
+                mock.patch.object(nr, "NativeRead", side_effect=AssertionError("inspection must not query BPF")):
+            self.assertEqual(ar.main(), 0)
+        actual = nr.decode(output.getvalue().encode())
+        serialized = json.dumps(actual["plan"], sort_keys=True, separators=(",", ":"),
+                                ensure_ascii=True).encode() + b"\n"
+        self.assertEqual(actual["plan_sha256"], hashlib.sha256(serialized).hexdigest())
+        self.assertEqual(actual["outcome"], "inspected")
+        self.assertIs(actual["mutations_performed"], False)
+        self.assertEqual(before, self.census())
 
 
 
