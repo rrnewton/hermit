@@ -12,8 +12,26 @@ import sys
 root = Path.cwd()
 target = root / "custom-cargo-target"
 args = sys.argv[1:]
+artifact_target = target / os.environ["CARGO_BUILD_TARGET"] if os.environ.get("CARGO_BUILD_TARGET") else target
 with open(os.environ["CARGO_CALL_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\n")
+
+# This one read-only query is part of the real preparation and revalidation
+# path. Keep it in the complete call ledger, and reject every other config argv.
+CONFIG_QUERY = ["-Z", "unstable-options", "config", "get", "--format=json", "--offline"]
+if args == CONFIG_QUERY:
+    mode = os.environ.get("CARGO_CONFIG_MODE", "current")
+    if mode == "current":
+        print(json.dumps({"build": {"target-dir": str(target)}}))
+    elif mode == "malformed":
+        print("{")
+    elif mode == "non-object":
+        print("[]")
+    elif mode == "failed":
+        raise SystemExit(23)
+    else:
+        raise SystemExit(f"unexpected configuration fixture mode: {mode!r}")
+    raise SystemExit(0)
 
 if args[:2] == ["nextest", "list"] and os.environ.get("CARGO_ARTIFACT_MODE") == "declined":
     raise SystemExit(75)
@@ -47,6 +65,8 @@ selections = {
     if "NEXTEST_PREPARED_BUILD_SELECTION" in step.get("env", {})
 }
 guest_names = json.loads((root / "guest-names.json").read_text())
+record_sources = dict(json.loads((root / "record-sources.json").read_text()))
+all_guest_names = sorted(set(guest_names) | set(record_sources))
 packages = {}
 for selection in selections:
     package, names = selectors(selection)
@@ -54,7 +74,9 @@ for selection in selections:
     for name in names:
         targets[name] = {"name": name, "kind": ["lib" if name == "library-fixture" else "test"]}
 packages["hermetic_infra_hermit_tests"] = {
-    name: {"name": name, "kind": ["bin"]} for name in guest_names
+    name: {"name": name, "kind": ["bin"],
+           **({"src_path": str(root / record_sources[name])} if name in record_sources else {})}
+    for name in all_guest_names
 }
 
 packages["hermit-manifest-plan"] = {
@@ -65,14 +87,14 @@ if args[:1] == ["metadata"]:
     print(json.dumps({
         "workspace_root": str(root), "target_directory": str(target),
         "packages": [{"name": name, "id": package_id(name), "source": None,
-                      "manifest_path": str(root / "Cargo.toml"), "targets": list(targets.values())}
+                      "manifest_path": str(root / ("tests/Cargo.toml" if name == "hermetic_infra_hermit_tests" else "Cargo.toml")), "targets": list(targets.values())}
                      for name, targets in packages.items()],
     }))
 elif args[:2] == ["nextest", "list"] and "--binaries-metadata" not in args:
     package, names = selectors(args)
     binaries = {}
     for name in names:
-        path = target / "debug" / "build" / package / "out" / name
+        path = artifact_target / "debug" / "build" / package / "out" / name
         mode = os.environ.get("CARGO_ARTIFACT_MODE", "current") if name == "tests_misc" else "current"
         if mode != "missing":
             write_binary(path)
@@ -88,8 +110,19 @@ elif args[:2] == ["nextest", "list"] and "--binaries-metadata" not in args:
             write_binary(second)
             duplicate = {**entry, "binary-id": binary_id + "-other", "binary-path": str(second)}
             binaries[duplicate["binary-id"]] = duplicate
-    print(json.dumps({"rust-build-meta": {"target-directory": str(target), "non-test-binaries": {}},
-                      "rust-binaries": binaries}))
+    # Production supplies the target derived from the real rustc -vV host.
+    # This fixture reports that actual selected environment; it does not guess
+    # the host or invent a platform when the producer failed to select one.
+    triple = os.environ.get("CARGO_BUILD_TARGET")
+    assert triple and not any(c.isspace() for c in triple), triple
+    platforms = [{"triple": triple}]
+    mode = os.environ.get("CARGO_ARTIFACT_MODE", "current")
+    if mode == "platform-wrong":
+        platforms = [{"triple": "different-controlled-target"}]
+    build_meta = {"target-directory": str(target), "non-test-binaries": {}}
+    if mode != "platform-missing":
+        build_meta["target-platforms"] = platforms
+    print(json.dumps({"rust-build-meta": build_meta, "rust-binaries": binaries}))
 elif args[:2] in (["nextest", "list"], ["nextest", "run"]) and "--binaries-metadata" in args:
     # Metadata-only enumeration must not retain any Cargo build selector.
     assert not any(arg in args for arg in ["-p", "--features", "--test", "--lib", "--bins", "--workspace"]), args
@@ -100,7 +133,7 @@ elif args[:2] in (["nextest", "list"], ["nextest", "run"]) and "--binaries-metad
 elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
     assert args == ["build", "--locked", "--message-format=json-render-diagnostics", "-p", "hermit-manifest-plan", "--bin", "nextest-cpu-wrapper"], args
     mode = os.environ.get("CARGO_ARTIFACT_MODE", "current")
-    path = target / "debug" / "nextest-cpu-wrapper"
+    path = artifact_target / "debug" / "nextest-cpu-wrapper"
     if mode != "wrapper-missing":
         write_binary(path)
     event = {"reason": "compiler-artifact", "package_id": package_id("hermit-manifest-plan"),
@@ -110,11 +143,15 @@ elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
     if mode == "wrapper-ambiguous":
         print(json.dumps(event))
 elif args[:1] == ["build"] and "hermetic_infra_hermit_tests" in args:
-    for name in guest_names:
-        path = target / "debug" / name
+    assert args == ["build", "--locked", "-p", "hermetic_infra_hermit_tests", "--bins", "--message-format=json"], args
+    for name in all_guest_names:
+        path = artifact_target / "debug" / name
         write_binary(path)
         print(json.dumps({"reason": "compiler-artifact", "package_id": package_id("hermetic_infra_hermit_tests"),
-                          "target": {"name": name, "kind": ["bin"]}, "profile": {"test": False},
+                          "target": {"name": name, "kind": ["bin"],
+                                     **({"src_path": str(root / record_sources[name])} if name in record_sources else {})},
+                          "profile": {"test": False},
                           "executable": str(path)}))
+    print(json.dumps({"reason": "build-finished", "success": True}))
 else:
     raise SystemExit(f"unexpected Cargo invocation: {args!r}")

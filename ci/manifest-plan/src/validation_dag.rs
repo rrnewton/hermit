@@ -950,6 +950,17 @@ fn materialize_network_http_host(cfg: &mut DagConfig) -> Result<(), String> {
     publisher.fail_fast_family = Some(publisher.tag());
     cfg.steps.push(publisher);
     cfg.steps.push(http);
+    // verify-results requires every selected result, including custom cells.
+    // HTTP no longer runs in either application launcher, so both scorecards
+    // that consume the privileged lane must await its separate result owner.
+    for tag in [
+        "full-scorecard.compatibility",
+        "privileged-scorecard.compatibility",
+    ] {
+        let scorecard = cfg.steps.iter_mut().find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("missing privileged result scorecard {tag}"))?;
+        scorecard.deps.push(NETWORK_HTTP_HOST.into());
+    }
     Ok(())
 }
 
@@ -2388,6 +2399,62 @@ mod tests {
         assert_eq!(publisher.timeout, 20);
         assert!(publisher.cmd.contains(&format!("verify-hermit-e2e-artifact.sh {HOST_ARTIFACT_POINTER}")));
         assert!(publisher.cmd.contains("--network-provider \"$VALIDATE_RUN_STATE/network-http-provider\""));
+    }
+
+    #[test]
+    fn network_http_materializer_preserves_scorecards_except_required_result_edges() {
+        let mut cfg = crate::validation_dag_static::config();
+        let mut expected = cfg.clone();
+        for tag in [
+            "full-scorecard.compatibility",
+            "privileged-scorecard.compatibility",
+        ] {
+            let scorecard = expected.steps.iter_mut().find(|step| step.tag() == tag).unwrap();
+            assert!(!scorecard.deps.iter().any(|dep| dep == NETWORK_HTTP_HOST));
+            scorecard.deps.push(NETWORK_HTTP_HOST.into());
+        }
+        materialize_network_http_host(&mut cfg).unwrap();
+        cfg.steps.retain(|step| step.group.contains("scorecard"));
+        expected.steps.retain(|step| step.group.contains("scorecard"));
+        // Compare every scorecard field, including unchanged portable owners,
+        // commands, limits and every previously required producer dependency.
+        assert_eq!(canonical_text(&cfg), canonical_text(&expected));
+    }
+
+    #[test]
+    fn network_http_scorecard_closures_require_actual_custom_result_owner() {
+        let cfg = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let http_cell = cells.iter().find(|cell| cell.test.as_deref() == Some(NETWORK_HTTP_TEST)).unwrap();
+        assert_eq!(http_cell.mode.as_deref(), Some("custom"));
+        assert_eq!(http_cell.lane, "privileged");
+        for (profile, tag) in [
+            ("full", "full-scorecard.compatibility"),
+            ("privileged", "privileged-scorecard.compatibility"),
+        ] {
+            let selected = select_steps_by_labels(&cfg, &[profile.into()]).unwrap();
+            let expected = selected.steps.iter().filter(|step| is_manifest_run(step))
+                .map(Step::tag).chain(["gate.manifest".into(), "pre.reverie_pin".into()])
+                .collect::<BTreeSet<_>>();
+            let scorecard = cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
+            assert_eq!(scorecard.deps.iter().cloned().collect::<BTreeSet<_>>(), expected, "{tag}");
+            assert_eq!(scorecard.deps.len(), expected.len(), "duplicate dependency in {tag}");
+            let owner_count = |graph: &DagConfig| {
+                let closure = dagrun::select_steps_by_tags(graph, &[tag.into()], false).unwrap();
+                closure.steps.iter().filter(|step| step.effective_result_manifests().iter()
+                    .any(|cell| result_identity(cell) == result_identity(http_cell))).count()
+            };
+            assert_eq!(owner_count(&cfg), 1, "{tag}");
+            let mut missing = cfg.clone();
+            let deps = &mut missing.steps.iter_mut().find(|step| step.tag() == tag).unwrap().deps;
+            deps.retain(|dep| dep != NETWORK_HTTP_HOST);
+            assert_ne!(deps.iter().cloned().collect::<BTreeSet<_>>(), expected);
+            assert_eq!(owner_count(&missing), 0, "missing HTTP edge must expose the old ordering gap");
+            let mut extra = cfg.clone();
+            let deps = &mut extra.steps.iter_mut().find(|step| step.tag() == tag).unwrap().deps;
+            deps.push("pre.submodules".into());
+            assert_ne!(deps.iter().cloned().collect::<BTreeSet<_>>(), expected);
+        }
     }
 
     #[test]

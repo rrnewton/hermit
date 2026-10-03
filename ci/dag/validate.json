@@ -9519,7 +9519,8 @@
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-e2e.manifest_applications",
-        "privileged-e2e.manifest_backend_parity_c"
+        "privileged-e2e.manifest_backend_parity_c",
+        "privileged-e2e.network_http_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -13934,6 +13935,7 @@
       "deps": [
         "gate.manifest",
         "pre.reverie_pin",
+        "privileged-e2e.network_http_on_host",
         "privileged-only-e2e.manifest_applications",
         "privileged-only-e2e.manifest_backend_parity_c"
       ],

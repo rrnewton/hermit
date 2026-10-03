@@ -6282,6 +6282,71 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         }
         ("target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".to_owned(),
             Path::new(run_id).join("results.jsonl"))
+    } else if let Some((test, mode, backend, bucket)) = match tag.as_str() {
+        "privileged-e2e.manifest_applications"
+        | "privileged-only-e2e.manifest_applications"
+        | "privileged-only-e2e.manifest_applications_on_host" => Some((
+            "applications/kvm-shell-environment",
+            "verify",
+            "kvm",
+            "privileged/manifest_applications",
+        )),
+        FULL_HTTP_HOST_TAG => Some((
+            "applications/network-only-curl-http",
+            "custom",
+            "ptrace",
+            "privileged/network_http",
+        )),
+        _ => None,
+    } {
+        let expected = DagManifest {
+            lane: "privileged".into(),
+            category: "applications".into(),
+            test: Some(test.into()),
+            mode: None,
+            backend: None,
+        };
+        if step.manifest.as_ref() != Some(&expected) {
+            return Err(format!("{tag} changed its exact filtered selector"));
+        }
+        let mut cell = expected;
+        cell.mode = Some(mode.into());
+        cell.backend = Some(backend.into());
+        if step.effective_result_manifests().as_ref() != [cell] {
+            return Err(format!("{tag} changed its exact filtered result cell"));
+        }
+        // Bind the whole original transport and artifact environment, not just
+        // a matching decoded payload. This is the same compiled source graph
+        // used by normal_census_launches, not a caller-supplied registry.
+        let normal = dag_from_json(include_str!("../ci/dag/validate.json"))
+            .map_err(|error| format!("compiled normal DAG is invalid: {error}"))?;
+        let owners = normal
+            .steps
+            .iter()
+            .filter(|candidate| candidate.tag() == tag)
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            return Err(format!("{tag} has no unique source-defined filtered owner"));
+        };
+        if step.cmd != owner.cmd
+            || step.env != owner.env
+            || step.manifest != owner.manifest
+            || step.result_manifests != owner.result_manifests
+        {
+            return Err(format!(
+                "{tag} changed its source-defined filtered publisher context"
+            ));
+        }
+        (
+            format!(
+                "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run \
+                 --lane privileged --category applications --test {test} \
+                 --ci-only --allow-empty --prebuilt \
+                 --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
+                 --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\""
+            ),
+            Path::new(bucket).join("results.jsonl"),
+        )
     } else {
         let manifest = step
             .manifest
@@ -14329,16 +14394,67 @@ mod nextest_timeout_tests {
             .find(|step| step.tag() == "quick.e2e_verify")
             .expect("the committed quick manifest node is present");
         let manifests = ManifestSet::load(&root).unwrap();
+        let required = manifests
+            .select(&Selection {
+                population: Some(Population::Required),
+                ..Default::default()
+            })
+            .unwrap();
+        let identities = required
+            .iter()
+            .map(|cell| {
+                (
+                    cell.test.lane.clone(),
+                    cell.category.clone(),
+                    cell.id.test.clone(),
+                    cell.id.mode.clone(),
+                    cell.id.backend.clone().unwrap_or_else(|| "native".into()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = hermit_manifest_plan::validation_dag::expected_cells_from_json(
+            &std::fs::read_to_string(root.join("ci/expected-e2e-plan.json")).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|cell| {
+            (
+                cell.lane,
+                cell.category,
+                cell.test.unwrap(),
+                cell.mode.unwrap(),
+                cell.backend.unwrap(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
         assert_eq!(
-            manifests
-                .select(&Selection {
-                    population: Some(Population::Required),
-                    ..Default::default()
-                })
-                .unwrap()
-                .len(),
+            identities.len(),
+            expected.len(),
+            "duplicate/missing required cell"
+        );
+        assert_eq!(
+            identities.iter().cloned().collect::<BTreeSet<_>>(),
+            expected
+        );
+        let http = (
+            "privileged".to_string(),
+            "applications".to_string(),
+            "applications/network-only-curl-http".to_string(),
+            "custom".to_string(),
+            "ptrace".to_string(),
+        );
+        assert_eq!(
+            identities
+                .iter()
+                .filter(|cell| cell.2 == http.2)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![http.clone()]
+        );
+        assert_eq!(
+            identities.iter().filter(|cell| *cell != &http).count(),
             859,
-            "timeout accounting must not change the shipped required-cell population"
+            "all original required cells remain; only the exact HTTP cell is additional"
         );
         let selection = Selection {
             population: Some(Population::Required),
@@ -14597,7 +14713,64 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .iter()
             .filter(|step| step.cmd.contains("target/debug/test-harness run "))
             .collect::<Vec<_>>();
-        assert_eq!(steps.len(), 33);
+        let expected_roles = [
+            "e2e.manifest_applications",
+            "e2e.manifest_applications_on_host",
+            "e2e.manifest_backend_parity_c",
+            "e2e.manifest_backend_parity_c_on_host",
+            "e2e.manifest_bin_c",
+            "e2e.manifest_bin_c_on_host",
+            "e2e.manifest_c_programs",
+            "e2e.manifest_c_programs_on_host",
+            "e2e.manifest_chaos_c",
+            "e2e.manifest_chaos_c_on_host",
+            "e2e.manifest_data_handling",
+            "e2e.manifest_data_handling_on_host",
+            "e2e.manifest_debugger_c",
+            "e2e.manifest_debugger_c_on_host",
+            "e2e.manifest_determinism_stress",
+            "e2e.manifest_determinism_stress_c",
+            "e2e.manifest_determinism_stress_c_on_host",
+            "e2e.manifest_determinism_stress_on_host",
+            "e2e.manifest_language_runtimes",
+            "e2e.manifest_language_runtimes_on_host",
+            "e2e.manifest_shared_futex_c",
+            "e2e.manifest_shared_futex_c_on_host",
+            "e2e.manifest_system_utils",
+            "e2e.manifest_system_utils_on_host",
+            "e2e.manifest_util_c",
+            "e2e.manifest_util_c_on_host",
+            "privileged-e2e.manifest_applications",
+            "privileged-e2e.manifest_backend_parity_c",
+            "privileged-e2e.network_http_on_host",
+            "privileged-only-e2e.manifest_applications",
+            "privileged-only-e2e.manifest_applications_on_host",
+            "privileged-only-e2e.manifest_backend_parity_c",
+            "privileged-only-e2e.manifest_backend_parity_c_on_host",
+            "quick.e2e_verify",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(
+            steps.len(),
+            expected_roles.len(),
+            "duplicate/missing manifest owner"
+        );
+        assert_eq!(
+            steps.iter().map(|step| step.tag()).collect::<BTreeSet<_>>(),
+            expected_roles
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.tag() != FULL_HTTP_HOST_TAG)
+                .count(),
+            33
+        );
+        let full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
+        full_pin_owner_contract(&full).unwrap();
+        full_http_host_contract(&full).unwrap();
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -24784,6 +24957,51 @@ mod fused_privileged_build_tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    const CONFIG_QUERY: [&str; 6] = [
+        "-Z",
+        "unstable-options",
+        "config",
+        "get",
+        "--format=json",
+        "--offline",
+    ];
+
+    // The complete on-disk ledger includes the newly required read-only Cargo
+    // config query. Preserve the original exact build/list/run assertions over
+    // every other invocation, and assert query counts/placement independently.
+    fn cargo_non_query_log(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| serde_json::from_str::<Vec<String>>(line).unwrap() != CONFIG_QUERY)
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    fn config_queries(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| serde_json::from_str::<Vec<String>>(line).unwrap() == CONFIG_QUERY)
+            .count()
+    }
+
+    fn native_artifact(root: &Path, relative: &str) -> PathBuf {
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let identity = Command::new(compiler).arg("-vV").output().unwrap();
+        assert!(identity.status.success());
+        let text = String::from_utf8(identity.stdout).unwrap();
+        let hosts = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("host: "))
+            .collect::<Vec<_>>();
+        assert_eq!(hosts.len(), 1);
+        assert!(!hosts[0].is_empty() && !hosts[0].contains(char::is_whitespace));
+        root.join("custom-cargo-target")
+            .join(hosts[0])
+            .join(relative)
+    }
+
     fn cold_fixture(repository: &Path, helper: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let cargo_log = root.path().join("cargo-calls");
@@ -24795,6 +25013,23 @@ mod fused_privileged_build_tests {
         std::fs::copy(repository.join("ci/dag/validate.json"), root.path().join("ci/dag/validate.json")).unwrap();
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.path().join("guest-names.json"), serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap()).unwrap();
+        let workloads = &hermit_manifest_plan::nextest_binaries::record_workloads::RUST_SOURCES;
+        let record_sources = workloads.iter().map(|(_, target, source)| (*target, *source)).collect::<BTreeMap<_, _>>();
+        std::fs::write(root.path().join("record-sources.json"), serde_json::to_vec(&record_sources).unwrap()).unwrap();
+        // Supply the actual maintained sources to the real C compiler. Cargo
+        // artifact events remain the existing controlled fixture premise; no
+        // C or Rust workload is executed by these preparation checks.
+        let copies = hermit_manifest_plan::nextest_binaries::record_workloads::C_SOURCES.iter()
+            .map(|(_, source)| *source)
+            .chain(workloads.iter().map(|(_, _, source)| *source))
+            .chain(["tests/Cargo.toml", "tests/c/util/assert.h"]);
+        for source in copies {
+            let destination = root.path().join(source);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(repository.join(source), &destination).unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(repository.join(source)).unwrap());
+        }
+
         std::fs::write(root.path().join(".gitignore"), "/target/\n/custom-cargo-target/\n/cargo-calls\n").unwrap();
         for args in [vec!["init", "-q"], vec!["add", "."], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]] {
             let output = Command::new("git").args(args).current_dir(root.path()).output().unwrap();
@@ -24853,7 +25088,12 @@ mod fused_privileged_build_tests {
         assert!(!log.exists(), "the consumer must not fall back to Cargo");
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
-        let before = std::fs::read_to_string(&log).unwrap();
+        let before = cargo_non_query_log(&log);
+        assert_eq!(config_queries(&log), 2, "preparation queries config before work and again before publication");
+        let all_calls = std::fs::read_to_string(&log).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(all_calls.first().unwrap(), &CONFIG_QUERY);
+        assert_eq!(all_calls.last().unwrap(), &CONFIG_QUERY);
+
         // The FULL profile, because `preparation` above is the full plan's own
         // producer (NEXTEST_FULL_PREPARE_COMMAND) run against a fixture holding
         // the real ci/dag/validate.json. Asking for "portable" compared this
@@ -24873,66 +25113,78 @@ mod fused_privileged_build_tests {
         assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build")).count(), 2, "no other builds were introduced");
         let read_only = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
         assert!(read_only.status.success(), "{}", String::from_utf8_lossy(&read_only.stderr));
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "the privileged consumer must not invoke Cargo after preparation");
+        assert_eq!(cargo_non_query_log(&log), before, "the privileged consumer must not invoke Cargo beyond the exact read-only configuration query after preparation");
+        assert_eq!(config_queries(&log), 4, "the barrier revalidates config once for assert and once for executable lookup");
         let record_path = root.path().join("target/ci/nextest-binaries/current.json");
         let published_record = std::fs::read(&record_path).unwrap();
         let wrapper_query = run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current");
         assert!(wrapper_query.status.success(), "{}", String::from_utf8_lossy(&wrapper_query.stderr));
         let wrapper = PathBuf::from(String::from_utf8(wrapper_query.stdout).unwrap().trim());
-        assert_eq!(wrapper, root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"));
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a wrapper lookup must not build");
+        assert_eq!(wrapper, native_artifact(root.path(), "debug/nextest-cpu-wrapper"));
+        assert_eq!(cargo_non_query_log(&log), before, "a wrapper lookup must not build");
+        assert_eq!(config_queries(&log), 5, "wrapper lookup performs one config query without a build");
         let wrapper_bytes = std::fs::read(&wrapper).unwrap();
         for mode in ["missing", "stale"] {
+            let queries = config_queries(&log);
             if mode == "missing" { std::fs::remove_file(&wrapper).unwrap(); }
             else { std::fs::write(&wrapper, "#!/bin/sh\nexit 23\n").unwrap(); }
             assert!(!run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper");
             assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper through the barrier");
-            assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a {mode} wrapper cannot cause a fallback build");
+            assert_eq!(cargo_non_query_log(&log), before, "a {mode} wrapper cannot cause a fallback build");
+            assert_eq!(config_queries(&log), queries + 2, "each failed reader checks config once before detecting the wrapper");
             write_executable(&wrapper, std::str::from_utf8(&wrapper_bytes).unwrap());
             // write_executable uses 0700; preserve the producer's original mode.
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let queries = config_queries(&log);
         let no_build = run_build("HERMIT_PREPARED_NEXTEST_REQUIRED=1 ./ci/nextest-binaries.rs build-cpu-wrapper", root.path(), &bin, &log, "current");
         assert!(!no_build.status.success(), "an official consumer cannot invoke standalone preparation");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+        assert_eq!(config_queries(&log), queries, "forbidden standalone preparation refuses before Cargo");
+        assert_eq!(cargo_non_query_log(&log), before);
         let selection = expected.values().next().unwrap();
         let declaration = validate_plan::shell_quote(&serde_json::to_string(selection).unwrap());
         let selectors = selection.iter().map(|arg| validate_plan::shell_quote(arg)).collect::<Vec<_>>().join(" ");
+        let queries = config_queries(&log);
         for operation in ["list", "run"] {
             let cmd = format!("HERMIT_PREPARED_NEXTEST_REQUIRED=1 NEXTEST_PREPARED_BUILD_SELECTION={declaration} HERMIT_NEXTEST_CPU_WRAPPER_BIN={} ./ci/nextest-binaries.rs {operation} {selectors}", validate_plan::shell_quote(&wrapper.to_string_lossy()));
             let result = run_build(&cmd, root.path(), &bin, &log, "current");
             assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         }
-        let after_readers = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(config_queries(&log), queries + 2, "each prepared list/run performs one config query");
+        let after_readers = cargo_non_query_log(&log);
         let added = after_readers.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
         assert_eq!(added.len(), 2);
         for (args, operation) in added.iter().zip(["list", "run"]) {
             assert_eq!(&args[..2], ["nextest", operation]);
             assert!(args.iter().any(|a| a == "--cargo-metadata") && args.iter().any(|a| a == "--binaries-metadata"));
         }
+        let queries = config_queries(&log);
         let declined = run_build(preparation, root.path(), &bin, &log, "declined");
         assert_eq!(declined.status.code(), Some(75), "a declined Cargo preparation must remain no-result");
+        assert_eq!(config_queries(&log), queries + 1, "declined build never reaches the publication config check");
         assert_eq!(std::fs::read(&record_path).unwrap(), published_record, "a declined replacement must preserve the prior complete record");
-        let before = std::fs::read_to_string(&log).unwrap();
+        let before = cargo_non_query_log(&log);
         assert!(run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "unchanged prior preparation must remain usable after a declined replacement");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "using the prior preparation must not invoke Cargo");
+        assert_eq!(cargo_non_query_log(&log), before, "using the prior preparation must not invoke Cargo beyond the exact read-only configuration query");
         let executable = run_build("./ci/nextest-binaries.rs executable hermit-detcore tests_misc", root.path(), &bin, &log, "current");
         assert!(executable.status.success());
         let executable = PathBuf::from(String::from_utf8(executable.stdout).unwrap().trim());
-        assert_eq!(executable, root.path().join("custom-cargo-target/debug/build/hermit-detcore/out/tests_misc"));
+        assert_eq!(executable, native_artifact(root.path(), "debug/build/hermit-detcore/out/tests_misc"));
         assert!(executable.is_file(), "the exact Cargo target must exist before the consumer");
         assert!(!root.path().join("target/debug").exists(), "the producer must not silently remap to the default target");
         let changed_build = run_build(&format!("export SOURCE_DATE_EPOCH=946684800; {}", consumer.cmd), root.path(), &bin, &log, "current");
         assert!(!changed_build.status.success(), "a changed build timestamp must refuse prepared metadata");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a stale build setting must not compile a replacement");
+        assert_eq!(cargo_non_query_log(&log), before, "a stale build setting must not compile a replacement");
+        let queries = config_queries(&log);
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n# changed source\n").unwrap();
         assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed source must refuse old metadata");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a stale source must not compile a replacement");
+        assert_eq!(config_queries(&log), queries, "source mismatch refuses before querying Cargo");
+        assert_eq!(cargo_non_query_log(&log), before, "a stale source must not compile a replacement");
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         assert!(run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "restoring exact inputs must restore acceptance");
         std::fs::write(&executable, "#!/bin/sh\nexit 17\n").unwrap();
         assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed bytes at the same path must be stale");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "stale refusal must not compile a replacement");
+        assert_eq!(cargo_non_query_log(&log), before, "stale refusal must not compile a replacement");
 
         // The standalone privileged lane must prepare tests_misc even though
         // CPUID executes its harness directly rather than through Nextest.
@@ -24946,23 +25198,25 @@ mod fused_privileged_build_tests {
         direct.cmd = pinned_payload(&direct.cmd);
         let declaration = direct.env.get(hermit_manifest_plan::nextest_binaries::SELECTION_ENV).unwrap();
         let prefix = format!("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION={}; ", validate_plan::shell_quote(declaration));
-        let before = std::fs::read_to_string(&privileged_log).unwrap();
+        let before = cargo_non_query_log(&privileged_log);
+        let queries = config_queries(&privileged_log);
         let direct_result = run_build(&format!("{prefix}{}", direct.cmd), privileged_root.path(), &privileged_bin, &privileged_log, "current");
         assert!(direct_result.status.success(), "{}", String::from_utf8_lossy(&direct_result.stderr));
         let missing_declaration = run_build("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; unset NEXTEST_PREPARED_BUILD_SELECTION; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc", privileged_root.path(), &privileged_bin, &privileged_log, "current");
         assert!(!missing_declaration.status.success(), "the required direct selection cannot be omitted");
         let wrong_declaration = run_build("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION='[\"-p\",\"hermit-detcore\",\"--lib\"]'; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc", privileged_root.path(), &privileged_bin, &privileged_log, "current");
         assert!(!wrong_declaration.status.success(), "a different build selection cannot satisfy the direct target");
-        assert_eq!(std::fs::read_to_string(&privileged_log).unwrap(), before, "direct consumers and refusals must not invoke Cargo");
+        assert_eq!(cargo_non_query_log(&privileged_log), before, "direct consumers and refusals must not invoke Cargo beyond the exact read-only configuration query");
+        assert_eq!(config_queries(&privileged_log), queries + 3, "each direct reader revalidates before its declaration check");
 
         for mode in ["missing", "wrong", "ambiguous", "wrapper-missing", "wrapper-wrong", "wrapper-ambiguous"] {
             let (root, bin, log) = cold_fixture(repository, &helper);
             let result = run_build(preparation, root.path(), &bin, &log, mode);
             assert!(!result.status.success(), "the actual producer accepted Cargo artifact mode {mode}");
             assert!(!root.path().join("target/ci/nextest-binaries/current.json").exists(), "a failed producer must not publish partial selections");
-            let before = std::fs::read_to_string(&log).unwrap();
+            let before = cargo_non_query_log(&log);
             assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, mode).status.success());
-            assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "failed preparation must not enable consumer compilation");
+            assert_eq!(cargo_non_query_log(&log), before, "failed preparation must not enable consumer compilation");
         }
     }
     #[test]
@@ -24991,7 +25245,7 @@ os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixt
 "#);
         let prepared = run_build("./ci/nextest-binaries.rs prepare portable", root.path(), &bin, &log, "current");
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
-        let before = std::fs::read_to_string(&log).unwrap();
+        let before = cargo_non_query_log(&log);
         let width_log = root.path().join("target/width.jsonl");
         let mut paths = vec![bin.clone()];
         if let Some(existing) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&existing)); }
@@ -25006,12 +25260,18 @@ os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixt
                 .env("NEXTEST_WIDTH_LOG", &width_log)
                 .env("HERMIT_PREPARED_NEXTEST_REQUIRED", "1")
                 .env("NEXTEST_PREPARED_BUILD_SELECTION", serde_json::to_string(&selection).unwrap())
-                .env("HERMIT_NEXTEST_CPU_WRAPPER_BIN", root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"))
+                .env("HERMIT_NEXTEST_CPU_WRAPPER_BIN", native_artifact(root.path(), "debug/nextest-cpu-wrapper"))
                 .env("NEXTEST_TEST_THREADS", "99").env(name, value)
                 .output().unwrap();
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         }
         let rows = std::fs::read_to_string(&width_log).unwrap().lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4, "each reader revalidates config then runs prepared Nextest");
+        for pair in rows.as_chunks::<2>().0 {
+            assert_eq!(serde_json::from_value::<Vec<String>>(pair[0]["argv"].clone()).unwrap(), CONFIG_QUERY);
+            assert_eq!(pair[0]["threads"], pair[1]["threads"]);
+        }
+        let rows = rows.iter().skip(1).step_by(2).collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
         for (row, expected) in rows.iter().zip(["1", "3"]) {
             assert_eq!(row["threads"], expected);
@@ -25022,11 +25282,129 @@ os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixt
             assert!(args.ends_with(&tail.map(String::from)));
             assert!(!args.iter().any(|arg| arg == "-j" || arg == "--test-threads"));
         }
-        let after = std::fs::read_to_string(&log).unwrap();
+        let after = cargo_non_query_log(&log);
         let calls = after.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
         assert_eq!(calls.len(), 2, "prepared consumers must not rebuild or relist Cargo targets");
         assert!(calls.iter().all(|args| args[..2] == ["nextest", "run"]));
     }
+
+    #[test]
+    fn cargo_fixture_models_only_the_exact_config_query_and_native_platform() {
+        let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let query = Command::new(repository.join("ci/nextest-binaries.rs"))
+            .arg("--print-executable")
+            .output()
+            .unwrap();
+        assert!(
+            query.status.success(),
+            "{}",
+            String::from_utf8_lossy(&query.stderr)
+        );
+        let helper = PathBuf::from(String::from_utf8(query.stdout).unwrap().trim());
+        for (mode, reason) in [
+            ("failed", "cannot resolve preparation Cargo configuration"),
+            ("malformed", "invalid resolved Cargo configuration"),
+            (
+                "non-object",
+                "resolved Cargo configuration is not an object",
+            ),
+        ] {
+            let (root, bin, log) = cold_fixture(repository, &helper);
+            let result = run_build(
+                &format!("CARGO_CONFIG_MODE={mode} ./ci/nextest-binaries.rs prepare privileged"),
+                root.path(),
+                &bin,
+                &log,
+                "current",
+            );
+            assert!(!result.status.success(), "accepted {mode} configuration");
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains(reason),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(config_queries(&log), 1);
+            assert!(
+                cargo_non_query_log(&log).is_empty(),
+                "configuration failure must precede every build/list/metadata call"
+            );
+            assert!(
+                !root
+                    .path()
+                    .join("target/ci/nextest-binaries/current.json")
+                    .exists()
+            );
+        }
+        for mode in ["platform-missing", "platform-wrong"] {
+            let (root, bin, log) = cold_fixture(repository, &helper);
+            let result = run_build(
+                "./ci/nextest-binaries.rs prepare privileged",
+                root.path(),
+                &bin,
+                &log,
+                mode,
+            );
+            assert!(
+                !result.status.success(),
+                "accepted {mode} platform metadata"
+            );
+            let reason = if mode == "platform-missing" {
+                "prepared metadata has no target platforms"
+            } else {
+                "prepared metadata differs from the explicit native target"
+            };
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains(reason),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                !root
+                    .path()
+                    .join("target/ci/nextest-binaries/current.json")
+                    .exists()
+            );
+        }
+        let (root, bin, log) = cold_fixture(repository, &helper);
+        for args in [
+            vec!["-Z", "unstable-options", "config", "get", "--format=json"],
+            vec![
+                "-Z",
+                "unstable-options",
+                "config",
+                "get",
+                "--format=toml",
+                "--offline",
+            ],
+            vec![
+                "-Z",
+                "unstable-options",
+                "config",
+                "set",
+                "--format=json",
+                "--offline",
+            ],
+        ] {
+            let result = Command::new(bin.join("cargo"))
+                .args(&args)
+                .current_dir(root.path())
+                .env("CARGO_CALL_LOG", &log)
+                .output()
+                .unwrap();
+            assert!(
+                !result.status.success(),
+                "accepted unmodelled Cargo argv {args:?}"
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("unexpected Cargo invocation"));
+        }
+        assert_eq!(config_queries(&log), 0);
+        assert_eq!(
+            cargo_non_query_log(&log).lines().count(),
+            3,
+            "refused invocations remain in the complete ledger"
+        );
+    }
+
 
 }
 
@@ -26675,9 +27053,128 @@ mod raw_census_publication_tests {
             .iter()
             .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
             .collect::<Vec<_>>();
-        assert_eq!(publishers.len(), 33);
+        let command_roles = cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd.contains("target/debug/test-harness run "))
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            publishers.len(),
+            command_roles.len(),
+            "duplicate/missing raw publisher"
+        );
+        assert_eq!(
+            publishers
+                .iter()
+                .map(|step| step.tag())
+                .collect::<BTreeSet<_>>(),
+            command_roles
+        );
+        assert_eq!(
+            publishers
+                .iter()
+                .filter(|step| step.tag() != FULL_HTTP_HOST_TAG)
+                .count(),
+            33
+        );
+        assert_eq!(
+            publishers
+                .iter()
+                .filter(|step| step.tag() == FULL_HTTP_HOST_TAG)
+                .map(|step| step.tag())
+                .collect::<Vec<_>>(),
+            vec![FULL_HTTP_HOST_TAG.to_string()]
+        );
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
+            if step
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.test.is_some())
+            {
+                let expected_path = if step.tag() == FULL_HTTP_HOST_TAG {
+                    "privileged/network_http/results.jsonl"
+                } else {
+                    "privileged/manifest_applications/results.jsonl"
+                };
+                assert_eq!(path, Path::new(expected_path));
+                for opponent in [
+                    "selector",
+                    "cell",
+                    "duplicate-cell",
+                    "artifact",
+                    "transport",
+                    "renamed-owner",
+                    "report-owner",
+                    "report-schema",
+                ] {
+                    let mut changed = step.clone();
+                    match opponent {
+                        "selector" => {
+                            changed.manifest.as_mut().unwrap().test =
+                                Some("applications/unknown-filtered-test".into())
+                        }
+                        "cell" => {
+                            for result in changed.result_manifests.as_mut().unwrap() {
+                                if let ResultManifest::ManifestCell(cell) = result {
+                                    cell.backend = Some("unknown-backend".into());
+                                }
+                            }
+                        }
+                        "duplicate-cell" => {
+                            let cell = changed
+                                .result_manifests
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .find(|row| matches!(row, ResultManifest::ManifestCell(_)))
+                                .unwrap()
+                                .clone();
+                            changed.result_manifests.as_mut().unwrap().push(cell);
+                        }
+                        "artifact" => {
+                            changed.env.insert(
+                                "HERMIT_E2E_ARTIFACT_POINTER".into(),
+                                "target/ci/unrelated-artifact.path".into(),
+                            );
+                        }
+                        "transport" => {
+                            changed.cmd =
+                                guarded_command_source(&changed.tag(), &changed.cmd).unwrap();
+                            if changed.cmd == step.cmd {
+                                changed.cmd = format!("env {}", changed.cmd);
+                            }
+                        }
+                        "renamed-owner" => {
+                            changed.job.push_str("_unrecognized");
+                            let tag = changed.tag();
+                            for result in changed.result_manifests.as_mut().unwrap() {
+                                if let ResultManifest::StructuredTestResults(result) = result {
+                                    result.owner = tag.clone();
+                                }
+                            }
+                        }
+                        "report-owner" | "report-schema" => {
+                            for result in changed.result_manifests.as_mut().unwrap() {
+                                if let ResultManifest::StructuredTestResults(result) = result {
+                                    if opponent == "report-owner" {
+                                        result.owner = "unrecognized.owner".into();
+                                    } else {
+                                        result.schema = 0;
+                                    }
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        normal_raw_result_path(&changed, "fixture-run").is_err(),
+                        "{} accepted {opponent}",
+                        step.tag()
+                    );
+                }
+            }
             let expects_proc_locks_runtime = matches!(
                 step.tag().as_str(),
                 "e2e.manifest_c_programs" | "quick.e2e_verify"
