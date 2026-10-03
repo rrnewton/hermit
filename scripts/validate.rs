@@ -14440,7 +14440,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // kvm-backend rows of each bucket against all of its rows.
     let portable_partial: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
-        ("e2e.manifest_c_programs", 195, 742),
+        ("e2e.manifest_c_programs", 195, 744),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
@@ -14515,9 +14515,9 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|b| b.lane == "portable" && b.category == "c-programs")
         .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
-    if c_programs.selected != 742 || c_programs.withheld != 0 {
+    if c_programs.selected != 744 || c_programs.withheld != 0 {
         return Err(format!(
-            "host-inapplicable cells: with KVM present all 742 portable/c-programs cells must be \
+            "host-inapplicable cells: with KVM present all 744 portable/c-programs cells must be \
              counted and none withheld: {c_programs:?}"
         ));
     }
@@ -14657,7 +14657,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  host-inapplicable cells: plan rows 244 kvm withheld / 742 portable c-programs counted, \
+        "  host-inapplicable cells: plan rows 244 kvm withheld / 744 portable c-programs counted, \
          portable 8 running recorded / 0 withheld, full 10 running recorded / 1 withheld, \
          qualifying 2 complete / violating 2 NO_RESULT, attribution 1 shared / 2 refused"
     );
@@ -14735,7 +14735,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     // (tag, kvm cells, selected cells), measured from ci/expected-e2e-plan.json.
     let portable: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
-        ("e2e.manifest_c_programs", 195, 742),
+        ("e2e.manifest_c_programs", 195, 744),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
@@ -14753,7 +14753,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         ("privileged-only-e2e.manifest_c_programs", 1, 4),
         ("privileged-only-e2e.manifest_system_utils", 1, 2),
     ];
-    let c_programs: &[(&str, usize, usize)] = &[("e2e.manifest_c_programs", 195, 742)];
+    let c_programs: &[(&str, usize, usize)] = &[("e2e.manifest_c_programs", 195, 744)];
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
         &'a str,
@@ -14943,7 +14943,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
 
     println!(
         "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 241 \
-         kvm cells, --only full and --only portable c-programs 195 of 742, full 11 nodes, \
+         kvm cells, --only full and --only portable c-programs 195 of 744, full 11 nodes, \
          privileged 3 nodes) with the graph unchanged; every capability present admits all 5 \
          unchanged; 3 kvm-free selections admitted with KVM absent; unreadable plan refused"
     );
