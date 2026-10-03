@@ -12,8 +12,10 @@
 
 use std::path::Path;
 
+use dagrun::model::ResultManifest;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
+use dagrun::model::StructuredTestResultsManifest;
 
 use crate::validate_plan::node;
 use crate::validate_plan::shell_quote;
@@ -25,15 +27,36 @@ pub const DEFAULT_GATE_TIMEOUT_S: i64 = 600;
 /// `SUPER_REPETITIONS` (validate.sh:682).
 pub const SUPER_REPETITIONS_DEFAULT: i64 = 20;
 
-/// `STRICT_COMPAT_TIMEOUT` (validate.sh:1091) — the per-probe wall bound the
-/// bash imposed with the `timeout` binary. Here it is the node's wall cap, so a
-/// hung repetition is killed and reported by the runner rather than by a nested
-/// `timeout` whose exit code the runner would have to reinterpret.
+/// `STRICT_COMPAT_TIMEOUT` (validate.sh:1091) — the per-repetition wall bound
+/// the bash imposed with the `timeout` binary. All repetitions of a probe share
+/// one node, so this bound is a `timeout` around each repetition's Hermit run,
+/// and a repetition it kills is recorded as that repetition's failure.
 pub const SUPER_PROBE_TIMEOUT_S: i64 = 60;
 
+/// Grace between `timeout`'s SIGTERM and its SIGKILL for one repetition.
+const SUPER_PROBE_KILL_GRACE_S: i64 = 10;
+
 /// CPU budget for one stress repetition. These are sub-second guest runs; a CPU
-/// cap is what catches a spin that the wall cap would only catch at 60s.
+/// cap is what catches a spin that the wall bound would only catch at 60s. The
+/// node's CPU cap is this budget times the repetition count, and the node also
+/// fails any single repetition whose waited CPU time reached this budget.
 const SUPER_PROBE_CPU_TIMEOUT_S: i64 = 120;
+
+/// Environment variable through which dagrun hands a probe node its admitted
+/// width: the number of repetitions the node runs at the same time.
+const SUPER_PROBE_JOBS_ENV: &str = "HERMIT_SUPER_STRESS_JOBS";
+
+/// Wall slack for a probe node beyond its repetitions' bounds: the loop, the
+/// record probe's data-directory removal, and the result write. The node's
+/// wall cap is every repetition's bound end to end plus this slack, so it
+/// still holds if dagrun admits the node at width 1.
+const SUPER_PROBE_NODE_SLACK_S: i64 = 60;
+
+/// Memory cap for one probe node, all of its concurrent repetitions included.
+/// Measured 2026-10-02 on devbig030 with 20 repetitions at once, each Hermit
+/// call in its own safehermit cgroup: the 20 per-repetition peaks summed to
+/// 1052, 1226 and 1433 MiB for the strict, pipeline and record probes (largest
+/// single repetition 73 MiB), so 4 GiB is 2.8 times the largest sum.
 const SUPER_PROBE_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
 /// One row in the mechanically extracted super source table. These rows are a
@@ -174,7 +197,7 @@ impl StressProbe {
         }
     }
 
-    fn job_stem(self) -> String {
+    pub fn job_stem(self) -> String {
         self.slug().replace('-', "_")
     }
 
@@ -198,40 +221,156 @@ impl StressProbe {
         matches!(self, StressProbe::KvmVerify | StressProbe::DbtVerify)
     }
 
+    /// The node's inventory paragraph.
+    fn description(self, reps: i64) -> String {
+        let (what, binary) = match self {
+            StressProbe::PtraceStrictVerify => (
+                "hermit run --strict --verify of /bin/echo on the ptrace backend",
+                "the release Hermit binary",
+            ),
+            StressProbe::PtracePipeline => (
+                "hermit run --strict --verify of a bash pipeline (yes | head -n 64 | sha256sum) \
+                 on the ptrace backend",
+                "the release Hermit binary",
+            ),
+            StressProbe::PtraceRecordReplay => (
+                "hermit record start --verify of /bin/echo on the ptrace backend, recording into \
+                 a per-repetition data directory under the validation temporary directory and \
+                 removing it before and after",
+                "the release Hermit binary",
+            ),
+            StressProbe::KvmVerify => (
+                "hermit --backend kvm run --verify of /bin/echo",
+                "the debug Hermit binary, after superstress.kvm_available finds /dev/kvm readable \
+                 and writable",
+            ),
+            StressProbe::DbtVerify => (
+                "hermit --backend dbt run --verify of /bin/echo",
+                "the debug Hermit binary, after superstress.dbt_available completes one DBT run",
+            ),
+        };
+        let policy = if self.nonblocking() {
+            "Its failures are reported but do not block the super run: validate.sh never \
+             measured this probe (its backend guard was always false), so its first measurements \
+             are reported rather than ratcheted."
+        } else {
+            "Any failed repetition fails the node and blocks the super run."
+        };
+        format!(
+            "Runs {reps} repetitions of {what}, using {binary}. The repetitions run at the same \
+             time, as many at once as the node's admitted width ({SUPER_PROBE_JOBS_ENV}, declared \
+             as {reps}), so the probe still loads the host the way {reps} separate nodes did. Each \
+             repetition runs in its own background subshell under timeout \
+             {SUPER_PROBE_TIMEOUT_S} s (SIGKILL {SUPER_PROBE_KILL_GRACE_S} s later) and fails if \
+             its waited CPU time, read with the bash times builtin, reaches \
+             {SUPER_PROBE_CPU_TIMEOUT_S} s; the node prints one line per repetition and writes \
+             each as a pass or fail row of its schema-2 structured test results, which the super \
+             stress pass-rate table counts. {policy} If the node itself is killed by its wall, \
+             CPU or memory cap, it writes no rows and the table shows the probe as NO_RESULT; the \
+             node's failure still counts. Until 2026-10 each repetition was its own DAG node; \
+             folding them into one node per probe keeps the commands, the repetition count, the \
+             concurrency and the per-repetition wall and CPU bounds, and removes {} nodes from the \
+             plan.",
+            reps - 1
+        )
+    }
+
     /// One repetition's shell command, reproducing `super_probe_command`
-    /// (validate.sh:2589). The outer `timeout` binary is dropped because the
-    /// node's own wall cap enforces the same bound and the runner then reports a
-    /// TYPED timeout instead of an opaque exit 124.
-    fn command(self, iteration: i64, release_bin: &str, debug_bin: &str, tmp: &Path) -> String {
+    /// (validate.sh:2589). `iteration` is the shell expression naming the
+    /// repetition, and `bound` prefixes the Hermit invocation with that
+    /// repetition's wall bound: the repetitions share one node, so the node's
+    /// own wall cap can no longer say which repetition hung.
+    fn command(
+        self,
+        iteration: &str,
+        bound: &str,
+        release_bin: &str,
+        debug_bin: &str,
+        tmp: &Path,
+    ) -> String {
         let rel = shell_quote(release_bin);
         let dbg = shell_quote(debug_bin);
         match self {
             StressProbe::PtraceStrictVerify => format!(
-                "{rel} run --strict --verify -- /bin/echo hermit-super-{iteration} </dev/null"
+                "{bound}{rel} run --strict --verify -- /bin/echo hermit-super-{iteration} </dev/null"
             ),
             StressProbe::PtracePipeline => format!(
-                "{rel} run --strict --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
+                "{bound}{rel} run --strict --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
             ),
             StressProbe::PtraceRecordReplay => {
-                let dir = shell_quote(
-                    &tmp.join(format!("super-record-{iteration}"))
-                        .to_string_lossy(),
+                let dir = format!(
+                    "{}/super-record-{iteration}",
+                    shell_quote(&tmp.to_string_lossy())
                 );
                 // The bash removed the data dir before AND after, preserving the
                 // record phase's exit status across the second removal.
                 format!(
-                    "rm -rf {dir}; {rel} record start --verify --data-dir {dir} -- \
+                    "rm -rf {dir}; {bound}{rel} record start --verify --data-dir {dir} -- \
                      /bin/echo hermit-super-record-{iteration} </dev/null; \
                      status=$?; rm -rf {dir}; exit $status"
                 )
             }
             StressProbe::KvmVerify => format!(
-                "{dbg} --backend kvm run --verify -- /bin/echo hermit-super-kvm-{iteration} </dev/null"
+                "{bound}{dbg} --backend kvm run --verify -- /bin/echo hermit-super-kvm-{iteration} </dev/null"
             ),
             StressProbe::DbtVerify => format!(
-                "{dbg} --backend dbt run --verify -- /bin/echo hermit-super-dbt-{iteration} </dev/null"
+                "{bound}{dbg} --backend dbt run --verify -- /bin/echo hermit-super-dbt-{iteration} </dev/null"
             ),
         }
+    }
+
+    /// The node that runs every repetition of this probe.
+    ///
+    /// The separate nodes ran concurrently, so the repetitions do too: each is
+    /// a background subshell under `timeout` with the per-repetition wall bound
+    /// the separate nodes had, at most the admitted width at once. Each records
+    /// its exit status and its waited CPU time (`times`, children line) in its
+    /// own file, and the node fails a repetition whose CPU time reached the
+    /// per-repetition budget, which the separate nodes' CPU caps enforced. Each
+    /// repetition is a row of the node's structured test results, written once
+    /// by the registered writer `ci/write-structured-test-counts.sh`, so a
+    /// failed repetition stays typed evidence with its own identity. The node
+    /// fails when any repetition fails.
+    fn node_command(self, reps: i64, release_bin: &str, debug_bin: &str, tmp: &Path) -> String {
+        let slug = self.slug();
+        let bound =
+            format!("timeout --kill-after={SUPER_PROBE_KILL_GRACE_S} {SUPER_PROBE_TIMEOUT_S} ");
+        let repetition = self.command("$rep", &bound, release_bin, debug_bin, tmp);
+        let jobs_env = SUPER_PROBE_JOBS_ENV;
+        format!(
+            ": \"${{DAGRUN_TEST_COUNTS_PATH:?the structured result path is unset}}\"; \
+             width=${{{jobs_env}:-{reps}}}; \
+             case $width in ''|*[!0-9]*) echo \"super stress {slug}: {jobs_env}=$width is not a whole number\" >&2; exit 2;; esac; \
+             [ \"$width\" -ge 1 ] || width=1; [ \"$width\" -le {reps} ] || width={reps}; \
+             state=$(mktemp -d) || exit 2; trap 'rm -rf \"$state\"' EXIT; \
+             running=0; \
+             for rep in $(seq 1 {reps}); do \
+             if [ \"$running\" -ge \"$width\" ]; then wait -n; running=$((running - 1)); fi; \
+             ( ( {repetition} ); rc=$?; times >\"$state/$rep.times\"; echo \"$rc\" >\"$state/$rep.rc\" ) & \
+             running=$((running + 1)); \
+             done; \
+             wait; \
+             rows=(); failed=0; \
+             for rep in $(seq 1 {reps}); do \
+             rc=$(cat \"$state/$rep.rc\" 2>/dev/null); rc=${{rc:-none}}; \
+             cpu=$(awk 'NR == 2 {{ gsub(/s/, \"\"); split($1, u, \"m\"); split($2, k, \"m\"); printf \"%.2f\", u[1] * 60 + u[2] + k[1] * 60 + k[2] }}' \"$state/$rep.times\" 2>/dev/null); cpu=${{cpu:-0}}; \
+             case $rc in \
+             0) cause=;; \
+             124) cause=' (timed out after {SUPER_PROBE_TIMEOUT_S} s)';; \
+             137) cause=' (SIGKILL: timeout killed it {SUPER_PROBE_KILL_GRACE_S} s after the {SUPER_PROBE_TIMEOUT_S} s bound, or the OOM killer did)';; \
+             none) cause=' (wrote no exit status)';; \
+             *) cause=;; \
+             esac; \
+             result=pass; [ \"$rc\" = 0 ] || result=fail; \
+             if [ \"${{cpu%.*}}\" -ge {SUPER_PROBE_CPU_TIMEOUT_S} ]; then result=fail; cause=\"$cause (used $cpu CPU seconds; the per-repetition bound is {SUPER_PROBE_CPU_TIMEOUT_S})\"; fi; \
+             [ \"$result\" = pass ] || failed=$((failed + 1)); \
+             echo \"super stress {slug} repetition $rep/{reps}: $result, exit $rc, $cpu CPU s$cause\"; \
+             rows+=(\"$(printf '{slug}/repetition-%02d' \"$rep\")\" \"$result\" 1); \
+             done; \
+             ./ci/write-structured-test-counts.sh {reps} 0 \"${{rows[@]}}\" || exit 2; \
+             echo \"super stress {slug}: $(({reps} - failed))/{reps} repetitions passed, up to $width at a time\"; \
+             [ \"$failed\" -eq 0 ]"
+        )
     }
 }
 
@@ -277,8 +416,8 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
     ]
 }
 
-/// Build every stress node: two availability probes plus `reps` repetitions of
-/// each of the five probes.
+/// Build every stress node: two availability probes plus one node per probe
+/// that runs its `reps` repetitions.
 pub fn stress_nodes(
     release_bin: &str,
     debug_bin: &str,
@@ -298,18 +437,28 @@ pub fn stress_nodes(
         if let Some(av) = probe.availability_job() {
             deps.push(format!("superstress.{av}"));
         }
-        for i in 1..=reps {
-            out.push(node(
-                "superstress",
-                &format!("{stem}_{i:02}"),
-                &format!("super stress {} repetition {i}/{reps}", probe.slug()),
-                probe.command(i, release_bin, debug_bin, tmp),
-                deps.clone(),
-                SUPER_PROBE_TIMEOUT_S,
-                SUPER_PROBE_CPU_TIMEOUT_S,
-                SUPER_PROBE_MEM_BYTES,
-            ));
-        }
+        let per_repetition = SUPER_PROBE_TIMEOUT_S + SUPER_PROBE_KILL_GRACE_S;
+        let mut step = node(
+            "superstress",
+            &stem,
+            &format!("super stress {} ({reps} repetitions)", probe.slug()),
+            probe.node_command(reps, release_bin, debug_bin, tmp),
+            deps,
+            reps * per_repetition + SUPER_PROBE_NODE_SLACK_S,
+            reps * SUPER_PROBE_CPU_TIMEOUT_S,
+            SUPER_PROBE_MEM_BYTES,
+        );
+        // Declare the width the repetitions run at, so dagrun reserves (and
+        // its cpu.max allows) that many cores. jobs_flag is empty: the width
+        // reaches the command through SUPER_PROBE_JOBS_ENV, never a `-j`.
+        step.hint.preferred_inner_jobs = Some(reps);
+        step.jobs_env = Some(SUPER_PROBE_JOBS_ENV.to_string());
+        step.jobs_flag = Some(String::new());
+        step.description = probe.description(reps);
+        step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
+            StructuredTestResultsManifest::current(format!("superstress.{stem}")),
+        )]);
+        out.push(step);
     }
     out
 }
@@ -332,19 +481,20 @@ pub struct ProbeRate {
 pub fn stress_rates(outcomes: &[StepOutcome], reps: i64) -> Vec<ProbeRate> {
     let mut rates = Vec::new();
     for probe in STRESS_PROBES {
-        let stem = probe.job_stem();
-        let prefix = format!("superstress.{stem}_");
+        let tag = format!("superstress.{}", probe.job_stem());
+        // A repetition ran when the probe node reported a result row for it. A
+        // node that was skipped, aborted, or exited without its result file ran
+        // none, which the verdict reports as NO_RESULT rather than as passes.
+        let rows = outcomes
+            .iter()
+            .filter(|o| o.tag == tag && !o.aborted)
+            .filter_map(|o| o.test_results.as_ref())
+            .flatten();
         let mut passed = 0usize;
         let mut ran = 0usize;
-        for o in outcomes {
-            if !o.tag.starts_with(&prefix) {
-                continue;
-            }
-            if o.aborted {
-                continue;
-            }
+        for row in rows {
             ran += 1;
-            if o.ok {
+            if row.passed {
                 passed += 1;
             }
         }

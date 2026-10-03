@@ -209,8 +209,18 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "strictcompat.manifest_compat",
 ];
 
-pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] =
-    &["test.envelope_levels", "test.envelope_levels_on_host"];
+/// Nodes that write their rows through `ci/write-structured-test-counts.sh`:
+/// the envelope levels and, since 2026-10, each super stress probe, whose
+/// repetitions are its rows.
+pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] = &[
+    "test.envelope_levels",
+    "test.envelope_levels_on_host",
+    "superstress.ptrace_strict_verify",
+    "superstress.ptrace_pipeline",
+    "superstress.ptrace_record_replay",
+    "superstress.kvm_verify",
+    "superstress.dbt_verify",
+];
 pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] =
     &["test.applications_e2e", "test.applications_e2e_on_host"];
 
