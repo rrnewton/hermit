@@ -2532,3 +2532,76 @@ impl NetworkReplayEngine {
         *call
     }
 }
+
+impl NetworkReplayEngine {
+    /// Immutable Connect identity and real producer frontier for the existing
+    /// logical Call. No mutable NativeState or caller-selected completion bit
+    /// crosses this boundary, and inspection never delivers an outcome.
+    pub(in crate::network_replay) fn native_replay_connect_snapshot(
+        &self,
+        channel: NetworkChannelId,
+    ) -> Result<crate::network_replay::replay_connect::NativeInput, NetworkReplayError> {
+        let EngineState::Native(native) = &self.mode else {
+            return Err(NetworkReplayError::WrongMode);
+        };
+        let replay = native
+            .replay
+            .as_ref()
+            .ok_or(NetworkReplayError::WrongMode)?;
+        let definition = native
+            .trace
+            .channels
+            .iter()
+            .find(|row| row.id == channel)
+            .ok_or(NetworkReplayError::UnknownChannel(channel))?;
+        if definition.transport != NetworkTransportV2::Tcp
+            || definition.role != NetworkEndpointRoleV2::OutboundClient
+        {
+            return Err(invalid(
+                "Replay Connect requires a native outbound TCP channel",
+            ));
+        }
+        let mut rows = native
+            .trace
+            .inputs
+            .iter()
+            .filter(|row| row.channel == channel);
+        let input = rows
+            .next()
+            .ok_or_else(|| invalid("Replay Connect has no input"))?;
+        let NetworkInputKindV2::Connect(result) = &input.event else {
+            return Err(invalid("Replay Connect is not the channel's first input"));
+        };
+        if !matches!(
+            result,
+            NetworkConnectionResultV2::Connected
+                | NetworkConnectionResultV2::Error(libc::EINPROGRESS)
+        ) || rows.any(|row| matches!(row.event, NetworkInputKindV2::Connect(_)))
+        {
+            return Err(invalid("Replay Connect input is unsupported or ambiguous"));
+        }
+        let completed = self.native_completed()?;
+        let delivered = match result {
+            NetworkConnectionResultV2::Connected => replay.connected.contains(&channel),
+            NetworkConnectionResultV2::Error(libc::EINPROGRESS) => {
+                replay.connect_in_progress_delivered.contains(&channel)
+            }
+            _ => unreachable!("supported result checked"),
+        };
+        Ok(crate::network_replay::replay_connect::NativeInput {
+            ordinal: input.ordinal,
+            result: result.clone(),
+            release: input.release.not_before_global_time,
+            prerequisites_complete: input
+                .release
+                .prerequisites
+                .iter()
+                .all(|node| completed.contains(node)),
+            released: *replay
+                .released
+                .get(input.ordinal as usize)
+                .ok_or_else(|| invalid("Replay Connect input has no release state"))?,
+            delivered,
+        })
+    }
+}

@@ -311,7 +311,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && original_sendto_shape(send)
                 && self.network_open_file(guest, send.fd()).is_some()
                 && guest.thread_state().with_detfd(send.fd(), |fd| fd.is_nonblocking()).unwrap_or(false)
-                && guest.local_global_state().and_then(|global| global.native_receive_mode())
+                && guest
+                .local_global_state()
+                .and_then(|global| global.native_receive_mode())
                     == Some(crate::network_replay::NetworkEngineMode::Record)
             {
                 let result = self.network_original_sendto(guest, send).await;
@@ -1007,6 +1009,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let peer = read_network_address(guest, call.uservaddr(), call.addrlen())?;
         self.ensure_stream_channel(guest, open_file, call.fd(), peer)
             .await?;
+        if policy == NetworkPolicy::Replay
+            && guest
+                .local_global_state()
+                .and_then(|global| global.native_receive_mode())
+                == Some(crate::network_replay::NetworkEngineMode::Replay)
+        {
+            return self.network_replay_connect(guest, call, open_file).await;
+        }
         match policy {
             NetworkPolicy::Record => {
                 let result = self.live_network_syscall(guest, call.into()).await;
@@ -1062,6 +1072,94 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // Controlled tests enter after the unchanged transport query/channel join.
+    // The actual caller below remains private; no alternate production route.
+    #[cfg(test)]
+    pub(crate) async fn replay_connect_fixture_dispatch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Connect,
+        open_file: OpenFileId,
+    ) -> Result<i64, Error> {
+        self.network_replay_connect(guest, call, open_file).await
+    }
+
+    /// Replay pays the same external start/continuation as original Connect.
+    /// Its completion authority is the exact trace claim, never native socket
+    /// readability or a helper Connect. See https://github.com/rrnewton/hermit/issues/3630.
+    async fn network_replay_connect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Connect,
+        open_file: OpenFileId,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads || !self.network_fd_tracking_active(guest) {
+            return Err(engine_error(
+                "V4 Replay Connect requires admitted strict FD tracking",
+            ));
+        }
+        let state = guest.thread_state();
+        let owner = crate::network_replay::NetworkStreamOwner {
+            thread: state.dettid,
+            mm: state.mm_id,
+        };
+        let operation = ExternalOpId::new(owner.thread, state.stats.syscall_count);
+        let mut resources = Resources::new(owner.thread);
+        resources.insert(
+            ResourceID::BlockingNetworkCapture(operation),
+            Permission::RW,
+        );
+        resources.fyi(call.name());
+        resources.fd_read = Some(crate::scheduler::fd_read::FdReadIntent {
+            owner,
+            files: state.file_metadata.lock().unwrap().files_id,
+            fd: call.fd(),
+            operation,
+        });
+        let read = match crate::tool_global::fd_read_resource_request(guest, resources).await {
+            crate::scheduler::parked::ResourceReply::ReadGrant {
+                status: ResumeStatus::Normal,
+                read,
+            } => *read,
+            _ => return Err(engine_error("Replay Connect lost selected Normal start")),
+        };
+        let admitted = guest
+            .local_global_state()
+            .ok_or_else(|| engine_error("Replay Connect lost local global state"))?
+            .begin_replay_connect(
+                guest.tid(),
+                guest.thread_state(),
+                operation,
+                read,
+                open_file,
+            )
+            .map_err(engine_rpc_error)?;
+        let mut continuation = Resources::new(owner.thread);
+        continuation.insert(
+            ResourceID::BlockedExternalContinue(operation),
+            Permission::RW,
+        );
+        continuation.fyi(call.name());
+        if !matches!(
+            resource_request(guest, continuation).await,
+            ResumeStatus::Normal
+        ) {
+            // The current V4 publisher admits only actual 0/-EINPROGRESS.
+            // A signal cannot turn the retained claim into an invented errno.
+            return Err(engine_error(
+                "Replay Connect has an unsupported non-Normal continuation",
+            ));
+        }
+        match guest
+            .local_global_state()
+            .ok_or_else(|| engine_error("Replay Connect lost local global state"))?
+            .complete_replay_connect(guest.tid(), guest.thread_state(), operation, admitted.id)
+            .map_err(engine_rpc_error)?
+        {
+            NetworkConnectionResultV2::Connected => Ok(0),
+            NetworkConnectionResultV2::Error(errno) => errno_result(errno),
+        }
+    }
     /// Original Record connect: actual kernel selection, copy and return join
     /// the same Call which held the table before capture. The provider Driver
     /// releases that table at positive fdget, even if sockaddr uaccess blocks.

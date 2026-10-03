@@ -15,6 +15,7 @@ pub(crate) mod parked;
 mod parked_tests;
 pub(crate) mod real_timer;
 mod replayer;
+mod replay_connect;
 pub mod runqueue;
 pub(crate) mod send_handback;
 pub(crate) mod signal_control;
@@ -629,6 +630,7 @@ pub struct Scheduler {
     /// Typed subset of `blocked.external_io_blockers`. Only live network
     /// capture introduces host elapsed time; replay and ordinary IO do not.
     network_capture_blockers: BTreeMap<DetTid, ExternalOpId>,
+    replay_connect: BTreeMap<DetTid, replay_connect::Pending>,
     send_timing: send_handback::SendTimingBook,
 
     /// Last monotonic sample while no guest was runnable and network capture
@@ -3185,6 +3187,7 @@ impl Scheduler {
             #[cfg(test)]
             fd_read_test_cut: Default::default(),
             network_capture_blockers: BTreeMap::new(),
+            replay_connect: BTreeMap::new(),
             send_timing: Default::default(),
             network_capture_idle_since: None,
             vfork_barriers: Default::default(),
@@ -4183,6 +4186,9 @@ impl Scheduler {
     /// Remove entries from everywhere that non-runnable threads lurk.
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.cancel_send_timing(*dtid);
+        // The engine Call remains unresolved; removing scheduler transport is
+        // not delivery of a canceled Connect result.
+        self.replay_connect.remove(dtid);
         self.blocked.timed_waiters.remove(*dtid);
         let external = self.blocked.external_io_blockers.remove(dtid);
         if let Some(capture) = self.network_capture_blockers.remove(dtid) {
@@ -4457,8 +4463,12 @@ impl Scheduler {
         if self.backend_failed() || self.control_barrier() {
             return Err(SkipTurn);
         }
-        self.step2c_process_io_blockers()?;
+        if self.step2c_process_io_blockers().is_err() {
+            self.advance_replay_connect(global_time)?;
+            return Err(SkipTurn);
+        }
         self.step2e_process_signal_deferred();
+        self.advance_replay_connect(global_time)?;
         self.step2d_handle_empty_queue(global_time)
     }
 
@@ -5278,21 +5288,27 @@ impl Scheduler {
                 )
                 .collect();
             blockers.sort_by_key(|(dtid, _, _)| *dtid);
-            let ready: Vec<DetTid> = blockers
-                .iter()
-                .filter(|(dtid, op_id, signal_can_complete)| {
-                    let nt = self
-                        .next_turns
-                        .get(dtid)
-                        .expect("internal invariant broken");
-                    if let Some(Ok(req)) = nt.req.try_read() {
-                        blocking_request_is_ready(&req, *op_id, *signal_can_complete)
+            let mut ready = Vec::new();
+            for (dtid, op_id, signal_can_complete) in &blockers {
+                let nt = self.next_turns.get(dtid).expect("internal invariant broken");
+                if let Some(Ok(req)) = nt.req.try_read() {
+                    let is_ready = if self.replay_connect.contains_key(dtid) {
+                        match self.replay_connect_ready(*dtid, *op_id) {
+                            Ok(ready) => ready,
+                            Err(error) => {
+                                self.terminal_deadlock
+                                    .get_or_insert_with(|| error.to_string());
+                                return Err(SkipTurn);
+                            }
+                        }
                     } else {
-                        false
+                        blocking_request_is_ready(&req, *op_id, *signal_can_complete)
+                    };
+                    if is_ready {
+                        ready.push(*dtid);
                     }
-                })
-                .map(|(dtid, _, _)| *dtid)
-                .collect();
+                }
+            }
             debug!(
                 "Nondeterministic status of backgrounded operations: out of {}, completed on {}, dtids: {:?}",
                 blockers.len(),
@@ -5306,6 +5322,7 @@ impl Scheduler {
                         "[step2] Reschedule formerly backgrounded dtid {:?}",
                         ready_dtid
                     );
+                    scheduler.requeue_replay_connect(*ready_dtid);
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
                     if let Some(capture) = scheduler.network_capture_blockers.remove(ready_dtid) {
                         assert_eq!(external, Some(capture));
@@ -6814,6 +6831,10 @@ impl Scheduler {
                     self.fail_parked(next_dtid, parked::ProtocolFailure::Overflow);
                     return Err(SkipTurn);
                 }
+                if let Err(error) = self.check_replay_connect_grant(next_dtid) {
+                    self.terminal_deadlock.get_or_insert_with(|| error.to_string());
+                    return Err(SkipTurn);
+                }
                 // N.B.: these prints themselves should be deterministic between
                 // runs.  They are part of the "detlog".
                 let normalization_marker = if self.is_sabre_internal_pipe_io_turn(rsrcs) {
@@ -6866,6 +6887,10 @@ impl Scheduler {
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
             &resp, &dtid
         );
+        if let Err(error) = self.check_replay_connect_grant(dtid) {
+            self.terminal_deadlock.get_or_insert_with(|| error.to_string());
+            return Err(SkipTurn);
+        }
         let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
         self.observe_send_grant(dtid, signals.is_empty());
         let fd_grant_mm = self.ordinary_fd_grant_mm(dtid);
@@ -6916,6 +6941,7 @@ impl Scheduler {
             self.fail_parked(dtid, error);
             return Err(SkipTurn);
         }
+        self.record_replay_connect_grant(dtid);
         self.turn += 1;
         let answer = if !signals.is_empty() {
             SchedResponse::Signaled(Some(signals))

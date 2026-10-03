@@ -725,6 +725,7 @@ impl NetworkReplayEngine {
                 native_entry_attempted: None,
                 native_entry: None,
                 receive_policy: None,
+                replay_connect: None,
                 original: Some(OriginalCallState {
                     arguments: arguments.clone(),
                     source,

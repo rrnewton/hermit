@@ -16,6 +16,7 @@ mod foreground_store;
 mod native_source_read;
 mod original_connect;
 mod original_source_ioctl;
+mod replay_connect;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
@@ -9419,6 +9420,7 @@ mod tests {
     mod foreground_epoll;
     mod foreground_store;
     mod native_connected;
+    mod replay_connect;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;

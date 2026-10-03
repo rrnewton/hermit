@@ -30,6 +30,7 @@ mod helper_copy;
 pub(crate) mod lifetime;
 mod native_receive;
 pub(crate) mod original_connect;
+pub(crate) mod replay_connect;
 pub(crate) mod send_timing;
 pub(crate) use native_receive::CompletedNoStore;
 pub(crate) use native_receive::ForegroundStore;
@@ -513,6 +514,7 @@ struct StreamCallState {
     native_entry_attempted: Option<std::sync::Arc<native_receive::NativeEntryMarker>>,
     native_entry: Option<native_receive::NativeEntry>,
     receive_policy: Option<std::sync::Arc<crate::tool_global::SavedReceivePolicy>>,
+    replay_connect: Option<replay_connect::Claim>,
 }
 
 /// Short reader admission from the existing table and OFD authorities. This is
@@ -801,7 +803,7 @@ impl NetworkReplayEngine {
         if state.owner != owner {
             return Err(NetworkReplayError::StreamCallOwnerMismatch(call));
         }
-        if state.original.is_some() || state.open_file.is_none() {
+        if state.original.is_some() || state.open_file.is_none() || state.replay_connect.is_some() {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
         if state.abandoned {
@@ -899,6 +901,7 @@ impl NetworkReplayEngine {
             return Err(NetworkReplayError::UnresolvedStreamOperation(control_lease));
         }
         let open_file = control.open_file;
+        self.check_replay_connect_unclaimed(open_file)?;
         if self.retired_open_files.contains(&open_file) {
             return Err(NetworkReplayError::OpenFileRetired(open_file));
         }
@@ -937,6 +940,7 @@ impl NetworkReplayEngine {
                 native_entry_attempted: None,
                 native_entry: None,
                 receive_policy: None,
+                replay_connect: None,
                 capture_publication,
                 capture_control: capture_publication
                     .filter(|_| physical_pin_required)
@@ -5607,6 +5611,9 @@ impl NetworkReplayEngine {
         &mut self,
         channel: NetworkChannelId,
     ) -> Result<&mut ChannelState, NetworkReplayError> {
+        if let Some(open_file) = self.reverse_bindings.get(&channel) {
+            self.check_replay_connect_unclaimed(*open_file)?;
+        }
         self.channels
             .get_mut(&channel)
             .ok_or(NetworkReplayError::UnknownChannel(channel))
@@ -6202,6 +6209,7 @@ impl NetworkReplayEngine {
         peek_offset: usize,
     ) -> Result<NetworkStreamChunk, NetworkReplayError> {
         self.check_stream_owner(owner)?;
+        self.check_replay_connect_unclaimed(open_file)?;
         self.check_socket_control_available(open_file)?;
         let channel = self.bound_channel(open_file)?;
         if let Some(lease) = self.stream_delivery.get(&open_file) {
@@ -6550,6 +6558,7 @@ impl NetworkReplayEngine {
         &self,
         open_file: OpenFileId,
     ) -> Result<(), NetworkReplayError> {
+        self.check_replay_connect_unclaimed(open_file)?;
         if let Some(lease) = self.stream_delivery.get(&open_file) {
             return Err(
                 if self

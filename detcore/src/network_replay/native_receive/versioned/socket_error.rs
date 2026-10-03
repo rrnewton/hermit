@@ -226,6 +226,7 @@ impl NetworkReplayEngine {
     ) -> Result<i32, NetworkReplayError> {
         let control = self.owned_socket_control(owner, lease)?;
         let file = control.open_file;
+        self.check_replay_connect_unclaimed(file)?;
         if !control.physical.can_release_unchanged() || self.shadow_probes.contains_key(&lease) {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
