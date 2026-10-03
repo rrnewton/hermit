@@ -10,9 +10,12 @@
 //! The guest (`fixtures/getpid_loop.c`) makes N raw `getpid` calls and exits.
 //! Hermit virtualizes the guest's clocks, so this harness times each whole run
 //! from outside. For every variant it takes the median wall time at several N
-//! and fits a least-squares line through those medians: the slope is the cost
-//! of one call with process start-up removed, and the intercept is the fixed
-//! cost of a run. The native fit is the baseline.
+//! and fits a least-squares line through the medians at positive N: the slope
+//! is the cost of one call with process start-up removed, and the intercept is
+//! the fixed cost of a run. A run with N = 0 never reaches the guest's
+//! `getpid` site, so it also skips that site's one-time cost (LiteInst traps
+//! and patches the site at its first call); its median is reported but left
+//! out of the fit. The native fit is the baseline.
 //!
 //! After timing, one extra run per backend sets
 //! `RUST_LOG=hermit::backend_stats=debug` and keeps the backend's own
@@ -69,7 +72,10 @@ Usage: ./benchmarks/getpid_cost.rs [OPTIONS]
 
 Measure the wall-clock cost of one raw getpid call natively and under each
 selected Hermit backend. The cost is the least-squares slope of the median
-run time across several call counts, so process start-up is excluded.
+run time across the positive call counts, so process start-up is excluded.
+A count of 0 never reaches the fixture's getpid site and so also skips the
+site's one-time cost (LiteInst patches the site at its first call): its
+median is reported, but it is left out of the fit.
 
 Options:
   --hermit CMD        Hermit command prefix, split on whitespace, so a wrapper
@@ -77,9 +83,8 @@ Options:
                       directory (default: <repository>/target/release/hermit)
   --backends LIST     comma-separated subset of ptrace,liteinst
                       (default: ptrace,liteinst)
-  --counts LIST       comma-separated call counts, at least two distinct;
-                      LiteInst also needs the largest to be at least 2
-                      (default: 0,25000,50000,100000)
+  --counts LIST       comma-separated call counts with no duplicates and at
+                      least two positive values (default: 0,25000,50000,100000)
   --iterations N      measured runs per variant and count (default: 5)
   --warmups N         unmeasured runs per variant and count (default: 1)
   --timeout SECONDS   kill a run after this many seconds (default: 120)
@@ -219,9 +224,12 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Option
     let mut distinct = options.counts.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    if distinct.len() != options.counts.len() || distinct.len() < 2 {
+    // The fit uses positive counts only (see `fitted_points`), so a line
+    // needs two of them. Two distinct positive counts also make the largest
+    // at least 2, which LiteInst's statistics check needs.
+    if distinct.len() != options.counts.len() || distinct.iter().filter(|&&c| c > 0).count() < 2 {
         return Err(usage_error(
-            "--counts needs at least two distinct values and no duplicates",
+            "--counts needs at least two positive values and no duplicates",
         ));
     }
     let mut backends = options.backends.clone();
@@ -542,6 +550,21 @@ fn fit_line(points: &[(f64, f64)]) -> Option<(f64, f64)> {
     (slope.is_finite() && intercept.is_finite()).then_some((slope, intercept))
 }
 
+/// The `(count, median)` points the fit uses: positive counts only. A run
+/// with zero calls never reaches the fixture's `getpid` site, so it skips the
+/// site's one-time cost that every positive count pays (LiteInst's first
+/// trap and patch installation). Each sample is a fresh process, so warmups
+/// cannot remove that step, and fitting it would add it to the slope: a
+/// noiseless `T(0) = F`, `T(N > 0) = F + D + cN` fitted at counts 0 and 2
+/// gives `c + D/2`.
+fn fitted_points(points: &[(u64, f64, f64, usize)]) -> Vec<(f64, f64)> {
+    points
+        .iter()
+        .filter(|(calls, ..)| *calls > 0)
+        .map(|(calls, center, _, _)| (*calls as f64, *center))
+        .collect()
+}
+
 /// One variant's result: medians come from measured runs only, but a failed
 /// warmup or a rejected statistics run refuses the fit exactly as a failed
 /// measured run does.
@@ -553,9 +576,11 @@ struct Summary {
     /// Whether every statistics run of this backend was accepted; `None` for
     /// `native`, which has none.
     stats_accepted: Option<bool>,
-    /// `(calls, median ns, MAD ns, runs)` for each count with a successful run.
+    /// `(calls, median ns, MAD ns, runs)` for each count with a successful
+    /// run, including a zero count that the fit leaves out.
     points: Vec<(u64, f64, f64, usize)>,
-    /// `(ns per call, intercept ns)`, or `None` after any failure.
+    /// `(ns per call, intercept ns)` over the positive counts (see
+    /// [`fitted_points`]), or `None` after any failure.
     fit: Option<(f64, f64)>,
 }
 
@@ -590,14 +615,7 @@ fn summarize(
         }
     }
     let fit = (failed == 0 && failed_warmups == 0 && stats_accepted != Some(false))
-        .then(|| {
-            fit_line(
-                &points
-                    .iter()
-                    .map(|(calls, center, _, _)| (*calls as f64, *center))
-                    .collect::<Vec<_>>(),
-            )
-        })
+        .then(|| fit_line(&fitted_points(&points)))
         .flatten();
     Summary {
         variant: variant.to_string(),
@@ -955,7 +973,7 @@ fn run(options: &Options) -> Result<bool, String> {
         )
     };
     let json = format!(
-        "{{\n  \"schema\": \"hermit-getpid-cost/1\",\n  \"started_utc\": {},\n  \"host\": {},\n  \"kernel\": {},\n  \"cpu_model\": {},\n  \"load_before\": {},\n  \"load_after\": {},\n  \"cgroup_isolation\": \"none: this harness does not create a cgroup; record ambient load\",\n  \"repository_head\": {},\n  \"repository_dirty\": {},\n  \"producer_sha256\": {},\n  \"fixture_sha256\": {},\n  \"hermit_prefix\": {},\n  \"hermit_prefix_digests\": {},\n  \"command_shapes\": {{\"native\": {}, \"hermit\": {}}},\n  \"counts\": {},\n  \"warmups\": {},\n  \"iterations\": {},\n  \"timeout_seconds\": {},\n  \"order\": \"each round runs every count; within a count the variant order rotates by round\",\n  \"statistic\": \"median wall ns per (variant, count) with median absolute deviation; fit = ordinary least squares of median against count\",\n  \"poll_interval_ns\": {},\n  \"wall_clock_resolution\": \"each run is polled every poll_interval_ns, so a wall time can exceed the run by up to one poll interval plus the host's timer slack\",\n  \"log_environment\": {{\"removed_from_every_run\": {}, \"statistics_run_rust_log\": {}}},\n  \"summaries\": {},\n  \"stats_runs\": {},\n  \"samples\": {}\n}}\n",
+        "{{\n  \"schema\": \"hermit-getpid-cost/1\",\n  \"started_utc\": {},\n  \"host\": {},\n  \"kernel\": {},\n  \"cpu_model\": {},\n  \"load_before\": {},\n  \"load_after\": {},\n  \"cgroup_isolation\": \"none: this harness does not create a cgroup; record ambient load\",\n  \"repository_head\": {},\n  \"repository_dirty\": {},\n  \"producer_sha256\": {},\n  \"fixture_sha256\": {},\n  \"hermit_prefix\": {},\n  \"hermit_prefix_digests\": {},\n  \"command_shapes\": {{\"native\": {}, \"hermit\": {}}},\n  \"counts\": {},\n  \"warmups\": {},\n  \"iterations\": {},\n  \"timeout_seconds\": {},\n  \"order\": \"each round runs every count; within a count the variant order rotates by round\",\n  \"statistic\": \"median wall ns per (variant, count) with median absolute deviation; fit = ordinary least squares of median against count over the positive counts; a zero count is reported but not fitted\",\n  \"poll_interval_ns\": {},\n  \"wall_clock_resolution\": \"each run is polled every poll_interval_ns, so a wall time can exceed the run by up to one poll interval plus the host's timer slack\",\n  \"log_environment\": {{\"removed_from_every_run\": {}, \"statistics_run_rust_log\": {}}},\n  \"summaries\": {},\n  \"stats_runs\": {},\n  \"samples\": {}\n}}\n",
         json_string(&started_utc),
         json_string(&short_hostname()),
         json_string(
@@ -1072,10 +1090,15 @@ mod tests {
 
     #[test]
     fn parse_options_rejects_counts_that_cannot_define_a_line() {
-        assert!(parse_options(args(&["--counts", "0,100"])).is_ok());
+        assert!(parse_options(args(&["--counts", "25,100"])).is_ok());
+        assert!(parse_options(args(&["--counts", "0,25,100"])).is_ok());
+        assert!(parse_options(args(&["--counts", "1,2"])).is_ok());
         assert!(parse_options(args(&["--counts", "100"])).is_err());
         assert!(parse_options(args(&["--counts", "5,5"])).is_err());
         assert!(parse_options(args(&["--counts", "0,100,100"])).is_err());
+        // Zero is not fitted, so it does not make the second point of a line.
+        assert!(parse_options(args(&["--counts", "0,100"])).is_err());
+        assert!(parse_options(args(&["--counts", "0,1"])).is_err());
     }
 
     #[test]
@@ -1129,49 +1152,49 @@ mod tests {
         };
         let measured = || {
             vec![
-                sample(0, false, 1_000, Outcome::Ok),
                 sample(10, false, 3_000, Outcome::Ok),
+                sample(20, false, 5_000, Outcome::Ok),
             ]
         };
 
         let mut clean = measured();
         // A slow but successful warmup affects neither the medians nor the fit.
-        clean.push(sample(0, true, 900_000, Outcome::Ok));
-        let summary = summarize(&clean, "ptrace", &[0, 10], Some(true));
+        clean.push(sample(10, true, 900_000, Outcome::Ok));
+        let summary = summarize(&clean, "ptrace", &[10, 20], Some(true));
         assert_eq!((summary.measured, summary.failed), (2, 0));
         assert_eq!(summary.failed_warmups, 0);
-        assert_eq!(summary.points[0].1, 1_000.0);
+        assert_eq!(summary.points[0].1, 3_000.0);
         assert_eq!(summary.fit, Some((200.0, 1_000.0)));
 
         for outcome in [Outcome::TimedOut, Outcome::Failed("calls=9".to_string())] {
             let mut warm_failure = measured();
-            warm_failure.push(sample(10, true, 3_000, outcome));
-            let summary = summarize(&warm_failure, "ptrace", &[0, 10], Some(true));
+            warm_failure.push(sample(20, true, 5_000, outcome));
+            let summary = summarize(&warm_failure, "ptrace", &[10, 20], Some(true));
             assert_eq!((summary.failed, summary.failed_warmups), (0, 1));
             assert_eq!(summary.points.len(), 2);
             assert_eq!(summary.fit, None);
         }
 
         let mut measured_failure = measured();
-        measured_failure.push(sample(10, false, 3_000, Outcome::TimedOut));
-        let summary = summarize(&measured_failure, "ptrace", &[0, 10], Some(true));
+        measured_failure.push(sample(20, false, 5_000, Outcome::TimedOut));
+        let summary = summarize(&measured_failure, "ptrace", &[10, 20], Some(true));
         assert_eq!((summary.failed, summary.failed_warmups), (1, 0));
         assert_eq!(summary.fit, None);
         // Another variant's failure does not refuse this one.
-        for (calls, wall_ns) in [(0, 500), (10, 600)] {
+        for (calls, wall_ns) in [(10, 600), (20, 700)] {
             measured_failure.push(Sample {
                 variant: "native".to_string(),
                 ..sample(calls, false, wall_ns, Outcome::Ok)
             });
         }
-        let native = summarize(&measured_failure, "native", &[0, 10], None);
+        let native = summarize(&measured_failure, "native", &[10, 20], None);
         assert_eq!((native.failed, native.failed_warmups), (0, 0));
         assert_eq!(native.fit, Some((10.0, 500.0)));
     }
 
     #[test]
     fn summarize_refuses_a_fit_when_the_statistics_run_was_rejected() {
-        let samples: Vec<Sample> = [(0, 1_000), (10, 3_000)]
+        let samples: Vec<Sample> = [(10, 3_000), (20, 5_000)]
             .into_iter()
             .map(|(calls, wall_ns)| Sample {
                 variant: "liteinst".to_string(),
@@ -1182,15 +1205,52 @@ mod tests {
                 outcome: Outcome::Ok,
             })
             .collect();
-        let accepted = summarize(&samples, "liteinst", &[0, 10], Some(true));
+        let accepted = summarize(&samples, "liteinst", &[10, 20], Some(true));
         assert_eq!(accepted.fit, Some((200.0, 1_000.0)));
         // Clean timed samples, but the statistics run says the calls did not
         // take the hook: the slope would be a trap's cost, so no fit.
-        let rejected = summarize(&samples, "liteinst", &[0, 10], Some(false));
+        let rejected = summarize(&samples, "liteinst", &[10, 20], Some(false));
         assert_eq!(rejected.stats_accepted, Some(false));
         assert_eq!((rejected.failed, rejected.failed_warmups), (0, 0));
         assert_eq!(rejected.points.len(), 2);
         assert_eq!(rejected.fit, None);
+    }
+
+    #[test]
+    fn summarize_reports_a_zero_count_but_leaves_it_out_of_the_fit() {
+        // Noiseless runs with a fixed cost F = 1000 ns, a one-time site cost
+        // D = 50000 ns that only positive counts pay, and c = 200 ns per call.
+        let wall = |calls: u64| {
+            if calls == 0 {
+                1_000
+            } else {
+                51_000 + 200 * calls as u128
+            }
+        };
+        let samples = |counts: &[u64]| -> Vec<Sample> {
+            counts
+                .iter()
+                .map(|&calls| Sample {
+                    variant: "liteinst".to_string(),
+                    calls,
+                    round: 0,
+                    warmup: false,
+                    wall_ns: wall(calls),
+                    outcome: Outcome::Ok,
+                })
+                .collect()
+        };
+        let summary = summarize(&samples(&[0, 2, 4]), "liteinst", &[0, 2, 4], Some(true));
+        // The zero count is still reported...
+        assert_eq!(summary.points.len(), 3);
+        assert_eq!((summary.points[0].0, summary.points[0].1), (0, 1_000.0));
+        // ...but the slope is c, not c + D/2, and the intercept is F + D.
+        assert_eq!(summary.fit, Some((200.0, 51_000.0)));
+        // With only one positive count there is no line to fit.
+        let one = summarize(&samples(&[0, 2]), "liteinst", &[0, 2], Some(true));
+        assert_eq!(one.points.len(), 2);
+        assert_eq!(one.fit, None);
+        assert_eq!(fitted_points(&one.points), [(2.0, 51_400.0)]);
     }
 
     #[test]
@@ -1260,7 +1320,7 @@ mod tests {
         assert!(check_hooked_calls(100, 108, 10).is_err());
         assert!(check_hooked_calls(100, 109, 10).is_ok());
         // With a small N, hooks at other sites alone would have met the floor
-        // (`--counts 0,10` with nine other hooks and an unpatched site).
+        // (`--counts 0,5,10` with nine other hooks and an unpatched site).
         assert!(check_hooked_calls(10, 9, 9).is_err());
         // A zero-call run with more hooks than the measured run leaves none.
         assert!(check_hooked_calls(100, 5, 10).is_err());
@@ -1269,7 +1329,8 @@ mod tests {
         assert!(check_hooked_calls(2, 1, 0).is_ok());
         assert!(check_hooked_calls(2, 0, 0).is_err());
         // A largest count below 2 owes the hook nothing, so even counts that
-        // look clean are refused (`--counts 0,1`).
+        // look clean are refused. `parse_options` no longer accepts such
+        // counts (`--counts 0,1`), and this check does not rely on that.
         for calls in [0, 1] {
             let owed_nothing = check_hooked_calls(calls, calls, 0);
             assert!(
