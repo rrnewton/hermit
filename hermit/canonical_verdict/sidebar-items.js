@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ComparedLogScope","ContainerDisposition","InfrastructureError","LogCompareStrictness","NoResultReason","RecordEnvelopeReport","Verdict","VerificationRun"],"struct":["ComparedLogMessages","ComparedOutput","ComparedOutputs","ComparisonReport","ContainerFailure","DbtCountedBranchComparison","RuntimeStats","VerificationReport","VerificationRuntime"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["detcore_liteinst_initialize"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HAPPENS_BEFORE_VERSION"],"enum":["HappensBeforeError","PhaseSpec","Position","Strength"],"struct":["Anchor","CodeLocation","EdgeSpec","EventSpec","HappensBeforeEdge","HappensBeforeProgram","HappensBeforeSpec","ThreadRef","ThreadSpec"]};

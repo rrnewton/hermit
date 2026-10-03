@@ -1,0 +1,45 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="API documentation for the Rust `PARITY_HELP` constant in crate `test_harness`."><title>PARITY_HELP in test_harness - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="test_harness" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">PARITY_HELP</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../test_harness/index.html">test_<wbr>harness</a><span class="version">0.4.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">test_harness</a></div><h1>Constant <span class="constant">PARITY_<wbr>HELP</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/test_harness/test-harness.rs.html#149-193">Source</a> </span></div><pre class="rust item-decl"><code>pub(crate) const PARITY_HELP: &amp;<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.str.html">str</a> = &quot;\
+Usage: test-harness parity compare --artifacts &lt;DIR&gt; --cell &lt;TEST@BACKEND&gt; [OPTIONS]
+       test-harness parity export --e2e-root &lt;DIR&gt; [--expected-scope &lt;FILE&gt;]
+
+Measure parity cells from the logs a finished `run` retained, as its own
+post-pass does, without running any guest. Each cell compares TEST&#39;s verify
+run on BACKEND with its verify run on ptrace, using `hermit log-diff`, and
+prints one parity record per cell. Every cell named is measured, whichever
+process ran its verify cells.
+
+It writes only below DIR/parity-compare: parity.jsonl, parity.status.json
+(which names the hermit binary that compared the logs and its SHA-256), and
+the goldens and log-diff reports under DIR/parity-compare/parity/. The run&#39;s
+results.jsonl, JUnit, summary.json, parity.jsonl, parity.status.json and
+parity/ are only read. A golden the run wrote is reused once the reference&#39;s
+retained log is gone.
+
+Options:
+  --artifacts &lt;DIR&gt;                The directory holding the run&#39;s results.jsonl
+  --cell &lt;TEST@BACKEND&gt;            A parity cell to measure; repeatable
+  --output &lt;PATH&gt;                  Write records to PATH (default: DIR/parity-compare/parity.jsonl)
+  --jobs &lt;N&gt;                       Run at most N comparisons concurrently (default: 1)
+  -h, --help                       Print this help
+
+Environment:
+  HERMIT_BIN=&lt;PATH&gt;                      Hermit executable; a relative path is under the
+                                         repository root (default: target/debug/hermit)
+
+`parity export` reads every DIR/&lt;lane&gt;/&lt;node&gt;/parity.status.json and the
+parity.jsonl beside it, and prints one parity ledger source row per parity
+cell those post-passes owed, as JSONL on stdout, for series.py append-parity.
+A complete post-pass yields one row per record. A failed or running one
+yields the records it wrote plus a record-missing row for each other cell its
+status names. With --expected-scope, a JSON object mapping \&quot;&lt;lane&gt;/&lt;node&gt;\&quot; to
+the \&quot;&lt;test&gt;@&lt;backend&gt;\&quot; cells that node should have measured, a planned node
+with no status yields a record-missing row per expected cell, and so does
+each expected cell a node&#39;s status leaves out of its scope. It runs no guest
+and writes nothing. Any inconsistency (a record that fails validation, a
+count that disagrees with its status, a record outside the scope) is an error
+and prints no rows. validate, which must not lose a cell, instead appends a
+record-missing row for each cell the refused node&#39;s expected scope owed.
+
+Export options:
+  --e2e-root &lt;DIR&gt;                 The run&#39;s e2e result root, holding &lt;lane&gt;/&lt;node&gt;/
+  --expected-scope &lt;FILE&gt;          The cells each planned node owed (see above)&quot;;</code></pre></section></div></main></body></html>
