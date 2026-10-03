@@ -379,10 +379,11 @@ pub struct PpollEvent {
 /// Records every guest-visible output of a raw `select` or `pselect6` call.
 ///
 /// Linux copies the three descriptor sets out only when the call succeeds, or
-/// partially before an EFAULT. It then writes the remaining time into a
+/// partially before an EFAULT. It may then write the remaining time into a
 /// non-null timeout (a `struct timeval` for `select`, a `struct timespec` for
-/// `pselect6`) whatever the result. Replay restores the writes in that order
-/// before returning the recorded result.
+/// `pselect6`); the recorder keeps the post-call bytes whether or not it did.
+/// Replay restores the writes in that order before returning the recorded
+/// result.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SelectEvent {
     /// The exact return value or errno observed while recording.
@@ -390,7 +391,7 @@ pub struct SelectEvent {
 
     /// Post-kernel bytes of the read, write and exception sets, in argument
     /// order. Each holds the readable prefix of the set's `FDS_BYTES(nfds)`
-    /// range, or `None` when the pointer was null or the kernel did not copy
+    /// range, with `nfds` clamped to the guest's descriptor table, or `None` when the pointer was null or the kernel did not copy
     /// the sets out.
     pub fd_sets: [Option<Vec<u8>>; 3],
 

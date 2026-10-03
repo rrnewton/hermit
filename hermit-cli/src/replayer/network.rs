@@ -801,27 +801,39 @@ mod current_main_tests {
     }
 
     #[test]
-    fn replay_select_leaves_sets_untouched_on_an_error_result() {
+    fn replay_select_restores_only_the_recorded_prefix_before_efault() {
+        // Recorded: the read set was partly copied out (its first long), then
+        // the kernel faulted before reaching the write set.
         let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
-        unsafe { libc::FD_SET(3, &mut readfds) };
+        let mut writefds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_SET(3, &mut readfds);
+            libc::FD_SET(100, &mut readfds);
+            libc::FD_SET(5, &mut writefds);
+        }
         let event = SelectEvent {
-            result: Err(Errno::EBADF),
-            fd_sets: [None, None, None],
+            result: Err(Errno::EFAULT),
+            fd_sets: [Some(vec![0b0100_0000, 0, 0, 0, 0, 0, 0, 0]), None, None],
             timeout: None,
         };
         let result = replay_select_event(
             &mut LocalMemory::new(),
-            4,
+            128,
             [
                 AddrMut::from_raw((&mut readfds as *mut libc::fd_set) as usize),
-                None,
+                AddrMut::from_raw((&mut writefds as *mut libc::fd_set) as usize),
                 None,
             ],
             None,
             event,
         );
 
-        assert_eq!(result, Err(Errno::EBADF));
-        assert!(unsafe { libc::FD_ISSET(3, &readfds) });
+        assert_eq!(result, Err(Errno::EFAULT));
+        assert!(!unsafe { libc::FD_ISSET(3, &readfds) });
+        assert!(unsafe { libc::FD_ISSET(6, &readfds) });
+        // Past the recorded prefix, and the set the kernel never reached,
+        // keep the guest's own bytes.
+        assert!(unsafe { libc::FD_ISSET(100, &readfds) });
+        assert!(unsafe { libc::FD_ISSET(5, &writefds) });
     }
 }
