@@ -56,7 +56,11 @@ const SUPER_PROBE_NODE_SLACK_S: i64 = 60;
 /// Measured 2026-10-02 on devbig030 with 20 repetitions at once, each Hermit
 /// call in its own safehermit cgroup: the 20 per-repetition peaks summed to
 /// 1052, 1226 and 1433 MiB for the strict, pipeline and record probes (largest
-/// single repetition 73 MiB), so 4 GiB is 2.8 times the largest sum.
+/// single repetition 73 MiB), so 4 GiB is 2.8 times the largest sum. The KVM
+/// probe, measured the same way with the release binary, summed to 1363 MiB
+/// (largest 71 MiB). The DBT probe is unmeasured: no Hermit binary on the host
+/// was built with the dbt feature. It is nonblocking, and if it reaches this
+/// cap the node writes no rows, so the pass-rate table shows NO_RESULT.
 const SUPER_PROBE_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
 /// One row in the mechanically extracted super source table. These rows are a
@@ -263,8 +267,9 @@ impl StressProbe {
              repetition runs in its own background subshell under timeout \
              {SUPER_PROBE_TIMEOUT_S} s (SIGKILL {SUPER_PROBE_KILL_GRACE_S} s later) and fails if \
              its waited CPU time, read with the bash times builtin, reaches \
-             {SUPER_PROBE_CPU_TIMEOUT_S} s; the node prints one line per repetition and writes \
-             each as a pass or fail row of its schema-2 structured test results, which the super \
+             {SUPER_PROBE_CPU_TIMEOUT_S} s. Each repetition's output goes to its own log, which \
+             the node prints, indented and tagged with the repetition number, under that \
+             repetition's result line; the node writes each repetition as a pass or fail row of its schema-2 structured test results, which the super \
              stress pass-rate table counts. {policy} If the node itself is killed by its wall, \
              CPU or memory cap, it writes no rows and the table shows the probe as NO_RESULT; the \
              node's failure still counts. Until 2026-10 each repetition was its own DAG node; \
@@ -324,8 +329,8 @@ impl StressProbe {
     /// The separate nodes ran concurrently, so the repetitions do too: each is
     /// a background subshell under `timeout` with the per-repetition wall bound
     /// the separate nodes had, at most the admitted width at once. Each records
-    /// its exit status and its waited CPU time (`times`, children line) in its
-    /// own file, and the node fails a repetition whose CPU time reached the
+    /// its exit status, its waited CPU time (`times`, children line) and its
+    /// output in its own files, and the node fails a repetition whose CPU time reached the
     /// per-repetition budget, which the separate nodes' CPU caps enforced. Each
     /// repetition is a row of the node's structured test results, written once
     /// by the registered writer `ci/write-structured-test-counts.sh`, so a
@@ -333,8 +338,12 @@ impl StressProbe {
     /// fails when any repetition fails.
     fn node_command(self, reps: i64, release_bin: &str, debug_bin: &str, tmp: &Path) -> String {
         let slug = self.slug();
-        let bound =
-            format!("timeout --kill-after={SUPER_PROBE_KILL_GRACE_S} {SUPER_PROBE_TIMEOUT_S} ");
+        // --verbose makes timeout say which signal it sent, in the repetition's
+        // log, so the result line names a timeout only when timeout sent one: an
+        // exit status of 124 or 137 alone could also be Hermit's own.
+        let bound = format!(
+            "timeout --verbose --kill-after={SUPER_PROBE_KILL_GRACE_S} {SUPER_PROBE_TIMEOUT_S} "
+        );
         let repetition = self.command("$rep", &bound, release_bin, debug_bin, tmp);
         let jobs_env = SUPER_PROBE_JOBS_ENV;
         format!(
@@ -346,7 +355,7 @@ impl StressProbe {
              running=0; \
              for rep in $(seq 1 {reps}); do \
              if [ \"$running\" -ge \"$width\" ]; then wait -n; running=$((running - 1)); fi; \
-             ( ( {repetition} ); rc=$?; times >\"$state/$rep.times\"; echo \"$rc\" >\"$state/$rep.rc\" ) & \
+             ( ( {repetition} ) >\"$state/$rep.log\" 2>&1; rc=$?; times >\"$state/$rep.times\"; echo \"$rc\" >\"$state/$rep.rc\" ) & \
              running=$((running + 1)); \
              done; \
              wait; \
@@ -354,17 +363,19 @@ impl StressProbe {
              for rep in $(seq 1 {reps}); do \
              rc=$(cat \"$state/$rep.rc\" 2>/dev/null); rc=${{rc:-none}}; \
              cpu=$(awk 'NR == 2 {{ gsub(/s/, \"\"); split($1, u, \"m\"); split($2, k, \"m\"); printf \"%.2f\", u[1] * 60 + u[2] + k[1] * 60 + k[2] }}' \"$state/$rep.times\" 2>/dev/null); cpu=${{cpu:-0}}; \
-             case $rc in \
-             0) cause=;; \
-             124) cause=' (timed out after {SUPER_PROBE_TIMEOUT_S} s)';; \
-             137) cause=' (SIGKILL: timeout killed it {SUPER_PROBE_KILL_GRACE_S} s after the {SUPER_PROBE_TIMEOUT_S} s bound, or the OOM killer did)';; \
+             log=\"$state/$rep.log\"; \
+             if grep -q 'timeout: sending signal KILL' \"$log\" 2>/dev/null; then cause=' (timeout sent SIGKILL {SUPER_PROBE_KILL_GRACE_S} s after the {SUPER_PROBE_TIMEOUT_S} s bound)'; \
+             elif grep -q 'timeout: sending signal TERM' \"$log\" 2>/dev/null; then cause=' (timed out after {SUPER_PROBE_TIMEOUT_S} s)'; \
+             else case $rc in \
              none) cause=' (wrote no exit status)';; \
+             137) cause=' (SIGKILL that its timeout did not send)';; \
              *) cause=;; \
-             esac; \
+             esac; fi; \
              result=pass; [ \"$rc\" = 0 ] || result=fail; \
              if [ \"${{cpu%.*}}\" -ge {SUPER_PROBE_CPU_TIMEOUT_S} ]; then result=fail; cause=\"$cause (used $cpu CPU seconds; the per-repetition bound is {SUPER_PROBE_CPU_TIMEOUT_S})\"; fi; \
              [ \"$result\" = pass ] || failed=$((failed + 1)); \
              echo \"super stress {slug} repetition $rep/{reps}: $result, exit $rc, $cpu CPU s$cause\"; \
+             sed \"s|^|  [$rep] |\" \"$log\" 2>/dev/null; \
              rows+=(\"$(printf '{slug}/repetition-%02d' \"$rep\")\" \"$result\" 1); \
              done; \
              ./ci/write-structured-test-counts.sh {reps} 0 \"${{rows[@]}}\" || exit 2; \
@@ -731,8 +742,148 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         );
     }
 
+    let standin = stress_standin_bracket(root)?;
+
     Ok(format!(
-        "super source: 32 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed"
+        "super source: 32 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed; {standin}"
+    ))
+}
+
+/// Run a probe node's generated command against a stand-in Hermit, so the
+/// shell itself is exercised and not only inspected: each repetition's row and
+/// result line, the node's exit status, the per-repetition log, the width
+/// bound, and a malformed width.
+fn stress_standin_bracket(root: &Path) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "validate-super-standin-self-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create super stand-in fixture: {error}"))?;
+    let result = run_stress_standin(root, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const REPS: i64 = 6;
+    const WIDTH: usize = 3;
+    let probe = StressProbe::PtraceStrictVerify;
+    let slug = probe.slug();
+    // The probe's last argument is hermit-super-<repetition>. Each repetition
+    // records how many repetitions were running when it started, so the width
+    // bound is measured rather than assumed.
+    let standin = dir.join("hermit");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         rep=${{!#}}; rep=${{rep##*-}}; d={dir}\n\
+         mkdir \"$d/running.$rep\"\n\
+         ls -d \"$d\"/running.* | wc -l >\"$d/peak.$rep\"\n\
+         sleep 0.2\n\
+         rmdir \"$d/running.$rep\"\n\
+         case $rep in 2) exit 7;; 4) echo \"stand-in diagnostic $rep\" >&2; exit 3;; esac\n\
+         echo \"hermit-super-$rep\"\n",
+        dir = shell_quote(&dir.to_string_lossy())
+    );
+    std::fs::write(&standin, script)
+        .map_err(|error| format!("cannot write super stand-in: {error}"))?;
+    std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot make super stand-in executable: {error}"))?;
+    let command = probe.node_command(REPS, &standin.to_string_lossy(), "/nonexistent", dir);
+    let run = |width: &str, counts: &Path| {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(root)
+            .env("DAGRUN_TEST_COUNTS_PATH", counts)
+            .env(SUPER_PROBE_JOBS_ENV, width)
+            .output()
+            .map_err(|error| format!("cannot run super stand-in node: {error}"))
+    };
+
+    let counts = dir.join("counts.json");
+    let output = run(&WIDTH.to_string(), &counts)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.code() != Some(1) {
+        return Err(format!(
+            "super stand-in node with two failed repetitions exited {:?}, not 1:\n{stdout}",
+            output.status.code()
+        ));
+    }
+    for (rep, verdict) in [
+        (1, "pass, exit 0,"),
+        (2, "fail, exit 7,"),
+        (3, "pass, exit 0,"),
+        (4, "fail, exit 3,"),
+        (5, "pass, exit 0,"),
+        (6, "pass, exit 0,"),
+    ] {
+        let line = format!("super stress {slug} repetition {rep}/{REPS}: {verdict}");
+        if !stdout.contains(&line) {
+            return Err(format!("super stand-in output lacks {line:?}:\n{stdout}"));
+        }
+    }
+    for line in ["  [1] hermit-super-1\n", "  [4] stand-in diagnostic 4\n"] {
+        if !stdout.contains(line) {
+            return Err(format!(
+                "super stand-in output lacks the repetition log line {line:?}:\n{stdout}"
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(&counts)
+        .map_err(|error| format!("super stand-in wrote no structured results: {error}"))?;
+    let document: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("super stand-in results are not JSON: {error}"))?;
+    let rows = document["results"]
+        .as_array()
+        .ok_or_else(|| format!("super stand-in results have no rows: {text}"))?;
+    let failed = rows
+        .iter()
+        .filter(|row| row["result"] == "fail")
+        .filter_map(|row| row["id"].as_str())
+        .collect::<Vec<_>>();
+    let expected_failed = [
+        format!("{slug}/repetition-02"),
+        format!("{slug}/repetition-04"),
+    ];
+    if document["executed_tests"] != REPS
+        || rows.len() != REPS as usize
+        || rows.iter().filter(|row| row["result"] == "pass").count() != 4
+        || failed != expected_failed
+    {
+        return Err(format!(
+            "super stand-in rows are not 4 passes and failed repetitions 02 and 04: {text}"
+        ));
+    }
+    let mut peak = 0;
+    for rep in 1..=REPS {
+        let observed = std::fs::read_to_string(dir.join(format!("peak.{rep}")))
+            .map_err(|error| format!("super stand-in repetition {rep} did not run: {error}"))?;
+        let observed = observed
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| format!("super stand-in repetition {rep} peak: {error}"))?;
+        peak = peak.max(observed);
+    }
+    if peak > WIDTH {
+        return Err(format!(
+            "super stand-in ran {peak} repetitions at once with width {WIDTH}"
+        ));
+    }
+
+    let refused_counts = dir.join("refused.json");
+    let refused = run("three", &refused_counts)?;
+    if refused.status.code() != Some(2) || refused_counts.exists() {
+        return Err(format!(
+            "super stand-in node accepted a malformed width: exit {:?}",
+            refused.status.code()
+        ));
+    }
+    Ok(format!(
+        "stand-in probe node: 4/{REPS} passed, repetitions 02 and 04 failed as planted, at most {peak} of width {WIDTH} at once, malformed width refused"
     ))
 }
 
