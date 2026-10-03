@@ -657,7 +657,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
     // retains all 102.
-    ("test.cli_on_host", 103),
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths
+    // (https://github.com/rrnewton/hermit/pull/3564), as in test.cli; all 103
+    // prior identities retained.
+    ("test.cli_on_host", 104),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
