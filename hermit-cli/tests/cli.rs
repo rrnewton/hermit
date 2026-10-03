@@ -6577,8 +6577,24 @@ const DAP_GDB_REFUSAL: &str = "managed replay does not support this GDB";
 
 /// How long one DAP exchange may take before the test fails rather than hangs.
 /// A reverse request restarts the replay and runs it forward, so it gets more.
+/// Every wait is also cut off at the end of [`DAP_SESSION_BUDGET`].
 const DAP_TIMEOUT: Duration = Duration::from_secs(120);
 const DAP_REVERSE_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// How long a whole DAP session may run, from spawning hermit-dap, before
+/// scaling by [`dap_wall_timeout_multiplier`].
+///
+/// Nextest kills a test at 57 s (`.config/nextest.toml`, scaled by the same
+/// multiplier) and reports only `(test timed out)`, so a wait longer than that
+/// can never fail on its own: the hosted runs
+/// <https://github.com/rrnewton/hermit/actions/runs/37134916002> and
+/// <https://github.com/rrnewton/hermit/actions/runs/37126714210> lost which
+/// request hung (<https://github.com/rrnewton/hermit/issues/3651>). Ending the
+/// session 7 s before that kill makes a hang fail with the request it waited
+/// for and the DAP transcript. The 7 s cover what a test does before the
+/// session starts: compiling the guest and starting the gdbserver or recording
+/// the guest. The whole attach test, setup included, takes under 1 s locally.
+const DAP_SESSION_BUDGET: Duration = Duration::from_secs(50);
 
 /// The line of `square`'s body in [`DAP_GUEST_SOURCE`], where the tests break.
 const DAP_GUEST_BREAK_LINE: u64 = 4;
@@ -6795,6 +6811,23 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Whether `message` is a DAP event reporting that the debuggee stopped or
+/// ended: the events [`DapClient::stopped`] waits for.
+fn is_stop_class_event(message: &serde_json::Value) -> bool {
+    message["type"] == "event"
+        && matches!(
+            message["event"].as_str(),
+            Some("stopped" | "terminated" | "exited")
+        )
+}
+
+/// Appends `message` to `early` when it is a stop-class event.
+fn keep_stop_class_event(early: &mut Vec<serde_json::Value>, message: serde_json::Value) {
+    if is_stop_class_event(&message) {
+        early.push(message);
+    }
+}
+
 /// A Debug Adapter Protocol client for hermit-dap, keeping a transcript so a
 /// failure shows the whole exchange together with the adapter's stderr.
 struct DapClient {
@@ -6804,10 +6837,15 @@ struct DapClient {
     next_seq: u64,
     transcript: Vec<String>,
     stderr_path: PathBuf,
+    /// The scaled [`DAP_SESSION_BUDGET`] and the instant it runs out.
+    session_budget: Duration,
+    session_deadline: Instant,
 }
 
 impl DapClient {
     fn spawn(mut command: Command, stderr_path: PathBuf) -> Self {
+        let session_budget = DAP_SESSION_BUDGET.mul_f64(dap_wall_timeout_multiplier());
+        let session_deadline = Instant::now() + session_budget;
         let stderr =
             fs::File::create(&stderr_path).expect("failed to create the hermit-dap stderr file");
         let mut adapter = command
@@ -6873,6 +6911,26 @@ impl DapClient {
             next_seq: 0,
             transcript: Vec::new(),
             stderr_path,
+            session_budget,
+            session_deadline,
+        }
+    }
+
+    /// `timeout`, cut off at the end of the session budget, and what to add
+    /// to the failure when the cut-off is what runs out.
+    fn session_bound(&self, timeout: Duration) -> (Duration, String) {
+        let left = self
+            .session_deadline
+            .saturating_duration_since(Instant::now());
+        if left < timeout {
+            let note = format!(
+                " (the end of the DAP session's {:?} budget, which is set below \
+                 nextest's per-test wall kill)",
+                self.session_budget
+            );
+            (left, note)
+        } else {
+            (timeout, String::new())
         }
     }
 
@@ -6913,7 +6971,20 @@ impl DapClient {
         timeout: Duration,
         matches: impl Fn(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
-        let deadline = Instant::now() + timeout;
+        self.wait_for_noting(what, timeout, matches, |_| {})
+    }
+
+    /// Like [`Self::wait_for`], but each earlier message is also handed to
+    /// `skipped` after it is logged.
+    fn wait_for_noting(
+        &mut self,
+        what: &str,
+        timeout: Duration,
+        matches: impl Fn(&serde_json::Value) -> bool,
+        mut skipped: impl FnMut(serde_json::Value),
+    ) -> serde_json::Value {
+        let (bound, cut_off) = self.session_bound(timeout);
+        let deadline = Instant::now() + bound;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.messages.recv_timeout(remaining) {
@@ -6924,11 +6995,12 @@ impl DapClient {
                     if matches(&message) {
                         return message;
                     }
+                    skipped(message);
                 }
                 Ok(Err(problem)) => self.fail(&format!("waiting for {what}: {problem}")),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.fail(&format!("timed out after {timeout:?} waiting for {what}"))
-                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.fail(&format!(
+                    "timed out after {bound:?} waiting for {what}{cut_off}"
+                )),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.fail(&format!(
                     "hermit-dap closed its output while waiting for {what}"
                 )),
@@ -6943,10 +7015,25 @@ impl DapClient {
         arguments: serde_json::Value,
         timeout: Duration,
     ) -> serde_json::Value {
+        self.call_noting(command, arguments, timeout, |_| {})
+    }
+
+    /// Like [`Self::call`], but each message before the response is also
+    /// handed to `skipped`.
+    fn call_noting(
+        &mut self,
+        command: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+        skipped: impl FnMut(serde_json::Value),
+    ) -> serde_json::Value {
         let seq = self.request(command, arguments);
-        let response = self.wait_for(&format!("the {command} response"), timeout, |message| {
-            message["type"] == "response" && message["request_seq"] == seq
-        });
+        let response = self.wait_for_noting(
+            &format!("the {command} response"),
+            timeout,
+            |message| message["type"] == "response" && message["request_seq"] == seq,
+            skipped,
+        );
         if response["success"] != true {
             self.fail(&format!("{command} failed: {response}"));
         }
@@ -6987,12 +7074,15 @@ impl DapClient {
 
     /// Waits up to `timeout` for the adapter to exit and returns its status.
     fn exit_status(&mut self, timeout: Duration) -> std::process::ExitStatus {
-        let deadline = Instant::now() + timeout;
+        let (bound, cut_off) = self.session_bound(timeout);
+        let deadline = Instant::now() + bound;
         loop {
             match self.adapter.0.try_wait() {
                 Ok(Some(status)) => return status,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                Ok(None) => self.fail(&format!("hermit-dap did not exit within {timeout:?}")),
+                Ok(None) => self.fail(&format!(
+                    "hermit-dap did not exit within {bound:?}{cut_off}"
+                )),
                 Err(error) => self.fail(&format!("failed to poll hermit-dap: {error}")),
             }
         }
@@ -7013,6 +7103,15 @@ impl DapClient {
 
     /// Attaches to `target`, sets one breakpoint at `line` of `source`, finishes
     /// configuration, and returns the thread of the initial stop.
+    ///
+    /// GDB 16 and later defer the attach until `configurationDone`, so the
+    /// attach stop follows it. GDB 15 runs `target remote` inside the `attach`
+    /// request and reports the attach stop during configuration, before
+    /// `configurationDone` is even sent. A stop-class event that arrives
+    /// during configuration is therefore kept rather than discarded: waiting
+    /// for a second stop after it would hang, as it did with GDB 15.1 on the
+    /// hosted runner in
+    /// <https://github.com/rrnewton/hermit/actions/runs/37134916002>.
     fn attach_and_break(
         &mut self,
         program: &Path,
@@ -7020,25 +7119,32 @@ impl DapClient {
         source: &Path,
         line: u64,
     ) -> serde_json::Value {
+        let mut early = Vec::new();
         let attach = self.request(
             "attach",
             serde_json::json!({"program": program, "target": target}),
         );
-        let initialized = self.wait_for("the initialized event", DAP_TIMEOUT, |message| {
-            message["event"] == "initialized"
-                || (message["type"] == "response" && message["request_seq"] == attach)
-        });
+        let initialized = self.wait_for_noting(
+            "the initialized event",
+            DAP_TIMEOUT,
+            |message| {
+                message["event"] == "initialized"
+                    || (message["type"] == "response" && message["request_seq"] == attach)
+            },
+            |message| keep_stop_class_event(&mut early, message),
+        );
         if initialized["type"] == "response" && initialized["success"] != true {
             self.fail(&format!("attach failed: {initialized}"));
         }
-        let breakpoints = self.call(
+        let breakpoints = self.call_noting(
             "setBreakpoints",
             serde_json::json!({"source": {"path": source}, "breakpoints": [{"line": line}]}),
             DAP_TIMEOUT,
+            |message| keep_stop_class_event(&mut early, message),
         );
-        // GDB answers before `target remote` has run, so the breakpoint is
-        // still pending here. That it resolved is proved later, by a
-        // `breakpoint` stop at this line.
+        // GDB 16 and later answer before `target remote` has run, so the
+        // breakpoint is still pending here. That it resolved is proved later,
+        // by a `breakpoint` stop at this line.
         if breakpoints["body"]["breakpoints"]
             .as_array()
             .is_none_or(|breakpoints| breakpoints.len() != 1)
@@ -7047,8 +7153,27 @@ impl DapClient {
                 "expected one breakpoint for line {line}: {breakpoints}"
             ));
         }
-        self.call("configurationDone", serde_json::json!({}), DAP_TIMEOUT);
-        let stop = self.stopped("the stop after attaching", DAP_TIMEOUT);
+        self.call_noting(
+            "configurationDone",
+            serde_json::json!({}),
+            DAP_TIMEOUT,
+            |message| keep_stop_class_event(&mut early, message),
+        );
+        let stop = match early.as_slice() {
+            [] => self.stopped("the stop after attaching", DAP_TIMEOUT),
+            [event] if event["event"] == "stopped" && event["body"]["reason"] == "attach" => {
+                event["body"].clone()
+            }
+            events => self.fail(&format!(
+                "expected nothing but one `attach` stop before configurationDone \
+                 answered, got: {}",
+                events
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
         if !stop["threadId"].is_u64() {
             self.fail(&format!("the attach stop names no thread: {stop}"));
         }
@@ -7057,13 +7182,7 @@ impl DapClient {
 
     /// The body of the next `stopped` event; the debuggee ending first fails.
     fn stopped(&mut self, what: &str, timeout: Duration) -> serde_json::Value {
-        let event = self.wait_for(what, timeout, |message| {
-            message["type"] == "event"
-                && matches!(
-                    message["event"].as_str(),
-                    Some("stopped" | "terminated" | "exited")
-                )
-        });
+        let event = self.wait_for(what, timeout, is_stop_class_event);
         if event["event"] != "stopped" {
             self.fail(&format!("expected {what}, but the debuggee ended: {event}"));
         }
