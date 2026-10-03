@@ -6,7 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
+use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Guest;
@@ -45,14 +50,50 @@ struct Mapping {
     anonymous_shmem: bool,
 }
 
-fn parse_maps(text: &str) -> Vec<Mapping> {
+/// `(major, minor)` of a device as `/proc/<pid>/maps` prints it.
+type Device = (u32, u32);
+
+/// The device of the kernel's internal shmem mount, found from a memfd,
+/// which Linux creates on that mount.
+///
+/// Shared anonymous memory and System V segments live on the same mount, and
+/// their names there (`/dev/zero`, `/SYSV<key>`) are chosen by the kernel:
+/// nothing can create a named file on it. A file elsewhere with one of those
+/// names is on another device. `None` if no memfd could be made, in which
+/// case every file-backed mapping is refilled.
+fn shmem_device() -> Option<Device> {
+    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
+    *DEVICE.get_or_init(|| {
+        // SAFETY: the name is a valid C string; the result is checked.
+        let fd = unsafe { libc::memfd_create(c"hermit-shmem-device".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: memfd_create returned a new descriptor that nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let dev = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .ok()?
+            .dev();
+        Some((libc::major(dev), libc::minor(dev)))
+    })
+}
+
+fn parse_device(field: &str) -> Option<Device> {
+    let (major, minor) = field.split_once(':')?;
+    Some((
+        u32::from_str_radix(major, 16).ok()?,
+        u32::from_str_radix(minor, 16).ok()?,
+    ))
+}
+
+fn parse_maps(text: &str, shmem_device: Option<Device>) -> Vec<Mapping> {
     text.lines()
         .filter_map(|line| {
             let mut fields = line.split_ascii_whitespace();
             let (start, end) = fields.next()?.split_once('-')?;
             let perms = fields.next()?.as_bytes();
             let _offset = fields.next()?;
-            let _device = fields.next()?;
+            let device = parse_device(fields.next()?);
             let inode = fields.next()?;
             let path = fields.collect::<Vec<_>>().join(" ");
             if perms.len() < 4 {
@@ -74,7 +115,9 @@ fn parse_maps(text: &str) -> Vec<Mapping> {
                 prot,
                 private: perms[3] == b'p',
                 file_backed: inode != "0",
-                anonymous_shmem: path == "/dev/zero (deleted)" || path.starts_with("/SYSV"),
+                anonymous_shmem: shmem_device.is_some()
+                    && device == shmem_device
+                    && (path == "/dev/zero (deleted)" || path.starts_with("/SYSV")),
             })
         })
         .collect()
@@ -85,7 +128,7 @@ fn parse_maps(text: &str) -> Vec<Mapping> {
 fn read_mappings(path: &str) -> Vec<Mapping> {
     let maps = std::fs::read(path)
         .unwrap_or_else(|error| panic!("Cannot record madvise: {path}: {error}"));
-    parse_maps(&String::from_utf8_lossy(&maps))
+    parse_maps(&String::from_utf8_lossy(&maps), shmem_device())
 }
 
 /// The parts of `[start, end)` covered by mappings that replay represents
@@ -293,15 +336,21 @@ mod tests {
 00400000-00401000 r-xp 00000000 08:01 1234 /usr/bin/guest
 7f0000000000-7f0000002000 rw-p 00000000 00:00 0
 7f0000002000-7f0000003000 rw-p 00001000 08:01 1234 /usr/bin/guest
-7f0000003000-7f0000004000 ---s 00000000 00:05 77 /dev/zero (deleted)
+7f0000003000-7f0000004000 ---s 00000000 00:01 77 /dev/zero (deleted)
 7f0000004000-7f0000005000 rw-s 00000000 00:01 88 /memfd:shared state (deleted)
+7f0000005000-7f0000006000 rw-s 00000000 00:01 2 /SYSV00000000 (deleted)
+7f0000006000-7f0000007000 rw-s 00000000 08:01 99 /SYSV00000000 (deleted)
+7f0000007000-7f0000008000 rw-s 00000000 00:05 98 /dev/zero (deleted)
 7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
 ";
 
+    /// The shmem device in `MAPS`.
+    const SHMEM: Option<Device> = Some((0, 1));
+
     #[test]
     fn parses_maps_lines() {
-        let mappings = parse_maps(MAPS);
-        assert_eq!(mappings.len(), 6);
+        let mappings = parse_maps(MAPS, SHMEM);
+        assert_eq!(mappings.len(), 9);
         assert_eq!(
             mappings[0],
             Mapping {
@@ -319,11 +368,12 @@ mod tests {
         assert!(mappings[3].file_backed);
         assert!(mappings[3].anonymous_shmem);
         assert!(!mappings[4].anonymous_shmem);
+        assert!(mappings[5].anonymous_shmem);
     }
 
     #[test]
     fn refill_ranges_clip_to_the_advised_range() {
-        let mappings = parse_maps(MAPS);
+        let mappings = parse_maps(MAPS, SHMEM);
         assert_eq!(
             refill_ranges(&mappings, 0x7f0000001000, 0x7f0000004000),
             vec![(
@@ -337,20 +387,55 @@ mod tests {
 
     #[test]
     fn refill_ranges_cover_shared_files_but_not_shared_anonymous_memory() {
-        let mappings = parse_maps(MAPS);
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        // The memfd and the two files merely named like shared anonymous
+        // memory on other devices are refilled.
+        let mappings = parse_maps(MAPS, SHMEM);
         assert_eq!(
-            refill_ranges(&mappings, 0x7f0000003000, 0x7f0000005000),
-            vec![(
-                0x7f0000004000,
-                0x7f0000005000,
-                libc::PROT_READ | libc::PROT_WRITE
-            )]
+            refill_ranges(&mappings, 0x7f0000003000, 0x7f0000008000),
+            vec![
+                (0x7f0000004000, 0x7f0000005000, rw),
+                (0x7f0000006000, 0x7f0000007000, rw),
+                (0x7f0000007000, 0x7f0000008000, rw),
+            ]
+        );
+        // Without a known shmem device, everything file-backed is refilled.
+        let mappings = parse_maps(MAPS, None);
+        assert!(mappings.iter().all(|mapping| !mapping.anonymous_shmem));
+        assert_eq!(
+            refill_ranges(&mappings, 0x7f0000003000, 0x7f0000008000).len(),
+            5
         );
     }
 
     #[test]
+    fn this_hosts_shared_anonymous_memory_is_on_the_shmem_device() {
+        // SAFETY: a fresh anonymous mapping, unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        let mappings = read_mappings("/proc/self/maps");
+        let mapping = mappings
+            .iter()
+            .find(|mapping| mapping.start == addr as usize)
+            .expect("the new mapping is listed");
+        assert!(mapping.file_backed && mapping.anonymous_shmem);
+        assert!(refill_ranges(&mappings, mapping.start, mapping.end).is_empty());
+        // SAFETY: mapped above and no longer referenced.
+        assert_eq!(unsafe { libc::munmap(addr, PAGE_SIZE) }, 0);
+    }
+
+    #[test]
     fn wipeonfork_prefix_stops_at_the_first_private_file_mapping() {
-        let mappings = parse_maps(MAPS);
+        let mappings = parse_maps(MAPS, SHMEM);
         assert_eq!(
             wipeonfork_live_len(&mappings, 0x7f0000000000, 0x7f0000004000),
             Some(0x2000)
