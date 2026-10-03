@@ -379,6 +379,48 @@ publisher and verifier inventory every entry of a runtime closure, including
 directories and special files, and refuse any special file in a complete
 bundle, which its regular-file manifest could not bind.
 
+### Buck as the E2E runner
+
+A second, independent opt-in changes who runs the E2E cells, not which binary
+they test:
+
+```sh
+./scripts/validate.rs full --e2e-runner buck-hybrid \
+  --buck2 ~/.config/hermit/buck2.dotslash
+```
+
+`--e2e-runner` takes `cargo` (the default), `buck-local` (every cell runs on
+this host) or `buck-hybrid` (cells routed to remote execution run there, the
+rest locally). A Buck runner is accepted only for the complete `full` level,
+never with `--only`, `--selected` or `--buck-release`, and only with `--buck2`
+naming an absolute, executable, non-symlink file. That file is the host's own
+Buck2 launcher. Remote execution needs an internal Buck2 build, whose DotSlash
+descriptor is **never committed** to this repository: keep it outside the
+checkout (for example `~/.config/hermit/buck2.dotslash`) and pass its path.
+Nothing is inferred from ambient environment, and nothing falls back to Cargo.
+
+The plan is the committed `full` plan with the `full-buck-e2e` label swapped
+in (`buck_e2e_selection` in `ci/manifest-plan/src/validation_dag.rs`): the 16
+Cargo E2E bucket nodes, the compatibility scorecard and the five nodes that
+only fed them leave the plan, and `e2e.buck_cells` plus one `<bucket>_buck`
+import twin per bucket and `full-scorecard.compatibility_buck` take their
+place. `e2e.buck_cells` (`ci/buck-e2e/validate-node`) regenerates the
+third-party rules, stages the remote-execution inputs for `buck-hybrid`,
+builds the inputs Buck does not build yet with Cargo
+(`ci/buck-e2e/stage --from-cargo`), and runs every cell with
+`-c hermit_e2e.hermit=staged`. Each twin then judges its bucket's rows with the
+same `test-harness run` verdict as the Cargo bucket, reading them through
+`E2E_IMPORT_RESULTS`.
+
+The cells therefore test the Cargo-built validate-profile `hermit` staged at
+`target/buck-e2e-stage/validate/hermit`, with the same debug assertions and
+overflow checks as a Cargo-runner run. The ledger row records `release_builder:
+cargo`, `e2e_runner` (`cargo`, `buck-local` or `buck-hybrid`), and an
+`e2e_payload` whose path is that staged binary. A Buck-runner request is never
+answered from the tree cache. The host prerequisites below apply, and
+`HERMIT_GIT_DEP_MIRRORS` must be set in the validation's environment when the
+proxy refuses GitHub to Reindeer.
+
 ## Host prerequisites for Buck validation
 
 The Buck E2E flow (`shim/modes/stage-re-inputs`, `ci/buck-e2e/stage`, then
