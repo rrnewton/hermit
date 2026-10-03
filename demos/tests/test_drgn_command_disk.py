@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Tests for demo 7's command-disk resume, QMP socket path, and process cleanup."""
+"""Tests for demo 7's command-disk resume, QMP socket path, process cleanup,
+and RESULT line."""
 
+import contextlib
+import importlib.util
+import io
 import os
+import re
 import socket
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+DEMO07_DIR = Path(__file__).resolve().parent.parent / "07-drgn-kernel"
 sys.path.insert(0, str(LIB_DIR))
 
 import demo_common as dc  # noqa: E402
@@ -251,6 +258,102 @@ class QmpSocketPathTest(unittest.TestCase):
         kept_program.qmp_socket = in_run_dir
         kept_program.close()
         self.assertTrue(in_run_dir.exists())
+
+
+def _load_task_evolution():
+    """Load demo 7's drgn script with drgn itself replaced by empty modules.
+
+    The script imports a drgn helper at the top, and drgn need not be installed
+    to check what the script prints. None of the tests below reads guest memory.
+    """
+    names = ("drgn", "drgn.helpers", "drgn.helpers.linux", "drgn.helpers.linux.list")
+    stubs = {name: types.ModuleType(name) for name in names}
+    stubs["drgn.helpers.linux.list"].list_for_each_entry = mock.Mock(
+        side_effect=AssertionError("guest memory is not read in these tests")
+    )
+    spec = importlib.util.spec_from_file_location(
+        "demo07_task_evolution", str(DEMO07_DIR / "task_evolution.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    # The script prepends demos/lib to sys.path when it is loaded; keep that
+    # from leaking into the rest of the test process.
+    with mock.patch.dict(sys.modules, stubs):
+        with mock.patch.object(sys, "path", list(sys.path)):
+            spec.loader.exec_module(module)
+    return module
+
+
+class TaskEvolutionResultTest(unittest.TestCase):
+    """Demo 7's RESULT line names the sleep its command requests.
+
+    The command asks the guest for ``usleep 1000``; the guest then runs the rest
+    of the command and keeps running until the marker is seen and QEMU is
+    paused. Nothing measures how far guest time moved, so the RESULT field must
+    report the requested sleep, not a fixed advance.
+    """
+
+    def setUp(self):
+        self.module = _load_task_evolution()
+
+    def _requested_usleep(self) -> str:
+        command = self.module.DEFAULT_ADVANCE_COMMAND
+        match = re.search(r"(?:^|; )usleep (\d+);", command)
+        self.assertIsNotNone(match, command)
+        return match.group(1)
+
+    def _result_line(self) -> str:
+        """Run main() over two identical passes and return its RESULT line."""
+        before = [(0, "swapper/0"), (1, "init"), (95, "sleep")]
+        after = [(0, "swapper/0"), (1, "sh"), (101, "sleep"), (102, "sleep")]
+        removed, added = self.module._task_diff(before, after)
+        metrics = dh.ObservationMetrics(
+            physical_reads=1,
+            physical_bytes=4096,
+            qemu_state="t",
+            tracer_state="T",
+            serial_bytes_delta=0,
+        )
+        passes = (before, after, removed, added, metrics, metrics)
+        environment = {"DEMO07_RUNS": "2", "DEMO07_TASK_LIMIT": "16"}
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(self.module, "_config", return_value=object())
+            )
+            stack.enter_context(
+                mock.patch.object(self.module, "_run_once", return_value=passes)
+            )
+            stack.enter_context(mock.patch.dict(os.environ, environment))
+            stack.enter_context(contextlib.redirect_stdout(output))
+            self.assertEqual(self.module.main(), 0)
+        lines = output.getvalue().splitlines()
+        results = [line for line in lines if line.startswith("RESULT: ")]
+        self.assertEqual(len(results), 1, output.getvalue())
+        return results[0]
+
+    def test_result_reports_the_requested_sleep(self):
+        line = self._result_line()
+        fields = dict(
+            item.split("=", 1)
+            for item in line[len("RESULT: ") :].split("; ")
+            if "=" in item
+        )
+        self.assertNotIn("fixed_virtual_advance_us", fields, line)
+        requested = fields.get("requested_sleep_us")
+        self.assertEqual(requested, self._requested_usleep(), line)
+
+    def test_the_guest_command_is_unchanged(self):
+        # The command is now built from REQUESTED_SLEEP_US; the bytes the guest
+        # reads from its command disk must be the same as before.
+        self.assertEqual(
+            self.module.DEFAULT_ADVANCE_COMMAND,
+            "for n in 1 2; do sleep 1000 & done; "
+            'usleep 1000; echo __HERMIT_DEMO07_ADVANCE_"DONE__"',
+        )
+
+    def test_the_readme_shows_the_result_line_the_script_prints(self):
+        readme = (DEMO07_DIR / "README.md").read_text()
+        self.assertIn("\n" + self._result_line() + "\n", readme)
 
 
 if __name__ == "__main__":

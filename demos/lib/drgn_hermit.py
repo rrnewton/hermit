@@ -835,7 +835,7 @@ class HermitGuestProgram:
         raise TimeoutError("guest advance marker was not seen")
 
     def advance(self, command: str, marker: bytes) -> None:
-        """Run one fixed guest command interval, then freeze at its marker."""
+        """Run the preloaded guest command, then freeze the guest at its completion marker."""
         if not self._frozen or self._qmp is None:
             raise RuntimeError("guest is not ready for deterministic advance")
         if self._tracer_tgid is None or self._qemu_pid is None:

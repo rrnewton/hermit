@@ -5,8 +5,8 @@ disturbing it. This demo restores the snapshot from
 [demo 5](../05-qemu-boot/README.md), pauses the machine, and uses the
 [drgn](https://github.com/osandov/drgn) kernel debugger to read the guest
 kernel's list of tasks straight out of QEMU's memory. It then lets the guest run
-a fixed command that starts two processes and waits for 1 millisecond of guest
-time, pauses again, and reads the task list a second time. It does all of this
+a fixed command that starts two processes and asks for a 1 millisecond sleep,
+pauses again, and reads the task list a second time. It does all of this
 twice from fresh copies of the snapshot and checks that both passes see exactly
 the same task lists and the same difference between them.
 
@@ -83,7 +83,7 @@ task-list diff (- before, + after):
   +     1 sh
   +   101 sleep
   +   102 sleep
-RESULT: restored demo 5 boot snapshot; fixed_virtual_advance_us=1000; task_lists_differ=yes; evolution_reproducible=yes; read_virtual_time_advanced=no
+RESULT: restored demo 5 boot snapshot; requested_sleep_us=1000; task_lists_differ=yes; evolution_reproducible=yes; read_virtual_time_advanced=no
 
 === Demo 7: drgn Kernel Task Evolution: SUCCESS ===
 ```
@@ -148,8 +148,12 @@ use.
 To advance, the demo resumes Hermit's tracer, tells QEMU to continue over its
 control socket, and waits for the command's completion marker on the serial
 port. It then pauses QEMU and stops the tracer again for the second read. Guest
-time advances only between the two reads, by the fixed 1 millisecond timer in
-the command.
+time advances only between the two reads. The command asks for a 1 millisecond
+sleep (`usleep 1000`, printed as `requested_sleep_us=1000`), but that is a
+request, not a measurement: the guest also runs the rest of the command, and it
+keeps running until the demo sees the marker and pauses QEMU. The advance is
+the sleep plus everything else that runs before QEMU pauses, and the demo does
+not measure it.
 
 Controls (environment variables):
 

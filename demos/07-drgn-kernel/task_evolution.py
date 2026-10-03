@@ -20,11 +20,17 @@ from drgn_hermit import GuestConfig, program_from_hermit  # noqa: E402
 
 
 ADVANCE_MARKER = b"__HERMIT_DEMO07_ADVANCE_DONE__"
+# The sleep the command asks the guest for, in microseconds. It is a request,
+# not a measured advance: the guest also runs the rest of the command, and it
+# keeps running until this process sees the marker and pauses QEMU. Nothing
+# here measures how far guest time moves between the two reads.
+REQUESTED_SLEEP_US = 1000
 DEFAULT_ADVANCE_COMMAND = (
     "for n in 1 2; do sleep 1000 & done; "
+    + "usleep {}; ".format(REQUESTED_SLEEP_US)
     # Split the marker in the command text so terminal echo cannot satisfy the
     # wait; only the shell's post-timer output contains the complete marker.
-    'usleep 1000; echo __HERMIT_DEMO07_ADVANCE_"DONE__"'
+    + 'echo __HERMIT_DEMO07_ADVANCE_"DONE__"'
 )
 
 
@@ -178,9 +184,9 @@ def main() -> int:
     if any(item.serial_bytes_delta != 0 for item in all_metrics):
         raise RuntimeError("guest serial output advanced during a drgn read")
     print(
-        "RESULT: restored demo 5 boot snapshot; fixed_virtual_advance_us=1000; "
+        "RESULT: restored demo 5 boot snapshot; requested_sleep_us={}; "
         "task_lists_differ=yes; evolution_reproducible=yes; "
-        "read_virtual_time_advanced=no"
+        "read_virtual_time_advanced=no".format(REQUESTED_SLEEP_US)
     )
     return 0
 

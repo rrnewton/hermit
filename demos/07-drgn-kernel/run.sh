@@ -17,9 +17,11 @@ usage() {
 Usage: demos/07-drgn-kernel/run.sh
 
 Restore demo 5's QEMU/Linux snapshot twice. Each restore takes a read-only drgn
-snapshot of the kernel task list, advances guest virtual time by a fixed 1000
-microseconds (during which the guest starts two tasks), and takes a second
-task-list snapshot. The two restores must produce the same before, after, and
+snapshot of the kernel task list, lets the guest run a fixed command that starts
+two tasks and requests a 1000-microsecond sleep, pauses the guest when the
+command prints its completion marker, and takes a second task-list snapshot.
+The sleep is what the command asks for; how far guest time moves is not
+measured. The two restores must produce the same before, after, and
 difference. The drgn reads execute no guest instructions.
 
 Useful overrides:
