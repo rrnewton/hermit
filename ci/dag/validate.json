@@ -1628,6 +1628,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "kvm"
@@ -1839,6 +1846,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -5282,6 +5296,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -6104,6 +6132,13 @@
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -12757,6 +12792,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -12828,6 +12870,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -14108,6 +14157,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -14403,6 +14466,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timerfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -18239,6 +18309,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "liteinst"
@@ -18415,6 +18492,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -20927,6 +21011,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -21518,6 +21616,13 @@
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
