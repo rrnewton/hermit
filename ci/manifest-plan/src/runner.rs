@@ -4648,8 +4648,16 @@ fn monitor_process<R>(
                 }
                 Err(error) => {
                     let reason = error.reason;
-                    let missing_since = cpu_accounting_missing_since.get_or_insert(now);
-                    if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
+                    // Time the grace from when the failed sample returned, not
+                    // from `now`, which was taken before it ran. One host-wide
+                    // /proc census can itself outlast the grace, and proccpu
+                    // then serves its refusal again for 500 ms
+                    // (https://github.com/rrnewton/hermit/issues/3377). Timed
+                    // from `now`, that census alone would stop the command at
+                    // the next poll, with no fresh sample in between.
+                    let failed_at = Instant::now();
+                    let missing_since = cpu_accounting_missing_since.get_or_insert(failed_at);
+                    if failed_at.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
                         observation.termination = TerminationPath::AccountingUnavailableStop;
                         return match stop_process_group(pid, started, &mut observation.final_wait) {
                             Ok(_) => Err(format!(
@@ -9459,6 +9467,63 @@ mod tests {
         assert_eq!(live.valid_polls, 1);
         assert!(live.unavailable_polls > 1);
         assert!(matches!(live.last_error, RequiredNullable::Value(_)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_slow_failed_sample_does_not_use_up_the_unavailable_grace() {
+        // One host-wide /proc census can outlast the whole grace. proccpu then
+        // refuses it ("scan deadline") and serves that refusal again for 500 ms
+        // (https://github.com/rrnewton/hermit/issues/3377). The grace is timed
+        // from when the failed sample returned, so the refusal served right
+        // after a slow census cannot stop the command before a fresh sample
+        // runs. The samples are synthetic so the sequence is exact on any host.
+        let root = cpu_reader_test_root("reader-slow-failure");
+        let done = root.join("done");
+        let (child, started, mut observation) = spawn_cpu_reader_fixture(
+            &root,
+            "slow",
+            "while [ ! -f done ]; do sleep 0.02; done",
+            true,
+        );
+        let pid = child.id();
+        let mut samples = 0;
+        let output = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_| {
+                samples += 1;
+                match samples {
+                    1 => {
+                        std::thread::sleep(CELL_CPU_ACCOUNTING_GRACE + Duration::from_millis(200));
+                        Err("fixture scan deadline".into())
+                    }
+                    2 => Err("fixture scan deadline".into()),
+                    _ => {
+                        fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                        Ok(0.0)
+                    }
+                }
+            },
+        )
+        .expect("a slow failed sample followed by a valid one must not stop the command");
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert!(started.elapsed() > CELL_CPU_ACCOUNTING_GRACE);
+        assert!(samples >= 3);
+        assert!(done.is_file());
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.unavailable_polls, 2);
+        assert!(live.valid_polls >= 1);
         fs::remove_dir_all(root).unwrap();
     }
 
