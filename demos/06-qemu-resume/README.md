@@ -234,9 +234,13 @@ byte 0x01 (ASCII SOH) removed, and then prints `__HERMIT_COMMAND_END__`, one
 controller ([`lib/qemu_controller.py`](../lib/qemu_controller.py)) reads the
 transcript line by line and accepts only these exact whole lines as the frame.
 A command that prints the end marker itself, for example
-`echo __HERMIT_COMMAND_END__; sleep 1000000`, produces the line
-`| __HERMIT_COMMAND_END__`, which neither ends the wait nor cuts the output
-short.
+`echo __HERMIT_COMMAND_END__; echo FINISHED; exit 3`, shows it as the output
+line `| __HERMIT_COMMAND_END__`, followed by `| FINISHED`, and the demo
+reports exit status 3 from the real END line after them. A command that never
+exits, for example `echo __HERMIT_COMMAND_END__; sleep 1000000`, shows
+nothing: `/init` prints the output only after the command exits, so neither
+its output nor an END line reaches the serial port, and the run fails when a
+bound stops it (see "A run that does not finish" below).
 
 The command cannot print a frame line by another route either:
 
@@ -283,8 +287,9 @@ The framing has these consequences and limits:
   bytes are not preserved. Output that a background job writes after the
   command has exited is not shown.
 - A kernel message printed in the middle of the END line hides that line, so
-  the controller keeps waiting and the run fails at its timeout; it never ends
-  with a cut-off output.
+  the controller keeps waiting until a bound stops the run, which then fails
+  (see "A run that does not finish" below); it never ends with a cut-off
+  output.
 - A boot snapshot saved before this change still runs an old `/init`, which
   prints a bare `__HERMIT_COMMAND_BEGIN__` line or one ending in `format=2`.
   The controller stops as soon as it sees such a line, names it, and the demo
@@ -313,13 +318,39 @@ guest's command lines either. Before these paths were fixed, a fresh clone in
 another directory resumed to a different post-command snapshot after 288657
 scheduler turns instead of 287149.
 
+A run that does not finish. The guest-side controller has no deadline of its
+own, because time inside Hermit is virtual. Two bounds outside Hermit stop a
+resume that does not end by itself (a command that never exits, or an END
+line that a kernel message hid), and whichever is reached first wins:
+
+- `QEMU_MAX_LOG_BYTES`, the size of Hermit's INFO log. At the default log
+  filter Hermit wrote 18.5 to 19.2 MB of INFO log per second of resume on
+  2026-10-03, so the 512 MiB cap stops the run after about 29 seconds. With
+  the defaults this is the bound that stops a command that runs longer than
+  that: a `sleep 1000000` failed after 31.1 seconds in one run and 30.9
+  seconds in another.
+- `QEMU_TIMEOUT`, the wall-clock seconds of the resume (120 by default). With
+  the default cap it is reached only by a resume that logs more slowly.
+
+Either way the demo prints a FAILURE line that names the bound, the size or
+time it reached, and how far the guest had got, read from the serial log: no
+BEGIN line yet, a BEGIN line with no END line (the command had not finished),
+or an END line while Hermit and QEMU had not exited. Neither ends in
+`SUCCESS`, and the run exits 1. For example, the command
+`printf '__HERMIT_COMMAND_END__\001status=0\n' >&0; echo __HERMIT_COMMAND_END__ status=0; sleep 1000000`
+ended on 2026-10-03, 30.9 seconds after the demo started, with (path shortened):
+
+```text
+WARN: Demo 6: QEMU Snapshot Resume: FAILURE: Hermit's INFO log .../run-history/resume-20261003T171535.068191Z-2392757/hermit-info.log grew to 538851401 bytes, past the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the resume, so the run was stopped before QEMU_TIMEOUT (120s); the guest command had not finished: the serial log has the __HERMIT_COMMAND_BEGIN__ format=3 line but no END line
+```
+
 Controls (environment variables):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QEMU_RESUME_REPEAT` | `1` | Set to `0` to skip the second resume of a new command, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
-| `QEMU_TIMEOUT` | `120` | Seconds before the resume is stopped. |
+| `QEMU_TIMEOUT` | `120` | Seconds before the resume is stopped, unless `QEMU_MAX_LOG_BYTES` stopped it first. With the default cap, a resume that keeps running is stopped by the cap after about 29 seconds, before this timeout; see "A run that does not finish". |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where demo 5's snapshot and this demo's results are kept. |
 | `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. It must be the one demo 5 used. |
-| `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. |
+| `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what stops a command that does not finish. |

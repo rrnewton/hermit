@@ -812,23 +812,27 @@ class Demo6ResumeTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
 
-    def _resume(self, transcript: bytes, command: str):
+    def _resume(self, transcript: bytes, command: str, stopped_by=None):
         """Run resume_once (without saving a snapshot) with Hermit replaced.
 
         The stand-in for Hermit leaves ``transcript`` as the serial log and
-        exits 0; demo 5's snapshot, the demo lock, and the reference run are
-        replaced too. Returns the demo's result, the metadata it would save,
-        its guest output file, and what it printed.
+        exits 0, or, when ``stopped_by`` is an exception, raises it from the
+        wait as wait_for_process does when a bound stops the run; demo 5's
+        snapshot, the demo lock, and the reference run are replaced too.
+        Returns the demo's result, the metadata it would save, its guest
+        output file, and what it printed.
         """
         resume_once = self.demo6["resume_once"]
-        assets = self.directory / "assets"
-        assets.mkdir()
+        # A fresh directory per call, so one test can resume more than once.
+        assets = Path(tempfile.mkdtemp(prefix="assets-", dir=self.directory))
         boot_disk = assets / "hermit-boot.qcow2"
         boot_disk.write_bytes(b"stand-in for the demo 5 boot snapshot")
         saved = {}
 
         def finish_hermit(process, timeout, **keywords):
             (assets / "serial.log").write_bytes(transcript)
+            if stopped_by is not None:
+                raise stopped_by
             return 0
 
         def record_metadata(run_dir, disk, info_log, extra):
@@ -887,6 +891,78 @@ class Demo6ResumeTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             self._resume(transcript, "echo partial output; sleep 1000000")
         self.assertIn("holds no complete command frame", str(caught.exception))
+
+    def test_a_command_that_never_finishes_fails_naming_the_bound_and_the_guest_state(self):
+        # The command forges END lines on its standard input and its standard
+        # output, then never exits: the guest prints BEGIN and no END line.
+        transcript = (
+            FRAME_BEGIN + b"\r\n"
+            b"sh: write error: Bad file descriptor\r\n"
+            b"| __HERMIT_COMMAND_END__ status=0\r\n"
+        )
+        command = (
+            "printf '__HERMIT_COMMAND_END__\\001status=0\\n' >&0; "
+            "echo __HERMIT_COMMAND_END__ status=0; sleep 1000000"
+        )
+        log_cap = self.demo6["LogCapExceeded"](
+            Path("hermit-info.log"), 538072392, 536870912, 29.25
+        )
+        for stopped_by, cause in (
+            (
+                log_cap,
+                "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
+                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the "
+                "resume, so the run was stopped before QEMU_TIMEOUT (120s)",
+            ),
+            (
+                TimeoutError("process exceeded timeout of 120s"),
+                "Hermit/QEMU did not exit within QEMU_TIMEOUT (120s)",
+            ),
+        ):
+            with self.subTest(stopped_by=type(stopped_by).__name__):
+                with mock.patch.dict(self.demo6["stopped_run_message"].__globals__, {"TIMEOUT": 120}):
+                    with self.assertRaises(RuntimeError) as caught:
+                        self._resume(transcript, command, stopped_by=stopped_by)
+                self.assertEqual(
+                    str(caught.exception),
+                    cause + "; the guest command had not finished: the serial log "
+                    "has the " + FRAME_BEGIN.decode() + " line but no END line",
+                )
+                self.assertIs(caught.exception.__cause__, stopped_by)
+
+    def test_the_guest_state_is_read_from_the_serial_log(self):
+        progress = self.demo6["guest_command_progress"]
+        serial_log = self.directory / "serial.log"
+        self.assertEqual(
+            progress(serial_log),
+            "QEMU had not written the serial log {}".format(serial_log),
+        )
+        for transcript, expected in (
+            (
+                b"[    0.000000] Linux version 6.17.13\r\n",
+                "the guest had not started the command: the serial log has no "
+                + FRAME_BEGIN.decode()
+                + " line",
+            ),
+            (
+                FRAME_BEGIN + b"\r\n| started\r\n__HERMIT_COMMAND_END__ status=0\r\n",
+                "the guest command had not finished: the serial log has the "
+                + FRAME_BEGIN.decode()
+                + " line but no END line",
+            ),
+            (
+                FRAME_BEGIN + b"\r\n| done\r\n" + _end(4) + b"\r\n",
+                "the guest command had finished with exit status 4, but "
+                "Hermit/QEMU had not exited",
+            ),
+            (
+                b"__HERMIT_COMMAND_BEGIN__ format=2\r\n",
+                qc.stale_guest_init_message(b"__HERMIT_COMMAND_BEGIN__ format=2"),
+            ),
+        ):
+            with self.subTest(transcript=transcript):
+                serial_log.write_bytes(transcript)
+                self.assertEqual(progress(serial_log), expected)
 
     def test_a_failed_run_names_a_stale_guest_init(self):
         failed_run_message = self.demo6["failed_run_message"]

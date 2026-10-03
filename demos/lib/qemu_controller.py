@@ -138,6 +138,11 @@ class CommandTranscriptParser:
         self._console_lines: List[bytes] = []
         self.result: Optional[CommandResult] = None
 
+    @property
+    def started(self) -> bool:
+        """Whether the current frame format's BEGIN line has been read."""
+        return self._started
+
     def feed(self, data: bytes) -> Optional[CommandResult]:
         """Add transcript bytes; return the result once the END line is in."""
         if self.result is not None:
