@@ -99,6 +99,16 @@ impl PollSnapshots {
         }
     }
 
+    pub(super) fn shared_observation_at(
+        &self,
+        channel: NetworkChannelId,
+        consumed: u64,
+    ) -> Option<(LogicalTime, i16)> {
+        self.latest
+            .get(&channel)
+            .and_then(|&(cut, at, mask)| (cut == consumed).then_some((at, mask)))
+    }
+
     #[cfg(test)]
     fn at(&self, channel: NetworkChannelId, consumed: u64) -> Result<i16, NetworkReplayError> {
         self.observation_at(channel, consumed).map(|(_, mask)| mask)

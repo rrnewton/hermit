@@ -30,8 +30,16 @@ pub(crate) struct CheckedReadInvocation {
 
 /// Immutable policy of one actual local Read admission. Numeric socket options
 /// alone cannot construct this permission to use the finite-timeout path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceivePolicyOrigin {
+    SoleInitial,
+    SharedFollowed,
+}
+
 #[derive(Debug)]
 pub(crate) struct SavedReceivePolicy {
+    origin: ReceivePolicyOrigin,
+    target: usize,
     owner: NetworkStreamOwner,
     call: crate::network_replay::NetworkStreamCallId,
     open_file: OpenFileId,
@@ -56,11 +64,66 @@ impl SavedReceivePolicy {
         call: crate::network_replay::NetworkStreamCallId,
         open_file: OpenFileId,
     ) -> bool {
-        self.owner == owner
+        self.origin == ReceivePolicyOrigin::SoleInitial
+            && self.owner == owner
             && self.call == call
             && self.open_file == open_file
             && self.root.is_current(owner)
             && self.root.is_sole_initial_root(owner)
+    }
+
+    /// Explicit controlled original-policy premise for component tests. It
+    /// supplies no native original-entry, live grant or complete Call census.
+    #[cfg(test)]
+    pub(crate) fn controlled_shared(
+        identity: (
+            NetworkStreamOwner,
+            crate::network_replay::NetworkStreamCallId,
+            OpenFileId,
+        ),
+        root: Arc<crate::network_runtime::ForegroundRoot>,
+        raw: (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs),
+        timing: (LogicalTime, Option<LogicalTime>),
+        options: (bool, usize),
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            origin: ReceivePolicyOrigin::SharedFollowed,
+            owner: identity.0,
+            call: identity.1,
+            open_file: identity.2,
+            root,
+            raw,
+            started: timing.0,
+            deadline: timing.1,
+            nonblocking: options.0,
+            target: options.1,
+        })
+    }
+
+    /// This immutable policy is not a live shared-MM census. A caller also
+    /// holds the original root's positive scheduler/physical/Call admission.
+    pub(crate) fn matches_shared(
+        &self,
+        owner: NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        open_file: OpenFileId,
+    ) -> bool {
+        self.origin == ReceivePolicyOrigin::SharedFollowed
+            && self.owner == owner
+            && self.call == call
+            && self.open_file == open_file
+            && self.root.is_current(owner)
+            && self.root.has_shared_mm_history()
+    }
+
+    pub(crate) fn target(&self) -> usize {
+        self.target
+    }
+    pub(crate) fn root(&self) -> &Arc<crate::network_runtime::ForegroundRoot> {
+        &self.root
+    }
+    pub(crate) fn raw(&self) -> (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs) {
+        self.raw
     }
 
     pub(crate) fn deadline(&self) -> Option<LogicalTime> {
@@ -382,6 +445,8 @@ impl GlobalState {
             })
             .transpose()?;
         let policy = Arc::new(SavedReceivePolicy {
+            origin: ReceivePolicyOrigin::SoleInitial,
+            target: 1,
             owner,
             call: call.id,
             open_file: call.open_file,

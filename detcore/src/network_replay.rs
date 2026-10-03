@@ -29,6 +29,7 @@ mod fd_read_metadata;
 mod helper_copy;
 pub(crate) mod lifetime;
 mod native_receive;
+pub(crate) use native_receive::shared_waits;
 pub(crate) mod original_connect;
 pub(crate) mod replay_connect;
 pub(crate) mod send_timing;
@@ -965,7 +966,16 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
         outcome: NetworkStreamPinOutcome,
     ) -> Result<(), NetworkReplayError> {
-        let state = self.owned_stream_call(owner, call)?;
+        let state = if self.stream_calls.get(&call).is_some_and(|state| {
+            matches!(
+                state.shared_attempt,
+                Some(native_receive::SharedAttempt::Wait(_))
+            )
+        }) {
+            self.shared_wait_pin_confirmation_state(owner, call)?
+        } else {
+            self.owned_stream_call(owner, call)?
+        };
         if state.phase != StreamCallPhase::PinAcquireSubmitted || !state.physical_pin_required {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }

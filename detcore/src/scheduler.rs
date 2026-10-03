@@ -4505,6 +4505,20 @@ impl Scheduler {
         })
     }
 
+    fn network_call_wait_is_ready(
+        engine: &NetworkReplayEngine,
+        owner: crate::network_replay::NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        kind: NetworkWaitKind,
+        deadline: Option<LogicalTime>,
+    ) -> Result<bool, crate::network_replay::NetworkReplayError> {
+        let binding = engine.call_wait_binding(owner, call, kind, deadline)?;
+        match binding.observed_ready {
+            Some(ready) => Ok(ready),
+            None => Self::network_wait_is_ready(engine, binding.open_file, kind),
+        }
+    }
+
     /// Release trace events whose exact virtual-time and outbound-progress
     /// gates are satisfied, then wake every eligible waiter.  No bytes are
     /// consumed here: after ordinary scheduling, the winning syscall consumes
@@ -4571,14 +4585,14 @@ impl Scheduler {
                         .zero_stream_wait_ready(*owner, *id)
                         .map(|ready| vec![ready])
                 } else {
-                    interests
+                    engine.validate_call_wait_set(*owner, interests,
+                        self.blocked.timed_waiters.thread_deadline(dettid)).and_then(|()| interests
                         .iter()
                         .map(|&(call, kind)| {
-                            engine
-                                .stream_call_open_file(*owner, call)
-                                .and_then(|ofd| Self::network_wait_is_ready(&engine, ofd, kind))
+                            Self::network_call_wait_is_ready(&engine, *owner, call, kind,
+                                self.blocked.timed_waiters.thread_deadline(dettid))
                         })
-                        .collect::<Result<Vec<_>, _>>()
+                        .collect::<Result<Vec<_>, _>>())
                 };
                 match readiness {
                     Ok(values) if values.iter().any(|value| *value) => ready.push(dettid),
@@ -6380,14 +6394,12 @@ impl Scheduler {
                             engine.zero_stream_wait_ready(owner, *id).map(|ready| vec![ready])
                         })
                     } else {
-                        interests
+                        engine.validate_call_wait_set(owner, interests, *deadline).and_then(|()| interests
                             .iter()
                             .map(|&(call, kind)| {
-                                engine
-                                    .stream_call_open_file(owner, call)
-                                    .and_then(|ofd| Self::network_wait_is_ready(&engine, ofd, kind))
+                                Self::network_call_wait_is_ready(&engine, owner, call, kind, *deadline)
                             })
-                            .collect::<Result<Vec<_>, _>>()
+                            .collect::<Result<Vec<_>, _>>())
                     }
                 };
                 let ready = match ready {

@@ -350,6 +350,14 @@ impl SharedMmForegroundObservation<'_> {
     pub(crate) fn owner(&self) -> NetworkStreamOwner { self.grant.owner() }
     pub(crate) fn epoch(&self) -> u64 { self.grant.epoch() }
     pub(crate) fn root(&self) -> &std::sync::Arc<crate::network_runtime::ForegroundRoot> { self.lineage.root() }
+    pub(crate) fn contains_root(
+        &self,
+        root: &std::sync::Arc<crate::network_runtime::ForegroundRoot>,
+    ) -> bool {
+        self.lineage
+            .members()
+            .any(|actual| std::sync::Arc::ptr_eq(actual, root))
+    }
 }
 impl Scheduler {
     /// Retained historical identity, not a final-wait issuer. Cleanup may have
@@ -655,5 +663,99 @@ impl Scheduler {
         self.step5_guest_unblock(tid, &request, &response).unwrap();
         self.step6_reenquue(tid, false);
         assert_eq!(self.ordinary_fd_observation(owner).unwrap().resume(), OrdinaryFdResume::Normal);
+    }
+}
+
+#[cfg(test)]
+impl Scheduler {
+    /// Queue a controlled, already authenticated child registration, then use
+    /// the real Normal request/response path. This does not issue a birth or
+    /// replace the retained native projection installed by the fixture.
+    pub(crate) fn controlled_shared_child_grant(
+        &mut self,
+        root: &crate::network_runtime::ForegroundRoot,
+    ) {
+        let owner = root.owner();
+        assert!(self.physical_thread_pidfds.contains_key(&owner.thread));
+        assert!(self.thread_tree.tree.contains_key(&owner.thread));
+        assert!(!self.next_turns.contains_key(&owner.thread));
+        self.next_turns.insert(
+            owner.thread,
+            ThreadNextTurn {
+                dettid: owner.thread,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        self.priorities
+            .insert(owner.thread, super::DEFAULT_PRIORITY);
+        self.runqueue_push_front(owner.thread);
+        self.controlled_shared_foreground_grant(root);
+    }
+
+    pub(crate) fn controlled_park_shared_wait(
+        &mut self,
+        owner: NetworkStreamOwner,
+        interests: Vec<(
+            crate::network_replay::NetworkStreamCallId,
+            crate::resources::NetworkWaitKind,
+        )>,
+        deadline: Option<crate::types::LogicalTime>,
+        engine: std::sync::Arc<std::sync::Mutex<crate::network_replay::NetworkReplayEngine>>,
+    ) {
+        use super::parked::ControlCapability;
+        use super::parked::ResourceOrigin;
+        use super::parked::RpcOrigin;
+        self.set_network_engine(Some(engine));
+        self.install_resource_origin(
+            owner.thread,
+            ResourceOrigin {
+                rpc: RpcOrigin::DirectRequestResources,
+                mm: owner.mm,
+                control: ControlCapability::None,
+            },
+        )
+        .unwrap();
+        let mut request = crate::resources::Resources::new(owner.thread);
+        request.insert(
+            crate::resources::ResourceID::NetworkCallWaitSet {
+                interests: interests.clone(),
+                deadline,
+                zero_wait: None,
+            },
+            crate::resources::Permission::RW,
+        );
+        let req = self.next_turns[&owner.thread].req.clone();
+        self.request_put(
+            &req,
+            request,
+            &std::sync::Arc::new(std::sync::Mutex::new(crate::types::GlobalTime::new(
+                &crate::config::Config::default(),
+            ))),
+        );
+        // A controlled startup ordering chooses this already granted member.
+        self.run_queue.remove_tid(owner.thread);
+        self.runqueue_push_front(owner.thread);
+        let (tid, request, response) = self.step3_peek().unwrap();
+        assert_eq!(tid, owner.thread);
+        let request = request.try_read().unwrap().unwrap();
+        assert!(matches!(
+            self.step4_resource_block(tid, &request, &response),
+            Err(super::SkipTurn)
+        ));
+        assert_eq!(
+            self.blocked.network_call_waiters.get(&tid),
+            Some(&(owner, interests))
+        );
+        assert_eq!(self.blocked.timed_waiters.thread_deadline(tid), deadline);
+        let turn = self.turn;
+        let time = self.committed_time;
+        self.step2_network_replay_ready().unwrap();
+        assert!(self.blocked.network_call_waiters.contains_key(&tid));
+        assert_eq!(self.turn, turn);
+        assert_eq!(self.committed_time, time);
+        assert!(self.terminal_deadlock.is_none());
     }
 }

@@ -26,6 +26,7 @@ use crate::network_replay::NetworkStreamPhysicalResult as ResultValue;
 
 mod copy_exclusion;
 mod early_connect;
+mod shared_waits;
 pub(crate) use copy_exclusion::ConfirmedNoStore;
 
 const PUBLICATION_UNIT: usize = 1024;

@@ -2,15 +2,15 @@
 //! policy. Every publication retains its original grant, Call and joined
 //! prefix; physical cohort staging is performed by the actual Guest backend.
 use super::*;
-use crate::network_runtime::JoinedNativePrefix;
 use crate::network_runtime::SharedForegroundLineage;
+use crate::network_runtime::shared_waits::JoinedSharedPrefix;
 use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 
 pub(crate) struct SharedNativeSource {
     root: Arc<ForegroundRoot>,
     epoch: u64,
     call: crate::network_replay::NetworkStreamCallId,
-    prefix: JoinedNativePrefix,
+    prefix: JoinedSharedPrefix,
     pub(super) address: usize,
     pub(super) length: usize,
     pub(super) interval: NativeSourceInterval,
@@ -128,7 +128,13 @@ impl GlobalState {
             })?;
         // No scheduler, census, metadata or engine lock spans this real join.
         let prefix = runtime
-            .join_foreground_prefix(root.clone())
+            .join_shared_foreground_prefix(
+                root.clone(),
+                self.network_engine
+                    .as_ref()
+                    .ok_or_else(|| internal("shared Replay source lost engine"))?,
+                None,
+            )
             .await
             .map_err(internal)?;
         let (call, interval) =
@@ -149,7 +155,7 @@ impl GlobalState {
                 // Every refusal leaves the selected read caller-owned. Success
                 // transfers it once, with no fallible work after that transfer.
                 runtime
-                    .prepare_shared_replay_source(&prefix, lineage, |admission| {
+                    .prepare_shared_replay_source(&prefix, lineage, engine, |engine, admission| {
                         engine
                             .begin_shared_replay_transmit(
                                 read.clone(),
@@ -218,14 +224,19 @@ impl GlobalState {
                         )
                         .map_err(internal)?;
                     let outcome = runtime
-                        .with_source_interval(&prepared.interval, || {
-                            Ok(engine.complete_shared_replay_transmit(
-                                prepared.call,
-                                &grant,
-                                &prepared.prefix,
-                                &bytes,
-                            ))
-                        })
+                        .with_shared_source_interval(
+                            &prepared.interval,
+                            &mut engine,
+                            prepared.call,
+                            |engine| {
+                                Ok(engine.complete_shared_replay_transmit(
+                                    prepared.call,
+                                    &grant,
+                                    &prepared.prefix,
+                                    &bytes,
+                                ))
+                            },
+                        )
                         .map_err(internal)?
                         .map_err(|error| {
                             NetworkRpcError::from_engine(

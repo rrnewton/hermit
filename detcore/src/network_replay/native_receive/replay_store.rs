@@ -49,7 +49,10 @@ impl ReplayStoreSource {
     }
 }
 
-fn plain_prefix(channel: &ChannelState, maximum: usize) -> Result<Vec<u8>, NetworkReplayError> {
+pub(in crate::network_replay) fn plain_prefix(
+    channel: &ChannelState,
+    maximum: usize,
+) -> Result<Vec<u8>, NetworkReplayError> {
     if channel.transport.is_datagram()
         || channel.local_read_shutdown
         || maximum == 0

@@ -49,11 +49,12 @@ mod native_copy_exclusion;
 mod native_source_interval;
 mod openat_observation;
 pub(crate) mod original_connect;
-pub(crate) mod original_send;
 pub(crate) mod original_epoll_ctl;
 pub(crate) mod original_installation;
 pub(crate) mod original_read_copy;
+pub(crate) mod original_send;
 mod physical;
+pub(crate) mod shared_waits;
 pub(crate) mod socket_profile;
 mod terminal_socket_observation;
 // Both host C bridges use one supervisor module, including its unchanged

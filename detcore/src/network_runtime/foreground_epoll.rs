@@ -18,33 +18,6 @@ impl NetworkRuntimeResources {
         use_lineage(&lineage)
     }
 
-    /// Atomically reserve the original source interval before consuming a
-    /// selected reader. The callback must fail before its custody transfer;
-    /// success returns both the transferred Call and its interval. On refusal
-    /// no worker/keepalive exists and dropping the interval ends the reservation.
-    pub(crate) fn prepare_shared_replay_source<T>(
-        &self,
-        prefix: &JoinedNativePrefix,
-        lineage: &SharedForegroundLineage<'_>,
-        transfer: impl FnOnce(&ForegroundEntryAdmission<'_>) -> std::io::Result<T>,
-    ) -> std::io::Result<(T, NativeSourceInterval)> {
-        if !Arc::ptr_eq(lineage.root(), &prefix.root)
-            || !prefix.shared.ptr_eq(&Arc::downgrade(&self.shared))
-        {
-            return Err(std::io::Error::other("shared source changed its original runtime/root"));
-        }
-        let mut owned = self.shared.native_workers.lock().unwrap();
-        let interval = self.shared.reserve_source_interval(&mut owned, prefix.root.clone(), prefix.generation)?;
-        let calls = self.shared.native_streams.lock().unwrap();
-        calls.settled()?;
-        let value = transfer(&ForegroundEntryAdmission {
-            prefix,
-            _admission: &owned,
-            _calls: &calls,
-        })?;
-        Ok((value, interval))
-    }
-
     pub(crate) fn reserve_replay_source_interval(
         &self,
         prefix: &JoinedNativePrefix,
@@ -90,9 +63,9 @@ impl NetworkRuntimeResources {
 /// an empty task vector or a deserialized value cannot construct this proof.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinedNativePrefix {
-    shared: std::sync::Weak<RuntimeShared>,
-    root: Arc<ForegroundRoot>,
-    generation: u64,
+    pub(super) shared: std::sync::Weak<RuntimeShared>,
+    pub(super) root: Arc<ForegroundRoot>,
+    pub(super) generation: u64,
 }
 impl JoinedNativePrefix {
     pub(crate) fn root(&self) -> &Arc<ForegroundRoot> {

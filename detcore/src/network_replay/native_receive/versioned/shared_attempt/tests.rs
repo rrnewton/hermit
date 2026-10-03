@@ -124,14 +124,19 @@ async fn shared_source_claim_transfers_reader_and_excludes_generic_consumers_unt
         panic!("acknowledged descriptor")
     };
     let read = *read;
-    let prefix = runtime.join_foreground_prefix(root.clone()).await.unwrap();
+    let mut engine_owner = std::sync::Mutex::new(engine);
+    let prefix = runtime
+        .join_shared_foreground_prefix(root.clone(), &engine_owner, None)
+        .await
+        .unwrap();
+    let engine = engine_owner.get_mut().unwrap();
     let (call, interval) = runtime
         .with_shared_foreground_lineage(owner, |lineage| {
             let grant = scheduler.shared_mm_foreground_observation(owner, lineage)?;
             // Rejected preparation consumes neither the read nor an interval.
             assert!(
                 runtime
-                    .prepare_shared_replay_source(&prefix, lineage, |admission| {
+                    .prepare_shared_replay_source(&prefix, lineage, engine, |engine, admission| {
                         engine
                             .begin_shared_replay_transmit(
                                 read.clone(),
@@ -145,7 +150,7 @@ async fn shared_source_claim_transfers_reader_and_excludes_generic_consumers_unt
                     .is_err()
             );
             engine.validate_fd_read(owner, &read).unwrap();
-            runtime.prepare_shared_replay_source(&prefix, lineage, |admission| {
+            runtime.prepare_shared_replay_source(&prefix, lineage, engine, |engine, admission| {
                 engine
                     .begin_shared_replay_transmit(read.clone(), &grant, &prefix, admission, 3)
                     .map_err(|e| std::io::Error::other(e.to_string()))
@@ -159,7 +164,7 @@ async fn shared_source_claim_transfers_reader_and_excludes_generic_consumers_unt
     runtime
         .with_shared_foreground_lineage(owner, |lineage| {
             let grant = scheduler.shared_mm_foreground_observation(owner, lineage)?;
-            runtime.with_source_interval(&interval, || {
+            runtime.with_shared_source_interval(&interval, engine, call.id, |engine| {
                 assert!(
                     engine
                         .complete_shared_replay_transmit(call.id, &grant, &prefix, b"bad")

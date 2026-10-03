@@ -12,6 +12,9 @@ mod socket_error;
 #[path = "versioned/shared_attempt.rs"]
 pub(in crate::network_replay) mod shared_attempt;
 
+#[path = "versioned/shared_waits.rs"]
+pub(crate) mod shared_waits;
+
 use detcore_model::network_trace::FreshSendTimeoutV1;
 use detcore_model::network_trace::NetworkCreationModelV4;
 use detcore_model::network_trace::NetworkEstablishmentV4;

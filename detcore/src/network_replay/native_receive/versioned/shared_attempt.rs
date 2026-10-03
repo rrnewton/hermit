@@ -9,13 +9,27 @@ use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 mod tests;
 
 #[derive(Debug, Clone)]
-pub(in crate::network_replay) struct SharedAttempt {
+pub(in crate::network_replay) struct TransmitAttempt {
     root: Arc<crate::network_runtime::ForegroundRoot>,
     epoch: u64,
-    prefix: crate::network_runtime::JoinedNativePrefix,
+    prefix: crate::network_runtime::shared_waits::JoinedSharedPrefix,
     binding: crate::types::FdSlotBinding,
     transmitted: u64,
     length: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::network_replay) enum SharedAttempt {
+    Transmit(TransmitAttempt),
+    Wait(super::shared_waits::SharedWait),
+}
+impl SharedAttempt {
+    fn transmit(&self) -> Option<&TransmitAttempt> {
+        match self {
+            Self::Transmit(attempt) => Some(attempt),
+            Self::Wait(_) => None,
+        }
+    }
 }
 
 impl NetworkReplayEngine {
@@ -101,8 +115,8 @@ impl NetworkReplayEngine {
         &mut self,
         read: NetworkFdReadAdmission,
         grant: &SharedMmForegroundObservation<'_>,
-        prefix: &crate::network_runtime::JoinedNativePrefix,
-        admission: &crate::network_runtime::ForegroundEntryAdmission<'_>,
+        prefix: &crate::network_runtime::shared_waits::JoinedSharedPrefix,
+        admission: &crate::network_runtime::shared_waits::SharedAttemptAdmission<'_>,
         length: usize,
     ) -> Result<NetworkStreamCall, NetworkReplayError> {
         let owner = grant.owner();
@@ -116,7 +130,9 @@ impl NetworkReplayEngine {
             .ok_or_else(|| invalid("shared source lacks selected descriptor"))?;
         if !(1..=512).contains(&length)
             || read.external_grant.is_some()
-            || !self.stream_calls.is_empty()
+            || !admission.matches_peers(self, None)?
+            || !self.shared_census_matches_grant(None, None, grant)?
+            || self.stream_calls.values().any(|state| state.owner == owner)
             || !self.stream_operations.is_empty()
             || !self.shadow_probes.is_empty()
             || !Arc::ptr_eq(grant.root(), prefix.root())
@@ -153,7 +169,7 @@ impl NetworkReplayEngine {
         let control = read
             .control
             .ok_or_else(|| invalid("shared source lost selected control"))?;
-        let attempt = SharedAttempt {
+        let attempt = TransmitAttempt {
             root: grant.root().clone(),
             epoch: grant.epoch(),
             prefix: prefix.clone(),
@@ -168,7 +184,7 @@ impl NetworkReplayEngine {
         self.stream_calls
             .get_mut(&call.id)
             .expect("transferred Call")
-            .shared_attempt = Some(attempt);
+            .shared_attempt = Some(SharedAttempt::Transmit(attempt));
         Ok(call)
     }
 
@@ -176,7 +192,7 @@ impl NetworkReplayEngine {
         &self,
         call: NetworkStreamCallId,
         grant: &SharedMmForegroundObservation<'_>,
-        prefix: &crate::network_runtime::JoinedNativePrefix,
+        prefix: &crate::network_runtime::shared_waits::JoinedSharedPrefix,
     ) -> Result<OpenFileId, NetworkReplayError> {
         let owner = grant.owner();
         self.check_stream_owner(owner)?;
@@ -194,6 +210,7 @@ impl NetworkReplayEngine {
         let attempt = state
             .shared_attempt
             .as_ref()
+            .and_then(SharedAttempt::transmit)
             .ok_or(NetworkReplayError::StreamCallPhaseMismatch(call))?;
         if state.owner != owner
             || state.abandoned
@@ -221,7 +238,8 @@ impl NetworkReplayEngine {
             || !attempt.prefix.same_prefix(prefix)
             || !attempt.root.is_current(owner)
             || !attempt.root.has_shared_mm_history()
-            || self.stream_calls.len() != 1
+            || !prefix.matches_retained_peers(self, Some(call))?
+            || !self.shared_census_matches_grant(None, Some(call), grant)?
             || !self.stream_operations.is_empty()
             || !self.socket_controls.is_empty()
             || !self.shadow_probes.is_empty()
@@ -248,7 +266,7 @@ impl NetworkReplayEngine {
         &mut self,
         call: NetworkStreamCallId,
         grant: &SharedMmForegroundObservation<'_>,
-        prefix: &crate::network_runtime::JoinedNativePrefix,
+        prefix: &crate::network_runtime::shared_waits::JoinedSharedPrefix,
         bytes: &[u8],
     ) -> Result<StreamTransmitOutcome, NetworkReplayError> {
         let file = self.validate_shared_replay_transmit(call, grant, prefix)?;
@@ -256,6 +274,7 @@ impl NetworkReplayEngine {
             != self.stream_calls[&call]
                 .shared_attempt
                 .as_ref()
+                .and_then(SharedAttempt::transmit)
                 .unwrap()
                 .length
         {
