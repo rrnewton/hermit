@@ -154,7 +154,13 @@ fn package_metadata(
     }
     let topology = match (&contract.grouped_event, contract.ftrace_only) {
         (GroupedDeclaration::Absent, false) => {
-            if (contract.maps, contract.programs, contract.links) != (23, 46, 58) {
+            if (contract.maps, contract.programs, contract.links)
+                != (
+                    23 + usize::from(contract.abi_version == "415052555354000b"),
+                    46,
+                    58,
+                )
+            {
                 return Err(io::Error::other("unsupported classic provider topology"));
             }
             ProviderTopology::ClassicV40
@@ -169,7 +175,19 @@ fn package_metadata(
                 || known.get("btf_sha256").and_then(serde_json::Value::as_str)
                     != Some(contract.btf_sha256.as_str())
                 || (contract.maps, contract.programs, contract.links)
-                    != if ftrace { (24, 49, 49) } else { (23, 44, 44) }
+                    != if ftrace {
+                        (
+                            24 + usize::from(contract.abi_version == "415052555354000b"),
+                            49,
+                            49,
+                        )
+                    } else {
+                        (
+                            23 + usize::from(contract.abi_version == "415052555354000b"),
+                            44,
+                            44,
+                        )
+                    }
             {
                 return Err(io::Error::other(
                     "unsupported grouped provider schema or physical sites",
@@ -605,15 +623,33 @@ mod tests {
         serde_json::from_str(GROUPED_V1_CONTRACT).unwrap()
     }
     #[test]
-    fn current_ftrace_manifest_requires_exact_122_shape() {
+    fn current_ftrace_manifest_requires_exact_123_shape() {
         let contract: serde_json::Value = serde_json::from_str(ACCEPTED_CONTRACT).unwrap();
         let manifest = manifest_for(&contract);
-        assert_eq!((manifest["maps"].as_u64(), manifest["programs"].as_u64(),
-            manifest["links"].as_u64()), (Some(24), Some(49), Some(49)));
+        assert_eq!(
+            (
+                manifest["maps"].as_u64(),
+                manifest["programs"].as_u64(),
+                manifest["links"].as_u64()
+            ),
+            (Some(25), Some(49), Some(49))
+        );
         assert!(metadata(&contract, &manifest).is_ok());
-        eprintln!("current Ftrace122 qualifying neighbor accepted");
-        for counts in [[23,47,47], [23,49,49], [25,49,49], [24,48,49],
-            [24,50,49], [24,49,48], [24,49,50]] {
+        eprintln!("current Ftrace123 qualifying neighbor accepted");
+        for counts in [
+            [23, 47, 47],
+            [23, 49, 49],
+            [24, 49, 49],
+            [26, 49, 49],
+            [24, 48, 49],
+            [25, 48, 49],
+            [25, 50, 49],
+            [25, 49, 48],
+            [25, 49, 50],
+            [24, 50, 49],
+            [24, 49, 48],
+            [24, 49, 50],
+        ] {
             let mut wrong = manifest.clone();
             for (key, count) in ["maps","programs","links"].into_iter().zip(counts) {
                 wrong[key] = serde_json::json!(count);

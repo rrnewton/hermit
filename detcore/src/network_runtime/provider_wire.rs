@@ -27,6 +27,12 @@ pub enum ProviderWireFormat {
     /// The same blocking-TX ABI with receive-copy frontier version5.
     #[serde(rename = "abi10-copy5")]
     Abi10Copy5,
+    /// ABI11 adds a distinct472-byte executable observation sidecar.
+    #[serde(rename = "abi11-copy4")]
+    Abi11Copy4,
+    /// Same executable observation ABI with receive-copy version5.
+    #[serde(rename = "abi11-copy5")]
+    Abi11Copy5,
 }
 
 impl ProviderWireFormat {
@@ -40,6 +46,8 @@ impl ProviderWireFormat {
             (0x4150_5255_5354_0009, 5) => Ok(Self::Abi9Copy5),
             (0x4150_5255_5354_000a, 4) => Ok(Self::Abi10Copy4),
             (0x4150_5255_5354_000a, 5) => Ok(Self::Abi10Copy5),
+            (0x4150_5255_5354_000b, 4) => Ok(Self::Abi11Copy4),
+            (0x4150_5255_5354_000b, 5) => Ok(Self::Abi11Copy5),
             _ => Err(io::Error::other(
                 "unsupported provider adapter/copy version pair",
             )),
@@ -57,6 +65,8 @@ impl ProviderWireFormat {
             ("4150525553540009", Some(5)) => Ok(Self::Abi9Copy5),
             ("415052555354000a", Some(4)) => Ok(Self::Abi10Copy4),
             ("415052555354000a", Some(5)) => Ok(Self::Abi10Copy5),
+            ("415052555354000b", Some(4)) => Ok(Self::Abi11Copy4),
+            ("415052555354000b", Some(5)) => Ok(Self::Abi11Copy5),
             _ => Err(io::Error::other(
                 "unsupported provider package wire declaration",
             )),
@@ -70,6 +80,7 @@ impl ProviderWireFormat {
             Self::Abi8Copy5 => 0x4150_5255_5354_0008,
             Self::Abi9Copy4 | Self::Abi9Copy5 => 0x4150_5255_5354_0009,
             Self::Abi10Copy4 | Self::Abi10Copy5 => 0x4150_5255_5354_000a,
+            Self::Abi11Copy4 | Self::Abi11Copy5 => 0x4150_5255_5354_000b,
         }
     }
 
@@ -77,20 +88,33 @@ impl ProviderWireFormat {
     pub(crate) fn has_source_ioctl_dispatch(self) -> bool {
         matches!(
             self,
-            Self::Abi9Copy4 | Self::Abi9Copy5 | Self::Abi10Copy4 | Self::Abi10Copy5
+            Self::Abi9Copy4
+                | Self::Abi9Copy5
+                | Self::Abi10Copy4
+                | Self::Abi10Copy5
+                | Self::Abi11Copy4
+                | Self::Abi11Copy5
         )
     }
 
     /// Only ABI10 carries the enlarged internal command and distinct capture.
     pub(crate) fn has_blocking_tx(self) -> bool {
-        matches!(self, Self::Abi10Copy4 | Self::Abi10Copy5)
+        matches!(
+            self,
+            Self::Abi10Copy4 | Self::Abi10Copy5 | Self::Abi11Copy4 | Self::Abi11Copy5
+        )
+    }
+
+    /// Only ABI11 may call the472-byte executable receipt writer.
+    pub(crate) fn has_executable_source(self) -> bool {
+        matches!(self, Self::Abi11Copy4 | Self::Abi11Copy5)
     }
 
     /// Receive-copy grammar bound before any observation is parsed.
     pub fn copy_version(self) -> u64 {
         match self {
-            Self::Abi7Copy4 | Self::Abi9Copy4 | Self::Abi10Copy4 => 4,
-            Self::Abi8Copy5 | Self::Abi9Copy5 | Self::Abi10Copy5 => 5,
+            Self::Abi7Copy4 | Self::Abi9Copy4 | Self::Abi10Copy4 | Self::Abi11Copy4 => 4,
+            Self::Abi8Copy5 | Self::Abi9Copy5 | Self::Abi10Copy5 | Self::Abi11Copy5 => 5,
         }
     }
 }
@@ -117,7 +141,7 @@ mod tests {
             7,
             8,
             0x4150_5255_5354_0006,
-            0x4150_5255_5354_000b,
+            0x4150_5255_5354_000c,
             u64::MAX,
         ] {
             for copy in [4, 5] {

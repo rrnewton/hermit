@@ -16,6 +16,7 @@
 #endif
 #include "provider.h"
 #include "fd-effects.h"
+#include "executable-source.h"
 #include "connect-copy.h"
 #include "retirement-target.h"
 #include "task-disarm.h"
@@ -97,6 +98,8 @@ struct ap_pending_command {
     struct ap_task_disarm_outcome disarm;
     struct ap_fd_accept fd_receipt;
     bool fd_collected;
+    struct ap_executable_source executable_receipt;
+    bool executable_collected;
     struct ap_fd_enrollment enrollment_receipt;
     bool enrollment_collected;
     struct ap_original_selection original_selection;
@@ -106,6 +109,8 @@ struct ap_pending_command {
     struct ap_fd_call birth_completed;
     bool birth_observed,birth_child_admitted,birth_child_terminal,birth_collected;
 };
+static int executable_reserve(struct ap_session *,const struct ap_task_command *,const struct ap_executable_intent *);
+static int executable_ack(struct ap_session *,struct ap_pending_command *);
 static int fd_reserve_accept(struct ap_session *,const struct ap_task_command *);
 static int fd_ack_accept(struct ap_session *,struct ap_pending_command *);
 static int fd_reserve_enrollment(struct ap_session *,const struct ap_task_command *);
@@ -540,6 +545,13 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
        fault_info.key_size!=sizeof(u32) || fault_info.value_size!=sizeof(struct ap_stream_fault_state) ||
        fault_info.max_entries!=AP_COMMANDS)return unavailable();
 #endif
+    int exe_map=bpf_object__find_map_fd_by_name(s->object,"executable_sources");
+    struct bpf_map_info exe_info={0};u32 exe_size=sizeof(exe_info);
+    if(exe_map<0 || bpf_obj_get_info_by_fd(exe_map,&exe_info,&exe_size) ||
+       exe_size<offsetof(struct bpf_map_info,map_flags)+sizeof(exe_info.map_flags) ||
+       !exe_info.id || exe_info.type!=BPF_MAP_TYPE_ARRAY || exe_info.key_size!=sizeof(u32) ||
+       exe_info.value_size!=sizeof(struct ap_executable_source) ||
+       exe_info.max_entries!=AP_COMMANDS || exe_info.map_flags)return unavailable();
     u32 zero=0;struct ap_config c={.provider=incarnation};
     if(bpf_map_update_elem(config,&zero,&c,BPF_ANY))return -1;
     int copy_map=bpf_object__find_map_fd_by_name(s->object,"stream_copy_records");
@@ -837,7 +849,9 @@ done:
 }
 /* The session owns every reserved ticket even when a map syscall returns an
  * unknown outcome. No cancellation or ordinary error frees that reservation. */
-static int submit(struct ap_session *s,int pidfd,struct ap_task_command *c) {
+static int submit_with_executable(struct ap_session *s,int pidfd,struct ap_task_command *c,
+        const struct ap_executable_intent *intent) {
+    if((c->operation==AP_EXECUTABLE_SOURCE)!=(intent!=NULL))return invalid();
     if(pidfd<0 || !ap_task_command_extension_valid(c))return invalid();
     struct ap_task_command prior;
     if(bpf_map_lookup_elem(s->tasks,&pidfd,&prior))return -1;
@@ -860,9 +874,12 @@ static int submit(struct ap_session *s,int pidfd,struct ap_task_command *c) {
     struct ap_command_result reserved={.command=c->command,.operation=c->operation,
         .phase=AP_COMMAND_READY,.original_count=c->original_count};
     if(bpf_map_update_elem(s->commands,&key,&reserved,BPF_EXIST))return quarantine(p);
-    if(fd_reserve_accept(s,c) || fd_reserve_enrollment(s,c))return quarantine(p);
+    if(fd_reserve_accept(s,c) || fd_reserve_enrollment(s,c) || executable_reserve(s,c,intent))return quarantine(p);
     if(bpf_map_update_elem(s->tasks,&pidfd,c,BPF_EXIST))return quarantine(p);
     p->state=AP_SLOT_ACTIVE;return 0;
+}
+static int submit(struct ap_session *s,int pidfd,struct ap_task_command *c) {
+    return submit_with_executable(s,pidfd,c,NULL);
 }
 /* DONE is immutable and is the last producer access to this result. A second
  * complete lookup after observing DONE rejects a payload copied across that
@@ -993,7 +1010,7 @@ int ap_ack_command(struct ap_session *s,const struct ap_command_result *receipt)
     /* Producer is done, exact task command is disarmed, all driver readers are
      * excluded, and the service acknowledged its retained receipt. */
     struct ap_command_result empty={0};
-    if(fd_ack_accept(s,p) || fd_ack_enrollment(s,p) || fd_ack_original(s,p) || fd_ack_birth(s,p) || fd_ack_epoll_ctl_copy(s,p)) { quarantine(p);goto done; }
+    if(fd_ack_accept(s,p) || fd_ack_enrollment(s,p) || fd_ack_original(s,p) || fd_ack_birth(s,p) || fd_ack_epoll_ctl_copy(s,p) || executable_ack(s,p)) { quarantine(p);goto done; }
     if(bpf_map_update_elem(s->commands,&key,&empty,BPF_EXIST)) { quarantine(p);goto done; }
     if(bpf_map_lookup_elem(s->commands,&key,&observed)) { quarantine(p);goto done; }
     if(memcmp(&observed,&empty,sizeof(empty))) { errno=EPROTO;quarantine(p);goto done; }
@@ -1178,5 +1195,6 @@ int ap_close_grouped_startup_terminal(struct ap_session **owned,struct ap_groupe
 #include "epoll-ctl-copy-driver.h"
 
 #include "fd-enrollment-driver.h"
+#include "executable-source-driver.h"
 
 #include "owned-metadata-driver.h"

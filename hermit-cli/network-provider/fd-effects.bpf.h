@@ -1744,9 +1744,11 @@ static __attribute__((noinline)) int fd_enrollment_source_ioctl(
 #endif
     return 0;
 }
+#include "executable-source.bpf.h"
 SEC("fentry/ptrace_request") int fd_enrollment_enter(u64 *ctx) {
     struct task_struct *task=(struct task_struct *)ctx[0];
     struct ap_task_command *c=authenticated_command(task_storage(&tasks,task,0,0));
+    if(c && c->operation==AP_EXECUTABLE_SOURCE)return executable_source_enter(ctx,c);
     if(!c || c->operation!=AP_TABLE_ENROLLMENT || ctx[1]!=AP_PTRACE_GETREGSET || ctx[2]!=AP_NT_PRSTATUS)return 0;
     struct ap_command_result *r=result(c->command);
     u32 slot=ap_command_slot(c->command);
@@ -1822,6 +1824,7 @@ SEC("fentry/ptrace_request") int fd_enrollment_enter(u64 *ctx) {
 SEC("fexit/ptrace_request") int fd_enrollment_returned(u64 *ctx) {
     struct task_struct *task=(struct task_struct *)ctx[0];
     struct ap_task_command *c=authenticated_command(task_storage(&tasks,task,0,0));
+    if(c && c->operation==AP_EXECUTABLE_SOURCE)return executable_source_returned(ctx,c);
     if(!c || c->operation!=AP_TABLE_ENROLLMENT || ctx[1]!=AP_PTRACE_GETREGSET || ctx[2]!=AP_NT_PRSTATUS)return 0;
     struct ap_command_result *r=result(c->command);u32 slot=ap_command_slot(c->command);
     struct ap_fd_enrollment *e=lookup(&fd_enrollments,&slot);

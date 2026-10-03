@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "abi_version": "415052555354000a",
+  "abi_version": "415052555354000b",
   "copy_version": 4,
   "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
-  "maps": 23,
+  "maps": 24,
   "programs": 46,
   "links": 58,
   "shared_links": [
@@ -103,7 +103,11 @@
     "stream-copy.h",
     "stream-copy.bpf.h",
     "stream-copy-grouped-source.inc",
-    "stream-copy-driver.h"
+    "stream-copy-driver.h",
+    "executable-source.h",
+    "executable-source.bpf.h",
+    "executable-source-driver.h",
+    "executable-source-image.h"
   ],
   "hooks": {
     "fdget": [

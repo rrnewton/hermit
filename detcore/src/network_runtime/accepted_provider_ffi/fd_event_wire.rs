@@ -168,6 +168,8 @@ mod tests {
             ProviderWireFormat::Abi9Copy5,
             ProviderWireFormat::Abi10Copy4,
             ProviderWireFormat::Abi10Copy5,
+            ProviderWireFormat::Abi11Copy4,
+            ProviderWireFormat::Abi11Copy5,
         ];
         let topology = crate::network_runtime::ProviderTopology::FtraceV1 {
             contract_sha256: [0x29; 32],
@@ -183,6 +185,7 @@ mod tests {
                             b"ap_adapter_copy_version" => Ok(actual.copy_version()),
                             b"ap_provider_topology_version" => Ok(topology.driver_version()),
                             b"ap_adapter_task_command_size" => Ok(72),
+                            b"ap_adapter_executable_source_size" => Ok(472),
                             _ => panic!(
                                 "an event operation resolved before its layout was authenticated"
                             ),
@@ -265,6 +268,8 @@ mod tests {
             ProviderWireFormat::Abi9Copy5,
             ProviderWireFormat::Abi10Copy4,
             ProviderWireFormat::Abi10Copy5,
+            ProviderWireFormat::Abi11Copy4,
+            ProviderWireFormat::Abi11Copy5,
         ] {
             let out = read(wire, |p| {
                 unsafe { p.cast::<FdEvent>().write(current) };

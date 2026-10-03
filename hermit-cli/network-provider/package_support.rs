@@ -196,7 +196,7 @@ impl Contract {
             ("4150525553540007", None | Some(4)) => Ok(4),
             ("4150525553540008", Some(5)) => Ok(5),
             ("4150525553540009", Some(version @ (4 | 5))) => Ok(version),
-            ("415052555354000a", Some(version @ (4 | 5))) => Ok(version),
+            ("415052555354000a" | "415052555354000b", Some(version @ (4 | 5))) => Ok(version),
             _ => anyhow::bail!("unsupported accepted adapter/copy version pair"),
         }
     }
@@ -243,7 +243,7 @@ impl Contract {
             ensure!(
                 result.shared_links.len() == 12
                     && result.accepted_copy_version().is_ok()
-                    && result.maps == 23
+                    && result.maps == 23 + usize::from(result.abi_version == "415052555354000b")
                     && result.programs == 46
                     && result.shared_links.iter().zip([
                         ("fd_connect_post_fdget", "__sys_connect", 0x41, 3),
@@ -948,7 +948,7 @@ mod tests {
         // Build the actual historical population. The current dispatcher
         // folds three programs and inserts five earlier shared sites; cloning
         // its new count or truncating its prefix would test a different shape.
-        let mut old126=original.clone();old126["programs"]=json!(49);old126["links"]=json!(54);
+        let mut old126=original.clone();old126["maps"]=json!(23);old126["abi_version"]=json!("415052555354000a");old126["programs"]=json!(49);old126["links"]=json!(54);
         old126["shared_links"]=Value::Array(original["shared_links"].as_array().unwrap()[3..8].to_vec());
         assert_eq!(old126["shared_links"].as_array().unwrap().len(),5);
         assert_eq!(old126["shared_links"][0]["symbol"],json!("fdget_raw"));
@@ -1189,7 +1189,13 @@ mod tests {
     }
 
     fn shared_contract_json() -> Value {
-        let value: Value = serde_json::from_str(include_str!("accepted-classic-v40-contract.json")).unwrap();
+        let mut value: Value = serde_json::from_str(include_str!("accepted-classic-v40-contract.json")).unwrap();
+        assert_eq!(value["abi_version"], "415052555354000b");
+        assert_eq!(value["maps"], 24);
+        // Explicit historical ABI10 fixture: keep all old population oracles.
+        value["abi_version"] = json!("415052555354000a");
+        value["maps"] = json!(23);
+        value["source_files"].as_array_mut().unwrap().retain(|v| !v.as_str().unwrap().starts_with("executable-source"));
         // This preserves the exact historical classic contract and its assertions.
         assert_eq!(value["maps"], 23);
         assert_eq!(value["programs"], 46);
@@ -1469,7 +1475,7 @@ mod tests {
         let mut old=current.clone();
         let links=current["shared_links"].as_array().unwrap();
         old["shared_links"]=Value::Array(links[3..8].iter().chain(&links[10..12]).cloned().collect());
-        old["programs"]=json!(49);old["links"]=json!(56);
+        old["maps"]=json!(23);old["programs"]=json!(49);old["links"]=json!(56);
         assert_eq!(old["maps"].as_u64().unwrap()+old["programs"].as_u64().unwrap()+old["links"].as_u64().unwrap(),128);
         assert!(parse_contract(&old).is_err()); // Historical128 evidence remains separate.
     }
@@ -1549,9 +1555,14 @@ mod tests {
             ("415052555354000a", Some(5), Some(5)),
             ("415052555354000a", None, None),
             ("415052555354000a", Some(6), None),
-            ("415052555354000b", Some(5), None),
+            ("415052555354000b", Some(4), Some(4)),
+            ("415052555354000b", Some(5), Some(5)),
+            ("415052555354000b", None, None),
+            ("415052555354000b", Some(6), None),
+            ("415052555354000c", Some(5), None),
         ] {
             raw["abi_version"] = json!(abi);
+            raw["maps"] = json!(if abi == "415052555354000b" {24} else {23});
             match copy { Some(value) => { raw["copy_version"] = json!(value); },
                 None => { raw.as_object_mut().unwrap().remove("copy_version"); } }
             let parsed = Contract::parse(&serde_json::to_vec(&raw).unwrap());

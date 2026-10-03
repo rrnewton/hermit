@@ -308,7 +308,7 @@ fn run() -> Result<()> {
     }
     let contract_name = format!("{}-contract.json", args.component);
     let contract = Contract::parse(&read_regular(&args.source.join(&contract_name), 32768)?)?;
-    ensure!(args.component != "accepted" || contract.abi_version == "415052555354000a",
+    ensure!(args.component != "accepted" || contract.abi_version == "415052555354000b",
         "current accepted producer requires blocking-TX ABI10; historical packages keep their original sources");
     let accepted = args.component == "accepted";
     let tx_config = if accepted { Some(package_support::blocking_tx_config()?) } else { None };

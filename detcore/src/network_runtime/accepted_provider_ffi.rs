@@ -273,6 +273,7 @@ const _: () = {
 };
 #[path = "accepted_provider_ffi/blocking_tx.rs"]
 mod blocking_tx;
+pub mod executable_source;
 
 /// Exact physical cleanup evidence, not an observed syscall result.
 #[repr(C)]
@@ -537,6 +538,11 @@ fn authenticate_provider_declarations(
     if wire.has_blocking_tx() && read(c"ap_adapter_task_command_size")? != 72 {
         return Err(LoadError("provider task command layout mismatch".into()));
     }
+    if wire.has_executable_source() && read(c"ap_adapter_executable_source_size")? != 472 {
+        return Err(LoadError(
+            "provider executable source layout mismatch".into(),
+        ));
+    }
     topology
         .observe_driver(read(c"ap_provider_topology_version")?)
         .map_err(|error| LoadError(error.to_string()))
@@ -582,6 +588,7 @@ struct GroupedApi {
         unsafe extern "C" fn(*mut SessionPtr, *mut c_void, *mut c_void, u64, u64) -> c_int,
 }
 struct Api {
+    executable_source: Option<executable_source::Api>,
     blocking_tx: Option<blocking_tx::Api>,
     grouped: Option<GroupedApi>,
     original_read_copy_ready: unsafe extern "C" fn(SessionPtr, c_int, u64, u32) -> c_int,
@@ -842,7 +849,16 @@ impl Library {
         } else {
             None
         };
+        let executable_source = if wire_format.has_executable_source() {
+            Some(executable_source::Api {
+                prepare: symbol!("ap_prepare_executable_source", executable_source::Prepare),
+                collect: symbol!("ap_collect_executable_source", executable_source::Collect),
+            })
+        } else {
+            None
+        };
         let api = Api {
+            executable_source,
             blocking_tx,
             grouped,
             observe_socket_file: symbol!(
@@ -1783,6 +1799,57 @@ impl Session {
         }
     }
 
+    /// Inactive raw observation API: no source capability is issued by this adapter.
+    pub fn prepare_executable_source(
+        &mut self,
+        target: BorrowedFd<'_>,
+        intent: executable_source::Intent,
+    ) -> io::Result<Observation<u64>> {
+        let api =
+            self.library.api.executable_source.as_ref().ok_or_else(|| {
+                io::Error::other("executable source requires authenticated ABI11")
+            })?;
+        if intent.command != 0 {
+            return Err(io::Error::other(
+                "executable command must be freshly assigned",
+            ));
+        }
+        let mut raw = 0;
+        let rc = unsafe {
+            (api.prepare)(
+                self.pointer(),
+                target.as_raw_fd(),
+                intent.registration,
+                intent.owner_mm,
+                intent.call,
+                intent.address,
+                intent.length,
+                intent.iovec,
+                intent.registers,
+                &mut raw,
+            )
+        };
+        Ok(Observation {
+            status: CallStatus::capture("ap_prepare_executable_source", rc),
+            raw,
+        })
+    }
+
+    /// Failure retains both raw outputs, including actual partial native observation.
+    pub fn collect_executable_source(
+        &mut self,
+        target: BorrowedFd<'_>,
+        command: u64,
+    ) -> io::Result<Observation<executable_source::Effect>> {
+        let api =
+            self.library.api.executable_source.as_ref().ok_or_else(|| {
+                io::Error::other("executable source requires authenticated ABI11")
+            })?;
+        executable_source::read(self.wire_format(), |result, receipt| unsafe {
+            (api.collect)(self.pointer(), target.as_raw_fd(), command, result, receipt)
+        })
+    }
+
     pub fn prepare_original_sendto(
         &mut self,
         target: BorrowedFd<'_>,
@@ -2291,6 +2358,8 @@ mod topology_tests {
             ProviderWireFormat::Abi9Copy5,
             ProviderWireFormat::Abi10Copy4,
             ProviderWireFormat::Abi10Copy5,
+            ProviderWireFormat::Abi11Copy4,
+            ProviderWireFormat::Abi11Copy5,
         ] {
             for expected in [
                 ProviderTopology::ClassicV40,
@@ -2309,6 +2378,7 @@ mod topology_tests {
                             b"ap_adapter_abi_version" => Ok(wire.abi_version()),
                             b"ap_adapter_copy_version" => Ok(wire.copy_version()),
                             b"ap_adapter_task_command_size" => Ok(72),
+                            b"ap_adapter_executable_source_size" => Ok(472),
                             b"ap_provider_topology_version" => {
                                 actual.ok_or_else(|| LoadError("missing topology export".into()))
                             }
@@ -2327,6 +2397,9 @@ mod topology_tests {
                     }
                     if wire.has_blocking_tx() {
                         expected_names.push(c"ap_adapter_task_command_size".to_owned());
+                    }
+                    if wire.has_executable_source() {
+                        expected_names.push(c"ap_adapter_executable_source_size".to_owned());
                     }
                     expected_names.push(c"ap_provider_topology_version".to_owned());
                     assert_eq!(names, expected_names);

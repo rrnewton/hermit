@@ -159,7 +159,7 @@ void ring_buffer__free(struct ring_buffer *ring) {
 static struct bpf_object ownership_object;
 static struct bpf_program ownership_programs[AP_PROGRAMS];
 static struct bpf_link ownership_links[AP_LINKS];
-static struct bpf_map ownership_maps[23];
+static struct bpf_map ownership_maps[24];
 static unsigned ownership_unloads,ownership_link_closes,ownership_program_closes,ownership_map_closes;
 static unsigned ownership_links_alive,ownership_queries,ownership_checks;
 static unsigned ownership_attach_limit,ownership_perf_alive,ownership_kernel_reads,ownership_peak;
@@ -307,6 +307,10 @@ static int ownership_info(int fd,void *out,unsigned int *size) {
         if(at==1) { /* Actual tasks-map FD returned by this load facade. */
             m->type=BPF_MAP_TYPE_TASK_STORAGE;m->key_size=sizeof(int);
             m->value_size=sizeof(struct ap_task_command);m->map_flags=BPF_F_NO_PREALLOC;
+        }
+        if(at==23) { /* Added command-owned executable observation sidecar. */
+            m->type=BPF_MAP_TYPE_ARRAY;m->key_size=sizeof(u32);
+            m->value_size=sizeof(struct ap_executable_source);m->max_entries=AP_COMMANDS;
         }
         if(at==ownership_bad_at && ownership_fault==OWN_SHORT_MAP)*size=offsetof(struct bpf_map_info,id);
         return 0;
@@ -491,7 +495,7 @@ void bpf_object__close(struct bpf_object *object) {
     }
 }
 static void ownership_reset(unsigned attach_limit) {
-    ownership_mode=true;ownership_object=(struct bpf_object){AP_PROGRAMS,23};
+    ownership_mode=true;ownership_object=(struct bpf_object){AP_PROGRAMS,24};
     ownership_unloads=ownership_link_closes=ownership_program_closes=ownership_map_closes=ownership_queries=0;
     ownership_fault=OWN_OK;ownership_bad_at=7;ownership_links_alive=0;
     ownership_attach_limit=attach_limit;ownership_perf_alive=ownership_kernel_reads=ownership_peak=0;
@@ -503,20 +507,20 @@ static void ownership_reset(unsigned attach_limit) {
     for(unsigned i=0;i<AP_LINKS;i++) {
         ownership_links[i]=(struct bpf_link){i,-1};ownership_link_queried[i]=false;
     }
-    for(unsigned i=0;i<23;i++)ownership_maps[i]=(struct bpf_map){i,-1};
+    for(unsigned i=0;i<24;i++)ownership_maps[i]=(struct bpf_map){i,-1};
 }
 static unsigned ownership_live_fds(void) {
     unsigned count=ownership_btf_owned+ownership_perf_alive+ownership_ring.owned;
     for(unsigned i=0;i<AP_PROGRAMS;i++)count+=ownership_programs[i].fd>=0;
     for(unsigned i=0;i<AP_LINKS;i++)count+=ownership_links[i].fd>=0;
-    for(unsigned i=0;i<23;i++)count+=ownership_maps[i].fd>=0;
+    for(unsigned i=0;i<24;i++)count+=ownership_maps[i].fd>=0;
     return count;
 }
 static void ownership_inventory(struct ap_session *s,unsigned links) {
     struct ap_program_id ids[128];u32 count=0;
     OWN_CHECK(ap_identifiers(s,ids,128,&count)==0);
-    OWN_CHECK(count==23+AP_PROGRAMS+links);
-    const unsigned expected[]={23,AP_PROGRAMS,links};
+    OWN_CHECK(count==24+AP_PROGRAMS+links);
+    const unsigned expected[]={24,AP_PROGRAMS,links};
     for(unsigned kind=0;kind<3;kind++)for(unsigned at=0;at<expected[kind];at++) {
         unsigned matches=0;
         for(unsigned i=0;i<count;i++)matches+=ids[i].kind==kind && ids[i].id==10000+at;
@@ -527,7 +531,7 @@ static void ownership_close(struct ap_session *s,unsigned links,unsigned release
     OWN_CHECK(ap_close(s)==0);
     OWN_CHECK(ownership_link_closes==links && !ownership_links_alive);
     OWN_CHECK(ownership_unloads==released && ownership_program_closes+released==AP_PROGRAMS);
-    OWN_CHECK(ownership_map_closes==23 && ownership_live_fds()==0);
+    OWN_CHECK(ownership_map_closes==24 && ownership_live_fds()==0);
 }
 static void program_ownership_controls(void) {
     struct ap_session *s=NULL;ownership_reset(AP_LINKS);
@@ -537,10 +541,10 @@ static void program_ownership_controls(void) {
      * admits all58 actual links and the ring epoll FD. Forty redundant load
      * handles are released; six distinct program readers remain. No link or
      * identifier is omitted to meet the unchanged128 bounds. */
-    OWN_CHECK(ownership_peak==116);
+    OWN_CHECK(ownership_peak==117);
     OWN_CHECK(12+ownership_live_fds()+4<=128);
-    OWN_CHECK(12+ownership_live_fds()+4==120);
-    OWN_CHECK(ownership_unloads==40 && ownership_queries==216+1 /* exact ABI10 task-map query */);
+    OWN_CHECK(12+ownership_live_fds()+4==121);
+    OWN_CHECK(ownership_unloads==40 && ownership_queries==216+2 /* exact task and ABI11 executable-map queries */);
     for(unsigned i=0;i<AP_PROGRAMS;i++) {
         OWN_CHECK(ownership_programs[i].fd==(i<2 || i>=42?ownership_program_fd(i):-1));
     }
@@ -573,11 +577,11 @@ static void program_ownership_controls(void) {
     struct ap_program_id ids[128];u32 count=0;errno=0;
     OWN_CHECK(ap_identifiers(s,ids,110,&count)==-1 && errno==EOVERFLOW && count==110);
     count=0;errno=0;OWN_CHECK(ap_identifiers(s,ids,111,&count)==-1 && errno==EOVERFLOW && count==111);
-    for(u32 capacity=112;capacity<127;capacity++) {
+    for(u32 capacity=112;capacity<128;capacity++) {
         count=0;errno=0;
         OWN_CHECK(ap_identifiers(s,ids,capacity,&count)==-1 && errno==EOVERFLOW && count==capacity);
     }
-    count=0;OWN_CHECK(ap_identifiers(s,ids,127,&count)==0 && count==127);
+    count=0;OWN_CHECK(ap_identifiers(s,ids,128,&count)==0 && count==128);
     OWN_CHECK(ownership_unloads==40);
     ownership_close(s,AP_LINKS,40);
 
@@ -604,7 +608,7 @@ static void program_ownership_controls(void) {
         OWN_CHECK(ap_open("ownership-fixture",3,&s)==-1 && errno==EIO && s);
         unsigned original=links<AP_PROGRAMS?links:AP_PROGRAMS;
         unsigned released=original>42?40:original>2?original-2:0;
-        OWN_CHECK(ownership_unloads==released && ownership_queries==2*links+1 /* exact ABI10 task-map query */);
+        OWN_CHECK(ownership_unloads==released && ownership_queries==2*links+2 /* exact task and ABI11 executable-map queries */);
         ownership_inventory(s,links);ownership_close(s,links,released);
     }
     /* Every later link/program/map response is fresh. A prior positive binding
@@ -641,7 +645,7 @@ static void program_ownership_controls(void) {
         ownership_fault=OWN_OK;ownership_inventory(s,loaded);ownership_close(s,loaded,40);
     }
     ownership_mode=false;
-    printf("production program FD ownership: %u checks;127 objects,40 released load handles,6 retained program handles\n",ownership_checks);
+    printf("production program FD ownership: %u checks;128 objects,40 released load handles,6 retained program handles\n",ownership_checks);
 }
 
 enum { TASKS=101, COMMANDS, STATUS, CALLS, FD_STATUS };
@@ -681,6 +685,7 @@ int bpf_object__find_map_fd_by_name(const struct bpf_object *object,const char *
     if(ownership_mode) {
         assert(object==&ownership_object && ownership_loaded);
         if(!strcmp(name,"stream_copy_records"))return 3022;
+        if(!strcmp(name,"executable_sources"))return 3023;
         static const char *names[]={"ap_config_map","tasks","commands","events","status"};
         for(unsigned i=0;i<5;i++)if(!strcmp(name,names[i]))return 3000+(int)i;
         assert(0 && "unexpected load map lookup");return -ENOENT;

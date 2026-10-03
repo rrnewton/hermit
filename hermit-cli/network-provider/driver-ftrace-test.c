@@ -13,10 +13,10 @@
 #define DF_PIDFD 900
 #define DF_PROVIDER UINT64_C(0x123456789)
 #define DF_ANCHOR (AP_GROUPED_CONNECT_IMAGE+UINT64_C(0x200000))
-#define DF_MAPS 24U
+#define DF_MAPS 25U
 #define DF_TOTAL (DF_MAPS+AP_PROGRAMS+AP_LINKS)
 _Static_assert(AP_PROGRAMS==49 && AP_LINKS==49,"accepted-contract.json FtraceV1");
-_Static_assert(DF_TOTAL==122,"three separate identifier namespaces");
+_Static_assert(DF_TOTAL==123,"three separate identifier namespaces");
 
 static _Noreturn void df_unexpected(const char *what) {
     fprintf(stderr,"unmocked or out-of-contract driver effect: %s\n",what);
@@ -30,7 +30,7 @@ enum df_fault {
     DF_ATTACH_FAIL, DF_LOAD_FAIL, DF_CONFIG_FAIL, DF_RING_FAIL, DF_READ_LINK,
     DF_ANCHOR_FAIL, DF_WRONG_PROGRAM_KIND, DF_LEGACY_PROGRAM,
     DF_FAULT_TARGET, DF_FAULT_MISS, DF_FAULT_SHORT, DF_FAULT_MAP, DF_FAULT_MAP_MISSING,
-    DF_OPEN_FAIL, DF_PROGRAM_MISS, DF_LINK_MISS, DF_TASK_MAP
+    DF_OPEN_FAIL, DF_PROGRAM_MISS, DF_LINK_MISS, DF_TASK_MAP, DF_EXECUTABLE_MAP
 };
 static enum df_fault df_fault;
 static unsigned df_bad_at;
@@ -106,11 +106,11 @@ static const char *const df_map_names[]={
     "ap_config_map","status","listeners","events","commands","objects","clones","setters","tasks",
     "fd_accepts","fd_enrollments","fd_status","fd_journal","fd_files","fd_tables","fd_calls",
     "fd_replacements","fd_install_calls","fd_removals","fd_puts","fd_copies","fd_execs",
-    "stream_copy_records","stream_copy_faults"
+    "stream_copy_records","stream_copy_faults","executable_sources"
 };
 _Static_assert(DF_COUNT(df_map_names)==DF_MAPS,"actual BPF map declarations");
 static unsigned df_map_type(const char *name) {
-    if(!strcmp(name,"stream_copy_faults"))return BPF_MAP_TYPE_ARRAY;
+    if(!strcmp(name,"stream_copy_faults") || !strcmp(name,"executable_sources"))return BPF_MAP_TYPE_ARRAY;
     if(!strcmp(name,"tasks"))return BPF_MAP_TYPE_TASK_STORAGE;
     if(!strcmp(name,"stream_copy_records"))return BPF_MAP_TYPE_RINGBUF;
     for(unsigned i=0;i<5;i++)if(!strcmp(name,df_map_names[i]))return BPF_MAP_TYPE_ARRAY;
@@ -194,6 +194,8 @@ static int df_fseek(FILE *f,long offset,int whence) {
     const struct ap_copy_image_slice *s=v->kind==3?ap_copy_image_slices:ap_group_image_slices;
     size_t count=v->kind==3?DF_COUNT(ap_copy_image_slices):DF_COUNT(ap_group_image_slices);
     for(size_t i=0;i<count;i++)if(s[i].offset==offset) {v->slice=&s[i];v->cursor=0;return 0;}
+    if(v->kind==4)for(size_t i=0;i<DF_COUNT(ap_executable_image_slices);i++)
+        if(ap_executable_image_slices[i].offset==offset) {v->slice=&ap_executable_image_slices[i];v->cursor=0;return 0;}
     df_unexpected("unmodeled image seek");
 }
 static int df_ferror(FILE *f) {df_file_checked(f);return 0;}
@@ -466,6 +468,20 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
             default:df_unexpected("task-map mutant");
             }
         }
+        if(!strcmp(df_maps[at].name,"executable_sources")) {
+            m->key_size=4;m->value_size=472;m->max_entries=32;
+            if(df_fault==DF_EXECUTABLE_MAP)switch(df_bad_at) {
+            case 0:m->value_size=464;break;
+            case 1:m->value_size=480;break;
+            case 2:m->key_size=8;break;
+            case 3:m->type=BPF_MAP_TYPE_HASH;break;
+            case 4:m->max_entries=31;break;
+            case 5:m->map_flags=1;break;
+            case 6:m->id=0;break;
+            case 7:*size=offsetof(struct bpf_map_info,map_flags);break;
+            default:df_unexpected("executable-map mutant");
+            }
+        }
         if(!strcmp(df_maps[at].name,"stream_copy_faults")) {
             m->key_size=sizeof(u32);m->value_size=sizeof(struct ap_stream_fault_state);m->max_entries=AP_COMMANDS;
             if(df_fault==DF_FAULT_MAP)m->value_size--;
@@ -564,8 +580,8 @@ static void df_reset(enum df_fault fault,unsigned at) {
     /* Remove an unconsulted map, preserving the real config/ring prerequisites. */
     if(fault==DF_MISSING_MAP) {
         for(unsigned i=2;i<DF_MAPS-1;i++)df_maps[i].name=df_map_names[i+1];
-        df_maps[DF_MAPS-3].fd=1022; /* retained ring keeps its independently fixed FD */
-        df_maps[DF_MAPS-2].fd=1023; /* new witness map also remains present */
+        for(unsigned i=2;i<DF_MAPS-1;i++)df_maps[i].fd=1001+(int)i;
+        /* Preserve every original map FD while removing only events. */
     }
     if(fault==DF_MISSING_REQUIRED_MAP)df_maps[0].name="missing-config";
     for(unsigned i=0;i<df_object.maps;i++)df_maps[i].type=df_map_type(df_maps[i].name);
@@ -664,7 +680,7 @@ static void df_map_census(enum df_fault fault) {
         assert(rc==0 && n==DF_TOTAL-1);
         unsigned maps=0;
         for(unsigned i=0;i<n;i++)maps+=ids[i].kind==0;
-        assert(maps==23);
+        assert(maps==24);
     }
     df_closed(s,0);
 }
@@ -995,7 +1011,7 @@ static void dm_prepare(struct ap_session *s) {
 }
 static void dm_inventory(void) {
     struct ap_session *s=NULL;dm_ready(&s);
-    struct ap_program_id ids[122];u32 n=0;assert(!ap_identifiers(s,ids,122,&n) && n==122);
+    struct ap_program_id ids[123];u32 n=0;assert(!ap_identifiers(s,ids,123,&n) && n==123);
     unsigned counts[3]={0},linked=0;
     for(u32 i=0;i<n;i++) {
         struct ap_owned_metadata m={0};
@@ -1008,7 +1024,7 @@ static void dm_inventory(void) {
                 m.value.linked_program.link.type,BPF_LINK_TYPE_PERF_EVENT));linked++;
         } else assert(m.source==AP_OWNED_DIRECT_FD);
     }
-    CHECK(counts[0]==24 && counts[1]==49 && counts[2]==49 && linked==38 && dm_global_id_queries==0);
+    CHECK(counts[0]==25 && counts[1]==49 && counts[2]==49 && linked==38 && dm_global_id_queries==0);
     df_closed(s,0);
 }
 static void dm_identity(void) {
@@ -1066,6 +1082,12 @@ static void dm_gate(void) {
 }
 static void dm_task_map(void) {
     for(unsigned mutation=0;mutation<8;mutation++) {
+        df_reset(DF_EXECUTABLE_MAP,mutation);struct ap_session *session=NULL;
+        CHECK(ap_open("fixture-object-only",DF_PROVIDER,&session)==-1 && errno==ENODATA);
+        CHECK(session && !session->ready && !df_updates && !df_lookups && !df_attach_calls);
+        df_closed(session,0);
+    }
+    for(unsigned mutation=0;mutation<8;mutation++) {
         df_reset(DF_TASK_MAP,mutation);struct ap_session *session=NULL;
         CHECK(ap_open("fixture-object-only",DF_PROVIDER,&session)==-1 && errno==ENODATA);
         CHECK(session && !session->ready && !df_updates && !df_lookups && !df_attach_calls);
@@ -1091,6 +1113,9 @@ static void dm_command_wire(void) {
         raw.expected_timeout_ticks=0;CHECK(ap_task_command_extension_valid(&raw));
         raw.expected_timeout_ticks=5000;
     }
+    raw.operation=AP_EXECUTABLE_SOURCE;CHECK(!ap_task_command_extension_valid(&raw));
+    raw.expected_timeout_ticks=0;CHECK(ap_task_command_extension_valid(&raw));
+    raw.expected_timeout_ticks=5000;
     raw.operation=AP_ORIGINAL_SENDTO_BLOCKING_CALL;CHECK(ap_task_command_extension_valid(&raw));
     raw.expected_timeout_ticks=0;CHECK(!ap_task_command_extension_valid(&raw));
     raw.expected_timeout_ticks=0x7fffffffffffffffULL;CHECK(!ap_task_command_extension_valid(&raw));

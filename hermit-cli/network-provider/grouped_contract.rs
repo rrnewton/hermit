@@ -150,7 +150,7 @@ pub fn validate(contract: &Contract) -> Result<()> {
         } else {
             matches!(contract.accepted_copy_version(), Ok(4 | 5))
         })
-            && contract.maps == if contract.ftrace_only { 24 } else { 23 }
+            && contract.maps == (if contract.ftrace_only { 24 } else { 23 }) + usize::from(contract.abi_version == "415052555354000b")
             && contract.programs == if contract.ftrace_only { 49 } else { 44 }
             && contract.links == if contract.ftrace_only { 49 } else { 44 }
             && contract.shared_links.is_empty(),
@@ -191,6 +191,9 @@ pub fn validate(contract: &Contract) -> Result<()> {
     // count/site test intact. Its explicit adapter/copy pair is validated normally.
     let legacy = Contract::parse(include_bytes!("accepted-classic-v40-contract.json"))?;
     let mut sources = legacy.source_files;
+    if contract.abi_version != "415052555354000b" {
+        sources.retain(|name| !matches!(name.as_str(), "executable-source.h" | "executable-source.bpf.h" | "executable-source-driver.h" | "executable-source-image.h"));
+    }
     if contract.ftrace_only {
         sources.extend(FTRACE_SOURCES.iter().map(|name| (*name).to_owned()));
     } else {
@@ -254,8 +257,8 @@ mod tests {
     fn ftrace_topology_retains_role_coverage_without_group_runtime_sources() {
         let parsed=Contract::parse(include_bytes!("accepted-contract.json")).unwrap();
         assert!(parsed.ftrace_only);
-        assert_eq!((parsed.maps,parsed.programs,parsed.links),(24,49,49));
-        assert_eq!(parsed.maps+parsed.programs+parsed.links,122);
+        assert_eq!((parsed.maps,parsed.programs,parsed.links),(25,49,49));
+        assert_eq!(parsed.maps+parsed.programs+parsed.links,123);
         let group=parsed.grouped_event.unwrap();
         assert_eq!((group.version,group.program.as_str(),group.cookie),
             (2,"ftrace-replacements-v1",0));
@@ -268,8 +271,8 @@ mod tests {
     #[test]
     fn grouped_topology_keeps_every_physical_site_under_fixed_inventory() {
         let parsed = Contract::parse(include_bytes!("accepted-grouped-v4-contract.json")).unwrap();
-        assert_eq!((parsed.maps, parsed.programs, parsed.links), (23, 44, 44));
-        assert_eq!(parsed.maps + parsed.programs + parsed.links, 111);
+        assert_eq!((parsed.maps, parsed.programs, parsed.links), (24, 44, 44));
+        assert_eq!(parsed.maps + parsed.programs + parsed.links, 112);
         assert!(parsed.maps + parsed.programs + parsed.links <= 128);
         let group = parsed.grouped_event.unwrap();
         assert_eq!(group.sites.len(), 17);
@@ -356,7 +359,8 @@ mod tests {
             refuses(&v);
         }
         for (key, replacement) in [
-            ("maps", json!(24)),
+            ("maps", json!(23)),
+            ("maps", json!(25)),
             ("programs", json!(43)),
             ("links", json!(45)),
             ("abi_version", json!("4150525553540008")),
@@ -398,7 +402,7 @@ mod tests {
     #[test]
     fn ftrace_fault_witness_requires_exact_inventory_and_hook() {
         let selected = current();
-        for (field, exact) in [("maps", 24), ("programs", 49), ("links", 49)] {
+        for (field, exact) in [("maps", 25), ("programs", 49), ("links", 49)] {
             for replacement in [exact - 1, exact + 1] {
                 let mut changed = selected.clone();
                 changed[field] = json!(replacement);
@@ -427,15 +431,15 @@ mod tests {
         let selected = current();
         let parsed = Contract::parse(include_bytes!("accepted-contract.json")).unwrap();
         assert_eq!(parsed.accepted_copy_version().unwrap(), 5);
-        assert_eq!(parsed.abi_version, "415052555354000a");
+        assert_eq!(parsed.abi_version, "415052555354000b");
         assert!(parsed.ftrace_only);
-        assert_eq!((parsed.maps, parsed.programs, parsed.links), (24, 49, 49));
+        assert_eq!((parsed.maps, parsed.programs, parsed.links), (25, 49, 49));
         assert_eq!((historical["programs"].as_u64(),historical["links"].as_u64()),(Some(44),Some(44)));
         for field in ["schema", "btf_sha256", "shared_links"] {
             assert_eq!(selected[field], historical[field], "{field}");
         }
-        assert_eq!(selected["maps"], json!(24));
-        assert_eq!(historical["maps"], json!(23));
+        assert_eq!(selected["maps"], json!(25));
+        assert_eq!(historical["maps"], json!(24));
         let mut exact_hooks = historical["hooks"].clone();
         exact_hooks["fixup_exception"] = json!([[8, 4, 8, 8], 4, 4]);
         assert_eq!(selected["hooks"], exact_hooks);
@@ -448,10 +452,10 @@ mod tests {
         let classic:Value=serde_json::from_slice(include_bytes!("accepted-classic-v40-contract.json")).unwrap();
         let classic_sources = classic["source_files"].as_array().unwrap();
         let selected_sources = selected["source_files"].as_array().unwrap();
-        assert_eq!(classic_sources.len(), 23);
-        assert_eq!(selected_sources.len(), 50);
-        assert_eq!(&selected_sources[..23], classic_sources);
-        assert_eq!(&selected_sources[23..], &[
+        assert_eq!(classic_sources.len(), 27);
+        assert_eq!(selected_sources.len(), 54);
+        assert_eq!(&selected_sources[..27], classic_sources);
+        assert_eq!(&selected_sources[27..], &[
             json!("ftrace-coverage.h"),json!("driver-grouped.c"),json!("grouped-driver.h"),
             json!("grouped-io.h"),json!("grouped-owner.h"),json!("grouped-probes.bpf.h"),
             json!("grouped-probes.h"),json!("grouped-target.h"),json!("provider-grouped.bpf.c"),
@@ -470,7 +474,7 @@ mod tests {
             json!("stream-tx.bpf.h"),
             json!("stream-tx-driver.h"),
         ]);
-        assert_eq!(parsed.source_files.len(), 50);
+        assert_eq!(parsed.source_files.len(), 54);
     }
 
     #[test]
@@ -484,7 +488,9 @@ mod tests {
             ("4150525553540009", Some(4)),
             ("415052555354000a", None),
             ("415052555354000a", Some(4)),
-            ("415052555354000b", Some(5)),
+            ("415052555354000c", Some(5)),
+            ("415052555354000b", None),
+            ("415052555354000b", Some(4)),
             ("4150525553540008", Some(6)),
             ("4150525553540007", Some(4)),
         ] {
@@ -497,7 +503,7 @@ mod tests {
             refuses(&changed);
         }
         let count=selected["source_files"].as_array().unwrap().len();
-        assert_eq!(count,50);
+        assert_eq!(count,54);
         for index in 0..count {
             let mut changed = selected.clone();
             changed["source_files"].as_array_mut().unwrap().remove(index);
