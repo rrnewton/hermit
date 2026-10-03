@@ -3094,17 +3094,35 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         selected_cells.truncate(count);
         selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
     }
+    // The scorecard deliberately excludes custom modes from its comparable
+    // population. A disabled probe may still need a fixture whose only enabled
+    // preparation recipe is custom. Keep every existing comparable choice;
+    // consult the real enabled manifest population only for missing owners.
+    let enabled_manifest_cells = if selected_cells
+        .iter()
+        .any(|cell| !applicable_by_test.contains_key(&cell.id.test))
+    {
+        hermit_manifest_plan::runner::ManifestSet::load(root)?.select(
+            &hermit_manifest_plan::runner::Selection {
+                population: Some(hermit_manifest_plan::runner::Population::Enabled),
+                include_manual: true,
+                include_occasional: true,
+                ..Default::default()
+            },
+        )?
+    } else {
+        Vec::new()
+    };
     let mut preparation_by_test = BTreeMap::new();
     for cell in &selected_cells {
-        let prepared_with = applicable_by_test.get(&cell.id.test).ok_or_else(|| {
-            format!(
-                "{} has no applicable manifest mode available to build its fixture",
-                cell.id.test
-            )
-        })?;
+        let prepared_with = fixture_preparation_cell(
+            &cell.id,
+            applicable_by_test.get(&cell.id.test),
+            &enabled_manifest_cells,
+        )?;
         preparation_by_test
             .entry(cell.id.test.clone())
-            .or_insert_with(|| prepared_with.clone());
+            .or_insert(prepared_with);
     }
     Ok(PressureCells {
         selected: selected_cells,
@@ -3112,6 +3130,41 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         eligible_cells,
         preparation_by_test,
         cells_file_sha256,
+    })
+}
+
+// This selects a build-only recipe, never an additional pressure execution.
+// Enabled recipes come from ManifestSet::select, which shares the real build
+// consumer's manifest validation. A budget row or disabled backend cannot
+// grant fixture applicability.
+fn fixture_preparation_cell(
+    selected: &CellId,
+    comparable: Option<&CellId>,
+    enabled: &[hermit_manifest_plan::runner::SelectedCell],
+) -> Result<CellId, String> {
+    if let Some(existing) = comparable {
+        return Ok(existing.clone());
+    }
+    let cell = enabled
+        .iter()
+        .find(|cell| {
+            cell.enabled
+                && cell.id.test == selected.test
+                && cell.category == selected.category
+                && cell.test.lane == selected.lane
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} has no applicable manifest mode available to build its fixture",
+                selected.test
+            )
+        })?;
+    Ok(CellId {
+        lane: cell.test.lane.clone(),
+        category: cell.category.clone(),
+        test: cell.id.test.clone(),
+        mode: cell.id.mode.clone(),
+        backend: cell.id.backend.clone().unwrap_or_else(|| "native".into()),
     })
 }
 
@@ -8971,6 +9024,159 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     Ok(())
 }
 
+fn custom_fixture_preparation_self_test(
+    root: &Path,
+    tracked: &TrackedCells,
+    batch: &PressureCells,
+    dag: &DagConfig,
+    results: &Path,
+) -> Result<(), String> {
+    let test = "applications/network-only-curl-http";
+    let selected = batch
+        .selected
+        .iter()
+        .find(|cell| cell.id.test == test && cell.id.mode == "verify" && cell.id.backend == "kvm")
+        .ok_or("custom fixture bracket omitted the actual disabled HTTP probe")?;
+    if selected.is_applicable() || selected.status != "not-applicable" {
+        return Err("custom fixture preparation changed the disabled HTTP population".into());
+    }
+    let enabled = hermit_manifest_plan::runner::ManifestSet::load(root)?.select(
+        &hermit_manifest_plan::runner::Selection {
+            population: Some(hermit_manifest_plan::runner::Population::Enabled),
+            include_manual: true,
+            include_occasional: true,
+            ..Default::default()
+        },
+    )?;
+    let expected = CellId {
+        lane: "privileged".into(),
+        category: "applications".into(),
+        test: test.into(),
+        mode: "custom".into(),
+        backend: "ptrace".into(),
+    };
+    if fixture_preparation_cell(&selected.id, None, &enabled)? != expected
+        || batch.preparation_by_test.get(test) != Some(&expected)
+    {
+        return Err("HTTP fixture did not use its genuine enabled custom/ptrace recipe".into());
+    }
+    if fixture_preparation_cell(&selected.id, None, &[]).is_ok() {
+        return Err("fixture without any enabled manifest recipe was accepted".into());
+    }
+    let original = enabled
+        .iter()
+        .find(|cell| {
+            cell.id.test == test
+                && cell.id.mode == "custom"
+                && cell.id.backend.as_deref() == Some("ptrace")
+        })
+        .ok_or("HTTP fixture bracket lost the real custom recipe")?;
+    for mutation in 0..4 {
+        let mut changed = original.clone();
+        match mutation {
+            0 => changed.enabled = false,
+            1 => changed.id.test.push_str("-wrong"),
+            2 => changed.category.push_str("-wrong"),
+            3 => changed.test.lane.push_str("-wrong"),
+            _ => unreachable!(),
+        }
+        if fixture_preparation_cell(&selected.id, None, &[changed]).is_ok() {
+            return Err(format!(
+                "fixture identity/applicability mutation {mutation} was accepted"
+            ));
+        }
+    }
+    // Preserve the old first applicable scorecard recipe for every such test,
+    // even when another enabled (including custom) recipe could also prepare it.
+    let mut previous = BTreeMap::new();
+    for cell in &tracked.cells {
+        if cell.is_applicable() {
+            previous.entry(cell.id.test.clone()).or_insert(&cell.id);
+        }
+    }
+    for cell in previous.values() {
+        if fixture_preparation_cell(cell, Some(cell), &enabled)? != **cell {
+            return Err(format!(
+                "existing fixture preference changed for {}",
+                cell.test
+            ));
+        }
+    }
+    let prepare_tag = format!("prepare.{}", sanitize(test));
+    let prepare = dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == prepare_tag)
+        .ok_or("HTTP fixture preparation node is missing")?;
+    let consumer_tag = format!("cell.{}", cell_run_slug(&selected.id, Some(1)));
+    let consumer = dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == consumer_tag)
+        .ok_or("HTTP disabled probe consumer is missing")?;
+    let prepare_selector = format!(
+        "--test {} --mode {} --backend {}",
+        shell_quote(test),
+        shell_quote("custom"),
+        shell_quote("ptrace")
+    );
+    let consumer_selector = format!(
+        "--test {} --mode {} --backend {}",
+        shell_quote(test),
+        shell_quote("verify"),
+        shell_quote("kvm")
+    );
+    let status = results.join("prepare").join(sanitize(test)).join("status");
+    let status_guard = format!(
+        "if ! test \"$(cat {} 2>/dev/null)\" = 0; then printf '{}\\n'",
+        shell_quote(&status.to_string_lossy()),
+        PREPARATION_FAILED_STATUS
+    );
+    if !prepare
+        .cmd
+        .contains("target/debug/test-harness build --include-manual --include-occasional")
+        || !prepare.cmd.contains(&prepare_selector)
+        || prepare.cmd.contains("test-harness run")
+        || prepare.deps != vec!["setup.manifest_plan", "build.e2e_artifact"]
+        || !consumer
+            .cmd
+            .contains("test-harness run --probe-disabled --include-occasional --prebuilt")
+        || !consumer.cmd.contains(&consumer_selector)
+        || !consumer.cmd.contains(&status_guard)
+        || consumer.deps
+            != selected_cell_dependencies(false, true, "verify", "kvm", Some(&prepare_tag))
+        || dag.steps.iter().filter(|step| step.group == "cell").count() != batch.selected.len()
+    {
+        return Err(
+            "custom fixture preparation lost its actual build/consumer/status/dependency contract"
+                .into(),
+        );
+    }
+    let key = (test.to_string(), "custom".to_string(), "ptrace".to_string());
+    let budgets = resolve_budgets(
+        load_budgets(root)?,
+        PressureTimeoutPolicy::from_env()?,
+        &BTreeSet::from([key.clone()]),
+    )?;
+    let budget = budgets
+        .get(&key)
+        .ok_or("HTTP preparation lost its actual manifest budget")?;
+    let wall = preparation_node_timeout(budget)?;
+    if prepare.timeout != wall
+        || prepare.cpu_timeout != wall * 2
+        || !prepare.cmd.contains(&format!(
+            "timeout --kill-after=10s {}s",
+            preparation_timeout(budget)?
+        ))
+    {
+        return Err("custom fixture preparation changed its original budget formula".into());
+    }
+    println!(
+        "  custom fixture: actual disabled HTTP probe retained; enabled custom/ptrace build only, exact identity, old preferences, budgets and preparation-failure gate preserved"
+    );
+    Ok(())
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -9998,6 +10204,13 @@ fn self_test(root: &Path) -> Result<(), String> {
         &disabled_batch_results,
         &disabled_batch_results.join("dag.json"),
         &disabled_batch_selection,
+    )?;
+    custom_fixture_preparation_self_test(
+        root,
+        &tracked,
+        &disabled_batch,
+        &disabled_batch_dag,
+        &disabled_batch_results,
     )?;
     if !disabled_batch_metadata.probe_disabled
         || disabled_batch_dag

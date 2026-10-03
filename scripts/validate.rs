@@ -423,7 +423,7 @@ enum ValidationStepIdentity {
 fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     let manifest_group = step.group == "e2e" || step.group.ends_with("-e2e");
     let quick_manifest_run = step.group == "quick" && step.job == "e2e_verify";
-    if (step.group == "gate" && step.job == "manifest")
+    if (step.group == "gate" && matches!(step.job.as_str(), "manifest" | "manifest_on_host"))
         || (manifest_group && step.job == "metadata")
     {
         ValidationStepIdentity::ManifestAudit
@@ -432,6 +432,402 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     } else {
         ValidationStepIdentity::Other
     }
+}
+
+const FULL_HTTP_HOST_TAG: &str = "privileged-e2e.network_http_on_host";
+const FULL_HOST_ARTIFACT_POINTER: &str = "target/ci/hermit-network-e2e-artifact.path";
+
+/// A self-test of the closed, source-defined full-plan roles. This does not
+/// rewrite the graph or issue an admission floor; both real pin checks remain
+/// owned and observed by the existing admission path.
+fn full_plan_node<'a>(
+    cfg: &'a DagConfig,
+    tag: &str,
+    command: &str,
+    dependencies: &[&str],
+    limits: (i64, i64),
+    environment: &[(&str, &str)],
+) -> Result<&'a Step, String> {
+    let nodes = cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == tag)
+        .collect::<Vec<_>>();
+    let [step] = nodes.as_slice() else {
+        return Err(format!("full-plan role {tag}: expected one exact owner"));
+    };
+    if step.cmd != command
+        || step.deps.iter().map(String::as_str).collect::<Vec<_>>() != dependencies
+        || (step.timeout, step.cpu_timeout) != limits
+        || step.env.len() != environment.len()
+        || environment
+            .iter()
+            .any(|(key, value)| step.env.get(*key).map(String::as_str) != Some(*value))
+    {
+        return Err(format!(
+            "full-plan role {tag}: command, dependencies, limits or environment changed"
+        ));
+    }
+    Ok(step)
+}
+
+fn full_pin_owner_contract(cfg: &DagConfig) -> Result<(), String> {
+    let mut owners = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            step.tag().starts_with("pre.reverie_pin")
+                || step.cmd.contains("ci/run-reverie-pin-check.sh")
+        })
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    owners.sort();
+    if owners != [PIN_GATE_TAG, "pre.reverie_pin_on_host"] {
+        return Err(format!(
+            "full-plan bracket: unexpected exact pin owners: {owners:?}"
+        ));
+    }
+    for (tag, deps, wall) in [
+        (PIN_GATE_TAG, &["pre.submodules"][..], 900),
+        ("pre.reverie_pin_on_host", &[][..], 120),
+    ] {
+        let command = hermit_manifest_plan::validation_dag::admitted_pin_command(tag, None)?
+            .ok_or("full-plan bracket: canonical pin renderer lost an existing owner")?;
+        full_plan_node(cfg, tag, &command, deps, (wall, 300), &[])?;
+    }
+    // Each execution root's producer keeps its own actual pin dependency.
+    for (tag, pin) in [
+        (RUST_SCRIPT_PRODUCER_TAG, PIN_GATE_TAG),
+        ("build.rust_scripts_on_host", "pre.reverie_pin_on_host"),
+    ] {
+        full_plan_node(
+            cfg,
+            tag,
+            &format!("{RUST_SCRIPT_COMMAND_PREFIX}{RUST_SCRIPT_PRODUCER_BODY}"),
+            &[pin],
+            (900, 7200),
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+/// HTTP is the only source-defined full-plan manifest consumer that needs the
+/// host manager/provider. Authenticate its complete existing route rather than
+/// exempting arbitrary host commands from the pinned-consumer assertions.
+fn full_http_host_contract(cfg: &DagConfig) -> Result<(), String> {
+    let host_consumers = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                && !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+        })
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if host_consumers != [FULL_HTTP_HOST_TAG] {
+        return Err(format!(
+            "full-plan bracket: unexpected host manifest owners: {host_consumers:?}"
+        ));
+    }
+    full_plan_node(
+        cfg,
+        "setup.manifest_plan_on_host",
+        &format!(
+            "{RUST_SCRIPT_COMMAND_PREFIX}{}",
+            validate_plan::MANIFEST_PLAN_BUILD_COMMAND
+        ),
+        &["build.rust_scripts_on_host"],
+        (180, 7200),
+        &[],
+    )?;
+    full_plan_node(
+        cfg,
+        "gate.manifest_on_host",
+        &format!("{RUST_SCRIPT_COMMAND_PREFIX}{MANIFEST_AUDIT_COMMAND}"),
+        &["setup.manifest_plan_on_host"],
+        (180, 600),
+        &[],
+    )?;
+    full_plan_node(
+        cfg,
+        "privileged-build.manifest_guests_on_host",
+        &format!(
+            "{RUST_SCRIPT_COMMAND_PREFIX}target/debug/test-harness build --lane privileged --ci-only --allow-empty"
+        ),
+        &[
+            "gate.manifest_on_host",
+            "pre.reverie_pin_on_host",
+            "setup.manifest_plan_on_host",
+        ],
+        (120, 7200),
+        &[],
+    )?;
+    full_plan_node(
+        cfg,
+        "privileged-only-build.privileged_tests_on_host",
+        &format!(
+            "{RUST_SCRIPT_COMMAND_PREFIX}CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-host-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"
+        ),
+        &["gate.manifest_on_host", "pre.reverie_pin_on_host"],
+        (120, 7200),
+        &[],
+    )?;
+    for (component, tag) in [
+        ("accepted", "build.network_http_accepted_on_host"),
+        ("unix-guard", "build.network_http_unix_guard_on_host"),
+    ] {
+        full_plan_node(
+            cfg,
+            tag,
+            &format!(
+                "{RUST_SCRIPT_COMMAND_PREFIX}./hermit-cli/network-provider/package.rs --component {component} --source-dir \"$PWD/hermit-cli/network-provider\" --output-dir \"$VALIDATE_RUN_STATE/network-http-provider/{component}\""
+            ),
+            &[
+                "build.rust_scripts_on_host",
+                "gate.manifest_on_host",
+                "pre.reverie_pin_on_host",
+            ],
+            (120, 7200),
+            &[],
+        )?;
+    }
+    full_plan_node(
+        cfg,
+        "build.network_http_artifact_on_host",
+        &format!(
+            "{RUST_SCRIPT_COMMAND_PREFIX}bundle=$(./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-host-e2e-artifact.path) && ./ci/publish-hermit-e2e-artifact.sh --network-provider \"$VALIDATE_RUN_STATE/network-http-provider\" \"$bundle/hermit\" target/ci/hermit-e2e-artifacts {FULL_HOST_ARTIFACT_POINTER}"
+        ),
+        &[
+            "build.network_http_accepted_on_host",
+            "build.network_http_unix_guard_on_host",
+            "gate.manifest_on_host",
+            "pre.reverie_pin_on_host",
+            "privileged-only-build.privileged_tests_on_host",
+        ],
+        (20, 7200),
+        &[],
+    )?;
+    let http = full_plan_node(
+        cfg,
+        FULL_HTTP_HOST_TAG,
+        &format!(
+            "{RUST_SCRIPT_COMMAND_PREFIX}./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --test applications/network-only-curl-http --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/network_http/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/network_http/junit.xml\""
+        ),
+        &[
+            "build.network_http_artifact_on_host",
+            "gate.manifest_on_host",
+            "pre.reverie_pin_on_host",
+            "privileged-build.manifest_guests_on_host",
+            "privileged-only-build.privileged_tests_on_host",
+            "setup.manifest_plan_on_host",
+        ],
+        (600, 7200),
+        &[("HERMIT_E2E_ARTIFACT_POINTER", FULL_HOST_ARTIFACT_POINTER)],
+    )?;
+    let expected = DagManifest {
+        lane: "privileged".into(),
+        category: "applications".into(),
+        test: Some("applications/network-only-curl-http".into()),
+        mode: None,
+        backend: None,
+    };
+    if http.manifest.as_ref() != Some(&expected) {
+        return Err("full-plan bracket: HTTP selector changed".into());
+    }
+    let mut cell = expected;
+    cell.mode = Some("custom".into());
+    cell.backend = Some("ptrace".into());
+    if http.effective_result_manifests().as_ref() != [cell] {
+        return Err("full-plan bracket: HTTP exact required result cell changed".into());
+    }
+    let structured = http
+        .structured_test_results_manifest()?
+        .ok_or("full-plan bracket: HTTP structured result producer disappeared")?;
+    if structured.owner != FULL_HTTP_HOST_TAG
+        || structured.schema != dagrun::test_results::CURRENT_SCHEMA
+    {
+        return Err("full-plan bracket: HTTP structured result owner/schema changed".into());
+    }
+    Ok(())
+}
+
+fn full_route_contract_bracket(cfg: &DagConfig) -> Result<(), String> {
+    let check = |candidate: &DagConfig| -> Result<(), String> {
+        full_pin_owner_contract(candidate)?;
+        full_http_host_contract(candidate)
+    };
+    check(cfg)?;
+    let refuse = |candidate: &DagConfig, why: &str| -> Result<(), String> {
+        if check(candidate).is_ok() {
+            return Err(format!("full-plan route mutant accepted: {why}"));
+        }
+        Ok(())
+    };
+    let roles = [
+        PIN_GATE_TAG,
+        "pre.reverie_pin_on_host",
+        RUST_SCRIPT_PRODUCER_TAG,
+        "build.rust_scripts_on_host",
+        "setup.manifest_plan_on_host",
+        "gate.manifest_on_host",
+        "privileged-build.manifest_guests_on_host",
+        "privileged-only-build.privileged_tests_on_host",
+        "build.network_http_accepted_on_host",
+        "build.network_http_unix_guard_on_host",
+        "build.network_http_artifact_on_host",
+        FULL_HTTP_HOST_TAG,
+    ];
+    for tag in roles {
+        let original = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or("missing positive role")?;
+        let mut missing = cfg.clone();
+        missing.steps.retain(|step| step.tag() != tag);
+        refuse(&missing, "missing exact role")?;
+        let mut duplicate = cfg.clone();
+        duplicate.steps.push(original.clone());
+        refuse(&duplicate, "duplicate exact role")?;
+        let mut command = cfg.clone();
+        command
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == tag)
+            .unwrap()
+            .cmd
+            .push_str(" && true");
+        refuse(&command, "changed command")?;
+        let mut budget = cfg.clone();
+        budget
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == tag)
+            .unwrap()
+            .timeout += 1;
+        refuse(&budget, "changed original wall bound")?;
+        for dependency in &original.deps {
+            let mut lost_edge = cfg.clone();
+            lost_edge
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .deps
+                .retain(|dep| dep != dependency);
+            refuse(&lost_edge, "missing actual prerequisite edge")?;
+        }
+    }
+    let mut extra_pin = cfg.clone();
+    let mut extra = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == PIN_GATE_TAG)
+        .unwrap()
+        .clone();
+    extra.job = "unrecognized_pin".into();
+    extra_pin.steps.push(extra);
+    refuse(&extra_pin, "foreign pin command owner")?;
+    let mut wrong_pin = cfg.clone();
+    wrong_pin
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.rust_scripts_on_host")
+        .unwrap()
+        .deps = vec![PIN_GATE_TAG.into()];
+    refuse(&wrong_pin, "host producer using the other pin owner")?;
+    let mut wrong_result = cfg.clone();
+    wrong_result
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap()
+        .cmd = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap()
+        .cmd
+        .replace("/network_http/", "/network_http_on_host/");
+    refuse(&wrong_result, "different actual results and JUnit paths")?;
+    let mut wrong_pointer = cfg.clone();
+    wrong_pointer
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap()
+        .env
+        .insert(
+            "HERMIT_E2E_ARTIFACT_POINTER".into(),
+            "target/ci/hermit-e2e-artifact.path".into(),
+        );
+    refuse(&wrong_pointer, "wrong artifact pointer")?;
+    let mut wrong_cell = cfg.clone();
+    wrong_cell
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap()
+        .result_manifests = None;
+    refuse(&wrong_cell, "missing full custom/ptrace result identity")?;
+    let mut extra_cell = cfg.clone();
+    let http = extra_cell
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap();
+    let duplicate = http.result_manifests.as_ref().unwrap()[0].clone();
+    http.result_manifests.as_mut().unwrap().push(duplicate);
+    refuse(&extra_cell, "duplicate typed result declaration")?;
+    for corrupt_owner in [false, true] {
+        let mut wrong_structured = cfg.clone();
+        let http = wrong_structured
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+            .unwrap();
+        let mut mutated = false;
+        for result in http.result_manifests.as_mut().unwrap() {
+            if let dagrun::model::ResultManifest::StructuredTestResults(result) = result {
+                if corrupt_owner {
+                    result.owner = "privileged-e2e.unrecognized_http_on_host".into();
+                } else {
+                    result.schema = 0;
+                }
+                mutated = true;
+            }
+        }
+        if !mutated {
+            return Err("positive HTTP structured result declaration absent".into());
+        }
+        refuse(&wrong_structured, "wrong structured result owner/schema")?;
+    }
+    let mut wrong_selector = cfg.clone();
+    wrong_selector
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap()
+        .manifest
+        .as_mut()
+        .unwrap()
+        .mode = Some("verify".into());
+    refuse(&wrong_selector, "narrowed HTTP selection")?;
+    let mut foreign_host = cfg.clone();
+    let mut foreign = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == FULL_HTTP_HOST_TAG)
+        .unwrap()
+        .clone();
+    foreign.job = "unrecognized_http_on_host".into();
+    foreign_host.steps.push(foreign);
+    refuse(&foreign_host, "additional host manifest consumer")?;
+    println!(
+        "  full route: both canonical pin owners and the exact HTTP host chain; missing/extra/changed owners, commands, edges, bounds, outputs and cell identity refuse"
+    );
+    Ok(())
 }
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
@@ -3367,8 +3763,8 @@ cleared-caps refusal names {} starved step(s)",
                      base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
         }
     }
-    // The full hot path selects the committed full-labelled graph and pays the
-    // exact-tree manifest audit once. Bracket that immutable scheduler input
+    // The full hot path selects the committed full-labelled graph and runs
+    // each execution root's existing audit. Bracket that immutable scheduler input
     // and the explicit refusal of the removed sequential-lanes spelling.
     {
         let root = repo_root();
@@ -3403,12 +3799,13 @@ cleared-caps refusal names {} starved step(s)",
             .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestAudit)
             .map(|s| s.tag())
             .collect();
-        if manifest_nodes != vec!["gate.manifest"] {
+        if manifest_nodes != vec!["gate.manifest", "gate.manifest_on_host"] {
             return Err(format!(
-                "full-plan bracket: exact-tree manifest audit was not exactly gate.manifest: {manifest_nodes:?}"
+                "full-plan bracket: exact root-specific manifest audits changed: {manifest_nodes:?}"
             ));
         }
-        // The one committed audit must run AFTER the node that builds the binary it
+        full_route_contract_bracket(&full.cfg)?;
+        // The ordinary committed audit must run AFTER the node that builds the binary it
         // invokes, and that builder must not wait on the audit. Losing this edge
         // in the former runtime deduplication made every cold full run die at
         // `exit 127: target/debug/test-harness: No such file or directory` with
@@ -3498,18 +3895,7 @@ cleared-caps refusal names {} starved step(s)",
             ));
         }
         println!("  {}", manifest_producer_edge_bracket(&full.cfg)?);
-        let pin_nodes: Vec<String> = full
-            .cfg
-            .steps
-            .iter()
-            .filter(|s| s.cmd.contains("ci/run-reverie-pin-check.sh"))
-            .map(|s| s.tag())
-            .collect();
-        if pin_nodes != vec![PIN_GATE_TAG] {
-            return Err(format!(
-                "full-plan bracket: committed graph has more than one pin authority: {pin_nodes:?}"
-            ));
-        }
+        full_pin_owner_contract(&full.cfg)?;
         for required in ["compat.echo", "privileged-cpuid.faulting"] {
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: committed plan lost {required}"));
@@ -3617,13 +4003,19 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag()
                 )
             })?;
+            // The host route was authenticated above, including both exact paths.
+            let result_job = if consumer.tag() == FULL_HTTP_HOST_TAG {
+                "network_http"
+            } else {
+                consumer.job.as_str()
+            };
             let result_path = format!(
                 "\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"",
-                consumer.job
+                result_job
             );
             let junit_path = format!(
                 "\"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
-                consumer.job
+                result_job
             );
             if consumer.cmd.matches("--results").count() != 1
                 || !consumer.cmd.contains(&format!("--results {result_path}"))
@@ -3648,6 +4040,10 @@ cleared-caps refusal names {} starved step(s)",
                     "full-plan bracket: {} does not have one unique JUnit path: {}",
                     consumer.tag(), consumer.cmd
                 ));
+            }
+            if consumer.tag() == FULL_HTTP_HOST_TAG {
+                full_http_host_contract(&full.cfg)?;
+                continue;
             }
             if !consumer
                 .cmd
@@ -3798,6 +4194,10 @@ cleared-caps refusal names {} starved step(s)",
             step.tag().ends_with("_in_pinned_root")
                 || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
         }) {
+            if step.tag() == FULL_HTTP_HOST_TAG {
+                full_http_host_contract(&full.cfg)?;
+                continue;
+            }
             if !step
                 .cmd
                 .contains("/src/ci/hermetic/assert-build-dependencies.sh")
@@ -3847,7 +4247,7 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         println!(
-            "  full plan: {} committed labelled node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; removed sequential-lanes spelling refused",
+            "  full plan: {} committed labelled node(s), root-specific producers/audits + both canonical pin owners + the exact HTTP host route; removed sequential-lanes spelling refused",
             full.cfg.steps.len()
         );
     }
