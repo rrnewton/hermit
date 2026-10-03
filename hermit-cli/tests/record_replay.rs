@@ -225,6 +225,194 @@ fn public_record_replay_preserves_distinct_forked_child_streams() {
     assert_eq!(replay.stdout, recording.stdout);
 }
 
+/// `--mount=type=tmpfs` gives the guest a tmpfs in a mount namespace the
+/// replayer cannot name, as the E2E harness does for `/test`. Replay must
+/// decide what lies inside the guest root from directory objects rather than
+/// procfs link text. `rm -rf` removes entries relative to directory
+/// descriptors; replay used to skip those removals and then fail the final
+/// `rmdir` with ENOTEMPTY (https://github.com/rrnewton/hermit/issues/3592).
+#[test]
+fn record_replay_removes_a_tree_on_a_guest_private_tmpfs() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest tmpfs mountpoint");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!(
+            "--mount=type=tmpfs,target={}",
+            mountpoint.path().display()
+        ))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "mkdir -p w/sub/deeper && echo hi > w/sub/f && echo there > w/sub/deeper/g \
+             && rm -rf w && test ! -e w && echo removed",
+        ]);
+    let output = command_output(command, "record/replay of rm -rf on a guest tmpfs");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("removed\n"),
+        "the guest did not remove its tree:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+    assert!(
+        fs::read_dir(mountpoint.path())
+            .expect("read host view of the mountpoint")
+            .next()
+            .is_none(),
+        "the guest tmpfs leaked into the host mount namespace, so this test no \
+         longer separates the two namespaces"
+    );
+}
+
+/// The open half of https://github.com/rrnewton/hermit/issues/3592: replay
+/// must open for real a file the guest creates on its private tmpfs. `flock`
+/// creates its lock file with `O_CREAT` and then locks the descriptor; replay
+/// refuses to fake a lock on a descriptor outside the replay root, so a
+/// placeholder descriptor for the create makes replay fail.
+#[test]
+fn record_replay_locks_a_file_created_on_a_guest_private_tmpfs() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest tmpfs mountpoint");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!(
+            "--mount=type=tmpfs,target={}",
+            mountpoint.path().display()
+        ))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "mkdir -p locks && flock locks/l -c 'echo locked'",
+        ]);
+    let output = command_output(command, "record/replay of flock on a guest tmpfs");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// Records `script` with standard output `record_stdout`, then lets `prepare`
+/// reset host state and replays the recording with `--autopilot` and standard
+/// output `replay_stdout`, returning the replay's output.
+fn record_then_replay(
+    script: &str,
+    record_stdout: Stdio,
+    prepare: impl FnOnce(),
+    replay_stdout: Stdio,
+) -> Output {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", script])
+        .stdout(record_stdout);
+    command_output(record, "recording");
+    prepare();
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .stdout(replay_stdout)
+        .stderr(Stdio::piped());
+    replay.output().expect("failed to start replay")
+}
+
+/// `/proc/1/root` reads as `/`, a path inside the replay root, but the guest's
+/// kernel follows it to the linked root. Replay must not let the guest re-run
+/// an `O_CREAT` open through it, which would create a host file outside the
+/// replay root.
+#[test]
+fn replay_does_not_create_a_host_file_through_proc_root() {
+    let scratch = tempfile::tempdir().expect("failed to create scratch directory");
+    let target = scratch.path().join("escaped");
+    let script = format!("echo escaped > /proc/1/root{}", target.display());
+    let output = record_then_replay(
+        &script,
+        Stdio::piped(),
+        || {
+            assert!(
+                target.exists(),
+                "recording did not reach the host file through /proc/1/root, so \
+                 this test no longer exercises a link out of the guest root"
+            );
+            fs::remove_file(&target).expect("remove the recorded host file");
+        },
+        Stdio::piped(),
+    );
+    assert!(
+        !target.exists(),
+        "replay created {} outside the replay root; replay stderr:\n{}",
+        target.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `/dev/fd/1` reaches replay's own standard output through the magic link
+/// `/proc/self/fd/1`. A recorded `O_TRUNC` open of it must not truncate that
+/// host file during replay. The recording's standard output is a regular file
+/// too, so the recorded open is of a regular file, as replay sees.
+///
+/// Only truncation is checked. Replay on main writes the recorded "hi\n" at
+/// the recorded offset 0 over the start of the sentinel, without truncating;
+/// that is separate from the open decision and this test does not judge it.
+#[test]
+fn replay_does_not_truncate_its_stdout_through_dev_fd() {
+    let scratch = tempfile::tempdir().expect("failed to create scratch directory");
+    let replay_stdout = scratch.path().join("replay-stdout");
+    fs::write(&replay_stdout, "sentinel\n").expect("write replay stdout sentinel");
+    let stdout = OpenOptions::new()
+        .append(true)
+        .open(&replay_stdout)
+        .expect("open replay stdout");
+    let record_stdout =
+        fs::File::create(scratch.path().join("record-stdout")).expect("create record stdout");
+    let output = record_then_replay(
+        "echo hi > /dev/fd/1",
+        Stdio::from(record_stdout),
+        || {},
+        Stdio::from(stdout),
+    );
+    let content = fs::read_to_string(&replay_stdout).expect("read replay stdout");
+    assert!(
+        content.len() >= "sentinel\n".len(),
+        "replay truncated its host stdout file: {content:?}; replay stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn public_record_replay_handles_a_deep_serial_fork_chain() {
     const INNER: &str = "HERMIT_DEEP_FORK_STREAM_RECORD_REPLAY_INNER";

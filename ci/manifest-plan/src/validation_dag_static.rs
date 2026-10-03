@@ -577,7 +577,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run::tests::skid_overshoot_overrides_a_log_match_for_retention) and
     // retains all 791 prior identities (`cargo nextest list --profile ci`
     // measured the +5 when the change was written, not on this base).
-    ("test.hermit_unit", 796),
+    // https://github.com/rrnewton/hermit/pull/3603 adds
+    // record_replay_path::tests::procfs_symlinks_are_refused_only_when_requested
+    // (replay-root containment refuses procfs symlinks) and retains all 796
+    // prior identities.
+    ("test.hermit_unit", 797),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -821,7 +825,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin carries the same dispatch-record change (+2, -1;
     // https://github.com/rrnewton/hermit/pull/3522).
     // The host node carries the identical selection.
-    ("test.hermit_unit_on_host", 796),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3603 test.
+    ("test.hermit_unit_on_host", 797),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
