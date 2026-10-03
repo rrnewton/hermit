@@ -81,7 +81,7 @@ fi
 # The ASAN binaries and the image are large and host-specific, so they live in
 # an ignored directory rather than the repository. Skip cleanly (exit 0) when
 # they are absent, so run-all.sh reports the demo as skipped, not failed; the
-# sweep still exits 3 for the skip unless run-all.sh was given --allow-skips.
+# sweep still exits 3 for the skip.
 for f in "$BUGGY" "$FIXED" "$IMAGE"; do
   if [ ! -r "$f" ]; then
     if [ "$REQUIRE_ASSETS" = 1 ]; then

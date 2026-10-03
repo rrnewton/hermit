@@ -182,11 +182,12 @@ make -C demos all
 This is the same as `demos/run-all.sh --all`. It writes one log per demo and a
 `summary.tsv` to `target/demo-sweep/`. Demo 8 is skipped, which counts as
 neither a pass nor a failure, until you have run its `prepare-assets.sh`. The
-script exits 1 if any demo fails, and 3 if none failed but at least one was
-skipped, because a skipped demo produced no result; `make` reports either one
-as its own exit status 2. To accept skipped demos, run
-`demos/run-all.sh --all --allow-skips`: it exits 0 when no demo failed, but
-still reports the sweep as `INCOMPLETE` rather than `SUCCESS`.
+script exits 1 if any demo fails. Otherwise it exits 4 if it could not create,
+write, or read its log directory, a demo's log, or `summary.tsv`, because it
+reads each log to tell a skip from a pass, and 3 if at least one demo was
+skipped, because a skipped demo produced no result. `make` reports any of
+these as its own exit status 2. A caller that accepts skipped demos can check
+for exit status 3 itself; `demos/run-all.sh --help` lists every exit status.
 
 Smaller selections:
 
