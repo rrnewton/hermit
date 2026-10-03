@@ -45,6 +45,33 @@
       ]
     },
     {
+      "_why": "@generated: Cargo package `hermit-cli-refusal-fixture`; reverse-dependent closure: hermit, hermit-cli-refusal-fixture.",
+      "nodes": [
+        "build.runtime_release",
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.app_strict_verify_on_host",
+        "test.arbitrary_binaries_on_host",
+        "test.cli_on_host",
+        "test.command_strict_verify_on_host",
+        "test.hermit_integration_on_host",
+        "test.hermit_modes_on_host",
+        "test.hermit_unit_on_host",
+        "test.ignored_syscall_regressions_on_host",
+        "test.liteinst_strict_on_host",
+        "test.regular_crates_on_host",
+        "test.rr_suite_contract_on_host",
+        "test.sabre_examples_on_host"
+      ],
+      "paths": [
+        "common/cli-refusal-fixture/**/*.rs",
+        "common/cli-refusal-fixture/Cargo.toml"
+      ]
+    },
+    {
       "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
