@@ -18,8 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <utime.h>
 
 // 2030-01-01T00:00:00Z and 2020-01-01T00:00:00Z.
 #define LATE 1893456000L
@@ -117,6 +119,35 @@ int main(void) {
     return 2;
   }
   expect_mtime("utimes", "a", EARLY + 2, 7000);
+
+  // The raw utime and utimes syscalls reach Hermit's own handlers for them;
+  // glibc routes its utime() and utimes() through utimensat instead.
+  struct utimbuf by_utime = {.actime = EARLY, .modtime = EARLY + 3};
+  if (syscall(SYS_utime, "a", &by_utime) != 0) {
+    perror("raw utime");
+    return 2;
+  }
+  expect_mtime("raw utime", "a", EARLY + 3, 0);
+  struct timeval by_utimes[2] = {{EARLY, 0}, {EARLY + 4, 9}};
+  if (syscall(SYS_utimes, "b", by_utimes) != 0) {
+    perror("raw utimes");
+    return 2;
+  }
+  expect_mtime("raw utimes", "b", EARLY + 4, 9000);
+  // A NULL times sets the current time, later than both values above both
+  // natively and under Hermit's default 2026 epoch.
+  if (syscall(SYS_utime, "a", NULL) != 0 || syscall(SYS_utimes, "b", NULL) != 0) {
+    perror("raw utime/utimes NULL");
+    return 2;
+  }
+  if (mtime_of("a").tv_sec <= EARLY + 4 || mtime_of("b").tv_sec <= EARLY + 4) {
+    fprintf(
+        stderr,
+        "raw utime/utimes(NULL) set mtimes %ld and %ld, not the current time\n",
+        (long)mtime_of("a").tv_sec,
+        (long)mtime_of("b").tv_sec);
+    failures++;
+  }
 
   // A later write still moves the mtime off the explicitly set value.
   write_file("a");
