@@ -642,7 +642,7 @@ mod tests {
         fs::rename(events[0]["executable"].as_str().unwrap(), &artifact).unwrap();
         events[0]["executable"] = serde_json::json!(artifact);
         let paths = cargo_executables(&jsonl(&events), &cargo, &fixture.0, &fixture.0).unwrap();
-        assert_eq!(paths.len(), 16);
+        assert_eq!(paths.len(), 17);
         assert_eq!(paths["rs_clock_gettime"], artifact);
         assert!(!paths.contains_key("rustbin_clock_gettime"));
     }
