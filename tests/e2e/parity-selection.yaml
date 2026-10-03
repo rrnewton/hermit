@@ -158,7 +158,7 @@ cells:
   - test: c-programs/pipe2-flags
     backends: [kvm, liteinst]
   - test: c-programs/poll-readiness
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/prctl-identity
     backends: [dbt, kvm, liteinst]
   - test: c-programs/prctl-pdeathsig
