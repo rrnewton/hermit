@@ -344,7 +344,15 @@ impl ResourceRecoveryContext {
         let journal = self
             .unix
             .read(&format!("ugb1-{}", &labels[1][..16]), UNIX_LIMIT)?;
-        wire::validate(self, &intent, intent_raw, &result)?;
+        match text(&array(&result, 12)?[0])? {
+            "hermit-failed-resource-result-v1" => {
+                wire::validate(self, &intent, intent_raw, &result)?;
+            }
+            "hermit-failed-resource-resume-result-v1" => {
+                wire::validate_resume(self, &intent, intent_raw, &result)?;
+            }
+            _ => return Err(io::Error::other("resource result protocol differs")),
+        }
         original::validate(self, &intent, accepted, unix, &journal, a_prefix, u_prefix)?;
         for root in [&self.accepted, &self.unix, &self.pins] {
             root.recheck()?;

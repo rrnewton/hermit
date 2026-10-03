@@ -4,6 +4,8 @@
 ``--fixture NEW_ABSOLUTE_DIRECTORY`` exports the same production-writer
 fixture for the Rust admission reader. Privilege, BPF and actor observations
 remain explicit substituted premises, never native recovery evidence.
+``--resume-fixture NEW_ABSOLUTE_DIRECTORY`` additionally exercises the pending
+failed-scan and new append-only continuation paths under those same premises.
 """
 import contextlib
 import copy
@@ -391,7 +393,10 @@ def recovery_fixture(base):
         roots = {str(f.path): f.root() for f in fixtures}
         for root in roots.values(): stack.callback(root.close)
         args = SimpleNamespace(accepted_root=str(accepted_fixture.path), unix_root=str(unix_fixture.path),
-                               pin_root=str(pin_fixture.path), owner_uid=os.getuid(), expect_inspection_sha256=None)
+                               pin_root=str(pin_fixture.path), owner_uid=os.getuid(), expect_inspection_sha256=None,
+                               accepted_label=LABEL, unix_label=LABEL,
+                               accepted_package=str(base / "accepted-package"), unix_package=str(base / "package"),
+                               expect_intent_sha256=None)
         accepted = nr.inspect_accepted(roots[args.accepted_root], LABEL, artifact)
         unix = nr.inspect_unix(roots[args.unix_root], LABEL)
         pin_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY); stack.callback(os.close, pin_fd)
@@ -423,6 +428,7 @@ def recovery_fixture(base):
                 "pin_directory": nr.identity(os.fstat(pin_fd)), "current_actors": actors,
                 "retained_unix_manager_fragment": fragment,
                 "tool_sha256": nr.digest(Path(nr.__file__).read_bytes()), "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+        plan["current_unix_package"] = {"helper_path": helper, "helper_sha256": "c" * 64}
         args.expect_inspection_sha256 = nr.digest(json.dumps(plan, sort_keys=True, indent=2).encode() + b"\n")
         prefixes = [next(f for f in roots[p].files if f.name.endswith("terminal.jsonl")).data
                     for p in (args.accepted_root, args.unix_root)]
@@ -470,6 +476,70 @@ def export_fixture(destination):
         (base / "inspection.json").write_bytes(nr.wire(fixture.plan))
         (base / "controlled-fragment.txt").write_bytes(fixture.fragment_bytes)
         return metadata
+
+
+def pending_fixture(base):
+    """Real failed orchestration, with explicitly modeled old source/time."""
+    with recovery_fixture(base) as fixture:
+        fixture.plan["tool_sha256"] = nr.RESUME_PREDECESSOR
+        fixture.args.expect_inspection_sha256 = nr.digest(
+            json.dumps(fixture.plan, sort_keys=True, indent=2).encode() + b"\n")
+        clock = nr.time.monotonic_ns
+        # Model a completed old five-second action interval without sleeping or
+        # changing the continuation's actual clock. The failed attempt still
+        # uses real temporary-file unlinks and actual object-owner closes.
+        with mock.patch.object(nr.time, "monotonic_ns", side_effect=lambda: clock() - 6_000_000_000), \
+             mock.patch.object(nr, "run_scanner", side_effect=nr.Refused("controlled first scanner failure")):
+            try:
+                controlled_recover(fixture)
+            except nr.Refused as error:
+                nr.require(str(error) == "controlled first scanner failure", "fixture failed before scanner")
+            else:
+                raise AssertionError("pending fixture unexpectedly completed")
+        terminal = Path(fixture.args.accepted_root) / f"accepted-b1-{LABEL}.terminal.jsonl"
+        raw = terminal.read_bytes().splitlines(keepends=True)[-1]
+        fixture.args.expect_intent_sha256 = nr.digest(raw)
+        fixture.intent_row = raw
+    # All fixture root locks/target descriptors are gone before real resume().
+    return fixture
+
+
+@contextlib.contextmanager
+def resume_premises(fixture):
+    """Substitute only privilege/kernel/package/actor observations, not joins."""
+    plan = fixture.plan
+    with mock.patch.object(nr.os, "getuid", return_value=0), \
+         mock.patch.object(nr.os, "geteuid", return_value=0), \
+         mock.patch.object(nr, "NativeRead", AbsentNative), \
+         mock.patch.object(nr, "expected_package", return_value=fixture.artifact), \
+         mock.patch.object(nr, "expected_unix_package", return_value=plan["current_unix_package"]), \
+         mock.patch.object(nr, "manager", side_effect=lambda unit, deadline: copy.deepcopy(plan["current_actors"][unit])), \
+         mock.patch.object(nr, "retained_fragment", side_effect=lambda *args: copy.deepcopy(plan["retained_unix_manager_fragment"])), \
+         mock.patch.object(nr.os.path, "lexists", return_value=False), \
+         mock.patch.object(nr, "unlink_owned_pins", side_effect=AssertionError("resume repeated cleanup")), \
+         mock.patch.object(nr.ObjectOwner, "close", side_effect=AssertionError("resume closed original object")), \
+         mock.patch.object(nr.os, "unlink", side_effect=AssertionError("resume unlinked evidence")), \
+         mock.patch.object(nr.os, "rmdir", side_effect=AssertionError("resume removed directory")):
+        yield
+
+
+def export_resume_fixture(destination):
+    base = Path(destination)
+    nr.require(base.is_absolute() and str(base) == str(base.resolve()), "fixture destination must be canonical absolute")
+    base.mkdir(mode=0o700)
+    fixture = pending_fixture(base)
+    with resume_premises(fixture):
+        result = nr.resume(fixture.args)
+    metadata = {"schema": "hermit-controlled-resource-fixture-v1", "native_recovery_evidence": False,
+                "substituted_premises": ["privilege", "BPF identity/state/absence", "actor observations",
+                                         "old intent producer identity and historical action time"],
+                "accepted_root": fixture.args.accepted_root, "unix_root": fixture.args.unix_root,
+                "pin_root": fixture.args.pin_root, "accepted_label": LABEL, "unix_label": LABEL,
+                "producer_sha256": nr.digest(Path(nr.__file__).read_bytes()), "result": result}
+    (base / "fixture.json").write_bytes(nr.wire(metadata))
+    (base / "inspection.json").write_bytes(nr.wire(fixture.plan))
+    (base / "controlled-fragment.txt").write_bytes(fixture.fragment_bytes)
+    return metadata
 
 
 class RecoveryActionTests(unittest.TestCase):
@@ -652,8 +722,220 @@ class RecoveryActionTests(unittest.TestCase):
                 self.assertEqual(outsider.read_bytes(), b"retained")
 
 
+class ResumeTests(unittest.TestCase):
+    @staticmethod
+    def terminals(fixture):
+        return [Path(root) / f"{prefix}-b1-{LABEL}.terminal.jsonl"
+                for root, prefix in ((fixture.args.accepted_root, "accepted"), (fixture.args.unix_root, "guard"))]
+
+    def rewrite_intent(self, fixture, mutate, both=True):
+        intent = nr.decode(fixture.intent_row)
+        mutate(intent)
+        raw = nr.wire(intent)
+        for path, prefix in zip(self.terminals(fixture)[:2 if both else 1], fixture.prefixes):
+            path.write_bytes(prefix + raw)
+        fixture.args.expect_intent_sha256 = nr.digest(raw)
+
+    def test_actual_resume_preserves_failed_attempt_and_has_no_cleanup_actions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = pending_fixture(Path(temporary))
+            originals = {p: p.read_bytes() for root in (fixture.args.accepted_root, fixture.args.unix_root)
+                         for p in Path(root).iterdir()}
+            with resume_premises(fixture):
+                result = nr.resume(fixture.args)
+            self.assertTrue(result["resource_recovery_complete"])
+            self.assertFalse(result["execution_success"])
+            self.assertFalse(result["original_recovery_completed"])
+            current_source = nr.digest(Path(nr.__file__).read_bytes())
+            tails = []
+            for path, before in originals.items():
+                if path in self.terminals(fixture):
+                    self.assertTrue(path.read_bytes().startswith(before))
+                    tails.append(path.read_bytes()[len(before):])
+                else:
+                    self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(tails[0], tails[1])
+            row = nr.decode(tails[0]); intent = nr.decode(fixture.intent_row)
+            self.assertEqual(row[0], nr.RESUME_TAG); self.assertEqual(len(row), 12)
+            self.assertEqual(row[1], nr.digest(fixture.intent_row))
+            self.assertEqual(intent[5], nr.RESUME_PREDECESSOR)
+            self.assertEqual(row[6][5], current_source); self.assertEqual(row[11], current_source)
+            self.assertEqual(row[3][0], fixture.leaf.name); self.assertEqual(row[3][2::2], [2, 2])
+            self.assertLessEqual(intent[3], row[4])
+            self.assertEqual(row[5] - row[4], 1_000_000_000)
+            self.assertLessEqual(row[4], row[3][1]); self.assertLessEqual(row[3][1], row[8][0][0])
+            self.assertLessEqual(row[8][1][1], row[3][3]); self.assertLessEqual(row[3][3], row[9])
+            nr.scan_shape(row[8], intent[9], row[4], row[5], row[9])
+            self.assertEqual(row[7], 0)
+            with self.assertRaises(ChildProcessError): os.waitpid(row[6][0], os.WNOHANG)
+            with resume_premises(fixture), self.assertRaises(nr.Refused): nr.resume(fixture.args)
+            for root_path, parse in ((fixture.args.accepted_root, lambda r: nr.inspect_accepted(r, LABEL, fixture.artifact)),
+                                     (fixture.args.unix_root, lambda r: nr.inspect_unix(r, LABEL))):
+                root = nr.HeldRoot(root_path, fixture.args.owner_uid, 384)
+                try:
+                    with self.assertRaises(nr.Refused): parse(root)
+                finally:
+                    root.close()
+
+    def test_paired_intent_authenticates_all_original_joins_before_append(self):
+        mutations = [
+            lambda i: i.__setitem__(5, "f" * 64),
+            lambda i: i.__setitem__(1, "foreign-boot"),
+            lambda i: i.__setitem__(4, i[4] + 1),
+            lambda i: i.__setitem__(3, i[3] + 1),
+            lambda i: i[6].__setitem__(0, "/foreign/root"),
+            lambda i: i[6][1].__setitem__(1, 0),
+            lambda i: i[6].__setitem__(2, "f" * 32),
+            lambda i: i[6].__setitem__(3, "f" * 32),
+            lambda i: i[6][4][0].__setitem__(9, "f" * 64),
+            lambda i: i[6][5].__setitem__(2, "f" * 64),
+            lambda i: i[7][3][3].__setitem__(9, "f" * 64),
+            lambda i: i[7][6].__setitem__(0, 0),
+            lambda i: i[7][7].__setitem__(1, 0),
+            lambda i: i[8][2][1][0].__setitem__(1, "changed"),
+            lambda i: i[8][2][3].__setitem__(9, "f" * 64),
+            lambda i: i[9].pop(),
+            lambda i: i[9].__setitem__(0, i[9][1]),
+            lambda i: i.__setitem__(10, "f" * 64),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:
+                fixture = pending_fixture(Path(temporary))
+                self.rewrite_intent(fixture, mutate)
+                before = [p.read_bytes() for p in self.terminals(fixture)]
+                with resume_premises(fixture), self.assertRaises(nr.Refused): nr.resume(fixture.args)
+                self.assertEqual([p.read_bytes() for p in self.terminals(fixture)], before)
+
+    def test_wrong_expected_digest_partial_peer_extra_rows_and_changed_original_bytes_refuse(self):
+        for variant in ("digest", "peer", "missing", "partial", "extra", "original", "journal"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                fixture = pending_fixture(Path(temporary)); a, u = self.terminals(fixture)
+                if variant == "digest": fixture.args.expect_intent_sha256 = "0" * 64
+                if variant == "peer": self.rewrite_intent(fixture, lambda i: i.__setitem__(10, "a" * 64), both=False)
+                if variant == "missing": u.write_bytes(fixture.prefixes[1])
+                if variant == "partial": u.write_bytes(u.read_bytes()[:-1])
+                if variant == "extra": a.write_bytes(a.read_bytes() + fixture.intent_row)
+                if variant == "original": a.write_bytes(a.read_bytes().replace(b"wrapper exit 125", b"wrapper exit 126"))
+                if variant == "journal":
+                    path = Path(fixture.args.unix_root) / fixture.leaf.name
+                    path.write_bytes(path.read_bytes()[:-1] + b"x")
+                before = [p.read_bytes() for p in (a, u)]
+                with resume_premises(fixture), self.assertRaises(nr.Refused): nr.resume(fixture.args)
+                self.assertEqual([p.read_bytes() for p in (a, u)], before)
+
+    def test_current_actor_change_pin_reuse_and_shared_launch_lock_refuse(self):
+        for variant in ("actor", "fragment", "pin", "symlink", "lock", "late_pin"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                fixture = pending_fixture(Path(temporary))
+                before = [p.read_bytes() for p in self.terminals(fixture)]
+                if variant == "actor": fixture.plan["current_actors"][fixture.plan["unix"]["loader_unit"]]["InvocationID"] = "f" * 32
+                if variant == "fragment": fixture.plan["retained_unix_manager_fragment"]["sha256"] = "f" * 64
+                if variant == "pin": fixture.leaf.mkdir()
+                if variant == "symlink": fixture.leaf.symlink_to("/missing/foreign/object")
+                held = None
+                if variant == "lock":
+                    held = os.open(fixture.args.unix_root, os.O_RDONLY | os.O_DIRECTORY)
+                    nr.fcntl.flock(held, nr.fcntl.LOCK_SH | nr.fcntl.LOCK_NB)
+                real_scan = nr.run_scanner
+
+                def scanner(*args):
+                    result = real_scan(*args)
+                    if variant == "late_pin": fixture.leaf.mkdir()
+                    return result
+                try:
+                    with resume_premises(fixture), mock.patch.object(nr, "run_scanner", side_effect=scanner), \
+                         self.assertRaises((nr.Refused, BlockingIOError)):
+                        nr.resume(fixture.args)
+                finally:
+                    if held is not None: os.close(held)
+                self.assertEqual([p.read_bytes() for p in self.terminals(fixture)], before)
+
+    def test_failed_or_partial_second_append_never_repairs_or_relabels_first_append(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as temporary:
+                fixture = pending_fixture(Path(temporary)); paths = self.terminals(fixture)
+                before = [p.read_bytes() for p in paths]; real = nr.HeldFile.append; calls = 0
+
+                def append(held, data, limit):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        if partial:
+                            with open(held.directory.path / held.name, "ab") as f: f.write(data[:9])
+                        raise OSError(errno.EIO, "controlled second resume append failure")
+                    return real(held, data, limit)
+                with resume_premises(fixture), mock.patch.object(nr.HeldFile, "append", append), \
+                     self.assertRaises(OSError): nr.resume(fixture.args)
+                after = [p.read_bytes() for p in paths]
+                self.assertTrue(all(a.startswith(b) for a, b in zip(after, before)))
+                self.assertEqual(len(after[0].splitlines()), 5)
+                self.assertEqual(after[1], before[1] + (after[0][len(before[0]):][:9] if partial else b""))
+                with resume_premises(fixture), self.assertRaises(nr.Refused): nr.resume(fixture.args)
+                self.assertEqual([p.read_bytes() for p in paths], after)
+
+    def test_new_scanner_failure_keeps_bounded_stage_query_errno_and_actual_wait(self):
+        class Failed(AbsentNative):
+            def by_id(self, kind, ident): raise OSError(errno.EPERM, "controlled no authority")
+        with mock.patch.object(nr, "NativeRead", Failed), \
+             mock.patch.object(nr.os, "getuid", return_value=0), \
+             mock.patch.object(nr.os, "geteuid", return_value=0):
+            start = nr.time.monotonic_ns()
+            with self.assertRaises(nr.Refused) as caught:
+                nr.run_scanner([[1, 2, 987]], start, start + 1_000_000_000, "a" * 64)
+        message = str(caught.exception)
+        self.assertIn("wait_status=32000", message)
+        self.assertIn("scans", message); self.assertIn("1/2/987", message); self.assertIn("errno=1", message)
+        self.assertLess(len(message), 8192)
+
+    def test_resume_refuses_real_second_scan_errors_live_ids_and_bad_sample_order(self):
+        for variant in ("first_query", "second_query", "live", "before_pin", "after_deadline", "future_old_deadline"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                fixture = pending_fixture(Path(temporary))
+                if variant == "future_old_deadline":
+                    def future(intent):
+                        intent[2] = nr.time.monotonic_ns()
+                        intent[3] = intent[2] + 5_000_000_000
+                    self.rewrite_intent(fixture, future)
+                before = [p.read_bytes() for p in self.terminals(fixture)]
+
+                class Failed(AbsentNative):
+                    def __init__(self): self.queries = 0
+                    def by_id(self, kind, ident):
+                        self.queries += 1
+                        if variant == "first_query" and self.queries == 1:
+                            raise OSError(errno.EPERM, "controlled query authority failure")
+                        if variant == "second_query" and self.queries == 195:
+                            raise OSError(errno.EIO, "controlled second full scan failure")
+                        if variant == "live" and self.queries == 195:
+                            return os.open("/dev/null", os.O_RDONLY)
+                        return super().by_id(kind, ident)
+                actual = nr.run_scanner
+
+                def scanner(ids, started, deadline, source):
+                    actor, status, scans = actual(ids, started, deadline, source)
+                    # Explicitly corrupted receipt controls: no accepted sample
+                    # may predate the pin check or exceed the unchanged bound.
+                    if variant == "before_pin": scans[0][0] = started
+                    if variant == "after_deadline": scans[1][1] = deadline + 1
+                    return actor, status, scans
+                with resume_premises(fixture), mock.patch.object(nr, "NativeRead", Failed), \
+                     mock.patch.object(nr, "run_scanner", side_effect=scanner), self.assertRaises(nr.Refused):
+                    nr.resume(fixture.args)
+                self.assertEqual([p.read_bytes() for p in self.terminals(fixture)], before)
+
+    def test_resume_export_uses_real_append_and_is_new_directory_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "export"
+            result = export_resume_fixture(str(base))
+            self.assertFalse(result["native_recovery_evidence"])
+            self.assertFalse(result["result"]["original_recovery_completed"])
+            with self.assertRaises(FileExistsError): export_resume_fixture(str(base))
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--fixture":
         print(json.dumps(export_fixture(sys.argv[2]), sort_keys=True))
+    elif len(sys.argv) == 3 and sys.argv[1] == "--resume-fixture":
+        print(json.dumps(export_resume_fixture(sys.argv[2]), sort_keys=True))
     else:
         unittest.main()

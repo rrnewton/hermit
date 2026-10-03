@@ -171,6 +171,155 @@ pub(super) fn validate(
     Ok(())
 }
 
+// This predecessor emitted the retained paired intent before a failed scanner.
+// It grants no missing historical action results. Only the distinct resume
+// result may bind it to a new, independently measured absence certificate.
+pub(super) const RESUME_INTENT_PRODUCER: &str =
+    "5754ddedd11be06d2112de0c1d0f724b8ae981e93a9d8a08aad9957204fda5e1";
+
+pub(super) fn validate_resume(
+    context: &ResourceRecoveryContext,
+    intent: &Value,
+    intent_raw: &[u8],
+    result: &Value,
+) -> io::Result<()> {
+    let i = array(intent, 11)?;
+    let r = array(result, 12)?;
+    require(
+        text(&i[0])? == "hermit-failed-resource-intent-v1"
+            && text(&r[0])? == "hermit-failed-resource-resume-result-v1",
+        "resource resume protocol differs",
+    )?;
+    let boot = text(&i[1])?;
+    require(
+        uuid::Uuid::parse_str(boot).is_ok()
+            && boot == std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()
+            && r[2] == i[1],
+        "resource resume boot differs",
+    )?;
+    let producer = digest(PRODUCER);
+    require(
+        hex(&i[5], 64)? == RESUME_INTENT_PRODUCER
+            && hex(&r[11], 64)? == producer
+            && hex(&r[1], 64)? == digest(intent_raw),
+        "resource resume producer or intent hash differs",
+    )?;
+    let original_started = number(&i[2])?;
+    let original_deadline = number(&i[3])?;
+    require(
+        original_started > 0
+            && original_started.checked_add(5_000_000_000) == Some(original_deadline)
+            && number(&i[4])? == u64::from(unsafe { libc::getuid() }),
+        "resource resume original interval or owner differs",
+    )?;
+    let a = array(&i[6], 7)?;
+    let u = array(&i[7], 8)?;
+    for (path, identity, root) in [
+        (&a[0], &a[1], &context.accepted),
+        (&u[0], &u[1], &context.unix),
+        (&u[5], &u[6], &context.pins),
+    ] {
+        require(
+            Path::new(text(path)?) == root.path && identity == &root.identity,
+            "resource resume configured root differs",
+        )?;
+    }
+    let pin_directory = array(&u[7], 4)?;
+    require(
+        number(&pin_directory[0])? == number(&u[6][0])?
+            && number(&pin_directory[1])? > 0
+            && number(&pin_directory[2])? == u64::from(libc::S_IFDIR | 0o700)
+            && pin_directory[3] == i[4],
+        "resource resume original pin directory differs",
+    )?;
+    require(
+        number(&a[6])? > 0 && number(&a[6])? <= original_started,
+        "resource resume original close chronology differs",
+    )?;
+    let ids = object_ids(&i[9])?;
+    require(
+        hex(&i[10], 64)? == digest(&serde_json::to_vec(&i[9])?),
+        "resource resume inventory hash differs",
+    )?;
+
+    // This cut begins fresh verification. It never substitutes for the lost
+    // historical close time or any of v1's 42 required action observations.
+    let started = number(&r[4])?;
+    let deadline = number(&r[5])?;
+    let final_ns = number(&r[9])?;
+    require(
+        original_deadline <= started
+            && started.checked_add(1_000_000_000) == Some(deadline)
+            && started <= final_ns
+            && final_ns <= deadline,
+        "resource resume verification interval differs",
+    )?;
+    let absence = array(&r[3], 5)?;
+    let pin_name = format!("ugb1-{}", &label(&u[2])?[..16]);
+    let pin_pre = number(&absence[1])?;
+    let pin_post = number(&absence[3])?;
+    require(
+        text(&absence[0])? == pin_name
+            && number(&absence[2])? == libc::ENOENT as u64
+            && number(&absence[4])? == libc::ENOENT as u64
+            && started <= pin_pre
+            && pin_pre <= pin_post
+            && pin_post <= final_ns,
+        "resource resume pin absence differs",
+    )?;
+    let name = std::ffi::CString::new(pin_name).map_err(io::Error::other)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let observed = unsafe {
+        libc::fstatat(
+            context.pins.file.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    require(
+        observed == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT),
+        "resource resume owned pin directory remains or absence is unknown",
+    )?;
+
+    let scanner = array(&r[6], 6)?;
+    require(
+        number(&scanner[0])? > 0
+            && number(&scanner[0])? <= i32::MAX as u64
+            && number(&scanner[1])? > 0
+            && number(&scanner[2])? == 0
+            && number(&scanner[3])? == 0
+            && hex(&scanner[5], 64)? == producer
+            && number(&r[7])? == 0,
+        "resource resume scanner identity or wait differs",
+    )?;
+    hex(&scanner[4], 64)?;
+    let mut previous = pin_pre;
+    for scan in array(&r[8], 2)? {
+        let scan = array(scan, 3)?;
+        let begin = number(&scan[0])?;
+        let end = number(&scan[1])?;
+        require(
+            previous <= begin && begin <= end && end <= pin_post,
+            "resource resume scan chronology differs",
+        )?;
+        previous = end;
+        for (answer, id) in array(&scan[2], ids.len())?.iter().zip(&ids) {
+            let answer = array(answer, 4)?;
+            require(
+                answer[..3] == id[..] && number(&answer[3])? == libc::ENOENT as u64,
+                "resource resume scan omitted, repeated or did not prove an original ID absent",
+            )?;
+        }
+    }
+    require(
+        r[10] == i[8],
+        "resource resume actors changed after scanning",
+    )?;
+    actors(&i[8], label(&a[3])?, label(&u[2])?, original_started)?;
+    Ok(())
+}
+
 pub(super) fn object_ids(value: &Value) -> io::Result<Vec<[Value; 3]>> {
     let rows = array(value, 194)?;
     let mut result = Vec::new();

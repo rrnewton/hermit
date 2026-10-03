@@ -616,7 +616,9 @@ fn guard_admission_census_with_recovery(
     for name in &receipt_names {
         if let Some(identity) = name.strip_prefix(GUARD_BOUNDED_PIN_PREFIX) {
             if !exact_hex(identity, 8) {
-                return Err(io::Error::other("Unix guard keeper journal filename differs"));
+                return Err(io::Error::other(
+                    "Unix guard keeper journal filename differs",
+                ));
             }
             let incarnation = u64::from_str_radix(identity, 16).map_err(io::Error::other)?;
             journals.insert(
@@ -928,49 +930,54 @@ mod recovery_root_tests {
         );
         // Use the actual paired writer with its documented controlled BPF,
         // privilege and actor premises, not a fabricated success-shaped row.
-        let fixture = temp.path().join("writer-fixture");
-        let output = std::process::Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/test_network_recovery.py"))
-            .arg("--fixture")
-            .arg(&fixture)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(metadata["native_recovery_evidence"], false);
-        let label = metadata["unix_label"].as_str().unwrap();
-        let root =
-            RecoveryDeploymentRoot::open_at(Path::new(metadata["unix_root"].as_str().unwrap()))
+        for option in ["--fixture", "--resume-fixture"] {
+            let fixture = temp.path().join(format!("writer{option}"));
+            let output = std::process::Command::new("python3")
+                .arg("-B")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../scripts/test_network_recovery.py"),
+                )
+                .arg(option)
+                .arg(&fixture)
+                .output()
                 .unwrap();
-        let incarnation = u64::from_str_radix(&label[..16], 16).unwrap();
-        let name = format!("guard-b1-{label}.terminal.jsonl");
-        let before = std::fs::read(root.writable_path.join(&name)).unwrap();
-        let journal = guard_keeper_journal(
-            root.directory.as_fd(),
-            &format!("ugb1-{}", &label[..16]),
-            incarnation,
-            unsafe { libc::getuid() },
-        )
-        .unwrap();
-        assert!(
-            !guard_terminal_complete(
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(metadata["native_recovery_evidence"], false);
+            let label = metadata["unix_label"].as_str().unwrap();
+            let root =
+                RecoveryDeploymentRoot::open_at(Path::new(metadata["unix_root"].as_str().unwrap()))
+                    .unwrap();
+            let incarnation = u64::from_str_radix(&label[..16], 16).unwrap();
+            let name = format!("guard-b1-{label}.terminal.jsonl");
+            let before = std::fs::read(root.writable_path.join(&name)).unwrap();
+            let journal = guard_keeper_journal(
                 root.directory.as_fd(),
-                &name,
+                &format!("ugb1-{}", &label[..16]),
                 incarnation,
                 unsafe { libc::getuid() },
-                Some(&journal)
             )
-            .unwrap()
-        );
-        assert_eq!(
-            std::fs::read(root.writable_path.join(name)).unwrap(),
-            before
-        );
+            .unwrap();
+            assert!(
+                !guard_terminal_complete(
+                    root.directory.as_fd(),
+                    &name,
+                    incarnation,
+                    unsafe { libc::getuid() },
+                    Some(&journal)
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                std::fs::read(root.writable_path.join(name)).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,11 @@ The admission reader compiles these exact source bytes into its trusted producer
 identity. A later edit intentionally makes older certificates unresolved until
 an explicit review adds support for that producer version. This tool does not
 accept arbitrary source hashes or rewrite an older certificate.
+
+The resume operation recognizes exactly one reviewed predecessor intent. It
+does not repeat cleanup or reconstruct missing unlink receipts: it appends a
+distinct certificate of newly measured resource absence, preserving the failed
+attempt and its expired action deadline.
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ import time
 
 class Refused(Exception):
     """Incomplete or inconsistent evidence remains unresolved."""
+
+
+RESUME_PREDECESSOR = "5754ddedd11be06d2112de0c1d0f724b8ae981e93a9d8a08aad9957204fda5e1"
+RESUME_TAG = "hermit-failed-resource-resume-result-v1"
 
 
 def require(condition, reason):
@@ -684,10 +693,11 @@ def scan_once(native, ids, deadline_ns):
         try:
             fd = native.by_id(kind, ident)
         except OSError as error:
-            require(error.errno == errno.ENOENT, "resource query failed without proving absence")
+            require(error.errno == errno.ENOENT,
+                    f"resource query failed without proving absence: {domain}/{kind}/{ident}, errno={error.errno}")
         else:
             os.close(fd)
-            raise Refused("original or reused object ID remains live")
+            raise Refused(f"original or reused object ID remains live: {domain}/{kind}/{ident}")
         answers.append([domain, kind, ident, errno.ENOENT])
     ended = time.monotonic_ns()
     require(started <= ended <= deadline_ns, "resource scan exceeded deadline")
@@ -722,9 +732,13 @@ def run_scanner(ids, closed, deadline_ns, tool_hash):
     if child == 0:
         os.close(read_fd)
         status = 125
+        stage = "identity"
         try:
             native = NativeRead()
-            result = [scanner_identity(tool_hash), [scan_once(native, ids, deadline_ns) for _ in range(2)]]
+            actor = scanner_identity(tool_hash)
+            stage = "scans"
+            result = [actor, [scan_once(native, ids, deadline_ns) for _ in range(2)]]
+            stage = "output"
             data = wire(result)
             require(len(data) <= 32768, "scanner output exceeds fixed bound")
             with selectors.DefaultSelector() as selector:
@@ -738,8 +752,17 @@ def run_scanner(ids, closed, deadline_ns, tool_hash):
                         require(count > 0, "scanner output failed")
                         left = left[count:]
             status = 0
-        except BaseException:
-            pass
+        except BaseException as error:
+            # Diagnostic only: a nonzero actual wait can never carry authority.
+            # One nonblocking write is bounded below PIPE_BUF; failure to retain
+            # it does not change the refusal or retry the original queries.
+            detail = wire(["hermit-resource-scanner-failure-v1", stage,
+                           type(error).__name__, str(error)[:512],
+                           error.errno if isinstance(error, OSError) else None])
+            try:
+                os.write(write_fd, detail[:4096])
+            except OSError:
+                pass
         os.close(write_fd)
         os._exit(status)
     os.close(write_fd)
@@ -765,7 +788,8 @@ def run_scanner(ids, closed, deadline_ns, tool_hash):
                 break
             require(time.monotonic_ns() <= deadline_ns, "scanner wait deadline expired")
             time.sleep(.001)
-        require(status == 0, "privileged scanner did not exit successfully")
+        require(status == 0, "privileged scanner did not exit successfully: "
+                f"wait_status={status}, detail={bytes(data[:4096])!r}")
         require(data.endswith(b"\n") and len(data.splitlines()) == 1, "incomplete scanner receipt")
         result = decode(data)
         require(isinstance(result, list) and len(result) == 2, "scanner receipt shape differs")
@@ -886,6 +910,176 @@ def recover(args, plan, roots, pin_fd, leaf, native, descriptors, pin_stats, own
             "admission_authority": "only independently validated paired resource proof"}
 
 
+class PrefixFile:
+    """Read-only authenticated old prefix; never changes the held actual file."""
+
+    def __init__(self, held, proof, prefix=None):
+        keys = ("name", "device", "inode", "mode", "uid", "nlink", "bytes",
+                "mtime_ns", "ctime_ns", "sha256")
+        require(isinstance(proof, list) and len(proof) == len(keys), "original file proof shape differs")
+        require(proof[0] == held.name and isinstance(proof[9], str)
+                and re.fullmatch(r"[0-9a-f]{64}", proof[9]) and int(proof[9], 16),
+                "original file proof identity differs")
+        for value in proof[1:9]:
+            uint(value)
+        self.fd, self.data = held.fd, held.data if prefix is None else prefix
+        self.original = dict(zip(keys, proof))
+        expected = held.proof()
+        # Appending the intent changed only terminal length/timestamps/hash.
+        # The old timestamps are historical; only unchanged files can match
+        # their current timestamps. All prefixes still require exact old bytes.
+        for key in keys[1:6] if prefix is not None else keys[1:9]:
+            require(self.original[key] == expected[key], "original held file metadata differs")
+        require(len(self.data) == proof[6] and digest(self.data) == proof[9],
+                "original failed prefix/file bytes differ")
+
+    def proof(self):
+        return self.original.copy()
+
+
+class PrefixRoot:
+    """Feeds exact old bytes through the unchanged original receipt parsers."""
+
+    def __init__(self, root, proofs, terminal, prefix):
+        require(isinstance(proofs, list), "original file proofs are not an array")
+        self.root, self.identity, self.names = root, root.identity, root.names
+        self.proofs, self.terminal, self.prefix = proofs, terminal, prefix
+        self.used = 0
+
+    def read(self, name, limit):
+        require(self.used < len(self.proofs), "missing original file proof")
+        proof = self.proofs[self.used]
+        self.used += 1
+        held = self.terminal if name == self.terminal.name else self.root.read(name, limit)
+        return PrefixFile(held, proof, self.prefix if held is self.terminal else None)
+
+    def finish(self):
+        require(self.used == len(self.proofs), "extra original file proof")
+
+
+def pin_absent(root, leaf):
+    try:
+        os.stat(leaf, dir_fd=root.fd, follow_symlinks=False)
+    except OSError as error:
+        require(error.errno == errno.ENOENT, "owned pin absence query failed")
+    else:
+        raise Refused("owned pin name remains present or was reused")
+    return time.monotonic_ns()
+
+
+def pending_plan(args, roots, deadline):
+    """Authenticate one known old paired intent without reopening absent objects."""
+    terminals, prefixes, intent_rows = [], [], []
+    for path, prefix, selected, count, limit in (
+            (args.accepted_root, "accepted", args.accepted_label, 3, 1_048_576),
+            (args.unix_root, "guard", args.unix_label, 2, 65536)):
+        label(selected)
+        held = roots[path].read(f"{prefix}-b1-{selected}.terminal.jsonl", limit)
+        parts = held.data.splitlines(keepends=True)
+        require(held.data.endswith(b"\n") and len(parts) == count + 1,
+                "resume requires exactly one complete pending intent")
+        terminals.append(held)
+        prefixes.append(b"".join(parts[:-1]))
+        intent_rows.append(parts[-1])
+    require(intent_rows[0] == intent_rows[1], "pending paired intents differ")
+    raw = intent_rows[0]
+    require(isinstance(args.expect_intent_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", args.expect_intent_sha256)
+            and digest(raw) == args.expect_intent_sha256, "exact pending intent digest differs")
+    intent = decode(raw)
+    require(isinstance(intent, list) and len(intent) == 11
+            and intent[0] == "hermit-failed-resource-intent-v1"
+            and intent[5] == RESUME_PREDECESSOR, "unknown pending intent producer/schema")
+    require(uint(intent[4], 32) == args.owner_uid
+            and 0 < uint(intent[2]) < uint(intent[3]) == uint(intent[2] + 5_000_000_000),
+            "pending owner/action interval differs")
+    require(intent[1] == Path("/proc/sys/kernel/random/boot_id").read_text().strip(), "pending boot differs")
+    accepted_input, unix_input = intent[6:8]
+    require(isinstance(accepted_input, list) and len(accepted_input) == 7
+            and isinstance(unix_input, list) and len(unix_input) == 8, "pending inputs shape differs")
+    require(accepted_input[:3] == [args.accepted_root, root_fields(roots[args.accepted_root].identity), args.accepted_label]
+            and unix_input[:3] == [args.unix_root, root_fields(roots[args.unix_root].identity), args.unix_label]
+            and unix_input[5:7] == [args.pin_root, root_fields(roots[args.pin_root].identity)],
+            "pending configured roots/labels differ")
+    accepted_view = PrefixRoot(roots[args.accepted_root], accepted_input[4], terminals[0], prefixes[0])
+    unix_view = PrefixRoot(roots[args.unix_root], unix_input[3], terminals[1], prefixes[1])
+    accepted = inspect_accepted(accepted_view, args.accepted_label, expected_package(args.accepted_package))
+    unix = inspect_unix(unix_view, args.unix_label)
+    accepted_view.finish(); unix_view.finish()
+    leaf_identity = unix_input[7]
+    require(isinstance(leaf_identity, list) and len(leaf_identity) == 4,
+            "original pin directory identity shape differs")
+    for value in leaf_identity:
+        uint(value)
+    require(leaf_identity == [unix["journal"]["directory"][k] for k in ("device", "inode")]
+            + [stat.S_IFDIR | 0o700, args.owner_uid], "original pin directory identity differs")
+    package = expected_unix_package(args.unix_package)
+    actors = {}
+    for expected in accepted["actors"].values():
+        current = manager(expected["unit"], deadline)
+        actor_gone(current, expected)
+        actors[expected["unit"]] = current
+    current = manager(unix["loader_unit"], deadline)
+    actor_gone(current, unix=True)
+    actors[unix["loader_unit"]] = current
+    fragment = retained_fragment(current, package, args.owner_uid, args.pin_root, args.unix_root)
+    plan = {"accepted": accepted, "unix": unix, "pin_root": roots[args.pin_root].identity,
+            "pin_directory": dict(zip(("device", "inode", "mode", "uid"), leaf_identity)),
+            "current_actors": actors, "retained_unix_manager_fragment": fragment,
+            "current_unix_package": package, "boot_id": intent[1], "tool_sha256": RESUME_PREDECESSOR}
+    # Reconstruct every old field from the original evidence/current bindings.
+    # Exact wire equality also excludes bool/float aliases and noncanonical rows.
+    require(wire(intent_for(plan, args, intent[2])) == raw, "pending intent evidence/actor joins differ")
+    plan["tool_sha256"] = digest(bounded_regular(Path(__file__), 1_048_576)[0])
+    return plan, intent, raw, terminals
+
+
+def resume(args):
+    """Append only: newly prove absence, without repeating any old cleanup."""
+    require(os.getuid() == os.geteuid() == 0, "resume requires actual privileged executor")
+    require(len({args.accepted_root, args.unix_root, args.pin_root}) == 3, "resume roots alias")
+    with contextlib.ExitStack() as stack:
+        roots = {}
+        for path, limit in sorted(((args.accepted_root, 4096), (args.unix_root, 384), (args.pin_root, 128))):
+            roots[path] = root = HeldRoot(path, args.owner_uid, limit)
+            stack.callback(root.close)
+        require(len({(r.identity["device"], r.identity["inode"]) for r in roots.values()}) == 3,
+                "resume roots alias by identity")
+        plan, intent, raw, terminals = pending_plan(args, roots, Deadline())
+        for held, limit in zip(terminals, (1_048_576, 65536)):
+            require(len(held.data) + 32768 <= limit, "insufficient original recovery file capacity")
+        leaf = "ugb1-" + args.unix_label[:16]
+        started = time.monotonic_ns()
+        require(intent[3] <= started, "original action deadline has not expired")
+        deadline = uint(started + 1_000_000_000)
+        recheck_actors(plan, args, Deadline((deadline - time.monotonic_ns()) / 1e9))
+        for root in roots.values():
+            root.recheck()
+        pre = pin_absent(roots[args.pin_root], leaf)
+        scanner, status, scans = run_scanner(original_ids(plan), started, deadline, plan["tool_sha256"])
+        post = pin_absent(roots[args.pin_root], leaf)
+        recheck_actors(plan, args, Deadline((deadline - time.monotonic_ns()) / 1e9))
+        for root in roots.values():
+            root.recheck()
+        final = time.monotonic_ns()
+        scan_shape(scans, original_ids(plan), started, deadline, final)
+        require(started <= pre <= scans[0][0] and scans[1][1] <= post <= final,
+                "resume pin observation order differs")
+        result = [RESUME_TAG, digest(raw), plan["boot_id"], [leaf, pre, errno.ENOENT, post, errno.ENOENT],
+                  started, deadline, scanner, status, scans, final, actors_fields(plan), plan["tool_sha256"]]
+        result_row = wire(result)
+        require(len(result_row) <= 32768, "resume proof exceeds reserved byte bound")
+        for held, limit in zip(terminals, (1_048_576, 65536)):
+            held.append(result_row, limit)
+        for root in roots.values():
+            root.recheck()
+        return {"schema": RESUME_TAG, "resource_recovery_complete": True,
+                "execution_success": False, "original_recovery_completed": False,
+                "intent_sha256": digest(raw), "result_sha256": digest(result_row),
+                "original_failure_preserved": True,
+                "admission_authority": "only independently validated paired resource proof"}
+
+
 def inspect(args):
     require(len({str(Path(p)) for p in (args.accepted_root, args.unix_root, args.pin_root)}) == 3,
             "recovery roots alias")
@@ -976,15 +1170,16 @@ def inspect(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["inspect", "recover"])
+    parser.add_argument("action", choices=["inspect", "recover", "resume"])
     for option in ("accepted-root", "accepted-label", "accepted-package", "unix-root", "unix-label", "unix-package", "pin-root"):
         parser.add_argument("--" + option, required=True)
     parser.add_argument("--owner-uid", required=True, type=int)
     parser.add_argument("--expect-inspection-sha256")
+    parser.add_argument("--expect-intent-sha256")
     args = parser.parse_args()
     try:
         require(args.owner_uid >= 0, "invalid owner UID")
-        result = inspect(args)
+        result = resume(args) if args.action == "resume" else inspect(args)
     except (Refused, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(json.dumps({"schema": "hermit-failed-resource-inspection-v1", "outcome": "refused",
                           "resource_recovery_complete": False, "admission_authority": False,
