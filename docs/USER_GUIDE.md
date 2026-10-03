@@ -738,9 +738,11 @@ time. Detcore counts retired conditional branches with the CPU PMU and uses a
 timer to end a time slice. At each scheduling point it chooses the next runnable
 thread deterministically; chaos mode makes that choice with a seeded PRNG.
 
-Some calls are fully emulated, some are forwarded and sanitized, and unsupported
-calls may pass through. This is why Hermit can run ordinary unmodified binaries
-but cannot guarantee determinism for every Linux interface.
+Some calls are fully emulated, some are forwarded and sanitized, and calls
+classified Unsupported are rejected unless the run-only
+`--allow-unsupported-syscalls` option lets them reach Linux. This is why Hermit
+can run ordinary unmodified binaries but cannot guarantee determinism for every
+Linux interface.
 
 ## Reproducibility Checklist
 

@@ -292,7 +292,9 @@ when that executable is not `/usr/bin/gdb`. To identify the default GDB:
 ```
 
 A version string alone does not establish a working DAP session. To build
-the adapter and start a remote target:
+the adapter and start a remote target (the first command rebuilds
+`target/debug/hermit` with default features, so if you built it with
+`--features liteinst` above, rerun that build afterwards to keep LiteInst):
 
 ```bash
 cargo build -p hermit --bin hermit --bin hermit-dap
@@ -428,7 +430,11 @@ dapper debug --control-port 4711 reverse-continue 1
 
 The `order_violation` guest reads shared state without ensuring that another
 thread has published it. Build Hermit and the guest, then run the default
-deterministic schedule twice:
+deterministic schedule twice. The first command rebuilds `target/release/hermit`,
+which `target/install_pkg/hermit` links to, with default features; if you built
+the `dbt`, `sabre`, and `e9patch` backends above, use
+`cargo build --release --workspace --features hermit/third-party-backends`
+instead so the rebuild keeps them:
 
 ```bash
 cargo build --release -p hermit --bin hermit
