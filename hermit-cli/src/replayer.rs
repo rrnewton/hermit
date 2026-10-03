@@ -197,7 +197,7 @@ fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bo
         .is_some_and(|files| files.contains_key(&ReplayFileIdentity::from_metadata(metadata)))
 }
 
-// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
 /// Replay sockets whose connection state cannot match the recording: placeholders
 /// reserved for accepted sockets, and sockets that replay connected, or sent
 /// to an address, without doing so live. A state-dependent call such as
@@ -206,9 +206,10 @@ fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bo
 /// socket through `dup`, `fork` and SCM_RIGHTS.
 ///
 /// A mark only replaces a live check of the call's result with the recorded
-/// result; that is why the set is process-wide and never shrinks, and why a
-/// socket whose inode Linux reuses after an earlier one closed loses only that
-/// check. It does not make the socket's state match the recording for
+/// result; that is why the set is process-wide and never shrinks. Socket
+/// inodes come from the kernel's monotonic `get_next_ino` counter, so a later
+/// socket reuses a marked identity only after that 32-bit counter wraps, and
+/// then loses only that check. It does not make the socket's state match the recording for
 /// observers that still run live: `select` and `pselect6` do today, so a
 /// readiness check on such a socket can differ until they are recorded
 /// (https://github.com/rrnewton/hermit/pull/3575).
@@ -575,7 +576,7 @@ impl Tool for Replayer {
             Syscall::Sendto(call) => self.handle_send(guest, syscall, call.fd()).await,
             Syscall::Sendmsg(call) => self.handle_send(guest, syscall, call.fd()).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
+            // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579):
             // bind and listen still run live in replay because setsockopt does:
             // options such as AF_ALG's ALG_SET_KEY or IPV6_V6ONLY depend on the
             // bound state, and must succeed or fail as they did when recorded.
@@ -1356,7 +1357,7 @@ impl Replayer {
         }
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Reserve replay FD `fd` for a socket the recording received from the
     /// kernel (for example by `accept`) with an unconnected socket of the
     /// recorded shape. It is marked detached, so state-dependent socket calls
@@ -2081,7 +2082,7 @@ impl Replayer {
         next_event!(guest, Return)
     }
 
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Run a socket call whose result depends on the socket's state live, as
     /// `handle_replayed_side_effect` does, unless the socket is detached: its
     /// replay state cannot match the recording, so return the recorded result.
@@ -2100,7 +2101,7 @@ impl Replayer {
         }
     }
 
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Replay `connect` without connecting. Whatever it returned, the recorded
     /// call may have changed the socket's state, so the socket is marked
     /// detached.
@@ -2114,7 +2115,7 @@ impl Replayer {
         recorded
     }
 
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Replay a send without sending. A send to an address can bind the socket
     /// or, with MSG_FASTOPEN, connect it, so the socket is marked detached.
     async fn handle_send<G: Guest<Self>>(

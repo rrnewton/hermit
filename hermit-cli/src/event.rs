@@ -105,7 +105,7 @@ pub enum SyscallEvent {
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579):
     // Audit the socket fd-creation and multi-message event schema.
     /// A successful `accept`/`accept4`: the new fd, the peer address written
     /// back to the guest, and the kind of placeholder replay must install.

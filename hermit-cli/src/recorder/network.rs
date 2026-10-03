@@ -73,8 +73,18 @@ fn capture_recvmsg<M: MemoryAccess>(
         remaining -= length;
     }
 
-    let name_length = name_capacity.min(output.msg_namelen as usize);
-    let control_length = control_capacity.min(output.msg_controllen);
+    // Without a buffer Linux stores nothing, whatever length the header holds.
+    let stored = |buffer: *mut libc::c_void, length: usize| {
+        if buffer.is_null() { 0 } else { length }
+    };
+    let name_length = stored(
+        output.msg_name,
+        name_capacity.min(output.msg_namelen as usize),
+    );
+    let control_length = stored(
+        output.msg_control,
+        control_capacity.min(output.msg_controllen),
+    );
 
     Ok(RecvmsgEvent {
         result,
@@ -149,77 +159,122 @@ fn copy_out_as_guest<M: MemoryAccess>(memory: &mut M, address: usize, bytes: &[u
     }
 }
 
-/// The guest's writable address ranges, read from `/proc/<pid>/maps`
-/// without touching guest memory.
-struct WritableMappings(Vec<(usize, usize)>);
+/// How many `recvmmsg` headers the recorder examines before a call: 4 MiB
+/// of headers, far more datagrams than a default socket receive queue holds.
+const RECVMMSG_SCAN_LIMIT: usize = 65536;
 
-impl WritableMappings {
+/// The guest's address ranges, read from `/proc/<pid>/maps` without touching
+/// guest memory.
+struct GuestMappings(Vec<GuestMapping>);
+
+struct GuestMapping {
+    start: usize,
+    end: usize,
+    writable: bool,
+    /// Whether the guest can read it. On x86_64 every mapping that is not
+    /// `PROT_NONE` is user-readable, including a `PROT_WRITE`-only one that
+    /// `process_vm_readv` refuses to read.
+    accessible: bool,
+}
+
+impl GuestMappings {
     fn read(pid: reverie::Pid) -> Self {
         let maps = std::fs::read(format!("/proc/{}/maps", pid.as_raw()))
             .unwrap_or_else(|error| panic!("cannot read the memory map of {pid}: {error}"));
         // A mapped path need not be UTF-8; only the leading fields are parsed.
         let maps = String::from_utf8_lossy(&maps);
-        let ranges = maps
+        let mappings = maps
             .lines()
             .filter_map(|line| {
                 let mut fields = line.split_whitespace();
                 let (start, end) = fields.next()?.split_once('-')?;
-                let writable = fields.next()?.as_bytes().get(1) == Some(&b'w');
-                writable.then(|| {
-                    Some((
-                        usize::from_str_radix(start, 16).ok()?,
-                        usize::from_str_radix(end, 16).ok()?,
-                    ))
-                })?
+                let permissions = fields.next()?.as_bytes();
+                let granted = |index: usize, flag: u8| permissions.get(index) == Some(&flag);
+                Some(GuestMapping {
+                    start: usize::from_str_radix(start, 16).ok()?,
+                    end: usize::from_str_radix(end, 16).ok()?,
+                    writable: granted(1, b'w'),
+                    accessible: granted(0, b'r') || granted(1, b'w') || granted(2, b'x'),
+                })
             })
             .collect();
-        Self(ranges)
+        Self(mappings)
     }
 
-    fn contains_byte(&self, address: usize) -> bool {
+    fn covers_byte(&self, address: usize, permitted: impl Fn(&GuestMapping) -> bool) -> bool {
         self.0
             .iter()
-            .any(|&(start, end)| start <= address && address < end)
+            .any(|mapping| mapping.start <= address && address < mapping.end && permitted(mapping))
     }
 
-    /// Whether every byte of `[address, address + length)` is writable. A
-    /// field no larger than a page spans at most two pages, so checking its
-    /// first and last bytes suffices.
-    fn contains(&self, address: usize, length: usize) -> bool {
-        address
-            .checked_add(length - 1)
-            .is_some_and(|last| self.contains_byte(address) && self.contains_byte(last))
+    /// Whether every byte of `[address, address + length)` lies in a mapping
+    /// for which `permitted` holds. A field no larger than a page spans at
+    /// most two pages, so checking its first and last bytes suffices.
+    fn covers(
+        &self,
+        address: usize,
+        length: usize,
+        permitted: impl Fn(&GuestMapping) -> bool + Copy,
+    ) -> bool {
+        address.checked_add(length - 1).is_some_and(|last| {
+            self.covers_byte(address, permitted) && self.covers_byte(last, permitted)
+        })
+    }
+
+    fn writable(&self, address: usize, length: usize) -> bool {
+        self.covers(address, length, |mapping| mapping.writable)
+    }
+
+    fn accessible(&self, address: usize, length: usize) -> bool {
+        self.covers(address, length, |mapping| mapping.accessible)
     }
 }
 
-/// Whether Linux could write its results back to `mmsghdr` entry `index` at
-/// `base`: `msg_namelen`, `msg_controllen`, `msg_flags` and `msg_len`.
-fn mmsghdr_is_writable(mappings: &WritableMappings, base: usize, index: usize) -> bool {
+/// Whether Linux could write its results back to `header`, entry `index` at
+/// `base`: `msg_namelen` if it has a name buffer, and `msg_controllen`,
+/// `msg_flags` and `msg_len`.
+fn mmsghdr_is_writable(
+    mappings: &GuestMappings,
+    base: usize,
+    index: usize,
+    header: &libc::mmsghdr,
+) -> bool {
     use std::mem::offset_of;
     use std::mem::size_of;
-    let header = offset_of!(libc::mmsghdr, msg_hdr);
+    let message = offset_of!(libc::mmsghdr, msg_hdr);
+    let name_length = (
+        message + offset_of!(libc::msghdr, msg_namelen),
+        size_of::<libc::socklen_t>(),
+    );
     let fields = [
         (
-            header + offset_of!(libc::msghdr, msg_namelen),
-            size_of::<libc::socklen_t>(),
-        ),
-        (
-            header + offset_of!(libc::msghdr, msg_controllen),
+            message + offset_of!(libc::msghdr, msg_controllen),
             size_of::<usize>(),
         ),
         (
-            header + offset_of!(libc::msghdr, msg_flags),
+            message + offset_of!(libc::msghdr, msg_flags),
             size_of::<libc::c_int>(),
         ),
         (offset_of!(libc::mmsghdr, msg_len), size_of::<u32>()),
     ];
+    let named = !header.msg_hdr.msg_name.is_null();
     mmsghdr_entry(base, index).is_ok_and(|entry| {
-        fields.iter().all(|&(offset, length)| {
-            entry
-                .checked_add(offset)
-                .is_some_and(|field| mappings.contains(field, length))
-        })
+        named
+            .then_some(name_length)
+            .into_iter()
+            .chain(fields)
+            .all(|(offset, length)| {
+                entry
+                    .checked_add(offset)
+                    .is_some_and(|field| mappings.writable(field, length))
+            })
     })
+}
+
+/// Whether the guest could read the `mmsghdr` entry `index` at `base`.
+fn mmsghdr_is_accessible(mappings: &GuestMappings, base: usize, index: usize) -> bool {
+    mmsghdr_entry(base, index)
+        .is_ok_and(|entry| mappings.accessible(entry, std::mem::size_of::<libc::mmsghdr>()))
 }
 
 /// Query the domain, type and protocol of the guest's socket `fd`.
@@ -534,7 +589,7 @@ impl Recorder {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Record every message a `recvmmsg` received through the same capture as
     /// `recvmsg`, plus the remaining timeout Linux writes back.
     pub(super) async fn handle_recvmmsg<G: Guest<Self>>(
@@ -542,28 +597,57 @@ impl Recorder {
         guest: &mut G,
         syscall: Recvmmsg,
     ) -> Result<i64, Errno> {
-        // Unlike sendmmsg, Linux does not clamp recvmmsg's vlen.
+        // Unlike sendmmsg, Linux does not clamp recvmmsg's vlen. It reads each
+        // header lazily, but the recorder must decide before the call how many
+        // Linux may use, so it looks at no more than `RECVMMSG_SCAN_LIMIT`.
         let vlen = syscall.vlen() as usize;
+        let scanned = vlen.min(RECVMMSG_SCAN_LIMIT);
         let base = syscall.mmsg().map(|address| address.as_raw());
+        let timeout_address = syscall.timeout();
+        let timeout = timeout_address.map(|address| guest.memory().read_value(address));
         // Reduced to plain capacities inside this block so no raw pointer is
         // held across an await, which would make this future non-`Send`.
         let (readable, writable, input) = {
             // Linux stops at the first header it cannot read, without side
             // effects.
             let headers = base
-                .map(|base| read_readable_mmsghdrs(&guest.memory(), base, vlen))
+                .map(|base| read_readable_mmsghdrs(&guest.memory(), base, scanned))
                 .unwrap_or_default();
-            // But it receives into a header before writing results back to it,
+            let mappings = (base.is_some() && scanned != 0 || matches!(timeout, Some(Err(_))))
+                .then(|| GuestMappings::read(guest.pid()));
+            // The recorder reads with process_vm_readv, which refuses a
+            // PROT_WRITE-only page the guest itself can read. Linux would use
+            // such a header or timeout where the recorder could not see it.
+            if let (Some(base), Some(mappings)) = (base, &mappings) {
+                assert!(
+                    headers.len() == scanned
+                        || !mmsghdr_is_accessible(mappings, base, headers.len()),
+                    "recvmmsg entry {} is readable by the guest but not by the recorder \
+                     (https://github.com/rrnewton/hermit/issues/3583)",
+                    headers.len()
+                );
+            }
+            if let (Some(Err(_)), Some(address), Some(mappings)) =
+                (&timeout, timeout_address, &mappings)
+            {
+                assert!(
+                    !mappings.accessible(address.as_raw(), std::mem::size_of::<Timespec>()),
+                    "recvmmsg's timeout is readable by the guest but not by the recorder \
+                     (https://github.com/rrnewton/hermit/issues/3583)"
+                );
+            }
+            // Linux receives into a header before writing results back to it,
             // so a header it can read but not write loses a message. Offer
             // Linux only the writable prefix, and refuse below if that could
             // have mattered.
-            let writable = match base {
-                Some(base) if !headers.is_empty() => {
-                    let mappings = WritableMappings::read(guest.pid());
-                    (0..headers.len())
-                        .take_while(|index| mmsghdr_is_writable(&mappings, base, *index))
-                        .count()
-                }
+            let writable = match (base, &mappings) {
+                (Some(base), Some(mappings)) => headers
+                    .iter()
+                    .enumerate()
+                    .take_while(|(index, header)| {
+                        mmsghdr_is_writable(mappings, base, *index, header)
+                    })
+                    .count(),
                 _ => 0,
             };
             let input: Vec<(usize, usize)> = headers[..writable]
@@ -575,14 +659,20 @@ impl Recorder {
                     )
                 })
                 .collect();
-            (headers.len(), writable, input)
+            // Linux would have gone on past the scanned headers.
+            let readable = if headers.len() == scanned {
+                vlen
+            } else {
+                headers.len()
+            };
+            (readable, writable, input)
         };
         let clamped = writable < readable;
         let refusal = |index: usize| -> ! {
             panic!(
-                "recvmmsg entry {index} can be read but not written: Linux would receive \
-                 into it and then fail, which cannot be recorded \
-                 (https://github.com/rrnewton/hermit/issues/3583)"
+                "recvmmsg entry {index} can be read but not written, or lies beyond the \
+                 {RECVMMSG_SCAN_LIMIT} entries the recorder checks: Linux would receive into \
+                 it, which cannot be recorded (https://github.com/rrnewton/hermit/issues/3583)"
             )
         };
         if clamped && writable == 0 {
@@ -597,14 +687,12 @@ impl Recorder {
         // Linux writes the remaining timeout back only after receiving, and a
         // failed write turns the count into EFAULT. Give it a scratch copy and
         // write the remainder back here, so the received messages are known.
-        let timeout = syscall
-            .timeout()
-            .map(|address| guest.memory().read_value(address));
         let (mut result, remaining) = match timeout {
             Some(Ok(timeout)) => {
                 let mut stack = guest.stack().await;
                 let scratch = stack.push(timeout);
-                // Failing here would lose an already performed receive.
+                // Nothing has been received yet, but the call cannot be
+                // recorded without its scratch timeout.
                 let _guard = stack
                     .commit()
                     .expect("cannot place recvmmsg's timeout on the guest stack");
@@ -625,6 +713,34 @@ impl Recorder {
         };
         if clamped && result == Ok(writable as i64) {
             refusal(writable);
+        }
+        // The writable prefix was decided from a snapshot of the memory map.
+        // A blocking receive lets other guest threads run, and one that
+        // changed the protection of a header Linux used meanwhile would leave
+        // a result the recording does not describe; refuse rather than record
+        // it. Rechecking afterwards catches every change that is still in
+        // place when the call returns. The header after the last received one
+        // is included: Linux may have received into it and then failed to
+        // write back, which is exactly the lost message.
+        if let (Ok(received), Some(base)) = (result, base) {
+            let used = usize::try_from(received)
+                .unwrap_or(0)
+                .saturating_add(1)
+                .min(writable);
+            if used != 0 {
+                let mappings = GuestMappings::read(guest.pid());
+                let headers = read_readable_mmsghdrs(&guest.memory(), base, used);
+                let unchanged = headers.len() == used
+                    && headers
+                        .iter()
+                        .enumerate()
+                        .all(|(index, header)| mmsghdr_is_writable(&mappings, base, index, header));
+                assert!(
+                    unchanged,
+                    "a recvmmsg header changed protection while the call ran \
+                     (https://github.com/rrnewton/hermit/issues/3583)"
+                );
+            }
         }
         // Capture the messages before writing the timeout back: Linux writes it
         // last, so a timeout aliasing a header overwrites that header's result.
@@ -652,9 +768,7 @@ impl Recorder {
         // Linux's copy-out can store a prefix of the timeout before faulting.
         let mut timeout_fault = None;
         if let Some((_, bytes)) = &remaining {
-            let address = syscall
-                .timeout()
-                .expect("a remaining timeout needs a timeout");
+            let address = timeout_address.expect("a remaining timeout needs a timeout");
             let copied = copy_out_as_guest(&mut guest.memory(), address.as_raw(), bytes);
             if copied < bytes.len() {
                 timeout_fault = Some(bytes[..copied].to_vec());
@@ -681,7 +795,7 @@ impl Recorder {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Record the `msg_len` of every message a `sendmmsg` sent.
     pub(super) async fn handle_sendmmsg<G: Guest<Self>>(
         &self,
@@ -706,7 +820,7 @@ impl Recorder {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Record the fd, peer address and socket shape of an `accept`/`accept4`,
     /// so replay can reproduce the connection without a live peer.
     pub(super) async fn handle_accept<G: Guest<Self>>(
@@ -754,7 +868,7 @@ impl Recorder {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Record the two fds a `socketpair` wrote to the guest.
     pub(super) async fn handle_socketpair<G: Guest<Self>>(
         &self,

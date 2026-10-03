@@ -168,14 +168,16 @@ fn restore_recvmsg<M: MemoryAccess>(
     write_bytes(memory, message.msg_name, &event.name)?;
     write_bytes(memory, message.msg_control, &event.control)?;
 
-    // Linux writes back only these fields; the rest of the header may be on a
-    // page the guest cannot write.
+    // Linux writes back only these fields, and msg_namelen only with a name
+    // buffer; the rest of the header may be on a page the guest cannot write.
     let header = message_address.as_raw();
-    write_field(
-        memory,
-        header + std::mem::offset_of!(libc::msghdr, msg_namelen),
-        &event.name_len,
-    )?;
+    if !message.msg_name.is_null() {
+        write_field(
+            memory,
+            header + std::mem::offset_of!(libc::msghdr, msg_namelen),
+            &event.name_len,
+        )?;
+    }
     write_field(
         memory,
         header + std::mem::offset_of!(libc::msghdr, msg_controllen),
@@ -374,7 +376,7 @@ impl Replayer {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Restore every recorded message of a `recvmmsg` without receiving live.
     pub(super) async fn handle_recvmmsg<G: Guest<Self>>(
         &self,
@@ -426,7 +428,7 @@ impl Replayer {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Restore the recorded `msg_len` of every message a `sendmmsg` sent.
     pub(super) async fn handle_sendmmsg<G: Guest<Self>>(
         &self,
@@ -443,7 +445,7 @@ impl Replayer {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Restore a recorded `accept`/`accept4` without accepting live: the
     /// recorded peer never connects during replay, so a live accept would hang.
     pub(super) async fn handle_accept<G: Guest<Self>>(
@@ -489,7 +491,7 @@ impl Replayer {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
     /// Recreate a recorded `socketpair` live. It touches no network, and the
     /// resulting connected pair keeps later live fd operations valid; assert
     /// the kernel chose the recorded fds.

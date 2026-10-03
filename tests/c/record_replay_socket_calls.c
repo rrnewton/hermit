@@ -16,7 +16,8 @@
  * recvmmsg edge cases return a count or an error after partial side effects:
  * an unmapped header after the received ones, and a read-only timeout. A
  * timeout straddling a writable and a read-only page is copied back in part,
- * and a header whose input-only msg_name pointer is read-only still receives.
+ * and a header whose input-only msg_name pointer, or whose msg_namelen without
+ * a name buffer, is read-only still receives.
  */
 
 #define _GNU_SOURCE
@@ -26,6 +27,7 @@
 #include <linux/if_alg.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -224,6 +226,28 @@ static int partial_side_effects(void) {
          received, received < 0 ? errno : 0, straddling->msg_len,
          message_buffers[0]);
   CHECK(received == 1 && straddling->msg_len == 2 &&
+        memcmp(message_buffers[0], "m0", 2) == 0);
+  close(sv[0]);
+  close(sv[1]);
+
+  /* Without a name buffer Linux leaves msg_namelen alone, so it may be
+   * read-only too. */
+  CHECK(queued_pair(sv, 1) == 0);
+  CHECK(mprotect(pages, page, PROT_READ | PROT_WRITE) == 0);
+  struct mmsghdr* nameless =
+      (struct mmsghdr*)(pages + page - offsetof(struct msghdr, msg_iov));
+  memset(message_buffers[0], 0, sizeof message_buffers[0]);
+  prepare_receive(nameless, &message_iov[0], message_buffers[0],
+                  sizeof message_buffers[0]);
+  nameless->msg_hdr.msg_namelen = 9;
+  CHECK(mprotect(pages, page, PROT_READ) == 0);
+  received = recvmmsg(sv[1], nameless, 1, MSG_DONTWAIT, NULL);
+  printf("recvmmsg read-only msg_namelen %d errno %d len %u namelen %u "
+         "data %.2s\n",
+         received, received < 0 ? errno : 0, nameless->msg_len,
+         nameless->msg_hdr.msg_namelen, message_buffers[0]);
+  CHECK(received == 1 && nameless->msg_len == 2 &&
+        nameless->msg_hdr.msg_namelen == 9 &&
         memcmp(message_buffers[0], "m0", 2) == 0);
   close(sv[0]);
   close(sv[1]);
