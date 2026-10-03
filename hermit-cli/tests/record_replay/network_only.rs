@@ -182,13 +182,7 @@ impl Controller {
 
     fn stop_without_connection(mut self) {
         let child = self.child.as_mut().expect("controller child exists");
-        if child
-            .try_wait()
-            .expect("failed to inspect unused TCP controller")
-            .is_none()
-        {
-            child.kill().expect("failed to stop unused TCP controller");
-        }
+        Self::request_stop(child).expect("failed to stop unused TCP controller");
         let output = self.finish_child();
         assert!(
             !output.status.success(),
@@ -204,6 +198,23 @@ impl Controller {
         );
     }
 
+    fn request_stop(child: &mut Child) -> std::io::Result<()> {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        // This still-unreaped Child owns the timeout supervisor's PID. Send
+        // TERM to that supervisor, so its existing signal forwarding and
+        // --kill-after=1s also retire the real controller and inherited pipes.
+        // SIGKILL here would strand that child until its own accept alarm.
+        // Never signal a process group or a PID after Child has reaped it.
+        let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .map_err(std::io::Error::from)
+    }
+
     fn finish_child(&mut self) -> Output {
         self.child
             .take()
@@ -216,9 +227,80 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
-            let _ = child.kill();
+            let _ = Self::request_stop(child);
             let _ = child.wait();
         }
+    }
+}
+
+// The real GNU timeout supervisor owns a real child that keeps stdout open.
+// Readiness comes from that child before cancellation; no Hermit run is needed.
+fn pipe_owning_controller(directory: &Path, ignore_term: bool) -> Controller {
+    use std::io::BufRead;
+
+    let script = if ignore_term {
+        "trap '' TERM; printf 'controller-ready\\n'; exec /bin/sleep 30"
+    } else {
+        "printf 'controller-ready\\n'; exec /bin/sleep 30"
+    };
+    let child = Command::new("timeout")
+        .args(["--kill-after=1s", &format!("{CONTROLLER_WALL_SECONDS}s")])
+        .args(["/bin/sh", "-c", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bounded pipe-owning controller");
+    // Establish cancellation ownership before any fallible readiness check.
+    let mut controller = Controller {
+        child: Some(child),
+        port_path: directory.join("controller.port"),
+        contact_path: directory.join("controller.contact"),
+        report_path: directory.join("controller.report"),
+    };
+    let mut stdout =
+        std::io::BufReader::new(controller.child.as_mut().unwrap().stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout
+        .read_line(&mut ready)
+        .expect("read actual child readiness");
+    assert_eq!(ready, "controller-ready\n");
+    controller.child.as_mut().unwrap().stdout = Some(stdout.into_inner());
+    controller
+}
+
+#[test]
+fn controller_cancellation_joins_supervisor_and_pipe_eof_promptly() {
+    for ignore_term in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = pipe_owning_controller(directory.path(), ignore_term);
+        let started = Instant::now();
+        controller.stop_without_connection();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "controller cancellation waited for the 30-second child (ignore_term={ignore_term})"
+        );
+    }
+}
+
+#[test]
+fn controller_drop_joins_supervisor_and_pipe_eof_promptly() {
+    use std::io::Read;
+
+    for ignore_term in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = pipe_owning_controller(directory.path(), ignore_term);
+        let mut stdout = controller.child.as_mut().unwrap().stdout.take().unwrap();
+        let started = Instant::now();
+        drop(controller);
+        let mut remainder = Vec::new();
+        stdout
+            .read_to_end(&mut remainder)
+            .expect("join child pipe EOF");
+        assert!(remainder.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "controller Drop left the 30-second pipe owner alive (ignore_term={ignore_term})"
+        );
     }
 }
 

@@ -9,6 +9,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Read;
+use std::io::Write;
 use std::io::{self};
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -260,7 +261,14 @@ fn nonblocking(fd: i32) {
     assert!(flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0);
 }
 
-fn capture(reader: &mut impl Read, bytes: &mut Vec<u8>, total: &mut usize) -> io::Result<bool> {
+// The unbuffered sink retains every completed, below-limit read before another
+// pipe read. An incomplete file is diagnostic evidence, never a cell receipt.
+fn capture_to(
+    reader: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    total: &mut usize,
+    retained: &mut impl Write,
+) -> io::Result<bool> {
     let mut buffer = [0u8; 8192];
     loop {
         match reader.read(&mut buffer) {
@@ -273,6 +281,7 @@ fn capture(reader: &mut impl Read, bytes: &mut Vec<u8>, total: &mut usize) -> io
                         "aggregate output reached 4 MiB",
                     ));
                 }
+                retained.write_all(&buffer[..count])?;
                 bytes.extend_from_slice(&buffer[..count]);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -280,6 +289,15 @@ fn capture(reader: &mut impl Read, bytes: &mut Vec<u8>, total: &mut usize) -> io
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(test)]
+fn capture(reader: &mut impl Read, bytes: &mut Vec<u8>, total: &mut usize) -> io::Result<bool> {
+    capture_to(reader, bytes, total, &mut io::sink())
+}
+
+fn capture_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 pub(super) fn run(
@@ -325,6 +343,12 @@ pub(super) fn run(
         format!("{command:?}\n"),
     )
     .unwrap();
+    // Create fresh logs under the original watchdog before the child starts.
+    // Stale paths and write errors cannot be mistaken for completed capture.
+    let mut retained_stdout = capture_file(&evidence.join(format!("{label}.stdout")))
+        .unwrap_or_else(|_| lethal(&boundary.kill, &boundary.cause, 3));
+    let mut retained_stderr = capture_file(&evidence.join(format!("{label}.stderr")))
+        .unwrap_or_else(|_| lethal(&boundary.kill, &boundary.cause, 3));
     let mut child = command.spawn().expect("launch official bounded Hermit");
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -334,30 +358,32 @@ pub(super) fn run(
     let (mut out_done, mut err_done, mut status) = (false, false, None);
     while status.is_none() || !out_done || !err_done {
         if !out_done {
-            out_done = capture(&mut stdout, &mut out, &mut total).unwrap_or_else(|error| {
-                lethal(
-                    &boundary.kill,
-                    &boundary.cause,
-                    if error.kind() == io::ErrorKind::FileTooLarge {
-                        2
-                    } else {
-                        3
-                    },
-                )
-            });
+            out_done = capture_to(&mut stdout, &mut out, &mut total, &mut retained_stdout)
+                .unwrap_or_else(|error| {
+                    lethal(
+                        &boundary.kill,
+                        &boundary.cause,
+                        if error.kind() == io::ErrorKind::FileTooLarge {
+                            2
+                        } else {
+                            3
+                        },
+                    )
+                });
         }
         if !err_done {
-            err_done = capture(&mut stderr, &mut err, &mut total).unwrap_or_else(|error| {
-                lethal(
-                    &boundary.kill,
-                    &boundary.cause,
-                    if error.kind() == io::ErrorKind::FileTooLarge {
-                        2
-                    } else {
-                        3
-                    },
-                )
-            });
+            err_done = capture_to(&mut stderr, &mut err, &mut total, &mut retained_stderr)
+                .unwrap_or_else(|error| {
+                    lethal(
+                        &boundary.kill,
+                        &boundary.cause,
+                        if error.kind() == io::ErrorKind::FileTooLarge {
+                            2
+                        } else {
+                            3
+                        },
+                    )
+                });
         }
         if status.is_none() {
             status = child.try_wait().expect("reap bounded Hermit child");
@@ -378,8 +404,6 @@ pub(super) fn run(
         status.code().is_some(),
         "Hermit terminated by a signal: {status}"
     );
-    fs::write(evidence.join(format!("{label}.stdout")), &out).unwrap();
-    fs::write(evidence.join(format!("{label}.stderr")), &err).unwrap();
     let receipt = serde_json::json!({
         "schema": "hermit-official-network-cell-v1", "case": boundary.case,
         "cgroup_device": boundary.device, "cgroup_inode": boundary.inode,
@@ -477,5 +501,103 @@ mod tests {
         assert_eq!(count, LOG_BYTES);
         assert!(first.len() + second.len() < LOG_BYTES);
         assert_eq!(first, vec![b'a'; LOG_BYTES / 2]);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    #[test]
+    fn incomplete_stream_is_retained_before_eof_and_success_bytes_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell.stdout");
+        let mut retained = capture_file(&path).unwrap();
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        writer.write_all(b"first\0chunk").unwrap();
+        let (mut bytes, mut total) = (Vec::new(), 0);
+        assert!(!capture_to(&mut reader, &mut bytes, &mut total, &mut retained).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first\0chunk");
+        assert_eq!(bytes, b"first\0chunk");
+        assert_eq!(total, bytes.len());
+        writer.write_all(b"second").unwrap();
+        drop(writer);
+        assert!(capture_to(&mut reader, &mut bytes, &mut total, &mut retained).unwrap());
+        assert_eq!(bytes, b"first\0chunksecond");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(total, bytes.len());
+    }
+
+    #[test]
+    fn partial_sink_error_refuses_without_claiming_a_complete_chunk() {
+        struct PartialThenError(Vec<u8>);
+        impl Write for PartialThenError {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    self.0.extend_from_slice(&bytes[..2]);
+                    Ok(2)
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = PartialThenError(Vec::new());
+        let (mut bytes, mut total) = (Vec::new(), 0);
+        let error = capture_to(
+            &mut io::Cursor::new(b"actual bytes"),
+            &mut bytes,
+            &mut total,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(sink.0, b"ac");
+        assert!(bytes.is_empty());
+        assert_eq!(total, b"actual bytes".len());
+    }
+
+    #[test]
+    fn exact_aggregate_cap_refuses_before_writing_the_crossing_chunk() {
+        let (mut bytes, mut retained, mut total) = (Vec::new(), Vec::new(), LOG_BYTES - 2);
+        assert!(
+            capture_to(
+                &mut io::Cursor::new(b"a"),
+                &mut bytes,
+                &mut total,
+                &mut retained,
+            )
+            .unwrap()
+        );
+        assert_eq!(total, LOG_BYTES - 1);
+        assert_eq!(retained, b"a");
+        let error = capture_to(
+            &mut io::Cursor::new(b"b"),
+            &mut bytes,
+            &mut total,
+            &mut retained,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(total, LOG_BYTES);
+        assert_eq!(bytes, b"a");
+        assert_eq!(retained, b"a");
+    }
+
+    #[test]
+    fn existing_capture_path_is_refused_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell.stderr");
+        fs::write(&path, b"previous failure").unwrap();
+        assert_eq!(
+            capture_file(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(path).unwrap(), b"previous failure");
     }
 }
