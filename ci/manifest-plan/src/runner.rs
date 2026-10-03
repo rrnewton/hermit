@@ -10113,6 +10113,15 @@ int main(int argc, char **argv) {
         let mut mode = test.modes.remove("verify").unwrap();
         mode.runs = Some(3);
         test.modes.insert("naked".into(), mode);
+        // The property under test: three attempts that each sleep 0.7 s spend
+        // at least 2.1 s of wall time but almost no CPU, so the cell must
+        // pass under a 1 s aggregate CPU budget. That needs only total wall
+        // time > cpu_timeout_seconds; the wall deadline is the backstop for a
+        // wedged process, not part of the property. A 3 s deadline left
+        // about 0.9 s for three shell start-ups and timed out at 3.048 s on a
+        // heavily loaded host, so the deadline and the upper duration bound
+        // carry several seconds of margin. The lower bound of 2_000 ms still
+        // proves that wall time exceeded the CPU budget.
         let cell = SelectedCell {
             category: "fixture".into(),
             id: CellId {
@@ -10122,7 +10131,7 @@ int main(int argc, char **argv) {
             },
             test,
             enabled: true,
-            timeout_seconds: 3,
+            timeout_seconds: 10,
             cpu_timeout_seconds: 1,
         };
         let context = RunContext {
@@ -10165,7 +10174,7 @@ int main(int argc, char **argv) {
             .duration_ms
             .expect("a cell that executed must report measured wall time");
         assert!(
-            (2_000..3_000).contains(&duration_ms),
+            (2_000..10_000).contains(&duration_ms),
             "three sleeping attempts should pass despite exceeding the old one-second wall cap: {duration_ms}ms"
         );
         let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
@@ -14878,10 +14887,18 @@ cp "{}" "$verdict"
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        // The property under test: preparation and execution each get their
+        // own wall deadline of timeout_seconds, so preparation time is not
+        // charged against the execution budget. Each phase sleeps 2.1 s under
+        // a 4 s deadline, so the two phases together (at least 4.2 s) exceed
+        // one deadline: a shared deadline would time out the run, while
+        // separate deadlines let both phases pass. Each phase keeps about
+        // 1.9 s for process start-up on a loaded host; the earlier 1.1 s
+        // sleeps under a 2 s deadline left only 0.9 s per phase.
         let program = root.join("fixture.sh");
         fs::write(
             &program,
-            "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 1.1 ;;\n  --run) sleep 1.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 2.1 ;;\n  --run) sleep 2.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&program).unwrap().permissions();
@@ -14908,7 +14925,7 @@ cp "{}" "$verdict"
             },
             test,
             enabled: true,
-            timeout_seconds: 2,
+            timeout_seconds: 4,
             cpu_timeout_seconds: 1,
         };
         let context = run_context(&root);
@@ -14930,7 +14947,7 @@ cp "{}" "$verdict"
         assert!(!result.attempts[0].timed_out);
         assert_eq!(result.attempts[0].stdout, "complete\n");
         assert!(
-            result.duration_ms.is_some_and(|duration| duration >= 2_000),
+            result.duration_ms.is_some_and(|duration| duration >= 4_000),
             "the fixture did not exercise separate preparation and execution time: {result:?}"
         );
         fs::remove_dir_all(root).unwrap();
