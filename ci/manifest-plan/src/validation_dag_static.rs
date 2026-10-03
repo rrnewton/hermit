@@ -204,6 +204,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "privileged-only-e2e.manifest_system_utils",
     "privileged-only-e2e.manifest_system_utils_on_host",
     "quick.e2e_verify",
+    "sabrecompat.manifest_compat",
 ];
 
 pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] =
@@ -488,7 +489,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_source_sha_is_refused_through_a_symlink_to_tracked_files.
     // `cargo nextest list --profile ci` over this node's selection measured
     // 819 at 9e7dd6e33cf6fc76f3b9a744f50441120b32f0d6.
-    ("test.regular_crates", 819),
+    // runner::tests::a_cell_labelled_by_its_mode_belongs_to_that_run_type_alone,
+    // manifest_corpus::tests::a_focused_run_type_adds_labelled_cells_and_records_red_ones
+    // and validation_dag::tests::steps_sharing_a_result_file_never_run_in_one_run_type,
+    // added when the sabre-compat-only lane became compat.yaml cells (fold 3 of
+    // https://github.com/rrnewton/hermit/issues/3448), retain all 819 prior
+    // identities.
+    ("test.regular_crates", 822),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -848,8 +855,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // added and one removed, whose test S12 rewrote under a new name, so 783
     // of its 784 prior identities are retained.
     // The six import-mode tests of https://github.com/rrnewton/hermit/pull/3542
-    // retain all 813 prior identities (measured 819, as above).
-    ("test.regular_crates_on_host", 819),
+    // retain all 813 prior identities (measured 819, as above), and the three
+    // fold-3 run-type tests retain all 819.
+    ("test.regular_crates_on_host", 822),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
@@ -895,6 +903,10 @@ struct ManifestSpec {
     test: Option<&'static str>,
     mode: Option<&'static str>,
     backend: Option<&'static str>,
+    /// The run type whose labelled cells the node selects with
+    /// `test-harness run --label`; `None` selects the default run type
+    /// (runner::DEFAULT_RUN_TYPE).
+    label: Option<&'static str>,
 }
 
 impl ManifestSpec {
@@ -1042,6 +1054,27 @@ impl StaticStepSpec {
                 .then(|| PMU_MEMORY_FAILURE_FAMILY.into()),
         }
     }
+}
+
+/// The run type a static manifest bucket node selects by label
+/// ([`ManifestSpec::label`]), or `None` for the default run type. A node's
+/// hosted twin (`<tag>_on_host`) selects what the node selects.
+pub(super) fn manifest_run_type(tag: &str) -> Option<&'static str> {
+    let tag = tag.strip_suffix("_on_host").unwrap_or(tag);
+    STATIC_STEPS.iter().find_map(|spec| {
+        (tag.split_once('.') == Some((spec.group, spec.job)))
+            .then_some(spec.manifest)
+            .flatten()
+            .and_then(|manifest| manifest.label)
+    })
+}
+
+/// Every run type some static manifest bucket node selects by label.
+pub(super) fn manifest_run_types() -> std::collections::BTreeSet<&'static str> {
+    STATIC_STEPS
+        .iter()
+        .filter_map(|spec| spec.manifest.and_then(|manifest| manifest.label))
+        .collect()
 }
 
 pub(super) fn config() -> DagConfig {
@@ -2146,6 +2179,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2223,6 +2257,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2267,6 +2302,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2312,6 +2348,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2356,6 +2393,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2399,6 +2437,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2434,6 +2473,52 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         jobs_env: None,
     },
     StaticStepSpec {
+        group: r########"sabrecompat"########,
+        job: r########"manifest_compat"########,
+        desc: r########"The compatibility corpus on SaBRe"########,
+        description: r########"The sabre-compat-only run type: `test-harness run --label sabre-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are each corpus row's SaBRe verify cell (the `focused` section: every row but lsof, netlink-route, netlink-sock-diag and shell-build) and both cells of the 30 rows only this run type has (23 programs the SaBRe corpus had and the strict corpus lacks; lua-direct, perl-direct and df-direct, which keep that corpus's single-image argv for programs whose strict rows run under a bash wrapper; and rustc, javac, java and node, whose ptrace cells get 600 seconds). It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, whose install tree carries the SaBRe loader and libdetcore_sabre.so, against the fixtures sabrecompatprep.fixtures writes; each cell runs Hermit's stripped --verify once and must also pass the harness's SaBRe execution-path contract (an RPC from the in-guest tool, zero ptrace-fallback and zero trusted shared-object system-call sites). A cell measured red stays enabled with `ci: false` and its failure class's issue (https://github.com/rrnewton/hermit/issues/3486 and the issues it names), so `--ci-only` selects only the cells that pass. A program that diverges, crashes or leaves SaBRe's measured path turns it red. Until 2026-10-01 these rows were 212 separate sabrecompat.<program> nodes that checked only Hermit's exit status, so a program whose children ran outside SaBRe passed, and on a fresh checkout their release Hermit had no SaBRe loader at all. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom, plus 300 seconds for the rest of the bucket, so a hung heavy cell is reported as that cell's timeout rather than ending the node. The self-test models every manifest cell as two attempts with 10 seconds of termination grace each, and its representative 1.5x wall multiplier turns the largest selected cells (rustc and node on ptrace, 600 seconds each) into 900-second windows: 2 x (900 + 10). The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
+        labels: &[r########"sabre-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label sabre-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmdtype: CmdType::Unknown,
+        manifest: Some(ManifestSpec {
+            lane: r########"portable"########,
+            category: r########"compat"########,
+            test: None,
+            mode: None,
+            backend: None,
+            label: Some(r########"sabre-compat-only"########),
+        }),
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.host_hermit_link"########,
+            r########"build.rust_scripts"########,
+            r########"gate.manifest"########,
+            r########"pre.reverie_pin"########,
+            r########"sabrecompatprep.fixtures"########,
+            r########"setup.manifest_plan"########,
+        ],
+        env: &[(
+            r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+            r########"/test"########,
+        )],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 120.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(6442450944),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 2120,
+        cpu_timeout: 1800,
+        jobs_flag: Some(r########"--jobs"########),
+        jobs_env: None,
+    },
+    StaticStepSpec {
         group: r########"e2e"########,
         job: r########"manifest_data_handling"########,
         desc: r########"Portable manifest bucket: data-handling"########,
@@ -2447,6 +2532,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2491,6 +2577,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2535,6 +2622,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2579,6 +2667,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2623,6 +2712,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2667,6 +2757,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2711,6 +2802,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -2756,6 +2848,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -3851,6 +3944,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -3896,6 +3990,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -3942,6 +4037,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -5348,6 +5444,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -5392,6 +5489,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -5436,6 +5534,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -5532,11 +5631,10 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         group: r########"compatprep"########,
         job: r########"hermit_release"########,
         desc: r########"Release Hermit for compatibility"########,
-        description: r########"Dedicated release build for the five focused compatibility profiles; it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build."########,
+        description: r########"Dedicated release build for the focused compatibility profiles that still run per-program probes (strict, e9patch and rr; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only profile does not take it: its bucket runs the validation's one build, the e2e artifact."########,
         labels: &[
             r########"portable-strict-compat-only"########,
             r########"strict-compat-only"########,
-            r########"sabre-compat-only"########,
             r########"e9patch-compat-only"########,
             r########"rr-compat-only"########,
         ],
@@ -6192,6 +6290,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6231,6 +6330,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6270,6 +6370,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6309,6 +6410,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6348,6 +6450,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6389,6 +6492,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6428,6 +6532,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6467,6 +6572,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6506,6 +6612,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6545,6 +6652,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6584,6 +6692,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6623,6 +6732,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -6662,6 +6772,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -7005,6 +7116,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -7044,6 +7156,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[
@@ -7083,6 +7196,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             test: None,
             mode: None,
             backend: None,
+            label: None,
         }),
         integration_test_binaries: None,
         deps: &[

@@ -1168,7 +1168,7 @@ fn usage() -> &'static str {
      \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
-     \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
+     \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
@@ -2099,10 +2099,9 @@ const STRICT_EXECUTION_FLAG: &str = "--strict";
 /// `record start --verify --verify-strict`, a different path with a different
 /// evidence policy and no `--strict` marker, so folding it into this list would
 /// assert something untrue about it.
-const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 4] = [
+const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 3] = [
     CompatMode::Strict,
     CompatMode::PortableStrict,
-    CompatMode::Sabre,
     CompatMode::E9patch,
 ];
 
@@ -3039,10 +3038,9 @@ fn self_test() -> Result<(), String> {
             ),
             (CompatMode::Strict, false, false, false, D::Blocking, true),
             // No other mode consults either table: a failure blocks whatever the tables say.
-            (CompatMode::Sabre, false, true, false, D::Blocking, true),
-            (CompatMode::Sabre, false, false, true, D::Blocking, true),
-            (CompatMode::Sabre, true, true, false, D::Passed, false),
             (CompatMode::E9patch, false, true, false, D::Blocking, true),
+            (CompatMode::E9patch, false, false, true, D::Blocking, true),
+            (CompatMode::E9patch, true, true, false, D::Passed, false),
             (CompatMode::Rr, false, true, false, D::Blocking, true),
         ];
         for (mode, ok, listed, diag, want, want_blocking) in cases.iter().copied() {
@@ -4164,13 +4162,6 @@ fn self_test() -> Result<(), String> {
             validate_corpus::STRICT_COMPAT_TOTAL
         ));
     }
-    let sabre = count("sabre")?;
-    if sabre != validate_corpus::SABRE_COMPAT_TOTAL {
-        return Err(format!(
-            "sabre corpus has {sabre} rows, SABRE_COMPAT_TOTAL is {}",
-            validate_corpus::SABRE_COMPAT_TOTAL
-        ));
-    }
     // rr admits a superset and is filtered to the measured-passing labels; what
     // must hold is that every passing label is actually present to be measured.
     let rr_rows = validate_corpus::load(&root, "rr", &paths)?;
@@ -4195,7 +4186,7 @@ fn self_test() -> Result<(), String> {
         ));
     }
     println!(
-        "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}",
+        "  corpora: strict={strict} rr={} (filtered to {}) e9patch={e9}",
         rr_rows.len(),
         validate_corpus::RR_COMPAT_EXPECTED
     );
@@ -7181,15 +7172,16 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         };
         // A fail-closed bucket omits --allow-empty; the generator and this
         // check read the one list in hermit_manifest_plan.
-        let selector =
-            hermit_manifest_plan::validation_dag::manifest_selector_flags(&manifest.category);
+        // Lane, category, a focused run type's --label and the category's
+        // fail-closed/diagnostic flags: the one source the generator reads.
+        let selection =
+            hermit_manifest_plan::validation_dag::manifest_bucket_selection(&tag, manifest);
         (
             format!(
                 "{launcher}target/debug/test-harness run \
-            --lane {} --category {} {selector}{exclusions}{jobs} \
+            {selection}{exclusions}{jobs} \
             --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
-            --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
-                manifest.lane, manifest.category
+            --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\""
             ),
             Path::new(&bucket).join("results.jsonl"),
         )
@@ -11625,7 +11617,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let (compat, compat_prefix) = match label {
             "strict-compat-only" => (Some(CompatMode::Strict), Some("strictcompat.")),
             "rr-compat-only" => (Some(CompatMode::Rr), Some("rrcompat.")),
-            "sabre-compat-only" => (Some(CompatMode::Sabre), Some("sabrecompat.")),
             "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
             _ => (None, None),
         };
@@ -11800,6 +11791,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     // live in hermit-manifest-plan's private static source.
     let anchor_tags = [
         "build.e2e_artifact",
+        "build.host_hermit_link",
         "compatprep.hermit_release",
         "gate.manifest",
         "setup.nextest",
@@ -11865,6 +11857,21 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     portable_prep.labels = vec!["full".into(), "portable".into()];
     steps.push(portable_prep);
 
+    // The SaBRe run type's rows are the compat.yaml cells labelled
+    // sabre-compat-only, run by the static node sabrecompat.manifest_compat
+    // against the validation's one Hermit build; this node prepares the files
+    // those rows read, at the path the rows name.
+    let mut sabre_prep =
+        prepare_fixtures_node_dep("sabrecompatprep.fixtures", &portable_fixtures, "build.host_hermit_link");
+    sabre_prep.group = "sabrecompatprep".into();
+    sabre_prep.desc = "Prepare the fixture files the SaBRe run type's compat cells read".into();
+    sabre_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of sabrecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
+    );
+    sabre_prep.labels = vec!["sabre-compat-only".into()];
+    steps.push(sabre_prep);
+
     for (mode, namespace, label) in [
         (
             CompatMode::PortableStrict,
@@ -11872,7 +11879,6 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
             "portable-strict-compat-only",
         ),
         (CompatMode::Strict, "strictcompat", "strict-compat-only"),
-        (CompatMode::Sabre, "sabrecompat", "sabre-compat-only"),
         (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
         (CompatMode::Rr, "rrcompat", "rr-compat-only"),
     ] {
@@ -16641,7 +16647,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             // are unchanged.
             "--diagnostic-results" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--exclude-backend"
-            | "--exclude-category" | "--results" | "--junit" | "--jobs" => {
+            | "--exclude-category" | "--label" | "--results" | "--junit" | "--jobs" => {
                 index += 1;
                 let value = argv
                     .get(index)
@@ -16660,6 +16666,8 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     // The quick verify smoke omits the host-bound strict
                     // compatibility corpus; model it like the backend omission.
                     "--exclude-category" => selection.exclude_categories.push(value.clone()),
+                    // A focused run type's bucket selects its labelled cells.
+                    "--label" => selection.labels.push(value.clone()),
                     _ => {}
                 }
             }
@@ -16697,6 +16705,11 @@ fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
             || selection.test != manifest.test
             || selection.mode != manifest.mode
             || selection.backend != manifest.backend
+            || selection.labels
+                != hermit_manifest_plan::validation_dag::manifest_run_type(&step.tag())
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>()
         {
             return Err(format!(
                 "retry bounds: {} command disagrees with its declared manifest selector",
@@ -17266,8 +17279,10 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // https://github.com/rrnewton/hermit/issues/3448). 37 since
         // portablecompat.manifest_compat replaced the 189 generated
         // portablecompat.<program> probes of the portable-strict-compat-only
-        // run type (fold 2 of the same issue).
-        assert_eq!(steps.len(), 37);
+        // run type (fold 2 of the same issue). 38 since
+        // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
+        // probes of the sabre-compat-only run type (fold 3).
+        assert_eq!(steps.len(), 38);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -26701,7 +26716,6 @@ fn run(
         compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
         let floor = match mode {
-            CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
             CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
             CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
         };
@@ -31336,8 +31350,10 @@ mod raw_census_publication_tests {
         // https://github.com/rrnewton/hermit/issues/3448). 37 since
         // portablecompat.manifest_compat replaced the 189 generated
         // portablecompat.<program> probes of the portable-strict-compat-only
-        // run type (fold 2 of the same issue).
-        assert_eq!(publishers.len(), 37);
+        // run type (fold 2 of the same issue). 38 since
+        // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
+        // probes of the sabre-compat-only run type (fold 3).
+        assert_eq!(publishers.len(), 38);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(

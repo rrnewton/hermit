@@ -88,7 +88,6 @@ const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 pub enum CompatMode {
     Strict,
     PortableStrict,
-    Sabre,
     E9patch,
     Rr,
 }
@@ -100,7 +99,6 @@ impl CompatMode {
     pub fn corpus_name(self) -> &'static str {
         match self {
             CompatMode::Strict | CompatMode::PortableStrict => "strict",
-            CompatMode::Sabre => "sabre",
             CompatMode::E9patch => "e9patch",
             CompatMode::Rr => "rr",
         }
@@ -110,7 +108,6 @@ impl CompatMode {
     pub fn display_name(self) -> &'static str {
         match self {
             CompatMode::Strict | CompatMode::PortableStrict => "legacy below-L2 stripped verify",
-            CompatMode::Sabre => "SaBRe legacy below-L2 stripped verify",
             CompatMode::E9patch => "e9patch legacy below-L2 stripped verify",
             CompatMode::Rr => "rr",
         }
@@ -142,16 +139,6 @@ impl CompatMode {
                 s("TMPDIR=/tmp"),
                 s("--"),
             ],
-            CompatMode::Sabre => {
-                vec![
-                    s("--backend"),
-                    s("sabre"),
-                    s("run"),
-                    s("--strict"),
-                    s("--verify"),
-                    s("--"),
-                ]
-            }
             CompatMode::E9patch => {
                 let mut v = vec![s("--backend"), s("e9patch"), s("run")];
                 // These rows query owner names the host may delegate to an async
@@ -244,7 +231,7 @@ impl CompatDisposition {
 /// keeps reading the real tables.
 ///
 /// `Strict` keeps its exemption. `PortableStrict` gains REPORTING ONLY. Every other mode --
-/// `Sabre`, `E9patch`, `Rr` -- consults neither table and gains nothing: a failure there is
+/// `E9patch`, `Rr` -- consults neither table and gains nothing: a failure there is
 /// blocking exactly as before.
 pub fn classify_compat_outcome(
     mode: CompatMode,

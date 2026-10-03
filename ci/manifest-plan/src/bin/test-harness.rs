@@ -5615,8 +5615,9 @@ sys.exit(1 if failed else 0)
         // because the corpus's programs are host-installed (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448).
         // +1 direct for portablecompat.manifest_compat, the corpus-only run
-        // type's bucket, which also runs on the host.
-        assert_eq!((pinned, direct), (19, 18));
+        // type's bucket, which also runs on the host, and +1 for
+        // sabrecompat.manifest_compat, the SaBRe run type's host bucket.
+        assert_eq!((pinned, direct), (19, 19));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -5700,14 +5701,27 @@ sys.exit(1 if failed else 0)
             .filter(|cell| !explicitly.contains_key(*cell))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        // 628 applicable, 624 reported and 4 not until fold 3 of
+        // https://github.com/rrnewton/hermit/issues/3448 gave 212 compat rows a
+        // SaBRe verify cell, which makes their SaBRe parity cell applicable.
+        // e2e.manifest_compat plans the ptrace side of 185 of them. The other
+        // 27 are the rows only the SaBRe run type runs, so no full node plans
+        // either side of their cell; so are the 3 single-image rows
+        // lua-direct, perl-direct and df-direct.
         assert_eq!(
             (applicable.len(), explicitly.len(), unreported.len()),
-            // The same six earlier and three socket cells are reported; four unreported cells stay fixed.
+            // The six earlier and three socket KVM verify enables add nine
+            // applicable cells, all reported.
             // https://github.com/rrnewton/reverie/issues/891
             // The poll-readiness KVM cell is reported too: https://github.com/rrnewton/reverie/issues/620
-            (628 + 6 + 3 + 1, 624 + 6 + 3 + 1, 4),
+            (628 + 6 + 3 + 1 + 215, 624 + 6 + 3 + 1 + 185, 4 + 30),
             "{unreported:?}"
         );
+        let sabre_only = unreported
+            .iter()
+            .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
+            .count();
+        assert_eq!(sabre_only, 30, "{unreported:?}");
     }
 
     #[test]

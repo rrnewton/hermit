@@ -131,12 +131,14 @@ fn build_export_from_inputs(
 
     let mut cells = Vec::new();
     // Keep both source populations: selection by full validation is a separate
-    // fact from whether a comparable cell is present in the manifest.
+    // fact from whether a comparable cell is present in the manifest. A cell
+    // only a focused run type selects (by its label) is still in the manifest.
     for population in [Population::Enabled, Population::Disabled] {
         let selected = manifests.select(&Selection {
             population: Some(population),
             include_occasional: true,
             include_manual: true,
+            all_run_types: true,
             ..Selection::default()
         })?;
         for cell in selected {
@@ -247,6 +249,14 @@ fn cell_metadata(cell: &SelectedCell, selected_by_full: bool) -> Result<CellMeta
             None
         } else if let Some(reason) = configured_selection.reason(&backend) {
             Some(reason.clone())
+        } else if let Some(reason) =
+            crate::runner::focused_run_type_reason(&cell.test, recipe, Some(&backend))
+        {
+            Some(CiDisabledReasonData {
+                result: None,
+                evidence: None,
+                reason,
+            })
         } else if cell.test.occasional {
             Some(CiDisabledReasonData {
                 result: None,

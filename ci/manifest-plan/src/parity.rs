@@ -338,6 +338,10 @@ fn availability(
         }
         let why = if let Some(reason) = selection.reason(side) {
             reason.reason.clone()
+        } else if let Some(reason) =
+            crate::runner::focused_run_type_reason(test, recipe, Some(side))
+        {
+            reason
         } else if test.occasional {
             OCCASIONAL_REASON.to_string()
         } else {
@@ -5099,7 +5103,7 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 2252);
+        assert_eq!(parsed.cells.len(), 2372);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -5131,16 +5135,22 @@ mod tests {
         // strict compatibility programs into the manifest: each declares its
         // verify cell disabled on the four non-ptrace backends, so the census
         // gains 756 cells and no applicable, selectable or selected one.
-        // Six earlier and three socket KVM verify enables add applicable, selectable and selected cells;
-        // the full matrix still has the same 2252 candidate identities.
+        // 2360 (590 per backend) since fold 3 added the 27 rows only the
+        // sabre-compat-only run type runs, and 212 more applicable SaBRe
+        // cells: that run type's verify cells, none selectable or selected.
+        // 2372 (593 per backend) and 3 more applicable SaBRe cells since the
+        // rows lua-direct, perl-direct and df-direct kept the SaBRe corpus's
+        // single-image argv.
+        // Six earlier and three socket KVM verify enables add applicable,
+        // selectable and selected cells without adding candidate identities.
         // https://github.com/rrnewton/reverie/issues/891
         // The poll-readiness KVM verify enable adds one more:
         // https://github.com/rrnewton/reverie/issues/620
         assert_eq!(
             row(&counts.all),
             (
-                2252,
-                628 + 6 + 3 + 1,
+                2372,
+                843 + 6 + 3 + 1,
                 527 + 6 + 3 + 1,
                 194 + 6 + 3 + 1,
                 177 + 6 + 3 + 1
@@ -5154,19 +5164,19 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (563, 85, 26, 16, 2)),
+                ("dbt", (593, 85, 26, 16, 2)),
                 (
                     "kvm",
                     (
-                        563,
+                        593,
                         250 + 6 + 3 + 1,
                         243 + 6 + 3 + 1,
                         77 + 6 + 3 + 1,
                         76 + 6 + 3 + 1
                     )
                 ),
-                ("liteinst", (563, 149, 146, 99, 98)),
-                ("sabre", (563, 144, 112, 2, 1)),
+                ("liteinst", (593, 149, 146, 99, 98)),
+                ("sabre", (593, 359, 112, 2, 1)),
             ]
         );
     }
