@@ -525,11 +525,11 @@ fn accepted_control_sequence(
         compile
             .args(["-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG"])
             .arg("-I")
-            .arg(&source)
+            .arg(source)
             .arg(source.join(name))
             .arg("-o")
             .arg(if driver_ftrace { &driver_object } else { &executable });
-        let compiled = execute_logged_stage(&mut compile, started, &stdout_path, &stderr_path);
+        let compiled = execute_logged_stage(&mut compile, started, stdout_path, stderr_path);
         stages.push(json!({ "name":format!("compile:{name}"), "receipt":compiled }));
         if compiled["passed"] != true {
             receipt = compiled;
@@ -538,20 +538,20 @@ fn accepted_control_sequence(
         if driver_ftrace {
             let mut fence = Command::new("python3");
             fence.arg("-c").arg(DRIVER_FTRACE_IMPORT_FENCE).arg(&driver_object);
-            let checked = execute_logged_stage(&mut fence, started, &stdout_path, &stderr_path);
+            let checked = execute_logged_stage(&mut fence, started, stdout_path, stderr_path);
             stages.push(json!({"name":"fence:driver-ftrace-imports","receipt":checked}));
             if checked["passed"] != true { receipt = checked; break 'sequence; }
             let mut link = Command::new("clang");
             link.arg(&driver_object).arg("-Wl,--no-undefined").arg("-o").arg(&executable);
-            let linked = execute_logged_stage(&mut link, started, &stdout_path, &stderr_path);
+            let linked = execute_logged_stage(&mut link, started, stdout_path, stderr_path);
             stages.push(json!({"name":"link:driver-ftrace-control","receipt":linked}));
             if linked["passed"] != true { receipt = linked; break 'sequence; }
         }
         let tested = execute_logged_stage(
             &mut Command::new(&executable),
             started,
-            &stdout_path,
-            &stderr_path,
+            stdout_path,
+            stderr_path,
         );
         stages.push(json!({ "name":format!("test:{name}"), "receipt":tested }));
         if tested["passed"] != true {
@@ -564,8 +564,8 @@ fn accepted_control_sequence(
                 let tested = execute_logged_stage(
                     Command::new(&executable).arg(selector),
                     started,
-                    &stdout_path,
-                    &stderr_path,
+                    stdout_path,
+                    stderr_path,
                 );
                 stages.push(json!({"name":format!("test:driver-ftrace:{selector}"),"receipt":tested}));
                 if tested["passed"] != true {
