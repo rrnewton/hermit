@@ -7,7 +7,11 @@ write the outputs a harness would. It checks that a cell marked
 HERMIT_E2E_CONTAINER=pinned-root runs the harness only through the wrapper, with the
 bundle at /src/bundle, outputs under the /results mount and a /test workdir, and that a
 missing image, a non-local route or an unknown container value are reported as an
-ERROR rather than run on the host. Nothing here needs podman, /test or capabilities.
+ERROR rather than run on the host. In the container, the private bundle copy's DBT
+client directory gets a link to each library the image's loader (a stand-in ldd)
+resolves outside the bundle, never replacing one the bundle ships, and a library the
+image lacks is an ERROR. The wrapper and the harness each get a deadline that leaves
+the next one out time to stop them. Nothing here needs podman, /test or capabilities.
 
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
@@ -38,7 +42,8 @@ SLUG = "c-programs-cpuid-probe-verify-dbt"
 
 # test-harness, for `run ... --results F --junit F --tpx-json F`: records its argv and
 # the environment cell.sh gives it, then writes one PASS row, its test_done and the
-# verify evidence a passing verify cell must return. HARNESS_ROOT_MAP maps a container
+# verify evidence a passing verify cell must return; FAKE_OUTCOME=FAIL writes a FAIL row and
+# exits 1, as the harness does. HARNESS_ROOT_MAP maps a container
 # path prefix to the host directory behind it, the way the fake wrapper's mounts would.
 FAKE_HARNESS = r"""#!/usr/bin/env python3
 import json, os, sys
@@ -52,8 +57,13 @@ def host(path):
     return path
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS")
+# The client directory the DBT backend would load from: name -> link target, or None.
+rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
+links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
+         for n in sorted(os.listdir(rsrcs))} if os.path.isdir(rsrcs) else None
 with open(os.environ["FAKE_CALLS"], "a") as calls:
-    calls.write(json.dumps({"who": "harness", "argv": args, "env": {k: os.environ.get(k) for k in keys}}) + "\n")
+    calls.write(json.dumps({"who": "harness", "argv": args, "env": {k: os.environ.get(k) for k in keys},
+                            "rsrcs": links}) + "\n")
 # Like hermit, which writes its private verify summary into its working directory (the
 # repository root when no enclosing checkout ignores `ignored/`), and a write through an
 # existing bundle file, which a hard-linked copy would carry back into the bundle.
@@ -83,6 +93,7 @@ with open(os.path.join(celldir, "verify-1.json"), "w") as f:
 for n in (1, 2):
     with open(os.path.join(celldir, "verify-logs", "run%d_log_detlog" % n), "w") as f:
         f.write("detlog\n")
+sys.exit(0 if outcome == "PASS" else 1)
 """
 
 # ci/hermetic/run-in-pinned-root.sh. `--check-image` exits FAKE_IMAGE_RC. A run records
@@ -115,11 +126,51 @@ env = {k: v for k, v in os.environ.items() if k not in forwarded}
 env.update({"E2E_RESULT_ROOT": "/results", "VALIDATE_RUN_STATE": "/validate-run-state",
             "HARNESS_ROOT_MAP": json.dumps(mapping)})
 env.update({k: v for k, v in forwarded.items() if k not in ("E2E_RESULT_ROOT", "VALIDATE_RUN_STATE")})
-# The command is `env NAME=VALUE... timeout ... /src/bundle/bin/test-harness ...`: run it
-# with the container paths of its executable mapped to the host.
-command = [mapping["/src"] + c[len("/src"):] if c.startswith("/src/bundle/bin/") else c for c in command]
+# The command is `sh -c SCRIPT NAME /src/bundle/.../rsrcs env NAME=VALUE... timeout ...
+# /src/bundle/bin/test-harness ...`: run it with the container paths among its arguments
+# mapped to the host.
+command = [mapping["/src"] + c[len("/src"):] if c.startswith("/src/bundle/") else c for c in command]
 sys.exit(subprocess.run(command, env=env).returncode)
 """
+
+
+# ldd, for the DBT client and libdetcore_dbt.so in RSRCS: what the image's loader prints
+# for them, with RSRCS where /src/bundle/hermit/install/rsrcs is, plus FAKE_LDD_EXTRA
+# (a line for the client) and an exit status of FAKE_LDD_RC. Given only the client, it
+# prints only the client's block.
+FAKE_LDD = r"""#!/bin/sh
+d=$(dirname "$1")
+printf '%s:\n' "$1"
+printf '\tlinux-vdso.so.1 (0x00007f68c1e4e000)\n'
+printf '\tlibdrx.so => %s/dynamorio/ext/lib64/release/libdrx.so (0x0000000077000000)\n' "$d"
+printf '\tlibc.so.6 => /nix/store/g-glibc-2.42/lib/libc.so.6 (0x00007f68c1200000)\n'
+printf '\t/nix/store/g-glibc-2.42/lib64/ld-linux-x86-64.so.2 (0x00007f68c1e50000)\n'
+printf '\tlibgcc_s.so.1 => /nix/store/x-libgcc/lib/libgcc_s.so.1 (0x00007f68c1e27000)\n'
+printf '\tlibshipped.so => /nix/store/s-shipped/lib/libshipped.so (0x00007f68c1e00000)\n'
+[ -z "${FAKE_LDD_EXTRA:-}" ] || printf '\t%s\n' "$FAKE_LDD_EXTRA"
+[ -n "${2:-}" ] || exit "${FAKE_LDD_RC:-0}"
+printf '%s:\n' "$2"
+printf '\tlibc.so.6 => /nix/store/g-glibc-2.42/lib/libc.so.6 (0x00007f68c1200000)\n'
+printf '\tlibm.so.6 => /nix/store/g-glibc-2.42/lib/libm.so.6 (0x00007f68c1523000)\n'
+printf '\tlibgcc_s.so.1 => /nix/store/x-libgcc/lib/libgcc_s.so.1 (0x00007f68c1e27000)\n'
+exit "${FAKE_LDD_RC:-0}"
+"""
+
+# timeout: records its argv, then runs the real one.
+FAKE_TIMEOUT = r"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_CALLS"], "a") as f:
+    f.write(json.dumps({"who": "timeout", "argv": sys.argv[1:]}) + "\n")
+os.execv("/usr/bin/timeout", ["timeout"] + sys.argv[1:])
+"""
+
+# The links the container's image libraries get in the private copy's client directory.
+IMAGE_LINKS = {
+    "libc.so.6": "/nix/store/g-glibc-2.42/lib/libc.so.6",
+    "libm.so.6": "/nix/store/g-glibc-2.42/lib/libm.so.6",
+    "ld-linux-x86-64.so.2": "/nix/store/g-glibc-2.42/lib64/ld-linux-x86-64.so.2",
+    "libgcc_s.so.1": "/nix/store/x-libgcc/lib/libgcc_s.so.1",
+}
 
 
 def write_exe(path: Path, text: str) -> None:
@@ -136,7 +187,12 @@ class CellTest(unittest.TestCase):
         write_exe(self.bundle / "bin" / "test-harness", FAKE_HARNESS)
         write_exe(self.bundle / "src" / "ci" / "hermetic" / "run-in-pinned-root.sh", FAKE_WRAPPER)
         (self.bundle / "build").mkdir()
-        (self.bundle / "hermit" / "install").mkdir(parents=True)
+        rsrcs = self.bundle / "hermit" / "install" / "rsrcs"
+        rsrcs.mkdir(parents=True)
+        for lib in ("libreverie_dbt_client.so", "libdetcore_dbt.so", "libshipped.so"):
+            (rsrcs / lib).write_text(lib + "\n")
+        write_exe(self.tmp / "image-bin" / "ldd", FAKE_LDD)
+        write_exe(self.tmp / "image-bin" / "timeout", FAKE_TIMEOUT)
         (self.bundle / "hermit" / "hermit").write_text("hermit\n")
         (self.bundle / "run-state").mkdir()
         (self.bundle / "SOURCE_SHA").write_text("a" * 40 + "\n")
@@ -149,7 +205,7 @@ class CellTest(unittest.TestCase):
         annotations = self.tmp / "tpx" / "annotations"
         shutil.rmtree(self.tmp / "tpx", ignore_errors=True)
         base = {
-            "PATH": os.environ["PATH"],
+            "PATH": f"{self.tmp / 'image-bin'}:{os.environ['PATH']}",
             "HOME": str(self.tmp),
             "TEST_RESULT_ARTIFACTS_DIR": str(artifacts),
             "TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR": str(annotations),
@@ -198,7 +254,8 @@ class CellTest(unittest.TestCase):
         self.assertEqual(wrapper["forwarded"]["E2E_PARITY_POST_PASS"], "0")
         self.assertNotIn("E2E_BUILD_ROOT", wrapper["forwarded"],
                          "the wrapper would replace E2E_BUILD_ROOT with /src/target/e2e-build")
-        self.assertEqual(command[0], "env")
+        self.assertEqual(command[:2], ["sh", "-c"])
+        self.assertEqual(command[3:6], ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
         for assignment in ("E2E_BUILD_ROOT=/src/bundle/build", "HERMIT_BIN=/src/bundle/hermit/hermit",
                            "HERMIT_INSTALL_DIR=/src/bundle/hermit/install"):
             self.assertIn(assignment, command)
@@ -214,6 +271,11 @@ class CellTest(unittest.TestCase):
         self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
         self.assertEqual(harness["env"]["E2E_RESULT_ROOT"], "/results")
         self.assertEqual(harness["env"]["E2E_BUILD_ROOT"], "/src/bundle/build")
+        # The image's libc, libm, libgcc_s and its ld.so, from the same glibc, beside the
+        # client; nothing for the vdso, a library the bundle resolves itself, or one it ships.
+        expected = dict(IMAGE_LINKS, **{n: None for n in ("libreverie_dbt_client.so", "libdetcore_dbt.so",
+                                                          "libshipped.so")})
+        self.assertEqual(harness["rsrcs"], expected)
         self.assertEqual(result["container"], "pinned-root")
         self.assertEqual(result["container_reason"], "dbt backend: needs CAP_SYS_ADMIN")
         self.assertEqual(result["empty_workdir"], "HERMIT_E2E_EMPTY_WORKDIR=/test")
@@ -225,11 +287,38 @@ class CellTest(unittest.TestCase):
                          "a write in the container reached the bundle: the copy shares its inodes")
         self.assertEqual(list(self.tmp.joinpath("tpx").glob("hermit-cell.*")), [], "scratch left behind")
 
+    def test_library_missing_from_the_image_is_an_error(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                     FAKE_LDD_EXTRA="libzstd.so.1 => not found")
+        self.assert_error(done, "harness rc=125")
+        stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
+        self.assertIn("the pinned-root image has no libzstd.so.1, which the DBT client needs", stderr)
+        self.assertEqual(result["harness_rc"], 125)
+
+    def test_ldd_failure_is_an_error(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_LDD_RC="1")
+        self.assert_error(done)
+        self.assertNotEqual(result["harness_rc"], 0)
+
+    def test_harness_deadline_leaves_the_wrapper_time_to_stop(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", CELL_DEADLINE_S="100")
+        self.assertEqual(done["status"], "passed", done)
+        # The first bounds the wrapper, the second, run in the container, the harness.
+        wrapper_timeout, harness_timeout = [c["argv"] for c in self.calls_by("timeout")]
+        self.assertEqual(wrapper_timeout[:1], ["--kill-after=10"], wrapper_timeout)
+        self.assertTrue(wrapper_timeout[2].endswith("/run-in-pinned-root.sh"), wrapper_timeout)
+        outer = int(wrapper_timeout[1])
+        self.assertTrue(85 <= outer <= 100, f"the wrapper may run {outer} s of a 100 s deadline")
+        self.assertEqual(harness_timeout[:2], ["--kill-after=10", str(outer - 15)], harness_timeout)
+        self.assertTrue(harness_timeout[2].endswith("/bin/test-harness"), harness_timeout)
+        self.assertEqual(result["deadline_s"], outer - 15)
+
     def test_pinned_root_failure_is_reported(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_OUTCOME="FAIL")
         self.assertEqual(done["status"], "failed")
         self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
         self.assertEqual(result["outcome"], "FAIL")
+        self.assertEqual(result["harness_rc"], 1, "the harness's own exit status must reach the result")
 
     def test_missing_image_is_an_error_not_a_host_run(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_IMAGE_RC="2")
