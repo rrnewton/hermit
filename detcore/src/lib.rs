@@ -35,6 +35,23 @@
 #![deny(clippy::all)]
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
+// On the Narf kernel target (`x86_64-unknown-none`) Detcore is built without
+// std: detcore-std stands in for `std` and detcore-libc for `libc`, and what
+// needs an operating system is left out. scripts/check-detcore-nostd.sh
+// checks that build.
+#![cfg_attr(target_os = "none", no_std)]
+#![cfg_attr(target_os = "none", feature(if_let_guard, prelude_import))]
+#![cfg_attr(target_os = "none", allow(internal_features))]
+
+#[cfg(target_os = "none")]
+#[macro_use]
+extern crate detcore_std as std;
+#[cfg(target_os = "none")]
+extern crate detcore_libc as libc;
+#[cfg(target_os = "none")]
+#[prelude_import]
+#[allow(unused_imports)]
+use std::prelude::rust_2024::*;
 
 mod config;
 mod consts;

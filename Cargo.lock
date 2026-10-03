@@ -524,6 +524,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "detcore-libc"
+version = "0.2.0"
+dependencies = [
+ "reverie-core",
+]
+
+[[package]]
 name = "detcore-model"
 version = "0.2.0"
 dependencies = [
@@ -555,6 +562,16 @@ dependencies = [
  "reverie-sabre",
  "reverie-syscalls",
  "syscalls",
+]
+
+[[package]]
+name = "detcore-std"
+version = "0.2.0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "libm",
+ "serde",
+ "spin",
 ]
 
 [[package]]
@@ -903,6 +920,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash",
+ "serde",
 ]
 
 [[package]]
@@ -2230,6 +2248,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "stable_deref_trait"
