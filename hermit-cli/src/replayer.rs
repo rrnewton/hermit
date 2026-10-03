@@ -440,7 +440,7 @@ impl Tool for Replayer {
                 Ok(self.handle_write_family(guest, syscall.into()).await?)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#3590)
+            // TODO-HUMAN-REVIEW(#3598)
             Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
                 self.handle_simple(guest, syscall).await
             }
@@ -464,7 +464,7 @@ impl Tool for Replayer {
             Syscall::Openat2(call) => self.handle_openat2(guest, call).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#3590)
+            // TODO-HUMAN-REVIEW(#3598)
             Syscall::Chdir(_) => self.handle_chdir(guest, syscall).await,
             Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
             Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
@@ -1606,7 +1606,7 @@ impl Replayer {
             Syscall::Mknodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchownat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchmodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
-            // TODO-HUMAN-REVIEW(#3590): the legacy forms resolve relative
+            // TODO-HUMAN-REVIEW(#3598): the legacy forms resolve relative
             // paths against the working directory, like AT_FDCWD.
             Syscall::Rename(_)
             | Syscall::Link(_)
@@ -1684,7 +1684,7 @@ impl Replayer {
         recorded
     }
 
-    // TODO-HUMAN-REVIEW(#3590)
+    // TODO-HUMAN-REVIEW(#3598)
     /// Replay `chdir(2)` from its recorded result, and move the replay
     /// process's working directory along with it when the target exists in the
     /// replay chroot, so later `AT_FDCWD`-relative replay mutations land in the

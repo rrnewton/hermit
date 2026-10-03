@@ -840,7 +840,7 @@ impl Recorder {
         result
     }
 
-    // TODO-HUMAN-REVIEW(#3590)
+    // TODO-HUMAN-REVIEW(#3598)
     /// Records the path `getcwd` copied out. The raw syscall returns the
     /// length including the terminating NUL, so the recorded bytes include it.
     pub(super) async fn handle_getcwd<G: Guest<Self>>(

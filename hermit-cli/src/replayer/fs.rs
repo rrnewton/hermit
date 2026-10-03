@@ -1172,7 +1172,7 @@ impl Replayer {
         Ok(buf.len() as i64)
     }
 
-    // TODO-HUMAN-REVIEW(#3590)
+    // TODO-HUMAN-REVIEW(#3598)
     /// Writes back the recorded working directory, including its NUL, without
     /// asking the replay process, whose working directory lives in the replay
     /// chroot rather than the recording's namespace.
