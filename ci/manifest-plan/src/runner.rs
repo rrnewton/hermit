@@ -3223,7 +3223,15 @@ fn resolve_repo_guest_args(root: &Path, argv: &mut [String]) {
         if path.is_absolute() || arg == "." || arg == ".." {
             continue;
         }
-        let resolved = root.join(path);
+        // `./examples/x` names the same file as `examples/x`. Joining it
+        // verbatim leaves `<root>/./examples/x` in the recorded command, and
+        // the retained-evidence renderer rightly refuses a `.` component after
+        // a provenance root (validate_cell_results.rs), so drop it here.
+        let resolved = root.join(
+            path.components()
+                .filter(|component| !matches!(component, Component::CurDir))
+                .collect::<PathBuf>(),
+        );
         let looks_like_repo_path = arg.starts_with("./") || arg.contains('/') || resolved.is_file();
         if looks_like_repo_path && resolved.exists() {
             *arg = resolved.to_string_lossy().into_owned();
@@ -10920,6 +10928,8 @@ backends_disabled:
             "README.md".into(),
             ".".into(),
             "missing/path".into(),
+            "./README.md".into(),
+            "./tests/./e2e".into(),
         ];
         resolve_repo_guest_args(&root, &mut argv);
         assert_eq!(argv[0], "tool");
@@ -10927,6 +10937,10 @@ backends_disabled:
         assert_eq!(argv[2], root.join("README.md").to_string_lossy());
         assert_eq!(argv[3], ".");
         assert_eq!(argv[4], "missing/path");
+        // The manifests spell six repo paths `./examples/...`; the resolved
+        // path must carry no `.` component after the root.
+        assert_eq!(argv[5], root.join("README.md").to_string_lossy());
+        assert_eq!(argv[6], root.join("tests/e2e").to_string_lossy());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -10963,8 +10977,9 @@ backends_disabled:
                     .join("literal.txt")
                     .to_string_lossy()
                     .into_owned(),
+                // `./literal.txt` resolves without its `.` component.
                 root.as_path()
-                    .join("./literal.txt")
+                    .join("literal.txt")
                     .to_string_lossy()
                     .into_owned(),
                 original[3].clone(),

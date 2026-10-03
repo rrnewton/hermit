@@ -379,10 +379,89 @@ publisher and verifier inventory every entry of a runtime closure, including
 directories and special files, and refuse any special file in a complete
 bundle, which its regular-file manifest could not bind.
 
+### Buck as the E2E runner
+
+A second, independent opt-in changes who runs the E2E cells, not which binary
+they test:
+
+```sh
+./scripts/validate.rs full --e2e-runner buck-hybrid \
+  --buck2 ~/.config/hermit/buck2.dotslash
+```
+
+`--e2e-runner` takes `cargo` (the default), `buck-local` (every cell runs on
+this host) or `buck-hybrid` (cells routed to remote execution run there, the
+rest locally). A Buck runner is accepted only for the complete `full` level,
+never with `--only`, `--selected` or `--buck-release`, and only with `--buck2`
+naming an absolute, executable, non-symlink file. That file is the host's own
+Buck2 launcher. Remote execution needs an internal Buck2 build, whose DotSlash
+descriptor is **never committed** to this repository: keep it outside the
+checkout (for example `~/.config/hermit/buck2.dotslash`) and pass its path.
+Nothing is inferred from ambient environment, and nothing falls back to Cargo.
+
+The plan is the committed `full` plan with the `full-buck-e2e` label swapped
+in (`buck_e2e_selection` in `ci/manifest-plan/src/validation_dag.rs`): the 16
+Cargo E2E bucket nodes, the compatibility scorecard and the five nodes that
+only fed them leave the plan, and `e2e.buck_cells` plus one `<bucket>_buck`
+import twin per bucket and `full-scorecard.compatibility_buck` take their
+place. `e2e.buck_cells` (`ci/buck-e2e/validate-node`) regenerates the
+third-party rules, stages the remote-execution inputs for `buck-hybrid`,
+builds the inputs Buck does not build yet with Cargo
+(`ci/buck-e2e/stage --from-cargo`), and runs every cell with
+`-c hermit_e2e.hermit=staged`. Each twin then judges its bucket's rows with the
+same `test-harness run` verdict as the Cargo bucket, reading them through
+`E2E_IMPORT_RESULTS`.
+
+One ordering difference follows. In the Cargo plan, eight nodes run before the
+E2E buckets, directly or through `compatprep.fixtures`: `check.dbt_runtime_abi`,
+`doc.doctests`, `doc.rustdoc`, `lint.clippy`, `test.detcore_unit`,
+`test.hermit_unit`, `test.regular_crates` and `test.rr_suite_contract`. In the
+Buck plan nothing waits for them. They still run, and a failure still fails the
+validation, but the Buck cells no longer wait on them, so a failure among them
+no longer stops the cells early.
+
+The cells therefore test the Cargo-built validate-profile
+`target/validate/hermit`, which `ci/buck-e2e/stage --from-cargo` builds on the
+host in the checkout's `target/`, with the same debug assertions and overflow
+checks as a Cargo-runner run. The ledger row records `release_builder: cargo`,
+the Cargo `e2e_payload` identity unchanged, and `e2e_runner` (`cargo`,
+`buck-local` or `buck-hybrid`). A Buck-runner request is never answered from the
+tree cache, and a Buck-runner row never answers a cargo request: the cache reads
+`e2e_runner` as well as the payload. The host prerequisites below apply, and
+`HERMIT_GIT_DEP_MIRRORS` must be set in the validation's environment when the
+proxy refuses GitHub to Reindeer.
+
+## Host prerequisites for Buck validation
+
+The Buck E2E flow (`shim/modes/stage-re-inputs`, `ci/buck-e2e/stage`, then
+`ci/buck-e2e/run`) copies some host libraries and tools into its inputs rather
+than building them. On CentOS Stream 9 or Fedora:
+
+```sh
+sudo dnf install -y libunwind-devel xz-devel cmake patchelf binutils podman
+```
+
+| Package | Needed by | For |
+|---|---|---|
+| `libunwind-devel` | `stage-re-inputs`, `stage` | the libunwind link inputs remote actions link against, and the runtime closure shipped beside the staged `hermit` |
+| `xz-devel` | `stage-re-inputs` | `liblzma`, which `//hermit-cli:hermit-release` links on remote execution |
+| `cmake` | `stage` | the host Cargo build of `reverie-dbt`, which builds DynamoRIO (remote actions use the pinned cmake wheel `stage-re-inputs` stages instead) |
+| `patchelf` | `stage` | the `DT_RPATH` through which the staged `hermit` finds the libunwind closure beside it |
+| `binutils` | `stage` | `strip` for the staged harness, and `readelf`, with which `ci/publish-hermit-e2e-artifact.sh` checks the staged `hermit`'s runtime closure |
+| `podman` | `ci/buck-e2e/cell.sh` | privileged-lane, pinned-root-only and local DBT cells, which run inside `ci/hermetic/run-in-pinned-root.sh` exactly as the Cargo flow runs them |
+
+Those cells also need the pinned root image: build it once with
+`ci/hermetic/build-image.sh`. Without it they fail with `pinned-root image
+unavailable`; they never fall back to running on the host. A missing package
+stops `stage-re-inputs` or `stage` before anything is built, with a message
+naming the package; nothing downloads a substitute. `stage-re-inputs`
+downloads its pinned cmake wheel from `files.pythonhosted.org`, so on a Meta
+host run it under `with-proxy`.
+
 ## On a Meta host
 
-A Meta devserver needs five things the steps above do not mention. All five are
-host facts rather than repository defects; a machine with direct internet
+A Meta devserver needs the following, which the steps above do not mention. All
+are host facts rather than repository defects; a machine with direct internet
 access and no internal `dotslash` needs none of them.
 
 **Every network-touching command needs `with-proxy`** — the clone, the
@@ -429,6 +508,34 @@ CARGO_HTTP_CAINFO=/etc/pki/tls/certs/ca-bundle.crt \
 CARGO_HTTP_PROXY=http://fwdproxy:8080 \
   ./bootstrap/regenerate-rust-deps
 ```
+
+**A proxy that refuses `github.com` to the build needs local git mirrors.**
+`Cargo.lock` locks some crates to git commits (`rust-shed`, `liteinst2` and
+`reverie` today), and Reindeer's Cargo fetches them from GitHub even when the
+host's `~/.cargo/git` already holds them. If the proxy refuses that fetch
+(`CONNECT tunnel failed, response 403`), mirror each source with whatever
+route does reach GitHub, then point `HERMIT_GIT_DEP_MIRRORS` at the directory:
+
+```sh
+mirrors=~/.cache/hermit-git-mirrors
+mkdir -p "$mirrors"
+for url in $(sed -n 's/^source = "git+\([^?#"]*\).*/\1/p' Cargo.lock | sort -u); do
+  name=${url##*/}
+  with-proxy git clone --mirror "$url" "$mirrors/${name%.git}.git"
+done
+HERMIT_GIT_DEP_MIRRORS=$mirrors \
+CARGO_HTTP_CAINFO=/etc/pki/tls/certs/ca-bundle.crt \
+CARGO_HTTP_PROXY=http://fwdproxy:8080 \
+  ./bootstrap/regenerate-rust-deps
+```
+
+Each mirror is named after its URL's last component without `.git`, plus
+`.git`. Once the variable is set, every git source must come from it:
+`regenerate-rust-deps` refuses a missing mirror, or one that lacks a commit
+`Cargo.lock` pins, before Reindeer runs, and prints the `git clone` or `git
+fetch` that fixes it. Because each source is pinned to a commit, a mirror
+changes only where the objects come from, never what is built. After a
+`Cargo.lock` change, `git -C <mirror> fetch` brings a mirror up to date.
 
 ## Pinned versions
 

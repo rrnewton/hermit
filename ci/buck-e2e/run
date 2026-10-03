@@ -17,7 +17,8 @@
 #           fetches the results with testx ($TESTX, else testx on PATH).
 #   --no-verdict  stop after ingesting: leave the rows in IMPORT_DIR unjudged, for a caller
 #           that judges them itself (`test-harness run` in import mode, as verdict.py does),
-#           and exit 0 whatever the cells' verdicts are. No validation-DAG node does this yet.
+#           and exit 0 whatever the cells' verdicts are. The validation DAG's e2e.buck_cells node
+#           (ci/buck-e2e/validate-node) does this; its <bucket>_buck import twins judge.
 #
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
