@@ -1759,10 +1759,11 @@ impl Replayer {
     /// state may differ from the recording's. A set therefore runs without
     /// XATTR_CREATE or XATTR_REPLACE: whatever was there, the attribute ends up
     /// holding the recorded value. A removal ends in the recorded state whether
-    /// it removes the attribute or finds none (ENODATA). Any other failure,
-    /// such as another filesystem refusing the value, leaves the replay root
-    /// short of the recorded state and is reported; a later live call that
-    /// depends on it then diverges loudly in its own handler.
+    /// it removes the attribute or finds none (ENODATA). As for other path
+    /// mutations, a path absent from the replay root (ENOENT, ENOTDIR) or a
+    /// read-only one (EROFS) keeps the change virtual: no later live call can
+    /// reach it there either. Any other failure would leave the replay root
+    /// short of the recorded state, so replay refuses to continue.
     async fn handle_xattr_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1790,11 +1791,12 @@ impl Replayer {
             match guest.inject_with_retry(live_call).await {
                 Ok(_) => {}
                 Err(Errno::ENODATA) if is_removal => {}
-                Err(error) => tracing::warn!(
-                    ?syscall,
-                    %error,
-                    "replay root could not take the recorded xattr change"
-                ),
+                Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
+                    tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
+                }
+                Err(error) => {
+                    panic!("replay root could not take recorded xattr change {syscall:?}: {error}")
+                }
             }
         }
         recorded

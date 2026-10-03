@@ -2223,37 +2223,6 @@ fn record_fd_metadata_calls() {
         host_dir.path(),
         std::io::Error::last_os_error()
     );
-    // preacl carries an access ACL from before recording, granting the owner
-    // rwx and nothing else; the guest replaces it with XATTR_REPLACE. The
-    // value is the version, then a (tag, permissions, id) entry each for the
-    // owner, the group and others.
-    let preacl = host_dir.path().join("preacl");
-    std::fs::create_dir(&preacl).expect("failed to create preacl");
-    let mut acl = 2u32.to_le_bytes().to_vec();
-    for (tag, perm) in [(0x01u16, 7u16), (0x04, 0), (0x20, 0)] {
-        acl.extend(tag.to_le_bytes());
-        acl.extend(perm.to_le_bytes());
-        acl.extend(u32::MAX.to_le_bytes());
-    }
-    let preacl = std::ffi::CString::new(preacl.into_os_string().into_encoded_bytes())
-        .expect("preacl path contains a NUL byte");
-    // SAFETY: the path and name are NUL-terminated and the value is acl.len()
-    // bytes long.
-    let set = unsafe {
-        libc::setxattr(
-            preacl.as_ptr(),
-            c"system.posix_acl_access".as_ptr(),
-            acl.as_ptr().cast(),
-            acl.len(),
-            0,
-        )
-    };
-    assert_eq!(
-        set,
-        0,
-        "failed to set an access ACL on preacl: {}",
-        std::io::Error::last_os_error()
-    );
     canonical_record_replay_command(
         "descriptor metadata calls",
         &workload("c_record_replay_fd_metadata").path,

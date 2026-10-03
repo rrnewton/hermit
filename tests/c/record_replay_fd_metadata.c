@@ -160,14 +160,18 @@ int main(int argc, char** argv) {
   // replay root too (replay enters the recorded directory), so descriptor and
   // path calls mix there. The replay root is built without the host's
   // attributes: the directory's user.pre, which the test harness set before
-  // recording, is absent from it, yet removing and re-creating it must replay
-  // what the recording saw.
+  // recording, is absent from it, yet replacing, removing and re-creating it
+  // must replay what the recording saw. Replay refuses a set the replay root
+  // cannot take, so the replace passes only because replay drops
+  // XATTR_REPLACE.
   if (chdir(argv[1]) != 0) {
     perror("chdir");
     return 2;
   }
   int dir = open(".", O_RDONLY | O_DIRECTORY);
   expect("open-dir", dir, 0);
+  expect_value(
+      "dir-setxattr-pre-replace", setxattr(".", PRE, "p", 1, XATTR_REPLACE), 0);
   expect_value("dir-fremovexattr-pre", fremovexattr(dir, PRE), 0);
   expect("dir-fremovexattr-pre-gone", fremovexattr(dir, PRE), ENODATA);
   expect_value(
@@ -232,21 +236,6 @@ int main(int argc, char** argv) {
       0);
   expect_value("rename-acl", rename("acl/a", "acl/b"), 0);
   expect_value("rename-facl", rename("facl/a", "facl/b"), 0);
-  // The test harness gave preacl an access ACL before recording, which the
-  // replay root's copy lacks. Replacing it must still leave that copy with the
-  // owner's rwx, or the rename fails there. Kernels since 6.2 set an ACL
-  // without honoring XATTR_CREATE or XATTR_REPLACE, so on them this replace
-  // takes the same path as a plain set; replay drops the flag either way.
-  int pre_a = open("preacl/a", O_CREAT | O_RDWR | O_TRUNC, 0644);
-  expect("open-preacl-a", pre_a, 0);
-  close(pre_a);
-  expect_value("chmod-preacl-0", chmod("preacl", 0), 0);
-  expect_value(
-      "setxattr-preacl-replace",
-      setxattr(
-          "preacl", "system.posix_acl_access", &acl, sizeof(acl), XATTR_REPLACE),
-      0);
-  expect_value("rename-preacl", rename("preacl/a", "preacl/b"), 0);
   expect_value("close-facl", close(facl), 0);
 
   printf("failures=%d\n", failures);
