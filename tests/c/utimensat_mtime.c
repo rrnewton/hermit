@@ -71,10 +71,12 @@ static void set_mtime(const char* path, long sec, long nsec) {
   }
 }
 
-// Calls utimensat with the stack pointer 64 bytes above an unmapped page, so
-// that Hermit has no scratch space below it for its own bookkeeping, and
-// returns the raw result. The kernel itself does not touch the stack.
-static long utimensat_on_short_stack(const char* path, const struct timespec* times) {
+// Makes a raw syscall with the stack pointer 192 bytes above an unmapped page
+// and returns its result. Below the 128-byte red zone that leaves Hermit 64
+// bytes of scratch space: enough to stage the 32-byte times of raw utime and
+// utimes(NULL), as before the virtual mtime update existed, but not enough for
+// the update's stat buffer. The kernel itself does not touch the stack.
+static long syscall_on_short_stack(long nr, long a1, long a2, long a3, long a4) {
   long page = sysconf(_SC_PAGESIZE);
   char* map =
       mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -82,8 +84,8 @@ static long utimensat_on_short_stack(const char* path, const struct timespec* ti
     perror("short stack");
     exit(2);
   }
-  char* sp = map + page + 64;
-  register long flags __asm__("r10") = 0;
+  char* sp = map + page + 192;
+  register long r10 __asm__("r10") = a4;
   long ret;
   __asm__ volatile(
       "mov %%rsp, %%r12\n\t"
@@ -91,11 +93,11 @@ static long utimensat_on_short_stack(const char* path, const struct timespec* ti
       "syscall\n\t"
       "mov %%r12, %%rsp"
       : "=a"(ret)
-      : "0"((long)SYS_utimensat),
-        "D"((long)AT_FDCWD),
-        "S"(path),
-        "d"(times),
-        "r"(flags),
+      : "0"(nr),
+        "D"(a1),
+        "S"(a2),
+        "d"(a3),
+        "r"(r10),
         [sp] "r"(sp)
       : "rcx", "r11", "r12", "memory");
   munmap(map + page, page);
@@ -181,12 +183,24 @@ int main(void) {
     failures++;
   }
 
-  // Hermit's bookkeeping must not keep the call from reaching Linux when the
+  // Hermit's bookkeeping must not keep a call from reaching Linux when the
   // guest's stack has no room for it.
   struct timespec short_stack[2] = {{0, UTIME_OMIT}, {EARLY + 6, 13}};
-  long ret = utimensat_on_short_stack("a", short_stack);
+  long ret = syscall_on_short_stack(
+      SYS_utimensat, AT_FDCWD, (long)"a", (long)short_stack, 0);
   if (ret != 0) {
     fprintf(stderr, "utimensat on a short stack returned %ld\n", ret);
+    failures++;
+  }
+  struct utimbuf short_utime = {.actime = EARLY, .modtime = EARLY + 6};
+  ret = syscall_on_short_stack(SYS_utime, (long)"a", (long)&short_utime, 0, 0);
+  if (ret != 0) {
+    fprintf(stderr, "raw utime on a short stack returned %ld\n", ret);
+    failures++;
+  }
+  ret = syscall_on_short_stack(SYS_utimes, (long)"b", 0, 0, 0);
+  if (ret != 0) {
+    fprintf(stderr, "raw utimes(NULL) on a short stack returned %ld\n", ret);
     failures++;
   }
 
