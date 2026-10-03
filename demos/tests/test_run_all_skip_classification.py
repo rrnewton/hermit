@@ -19,10 +19,15 @@ SAVED. The sweep records such a demo as UNCOMPARED, exits 3 as for a skip, and
 never reports it as passed. It also sets QEMU_BOOT_REPEAT=1 and
 QEMU_RESUME_REPEAT=1, so that a demo with no reference run runs a second time
 and compares.
+
+Exit 0 alone is not a pass either: a demo passes only when its own last result
+line, `=== Demo N: <title>: SUCCESS ===` with N its own number, says SUCCESS. A
+demo that exits 0 without that line is recorded as FAIL.
 """
 
 import collections
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -167,6 +172,50 @@ echo "=== Demo 5: QEMU Linux Snapshot: SUCCESS ==="
 exit 0
 """
 
+# Exits 0 and prints nothing: a demo that stopped before it reached a result.
+SILENT_DEMO = """#!/usr/bin/env bash
+exit 0
+"""
+
+# Exits 0 after printing ordinary output but no result line.
+DEMO_WITH_OUTPUT_BUT_NO_RESULT_LINE = """#!/usr/bin/env bash
+echo "=== Demo 3: Chaos Concurrency Testing ==="
+echo "PASS: something that is not the demo's result"
+exit 0
+"""
+
+# Exits 0 after printing a PARTIAL result line: it did not succeed.
+PARTIAL_DEMO_THAT_EXITS_0 = """#!/usr/bin/env bash
+echo "=== Demo 6: QEMU Snapshot Resume: PARTIAL ==="
+exit 0
+"""
+
+# Exits 0 after only demo 5's result lines. make runs demo 5 first when demos 6
+# and 7 need its boot snapshot, so their logs can hold demo 5's lines.
+DEMO_THAT_PRINTS_ONLY_ANOTHER_DEMOS_SUCCESS = """#!/usr/bin/env bash
+echo "=== Demo 5: QEMU Linux Snapshot: SUCCESS ==="
+exit 0
+"""
+
+# Exits 0 after only demo 5's FIRST RUN SAVED line, run first for its boot
+# snapshot: the demo itself printed no result, so it did not succeed, and the
+# first run it reports is demo 5's, not its own.
+DEMO_THAT_PRINTS_ONLY_ANOTHER_DEMOS_FIRST_RUN = """#!/usr/bin/env bash
+echo "=== Demo 5: QEMU Linux Snapshot: FIRST RUN SAVED ==="
+exit 0
+"""
+
+# Demo 5 runs first and saves, then compares; then the demo itself succeeds.
+DEMO_THAT_SUCCEEDS_AFTER_DEMO_5_RAN_FIRST = """#!/usr/bin/env bash
+echo "=== Demo 5: QEMU Linux Snapshot: FIRST RUN SAVED ==="
+echo "=== Demo 5: QEMU Linux Snapshot: SUCCESS ==="
+case "${@: -1}" in
+  demo6) echo "=== Demo 6: QEMU Snapshot Resume: SUCCESS ===" ;;
+  demo7) echo "=== Demo 7: drgn Kernel Task Evolution: SUCCESS ===" ;;
+esac
+exit 0
+"""
+
 # Stands in for grep on PATH. It fails as grep does when it cannot read a file,
 # but only when searching for result lines (the pattern names FIRST RUN SAVED);
 # every other call goes to the real grep, whose path replaces REAL_GREP.
@@ -183,6 +232,43 @@ exec REAL_GREP "$@"
 """
 
 Sweep = collections.namedtuple("Sweep", "result summary calls")
+
+
+def real_success_lines():
+    """Return {N: the success line demo N prints}, read from the demo's source.
+
+    Demos 1-4 set DEMO_LABEL in run.sh and print it with common.sh's
+    demo_success; demos 5 and 6 set DEMO_LABEL in run.py and print
+    `=== {label}: {result} ===`; demos 7-9 echo the line literally. The value
+    is None when the line cannot be found, so a caller fails rather than check
+    fewer demos.
+    """
+    lines = {}
+    for directory in sorted((ROOT / "demos").glob("[0-9][0-9]-*")):
+        number = int(directory.name[:2])
+        run_sh = directory / "run.sh"
+        run_py = directory / "run.py"
+        shell = run_sh.read_text() if run_sh.is_file() else ""
+        python = run_py.read_text() if run_py.is_file() else ""
+        label_pattern = r'^DEMO_LABEL ?= ?"(Demo {}: [^"\n]+)"$'.format(number)
+        shell_label = re.search(label_pattern, shell, re.M)
+        python_label = re.search(label_pattern, python, re.M)
+        literal = re.search(
+            r'^echo "(=== Demo {}: [^"\n]+: SUCCESS ===)"$'.format(number),
+            shell,
+            re.M,
+        )
+        line = None
+        if shell_label is not None and re.search(r"^demo_success$", shell, re.M):
+            line = "=== {}: SUCCESS ===".format(shell_label.group(1))
+        elif python_label is not None and (
+            '=== {}: {} ===".format(DEMO_LABEL, result)' in python
+        ):
+            line = "=== {}: SUCCESS ===".format(python_label.group(1))
+        elif literal is not None:
+            line = literal.group(1)
+        lines[number] = line
+    return lines
 
 
 class RunAllSkipClassificationTest(unittest.TestCase):
@@ -313,6 +399,107 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertEqual(self._statuses(summary), ["FAIL"])
         self.assertEqual(result.returncode, 1)
         self.assertIn("1 demo(s) failed", result.stdout)
+
+    def assertExitZeroWithoutSuccessFails(self, sweep, demo):
+        self.assertEqual(sweep.calls, [demo])
+        self.assertIsNotNone(sweep.summary, sweep.result.stdout)
+        self.assertEqual(self._statuses(sweep.summary), ["FAIL"])
+        # The row keeps the demo's real exit status, 0.
+        row = sweep.summary.strip().splitlines()[1].split("\t")
+        self.assertEqual(row[2], "0", sweep.summary)
+        self.assertEqual(sweep.result.returncode, 1, sweep.result.stdout)
+        self.assertIn(
+            '=== {}: FAIL (exit 0 without its own "=== Demo {}: <title>: '
+            'SUCCESS ===" line'.format(demo, demo[len("demo") :]),
+            sweep.result.stdout,
+        )
+        self.assertIn(
+            "Demo suite: FAILURE — 1 demo(s) failed, 0 passed, 0 skipped",
+            sweep.result.stdout,
+        )
+        self.assertNeverAPassOrSuccess(sweep)
+        self.assertNotIn("INCOMPLETE", sweep.result.stdout)
+
+    def test_a_demo_that_exits_0_silently_fails(self):
+        sweep = self._run(SILENT_DEMO, target="demo3")
+        self.assertExitZeroWithoutSuccessFails(sweep, "demo3")
+
+    def test_output_without_a_result_line_is_not_a_pass(self):
+        sweep = self._run(DEMO_WITH_OUTPUT_BUT_NO_RESULT_LINE, target="demo3")
+        self.assertExitZeroWithoutSuccessFails(sweep, "demo3")
+
+    def test_a_partial_result_that_exits_0_is_not_a_pass(self):
+        sweep = self._run(PARTIAL_DEMO_THAT_EXITS_0, target="demo6")
+        self.assertExitZeroWithoutSuccessFails(sweep, "demo6")
+
+    def test_another_demos_success_line_is_not_a_pass(self):
+        sweep = self._run(DEMO_THAT_PRINTS_ONLY_ANOTHER_DEMOS_SUCCESS, target="demo7")
+        self.assertExitZeroWithoutSuccessFails(sweep, "demo7")
+
+    def test_another_demos_first_run_is_not_the_demos_result(self):
+        sweep = self._run(
+            DEMO_THAT_PRINTS_ONLY_ANOTHER_DEMOS_FIRST_RUN, target="demo7"
+        )
+        self.assertExitZeroWithoutSuccessFails(sweep, "demo7")
+
+    def test_a_silent_demo_still_outranks_a_skip(self):
+        silent_demo3_and_skipping_demo8 = (
+            "#!/usr/bin/env bash\n"
+            'case "${@: -1}" in\n'
+            '  demo8) echo "=== Demo 8: SKIPPED -- missing asset: /x ===" ;;\n'
+            "esac\n"
+            "exit 0\n"
+        )
+        sweep = self._run(silent_demo3_and_skipping_demo8, target="demo3 demo8")
+        self.assertEqual(sweep.calls, ["demo3", "demo8"])
+        self.assertEqual(self._statuses(sweep.summary), ["FAIL", "SKIP"])
+        self.assertEqual(sweep.result.returncode, 1, sweep.result.stdout)
+        self.assertIn("1 demo(s) failed, 0 passed, 1 skipped", sweep.result.stdout)
+
+    def test_a_success_after_demo_5_ran_first_is_a_pass(self):
+        """Positive control: demo 5's result lines, from make running demo 5
+        first for its boot snapshot, do not hide the demo's own SUCCESS."""
+        result, summary = self._sweep(
+            DEMO_THAT_SUCCEEDS_AFTER_DEMO_5_RAN_FIRST, target="demo6 demo7"
+        )
+        self.assertEqual(self._statuses(summary), ["PASS", "PASS"])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Demo suite: SUCCESS — all 2 requested demos passed", result.stdout)
+
+    def test_every_demos_real_success_line_is_a_pass(self):
+        """Positive control: no demo that passes today turns red. Each demo's
+        own success line, read from its source, is a pass for its target."""
+        lines = real_success_lines()
+        self.assertEqual(sorted(lines), list(range(1, 10)))
+        self.assertEqual(
+            [number for number, line in lines.items() if line is None],
+            [],
+            "a demo's success line was not found in its source",
+        )
+        common = (ROOT / "demos/lib/common.sh").read_text()
+        self.assertIn(
+            "demo_success() { printf '\\n=== %s: SUCCESS ===\\n' "
+            '"${DEMO_LABEL:-demo}"; }',
+            common,
+        )
+        stub = '#!/usr/bin/env bash\ncase "${@: -1}" in\n'
+        for number, line in sorted(lines.items()):
+            stub += "  demo{}) echo; echo {} ;;\n".format(number, shlex.quote(line))
+        stub += "esac\nexit 0\n"
+        targets = " ".join("demo{}".format(number) for number in sorted(lines))
+        result, summary = self._sweep(stub, target=targets)
+        self.assertEqual(self._statuses(summary), ["PASS"] * 9, result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Demo suite: SUCCESS — all 9 requested demos passed", result.stdout)
+
+    def test_a_target_that_is_not_a_demo_is_refused(self):
+        for target in ("demo3 lint", "demo3 demo", "demo3 demo08", "demo3 demo3x"):
+            with self.subTest(target=target):
+                sweep = self._run(PASSING_DEMO, target=target)
+                self.assertEqual(sweep.result.returncode, 2, sweep.result.stdout)
+                self.assertEqual(sweep.calls, [], "no demo may run after a usage error")
+                self.assertIn("is not a demo target", sweep.result.stdout)
+                self.assertNeverAPassOrSuccess(sweep)
 
     def test_a_log_directory_that_cannot_be_created_stops_the_sweep(self):
         def log_dir_below_a_file(scratch, environment):
@@ -560,6 +747,30 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prose)
+
+    def test_the_usage_documents_that_exit_0_alone_is_not_a_pass(self):
+        result = subprocess.run(
+            [str(RUN_ALL), "--help"],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "\n  1  at least one selected demo failed\n"
+            "     (including one that exited 0 without its own SUCCESS line)\n",
+            result.stdout,
+        )
+        prose = " ".join(result.stdout.split())
+        self.assertIn(
+            "A demo passes only when it exits 0 and its own last result line, "
+            "`=== Demo N: <title>: SUCCESS ===` with N its own number, says "
+            "SUCCESS. A demo that exits 0 without that line",
+            prose,
+        )
+        self.assertIn("is recorded as FAIL.", prose)
 
     def test_the_usage_documents_the_exit_statuses(self):
         result = subprocess.run(
