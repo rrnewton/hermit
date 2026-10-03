@@ -107,6 +107,10 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
+use crate::timeouts::SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS;
+#[cfg(test)]
+use crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
@@ -8567,7 +8571,26 @@ mod tests {
                 + 1
                 // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
                 + 1
+                + SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
         );
+        // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
+        // and the ones that were enabled with ci:false are now required.
+        fn sabre_verify<'a>(
+            population: &'a [SelectedCell],
+            test: &str,
+        ) -> Option<&'a SelectedCell> {
+            population.iter().find(|cell| {
+                cell.id.test == test
+                    && cell.id.mode == "verify"
+                    && cell.id.backend.as_deref() == Some("sabre")
+            })
+        }
+        for test in SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS {
+            let cell = sabre_verify(&required, test)
+                .unwrap_or_else(|| panic!("{test} verify/sabre is not required"));
+            assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+            assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        }
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
         // ci:false DBT verify cell; the timeouts module names them.
@@ -8599,7 +8622,8 @@ mod tests {
             NON_CI_CELL_COUNT
                 - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
-                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len(),
+                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len()
+                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(),
             "the current manifest census records every enabled ci:false cell"
         );
 
@@ -12768,7 +12792,9 @@ exit "$(cat "$PWD/exit-status")"
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
         // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
+        // 89 SaBRe candidates from the 2026-10-03 selection of ten-for-ten
+        // SaBRe verify cells (timeouts::SABRE_2026_10_03_EVIDENCE_SHA).
+        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12781,7 +12807,7 @@ exit "$(cat "$PWD/exit-status")"
                 ("dbt", 1),
                 ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
                 ("liteinst", 97),
-                ("sabre", 1)
+                ("sabre", 1 + 89)
             ])
         );
         assert!(
@@ -12811,8 +12837,8 @@ exit "$(cat "$PWD/exit-status")"
         }
     }
 
-    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1, 97 and 1) used to
-    /// add a ptrace reference run and a `hermit log-diff` comparison, and the
+    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+    /// 97 and 1 + 89) used to add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
     /// backend's strict verification, even when its log differs from ptrace's.

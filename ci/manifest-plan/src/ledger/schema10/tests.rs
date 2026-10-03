@@ -789,10 +789,12 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
     // https://github.com/rrnewton/reverie/issues/838
     // The pipe owner/signal row adds one: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*) adds 89
+    // portable SaBRe verify cells of folded tests.
     assert_eq!(
         restored,
-        282 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-        "292 portable and 4 privileged folded cells"
+        282 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
+        "381 portable and 4 privileged folded cells"
     );
     serde_json::to_string(&expected).unwrap()
 }
@@ -961,6 +963,8 @@ fn generated_plan_populations_preserve_command_policy() {
     // replay cells https://github.com/rrnewton/hermit/pull/3580 selects.
     let compat = crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
     let select = crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
+    // The 2026-10-03 SaBRe promotion adds 128 portable SaBRe verify cells.
+    let sabre = crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
     // https://github.com/rrnewton/reverie/issues/891 selects six more portable
     // KVM verify cells; keep the earlier populations as explicit baselines.
     // Three more socket KVM verify selections: https://github.com/rrnewton/reverie/issues/891.
@@ -969,7 +973,7 @@ fn generated_plan_populations_preserve_command_policy() {
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
     // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1;
+    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1016,7 +1020,9 @@ fn generated_plan_populations_preserve_command_policy() {
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
         // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 - (241 + 6 + 3 + 1 + 1 + 1 + 1 + 1)
+        // The SaBRe cells are portable and not KVM, so hosted runs keep them.
+        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre
+            - (241 + 6 + 3 + 1 + 1 + 1 + 1 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1068,7 +1074,7 @@ fn generated_plan_populations_preserve_command_policy() {
             // The ordinary syncfs KVM row adds one too: https://github.com/rrnewton/reverie/issues/838.
             // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
             // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1191,8 +1197,9 @@ fn generated_plan_populations_preserve_command_policy() {
                 // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
                 // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
                 // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+                // The 89 promoted folded SaBRe verify cells add one relation each.
                 if active {
-                    174 + 6 + 3 + 1 + 1 + 1 + 1 + 1
+                    174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
                 } else {
                     0
                 }
@@ -1209,7 +1216,7 @@ fn generated_plan_populations_preserve_command_policy() {
                     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
                     ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
                     ("liteinst", 97),
-                    ("sabre", 1),
+                    ("sabre", 1 + 89),
                     ("dbt", 1),
                 ] {
                     assert_eq!(

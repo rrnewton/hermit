@@ -132,6 +132,36 @@ pub const SELECT_REPLAY_2026_10_03_TESTS: [&str; 2] = [
     "c-programs/pselect6-simulation",
 ];
 pub const SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT: usize = 2;
+/// SaBRe verify cells selected after ten clean first-attempt strict
+/// verification repetitions each, with retries off, at the evidence SHA
+/// (`ci/compat-envelope/pressure-test.rs run --probe-disabled --backend sabre
+/// --repetitions 10 --no-retry`, runs `sabre-promote-c3f7b2bcfa00-20261003`
+/// and `sabre-promote-red-c3f7b2bcfa00-20261003`). 120 of them had SaBRe
+/// under `backends_disabled`; the 8 in
+/// [`SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS`] were enabled with
+/// `ci.sabre: false` after timing out at the former 15-second cell limit.
+///
+/// The 1,280 verify invocations took at most 2,697 ms of wall time. The
+/// largest whole cell, test harness included, used 5,819 ms of CPU time and
+/// 6,283 ms of wall time, so the ordinary 22 s CPU and 57 s wall bounds cover
+/// them without an override.
+pub const SABRE_2026_10_03_EVIDENCE_SHA: &str = "c3f7b2bcfa0061d1cc6a308ac51761ff0ed29101";
+pub const SABRE_2026_10_03_EVIDENCE_COMPLETED_UTC: &str = "2026-10-03T20:42:34Z";
+pub const SABRE_2026_10_03_SELECTED_CI_CELL_COUNT: usize = 128;
+pub const SABRE_2026_10_03_MAX_MEASURED_CPU_MILLIS: u64 = 5819;
+pub const SABRE_2026_10_03_MAX_MEASURED_WALL_MILLIS: u64 = 6283;
+/// The SaBRe verify cells among those 128 that were already enabled with
+/// `ci: false`, so they leave the enabled-but-unselected census.
+pub const SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS: [&str; 8] = [
+    "c-programs/dbt-copied-tiocgpgrp",
+    "c-programs/dbt-wait-lifecycle",
+    "c-programs/get-robust-list-child",
+    "c-programs/pidfd-waitid-child",
+    "c-programs/ptrace-attach-eperm",
+    "c-programs/ptrace-seize-eperm",
+    "c-programs/remap-file-pages-tmpfile-enosys",
+    "c-programs/so-incoming-cpu-tcp4",
+];
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1958,6 +1988,25 @@ mod tests {
             );
             assert!(
                 DBT_MATRIX_2026_09_29_MAX_MEASURED_WALL_MILLIS
+                    < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
+            );
+        }
+        assert_eq!(
+            SABRE_2026_10_03_EVIDENCE_SHA,
+            "c3f7b2bcfa0061d1cc6a308ac51761ff0ed29101"
+        );
+        assert_eq!(
+            SABRE_2026_10_03_EVIDENCE_COMPLETED_UTC,
+            "2026-10-03T20:42:34Z"
+        );
+        assert_eq!(SABRE_2026_10_03_SELECTED_CI_CELL_COUNT, 128);
+        assert_eq!(SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(), 8);
+        const {
+            assert!(
+                SABRE_2026_10_03_MAX_MEASURED_CPU_MILLIS < DEFAULT_TEST_CPU_TIMEOUT_SECONDS * 1000
+            );
+            assert!(
+                SABRE_2026_10_03_MAX_MEASURED_WALL_MILLIS
                     < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
             );
         }
