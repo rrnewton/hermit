@@ -988,7 +988,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // liteinst_dispatch_record_reports_patched_sites retains all 27 prior
     // identities.
-    ("test.liteinst_strict", 28),
+    // external_signal_interrupt adds its 48 tests plus its copy of the shared
+    // liteinst_runtime::tests::staged_ci_artifact_never_becomes_a_cargo_profile
+    // unit test; all 28 liteinst_advanced identities are retained
+    // (`cargo nextest list --profile ci` measured 28 + 49 = 77 at the rebased
+    // head of https://github.com/rrnewton/hermit/pull/3361;
+    // https://github.com/rrnewton/hermit/issues/3146). Its tests are split per
+    // backend so each stays inside the per-test wall and CPU bounds.
+    ("test.liteinst_strict", 77),
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
     // prior identities.
     ("test.sabre_examples", 7),
@@ -1104,7 +1111,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
     // identities. The host twin also selects
     // liteinst_dispatch_record_reports_patched_sites.
-    ("test.liteinst_strict_on_host", 28),
+    // The host twin selects the same external_signal_interrupt binary
+    // (https://github.com/rrnewton/hermit/issues/3146).
+    ("test.liteinst_strict_on_host", 77),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
