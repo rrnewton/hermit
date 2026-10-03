@@ -4945,12 +4945,13 @@ sys.exit(37)
     }
 
     #[test]
-    fn committed_buck_e2e_selection_has_83_steps() {
+    fn committed_buck_e2e_selection_replaces_22_nodes_with_18() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_buck_e2e_selection(&committed, &cells).unwrap();
-        // 87 full nodes - 22 replaced + 18 full-buck-e2e nodes.
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 83);
+        // 88 full nodes (87 before test.detcore_time joined full) - 22
+        // replaced + 18 full-buck-e2e nodes.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 84);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
