@@ -344,6 +344,19 @@ ended on 2026-10-03, 30.9 seconds after the demo started, with (path shortened):
 WARN: Demo 6: QEMU Snapshot Resume: FAILURE: Hermit's INFO log .../run-history/resume-20261003T171535.068191Z-2392757/hermit-info.log grew to 538851401 bytes, past the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the resume, so the run was stopped before QEMU_TIMEOUT (120s); the guest command had not finished: the serial log has the __HERMIT_COMMAND_BEGIN__ format=3 line but no END line
 ```
 
+At either bound the demo stops Hermit and every process still in Hermit's
+process group before it reports: the group is sent SIGTERM and then SIGKILL,
+at most 10 seconds apart. On 2026-10-03, with `QEMU_TIMEOUT=20`, the command
+`sleep 1000000` ended 22.0 seconds after the demo started, and no Hermit, QEMU,
+or `sleep` process was left running.
+
+The cap also holds after Hermit exits. The demo then waits up to 60 seconds
+for the rest of Hermit's output to reach the INFO log. If a process Hermit
+left running writes the log past the cap, or still holds Hermit's output open
+after those 60 seconds, the demo stops it the same way and fails, with a cap
+message that names Hermit's exit status or with
+`Hermit's output was still open 60s after it exited, so the processes still holding it were stopped`.
+
 Controls (environment variables):
 
 | Variable | Default | Meaning |
@@ -353,4 +366,4 @@ Controls (environment variables):
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where demo 5's snapshot and this demo's results are kept. |
 | `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. It must be the one demo 5 used. |
-| `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what stops a command that does not finish. |
+| `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what stops a command that does not finish. The cap also holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output. |

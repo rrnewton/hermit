@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 
 DEMO_DIR = Path(__file__).resolve().parent
@@ -25,6 +26,7 @@ from demo_common import (  # noqa: E402
     copy_file,
     default_qemu_assets,
     display_path,
+    drain_output,
     extract_info_tail,
     hash_file,
     hermit_binary,
@@ -39,6 +41,7 @@ from demo_common import (  # noqa: E402
     save_metadata,
     stage_guest_controller,
     stop_process,
+    stop_process_group,
     wait_for_process,
 )
 from qemu_controller import build_qemu_command  # noqa: E402
@@ -105,6 +108,9 @@ def guest_environment_args() -> list:
 
 
 # Seconds to wait, after Hermit exits, for its last output to reach the log.
+# Processes Hermit left running can hold its output open meanwhile;
+# drain_output keeps QEMU_MAX_LOG_BYTES in force and stops them when this
+# runs out.
 OUTPUT_DRAIN_TIMEOUT = 60
 
 
@@ -314,6 +320,7 @@ def boot_once() -> str:
                 # process running and writing hermit-info.log.
                 start_new_session=True,
             )
+            launched = time.monotonic()
             copier = start_output_copier(process, log)
             try:
                 return_code = wait_for_process(
@@ -324,14 +331,24 @@ def boot_once() -> str:
                     log_path=info_log,
                     max_log_bytes=MAX_LOG_BYTES,
                 )
-            finally:
-                copier.join(OUTPUT_DRAIN_TIMEOUT)
-            if copier.is_alive():
-                raise RuntimeError(
-                    "Hermit's output was still open {}s after it exited".format(
-                        OUTPUT_DRAIN_TIMEOUT
-                    )
+                drain_output(
+                    copier,
+                    process,
+                    OUTPUT_DRAIN_TIMEOUT,
+                    log_path=info_log,
+                    max_log_bytes=MAX_LOG_BYTES,
+                    started=launched,
+                    label="Hermit",
                 )
+            finally:
+                # Whatever ended the wait, stop everything left in Hermit's
+                # process group, so nothing it started keeps writing the log.
+                # The pipe's last bytes then arrive at once. A copier still
+                # running after 10 seconds is reading from a process outside
+                # the group; closing the log at the end of this block stops it
+                # at its next write.
+                stop_process_group(process)
+                copier.join(10)
         if return_code != 0:
             raise RuntimeError("Hermit/QEMU exited with status {}".format(return_code))
         if not snapshot_exists(snapshot_disk, SNAPSHOT_NAME):

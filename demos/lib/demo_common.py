@@ -1139,19 +1139,38 @@ def make_run_dir(parent: Path, prefix: str) -> Path:
 
 
 class LogCapExceeded(RuntimeError):
-    """wait_for_process stopped a process whose log grew past its cap."""
+    """A run was stopped because its log grew past its cap.
 
-    def __init__(self, log_path: Path, log_size: int, max_log_bytes: int, elapsed: float):
-        super().__init__(
-            "{} grew to {} bytes, past the {}-byte log cap; the run was stopped".format(
+    wait_for_process raises it while the launched process runs. drain_output
+    raises it after that process exited while processes it left behind still
+    wrote to the log; ``exit_status`` is then the launched process's exit status.
+    """
+
+    def __init__(
+        self,
+        log_path: Path,
+        log_size: int,
+        max_log_bytes: int,
+        elapsed: float,
+        exit_status: Optional[int] = None,
+    ):
+        if exit_status is None:
+            message = "{} grew to {} bytes, past the {}-byte log cap; the run was stopped".format(
                 log_path, log_size, max_log_bytes
             )
-        )
+        else:
+            message = (
+                "{} grew to {} bytes, past the {}-byte log cap, after the launched "
+                "process exited with status {}; the processes still writing to it "
+                "were stopped".format(log_path, log_size, max_log_bytes, exit_status)
+            )
+        super().__init__(message)
         self.log_path = Path(log_path)
         self.log_size = log_size
         self.max_log_bytes = max_log_bytes
-        # Seconds from the start of the wait until the cap was seen.
+        # Seconds from the start of the run (or of the wait) until the cap was seen.
         self.elapsed = elapsed
+        self.exit_status = exit_status
 
 
 def wait_for_process(
@@ -1165,11 +1184,15 @@ def wait_for_process(
 ) -> int:
     """Wait for a process, optionally streaming a growing file or showing progress.
 
-    ``timeout`` bounds the wall time. When ``log_path`` and ``max_log_bytes`` are
-    both set, the file is also watched: if it grows past the cap, the process
-    group is stopped and LogCapExceeded (a RuntimeError) names the cap, so a
-    runaway log cannot fill the disk. The caller is expected to have started the
-    process with ``start_new_session=True``.
+    ``timeout`` bounds the wall time: past it, the process group is stopped and
+    TimeoutError is raised. When ``log_path`` and ``max_log_bytes`` are both
+    set, the file is also watched: if it grows past the cap, the process group
+    is stopped and LogCapExceeded (a RuntimeError) names the cap, so a runaway
+    log cannot fill the disk. Either way the group is stopped before the error
+    is raised, so nothing in it keeps writing while the caller cleans up. The
+    caller is expected to have started the process with
+    ``start_new_session=True``; once the process exits, drain_output keeps the
+    same cap while the rest of its output is copied.
 
     When ``first_output_label`` is set (used with ``stream_path``), a live
     seconds-counter ticks until the very first byte of streamed output appears,
@@ -1250,7 +1273,7 @@ def wait_for_process(
                 except FileNotFoundError:
                     log_size = 0
                 if log_size > max_log_bytes:
-                    stop_process(process)
+                    stop_process_group(process)
                     raise LogCapExceeded(
                         Path(log_path),
                         log_size,
@@ -1260,6 +1283,7 @@ def wait_for_process(
 
             now = time.monotonic()
             if now >= deadline:
+                stop_process_group(process)
                 raise TimeoutError("process exceeded timeout of {}s".format(timeout))
             if progress_label is not None:
                 elapsed = int(now - started)
@@ -1469,6 +1493,108 @@ def stop_process(process: Optional[subprocess.Popen]) -> None:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _group_empty(group: int, timeout: float) -> bool:
+    """Whether process group ``group`` empties within ``timeout`` seconds.
+
+    A member that has exited but not yet been reaped still counts. A group whose
+    remaining members this process may not signal counts as empty: nothing more
+    can be done about them from here.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(group, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def stop_process_group(process: Optional[subprocess.Popen]) -> None:
+    """Stop a launched child and everything left in its process group.
+
+    stop_process does nothing once the child has exited, but processes the
+    child started stay in its group and can keep running, still writing to the
+    output they inherited from it. This stops the child if it is still running
+    (with stop_process), then signals the group itself: SIGTERM, up to 10
+    seconds for the group to empty, then SIGKILL and up to 10 more.
+
+    It is meant for children started with ``start_new_session=True``, whose
+    group ID is the child's PID. Linux does not give that number to a new
+    process while any member of the group exists, so the signal reaches only
+    the child's own processes. Once the group is empty, the number can be
+    given out again, and a new process that made it a group ID before this
+    runs would receive the signal; that needs the PID counter to wrap (pid_max
+    numbers) between the last member's exit and this call. The caller's own
+    group is never signalled.
+    """
+    if process is None:
+        return
+    stop_process(process)
+    group = process.pid
+    if group == os.getpgrp():
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if _group_empty(group, 10):
+            return
+
+
+def drain_output(
+    copier: threading.Thread,
+    process: subprocess.Popen,
+    timeout: float,
+    log_path: Optional[Path] = None,
+    max_log_bytes: Optional[int] = None,
+    started: Optional[float] = None,
+    label: str = "the launched process",
+) -> None:
+    """After ``process`` exited, wait for ``copier`` to copy the rest of its output.
+
+    ``copier`` is the thread that copies the process's output pipe into a log.
+    Processes the child left in its process group inherit that pipe, so they
+    can keep it open, and keep writing to it, after the child exits. While
+    waiting, the log is held to the cap wait_for_process applies: once it
+    grows past ``max_log_bytes``, the child's group is stopped and
+    LogCapExceeded is raised, with ``elapsed`` counted from ``started`` (a
+    time.monotonic() value; by default, when this call began). If the output
+    is still open after ``timeout`` seconds, the group is stopped and
+    RuntimeError is raised, naming ``label``.
+    """
+    began = time.monotonic()
+    if started is None:
+        started = began
+    deadline = began + timeout
+    while True:
+        copier.join(0.1)
+        if not copier.is_alive():
+            return
+        if log_path is not None and max_log_bytes is not None:
+            try:
+                log_size = Path(log_path).stat().st_size
+            except FileNotFoundError:
+                log_size = 0
+            if log_size > max_log_bytes:
+                stop_process_group(process)
+                raise LogCapExceeded(
+                    Path(log_path),
+                    log_size,
+                    max_log_bytes,
+                    time.monotonic() - started,
+                    exit_status=process.returncode,
+                )
+        if time.monotonic() >= deadline:
+            stop_process_group(process)
+            raise RuntimeError(
+                "{}'s output was still open {}s after it exited, so the processes "
+                "still holding it were stopped".format(label, timeout)
+            )
 
 
 def extract_info_tail(log_path: Path) -> List[str]:

@@ -866,6 +866,7 @@ class Demo6ResumeTest(unittest.TestCase):
             "load_anchor": lambda command_root: None,
             "save_anchor": lambda command_root, current: command_root / "anchor",
             "stop_process": lambda process: None,
+            "stop_process_group": lambda process: None,
         }
         printed = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
         with mock.patch.dict(resume_once.__globals__, replacements), mock.patch.dict(

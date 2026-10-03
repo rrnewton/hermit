@@ -314,10 +314,10 @@ Controls (environment variables):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QEMU_BOOT_REPEAT` | `1` | Set to `0` to skip the second boot of a first invocation, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
-| `QEMU_TIMEOUT` | `600` | Seconds before the boot is stopped. |
+| `QEMU_TIMEOUT` | `600` | Seconds before the boot is stopped: the demo then stops Hermit and every process still in Hermit's process group (the group is sent SIGTERM and then SIGKILL, at most 10 seconds apart) and fails. |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where the kernel, initramfs, snapshot, and run history are kept. A checkout under `/tmp` uses a directory under `/var/tmp` instead. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. |
 | `KERNEL_IMAGE` | (download) | Use a local copy of the pinned kernel; its SHA-256 must still match. |
 | `BUSYBOX` | `busybox` on `PATH` | A statically linked BusyBox for the initramfs. |
 | `QEMU_SNAPSHOT_NAME` | `hermit-boot` | The snapshot's name inside the qcow2 file. |
-| `QEMU_MAX_LOG_BYTES` | 768 MiB | Stop the run if Hermit's event log grows past this size. Eight healthy boots on 2026-09-30 wrote 457,618,652 bytes each (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote about 253 MB. |
+| `QEMU_MAX_LOG_BYTES` | 768 MiB | Stop the run if Hermit's event log grows past this size. The cap still holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output; processes Hermit left running are stopped when the cap or those 60 seconds run out. Eight healthy boots on 2026-09-30 wrote 457,618,652 bytes each (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote about 253 MB. |
