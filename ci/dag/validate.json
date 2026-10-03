@@ -4066,6 +4066,13 @@
           "category": "c-programs",
           "test": "c-programs/poll-readiness",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/poll-readiness",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
