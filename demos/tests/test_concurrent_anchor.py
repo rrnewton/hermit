@@ -219,28 +219,50 @@ class InfoLogAdmissionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "qemu-run-metadata-qemu_argv"):
                 dc.parse_run_metadata(record)
 
-    def test_documented_launcher_fields_are_normalized(self):
+    def test_logs_that_differ_only_in_the_wallclock_prefix_match(self):
+        body = (
+            "INFO detcore: launcher read FileContents(DetInode(4)) "
+            "at 0x7fffffffa210\n"
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            anchor_log = root / "anchor.log"
-            current_log = root / "current.log"
-            anchor_log.write_text(
-                "2026-08-17T04:27:14.000000Z INFO detcore: "
-                "launcher read FileContents(123) at 0x7fffffffa210\n"
-            )
-            current_log.write_text(
-                "2026-08-17T04:29:10.000000Z INFO detcore: "
-                "launcher read FileContents(987) at 0x7fffffff9210\n"
+            passed, report = self._compare_logs(
+                tmp,
+                "2026-08-17T04:27:14.000000Z " + body,
+                "2026-08-17T04:29:10.000000Z " + body,
             )
 
-            passed, report = dc.compare_runs(
-                self._metadata(anchor_log), self._metadata(current_log)
-            )
-
-            self.assertTrue(passed, "documented normalized fields should match")
+            self.assertTrue(passed, report)
             self.assertTrue(
-                any(line.startswith("PASS: exact Hermit log") for line in report)
+                any(
+                    entry.startswith("PASS: Hermit INFO log matches first run exactly")
+                    for entry in report
+                ),
+                report,
             )
+
+    def test_a_changed_file_resource_id_is_refused(self):
+        # Hermit derives the N in FileContents(DetInode(N)) deterministically,
+        # so a different N means a different file or a divergent execution. The
+        # older raw form FileContents(<inode>) is not folded either.
+        cases = (
+            (
+                "INFO detcore: launcher read FileContents(DetInode(4))\n",
+                "INFO detcore: launcher read FileContents(DetInode(5))\n",
+            ),
+            (
+                "INFO detcore: launcher read FileContents(123)\n",
+                "INFO detcore: launcher read FileContents(987)\n",
+            ),
+        )
+        for anchor_text, current_text in cases:
+            with self.subTest(anchor=anchor_text), tempfile.TemporaryDirectory() as tmp:
+                passed, report = self._compare_logs(tmp, anchor_text, current_text)
+
+                self.assertFalse(passed, "a changed resource id must fail the repeat")
+                self.assertTrue(
+                    any("canonical repeat verification failed" in entry for entry in report),
+                    report,
+                )
 
     def test_relocated_qmp_socket_is_stable_for_repeat_comparison(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,25 +308,79 @@ class InfoLogAdmissionTest(unittest.TestCase):
         current_log.write_text(current_text)
         return dc.compare_runs(self._metadata(anchor_log), self._metadata(current_log))
 
-    # The address comparator folds the constant stack-base offset between two
-    # hermit invocations. It must NOT fold a change in which addresses are used,
-    # the order they first appear in, or whether two sites share one. Masking
-    # every address to a single token did exactly that; these four cases pin the
-    # difference. Each uses two addresses, because a relationship needs two.
+    # Guest addresses are compared byte for byte. Both logs come from separate
+    # `hermit run` invocations of identical input with guest address-space
+    # randomization off, so the same execution prints the same addresses. Any
+    # address change fails: a shift of the whole layout, one address moved to an
+    # unrelated value, two moved, or two swapped everywhere. Each case uses two
+    # addresses, because a relationship needs two.
 
-    def test_a_uniform_address_shift_still_compares_equal(self):
+    def test_identical_guest_addresses_match(self):
+        same = (
+            "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n"
+            "INFO detcore: c 0x7fffffffa210\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_logs(tmp, same, same)
+
+            self.assertTrue(passed, report)
+
+    def test_a_uniform_guest_address_shift_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             passed, report = self._compare_logs(
                 tmp,
                 "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n",
                 "INFO detcore: a 0x7fffffff9210 b 0x7fffffff9310\n",
             )
-            self.assertTrue(
-                passed, "a constant offset on every address is host layout, not divergence"
+
+            self.assertFalse(
+                passed, "the same input must print the same guest addresses"
             )
             self.assertTrue(
-                any(line.startswith("PASS: exact Hermit log") for line in report)
+                any("canonical repeat verification failed" in entry for entry in report),
+                report,
             )
+
+    def test_one_guest_address_moved_to_a_fresh_value_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n"
+                "INFO detcore: c 0x7fffffffa210\n",
+                "INFO detcore: a 0x7fffffffa210 b 0x7ffff7dd4000\n"
+                "INFO detcore: c 0x7fffffffa210\n",
+            )
+
+            self.assertFalse(
+                passed, "one guest address moving to an unrelated value is a real change"
+            )
+
+    def test_two_guest_addresses_moved_to_fresh_values_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n",
+                "INFO detcore: a 0x7ffff7dd4000 b 0x7ffff7ff1000\n",
+            )
+
+            self.assertFalse(
+                passed, "two guest addresses moving to unrelated values is a real change"
+            )
+
+    def test_two_guest_addresses_swapped_everywhere_are_refused(self):
+        # Swapping two addresses at every site keeps every sharing relationship.
+        # The earlier first-appearance comparator could not see it; byte-for-byte
+        # comparison does.
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n"
+                "INFO detcore: c 0x7fffffffa210\n",
+                "INFO detcore: a 0x7fffffffa310 b 0x7fffffffa210\n"
+                "INFO detcore: c 0x7fffffffa310\n",
+            )
+
+            self.assertFalse(passed, "two guest addresses swapped is a real change")
 
     def test_two_addresses_that_become_aliased_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -343,30 +419,62 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 passed, "a site that stops reusing an earlier address changed identity"
             )
 
-    def test_a_pure_relabelling_is_a_documented_blind_spot(self):
-        # Swapping two addresses everywhere is structurally isomorphic: every
-        # site keeps the same sharing relationships, so first-appearance
-        # canonicalization cannot see it and reports PASS.
-        #
-        # This is recorded rather than fixed. Catching it needs an offset from a
-        # single base, and that was MEASURED against real demo 6 logs: stack and
-        # mmap regions shift by different amounts between runs, so offsets from
-        # one base change legitimately and the comparator reds a correct run.
-        # A comparator that reds correct runs would be reverted or muted, which
-        # is a worse outcome than a named blind spot.
+    # Hermit's marker for a host-side address, `<hostaddr 0x...>`, is the one
+    # address the canonical policy renumbers (canonicalize_addresses_in_line in
+    # detcore/src/logdiff.rs); these mirror that file's canonical_* controls.
+
+    def test_marked_host_addresses_with_the_same_structure_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_logs(
+                tmp,
+                "INFO detcore: [t] p=<hostaddr 0x1111> q=<hostaddr 0x2222>\n"
+                "INFO detcore: [t] use <hostaddr 0x1111> then <hostaddr 0x2222>\n",
+                "INFO detcore: [t] p=<hostaddr 0xaaaa> q=<hostaddr 0xbbbb>\n"
+                "INFO detcore: [t] use <hostaddr 0xaaaa> then <hostaddr 0xbbbb>\n",
+            )
+
+            self.assertTrue(passed, report)
+
+    def test_marked_host_addresses_introduced_in_another_order_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             passed, _ = self._compare_logs(
                 tmp,
-                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n"
-                "INFO detcore: c 0x7fffffffa210\n",
-                "INFO detcore: a 0x7fffffffa310 b 0x7fffffffa210\n"
-                "INFO detcore: c 0x7fffffffa310\n",
+                "INFO detcore: [t] alloc <hostaddr 0x1111>\n"
+                "INFO detcore: [t] alloc <hostaddr 0x2222>\n"
+                "INFO detcore: [t] pair <hostaddr 0x1111> <hostaddr 0x2222>\n",
+                "INFO detcore: [t] alloc <hostaddr 0xbbbb>\n"
+                "INFO detcore: [t] alloc <hostaddr 0xaaaa>\n"
+                "INFO detcore: [t] pair <hostaddr 0xaaaa> <hostaddr 0xbbbb>\n",
             )
-            self.assertTrue(
-                passed,
-                "a pure relabelling is isomorphic; this pins the known limit so a "
-                "future change that closes it fails here and gets read",
+
+            self.assertFalse(passed, "a different introduction order is a real change")
+
+    def test_marked_host_addresses_that_stop_aliasing_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: [t] two <hostaddr 0x1111> <hostaddr 0x1111>\n",
+                "INFO detcore: [t] two <hostaddr 0xaaaa> <hostaddr 0xbbbb>\n",
             )
+
+            self.assertFalse(passed, "one marked address becoming two is a real change")
+
+    def test_a_bare_hex_value_beside_a_marked_address_is_compared_exactly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: flock(fd=3, operation=0x2) at <hostaddr 0x1111>\n",
+                "INFO detcore: flock(fd=3, operation=0x6) at <hostaddr 0xaaaa>\n",
+            )
+            self.assertFalse(passed, "only the marked value is renumbered")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_logs(
+                tmp,
+                "INFO detcore: flock(fd=3, operation=0x2) at <hostaddr 0x1111>\n",
+                "INFO detcore: flock(fd=3, operation=0x2) at <hostaddr 0xaaaa>\n",
+            )
+            self.assertTrue(passed, report)
 
     def test_info_divergence_fails_even_when_vm_artifacts_match(self):
         with tempfile.TemporaryDirectory() as tmp:

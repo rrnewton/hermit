@@ -29,47 +29,35 @@ WALLCLOCK_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]+"
 )
 
-# detcore logs the host-filesystem inode of a touched file as its resource id,
-# e.g. `FileContents(263701387)`. That number is a host-physical identifier the
-# kernel hands out afresh whenever a file is (re)created, so it varies run to run
-# even when guest execution is bit-identical (recreated fixed-path files churn it
-# just as per-run private directories do). It is nondeterministic in exactly the
-# same sense as the wallclock prefix, so the exact-log comparison folds it to a
-# stable token. Guest-observable determinism is still asserted independently via
-# the qcow2 / serial / guest-output SHAs.
-FILE_INODE_RE = re.compile(r"FileContents\(\d+\)")
-
-# The DETLOG renders raw guest virtual addresses (stack buffers, mmap regions)
-# for syscall pointer arguments, e.g. `openat(-100, 0x7fffffffa240 -> "...")`.
-# Those canonical-userspace addresses (0x7f...) shift by the size of the guest's
-# argv+env block, so two SEPARATE hermit invocations with different inherited
-# host environments place the stack at a different base and every such address
-# differs by a constant offset even when the guest does bit-identical work. The
-# dereferenced string after `-> ` is preserved, so masking only the address
-# folds host-physical layout noise without hiding a real path/content change.
-# Guest-observable determinism is asserted independently via the qcow2 / serial /
-# guest-output SHAs; see compare_runs.
+# The repeat check compares Hermit's INFO log under Hermit's own canonical
+# policy, BitwiseInfoV1 (detcore/src/logdiff.rs), and normalizes nothing else:
 #
-# Each address is replaced by its FIRST-APPEARANCE INDEX within its own log,
-# not by one shared token. Substituting a single `0x<uaddr>` folded the shift but
-# also discarded address IDENTITY: every address collapsed to the same string, so
-# a run that used a different address at a site, or newly aliased two sites that
-# had been distinct, compared EQUAL. Indexing keeps which sites share an address
-# and in what order those addresses are first seen, while still folding a shift
-# of the whole layout.
+# 1. WALLCLOCK_RE removes the real wall-clock timestamp that starts each
+#    tracing line (STRIP_WALL_CLOCK_PREFIX_V1).
+# 2. HOST_ADDR_RE matches the one marker Hermit puts around a host-side address
+#    it prints, `<hostaddr 0x...>` (`host_addr` in logdiff.rs). Each marked value
+#    becomes its first-appearance ordinal within its own log, exactly as
+#    `canonicalize_addresses_in_line` does (CANON_ADDRESS_ORDINAL_V1), so which
+#    marked values repeat, and in what order they first appear, still has to
+#    match.
 #
-# KNOWN LIMIT, pinned by test_a_pure_relabelling_is_a_documented_blind_spot:
-# swapping two addresses everywhere is structurally isomorphic and is not
-# detected. The alternative -- a signed offset from one base -- does detect it,
-# but was measured against real Demo 6 logs to red a CORRECT run, because stack
-# and mmap regions shift by different amounts and their offsets from a single
-# base legitimately change. A comparator that reds correct runs gets muted, so
-# the blind spot is named instead of traded for a false positive.
+# Every other byte must match, including the bare `0x7f...` guest addresses that
+# DETLOG prints for syscall pointer arguments. The two logs come from separate
+# `hermit run` invocations with identical inputs: the launchers give the guest
+# Hermit's minimal fixed environment (guest_environment_args), fixed guest-side
+# paths for the controller, the assets and the run directory, a fixed working
+# directory and a fixed --epoch, and the ptrace backend turns off address-space
+# randomization in the guest. Guest addresses are then reproducible, and the
+# retained logs agree: two demo 5 boot pairs (2026-09-30 and 2026-10-01;
+# 2,332,583 lines and 817,167 bare 0x7f... values per log) and one demo 6 resume
+# pair (2026-10-01; 1,604,193 lines, 320,244 values) differed in no line once the
+# wall-clock prefix was removed. A guest address that still differs means the
+# inputs differed or the execution diverged, so the repeat fails.
 #
-# It also means the comparison is only meaningful against an anchor recorded in a
-# comparable environment; a stale cross-session anchor reds legitimately. The old
-# masking hid that too. See _AddressCanonicalizer.
-USER_ADDR_RE = re.compile(r"0x7f[0-9a-f]{6,}")
+# Logs also carry a file's resource id, `FileContents(DetInode(N))`. Hermit
+# derives N deterministically (determinize_inode in detcore/src/tool_global.rs),
+# so it too is compared exactly.
+HOST_ADDR_RE = re.compile(r"<hostaddr (0[xX][A-Fa-f0-9]+)>")
 RUN_METADATA_SCHEMA_VERSION = 2
 
 
@@ -842,90 +830,79 @@ def _strip_wallclock_prefix(line: str) -> str:
     return WALLCLOCK_RE.sub("", line, count=1)
 
 
-class _AddressCanonicalizer:
-    """Map each userspace address to its first-appearance index within one log.
+class _HostAddressOrdinals:
+    """Number each Hermit-marked host address by first appearance in one log.
 
-    One canonicalizer per log, never shared between the two being compared: two
-    logs agree only when their address STRUCTURE agrees. Shifting the whole
-    layout -- which is what a different argv+env block does -- renames every
-    address without changing which sites share one or the order in which
-    distinct addresses are first seen, so the legitimate case still compares
-    equal. A different address at a site, two distinct addresses collapsing into
-    one, or one splitting into two all change the index sequence and are
-    reported.
-
-    A pure relabelling (two addresses swapped everywhere) is isomorphic and is
-    NOT detected; see the USER_ADDR_RE note for why that blind spot is preferred
-    to the alternative's false positives.
+    This is the canonical policy's only address rule (CANON_ADDRESS_ORDINAL_V1,
+    `canonicalize_addresses_in_line` in detcore/src/logdiff.rs): a value inside
+    `<hostaddr ...>` becomes `<addrN>`, where N counts distinct marked values in
+    order of first appearance. Use one instance per log, never shared between
+    the two logs being compared. Which marked values repeat, and their order,
+    must still agree. Bare hex values, including every guest address, are not
+    touched.
     """
 
     def __init__(self) -> None:
-        self._seen: Dict[str, str] = {}
+        self._seen: Dict[str, int] = {}
 
     def substitute(self, line: str) -> str:
-        def _token(match: "re.Match[str]") -> str:
-            raw = match.group(0)
-            token = self._seen.get(raw)
-            if token is None:
-                token = "0x<uaddr:{}>".format(len(self._seen) + 1)
-                self._seen[raw] = token
-            return token
+        def _ordinal(match: "re.Match[str]") -> str:
+            raw = match.group(1)
+            ordinal = self._seen.get(raw)
+            if ordinal is None:
+                ordinal = len(self._seen) + 1
+                self._seen[raw] = ordinal
+            return "<addr{}>".format(ordinal)
 
-        return USER_ADDR_RE.sub(_token, line)
+        return HOST_ADDR_RE.sub(_ordinal, line)
 
 
-def _normalize_log_line(line: str, addresses: _AddressCanonicalizer) -> str:
-    """Fold out host-physical nondeterminism (wallclock prefix, inode numbers).
+def _canonical_log_line(line: str, host_addresses: _HostAddressOrdinals) -> str:
+    """Apply the canonical policy to one log line; see HOST_ADDR_RE.
 
-    See WALLCLOCK_RE and FILE_INODE_RE for why each token is nondeterministic
-    even when the guest execution is bit-identical. Addresses are canonicalized
-    by first-appearance index rather than masked, so their identity and aliasing
-    survive; see USER_ADDR_RE. Anything else surviving here is a real
-    divergence.
+    Only the leading wall-clock timestamp is removed and only Hermit-marked host
+    addresses are renumbered. Anything else that differs is a real divergence.
     """
-    line = _strip_wallclock_prefix(line)
-    line = FILE_INODE_RE.sub("FileContents(<inode>)", line)
-    line = addresses.substitute(line)
-    return line
+    return host_addresses.substitute(_strip_wallclock_prefix(line))
 
 
 def hermit_log_diff(log1: Path, log2: Path) -> str:
-    """Return the first exact log divergence after documented normalization."""
+    """Return the first log divergence under the canonical policy, or ""."""
     before: List[Tuple[int, str, str]] = []
     with Path(log1).open(errors="replace") as left, Path(log2).open(
         errors="replace"
     ) as right:
         line_number = 0
-        left_addresses = _AddressCanonicalizer()
-        right_addresses = _AddressCanonicalizer()
+        left_addresses = _HostAddressOrdinals()
+        right_addresses = _HostAddressOrdinals()
         while True:
             left_line = left.readline()
             right_line = right.readline()
             if not left_line and not right_line:
                 return ""
             line_number += 1
-            normalized_left = _normalize_log_line(left_line, left_addresses)
-            normalized_right = _normalize_log_line(right_line, right_addresses)
-            if normalized_left != normalized_right:
+            canonical_left = _canonical_log_line(left_line, left_addresses)
+            canonical_right = _canonical_log_line(right_line, right_addresses)
+            if canonical_left != canonical_right:
                 context = ["  {!r}".format(item[1]) for item in before]
                 context.extend(
                     (
-                        "- {!r}".format(normalized_left),
-                        "+ {!r}".format(normalized_right),
+                        "- {!r}".format(canonical_left),
+                        "+ {!r}".format(canonical_right),
                     )
                 )
                 return (
-                    "first divergence at line {} "
-                    "(wallclock + inode + userspace address normalized):\n{}"
+                    "first divergence at line {} (only the wall-clock prefix "
+                    "removed and Hermit-marked host addresses numbered):\n{}"
                 ).format(line_number, "\n".join(context))
-            before.append((line_number, normalized_left, normalized_right))
+            before.append((line_number, canonical_left, canonical_right))
             before = before[-3:]
 
 
 def compare_runs(
     anchor: QemuRunMetadata, current: QemuRunMetadata
 ) -> Tuple[bool, List[str]]:
-    """Compare exact artifacts and timestamp-stripped logs."""
+    """Compare exact artifacts and the INFO logs under the canonical policy."""
     passed = True
     report: List[str] = []
     if anchor.kind is not current.kind:
@@ -969,12 +946,12 @@ def compare_runs(
                 )
             )
 
-    # Normalize only the documented host-physical fields above. Any remaining
-    # INFO difference is canonical execution evidence and must fail the repeat,
-    # even when the VM artifacts happen to be byte-identical. In particular, a
-    # difference that begins during Python startup can propagate into virtual
-    # clock values and the QEMU execution; its origin does not make the later
-    # guest-visible log evidence optional.
+    # Compare the logs under the canonical policy only (see HOST_ADDR_RE). Any
+    # remaining INFO difference, a guest address included, is execution
+    # evidence and must fail the repeat, even when the VM artifacts happen to be
+    # byte-identical. In particular, a difference that begins during Python
+    # startup can propagate into virtual clock values and the QEMU execution;
+    # its origin does not make the later guest-visible log evidence optional.
     anchor_log = anchor.info_log
     current_log = current.info_log
     if (
@@ -987,17 +964,17 @@ def compare_runs(
         if difference:
             passed = False
             report.append(
-                "WARN: Hermit INFO log differs from first run after normalizing "
-                "wallclock timestamps, host inode numbers, and env-dependent guest "
-                "addresses; canonical repeat verification failed\n{}".format(
+                "WARN: Hermit INFO log differs from first run with only the "
+                "wall-clock prefix removed and Hermit-marked host addresses "
+                "numbered; canonical repeat verification failed\n{}".format(
                     difference
                 )
             )
         else:
             report.append(
-                "PASS: exact Hermit log matches first run after normalizing "
-                "wallclock timestamps, host inode numbers, and env-dependent "
-                "guest addresses"
+                "PASS: Hermit INFO log matches first run exactly apart from the "
+                "wall-clock prefix (Hermit-marked host addresses compared by "
+                "first appearance)"
             )
     else:
         passed = False
