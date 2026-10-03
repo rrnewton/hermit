@@ -69,6 +69,10 @@ pub enum NetworkProgressV4 {
     },
     /// Final local incarnation retirement. Prior progress remains addressable.
     Retired,
+    /// A completed consuming SO_ERROR query, even if later user copyout faults.
+    SocketErrorConsumed {
+        input_ordinal: u64,
+    },
 }
 
 /// One represented producer. Extra declared dependencies express known program
@@ -478,6 +482,7 @@ impl NetworkTraceV4 {
         let nodes = self.release_model.nodes();
         let channels: BTreeMap<_, _> = self.channels.iter().map(|c| (c.id, c)).collect();
         let mut input_nodes = vec![None; self.inputs.len()];
+        let mut error_producers = BTreeMap::new();
         let mut edges = BTreeSet::new();
         for (n, node) in nodes.iter().enumerate() {
             if node.id.0 != n as u64 {
@@ -718,6 +723,18 @@ impl NetworkTraceV4 {
                                 _ => return Err(Invalid::InvalidProgress),
                             }
                         }
+                        NetworkProgressV4::SocketErrorConsumed { input_ordinal } => {
+                            let i = index(*input_ordinal, self.inputs.len())?;
+                            if self.inputs[i].channel != *channel
+                                || !matches!(self.inputs[i].event, NetworkInputKindV2::SocketErrorRead { .. })
+                                || error_producers.insert(*input_ordinal, n).is_some()
+                                || input_nodes[i].and_then(|input| input.checked_add(1)) != Some(n)
+                                || node.prerequisites != [NetworkReleaseNodeIdV4(input_nodes[i].unwrap() as u64)]
+                            {
+                                return Err(Invalid::InvalidProgress);
+                            }
+                            edges.insert((input_nodes[i].unwrap(), n));
+                        }
                         NetworkProgressV4::Retired => {
                             state.retired = Some(n);
                         }
@@ -730,6 +747,10 @@ impl NetworkTraceV4 {
         // Coverage is mandatory even when no input advertises an output as a
         // prerequisite. Otherwise omitted producers could hide after retirement.
         if output_producers.iter().any(Option::is_none) {
+            return Err(Invalid::MissingProducer);
+        }
+        if self.inputs.iter().any(|input| matches!(input.event, NetworkInputKindV2::SocketErrorRead { .. })
+            && !error_producers.contains_key(&input.ordinal)) {
             return Err(Invalid::MissingProducer);
         }
         let mut previous_output = BTreeMap::new();
@@ -892,6 +913,7 @@ fn frontier_key(milestone: &NetworkProgressV4) -> (u8, u64) {
         NetworkProgressV4::LocalShutdown { output_ordinal }
         | NetworkProgressV4::OutputError { output_ordinal } => (3, *output_ordinal),
         NetworkProgressV4::Retired => (4, 0),
+        NetworkProgressV4::SocketErrorConsumed { .. } => (5, 0),
     }
 }
 

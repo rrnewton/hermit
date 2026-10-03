@@ -1472,6 +1472,16 @@ struct SocketControlPhysical {
     )>,
     shutdown_pending: Option<NetworkShutdownV2>,
     transmit_pending: Option<NativeTransmitPending>,
+    socket_error: Option<SocketErrorRead>,
+}
+
+/// Retained across the consuming native query and subsequent user copyout.
+#[derive(Debug, Clone)]
+struct SocketErrorRead {
+    entry: Option<(std::sync::Arc<crate::network_runtime::ForegroundRoot>, u64,
+        detcore_model::network_trace::NetworkReleaseV4)>,
+    consumed_prefix: u64,
+    confirmed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1496,6 +1506,7 @@ impl SocketControlPhysical {
             && self.option_pending.is_none()
             && self.shutdown_pending.is_none()
             && self.transmit_pending.is_none()
+            && self.socket_error.is_none()
             && self.descriptor_released != Some(true)
     }
 }
@@ -1656,6 +1667,7 @@ impl NetworkReplayEngine {
         if control.physical.pending.is_some()
             || control.physical.descriptor_released.is_some()
             || control.physical.shutdown_pending.is_some()
+            || control.physical.socket_error.is_some()
         {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
@@ -1718,7 +1730,8 @@ impl NetworkReplayEngine {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
         match disposition {
-            NetworkSocketControlFinish::ErrorTaken => {
+            NetworkSocketControlFinish::ErrorTaken
+                if !control.physical.socket_error.as_ref().is_some_and(|read| read.confirmed) => {
                 return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
             }
             NetworkSocketControlFinish::Unchanged if !control.physical.can_release_unchanged() => {
@@ -1726,6 +1739,7 @@ impl NetworkReplayEngine {
             }
             NetworkSocketControlFinish::Closed { .. }
                 if control.physical.pending.is_some()
+                    || control.physical.socket_error.is_some()
                     || control.physical.descriptor_released != Some(true) =>
             {
                 return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
@@ -5798,7 +5812,8 @@ impl ChannelState {
             // V4's typed release applies this state without enqueuing another
             // Connect result. Legacy validators reject it before reaching here.
             NetworkInputKindV2::ConnectEstablished
-            | NetworkInputKindV2::RawTcpPollState { .. } => unreachable!("V4-only state input"),
+            | NetworkInputKindV2::RawTcpPollState { .. }
+            | NetworkInputKindV2::SocketErrorRead { .. } => unreachable!("V4-only state input"),
         }
         self.refresh_readiness();
     }

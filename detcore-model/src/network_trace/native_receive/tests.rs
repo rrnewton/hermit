@@ -4,6 +4,68 @@ use chrono::TimeZone;
 
 use super::*;
 
+#[test]
+fn socket_error_read_preserves_zero_nonzero_and_v4_only_framing() {
+    let mut trace = empty();
+    add_channel(&mut trace, 1, false);
+    input(&mut trace, 1,
+        NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected), &[]);
+    progress(&mut trace, 1, NetworkProgressV4::Established {
+        source: NetworkEstablishmentV4::ConnectedInput { input_ordinal: 0 },
+    }, &[0]);
+    for errno in [libc::ECONNRESET, 0, 0] {
+        let cut = NetworkReceiveEntryCutV4(nodes(&mut trace).len() as u64);
+        let prerequisites: Vec<_> = trace.entry_frontier(cut).unwrap().iter().map(|id| id.0).collect();
+        let ordinal = trace.inputs.len() as u64;
+        input(&mut trace, 1, NetworkInputKindV2::SocketErrorRead {
+            consumed_prefix: 0, errno,
+        }, &prerequisites);
+        progress(&mut trace, 1, NetworkProgressV4::SocketErrorConsumed { input_ordinal: ordinal }, &[cut.0]);
+    }
+    trace.validate().unwrap();
+    let mut bytes = Vec::new();
+    trace.write_framed(&mut bytes).unwrap();
+    assert_eq!(NetworkTraceV4::read_framed(Cursor::new(bytes)).unwrap(), trace);
+    let legacy = NetworkTraceV2 {
+        epoch: trace.epoch, channels: trace.channels.clone(), outputs: vec![],
+        inputs: trace.inputs.iter().map(|input| NetworkInputEventV2 {
+            ordinal: input.ordinal, channel: input.channel, event: input.event.clone(),
+            release: NetworkReleaseV2 { not_before_global_time: trace.epoch_global_time().unwrap(),
+                after_transmitted_offset: 0 },
+        }).collect(),
+    };
+    assert_eq!(legacy.validate(), Err(NetworkTraceValidationError::InvalidChannelRelationship));
+    for (consumed_prefix, errno) in [(1, 0), (0, -1), (0, 4096)] {
+        let mut invalid = trace.clone();
+        invalid.inputs[1].event = NetworkInputKindV2::SocketErrorRead { consumed_prefix, errno };
+        assert_eq!(invalid.validate(), Err(Invalid::Payload(NetworkTraceValidationError::InvalidChannelRelationship)));
+    }
+    let mut changed_frontier = trace.clone();
+    changed_frontier.inputs[1].release.prerequisites.clear();
+    nodes(&mut changed_frontier)[2].prerequisites.clear();
+    assert_eq!(changed_frontier.validate(), Err(Invalid::InvalidEntryFrontier));
+    let mut missing = trace.clone();
+    nodes(&mut missing).pop();
+    assert_eq!(missing.validate(), Err(Invalid::MissingProducer));
+    let mut duplicate = trace.clone();
+    let last = duplicate.inputs.len() as u64 - 1;
+    progress(&mut duplicate, 1, NetworkProgressV4::SocketErrorConsumed { input_ordinal: last }, &[]);
+    assert_eq!(duplicate.validate(), Err(Invalid::InvalidProgress));
+    // Delaying the completion past another input would let its entry cut omit
+    // the consuming read. Input and its completion are one recorder transaction.
+    let mut delayed = empty();
+    add_channel(&mut delayed, 1, false);
+    input(&mut delayed, 1,
+        NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected), &[]);
+    progress(&mut delayed, 1, NetworkProgressV4::Established {
+        source: NetworkEstablishmentV4::ConnectedInput { input_ordinal: 0 },
+    }, &[0]);
+    input(&mut delayed, 1, NetworkInputKindV2::SocketErrorRead { consumed_prefix: 0, errno: 0 }, &[1]);
+    input(&mut delayed, 1, NetworkInputKindV2::RawTcpPollState { consumed_prefix: 0, revents: libc::POLLOUT }, &[1]);
+    progress(&mut delayed, 1, NetworkProgressV4::SocketErrorConsumed { input_ordinal: 1 }, &[2]);
+    assert_eq!(delayed.validate(), Err(Invalid::InvalidProgress));
+}
+
 fn profile() -> FreshStreamSocketProfileV3 {
     FreshStreamSocketProfileV3 {
         key: StreamSocketKeyV3 {

@@ -3043,6 +3043,7 @@ impl GlobalTool for GlobalState {
                 | NetworkRequest::BeginShadowProbe { .. }
                 | NetworkRequest::SubmitStreamPhysical { .. }
                 | NetworkRequest::ConfirmStreamPhysical { .. }
+                | NetworkRequest::TakeSocketError { .. }
                 | NetworkRequest::CompleteShadowProbe { .. }
                 | NetworkRequest::ReserveStreamCallChunk { .. }
                 | NetworkRequest::ZeroStreamReceive { .. }
@@ -5585,6 +5586,22 @@ impl GlobalState {
                         )));
                     }
                 }
+                let socket_error_root = if matches!(&request,
+                    NetworkRequest::SubmitStreamPhysical {
+                        effect: NetworkStreamPhysicalEffect::ReadSocketError, ..
+                    } | NetworkRequest::ConfirmStreamPhysical {
+                        result: NetworkStreamPhysicalResult::SocketError(_), ..
+                    }) {
+                    let root = self.network_runtime.as_ref()
+                        .ok_or_else(|| std::io::Error::other("SO_ERROR lacks native runtime"))
+                        .and_then(|runtime| runtime.foreground_root(owner));
+                    match root {
+                        Ok(root) if self.cfg.sequentialize_threads => Some(root),
+                        _ => return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                            "SO_ERROR lacks its sequential foreground root",
+                        ))),
+                    }
+                } else { None };
                 // Obtain only an Arc under engine, then drop that guard before
                 // taking metadata. Revalidate below after reacquiring engine:
                 // lookup/upgrade alone never authorizes a reader.
@@ -5900,6 +5917,25 @@ impl GlobalState {
                             }
                             Ok(NetworkReply::ShadowProbe(probe))
                         }),
+                    NetworkRequest::SubmitStreamPhysical {
+                        lease, effect: NetworkStreamPhysicalEffect::ReadSocketError,
+                    } => (|| {
+                        let root = socket_error_root.as_ref().expect("SO_ERROR root");
+                        let grant = sched.foreground_native_observation(owner, root)
+                            .map_err(|e| NetworkReplayError::FdPublicationProtocol(e.to_string()))?;
+                        engine.submit_socket_error_read(owner, *lease, root, &grant, observed_at)
+                    })().map(|()| NetworkReply::Unit),
+                    NetworkRequest::ConfirmStreamPhysical {
+                        lease, result: NetworkStreamPhysicalResult::SocketError(errno),
+                    } => (|| {
+                        let root = socket_error_root.as_ref().expect("SO_ERROR root");
+                        let grant = sched.foreground_native_observation(owner, root)
+                            .map_err(|e| NetworkReplayError::FdPublicationProtocol(e.to_string()))?;
+                        engine.confirm_socket_error_read(owner, *lease, root, &grant, observed_at, *errno)
+                    })().map(|()| NetworkReply::Unit),
+                    NetworkRequest::TakeSocketError { lease } => engine
+                        .take_replay_socket_error(owner, *lease, observed_at)
+                        .map(NetworkReply::SocketError),
                     NetworkRequest::SubmitStreamPhysical { lease, effect } => engine
                         .submit_stream_physical(owner, *lease, effect.clone())
                         .map(|()| NetworkReply::Unit),
@@ -6296,6 +6332,7 @@ impl GlobalState {
             | NetworkRequest::BeginShadowProbe { .. }
             | NetworkRequest::SubmitStreamPhysical { .. }
             | NetworkRequest::ConfirmStreamPhysical { .. }
+            | NetworkRequest::TakeSocketError { .. }
             | NetworkRequest::CompleteShadowProbe { .. }
             | NetworkRequest::ReserveStreamCallChunk { .. }
             | NetworkRequest::ZeroStreamReceive { .. }
@@ -6687,6 +6724,11 @@ pub enum NetworkRequest {
         lease: NetworkStreamLeaseId,
         /// Known completion, distinct from future destruction.
         disposition: NetworkSocketControlFinish,
+    },
+    /// Consume exactly one eligible V4 SO_ERROR result without a native query.
+    TakeSocketError {
+        /// Existing task/MM-owned short socket control.
+        lease: NetworkStreamLeaseId,
     },
     /// Allocate an active-call reference before physical host pin acquisition.
     BeginStreamCall {
@@ -7157,6 +7199,8 @@ pub enum NetworkReply {
     StreamSocketState(Option<NetworkStreamSocketState>),
     /// One short control with its exact admission snapshot.
     SocketControl(NetworkSocketControl),
+    /// Actual recorded SO_ERROR scalar, including zero.
+    SocketError(i32),
     /// Current table/OFD read authority, or exact prior-prefix recovery.
     FdRead(crate::network_replay::NetworkFdReadBegin),
     /// Atomic sorted set of controls and their admission snapshots.

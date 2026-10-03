@@ -7,6 +7,7 @@ mod scalar_recvfrom;
 mod raw_poll;
 mod sendto_entry;
 mod native_source_read;
+mod socket_error;
 
 use std::cell::Cell;
 use std::io::IoSlice;
@@ -3777,6 +3778,8 @@ struct ScalarForegroundGuest<'a> {
     // old fixtures keep the production provider-controller refusal unchanged.
     controlled_retry_call: Option<NetworkStreamCallId>,
     record_timer_arrival: Option<(std::os::unix::net::UnixStream, bool)>,
+    // Opt-in SO_ERROR ABI tests use real permission-respecting copies.
+    socket_error_access: bool,
 }
 impl ScalarForegroundGuest<'_> {
     fn enable_record_timer(&mut self) {
@@ -3793,9 +3796,16 @@ struct ScalarForegroundMemory {
     checked: Cell<bool>,
     events: Arc<Mutex<Vec<&'static str>>>,
     timer: Option<usize>,
+    socket_error_access: bool,
 }
 impl MemoryAccess for ScalarForegroundMemory {
-    fn read_vectored(&self, _: &[IoSlice], _: &mut [IoSliceMut]) -> Result<usize, Errno> {
+    fn read_vectored(&self, remote: &[IoSlice], local: &mut [IoSliceMut]) -> Result<usize, Errno> {
+        if self.socket_error_access {
+            self.events.lock().unwrap().push("socket-error-read");
+            return Errno::result(unsafe { libc::process_vm_readv(self.tid,
+                local.as_ptr().cast(), local.len() as _, remote.as_ptr().cast(), remote.len() as _, 0) })
+                .map(|n| n as usize);
+        }
         panic!("V4 scalar dispatcher used an ordinary memory read")
     }
     fn write_vectored(
@@ -3803,6 +3813,12 @@ impl MemoryAccess for ScalarForegroundMemory {
         local: &[IoSlice],
         remote: &mut [IoSliceMut],
     ) -> Result<usize, Errno> {
+        if self.socket_error_access {
+            self.events.lock().unwrap().push("socket-error-write");
+            return Errno::result(unsafe { libc::process_vm_writev(self.tid,
+                local.as_ptr().cast(), local.len() as _, remote.as_ptr().cast(), remote.len() as _, 0) })
+                .map(|n| n as usize);
+        }
         let size = std::mem::size_of::<libc::timespec>();
         let slot = self
             .timer
@@ -3994,6 +4010,7 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
             checked: Cell::new(false),
             events: self.memory_events.clone(),
             timer: self.record_timer_slot(),
+            socket_error_access: self.socket_error_access,
         }
     }
     fn thread_state(&self) -> &crate::ThreadState<()> {
@@ -4098,6 +4115,7 @@ fn scalar_foreground_guest<'a>(
         record_timer_eintr: false,
         controlled_retry_call: None,
         record_timer_arrival: None,
+        socket_error_access: false,
     }
 }
 

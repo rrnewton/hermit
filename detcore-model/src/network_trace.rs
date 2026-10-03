@@ -769,6 +769,9 @@ pub enum NetworkInputKindV2 {
     /// V4-only complete poll(0) state at an observed consumed-byte cut.
     /// Repeated inspection does not consume the state. Zero replaces old bits.
     RawTcpPollState { consumed_prefix: u64, revents: i16 },
+    /// V4-only consuming SO_ERROR read, including the meaningful zero result.
+    /// This is control input, not a failed receive or a terminal stream event.
+    SocketErrorRead { consumed_prefix: u64, errno: i32 },
 }
 
 /// One globally ordered observation with schedule-independent release gates.
@@ -1454,6 +1457,7 @@ impl NetworkTraceV2 {
             connect_seen: bool,
             connect_in_progress: bool,
             last_poll_cut: Option<u64>,
+            last_error_read_cut: Option<u64>,
         }
         let mut progress: BTreeMap<_, Progress> = channels
             .keys()
@@ -1559,7 +1563,8 @@ impl NetworkTraceV2 {
             state.last_release_time = Some(input.release.not_before_global_time);
             state.last_release_output = input.release.after_transmitted_offset;
             if state.input_terminal && !matches!(input.event,
-                NetworkInputKindV2::Readiness(_) | NetworkInputKindV2::RawTcpPollState { .. }) {
+                NetworkInputKindV2::Readiness(_) | NetworkInputKindV2::RawTcpPollState { .. }
+                    | NetworkInputKindV2::SocketErrorRead { .. }) {
                 return Err(NetworkTraceValidationError::EventAfterTerminal);
             }
             match &input.event {
@@ -1595,6 +1600,17 @@ impl NetworkTraceV2 {
                         return Err(NetworkTraceValidationError::InvalidChannelRelationship);
                     }
                     state.last_poll_cut = Some(*consumed_prefix);
+                }
+                NetworkInputKindV2::SocketErrorRead { consumed_prefix, errno } => {
+                    if !early_connect || channel.transport != NetworkTransportV2::Tcp
+                        || channel.role != NetworkEndpointRoleV2::OutboundClient
+                        || !(0..=4095).contains(errno)
+                        || !state.connect_seen || state.connect_in_progress
+                        || *consumed_prefix > state.input_offset
+                        || state.last_error_read_cut.is_some_and(|cut| *consumed_prefix < cut) {
+                        return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                    }
+                    state.last_error_read_cut = Some(*consumed_prefix);
                 }
                 NetworkInputKindV2::Accept {
                     accepted,

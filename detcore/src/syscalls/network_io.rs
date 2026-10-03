@@ -5966,16 +5966,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                     bytes
                 }
                 libc::SO_ERROR => {
-                    took_error = true;
-                    let errno = if let Some(errno) = control.pending_error {
-                        errno
-                    } else if guest.config().network_trace.policy == NetworkPolicy::Record {
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-3464): consuming V4 SO_ERROR control input.
+                    // https://github.com/rrnewton/hermit/pull/3464
+                    let errno = if guest.config().network_trace.policy == NetworkPolicy::Record {
                         self.shadow_submit(
                             guest,
                             control.lease,
                             NetworkStreamPhysicalEffect::ReadSocketError,
                         )
                         .await?;
+                        took_error = true;
                         let errno = read_socket_i32(guest, call.fd(), libc::SO_ERROR).await?;
                         self.shadow_confirm(
                             guest,
@@ -5985,7 +5986,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .await?;
                         errno
                     } else {
-                        0
+                        let reply = network_request(guest, NetworkRequest::TakeSocketError {
+                            lease: control.lease,
+                        }).await.map_err(engine_rpc_error)?;
+                        let NetworkReply::SocketError(errno) = reply else {
+                            return Err(engine_error("unexpected SO_ERROR replay response"));
+                        };
+                        took_error = true;
+                        errno
                     };
                     errno.to_ne_bytes().to_vec()
                 }
