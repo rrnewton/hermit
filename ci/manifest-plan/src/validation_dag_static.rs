@@ -535,7 +535,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci` over this node's selection measured 834
     // at 5c4251450a21, and the full validation of c1312a563dc5, which has the
     // first four, ran 832.
-    ("test.regular_crates", 834),
+    // The falling- and flat-history cgroup CPU tests add three identities and
+    // remove one, so 833 of the 834 prior identities are retained and the
+    // count rises by two:
+    // cpu_evidence::tests::a_falling_cgroup_history_is_refused_by_every_reader,
+    // a_flat_cgroup_history_keeps_distinct_high_water_and_last_points, and
+    // each_live_source_is_named_and_a_cgroup_last_sample_cannot_fall_below_its_high_water,
+    // which replaces each_live_source_is_named_and_the_cgroup_counter_cannot_fall
+    // under a name that says what it checks. `cargo nextest list --profile ci
+    // -p hermit-manifest-plan` measured the +2 against 4773cd0aad80; no other
+    // selected crate changes.
+    ("test.regular_crates", 836),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -976,7 +986,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three fold-5 replay-variant tests retain all 825 prior identities.
     // The six later cpu_evidence, glibc_compat and runner tests listed for
     // test.regular_crates retain all 828 prior identities.
-    ("test.regular_crates_on_host", 834),
+    // The falling- and flat-history cgroup CPU tests listed for
+    // test.regular_crates retain 833 of the 834 prior identities (+2).
+    ("test.regular_crates_on_host", 836),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
