@@ -540,7 +540,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_rr_variant_keeps_the_rr_lane_programs_and_gates_only_those_that_replay,
     // which pins that variant at the retired lane's 139 programs, retain all 825
     // prior identities.
-    ("test.regular_crates", 828),
+    // validation_dag::tests::committed_buck_e2e_selection_replaces_22_nodes_with_18,
+    // added with the full-buck-e2e label (Buck as the E2E runner), retains all
+    // 828 prior identities.
+    ("test.regular_crates", 829),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -963,7 +966,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // fold-3 run-type tests retain all 819.
     // The three fold-4 variant tests retain all 822 prior identities.
     // The three fold-5 replay-variant tests retain all 825 prior identities.
-    ("test.regular_crates_on_host", 828),
+    // committed_buck_e2e_selection_replaces_22_nodes_with_18 retains all 828.
+    ("test.regular_crates_on_host", 829),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
