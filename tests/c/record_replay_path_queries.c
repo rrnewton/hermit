@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -56,6 +57,63 @@ static long create(const char* path) {
   return fd < 0 ? -1 : 0;
 }
 
+// Send fd over a socketpair with SCM_RIGHTS, close the original and return
+// the received copy, or -1.
+static int receive_passed_fd(int fd) {
+  int pair[2];
+  if (fd < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    return -1;
+  }
+  char byte = 'x';
+  struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+  union {
+    struct cmsghdr header;
+    char buffer[CMSG_SPACE(sizeof(int))];
+  } control;
+  memset(&control, 0, sizeof(control));
+  struct msghdr message = {
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+      .msg_control = control.buffer,
+      .msg_controllen = sizeof(control.buffer)};
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&message);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+  int received = -1;
+  if (sendmsg(pair[0], &message, 0) == 1) {
+    memset(&control, 0, sizeof(control));
+    message.msg_controllen = sizeof(control.buffer);
+    if (recvmsg(pair[1], &message, 0) == 1 &&
+        (cmsg = CMSG_FIRSTHDR(&message)) != NULL &&
+        cmsg->cmsg_type == SCM_RIGHTS) {
+      memcpy(&received, CMSG_DATA(cmsg), sizeof(int));
+    }
+  }
+  close(fd);
+  close(pair[0]);
+  close(pair[1]);
+  return received;
+}
+
+// Enter a directory and remove it, then fchdir back into it. The fchdir
+// succeeds on Linux, but the resulting working directory has no name; the
+// recorder must refuse rather than record procfs's "<dir> (deleted)" text.
+static int removed_cwd(void) {
+  char dir[] = "/tmp/hermit-rr-removed-cwd.XXXXXX";
+  if (mkdtemp(dir) == NULL) {
+    perror("mkdtemp");
+    return 1;
+  }
+  int dirfd = open(dir, O_RDONLY | O_DIRECTORY);
+  expect("chdir_removed", syscall(SYS_chdir, dir), 0);
+  expect("rmdir_removed", syscall(SYS_rmdir, dir), 0);
+  expect("fchdir_removed", syscall(SYS_fchdir, dirfd), 0);
+  printf("removed-cwd-recorded failures=%d\n", failures);
+  return 0;
+}
+
 // The directories under the argument exist on the host but not in the replay
 // chroot. Replay must still move its working directory there, or both rounds
 // of relative mutations land in one stale directory and the second link
@@ -76,10 +134,11 @@ static void host_directory_rounds(const char* base) {
   // fchdir back into the first host directory: its "f" must be reachable
   // relative to the restored working directory.
   snprintf(path, sizeof(path), "%s/first", base);
-  // Without O_DIRECTORY the replayed open yields a placeholder descriptor,
+  // Pass the directory descriptor through SCM_RIGHTS: replay reproduces the
+  // received descriptor as a placeholder, not a directory in the replay root,
   // so replay cannot fchdir through the descriptor itself.
-  int dirfd = open(path, O_RDONLY);
-  expect("open_host_dir", dirfd < 0 ? -1 : 0, 0);
+  int dirfd = receive_passed_fd(open(path, O_RDONLY | O_DIRECTORY));
+  expect("passed_host_dir", dirfd < 0 ? -1 : 0, 0);
   // Leave from second after giving it an "x" linked to "y": a replayed fchdir
   // that left the working directory there would collide on first's own link.
   snprintf(path, sizeof(path), "%s/second", base);
@@ -132,6 +191,9 @@ static void host_directory_rounds(const char* base) {
 }
 
 int main(int argc, char** argv) {
+  if (argc > 1 && strcmp(argv[1], "--removed-cwd") == 0) {
+    return removed_cwd();
+  }
   expect("access_passwd_r", syscall(SYS_access, "/etc/passwd", R_OK), 0);
   expect(
       "faccessat_passwd_r",

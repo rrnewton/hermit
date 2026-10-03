@@ -2193,6 +2193,50 @@ fn record_path_queries_and_legacy_mutations() {
     );
 }
 
+/// A working directory that was removed has no path: procfs names it
+/// "<dir> (deleted)", which is not a directory replay could enter. Recording
+/// must refuse such an fchdir loudly rather than store that text.
+#[test]
+fn record_refuses_a_removed_working_directory() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let guest = workload("c_record_replay_path_queries");
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path)
+        .arg("--removed-cwd");
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start removed-cwd recording: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "removed-cwd recording hung: {rendered}"
+    );
+    assert!(
+        !output.status.success(),
+        "removed-cwd recording reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has been removed"),
+        "removed-cwd recording did not name the removed directory:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("removed-cwd-recorded"),
+        "removed-cwd guest ran past the refused fchdir: {stdout}"
+    );
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
