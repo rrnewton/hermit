@@ -189,8 +189,9 @@ fn actors(
         let row = array(row, 7)?;
         let before = number(&row[4])?;
         let after = number(&row[5])?;
+        let expected_cgroup = format!("/sys/fs/cgroup/system.slice/{}", old.unit);
         require(
-            old.cgroup == PathBuf::from(format!("/sys/fs/cgroup/system.slice/{}", old.unit)),
+            old.cgroup == Path::new(&expected_cgroup),
             "accepted-only original actor cgroup profile differs",
         )?;
         require(
