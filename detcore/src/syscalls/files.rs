@@ -3783,7 +3783,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => call,
         };
         let statptr: StatPtr = StatPtr(stack.reserve());
-        let _guard = stack.commit()?;
+        let _guard = match stack.commit() {
+            Ok(guard) => guard,
+            // The lookup buffer only serves the virtual update, so a scratch
+            // stack that cannot hold it, for example one next to the guard
+            // page, must not keep the guest's own call from reaching Linux.
+            Err(_) if staged.is_none() => {
+                info!(
+                    "Guest stack scratch cannot hold the utimensat target lookup; \
+                     leaving the virtual mtime unchanged."
+                );
+                return self.record_or_replay(guest, call).await;
+            }
+            Err(errno) => return Err(errno),
+        };
 
         if !guest.config().virtualize_metadata {
             return self.record_or_replay(guest, call).await;
@@ -3822,34 +3835,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         // sequentialization another guest thread can rename, unlink or replace
         // the target, or dup2 over the descriptor, around the call; the target
         // is resolved before and after it, and the update is skipped unless
-        // both name the same file.
+        // both name the same file. Equal lookups alone do not show that the
+        // kernel updated that file: the name may have been swapped away and
+        // back during the call, an inode number reused, or the guest's
+        // `times` buffer rewritten after it was read here. So an explicit
+        // mtime is copied only when the file holds it, truncated to the
+        // filesystem's granularity, and the virtual mtime takes the value the
+        // kernel stored, which is what stat reports on Linux. `UTIME_NOW` has
+        // no such witness. With thread sequentialization, the default and
+        // required by --strict, no other guest thread runs during the call.
         let (Some(mtime), Some(before)) = (mtime, before) else {
             return Ok(res);
         };
-        if self.utimensat_target(guest, &call, statptr).await != Some(before) {
+        let Some(after) = self.utimensat_target(guest, &call, statptr).await else {
+            return Ok(res);
+        };
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {
             return Ok(res);
         }
-        let (_, raw_ino) = before;
         if mtime.tv_nsec == libc::UTIME_NOW {
-            touch_file(guest, raw_ino).await;
-        } else {
-            let nanos = i128::from(mtime.tv_sec) * 1_000_000_000 + i128::from(mtime.tv_nsec);
-            let nanos = u64::try_from(nanos.max(0)).unwrap_or(u64::MAX);
-            set_file_mtime(guest, raw_ino, LogicalTime::from_nanos(nanos)).await;
+            touch_file(guest, after.st_ino).await;
+            return Ok(res);
+        }
+        const NANOS_PER_SEC: i128 = 1_000_000_000;
+        let requested = i128::from(mtime.tv_sec) * NANOS_PER_SEC + i128::from(mtime.tv_nsec);
+        let stored = i128::from(after.st_mtime) * NANOS_PER_SEC + i128::from(after.st_mtime_nsec);
+        // Linux truncates the requested time down to the filesystem's
+        // granularity, at most a second on the filesystems builds use.
+        if (0..NANOS_PER_SEC).contains(&(requested - stored)) {
+            let nanos = u64::try_from(stored.max(0)).unwrap_or(u64::MAX);
+            set_file_mtime(guest, after.st_ino, LogicalTime::from_nanos(nanos)).await;
         }
         Ok(res)
     }
 
-    /// The device and raw inode of the file a utimensat call targets, with the
-    /// same target selection: the descriptor itself for `futimens` (a NULL
-    /// path), else a path walk honoring the flags utimensat accepts. `None` if
-    /// the lookup fails.
+    /// The metadata of the file a utimensat call targets, with the same target
+    /// selection: the descriptor itself for `futimens` (a NULL path), else a
+    /// path walk honoring the flags utimensat accepts. `None` if the lookup
+    /// fails.
     async fn utimensat_target<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: &syscalls::Utimensat,
         statptr: StatPtr<'_>,
-    ) -> Option<(u64, RawInode)> {
+    ) -> Option<libc::stat> {
         let lookup = match call.path() {
             None => Syscall::Fstat(
                 syscalls::Fstat::new()
@@ -3868,8 +3897,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
         self.record_or_replay(guest, lookup).await.ok()?;
-        let stat = statptr.read(&guest.memory()).ok()?;
-        Some((stat.st_dev, stat.st_ino))
+        statptr.read(&guest.memory()).ok()
     }
 
     /// socket system call.
