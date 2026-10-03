@@ -278,3 +278,6 @@ async fn shared_capture_actual_failed_acquisition_cannot_confirm_success() {
     );
     assert!(e.finish().is_err());
 }
+
+#[path = "record_probe_tests.rs"]
+mod record_probe_tests;

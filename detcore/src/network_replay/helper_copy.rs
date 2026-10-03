@@ -396,3 +396,35 @@ mod tests {
         );
     }
 }
+
+impl NetworkReplayEngine {
+    /// Explicit shared-Record adapter. The legacy binder above remains strict.
+    pub(crate) fn bind_shared_helper_copy(
+        &mut self,
+        binding: Arc<HelperCopyBinding>,
+        step: &Arc<shared_waits::SharedEffectIdentity>,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_shared_record_effect(step)?;
+        let origin = step.origin();
+        let state = self
+            .stream_calls
+            .get(&origin.call())
+            .ok_or(NetworkReplayError::UnknownStreamCall(origin.call()))?;
+        if state.helper_copy.is_some()
+            || binding.owner() != origin.owner()
+            || binding.call() != origin.call()
+            || binding.lease() != origin.lease()
+            || binding.effect() != step.effect()
+            || !matches!(step.effect(), NetworkStreamPhysicalEffect::Peek { .. })
+        {
+            return Err(NetworkReplayError::UnresolvedStreamOperation(
+                origin.lease(),
+            ));
+        }
+        self.stream_calls
+            .get_mut(&origin.call())
+            .unwrap()
+            .helper_copy = Some(binding);
+        Ok(())
+    }
+}

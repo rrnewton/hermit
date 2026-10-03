@@ -13,6 +13,15 @@ pub(crate) use replay_store::SharedReplayNoStorePlan;
 pub(crate) use replay_store::SharedReplayReceivePlan;
 pub(crate) use replay_store::SharedReplaySource;
 
+#[path = "shared_waits/record_probe.rs"]
+mod record_probe;
+pub(crate) use record_probe::PreparedSharedEffect;
+pub(crate) use record_probe::SharedEffectIdentity;
+pub(crate) use record_probe::SharedProbeProgress;
+pub(crate) use record_probe::SharedRecordPollPublication;
+pub(crate) use record_probe::SharedRecordPollSource;
+pub(crate) use record_probe::SharedRecordProbe;
+
 #[path = "shared_waits/capture.rs"]
 mod capture;
 pub(crate) use capture::SharedCaptureOrigin;
@@ -136,6 +145,8 @@ pub(in crate::network_replay) struct SharedWait {
     phase: AttemptPhase,
     output: Option<replay_store::SharedOutput>,
     capture: Option<Arc<SharedCaptureOrigin>>,
+    record_probe: Option<record_probe::ProbeState>,
+    record_history: Vec<Arc<record_probe::RecordHistory>>,
 }
 #[derive(Debug, Clone)]
 enum AttemptPhase {
@@ -174,6 +185,7 @@ struct Completion {
 }
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
+    Record(Arc<record_probe::RecordHistory>),
     ReplayReceive {
         consumed: u64,
         generation: Option<u64>,
@@ -347,11 +359,12 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
         state: &StreamCallState,
     ) -> Result<(), NetworkReplayError> {
-        if state.capture_publication.is_some()
+        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(w)) if w.record_probe.is_some())
+            || state.capture_publication.is_some()
             || state.capture_control.is_some()
             || state.original.is_some()
             || state.helper_copy.is_some()
-            || !state.native_receive.is_empty()
+            || !self.shared_record_history_covers(state)
             || state.private_receive.is_some()
             || state.record_no_store.is_some()
             || state.no_store_completed
@@ -393,6 +406,15 @@ impl NetworkReplayEngine {
         exclude: Option<NetworkStreamCallId>,
         delivery: Option<NetworkStreamLeaseId>,
     ) -> Result<SharedCallCensus, NetworkReplayError> {
+        self.shared_call_census_with_record_probe(selected, exclude, delivery, None)
+    }
+    fn shared_call_census_with_record_probe(
+        &self,
+        selected: Option<NetworkStreamCallId>,
+        exclude: Option<NetworkStreamCallId>,
+        delivery: Option<NetworkStreamLeaseId>,
+        record: Option<&SharedRecordProbe>,
+    ) -> Result<SharedCallCensus, NetworkReplayError> {
         if !self.uses_shared_mm_attempts() || !self.fd_table_capability() {
             return Err(invalid("shared census lacks declared policy/table"));
         }
@@ -401,7 +423,9 @@ impl NetworkReplayEngine {
             .stream_operations
             .keys()
             .any(|lease| Some(*lease) != delivery)
-            || !self.shadow_probes.is_empty()
+            || self.shadow_probes.iter().any(|(lease, probe)| {
+                record.is_none_or(|r| *lease != r.lease() || probe.call != r.call())
+            })
             || self.stream_delivery.iter().any(|(file, lease)| {
                 Some(*lease) != delivery
                     || self
@@ -600,6 +624,8 @@ impl NetworkReplayEngine {
             intent,
             output: None,
             capture: None,
+            record_probe: None,
+            record_history: Vec::new(),
             phase: AttemptPhase::Active {
                 ordinal: 0,
                 epoch: grant.epoch(),
@@ -798,7 +824,7 @@ impl NetworkReplayEngine {
             || !admission.matches_selected(self, c.call)?
             || !self.shared_census_matches_grant(Some(c.call), None, grant)?
             || !Arc::ptr_eq(admission.root(), grant.root())
-            || self.replay_shared_wait_observation(c.call, wait, c.observed_at)? != c.observation
+            || !self.shared_completed_observation_matches(c.call, wait, c)?
         {
             return Err(invalid(
                 "shared suspension changed exact completed attempt/census",
@@ -950,6 +976,28 @@ impl NetworkReplayEngine {
         }
         let observed_ready = match &wait.intent {
             SharedWaitIntent::Receive(_) => None,
+            SharedWaitIntent::Poll(_) if self.mode() == NetworkEngineMode::Record => {
+                let AttemptPhase::Suspended { completed } = &wait.phase else {
+                    unreachable!("suspended phase checked above")
+                };
+                self.shared_wait_debts_settled(call, &self.stream_calls[&call])?;
+                self.validate_stream_call_lifetime(owner, call, wait.binding.open_file)?;
+                if completed.owner != owner
+                    || completed.call != call
+                    || completed.file != wait.binding.open_file
+                    || !matches!(completed.observation, Observation::Record(_))
+                    || !self.shared_completed_observation_matches(call, wait, completed)?
+                {
+                    return Err(invalid(
+                        "shared Record Poll lost its completed pending publication",
+                    ));
+                }
+                // This is the original positively pending attempt, not a fresh
+                // readiness observation. Generic modeled bytes or a historical
+                // mask cannot provide a new schedule-changing wake source.
+                // Fresh Record retry/wake requires its own replayed evidence.
+                Some(false)
+            }
             SharedWaitIntent::Poll(p) => Some(
                 self.shared_poll_sample(wait.binding.open_file)?
                     .is_some_and(|(_, raw)| p.ready(raw)),

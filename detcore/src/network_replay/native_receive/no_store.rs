@@ -34,10 +34,14 @@ impl RecordNoStore {
             .as_ref()
             .expect("checked canonical no-store source")
     }
+    pub(super) fn kind(&self) -> NoStoreReturn {
+        self.outcome
+    }
+
     pub(crate) fn observed(&self) -> &Observation {
         &self.observed
     }
-    fn checked(observed: &Observation) -> Result<Self, NetworkReplayError> {
+    pub(super) fn checked(observed: &Observation) -> Result<Self, NetworkReplayError> {
         let completion = observed
             .helper_copy
             .as_ref()

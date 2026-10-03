@@ -12,7 +12,7 @@ pub(in crate::network_replay) struct PrivateSource {
     pub(super) length: usize,
 }
 impl PrivateSource {
-    fn checked(completion: &HelperCopyCompletion) -> Result<Self, NetworkReplayError> {
+    pub(super) fn checked(completion: &HelperCopyCompletion) -> Result<Self, NetworkReplayError> {
         completion
             .joined_worker()
             .map_err(|error| invalid(&error.to_string()))?;
@@ -73,7 +73,7 @@ impl PrivateSource {
             length: returned,
         })
     }
-    fn check_overlap(&self, other: &Self) -> Result<(), NetworkReplayError> {
+    pub(super) fn check_overlap(&self, other: &Self) -> Result<(), NetworkReplayError> {
         let end = self
             .cut
             .bytes
@@ -209,7 +209,7 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
-    fn check_private_published_prefix(
+    pub(super) fn check_private_published_prefix(
         &self,
         probe: &ShadowProbeState,
         source: &PrivateSource,
@@ -270,6 +270,14 @@ impl NetworkReplayEngine {
         source: &PrivateSource,
     ) -> Result<(), NetworkReplayError> {
         let open_file = self.stream_call_open_file(owner, call)?;
+        self.check_private_receive_cut_for_file(open_file, source)
+    }
+
+    pub(super) fn check_private_receive_cut_for_file(
+        &self,
+        open_file: OpenFileId,
+        source: &PrivateSource,
+    ) -> Result<(), NetworkReplayError> {
         let origin = self
             .shadow
             .as_ref()

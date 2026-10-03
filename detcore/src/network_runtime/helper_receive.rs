@@ -832,7 +832,7 @@ impl RuntimeShared {
         lease: NetworkStreamLeaseId,
         effect: Effect,
     ) -> io::Result<NativeObservation> {
-        self.execute_helper_receive_inner(owner, lease, effect, None)
+        self.execute_helper_receive_inner(owner, lease, effect, None, None)
             .await
     }
 
@@ -848,6 +848,22 @@ impl RuntimeShared {
                 maximum: store.length(),
             },
             Some(full),
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_shared_helper_receive(
+        self: &Arc<Self>,
+        step: Arc<crate::network_replay::shared_waits::SharedEffectIdentity>,
+    ) -> io::Result<NativeObservation> {
+        let origin = step.origin();
+        self.execute_helper_receive_inner(
+            origin.owner(),
+            origin.lease(),
+            step.effect().clone(),
+            None,
+            Some(step),
         )
         .await
     }
@@ -858,6 +874,7 @@ impl RuntimeShared {
         lease: NetworkStreamLeaseId,
         effect: Effect,
         full: Option<crate::network_replay::FullStoreCompletion>,
+        shared_probe: Option<Arc<crate::network_replay::shared_waits::SharedEffectIdentity>>,
     ) -> io::Result<NativeObservation> {
         let controller = self
             .controller
@@ -873,12 +890,24 @@ impl RuntimeShared {
         let worker_quarantine = quarantine.clone();
         let worker_effect = effect.clone();
         let owner_task = self.physical.lock().unwrap().get(owner)?.try_clone()?;
+        let (shared_permit, shared_entered) = if shared_probe.is_some() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let worker_probe = shared_probe.clone();
         let (worker, receive) = self.start_native_worker_with_quarantine(
             executor,
             None,
             false,
             Some(quarantine.clone()),
             move || {
+                if let Some(entered) = shared_entered {
+                    entered
+                        .recv()
+                        .map_err(|_| io::Error::other("shared Peek was never armed"))?;
+                }
                 let effect = worker_effect;
                 let work = shared.native_streams.lock().unwrap().prepare_with_store(
                     owner,
@@ -901,6 +930,10 @@ impl RuntimeShared {
                     if let Some(full) = &full {
                         engine
                             .bind_private_drain_helper(full, held.binding())
+                            .map_err(io::Error::other)?;
+                    } else if let Some(step) = &worker_probe {
+                        engine
+                            .bind_shared_helper_copy(held.binding(), step)
                             .map_err(io::Error::other)?;
                     } else {
                         engine
@@ -936,6 +969,12 @@ impl RuntimeShared {
                 result
             },
         )?;
+        if let (Some(step), Some(permit)) = (&shared_probe, shared_permit) {
+            self.arm_shared_effect(step, &worker)?;
+            permit
+                .send(())
+                .map_err(|_| io::Error::other("shared Peek lost gated worker"))?;
+        }
         let result = receive.await.map_err(io::Error::other)?;
         // Failure was delivered before the same worker parks. Awaiting that
         // handle here would prevent the caller reaching bounded shutdown.

@@ -759,3 +759,58 @@ impl Scheduler {
         assert!(self.terminal_deadlock.is_none());
     }
 }
+
+#[cfg(test)]
+impl Scheduler {
+    /// Exercise the real registration and maintenance lookups. The engine's
+    /// generic readiness is a deliberately conflicting controlled premise;
+    /// only the retained Record Pending publication may bind this wait.
+    pub(crate) fn controlled_pending_record_poll(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        deadline: crate::types::LogicalTime,
+        engine: std::sync::Arc<std::sync::Mutex<crate::network_replay::NetworkReplayEngine>>,
+    ) {
+        let kind = crate::resources::NetworkWaitKind::PollReadable;
+        {
+            let engine = engine.lock().unwrap();
+            assert_eq!(
+                engine.mode(),
+                crate::network_replay::NetworkEngineMode::Record
+            );
+            let binding = engine
+                .call_wait_binding(owner, call, kind, Some(deadline))
+                .unwrap();
+            assert!(Self::network_wait_is_ready(&engine, binding.open_file, kind).unwrap());
+            assert_eq!(binding.observed_ready, Some(false));
+        }
+        let turn = self.turn;
+        let time = self.committed_time;
+        self.controlled_park_shared_wait(owner, vec![(call, kind)], Some(deadline), engine);
+        // Existing NONCOMMIT parking advances the turn index once; it grants
+        // no guest execution and adds no committed logical time.
+        let parked_turn = turn.checked_add(1).unwrap();
+        assert_eq!(self.turn, parked_turn);
+        assert_eq!(self.committed_time, time);
+        assert!(!self.run_queue.contains_tid(owner.thread));
+        assert!(self.next_turns[&owner.thread].resp.try_read().is_none());
+        assert_eq!(
+            self.blocked.timed_waiters.thread_deadline(owner.thread),
+            Some(deadline)
+        );
+        self.step2_network_replay_ready().unwrap();
+        assert_eq!(
+            self.blocked.network_call_waiters.get(&owner.thread),
+            Some(&(owner, vec![(call, kind)]))
+        );
+        assert!(!self.run_queue.contains_tid(owner.thread));
+        assert!(self.next_turns[&owner.thread].resp.try_read().is_none());
+        assert_eq!(
+            self.blocked.timed_waiters.thread_deadline(owner.thread),
+            Some(deadline)
+        );
+        assert_eq!(self.turn, parked_turn);
+        assert_eq!(self.committed_time, time);
+    }
+}

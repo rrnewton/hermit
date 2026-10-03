@@ -8,6 +8,12 @@ use crate::network_replay::NetworkReplayError;
 use crate::network_replay::NetworkStreamCallId;
 use crate::network_replay::shared_waits::SharedCallCensus;
 
+mod record_probe;
+pub(crate) use record_probe::ConfirmedSharedEffect;
+pub(crate) use record_probe::ConfirmedSharedRecordPending;
+pub(crate) use record_probe::ConfirmedSharedRecordPoll;
+pub(crate) use record_probe::JoinedSharedEffect;
+
 mod capture;
 pub(crate) use capture::ConfirmedSharedCapture;
 pub(crate) use capture::JoinedSharedCapture;
