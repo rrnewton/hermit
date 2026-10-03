@@ -9,6 +9,9 @@
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;
 
+#[path = "common/run2_log.rs"]
+mod run2_log;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
@@ -196,7 +199,17 @@ fn controller_diagnostics(path: Option<&Path>) -> String {
     .unwrap_or_else(|| "unavailable".to_owned())
 }
 
-fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+fn run_bounded(command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+    run_bounded_polling(command, label, diagnostic_log, || {})
+}
+
+/// [`run_bounded`], calling `poll` before each 10 ms wait while the command runs.
+fn run_bounded_polling(
+    mut command: Command,
+    label: &str,
+    diagnostic_log: Option<&Path>,
+    mut poll: impl FnMut(),
+) -> Output {
     // Verification observes the guest's current directory. The source checkout is shared by
     // concurrent validation nodes, so Cargo or another test can change its metadata or entries
     // between Run1 and Run2. Keep this invocation in one empty directory until both runs and
@@ -227,7 +240,10 @@ fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>)
                 kill_process_group(child.id(), label);
                 break true;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                poll();
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => {
                 kill_process_group(child.id(), label);
                 let _ = child.wait();
@@ -557,7 +573,12 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
         "SaBRe scheduler verification artifacts: {}",
         retained_logs.display()
     );
-    let verify = run_bounded(
+    // Hermit deletes run 2's log after a match, so a hard link made while the
+    // command runs keeps it for the checks below; see the `run2_log` module.
+    // The link's name matches neither log prefix.
+    let capture = retained_logs.join("captured-run2.log");
+    let mut captured = false;
+    let verify = run_bounded_polling(
         example_command(
             Path::new("/bin/sh"),
             &["-c", "printf 'ok\\n'"],
@@ -568,6 +589,11 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
         ),
         "SaBRe strict verification with retained logs",
         None,
+        || {
+            if !captured {
+                captured = run2_log::link_run2_log(&retained_logs, &capture);
+            }
+        },
     );
     let diagnostics = format!(
         "{}{}",
@@ -619,38 +645,42 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
         duplicates.is_empty(),
         "a matched SaBRe verification must not retain run 2's log: {duplicates:?}",
     );
+    assert!(
+        captured,
+        "run 2's log was not captured while the command ran: {}",
+        capture.display(),
+    );
 
+    // The INFO comparison covers only INFO records, while these checks count
+    // the markers anywhere in each file, so run 2's log is checked as well.
     const SCHEDULER_EMPTY: &str =
         " INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.";
     const FALLBACK_COMPLETED: &str =
         " INFO hermit::sabre::fallback: SaBRe ptrace fallback completed";
-    for (index, path) in logs.iter().enumerate() {
-        let log = std::fs::read_to_string(path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read retained run log {}: {error}",
-                path.display()
-            )
-        });
+    for (index, path) in [&logs[0], &capture].into_iter().enumerate() {
+        let log = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read run log {}: {error}", path.display()));
         let scheduler_empty = log.match_indices(SCHEDULER_EMPTY).collect::<Vec<_>>();
         let fallback_completed = log.match_indices(FALLBACK_COMPLETED).collect::<Vec<_>>();
         assert_eq!(
             scheduler_empty.len(),
             1,
-            "retained run {} must contain exactly one scheduler-empty INFO:\n{log}",
+            "run {} log must contain exactly one scheduler-empty INFO:\n{log}",
             index + 1,
         );
         assert_eq!(
             fallback_completed.len(),
             1,
-            "retained run {} must contain exactly one fallback-completed INFO:\n{log}",
+            "run {} log must contain exactly one fallback-completed INFO:\n{log}",
             index + 1,
         );
         assert!(
             scheduler_empty[0].0 < fallback_completed[0].0,
-            "retained run {} logged fallback completion before scheduler completion:\n{log}",
+            "run {} logged fallback completion before scheduler completion:\n{log}",
             index + 1,
         );
     }
+    std::fs::remove_file(&capture).expect("failed to remove run 2's checked log");
 }
 
 #[test]

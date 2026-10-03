@@ -39,6 +39,9 @@ mod liteinst_runtime;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[path = "common/run2_log.rs"]
+mod run2_log;
+
 #[path = "common/nonleader_exec.rs"]
 mod nonleader_exec;
 
@@ -2860,8 +2863,9 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
 /// (https://github.com/rrnewton/hermit/issues/3301). So run 2's log must be
 /// gone, and each log must hold exactly one record from its own run: the
 /// golden log, and run 2's, through a link made while Hermit ran. Plain
-/// `--verify` compares only DETLOG records, so the match does not imply that
-/// run 2's log holds this DEBUG record.
+/// `--verify` compares only selected DETLOG and scheduler COMMIT records
+/// (`filter_deterministic` in `detcore/src/logdiff.rs`), so the match does not
+/// imply that run 2's log holds this DEBUG record.
 ///
 /// `process_reports=0` is today's architecture, not a gap: the ptrace host
 /// counts every hook entry itself, so no guest process submits a report.
@@ -2951,11 +2955,18 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
 
     check_record("the run's stderr", &run(&["--log", "debug"], None).0);
 
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create LiteInst verify directory");
-    let logs = directory.path().join("verify-logs");
+    let directory = tempfile::Builder::new()
+        .prefix("liteinst-stats-verify-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create LiteInst verify directory")
+        .keep();
+    eprintln!(
+        "LiteInst statistics verification artifacts retained at {}",
+        directory.display()
+    );
+    let logs = directory.join("verify-logs");
     fs::create_dir(&logs).expect("failed to create LiteInst verify-log directory");
-    let link = directory.path().join("captured-run2.log");
+    let link = directory.join("captured-run2.log");
     let (verify_stderr, run2_log) = run(&["--log", "debug"], Some((&logs, &link)));
     assert!(
         verify_stderr.contains("Success: deterministic. Determinism verified."),
@@ -3161,11 +3172,18 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
         (None, "<unset>"),
         (Some("guest-sentinel"), "guest-sentinel"),
     ] {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("failed to create DBT log-env verification directory");
-        let logs = directory.path().join("logs");
+        let directory = tempfile::Builder::new()
+            .prefix("dbt-log-env-verify-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create DBT log-env verification directory")
+            .keep();
+        eprintln!(
+            "DBT log-env verification artifacts retained at {}",
+            directory.display()
+        );
+        let logs = directory.join("logs");
         fs::create_dir(&logs).expect("failed to create DBT log-env verification log directory");
-        let verdict = directory.path().join("verdict.json");
+        let verdict = directory.join("verdict.json");
         let expected_arg = format!("expect={expected}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command
@@ -3191,7 +3209,7 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
         if let Some(value) = guest_value {
             command.env("HERMIT_LOG", value);
         }
-        let capture = directory.path().join("captured-run2.log");
+        let capture = directory.join("captured-run2.log");
         let (output, run2_log) = output_capturing_run2_log(&mut command, &logs, &capture);
         let report = read_terminal_dbt_verdict(&verdict);
         assert_eq!(
@@ -9009,9 +9027,9 @@ fn retained_captures(log_dir: &Path, prefix: &str) -> Vec<PathBuf> {
 /// Runs a `hermit run --verify --keep-logs` command whose `--verify-log-dir` is
 /// `logs`, as [`Command::output`] does, and also returns run 2's log, which
 /// Hermit deletes after a match. The log survives as a hard link at `capture`,
-/// made while the command runs; `kvm_cancellation::bounded_verify_command`
-/// explains why that link holds run 2's complete log. The caller checks it like
-/// a retained log and then removes it. `None` means no poll saw a run 2 log.
+/// made while the command runs; the `run2_log` module explains why that link
+/// holds run 2's complete log. The caller checks it like a retained log and
+/// then removes it. `None` means no poll saw a run 2 log.
 fn output_capturing_run2_log(
     command: &mut Command,
     logs: &Path,
@@ -9027,7 +9045,7 @@ fn output_capturing_run2_log(
     let mut captured = false;
     while !waiter.is_finished() {
         if !captured {
-            captured = kvm_cancellation::link_run2_log(logs, capture);
+            captured = run2_log::link_run2_log(logs, capture);
         }
         thread::sleep(Duration::from_millis(10));
     }
