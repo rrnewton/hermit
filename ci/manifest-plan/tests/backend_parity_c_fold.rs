@@ -18,11 +18,12 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1089 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1091 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
-//!    added (895 portable and 5 privileged) and the 189 portable cells of the
-//!    compatibility-corpus fold, after applying the later lane moves listed in
-//!    `LATER_LANE_MOVES` (now 1082 portable and 7 privileged).
+//!    added (895 portable and 5 privileged), the 189 portable cells of the
+//!    compatibility-corpus fold and the 2 portable select replay cells, after
+//!    applying the later lane moves listed in `LATER_LANE_MOVES` (now 1084
+//!    portable and 7 privileged).
 //! 3. The committed compatibility cell table has 9008 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
