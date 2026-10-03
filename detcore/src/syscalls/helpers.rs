@@ -33,6 +33,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::threads::BlockedWaitSignalError;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
@@ -40,7 +41,7 @@ use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
 use crate::syscalls::threads::eligible_pending_signals;
-use crate::syscalls::threads::read_kernel_signal_state;
+use crate::syscalls::threads::read_wait_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
 use crate::syscalls::threads::wait_signal_disposition;
 use crate::tool_global::ResumeStatus;
@@ -1688,7 +1689,7 @@ where
                 );
                 break Err(errno.into());
             }
-            Err(errno) => break Err(errno.into()),
+            Err(error) => break Err(error),
         }
         // A plain `inject`, never `inject_with_retry`: see `KernelSignalWait`.
         let syscall_result = guest.inject(call).await;
@@ -1714,7 +1715,7 @@ where
             );
             break res;
         }
-        if !signals.is_blocking() {
+        if signals.needs_block() {
             // Only one scratch-stack guard may be live, so release the probe's, block
             // signals from a fresh one, and rebuild the probe.
             guard = None;
@@ -1785,6 +1786,16 @@ where
 /// mask is set ends the wait without another probe. A stop after the probe ran
 /// replaces its result, so a probe that consumed something (an edge-triggered
 /// event, a dequeued signal) loses it; that remains a known gap.
+///
+/// No failure of this machinery reaches the guest as an errno the wait call
+/// cannot return. A `/proc` read that fails for a thread that still exists, or a
+/// guest mask that cannot be put back, ends the run with a
+/// [`BlockedWaitSignalError`]; a thread that no longer exists gets
+/// `ERESTARTNOINTR`, which nothing observes (`read_wait_signal_state`). If the
+/// mask cannot be changed at all (no scratch room below the guest's stack
+/// pointer, https://github.com/rrnewton/hermit/issues/3328), `block` leaves the
+/// guest's own mask in place and every later probe runs under it, as the first
+/// probe does.
 pub(crate) struct KernelSignalWait {
     pid: reverie::Pid,
     tid: reverie::Pid,
@@ -1797,6 +1808,8 @@ pub(crate) struct KernelSignalWait {
     defers_default_stops: bool,
     /// The guest's own mask while the wait runs with every signal blocked.
     saved_mask: Option<KernelSigset>,
+    /// `block` could not change the mask, so probes run under the guest's own.
+    unblockable: bool,
 }
 
 impl KernelSignalWait {
@@ -1811,12 +1824,14 @@ impl KernelSignalWait {
             consumed,
             defers_default_stops,
             saved_mask: None,
+            unblockable: false,
         }
     }
 
-    /// Whether every blockable signal is blocked for this wait.
-    pub(crate) fn is_blocking(&self) -> bool {
-        self.saved_mask.is_some()
+    /// Whether the caller should still call `block`: it has neither blocked the
+    /// guest's signals nor found that it cannot.
+    pub(crate) fn needs_block(&self) -> bool {
+        self.saved_mask.is_none() && !self.unblockable
     }
 
     /// Whether a signal that would end the wait natively is pending, in which case
@@ -1826,13 +1841,14 @@ impl KernelSignalWait {
     /// Linux would still report sources that were ready when the call began, which
     /// this check puts behind the signal, as the scheduler's `Signaled` path did.
     /// A `SIGCHLD` counts only once the scheduler made it eligible
-    /// (`eligible_pending_signals`).
-    pub(crate) async fn interrupted<T, G>(&self, guest: &mut G) -> Result<bool, Errno>
+    /// (`eligible_pending_signals`). A failed read is never returned as the
+    /// call's errno (`read_wait_signal_state`).
+    pub(crate) async fn interrupted<T, G>(&self, guest: &mut G) -> Result<bool, Error>
     where
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        let state = read_kernel_signal_state(self.pid, self.tid)?;
+        let state = read_wait_signal_state(self.pid, self.tid)?;
         let guest_mask = self.saved_mask.unwrap_or(state.blocked);
         let could_interrupt =
             state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed;
@@ -1853,6 +1869,15 @@ impl KernelSignalWait {
     /// otherwise a fresh guard is taken. A signal that stops the guest around this
     /// call arrived before the wait blocked, so the mask is put back if it took
     /// effect and the call restarts.
+    ///
+    /// If the mask cannot be changed for another reason, the guest's mask is
+    /// unchanged and no wait call can return that error, so the wait continues
+    /// with every probe under the guest's own mask, as the first probe runs, and
+    /// `block` is not tried again (`needs_block`). `interrupted` reads that mask
+    /// from the kernel each turn. The scratch-stack commit fails this way on a
+    /// guest stack with no room below its stack pointer
+    /// (https://github.com/rrnewton/hermit/issues/3328); poll and epoll_wait
+    /// probes need no scratch of their own, so for them this is the first need.
     pub(crate) async fn block<'a, T, G>(
         &mut self,
         guest: &mut G,
@@ -1862,7 +1887,7 @@ impl KernelSignalWait {
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        let guest_mask = read_kernel_signal_state(self.pid, self.tid)?.blocked;
+        let guest_mask = read_wait_signal_state(self.pid, self.tid)?.blocked;
         match inject_signal_mask(guest, blocked_signal_mask(), scratch).await {
             Ok(()) => {
                 self.saved_mask = Some(guest_mask);
@@ -1873,13 +1898,25 @@ impl KernelSignalWait {
                 self.restore(guest, scratch).await?;
                 Err(Errno::ERESTARTNOINTR.into())
             }
-            Err(errno) => Err(errno.into()),
+            Err(errno) => {
+                tracing::debug!(
+                    "[tid {}] cannot block signals for a wait ({}); its probes run under the \
+                     guest's mask",
+                    self.tid,
+                    errno
+                );
+                self.unblockable = true;
+                Ok(())
+            }
         }
     }
 
     /// Put back the guest's mask, if `block` replaced it. A signal can stop the guest
     /// around the call, before or after it takes effect, so success is read back
-    /// from the kernel.
+    /// from the kernel and the call is repeated until the kernel reports the
+    /// guest's mask. The guest never resumes with every signal blocked: if the
+    /// mask cannot be put back, the run ends with
+    /// [`BlockedWaitSignalError::MaskNotRestored`].
     pub(crate) async fn restore<'a, T, G>(
         &mut self,
         guest: &mut G,
@@ -1889,27 +1926,45 @@ impl KernelSignalWait {
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        const ATTEMPTS: usize = 3;
+        // Under the all-blocked mask only a signal that cannot be blocked (SIGKILL,
+        // SIGSTOP) can stop the call before it takes effect, and each such stop needs
+        // another signal sent, so a bound this large is never reached in practice.
+        const ATTEMPTS: usize = 16;
         let Some(guest_mask) = self.saved_mask.take() else {
             return Ok(());
         };
-        for _ in 0..ATTEMPTS {
-            if read_kernel_signal_state(self.pid, self.tid)?.blocked == guest_mask {
+        let mut attempts = 0;
+        let mut last_error = None;
+        while attempts < ATTEMPTS {
+            if read_wait_signal_state(self.pid, self.tid)?.blocked == guest_mask {
                 return Ok(());
             }
+            attempts += 1;
             match inject_signal_mask(guest, guest_mask, scratch).await {
                 Ok(()) => return Ok(()),
                 // Stopped by a signal: the read at the top of the loop decides whether
                 // the mask took effect.
-                Err(errno) if probe_was_interrupted_by_signal(errno) => {}
-                Err(errno) => return Err(errno.into()),
+                Err(errno) if probe_was_interrupted_by_signal(errno) => {
+                    last_error = Some(errno);
+                }
+                // The call could not run, so the mask is unchanged.
+                Err(errno) => {
+                    last_error = Some(errno);
+                    break;
+                }
             }
         }
-        if read_kernel_signal_state(self.pid, self.tid)?.blocked == guest_mask {
-            Ok(())
-        } else {
-            Err(Errno::EIO.into())
+        if read_wait_signal_state(self.pid, self.tid)?.blocked == guest_mask {
+            return Ok(());
         }
+        Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::MaskNotRestored {
+                pid: self.pid,
+                tid: self.tid,
+                attempts,
+                last_error,
+            },
+        )))
     }
 }
 
@@ -2199,5 +2254,449 @@ mod tests {
             Some(Errno::ERESTARTSYS.into_raw())
         );
         assert_eq!(request.resources.len(), 1);
+    }
+}
+
+/// `KernelSignalWait` against a scripted guest and a scripted `/proc` read
+/// (`signal_state_read_seam`). No failure of the wait's signal handling may reach
+/// the guest as an errno its wait call cannot return, and the guest must never
+/// resume with every signal blocked
+/// (https://github.com/rrnewton/hermit/issues/3146).
+#[cfg(test)]
+mod kernel_signal_wait_failures {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::syscalls::LocalMemory;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::syscalls::threads::KernelSignalState;
+    use crate::syscalls::threads::kernel_sigset_bit;
+    use crate::syscalls::threads::signal_state_read_seam;
+    use crate::types::DetPid;
+
+    /// What an injected `rt_sigprocmask` does.
+    #[derive(Clone, Copy, Debug)]
+    enum MaskOutcome {
+        /// The call runs: the mask changes and it returns 0.
+        Apply,
+        /// A signal stops the guest before the call runs: the mask is unchanged
+        /// and the backend reports its restart errno.
+        StoppedBefore,
+        /// The call cannot run at all.
+        Fail(Errno),
+    }
+
+    /// The kernel's view of the guest thread, shared by the scripted `/proc`
+    /// read and the scripted guest.
+    #[derive(Default)]
+    struct FakeKernel {
+        /// The thread's mask (`SigBlk`).
+        blocked: KernelSigset,
+        /// Pending signals (`SigPnd | ShdPnd`).
+        pending: KernelSigset,
+        /// Signals with a handler (`SigCgt`).
+        caught: KernelSigset,
+        /// Errors for the next reads, one per read.
+        read_failures: VecDeque<Errno>,
+        /// Outcomes for the next `rt_sigprocmask` calls; `Apply` once empty.
+        outcomes: VecDeque<MaskOutcome>,
+        /// Every mask the guest was asked to set, in order.
+        requested: Vec<KernelSigset>,
+    }
+
+    type Kernel = Arc<Mutex<FakeKernel>>;
+
+    /// Room for one mask, 8-byte aligned like a real stack slot.
+    const ARENA_WORDS: usize = 2;
+
+    /// A scratch stack in this process's memory whose commit can fail like the
+    /// ptrace scratch below an `rsp` with no writable memory under it
+    /// (https://github.com/rrnewton/hermit/issues/3328).
+    struct WaitStack {
+        commit_fails: bool,
+        arena: usize,
+    }
+
+    struct WaitStackGuard;
+
+    impl Drop for WaitStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for WaitStack {
+        type StackGuard = WaitStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("a blocked wait must not query the scratch size")
+        }
+        fn capacity(&self) -> usize {
+            panic!("a blocked wait must not query the scratch capacity")
+        }
+        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+            assert!(std::mem::size_of::<T>() <= ARENA_WORDS * std::mem::size_of::<u64>());
+            // SAFETY: the arena is a live, 8-byte aligned buffer owned by the guest,
+            // large enough for `T` (asserted above).
+            unsafe { std::ptr::write(self.arena as *mut T, value) };
+            Addr::from_raw(self.arena).unwrap()
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("a blocked wait pushes its mask rather than reserving room")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            if self.commit_fails {
+                Err(Errno::EFAULT)
+            } else {
+                Ok(WaitStackGuard)
+            }
+        }
+    }
+
+    struct WaitGuest {
+        config: Config,
+        thread: ThreadState<()>,
+        pid: Pid,
+        tid: Pid,
+        commit_fails: bool,
+        arena: Box<[u64; ARENA_WORDS]>,
+        kernel: Kernel,
+    }
+
+    impl WaitGuest {
+        /// A guest for thread `tid` of this process, with the guest's own `mask`
+        /// installed.
+        fn new(tid: Pid, mask: KernelSigset) -> (Self, Kernel) {
+            let config = Config::default();
+            let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let kernel = Arc::new(Mutex::new(FakeKernel {
+                blocked: mask,
+                ..FakeKernel::default()
+            }));
+            let guest = Self {
+                config,
+                thread,
+                pid: Pid::from_raw(std::process::id() as i32),
+                tid,
+                commit_fails: false,
+                arena: Box::new([u64::MAX; ARENA_WORDS]),
+                kernel: kernel.clone(),
+            };
+            (guest, kernel)
+        }
+
+        /// A guest for the calling thread, which exists.
+        fn live(mask: KernelSigset) -> (Self, Kernel) {
+            // SAFETY: gettid has no preconditions.
+            Self::new(Pid::from_raw(unsafe { libc::gettid() }), mask)
+        }
+    }
+
+    /// Answer this thread's `/proc` reads from `kernel` until the result drops.
+    fn scripted_proc(kernel: &Kernel) -> signal_state_read_seam::Installed {
+        let kernel = kernel.clone();
+        signal_state_read_seam::install(move |_, _| {
+            let mut kernel = kernel.lock().unwrap();
+            Some(match kernel.read_failures.pop_front() {
+                Some(errno) => Err(errno),
+                None => Ok(KernelSignalState {
+                    pending: kernel.pending,
+                    thread_pending: kernel.pending,
+                    blocked: kernel.blocked,
+                    caught: kernel.caught,
+                    ..KernelSignalState::default()
+                }),
+            })
+        })
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for WaitGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!("these waits must not send an RPC: {:?}", message.2)
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for WaitGuest {
+        type Memory = LocalMemory;
+        type Stack = WaitStack;
+
+        fn tid(&self) -> Pid {
+            self.tid
+        }
+        fn pid(&self) -> Pid {
+            self.pid
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("a blocked wait must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            WaitStack {
+                commit_fails: self.commit_fails,
+                arena: self.arena.as_mut_ptr() as usize,
+            }
+        }
+        async fn daemonize(&mut self) {
+            panic!("a blocked wait must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, args) = syscall.into_parts();
+            let Syscall::RtSigprocmask(call) = Syscall::from_raw(number, args) else {
+                panic!("a blocked wait injected {number}, not rt_sigprocmask")
+            };
+            assert_eq!(call.how(), libc::SIG_SETMASK);
+            assert!(call.oldset().is_none());
+            let set = call.set().expect("rt_sigprocmask without a mask");
+            let mask: KernelSigset = LocalMemory::new().read_value(set.cast::<KernelSigset>())?;
+            let mut kernel = self.kernel.lock().unwrap();
+            kernel.requested.push(mask);
+            match kernel.outcomes.pop_front().unwrap_or(MaskOutcome::Apply) {
+                MaskOutcome::Apply => {
+                    kernel.blocked = mask;
+                    Ok(0)
+                }
+                MaskOutcome::StoppedBefore => Err(Errno::ERESTARTNOINTR),
+                MaskOutcome::Fail(errno) => Err(errno),
+            }
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("a blocked wait must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("a blocked wait must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("a blocked wait must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("a blocked wait must not read a clock")
+        }
+    }
+
+    /// The guest's own mask in these tests.
+    fn guest_mask() -> KernelSigset {
+        kernel_sigset_bit(libc::SIGUSR2)
+    }
+
+    /// The diagnostic a result ends the run with.
+    fn diagnostic<V: std::fmt::Debug>(result: Result<V, Error>) -> BlockedWaitSignalError {
+        match result {
+            Err(Error::Tool(error)) => *error
+                .downcast_ref::<BlockedWaitSignalError>()
+                .unwrap_or_else(|| panic!("not a blocked-wait diagnostic: {error:#}")),
+            other => panic!("expected the run to end with a diagnostic, got {other:?}"),
+        }
+    }
+
+    /// A wait whose guest mask `block` replaced with the all-blocked mask.
+    async fn blocked_wait(guest: &mut WaitGuest, kernel: &Kernel) -> KernelSignalWait {
+        let mut wait = KernelSignalWait::new(guest, 0, false);
+        wait.block(guest, None).await.unwrap();
+        assert!(!wait.needs_block());
+        assert_eq!(kernel.lock().unwrap().blocked, blocked_signal_mask());
+        wait
+    }
+
+    #[tokio::test]
+    async fn restore_repeats_the_mask_change_until_the_kernel_reports_it() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        let _proc = scripted_proc(&kernel);
+        let mut wait = blocked_wait(&mut guest, &kernel).await;
+        kernel
+            .lock()
+            .unwrap()
+            .outcomes
+            .extend([MaskOutcome::StoppedBefore; 5]);
+
+        wait.restore(&mut guest, None).await.unwrap();
+
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(kernel.blocked, guest_mask());
+        assert_eq!(
+            kernel.requested.len(),
+            1 + 6,
+            "block, then five stopped attempts and one that ran"
+        );
+        assert!(
+            kernel.requested[1..]
+                .iter()
+                .all(|&mask| mask == guest_mask())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mask_that_signals_keep_stopping_ends_the_run_instead_of_resuming_the_guest() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        let _proc = scripted_proc(&kernel);
+        let mut wait = blocked_wait(&mut guest, &kernel).await;
+        kernel
+            .lock()
+            .unwrap()
+            .outcomes
+            .extend([MaskOutcome::StoppedBefore; 64]);
+
+        let error = diagnostic(wait.restore(&mut guest, None).await);
+
+        assert_eq!(
+            error,
+            BlockedWaitSignalError::MaskNotRestored {
+                pid: guest.pid,
+                tid: guest.tid,
+                attempts: 16,
+                last_error: Some(Errno::ERESTARTNOINTR),
+            }
+        );
+        let message = error.to_string();
+        assert!(
+            message.starts_with("cannot restore the signal mask of guest thread")
+                && message.contains("(16 attempts, last error ")
+                && message.contains("ERESTARTNOINTR")
+                && message.ends_with("); it would resume with every signal blocked"),
+            "{message}"
+        );
+        assert_eq!(kernel.lock().unwrap().requested.len(), 1 + 16);
+    }
+
+    #[tokio::test]
+    async fn a_mask_change_that_cannot_run_ends_the_run_instead_of_resuming_the_guest() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        let _proc = scripted_proc(&kernel);
+        let mut wait = blocked_wait(&mut guest, &kernel).await;
+        kernel
+            .lock()
+            .unwrap()
+            .outcomes
+            .push_back(MaskOutcome::Fail(Errno::EFAULT));
+
+        let error = diagnostic(wait.restore(&mut guest, None).await);
+
+        assert_eq!(
+            error,
+            BlockedWaitSignalError::MaskNotRestored {
+                pid: guest.pid,
+                tid: guest.tid,
+                attempts: 1,
+                last_error: Some(Errno::EFAULT),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_signal_state_of_a_live_thread_ends_the_run() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        let _proc = scripted_proc(&kernel);
+        let (pid, tid) = (guest.pid, guest.tid);
+        let expected = |errno| BlockedWaitSignalError::StateUnreadable { pid, tid, errno };
+
+        // The turn's check, before the mask is set.
+        let mut wait = KernelSignalWait::new(&guest, 0, false);
+        kernel.lock().unwrap().read_failures.push_back(Errno::EIO);
+        assert_eq!(
+            diagnostic(wait.interrupted(&mut guest).await),
+            expected(Errno::EIO)
+        );
+
+        // `block`'s read of the guest's mask.
+        kernel.lock().unwrap().read_failures.push_back(Errno::ESRCH);
+        assert_eq!(
+            diagnostic(wait.block(&mut guest, None).await),
+            expected(Errno::ESRCH)
+        );
+        assert!(kernel.lock().unwrap().requested.is_empty());
+
+        // `restore`'s read, with every signal blocked.
+        wait.block(&mut guest, None).await.unwrap();
+        kernel.lock().unwrap().read_failures.push_back(Errno::ESRCH);
+        assert_eq!(
+            diagnostic(wait.restore(&mut guest, None).await),
+            expected(Errno::ESRCH)
+        );
+        let error = expected(Errno::EIO).to_string();
+        assert!(
+            error.starts_with("cannot read the signal state of guest thread"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thread_that_no_longer_exists_ends_its_wait_with_erestartnointr() {
+        // SAFETY: gettid has no preconditions.
+        let exited = std::thread::spawn(|| unsafe { libc::gettid() })
+            .join()
+            .unwrap();
+        let (mut guest, _kernel) = WaitGuest::new(Pid::from_raw(exited), guest_mask());
+        // No script: the read goes to the real `/proc`, where the thread is gone.
+
+        let wait = KernelSignalWait::new(&guest, 0, false);
+        assert!(matches!(
+            wait.interrupted(&mut guest).await,
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
+        ));
+        assert!(matches!(
+            read_wait_signal_state(guest.pid, guest.tid),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stack_with_no_scratch_room_leaves_the_wait_under_the_guest_mask() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        guest.commit_fails = true;
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false);
+
+        wait.block(&mut guest, None).await.unwrap();
+
+        assert!(!wait.needs_block(), "block must not be tried again");
+        assert_eq!(kernel.lock().unwrap().blocked, guest_mask());
+        assert!(kernel.lock().unwrap().requested.is_empty());
+
+        // Later turns classify against the guest's own mask, read each turn.
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.caught = kernel_sigset_bit(libc::SIGUSR1) | kernel_sigset_bit(libc::SIGUSR2);
+            kernel.pending = kernel_sigset_bit(libc::SIGUSR2);
+        }
+        assert!(
+            !wait.interrupted(&mut guest).await.unwrap(),
+            "SIGUSR2 is blocked"
+        );
+        kernel.lock().unwrap().pending = kernel_sigset_bit(libc::SIGUSR1);
+        assert!(
+            wait.interrupted(&mut guest).await.unwrap(),
+            "SIGUSR1 is not blocked"
+        );
+
+        wait.restore(&mut guest, None).await.unwrap();
+        assert!(
+            kernel.lock().unwrap().requested.is_empty(),
+            "nothing to put back"
+        );
+        assert_eq!(kernel.lock().unwrap().blocked, guest_mask());
     }
 }
