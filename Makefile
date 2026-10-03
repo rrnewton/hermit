@@ -186,6 +186,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
 	bash ./tests/compat/real_compat_workload.sh --self-test-git-location
 	./bootstrap/test-run-pinned-tool.sh
+	./bootstrap/test-git-dep-mirrors.sh
 	python3 ./scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
@@ -222,6 +223,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	python3 ./ci/test_buck_e2e_ingest.py
 	python3 ./ci/test_buck_e2e_verdict.py
 	python3 ./ci/test_buck_e2e_cell.py
+	python3 ./ci/test_buck_e2e_stage.py
 	./ci/run-with-reverie-dbt-budget-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
