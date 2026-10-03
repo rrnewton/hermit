@@ -383,7 +383,7 @@ struct Profile {
 // 67/67 before. full, portable and hosted-portable then each lost one step
 // when check.backend_parity_suites and its _on_host twin were retired with
 // tests/backend-parity (also slice S13): 87/88, 74/75 and 68/68 before.
-const PROFILES: [Profile; 10] = [
+const PROFILES: [Profile; 11] = [
     Profile {
         label: "full",
         direct_steps: 86,
@@ -436,6 +436,12 @@ const PROFILES: [Profile; 10] = [
     // The strict run type: the same shape as the SaBRe run type.
     Profile {
         label: "strict-compat-only",
+        direct_steps: 2,
+        selected_steps: 13,
+    },
+    // The rr run type: the same shape again.
+    Profile {
+        label: "rr-compat-only",
         direct_steps: 2,
         selected_steps: 13,
     },
@@ -802,6 +808,7 @@ pub const HOST_MANIFEST_RUNS: &[&str] = &[
     "portablecompat.manifest_compat",
     "sabrecompat.manifest_compat",
     "strictcompat.manifest_compat",
+    "rrcompat.manifest_compat",
 ];
 
 /// The run type a manifest bucket node selects with `test-harness run
@@ -1617,7 +1624,10 @@ fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
         "e9patchcompat" | "e9patchcompatprep" => {
             return Some(GeneratedPartition::E9patchCompat);
         }
-        "rrcompat" | "rrcompatprep" => return Some(GeneratedPartition::RrCompat),
+        // The rr lane's rows are the compat.yaml replay cells labelled
+        // rr-compat-only, run by the static node rrcompat.manifest_compat;
+        // only its fixtures are generated.
+        "rrcompatprep" => return Some(GeneratedPartition::RrCompat),
         _ => {}
     }
     if step.group == "superstress" {
@@ -1675,7 +1685,9 @@ fn refresh_generated_partitions(
         // e9patchcompatprep.release_resources, which stages the release
         // resources the retired host build.runtime_release used to provide.
         (GeneratedPartition::E9patchCompat, 175usize),
-        (GeneratedPartition::RrCompat, 140usize),
+        // 1 since the rr lane's 139 probes became compat.yaml replay cells run
+        // by the static node rrcompat.manifest_compat: only its fixtures remain.
+        (GeneratedPartition::RrCompat, 1usize),
         (GeneratedPartition::SuperCompat, 5usize),
         (GeneratedPartition::SuperStress, 102usize),
     ] {
@@ -1774,14 +1786,15 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
+    // 113 since rrcompat.manifest_compat, the rr lane's bucket, joined them;
     // 112 since strictcompat.manifest_compat, the strict lane's bucket, joined
     // them; 111 since sabrecompat.manifest_compat, the SaBRe lane's bucket, joined
     // them; 110 since portablecompat.manifest_compat, the focused lane's corpus
     // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
     // joined the test-harness producers (2026-10-01).
-    if expected.len() != 112 {
+    if expected.len() != 113 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 112",
+            "structured result producer registry has {} entries, expected 113",
             expected.len()
         ));
     }
@@ -1919,8 +1932,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // TestHarness 34 -> 36 with the compat bucket and its hosted twin, and
     // 37 with the focused lane's portablecompat.manifest_compat, and 38 with
     // the SaBRe lane's sabrecompat.manifest_compat, and 39 with the strict
-    // lane's strictcompat.manifest_compat.
-    if actual_group_counts != [69, 39, 2, 2] {
+    // lane's strictcompat.manifest_compat, and 40 with the rr lane's
+    // rrcompat.manifest_compat.
+    if actual_group_counts != [69, 40, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2447,9 +2461,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // sabrecompat.manifest_compat (1051 - 212 + 1).
     // 648 since the 193 strictcompat.<program> probes became the one bucket
     // strictcompat.manifest_compat (840 - 193 + 1).
-    if cfg.steps.len() != 648 {
+    // 510 since the 139 rrcompat.<program> probes became the one bucket
+    // rrcompat.manifest_compat (648 - 139 + 1).
+    if cfg.steps.len() != 510 {
         return Err(format!(
-            "superset has {} steps, expected 648",
+            "superset has {} steps, expected 510",
             cfg.steps.len()
         ));
     }
@@ -2593,10 +2609,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         }
     }
     let focused_release = step("compatprep.hermit_release")?;
-    // sabre-compat-only left it on 2026-10-01, and strict-compat-only on
-    // 2026-10-02: those run types' buckets run the validation's one build,
-    // the e2e artifact.
-    let expected_focused_labels = ["e9patch-compat-only", "rr-compat-only"];
+    // sabre-compat-only left it on 2026-10-01, and strict-compat-only and
+    // rr-compat-only on 2026-10-02: those run types' buckets run the
+    // validation's one build, the e2e artifact.
+    let expected_focused_labels = ["e9patch-compat-only"];
     if focused_release.cmd != "cargo build --release -p hermit --features third-party-backends"
         || focused_release.deps != ["gate.manifest"]
         || focused_release.labels
@@ -2657,12 +2673,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         "rrcompatprep",
     ] {
         let prep = step(&format!("{group}.fixtures"))?;
-        // The SaBRe and strict run types take the validation's one build,
+        // The SaBRe, strict and rr run types take the validation's one build,
         // linked on the host by build.host_hermit_link, instead of a dedicated
         // release build.
         let producer = match group {
             "portablecompatprep" => "compatprep.hermit_release_in_pinned_root",
-            "sabrecompatprep" | "strictcompatprep" => HOST_HERMIT_LINK_TAG,
+            "sabrecompatprep" | "strictcompatprep" | "rrcompatprep" => HOST_HERMIT_LINK_TAG,
             _ => "compatprep.hermit_release",
         };
         if !prep.deps.iter().any(|dependency| dependency == producer)
@@ -3793,8 +3809,8 @@ sys.exit(37)
     #[test]
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
         // e2e.manifest_compat, portablecompat.manifest_compat,
-        // sabrecompat.manifest_compat, strictcompat.manifest_compat and
-        // e2e.manifest_compat_on_host all write
+        // sabrecompat.manifest_compat, strictcompat.manifest_compat,
+        // rrcompat.manifest_compat and e2e.manifest_compat_on_host all write
         // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
         // only while no run type selects two of them: a run selects one label,
         // so their label sets must be non-empty and pairwise disjoint.
@@ -3813,8 +3829,8 @@ sys.exit(37)
             .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
             .map_or(0, Vec::len);
         assert_eq!(
-            shared, 5,
-            "the five manifest_compat buckets share one result file"
+            shared, 6,
+            "the six manifest_compat buckets share one result file"
         );
         for (path, steps) in &writers {
             for (index, first) in steps.iter().enumerate() {

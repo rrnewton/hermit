@@ -1167,7 +1167,7 @@ fn usage() -> &'static str {
      Focused gates (run one matrix/lane and exit):\n\
      \x20 --strict-compat-only          Only the compat bucket's strict cells (label strict-compat-only).\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
-     \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
+     \x20 --rr-compat-only              Only the compat bucket's record/replay cells (label rr-compat-only).\n\
      \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
@@ -2095,10 +2095,10 @@ const STRICT_EXECUTION_FLAG: &str = "--strict";
 /// Legacy below-L2 compatibility modes whose Hermit-option prefix must carry
 /// [`STRICT_EXECUTION_FLAG`].
 ///
-/// `CompatMode::Rr` is deliberately absent rather than overlooked: it renders
-/// `record start --verify --verify-strict`, a different path with a different
-/// evidence policy and no `--strict` marker, so folding it into this list would
-/// assert something untrue about it.
+/// The rr run type is deliberately absent rather than overlooked: it was never a
+/// legacy stripped-verify mode (it rendered `record start --verify
+/// --verify-strict`), and since 2026-10-02 its rows are compat.yaml replay cells
+/// the harness runs, not a `CompatMode`.
 const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 2] =
     [CompatMode::PortableStrict, CompatMode::E9patch];
 
@@ -3012,7 +3012,6 @@ fn self_test() -> Result<(), String> {
             (CompatMode::E9patch, false, true, false, D::Blocking, true),
             (CompatMode::E9patch, false, false, true, D::Blocking, true),
             (CompatMode::E9patch, true, true, false, D::Passed, false),
-            (CompatMode::Rr, false, true, false, D::Blocking, true),
         ];
         for (mode, ok, listed, diag, want, want_blocking) in cases.iter().copied() {
             let got = classify(mode, ok, listed, diag);
@@ -4088,13 +4087,6 @@ fn self_test() -> Result<(), String> {
     // drift guard for a MECHANICALLY EXTRACTED table: if someone edits a corpus
     // JSON without moving the corresponding ratchet, or vice versa, the extraction
     // has silently diverged from the numbers the gates are judged against.
-    if validate_corpus::RR_PASSING_LABELS.len() != validate_corpus::RR_COMPAT_EXPECTED {
-        return Err(format!(
-            "R/R label set has {} rows, expected {}",
-            validate_corpus::RR_PASSING_LABELS.len(),
-            validate_corpus::RR_COMPAT_EXPECTED
-        ));
-    }
     let root = repo_root();
     let paths = validate_corpus::CorpusPaths {
         root_dir: "/nonexistent",
@@ -4114,20 +4106,6 @@ fn self_test() -> Result<(), String> {
             validate_corpus::STRICT_COMPAT_TOTAL
         ));
     }
-    // rr admits a superset and is filtered to the measured-passing labels; what
-    // must hold is that every passing label is actually present to be measured.
-    let rr_rows = validate_corpus::load(&root, "rr", &paths)?;
-    let present: BTreeSet<&str> = rr_rows.iter().map(|r| r.label.as_str()).collect();
-    let missing: Vec<&&str> = validate_corpus::RR_PASSING_LABELS
-        .iter()
-        .filter(|l| !present.contains(**l))
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "{} R/R passing label(s) are absent from the rr corpus and could never be measured: {missing:?}",
-            missing.len()
-        ));
-    }
     // e9patch admits a superset of its gated total (rows gate only when the
     // program is installed), so the invariant is >=, not ==.
     let e9 = count("e9patch")?;
@@ -4137,11 +4115,7 @@ fn self_test() -> Result<(), String> {
             validate_corpus::E9PATCH_COMPAT_TOTAL
         ));
     }
-    println!(
-        "  corpora: strict={strict} rr={} (filtered to {}) e9patch={e9}",
-        rr_rows.len(),
-        validate_corpus::RR_COMPAT_EXPECTED
-    );
+    println!("  corpora: strict={strict} e9patch={e9}");
     // Policy/data brackets are inert: none runs a gate, publishes a label,
     // writes the real ledger, or touches a PR. The one deliberate exception is
     // nested_scope_self_test: it uses a fresh disposable scope with strict
@@ -11567,7 +11541,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             selection_mode = "selected";
         }
         let (compat, compat_prefix) = match label {
-            "rr-compat-only" => (Some(CompatMode::Rr), Some("rrcompat.")),
             "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
             _ => (None, None),
         };
@@ -11839,6 +11812,22 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     strict_prep.labels = vec!["strict-compat-only".into()];
     steps.push(strict_prep);
 
+    // The rr run type's rows are the compat.yaml replay cells labelled
+    // rr-compat-only, run the same way by rrcompat.manifest_compat.
+    let mut rr_prep = prepare_fixtures_node_dep(
+        "rrcompatprep.fixtures",
+        &portable_fixtures,
+        "build.host_hermit_link",
+    );
+    rr_prep.group = "rrcompatprep".into();
+    rr_prep.desc = "Prepare the fixture files the rr run type's compat cells read".into();
+    rr_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of rrcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
+    );
+    rr_prep.labels = vec!["rr-compat-only".into()];
+    steps.push(rr_prep);
+
     for (mode, namespace, label) in [
         (
             CompatMode::PortableStrict,
@@ -11846,7 +11835,6 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
             "portable-strict-compat-only",
         ),
         (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
-        (CompatMode::Rr, "rrcompat", "rr-compat-only"),
     ] {
         steps.extend(generated_focused_compat_partition(
             root, tmp, mode, namespace, label,
@@ -14175,18 +14163,6 @@ fn compat_summary_with_attempts(
         format!("{passed}/{measured}")
     );
     println!("P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.");
-    if mode == CompatMode::Rr {
-        // Name the rows deliberately EXCLUDED from the R/R ratchet. A denominator
-        // that silently drops five known divergences reads as full coverage.
-        let excluded = validate_corpus::rr_known_failures();
-        println!(
-            "R/R ratchet excludes {} program(s) measured to diverge on replay:",
-            excluded.len()
-        );
-        for (label, why) in &excluded {
-            println!("  - {label}: {why}");
-        }
-    }
     (
         passed,
         measured,
@@ -17235,8 +17211,10 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
         // probes of the sabre-compat-only run type (fold 3). 39 since
         // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
-        // probes of the strict-compat-only run type (fold 4).
-        assert_eq!(steps.len(), 39);
+        // probes of the strict-compat-only run type (fold 4). 40 since
+        // rrcompat.manifest_compat replaced the 139 rrcompat.<program> probes
+        // of the rr-compat-only run type (fold 5).
+        assert_eq!(steps.len(), 40);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -20849,17 +20827,17 @@ fn compat_test_results(
     TestResults::current(executed, 0, results)
 }
 
-/// Add a focused compatibility lane's direct rows (`rrcompat.*`,
-/// `e9patchcompat.*`) to the exact test denominator.
+/// Add a focused compatibility lane's direct rows (`e9patchcompat.*`) to the
+/// exact test denominator.
 ///
 /// Before those lanes were flattened, a nested validate published a single
 /// structured-count file to one outer step. The direct steps already carry
 /// stronger typed terminal outcomes and attempts, so the outer producer now
 /// consumes those facts itself. (The portable strict corpus reports through
 /// its manifest bucket instead: e2e.manifest_compat, and
-/// portablecompat.manifest_compat in the corpus-only lane; so do the SaBRe
-/// and strict run types, through sabrecompat.manifest_compat and
-/// strictcompat.manifest_compat.) A failed
+/// portablecompat.manifest_compat in the corpus-only lane; so do the SaBRe,
+/// strict and rr run types, through sabrecompat.manifest_compat,
+/// strictcompat.manifest_compat and rrcompat.manifest_compat.) A failed
 /// count-bearing non-compatibility node still leaves the passed count unknown;
 /// flattening must not turn an inexact base count into an exact-looking total.
 fn run_test_counts(
@@ -26666,29 +26644,14 @@ fn run(
         let prefix = plan
             .compat_prefix
             .expect("compatibility plans carry their committed tag prefix");
-        let (passed, measured, blocking, nonblocking) =
+        // No remaining compat mode has a passing floor: the rr run type's, the
+        // only one, went with its per-program nodes on 2026-10-02, and its
+        // bucket fails on any selected cell that fails instead.
+        let (_passed, measured, blocking, nonblocking) =
             print_compat_summary(mode, prefix, &outcomes, &attempts);
         compat_blocking = blocking.len();
         compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
-        let floor = match mode {
-            CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
-            CompatMode::PortableStrict | CompatMode::E9patch => None,
-        };
-        if let Some(f) = floor {
-            if passed < f {
-                println!(
-                    "❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR",
-                    mode.display_name()
-                );
-                ok = false;
-            } else {
-                println!(
-                    "✅ {} ratchet: {passed}/{measured} passing, floor {f} — met",
-                    mode.display_name()
-                );
-            }
-        }
         if !blocking.is_empty() {
             println!(
                 "❌ {} blocking failures ({}): {}",
@@ -31310,8 +31273,10 @@ mod raw_census_publication_tests {
         // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
         // probes of the sabre-compat-only run type (fold 3). 39 since
         // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
-        // probes of the strict-compat-only run type (fold 4).
-        assert_eq!(publishers.len(), 39);
+        // probes of the strict-compat-only run type (fold 4). 40 since
+        // rrcompat.manifest_compat replaced the 139 rrcompat.<program> probes
+        // of the rr-compat-only run type (fold 5).
+        assert_eq!(publishers.len(), 40);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(

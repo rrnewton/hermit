@@ -228,6 +228,31 @@ fn strict_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, i
     deltas
 }
 
+/// Fold 5 of the same issue moved the rr compatibility run type from 139
+/// generated validation nodes into the manifest as replay variant tests
+/// compat/rr-<row>, one per program the retired rr lane listed as passing.
+/// Each adds the 16 rows every test has: its ptrace replay row is red
+/// (enabled, and only the rr-compat-only run type selects it), and its other 15
+/// rows, its ptrace verify row among them, are not applicable. The plan of the
+/// full validation is unchanged.
+const RR_FOLD_TESTS: usize = 139;
+
+fn rr_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let tests = RR_FOLD_TESTS as isize;
+    let mut deltas = vec![
+        ("ptrace", "replay", "red", tests),
+        ("native", "naked", "not-applicable", tests),
+    ];
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", tests));
+        deltas.push((backend, "verify", "not-applicable", tests));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+        deltas.push((backend, "replay", "not-applicable", tests));
+    }
+    deltas
+}
+
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
 /// changes which lane runs it, so the total and the per-(backend, mode) counts
@@ -660,7 +685,11 @@ fn the_committed_cell_table_keeps_its_row_counts() {
     let rows = table["cells"].as_array().unwrap();
     assert_eq!(
         rows.len(),
-        5776 + 208 + 16 * COMPAT_FOLD_TESTS + 16 * SABRE_FOLD_NEW_ROWS + 16 * STRICT_FOLD_TESTS
+        5776 + 208
+            + 16 * COMPAT_FOLD_TESTS
+            + 16 * SABRE_FOLD_NEW_ROWS
+            + 16 * STRICT_FOLD_TESTS
+            + 16 * RR_FOLD_TESTS
     );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
@@ -689,6 +718,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(KVM_SOCKET_CELL_DELTAS.iter().copied())
         .chain(sabre_fold_cell_deltas())
         .chain(strict_fold_cell_deltas())
+        .chain(rr_fold_cell_deltas())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))

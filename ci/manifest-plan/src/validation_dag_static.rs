@@ -204,6 +204,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "privileged-only-e2e.manifest_system_utils",
     "privileged-only-e2e.manifest_system_utils_on_host",
     "quick.e2e_verify",
+    "rrcompat.manifest_compat",
     "sabrecompat.manifest_compat",
     "strictcompat.manifest_compat",
 ];
@@ -502,7 +503,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_strict_variant_runs_exactly_the_strict_corpus_programs, which binds
     // that variant to ci/compat/corpus-strict.json, retain all 822 prior
     // identities.
-    ("test.regular_crates", 825),
+    // manifest_corpus::tests::a_replay_variant_runs_only_its_replay_cell_with_its_budget
+    // and a_replay_variant_with_verify_settings_is_refused, added when the
+    // rr-compat-only lane became compat.yaml replay cells (fold 5 of the same
+    // issue), and
+    // the_rr_variant_keeps_the_rr_lane_programs_and_gates_only_those_that_replay,
+    // which pins that variant at the retired lane's 139 programs, retain all 825
+    // prior identities.
+    ("test.regular_crates", 828),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -846,7 +854,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 813 prior identities (measured 819, as above), and the three
     // fold-3 run-type tests retain all 819.
     // The three fold-4 variant tests retain all 822 prior identities.
-    ("test.regular_crates_on_host", 825),
+    // The three fold-5 replay-variant tests retain all 825 prior identities.
+    ("test.regular_crates_on_host", 828),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
@@ -2447,6 +2456,52 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[(r########"manifest_guest"########, 8)],
             est_duration_s: 120.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(6442450944),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
+        cpu_timeout: 1800,
+        jobs_flag: Some(r########"--jobs"########),
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"rrcompat"########,
+        job: r########"manifest_compat"########,
+        desc: r########"The compatibility corpus recorded and replayed under strict Hermit"########,
+        description: r########"The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the corpus's `variants` cells compat/rr-<row>: one ptrace replay cell for each of the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02), each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures rrcompatprep.fixtures writes. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. Only 51 of the 139 pass, on the old lane's own command too (measured on 97ae0ccef with its release Hermit), so the old lane could not have been green: the other 88 stop recording with exit status 122 because record mode refuses every clock read (https://github.com/rrnewton/hermit/issues/3519), and the corpus lists them as `unselected` under that issue, so the node gates the 51 and any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 51 cells took 2.6 seconds of wall time and 15 CPU seconds at 16 jobs on 2026-10-02 (21 seconds of summed cell time), against 56.7 seconds for the same 51 programs run one after another through the old command. The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
+        labels: &[r########"rr-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label rr-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmdtype: CmdType::Unknown,
+        manifest: Some(ManifestSpec {
+            lane: r########"portable"########,
+            category: r########"compat"########,
+            test: None,
+            mode: None,
+            backend: None,
+            label: Some(r########"rr-compat-only"########),
+        }),
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.host_hermit_link"########,
+            r########"build.rust_scripts"########,
+            r########"gate.manifest"########,
+            r########"pre.reverie_pin"########,
+            r########"rrcompatprep.fixtures"########,
+            r########"setup.manifest_plan"########,
+        ],
+        env: &[(
+            r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+            r########"/test"########,
+        )],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 30.0,
             rss_baseline_bytes: Some(4294967296),
             hard_mem_max_bytes: Some(6442450944),
             classification: StepClass::LatencyBound,
@@ -5666,11 +5721,10 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         group: r########"compatprep"########,
         job: r########"hermit_release"########,
         desc: r########"Release Hermit for compatibility"########,
-        description: r########"Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch and rr; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only and strict-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact."########,
+        description: r########"Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact."########,
         labels: &[
             r########"portable-strict-compat-only"########,
             r########"e9patch-compat-only"########,
-            r########"rr-compat-only"########,
         ],
         cmd: r########"cargo build --release -p hermit --features third-party-backends"########,
         cmdtype: CmdType::Unknown,

@@ -408,7 +408,12 @@ labelled with the entry's run type, with one verify cell on the section's
 backend that keeps the section's environment and comparator but takes its
 `hermit_args` (none unless stated), budget, `slow_reason` and
 `no_retry_reason` from the entry and is never a diagnostic; the entry's own
-`unselected` lists its cells measured red. A row's own
+`unselected` lists its cells measured red. An entry with `mode: replay`
+instead gives each test one replay cell on ptrace (`hermit record start`
+then replay, compared by the harness), with the entry's budget and
+`slow_reason` but no `hermit_args`, environment, comparator or
+`no_retry_reason`, which a replay cell does not take; the default is
+`mode: verify`. A row's own
 `labels` put all of its cells in those run types. `unselected` lists cells
 measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`
 carrying the class's `result`, `evidence` (an issue) and `reason`. A row's

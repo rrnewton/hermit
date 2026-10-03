@@ -5103,13 +5103,18 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 3144);
+        assert_eq!(parsed.cells.len(), 3700);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
         );
+        // The repository's limit for a text file is 2 MiB. This bound was
+        // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
+        // took the snapshot to 1,099,771 bytes: every test lists one line per
+        // backend, and the 139 rr-compat-only replay tests added 556
+        // not-applicable lines. 854 KB of it is the 2857 not-applicable lines.
         assert!(
-            committed.len() < 1024 * 1024,
+            committed.len() < 1536 * 1024,
             "{PARITY_CELLS_PATH} is {} bytes; it must stay well under 2 MiB",
             committed.len()
         );
@@ -5145,12 +5150,16 @@ mod tests {
         // run type's 193 variant tests, each declaring its verify cell
         // disabled on the four non-ptrace backends like the rows it repeats:
         // 772 more cells and no applicable, selectable or selected one.
+        // 3700 (925 per backend) since fold 5 added the rr-compat-only run
+        // type's 139 replay variant tests, whose cells on the four non-ptrace
+        // backends are all off: 556 more cells and no applicable, selectable
+        // or selected one.
         // Six earlier and three socket KVM verify enables add applicable,
         // selectable and selected cells without adding candidate identities.
         // https://github.com/rrnewton/reverie/issues/891
         assert_eq!(
             row(&counts.all),
-            (3144, 843 + 6 + 3, 527 + 6 + 3, 194 + 6 + 3, 177 + 6 + 3)
+            (3700, 843 + 6 + 3, 527 + 6 + 3, 194 + 6 + 3, 177 + 6 + 3)
         );
         let by_backend: Vec<_> = counts
             .by_backend
@@ -5160,13 +5169,13 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (786, 85, 26, 16, 2)),
+                ("dbt", (925, 85, 26, 16, 2)),
                 (
                     "kvm",
-                    (786, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
+                    (925, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
                 ),
-                ("liteinst", (786, 149, 146, 99, 98)),
-                ("sabre", (786, 359, 112, 2, 1)),
+                ("liteinst", (925, 149, 146, 99, 98)),
+                ("sabre", (925, 359, 112, 2, 1)),
             ]
         );
     }
