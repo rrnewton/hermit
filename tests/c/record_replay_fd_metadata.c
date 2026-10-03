@@ -34,6 +34,16 @@
 // Set on the host directory by the test harness before recording.
 #define PRE "user.pre"
 
+// An access ACL: ACL_USER_OBJ rwx, ACL_GROUP_OBJ and ACL_OTHER nothing.
+static const struct {
+  uint32_t version;
+  struct {
+    uint16_t tag;
+    uint16_t perm;
+    uint32_t id;
+  } entries[3];
+} acl = {2, {{0x01, 7, (uint32_t)-1}, {0x04, 0, (uint32_t)-1}, {0x20, 0, (uint32_t)-1}}};
+
 static int failures;
 
 // Print a result and require it to succeed (expected_errno == 0) or to fail
@@ -154,6 +164,19 @@ int main(int argc, char** argv) {
     printf("UNEXPECTED fstat mode %o\n", st.st_mode & 07777);
     failures++;
   }
+  // Attributes the kernel consults on later calls, set through the
+  // placeholder: strip copies its input's ACL to its output this way, and an
+  // install step sets a capability on a staged binary. The replay root lacks
+  // the file, so no live call can reach either.
+  expect_value(
+      "fsetxattr-acl-placeholder",
+      fsetxattr(fd, "system.posix_acl_access", &acl, sizeof(acl), 0),
+      0);
+  struct vfs_cap_data cap = {VFS_CAP_REVISION_2, {{1u << CAP_NET_RAW, 0}, {0, 0}}};
+  expect_value(
+      "fsetxattr-cap-placeholder",
+      fsetxattr(fd, "security.capability", &cap, XATTR_CAPS_SZ_2, 0),
+      0);
   expect_value("close", close(fd), 0);
 
   // The working directory and a file the guest creates in it exist in the
@@ -216,15 +239,6 @@ int main(int argc, char** argv) {
   expect_value("capset-none", syscall(SYS_capset, &cap_header, no_caps), 0);
   expect_value("chmod-acl-0", chmod("acl", 0), 0);
   expect_value("chmod-facl-0", chmod("facl", 0), 0);
-  // ACL_USER_OBJ rwx, ACL_GROUP_OBJ and ACL_OTHER nothing.
-  struct {
-    uint32_t version;
-    struct {
-      uint16_t tag;
-      uint16_t perm;
-      uint32_t id;
-    } entries[3];
-  } acl = {2, {{0x01, 7, (uint32_t)-1}, {0x04, 0, (uint32_t)-1}, {0x20, 0, (uint32_t)-1}}};
   expect_value(
       "setxattr-acl",
       setxattr("acl", "system.posix_acl_access", &acl, sizeof(acl), 0),

@@ -1766,12 +1766,11 @@ impl Replayer {
     /// ends in the recorded state too.
     ///
     /// A file the replay root lacks (a placeholder descriptor, ENOENT or
-    /// ENOTDIR) or cannot write (EROFS) keeps the change virtual, as other
-    /// path mutations do: tools that copy a file's ACL to their output, such
-    /// as strip, do this to files outside the recorded tree. The exception is
-    /// setting a file capability. Exec materializes such a file in the replay
-    /// root from its contents and mode alone, so the capability would be
-    /// missing when the recording had it.
+    /// ENOTDIR) or cannot write (EROFS) keeps the change virtual, whatever the
+    /// name, as other path mutations do. No live call can reach such a file:
+    /// tools that copy a file's ACL to their output, such as strip, and
+    /// installs that set a capability on a staged binary both change files
+    /// outside the recorded tree.
     async fn handle_xattr_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1820,12 +1819,10 @@ impl Replayer {
         let name = name.unwrap_or_else(|error| {
             panic!("could not read the name of recorded xattr change {syscall:?}: {error}")
         });
-        let is_capability = name.to_bytes() == b"security.capability";
-        let governs_live_calls = is_capability
-            || matches!(
-                name.to_bytes(),
-                b"system.posix_acl_access" | b"system.posix_acl_default"
-            );
+        let governs_live_calls = matches!(
+            name.to_bytes(),
+            b"system.posix_acl_access" | b"system.posix_acl_default" | b"security.capability"
+        );
         // A placeholder descriptor names a file the replay root lacks.
         let outcome = if in_replay_root {
             guest.inject_with_retry(live_call).await.map(drop)
@@ -1835,9 +1832,7 @@ impl Replayer {
         match outcome {
             Ok(()) => {}
             Err(Errno::ENODATA) if is_removal => {}
-            Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS))
-                if is_removal || !is_capability =>
-            {
+            Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
                 tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
             }
             Err(error) if !governs_live_calls => {
