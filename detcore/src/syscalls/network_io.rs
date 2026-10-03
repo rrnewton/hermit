@@ -62,6 +62,7 @@ use crate::network_replay::NetworkStreamQueueStatus;
 use crate::network_replay::NetworkStreamSocketOption;
 use crate::network_replay::NetworkStreamSocketState;
 use crate::network_replay::NetworkZeroStreamReceive;
+use crate::network_replay::original_sendto_shape;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
 use crate::resources::NetworkWaitKind;
@@ -81,13 +82,6 @@ use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::types::LogicalTime;
 use crate::types::OpenFileId;
-
-fn original_sendto_shape(call: syscalls::Sendto) -> bool {
-    let (_, raw) = Syscall::from(call).into_parts();
-    (1..=512).contains(&call.size()) && raw.arg1 != 0
-        && matches!(call.flags() as i32, libc::MSG_NOSIGNAL | 0x4040)
-        && raw.arg4 == 0 && raw.arg5 == 0
-}
 
 fn engine_error(error: impl std::fmt::Display) -> Error {
     Error::Tool(anyhow::anyhow!(
@@ -3107,25 +3101,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
         if policy == NetworkPolicy::Replay
-            && guest.local_global_state().and_then(|global| global.native_receive_mode())
+            && self.network_fd_tracking_active(guest)
+            && guest
+                .local_global_state()
+                .and_then(|global| global.native_receive_mode())
+                != Some(crate::network_replay::NetworkEngineMode::Replay)
+        {
+            return Err(engine_error(
+                "tracked Sendto Replay requires actual local V4 authority",
+            ));
+        }
+        if policy == NetworkPolicy::Replay
+            && guest
+                .local_global_state()
+                .and_then(|global| global.native_receive_mode())
                 == Some(crate::network_replay::NetworkEngineMode::Replay)
         {
-            let (_, raw) = Syscall::from(call).into_parts();
-            if call.size() == 0 || !matches!(call.flags() as i32, libc::MSG_NOSIGNAL | 0x4040) || raw.arg4 != 0 || raw.arg5 != 0
-                || !guest.thread_state().with_detfd(call.fd(), |fd| fd.is_nonblocking())?
-            { return Err(engine_error("V4 Sendto Replay requires nonblocking scalar MSG_NOSIGNAL")); }
+            if !original_sendto_shape(call)
+                || !guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |fd| fd.is_nonblocking())?
+            {
+                return Err(engine_error(
+                    "V4 Sendto Replay requires nonblocking scalar MSG_NOSIGNAL",
+                ));
+            }
             let read = self.begin_network_fd_read(guest, call.fd()).await?;
             let result = async {
                 let maximum = guest.local_global_state().unwrap().replay_sendto_read_limit(
                     guest.tid(), guest.thread_state(), &read, call.size(),
                 ).map_err(engine_rpc_error)?;
-                let mut bytes = vec![0; maximum];
-                if !bytes.is_empty() {
-                    guest.memory().read_exact(call.buf().ok_or(Errno::EFAULT)?.cast::<u8>(), &mut bytes)?;
+                // A numeric guest address and a destination-write range do not
+                // own an outbound source read. Keep the selected prefix intact
+                // until the backend can retain the exact source stop and MM
+                // through the read worker's actual join. In particular, never
+                // read the requested tail beyond a recorded partial success.
+                if maximum != 0 {
+                    return Err(engine_error("V4 Sendto Replay positive prefix requires source-stop/MM-bound read custody"));
                 }
-                self.stream_transmit(guest, call.into(), open_file, bytes, policy).await
+                // A recorded errno has no source bytes. Preserve that outcome
+                // without touching even an inaccessible original payload.
+                self.stream_transmit(guest, call.into(), open_file, Vec::new(), policy).await
             }.await;
-            let released = self.shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read }).await;
+            let released = self
+                .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                .await;
             return finish_shadow_operation(result, released);
         }
         let mut bytes = vec![0; call.size()];

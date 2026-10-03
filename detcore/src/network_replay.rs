@@ -24,6 +24,7 @@ pub use accepted::NetworkAcceptedCompletion;
 mod fd_mutation;
 mod initial_record;
 pub(crate) use initial_record::initial_record_call_supported;
+pub(crate) use initial_record::original_sendto_shape;
 mod fd_read_metadata;
 mod helper_copy;
 pub(crate) mod lifetime;

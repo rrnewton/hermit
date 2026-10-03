@@ -4,6 +4,7 @@
 //! production Stopped implementation and target-PKRU check. No BPF/E2E claim.
 mod scalar_recvfrom;
 mod raw_poll;
+mod sendto_entry;
 
 use std::cell::Cell;
 use std::io::IoSlice;

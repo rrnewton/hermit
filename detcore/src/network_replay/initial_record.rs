@@ -7,8 +7,25 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 
+/// A supported scalar shape, not permission to read guest memory or submit a
+/// native call. Record still needs its actual original-file/provider admission;
+/// Replay separately refuses positive prefixes without source-stop/MM custody.
+pub(crate) fn original_sendto_shape(call: reverie::syscalls::Sendto) -> bool {
+    let (_, raw) = Syscall::from(call).into_parts();
+    (1..=512).contains(&call.size())
+        && raw.arg1 != 0
+        && matches!(call.flags() as i32, libc::MSG_NOSIGNAL | 0x4040)
+        && raw.arg4 == 0
+        && raw.arg5 == 0
+}
+
 pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
     match call {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3464): Route only the existing original scalar
+        // capture shape. This gate issues no native or guest-memory authority.
+        // https://github.com/rrnewton/hermit/pull/3464
+        Syscall::Sendto(send) => original_sendto_shape(send),
         Syscall::Socketpair(pair) => pair.family() == libc::AF_UNIX
             && pair.r#type() & !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) == libc::SOCK_STREAM
             && pair.protocol() == 0,
@@ -108,8 +125,8 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 // These scalar synchronization and stream operations already
                 // have exact Detcore handlers. Futex and poll join the
                 // scheduler's modeled blocking state; recvfrom joins the
-                // authenticated network physical-effect protocol. Keep sendto
-                // and vectored/message variants refused until their distinct
+                // authenticated network physical-effect protocol. Keep
+                // vectored/message variants refused until their distinct
                 // transmission, guest-memory, and descriptor-transfer joins
                 // are complete.
                 | Sysno::futex | Sysno::poll | Sysno::recvfrom
@@ -129,6 +146,49 @@ mod tests {
             number,
             reverie::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
         )
+    }
+    #[test]
+    fn initial_record_admits_only_exact_original_sendto_shape() {
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::Sendto;
+        use reverie::syscalls::SyscallArgs;
+        let send = |size, flags| {
+            Syscall::from(
+                Sendto::new()
+                    .with_fd(7)
+                    .with_buf(AddrMut::from_raw(0x1000))
+                    .with_size(size)
+                    .with_flags(flags),
+            )
+        };
+        for size in [1, 512] {
+            for flags in [libc::MSG_NOSIGNAL, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT] {
+                assert!(initial_record_call_supported(send(size, flags as u32)));
+            }
+        }
+        for (size, flags) in [
+            (0, libc::MSG_NOSIGNAL),
+            (513, libc::MSG_NOSIGNAL),
+            (3, 0),
+            (3, libc::MSG_DONTWAIT),
+            (3, libc::MSG_NOSIGNAL | libc::MSG_MORE),
+        ] {
+            assert!(!initial_record_call_supported(send(size, flags as u32)));
+        }
+        for (buffer, destination, destination_length) in [(0, 0, 0), (0x1000, 1, 0), (0x1000, 0, 1)]
+        {
+            assert!(!initial_record_call_supported(Syscall::from_raw(
+                Sysno::sendto,
+                SyscallArgs::new(
+                    7,
+                    buffer,
+                    3,
+                    libc::MSG_NOSIGNAL as usize,
+                    destination,
+                    destination_length
+                )
+            )));
+        }
     }
     #[test]
     fn initial_record_admits_only_local_stream_socketpair_shape() {
