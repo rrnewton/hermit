@@ -564,7 +564,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("privileged-test.cli_kvm", 36),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained.
-    ("test.cli_on_host", 102),
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths
+    // (https://github.com/rrnewton/hermit/pull/3564), as in test.cli; all 102
+    // prior identities retained.
+    ("test.cli_on_host", 103),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
