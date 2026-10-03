@@ -172,14 +172,30 @@ pub(crate) fn fixture(
 pub(crate) fn dispatcher_fixture(
     fd: i32,
 ) -> (NetworkReplayEngine, FileMetadata, NetworkStreamOwner) {
+    dispatcher_fixture_in_mode(fd, NetworkEngineMode::Record)
+}
+
+pub(crate) fn dispatcher_fixture_in_mode(
+    fd: i32,
+    mode: NetworkEngineMode,
+) -> (NetworkReplayEngine, FileMetadata, NetworkStreamOwner) {
     let first = DetTid::from_raw(61);
     let owner = NetworkStreamOwner {
         thread: first,
         mm: MmId::initial(first),
     };
-    let mut engine = NetworkReplayEngine::record_native_receive(
+    let record = NetworkReplayEngine::record_native_receive(
         chrono::Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
     );
+    let mut engine = match mode {
+        NetworkEngineMode::Record => record,
+        NetworkEngineMode::Replay => NetworkReplayEngine::replay_native_receive(
+            record.into_native_recorded_trace().unwrap(),
+        )
+        .unwrap(),
+    };
+    assert!(engine.native_receive_version());
+    assert_eq!(engine.mode(), mode);
     engine.fd_table_fixture_enable();
     engine.fd_publication_fixture_register(owner, None);
     let mut metadata = FileMetadata::empty_network_fixture(first);
@@ -578,4 +594,218 @@ fn close_positive_terminal_selection_publishes_once_after_original_owner_consump
         .unwrap();
     engine.finish_original_connect(owner, &admission).unwrap();
     assert_eq!(metadata.descriptor_binding(7).unwrap(), replacement);
+}
+
+fn replay_close_fixture() -> (
+    NetworkReplayEngine,
+    FileMetadata,
+    NetworkStreamOwner,
+    Admission,
+) {
+    let (mut engine, metadata, owner) = dispatcher_fixture_in_mode(7, NetworkEngineMode::Replay);
+    let old = metadata.descriptor_binding(7).unwrap();
+    let admission = engine
+        .begin_original_connect(
+            owner,
+            Arguments {
+                kind: Kind::Close,
+                operation: crate::resources::ExternalOpId::new(owner.thread, 10),
+                files: metadata.files_id,
+                binding: Some(old),
+                fd: 7,
+                address: 0,
+                length: 0,
+                original_count: 0,
+            },
+        )
+        .unwrap();
+    engine
+        .original_connect_provider_submitted(owner, &admission)
+        .unwrap();
+    engine
+        .original_call_prepared(owner, &admission, None, 17)
+        .unwrap();
+    (engine, metadata, owner, admission)
+}
+
+#[test]
+fn replay_close_preserves_selection_and_retirement_checks_across_reuse() {
+    replay_close_controls(0);
+    replay_close_controls(-i64::from(libc::EINTR));
+}
+
+fn replay_close_controls(returned: i64) {
+    let (mut engine, mut metadata, owner, admission) = replay_close_fixture();
+    let old = admission.arguments.binding.unwrap();
+    let physical = selected(owner, &admission);
+    assert!(
+        engine
+            .publish_original_close_selection(owner, &admission, &physical, &mut metadata)
+            .is_err()
+    );
+    engine.original_connect_invoked(owner, &admission).unwrap();
+    for mutation in 0..10 {
+        let mut changed = physical.clone();
+        match mutation {
+            0 => changed.command += 1,
+            1 => changed.call += 1,
+            2 => changed.owner_mm += 1,
+            3 => changed.requested_fd += 1,
+            4 => changed.file = 0,
+            5 => changed.ready = 0,
+            6 => changed.fdput_flags = 1,
+            7 => changed.provider = 0,
+            8 => changed.task = 0,
+            9 => {
+                assert_eq!(
+                    metadata.slot_generations.insert(7, old.generation + 1),
+                    Some(old.generation)
+                );
+            }
+            _ => unreachable!(),
+        }
+        let before = metadata.descriptor_binding(7).unwrap();
+        assert!(
+            engine
+                .publish_original_close_selection(owner, &admission, &changed, &mut metadata)
+                .is_err()
+        );
+        assert_eq!(metadata.descriptor_binding(7).unwrap(), before);
+        assert_eq!(
+            engine.native_capture_fixture_counts(old.open_file),
+            (1, 1, 1, 1)
+        );
+        assert!(
+            engine
+                .acquire_fd_publication(owner, metadata.files_id)
+                .is_err()
+        );
+        assert!(engine.finish_original_connect(owner, &admission).is_err());
+        if mutation == 9 {
+            metadata.slot_generations.insert(7, old.generation);
+        }
+    }
+    engine
+        .publish_original_close_selection(owner, &admission, &physical, &mut metadata)
+        .unwrap();
+    assert_eq!(metadata.descriptor_binding(7), Err(Errno::EBADF));
+    assert_eq!(
+        engine.native_capture_fixture_counts(old.open_file),
+        (1, 0, 0, 1)
+    );
+    assert_eq!(
+        engine.original_connect_result(owner, &admission).unwrap(),
+        None
+    );
+    assert!(engine.finish_original_connect(owner, &admission).is_err());
+    let replacement = dispatcher_install(&mut engine, &mut metadata, owner, 7);
+    assert_eq!(replacement.slot, old.slot);
+    assert_ne!(replacement.generation, old.generation);
+    engine
+        .publish_original_close_selection(owner, &admission, &physical, &mut metadata)
+        .unwrap();
+    let mut changed = physical.clone();
+    changed.file += 1;
+    assert!(
+        engine
+            .publish_original_close_selection(owner, &admission, &changed, &mut metadata)
+            .is_err()
+    );
+    assert_eq!(metadata.descriptor_binding(7).unwrap(), replacement);
+    engine
+        .original_connect_returned(owner, &admission, returned)
+        .unwrap();
+    assert!(engine.finish_original_connect(owner, &admission).is_err());
+    if returned != 0 {
+        assert!(
+            engine
+                .original_connect_provider_retired(owner, &admission, 0)
+                .is_err()
+        );
+    }
+    engine
+        .original_connect_provider_retired(owner, &admission, returned)
+        .unwrap();
+    assert!(engine.finish_original_connect(owner, &admission).is_err());
+    engine
+        .original_connect_pin_released(owner, &admission)
+        .unwrap();
+    engine.finish_original_connect(owner, &admission).unwrap();
+    assert_eq!(metadata.descriptor_binding(7).unwrap(), replacement);
+    assert_eq!(
+        engine.native_capture_fixture_counts(old.open_file),
+        (0, 0, 0, 0)
+    );
+}
+
+#[test]
+fn replay_uninvoked_close_requires_exact_disarm_and_preserves_both_slots() {
+    let (mut engine, metadata, owner, admission) = replay_close_fixture();
+    // The consumed owner is permanently gone. As in the existing table
+    // lifetime controls, retain an explicitly registered same-files peer to
+    // inspect that table; this is not a V4 sole-root admission certificate.
+    let peer = NetworkStreamOwner {
+        thread: DetTid::from_raw(62),
+        mm: owner.mm,
+    };
+    assert_eq!(
+        engine.fd_publication_fixture_register(peer, Some(owner)),
+        metadata.files_id
+    );
+    let old = admission.arguments.binding.unwrap();
+    engine
+        .original_connect_consumed(owner, &local(&admission, false))
+        .unwrap();
+    assert!(
+        engine
+            .acquire_fd_publication(owner, metadata.files_id)
+            .is_err()
+    );
+    assert!(
+        engine
+            .original_connect_disarmed(owner, &admission, 18)
+            .is_err()
+    );
+    assert!(
+        engine
+            .original_connect_cancel_retired(owner, &admission)
+            .is_err()
+    );
+    assert_eq!(metadata.descriptor_binding(7).unwrap(), old);
+    assert_eq!(
+        engine.native_capture_fixture_counts(old.open_file),
+        (1, 1, 1, 1)
+    );
+    engine
+        .original_connect_disarmed(owner, &admission, 17)
+        .unwrap();
+    assert!(engine.finish_original_connect(owner, &admission).is_err());
+    assert_eq!(
+        engine.original_connect_result(owner, &admission).unwrap(),
+        None
+    );
+    engine
+        .original_connect_cancel_retired(owner, &admission)
+        .unwrap();
+    assert!(engine.finish_original_connect(owner, &admission).is_err());
+    engine
+        .original_connect_pin_released(owner, &admission)
+        .unwrap();
+    engine.finish_original_connect(owner, &admission).unwrap();
+    assert_eq!(metadata.descriptor_binding(7).unwrap(), old);
+    assert!(matches!(
+        engine.begin_fd_read(owner, metadata.files_id, 7),
+        Err(NetworkReplayError::StreamOwnerGone(gone)) if gone == owner
+    ));
+    let NetworkFdReadBegin::Admitted(read) =
+        engine.begin_fd_read(peer, metadata.files_id, 7).unwrap()
+    else {
+        panic!("disarmed original Close must preserve the engine's occupied binding");
+    };
+    assert_eq!(read.binding, Some(old));
+    engine.finish_fd_read(peer, *read).unwrap();
+    assert_eq!(
+        engine.native_capture_fixture_counts(old.open_file),
+        (0, 0, 0, 0)
+    );
 }

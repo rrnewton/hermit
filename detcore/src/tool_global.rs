@@ -684,6 +684,16 @@ impl GlobalState {
         state
     }
 
+    #[cfg(test)]
+    pub(crate) fn native_replay_view_fixture(cfg: &Config) -> Self {
+        let state = Self::initialize(cfg, false);
+        assert_eq!(
+            state.native_receive_mode(),
+            Some(crate::network_replay::NetworkEngineMode::Replay)
+        );
+        state
+    }
+
     async fn recv_enroll_accepted_listener(
         &self,
         owner: NetworkStreamOwner,

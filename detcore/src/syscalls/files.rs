@@ -1219,11 +1219,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Close,
     ) -> Result<i64, Error> {
-        if self.original_connect_record_route(guest).await? {
-            // Close must use the same V3/V4 capability route as Connect. In
-            // particular, V4 descriptor tracking can be active without the
-            // legacy accepted-mode bit; bypassing its native removal join
-            // leaves an authenticated Openat slot live across FD reuse.
+        if self.network_fd_tracking_active(guest)
+            || self.original_connect_record_route(guest).await?
+        {
+            // Tracked Replay also owns real loader/socket placeholder FDs.
+            // Close must publish the exact selected removal to both local and
+            // engine tables before reuse, with independent native retirement.
+            // The tracking hint issues no authority; the original-call join
+            // still authenticates owner/MM/table and the provider selection.
+            // https://github.com/rrnewton/hermit/issues/3618
             return self.network_original_close(guest, call).await;
         }
         let fd = call.fd();

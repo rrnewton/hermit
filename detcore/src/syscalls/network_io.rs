@@ -9176,8 +9176,63 @@ mod original_file_delegate_error_tests {
         }
     }
 
+    // These fixtures deliberately reuse a just-closed numeric FD. Each needs
+    // its own OS descriptor table: a mutex between them cannot protect other
+    // concurrently running libtest cases from the fixture's dup3 replacement.
+    fn close_dispatch_subprocess() -> bool {
+        const CHILD: &str = "HERMIT_CLOSE_DISPATCH_TEST_CHILD";
+        let test = std::thread::current()
+            .name()
+            .expect("libtest supplies the exact test name")
+            .to_owned();
+        if let Some(selected) = std::env::var_os(CHILD) {
+            assert_eq!(selected, std::ffi::OsStr::new(&test));
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &test,
+                "--nocapture",
+                "--format=pretty",
+                "--color=never",
+            ])
+            .env(CHILD, &test)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{test}: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(&format!("test {test} ... ok"))
+                && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "exact child must execute its lifecycle assertions: {stdout}\n{stderr}"
+        );
+        true
+    }
+
     #[tokio::test]
     async fn v4_close_dispatch_joins_physical_effect_lifetime_and_fd_generation() {
+        if !close_dispatch_subprocess() {
+            close_dispatch_lifecycle(NetworkPolicy::Record).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_replay_close_dispatch_joins_physical_effect_lifetime_and_fd_generation() {
+        if !close_dispatch_subprocess() {
+            close_dispatch_lifecycle(NetworkPolicy::Replay).await;
+        }
+    }
+
+    // Actual syscall dispatcher, native Close, and local/engine publication.
+    // Provider callbacks and initial installation remain controlled premises;
+    // this is not a native provider or trace-comparator qualification.
+    async fn close_dispatch_lifecycle(policy: NetworkPolicy) {
         use std::os::fd::AsRawFd;
         use std::os::fd::FromRawFd;
         use std::os::fd::IntoRawFd;
@@ -9191,8 +9246,18 @@ mod original_file_delegate_error_tests {
 
         let (read_end, _write_end) = pipe();
         let fd = read_end.into_raw_fd();
-        let (engine, metadata, owner) =
-            crate::tool_local::original_close_tests::dispatcher_fixture(fd);
+        let (engine, metadata, owner) = match policy {
+            NetworkPolicy::Record => {
+                crate::tool_local::original_close_tests::dispatcher_fixture(fd)
+            }
+            NetworkPolicy::Replay => {
+                crate::tool_local::original_close_tests::dispatcher_fixture_in_mode(
+                    fd,
+                    crate::network_replay::NetworkEngineMode::Replay,
+                )
+            }
+            _ => unreachable!(),
+        };
         let old = metadata.descriptor_binding(fd).unwrap();
         let mut config = Config {
             sequentialize_threads: false,
@@ -9201,7 +9266,23 @@ mod original_file_delegate_error_tests {
             epoch: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
             ..Config::default()
         };
-        config.network_trace.policy = NetworkPolicy::Record;
+        config.network_trace.policy = policy;
+        let global = match policy {
+            NetworkPolicy::Record => GlobalState::native_record_view_fixture(&config),
+            NetworkPolicy::Replay => {
+                let trace = crate::network_replay::NetworkReplayEngine::record_native_receive(
+                    config.epoch,
+                )
+                .into_recorded_versioned_trace()
+                .unwrap();
+                let mut bytes = Vec::new();
+                trace.write_framed(&mut bytes).unwrap();
+                config.network_trace_input = Some(bytes);
+                GlobalState::native_replay_view_fixture(&config)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(global.native_receive_mode(), Some(engine.mode()));
         let tool: Detcore<FailingDelegate> =
             Detcore::new(Tid::from_raw(owner.thread.as_raw()), &config);
         let mut thread = tool.init_thread_state(Tid::from_raw(owner.thread.as_raw()), None);
@@ -9212,7 +9293,7 @@ mod original_file_delegate_error_tests {
         thread.file_metadata = std::sync::Arc::new(Mutex::new(metadata));
         let mut guest = CloseDispatchGuest {
             config: &config,
-            global: GlobalState::native_record_view_fixture(&config),
+            global,
             thread,
             engine: Mutex::new(engine),
             owner,
@@ -9222,6 +9303,10 @@ mod original_file_delegate_error_tests {
                 events: Vec::new(),
             }),
         };
+
+        if policy == NetworkPolicy::Replay {
+            assert!(!tool.original_connect_record_route(&mut guest).await.unwrap());
+        }
 
         assert_eq!(
             tool.handle_syscall_event(&mut guest, syscalls::Close::new().with_fd(fd).into(),)
