@@ -110,7 +110,7 @@ impl Replayer {
     /// `handle_madvise`: applies the advice live to the recorded prefix, then
     /// restores the file-backed contents the recording observed.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3537): Audit the madvise refill and WIPEONFORK prefix.
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3589): Audit the madvise refill and WIPEONFORK prefix.
     pub(super) async fn handle_madvise<G: Guest<Self>>(
         &self,
         guest: &mut G,

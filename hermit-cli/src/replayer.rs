@@ -451,6 +451,7 @@ impl Tool for Replayer {
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Madvise(syscall) => self.handle_madvise(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) | Syscall::Openat(_) => {
