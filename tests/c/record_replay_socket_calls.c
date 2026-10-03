@@ -14,7 +14,9 @@
  * (IPV6_V6ONLY after bind, AF_ALG's ALG_SET_KEY), which replay runs live, and
  * IPV6_ADDRFORM, which depends on a connection replay does not make. Two
  * recvmmsg edge cases return a count or an error after partial side effects:
- * an unmapped header after the received ones, and a read-only timeout.
+ * an unmapped header after the received ones, and a read-only timeout. A
+ * timeout straddling a writable and a read-only page is copied back in part,
+ * and a header whose input-only msg_name pointer is read-only still receives.
  */
 
 #define _GNU_SOURCE
@@ -183,6 +185,46 @@ static int partial_side_effects(void) {
   CHECK(received == -1 && errno == EFAULT);
   CHECK(messages[0].msg_len == 2 && messages[1].msg_len == 2 &&
         messages[2].msg_len == 77);
+  close(sv[0]);
+  close(sv[1]);
+
+  /* tv_sec ends the writable page, so Linux copies it back before faulting
+   * on tv_nsec. */
+  CHECK(queued_pair(sv, 2) == 0);
+  CHECK(mprotect(pages, page, PROT_READ | PROT_WRITE) == 0);
+  CHECK(mprotect(pages + page, page, PROT_READ) == 0);
+  timeout = (struct timespec*)(pages + page - sizeof timeout->tv_sec);
+  timeout->tv_sec = 5;
+  for (int i = 0; i < 3; i++) {
+    prepare_receive(&messages[i], &message_iov[i], message_buffers[i],
+                    sizeof message_buffers[i]);
+  }
+  received = recvmmsg(sv[1], messages, 3, MSG_DONTWAIT, timeout);
+  printf("recvmmsg straddling timeout %d errno %d lens %u %u tv_sec %lld\n",
+         received, received < 0 ? errno : 0, messages[0].msg_len,
+         messages[1].msg_len, (long long)timeout->tv_sec);
+  CHECK(received == -1 && errno == EFAULT);
+  CHECK(messages[0].msg_len == 2 && messages[1].msg_len == 2);
+  /* The remaining time was copied back, so less than the 5s passed in. */
+  CHECK(timeout->tv_sec == 4);
+  close(sv[0]);
+  close(sv[1]);
+
+  /* Linux writes only a header's output fields, so a header whose msg_name
+   * pointer is on a read-only page still receives. */
+  CHECK(queued_pair(sv, 1) == 0);
+  CHECK(mprotect(pages + page, page, PROT_READ | PROT_WRITE) == 0);
+  struct mmsghdr* straddling = (struct mmsghdr*)(pages + page - sizeof(void*));
+  memset(message_buffers[0], 0, sizeof message_buffers[0]);
+  prepare_receive(straddling, &message_iov[0], message_buffers[0],
+                  sizeof message_buffers[0]);
+  CHECK(mprotect(pages, page, PROT_READ) == 0);
+  received = recvmmsg(sv[1], straddling, 1, MSG_DONTWAIT, NULL);
+  printf("recvmmsg read-only msg_name pointer %d errno %d len %u data %.2s\n",
+         received, received < 0 ? errno : 0, straddling->msg_len,
+         message_buffers[0]);
+  CHECK(received == 1 && straddling->msg_len == 2 &&
+        memcmp(message_buffers[0], "m0", 2) == 0);
   close(sv[0]);
   close(sv[1]);
   CHECK(munmap(pages, 2 * page) == 0);

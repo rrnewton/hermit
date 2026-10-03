@@ -205,18 +205,21 @@ fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bo
 /// result instead of running live. Keyed by inode, so the mark follows the
 /// socket through `dup`, `fork` and SCM_RIGHTS.
 ///
-/// Marking is always safe, which is why the set is process-wide and never
-/// shrinks: a mark only replaces a live check with the recorded result, and
-/// every observer of socket state is itself replayed. A socket whose inode
-/// Linux reuses after an earlier one closed therefore loses only that check.
+/// A mark only replaces a live check of the call's result with the recorded
+/// result; that is why the set is process-wide and never shrinks, and why a
+/// socket whose inode Linux reuses after an earlier one closed loses only that
+/// check. It does not make the socket's state match the recording for
+/// observers that still run live: `select` and `pselect6` do today, so a
+/// readiness check on such a socket can differ until they are recorded
+/// (https://github.com/rrnewton/hermit/pull/3575).
 static DETACHED_SOCKETS: OnceLock<Mutex<BTreeSet<ReplayFileIdentity>>> = OnceLock::new();
 
 fn guest_fd_metadata(pid: Pid, fd: libc::c_int) -> Option<std::fs::Metadata> {
     std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()
 }
 
-/// Mark the guest's fd detached if it is a live socket. Any other fd is
-/// already treated as detached by `socket_is_detached`.
+/// Mark the guest's fd detached if it is a live socket. Placeholder and
+/// absent fds are already treated as detached by `socket_is_detached`.
 fn mark_detached_socket(pid: Pid, fd: libc::c_int) {
     let Some(metadata) = guest_fd_metadata(pid, fd).filter(|m| m.file_type().is_socket()) else {
         return;
@@ -229,13 +232,17 @@ fn mark_detached_socket(pid: Pid, fd: libc::c_int) {
 }
 
 /// Whether a socket call on the guest's fd must return its recorded result.
-/// True for marked sockets, and for an fd that is not a live socket in
-/// replay, such as the eventfd placeholder for a descriptor received through
-/// SCM_RIGHTS, or a virtual fd: there a live call could only fail.
+/// True for marked sockets, for the eventfd placeholder replay reserves for a
+/// descriptor received through SCM_RIGHTS, and for an fd that is absent in
+/// replay: there a live call could only fail. Any other fd runs live.
 fn socket_is_detached(pid: Pid, fd: libc::c_int) -> bool {
-    let Some(metadata) = guest_fd_metadata(pid, fd).filter(|m| m.file_type().is_socket()) else {
+    let Some(metadata) = guest_fd_metadata(pid, fd) else {
         return true;
     };
+    if !metadata.file_type().is_socket() {
+        return std::fs::read_link(format!("/proc/{}/fd/{fd}", pid.as_raw()))
+            .is_ok_and(|target| target.as_os_str() == "anon_inode:[eventfd]");
+    }
     let identity = ReplayFileIdentity::from_metadata(&metadata);
     DETACHED_SOCKETS.get().is_some_and(|sockets| {
         sockets

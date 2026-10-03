@@ -133,35 +133,93 @@ fn read_readable_mmsghdrs<M: MemoryAccess>(
     headers
 }
 
-/// Write `bytes` to guest `address` with the page permissions the guest's own
-/// stores, and so Linux's copy-out, would have. A plain debugger write can
-/// store through a read-only page.
-fn write_as_guest<M: MemoryAccess>(
-    memory: &mut M,
-    address: usize,
-    bytes: &[u8],
-) -> Result<(), Errno> {
-    let address = AddrMut::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
+/// Copy `bytes` to guest `address` as Linux's copy-out would: with the
+/// guest's page permissions, stopping at the first byte it cannot write. A
+/// plain debugger write can store through a read-only page. Returns the
+/// number of bytes copied.
+fn copy_out_as_guest<M: MemoryAccess>(memory: &mut M, address: usize, bytes: &[u8]) -> usize {
+    let Some(address) = AddrMut::<u8>::from_raw(address) else {
+        return 0;
+    };
     match memory.write_with_user_access(address, bytes) {
-        Ok(written) if written == bytes.len() => Ok(()),
-        Ok(_) => Err(Errno::EFAULT),
+        Ok(copied) => copied,
+        Err(Errno::EFAULT) => 0,
         // Recording always runs on ptrace, which supports this.
-        Err(Errno::ENOSYS) => panic!("recording needs permission-checked guest writes"),
-        Err(errno) => Err(errno),
+        Err(errno) => panic!("permission-checked guest write failed: {errno}"),
     }
 }
 
-/// Whether Linux could write back to `mmsghdr` entry `index` at `base`.
-/// Writing back the bytes just read leaves guest memory as it was.
-fn mmsghdr_is_writable<M: MemoryAccess>(memory: &mut M, base: usize, index: usize) -> bool {
-    let mut bytes = [0u8; std::mem::size_of::<libc::mmsghdr>()];
-    mmsghdr_entry(base, index)
-        .and_then(|entry| {
-            let entry = Addr::<u8>::from_raw(entry).ok_or(Errno::EFAULT)?;
-            memory.read_exact(entry, &mut bytes)?;
-            write_as_guest(memory, entry.as_raw(), &bytes)
+/// The guest's writable address ranges, read from `/proc/<pid>/maps`
+/// without touching guest memory.
+struct WritableMappings(Vec<(usize, usize)>);
+
+impl WritableMappings {
+    fn read(pid: reverie::Pid) -> Self {
+        let maps = std::fs::read(format!("/proc/{}/maps", pid.as_raw()))
+            .unwrap_or_else(|error| panic!("cannot read the memory map of {pid}: {error}"));
+        // A mapped path need not be UTF-8; only the leading fields are parsed.
+        let maps = String::from_utf8_lossy(&maps);
+        let ranges = maps
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (start, end) = fields.next()?.split_once('-')?;
+                let writable = fields.next()?.as_bytes().get(1) == Some(&b'w');
+                writable.then(|| {
+                    Some((
+                        usize::from_str_radix(start, 16).ok()?,
+                        usize::from_str_radix(end, 16).ok()?,
+                    ))
+                })?
+            })
+            .collect();
+        Self(ranges)
+    }
+
+    fn contains_byte(&self, address: usize) -> bool {
+        self.0
+            .iter()
+            .any(|&(start, end)| start <= address && address < end)
+    }
+
+    /// Whether every byte of `[address, address + length)` is writable. A
+    /// field no larger than a page spans at most two pages, so checking its
+    /// first and last bytes suffices.
+    fn contains(&self, address: usize, length: usize) -> bool {
+        address
+            .checked_add(length - 1)
+            .is_some_and(|last| self.contains_byte(address) && self.contains_byte(last))
+    }
+}
+
+/// Whether Linux could write its results back to `mmsghdr` entry `index` at
+/// `base`: `msg_namelen`, `msg_controllen`, `msg_flags` and `msg_len`.
+fn mmsghdr_is_writable(mappings: &WritableMappings, base: usize, index: usize) -> bool {
+    use std::mem::offset_of;
+    use std::mem::size_of;
+    let header = offset_of!(libc::mmsghdr, msg_hdr);
+    let fields = [
+        (
+            header + offset_of!(libc::msghdr, msg_namelen),
+            size_of::<libc::socklen_t>(),
+        ),
+        (
+            header + offset_of!(libc::msghdr, msg_controllen),
+            size_of::<usize>(),
+        ),
+        (
+            header + offset_of!(libc::msghdr, msg_flags),
+            size_of::<libc::c_int>(),
+        ),
+        (offset_of!(libc::mmsghdr, msg_len), size_of::<u32>()),
+    ];
+    mmsghdr_entry(base, index).is_ok_and(|entry| {
+        fields.iter().all(|&(offset, length)| {
+            entry
+                .checked_add(offset)
+                .is_some_and(|field| mappings.contains(field, length))
         })
-        .is_ok()
+    })
 }
 
 /// Query the domain, type and protocol of the guest's socket `fd`.
@@ -484,8 +542,8 @@ impl Recorder {
         guest: &mut G,
         syscall: Recvmmsg,
     ) -> Result<i64, Errno> {
-        // Linux silently clamps vlen to UIO_MAXIOV.
-        let vlen = (syscall.vlen() as usize).min(libc::UIO_MAXIOV as usize);
+        // Unlike sendmmsg, Linux does not clamp recvmmsg's vlen.
+        let vlen = syscall.vlen() as usize;
         let base = syscall.mmsg().map(|address| address.as_raw());
         // Reduced to plain capacities inside this block so no raw pointer is
         // held across an await, which would make this future non-`Send`.
@@ -500,12 +558,13 @@ impl Recorder {
             // Linux only the writable prefix, and refuse below if that could
             // have mattered.
             let writable = match base {
-                Some(base) => headers
-                    .iter()
-                    .enumerate()
-                    .take_while(|(index, _)| mmsghdr_is_writable(&mut guest.memory(), base, *index))
-                    .count(),
-                None => 0,
+                Some(base) if !headers.is_empty() => {
+                    let mappings = WritableMappings::read(guest.pid());
+                    (0..headers.len())
+                        .take_while(|index| mmsghdr_is_writable(&mappings, base, *index))
+                        .count()
+                }
+                _ => 0,
             };
             let input: Vec<(usize, usize)> = headers[..writable]
                 .iter()
@@ -545,13 +604,20 @@ impl Recorder {
             Some(Ok(timeout)) => {
                 let mut stack = guest.stack().await;
                 let scratch = stack.push(timeout);
-                let _guard = stack.commit()?;
+                // Failing here would lose an already performed receive.
+                let _guard = stack
+                    .commit()
+                    .expect("cannot place recvmmsg's timeout on the guest stack");
                 let result = guest.inject(call.with_timeout(Some(scratch))).await;
-                let remaining: Timespec = guest.memory().read_value(scratch)?;
+                let remaining: Timespec = guest
+                    .memory()
+                    .read_value(scratch)
+                    .expect("cannot read back recvmmsg's scratch timeout");
                 let mut bytes = [0u8; std::mem::size_of::<Timespec>()];
                 guest
                     .memory()
-                    .read_exact(scratch.cast::<u8>(), &mut bytes)?;
+                    .read_exact(scratch.cast::<u8>(), &mut bytes)
+                    .expect("cannot read back recvmmsg's scratch timeout");
                 (result, Some((remaining, bytes)))
             }
             // An unreadable timeout fails before any receive.
@@ -583,12 +649,16 @@ impl Recorder {
         });
         // Linux writes the remaining time back only after receiving something.
         let remaining = remaining.filter(|_| matches!(result, Ok(received) if received > 0));
-        let mut timeout_fault = false;
+        // Linux's copy-out can store a prefix of the timeout before faulting.
+        let mut timeout_fault = None;
         if let Some((_, bytes)) = &remaining {
             let address = syscall
                 .timeout()
                 .expect("a remaining timeout needs a timeout");
-            timeout_fault = write_as_guest(&mut guest.memory(), address.as_raw(), bytes).is_err();
+            let copied = copy_out_as_guest(&mut guest.memory(), address.as_raw(), bytes);
+            if copied < bytes.len() {
+                timeout_fault = Some(bytes[..copied].to_vec());
+            }
         }
 
         self.record_event(
@@ -598,13 +668,13 @@ impl Recorder {
                     messages,
                     timeout: remaining
                         .map(|(remaining, _)| remaining)
-                        .filter(|_| !timeout_fault),
-                    timeout_fault,
+                        .filter(|_| timeout_fault.is_none()),
+                    timeout_fault: timeout_fault.clone(),
                 })
             }),
         );
 
-        if timeout_fault {
+        if timeout_fault.is_some() {
             result = Err(Errno::EFAULT);
         }
         result

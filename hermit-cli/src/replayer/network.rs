@@ -154,7 +154,7 @@ fn restore_recvmsg<M: MemoryAccess>(
     message_address: AddrMut<'_, libc::msghdr>,
     event: &RecvmsgEvent,
 ) -> Result<(), Errno> {
-    let mut message: libc::msghdr = memory.read_value(message_address)?;
+    let message: libc::msghdr = memory.read_value(message_address)?;
     let iovecs = crate::read_iovecs(memory, &message)?;
     assert_eq!(iovecs.len(), event.iovs.len());
 
@@ -168,10 +168,33 @@ fn restore_recvmsg<M: MemoryAccess>(
     write_bytes(memory, message.msg_name, &event.name)?;
     write_bytes(memory, message.msg_control, &event.control)?;
 
-    message.msg_namelen = event.name_len;
-    message.msg_controllen = event.control_len;
-    message.msg_flags = event.flags;
-    memory.write_value(message_address, &message)
+    // Linux writes back only these fields; the rest of the header may be on a
+    // page the guest cannot write.
+    let header = message_address.as_raw();
+    write_field(
+        memory,
+        header + std::mem::offset_of!(libc::msghdr, msg_namelen),
+        &event.name_len,
+    )?;
+    write_field(
+        memory,
+        header + std::mem::offset_of!(libc::msghdr, msg_controllen),
+        &event.control_len,
+    )?;
+    write_field(
+        memory,
+        header + std::mem::offset_of!(libc::msghdr, msg_flags),
+        &event.flags,
+    )
+}
+
+fn write_field<M: MemoryAccess, T: Copy>(
+    memory: &mut M,
+    address: usize,
+    value: &T,
+) -> Result<(), Errno> {
+    let address = AddrMut::<T>::from_raw(address).ok_or(Errno::EFAULT)?;
+    memory.write_value(address, value)
 }
 
 /// The address of `mmsghdr` entry `index` of the array at `base`.
@@ -375,13 +398,24 @@ impl Replayer {
             write_mmsg_len(&mut guest.memory(), base, index, length)?;
         }
 
-        if event.timeout_fault {
-            // Linux received these messages, then failed to write the
-            // remaining timeout back.
-            assert!(syscall.timeout().is_some());
+        if let Some(prefix) = &event.timeout_fault {
+            // Linux received these messages, then copied only `prefix` of the
+            // remaining timeout back before faulting.
+            assert!(event.timeout.is_none() && !event.messages.is_empty());
+            let address = syscall
+                .timeout()
+                .expect("a timeout fault needs a timeout")
+                .as_raw();
+            let address = AddrMut::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(address, prefix)?;
             return Err(Errno::EFAULT);
         }
-        assert!(event.timeout.is_none() || syscall.timeout().is_some());
+        // Linux writes the remaining timeout back exactly when it was given
+        // one and received something.
+        assert_eq!(
+            event.timeout.is_some(),
+            syscall.timeout().is_some() && !event.messages.is_empty()
+        );
         if let Some(timeout) = event.timeout {
             let address = AddrMut::<Timespec>::from_raw(syscall.timeout().unwrap().as_raw())
                 .ok_or(Errno::EFAULT)?;

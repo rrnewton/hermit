@@ -153,8 +153,9 @@ pub struct RecvmmsgEvent {
     /// and at least one message arrived.
     pub timeout: Option<Timespec>,
     /// Linux received `messages` but could not write the remaining timeout
-    /// back, so the call returned EFAULT after its side effects.
-    pub timeout_fault: bool,
+    /// back, so the call returned EFAULT after its side effects. Holds the
+    /// prefix of the timeout it did copy before faulting, possibly empty.
+    pub timeout_fault: Option<Vec<u8>>,
 }
 
 /// Recorded output and signal side effects of a read syscall.
