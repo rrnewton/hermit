@@ -562,6 +562,34 @@ class Abi11PackageTests(unittest.TestCase):
         with self.kernel_premise(), self.assertRaises(OSError):
             ar.expected_package(self.package)
 
+    def test_producer_sorted_object_keys_preserve_exact_package(self):
+        # The real package producer sorts every JSON object's keys; the source
+        # contract has its own insertion order. Arrays and scalar types stay exact.
+        (self.package / "manifest.json").write_text(json.dumps(self.manifest, sort_keys=True) + "\n")
+        with self.kernel_premise():
+            artifact = ar.expected_package(self.package)
+        self.assertEqual(ar.artifact_fields(artifact),
+                         ["abi11-copy5", ar.CONTRACT_CANONICAL,
+                          self.manifest["object_sha256"], self.manifest["library_sha256"],
+                          self.contract["btf_sha256"], 25, 49, 49])
+
+    def test_sorted_nested_types_values_and_array_order_still_refuse(self):
+        mutations = (
+            lambda group: group.update(version=2.0),
+            lambda group: group.update(cookie=False),
+            lambda group: group["sites"][0].update(role=True),
+            lambda group: group["sites"][0].update(offset=29),
+            lambda group: group["sites"].reverse(),
+            lambda group: group["receive_entry"].reverse(),
+            lambda group: group["receive_return"].reverse(),
+        )
+        for index, mutate in enumerate(mutations):
+            value = copy.deepcopy(self.manifest)
+            mutate(value["grouped_event"])
+            (self.package / "manifest.json").write_text(json.dumps(value, sort_keys=True) + "\n")
+            with self.subTest(index=index), self.kernel_premise(), self.assertRaises(nr.Refused):
+                ar.expected_package(self.package)
+
 
 def export_fixture(path):
     path = Path(path)

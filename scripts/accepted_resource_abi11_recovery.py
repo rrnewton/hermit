@@ -234,7 +234,11 @@ def expected_package(directory):
     manifest = nr.decode(nr.bounded_regular(directory / "manifest.json", 32768)[0])
     for key in ("schema", "abi_version", "copy_version", "maps", "programs", "links", "btf_sha256",
                 "grouped_event", "ftrace_only"):
-        require(key in manifest and nr.wire(manifest[key]) == nr.wire(contract[key]),
+        # JSON object key order is not part of the contract. Canonicalizing only
+        # keys keeps nested scalar types and every array element/order exact.
+        require(key in manifest
+                and json.dumps(manifest[key], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                == json.dumps(contract[key], sort_keys=True, separators=(",", ":"), ensure_ascii=False),
                 "original package contract differs")
     require(manifest.get("kind") == "hermit-accepted-provider"
             and manifest["abi_version"] == "415052555354000b" and manifest["copy_version"] == 5
