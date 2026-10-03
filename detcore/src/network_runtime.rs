@@ -782,10 +782,15 @@ struct GuardRuntime {
     control: std::sync::Arc<dyn guard::NetworkGuardControl>,
     deadline: std::time::Instant,
     observer: Option<(guard::NetworkGuardPublication, Result<(), String>)>,
-    initial: Option<(
-        crate::network_replay::NetworkStreamOwner,
-        Result<(), String>,
-    )>,
+    initial: Option<GuardInitial>,
+}
+
+#[derive(Debug)]
+struct GuardInitial {
+    owner: crate::network_replay::NetworkStreamOwner,
+    // Keep the enrolled native task pinned across the initial exec's MM change.
+    task: OwnedFd,
+    result: Result<(), String>,
 }
 
 impl RuntimeShared {
@@ -1296,28 +1301,39 @@ impl NetworkRuntimeResources {
         let Some(guard) = retained.as_mut() else {
             return Ok(());
         };
-        if let Some((initial, result)) = &guard.initial {
-            if *initial != owner {
+        let physical = self.shared.physical.lock().unwrap();
+        let task = physical.get(owner)?;
+        if let Some(initial) = &guard.initial {
+            // Exec replaces the MM, not the native guard's task-storage entry.
+            // Only the globally consumed initial EXEC receipt may bridge that
+            // transition, and both custody pins must name the enrolled task.
+            // https://github.com/rrnewton/hermit/pull/3464
+            let same_exec = physical.initial_exec(owner)?.is_some_and(|receipt| {
+                receipt.caller == initial.owner.thread
+                    && receipt.process == initial.owner.thread
+                    && receipt.mm == initial.owner.mm
+                    && receipt.mm.for_exec(receipt.process) == owner.mm
+            });
+            if initial.owner.thread != owner.thread
+                || (initial.owner.mm != owner.mm && !same_exec)
+                || PidfdIdentity::read(&initial.task)? != PidfdIdentity::read(task)?
+            {
                 return Err(std::io::Error::other("guard initial task changed"));
             }
-            return result.clone().map_err(std::io::Error::other);
+            return initial.result.clone().map_err(std::io::Error::other);
         }
-        let task = self
-            .shared
-            .physical
-            .lock()
-            .unwrap()
-            .get(owner)?
-            .as_fd()
-            .try_clone_to_owned()?;
-        guard.initial = Some((
+        let task = task.try_clone()?;
+        drop(physical);
+        guard.initial = Some(GuardInitial {
             owner,
-            Err("guard initial enrollment submitted without result".into()),
-        ));
+            task,
+            result: Err("guard initial enrollment submitted without result".into()),
+        });
         let result = unsafe {
-            guard
-                .control
-                .register_stopped_initial(task.as_fd(), guard.deadline)
+            guard.control.register_stopped_initial(
+                guard.initial.as_ref().unwrap().task.as_fd(),
+                guard.deadline,
+            )
         }
         .and_then(|()| {
             // The native observer requires completed initial enrollment. Keep
@@ -1342,7 +1358,7 @@ impl NetworkRuntimeResources {
             Ok(())
         })
         .map_err(|error| error.to_string());
-        guard.initial.as_mut().unwrap().1 = result.clone();
+        guard.initial.as_mut().unwrap().result = result.clone();
         result.map_err(std::io::Error::other)
     }
 
@@ -2620,6 +2636,10 @@ mod tests {
     use super::*;
 
     include!("network_runtime/failed_backend_retirement.rs");
+
+    mod guard_initial_exec_tests {
+        include!("network_runtime/guard_initial_exec_tests.rs");
+    }
 
     #[derive(Debug, Default)]
     struct AdmissionControl {

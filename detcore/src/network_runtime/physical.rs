@@ -650,6 +650,14 @@ impl<T> CustodyTasks<T> {
         Ok(())
     }
 
+    pub(super) fn initial_exec(
+        &self,
+        owner: NetworkStreamOwner,
+    ) -> std::io::Result<Option<ExecFilesReceipt>> {
+        self.get(owner)?;
+        Ok(self.tasks[&owner.thread].initial_exec)
+    }
+
     pub(super) fn get(&self, owner: NetworkStreamOwner) -> std::io::Result<&T> {
         self.tasks
             .get(&owner.thread)
