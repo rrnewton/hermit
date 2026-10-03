@@ -118,8 +118,10 @@ exited.
 - `read_states=t/T,t/T`: for each of the two reads, QEMU was in the `t`
   (stopped under `ptrace`) state and Hermit's tracer was in the `T` (stopped)
   state. With both stopped, reading the task list cannot execute a single guest
-  instruction. `serial_delta=0/0` records that the guest printed nothing during
-  either read.
+  instruction. `serial_delta=0/0` counts, for each read, the bytes that reached
+  the host end of the guest's serial pipe while the read ran: the demo takes
+  whatever the pipe already holds just before the read, takes it again just
+  after, and fails if anything arrived in between.
 - The task list changes between the two reads (`task_lists_differ=yes`): the
   command started two `sleep` processes. The second pass, from a fresh copy of
   the snapshot, produced the same before list, after list, and difference

@@ -780,9 +780,15 @@ class HermitGuestProgram:
     def observation(self):
         if self._qemu_pid is None or self._tracer_tgid is None:
             raise RuntimeError("guest was not started")
+        # Bytes already in the serial pipe reached it before this read began,
+        # for example output that followed the advance marker: log them and
+        # leave them out of the count.
+        self._drain_serial()
         serial_before = self._serial_bytes
         program = self._program()
         yield program
+        # Whatever the pipe holds now reached it while the read ran.
+        self._drain_serial()
         qemu_state = _proc_state(self._qemu_pid)
         tracer_state = _proc_state(self._tracer_tgid)
         serial_delta = self._serial_bytes - serial_before
@@ -800,6 +806,26 @@ class HermitGuestProgram:
                     qemu_state, tracer_state, serial_delta
                 )
             )
+
+    def _drain_serial(self) -> None:
+        """Read every byte the serial pipe holds now, without waiting for more.
+
+        The bytes are appended to the serial transcript and counted in
+        ``_serial_bytes``. QEMU keeps the pipe's write end open, so an empty
+        pipe raises BlockingIOError rather than returning end of file.
+        """
+        if self._serial_read_fd is None or self.serial_log is None:
+            raise RuntimeError("serial transport is unavailable")
+        with self.serial_log.open("ab") as output:
+            while True:
+                try:
+                    chunk = os.read(self._serial_read_fd, 65536)
+                except BlockingIOError:
+                    return
+                if not chunk:
+                    raise RuntimeError("guest serial disconnected during a read")
+                self._serial_bytes += len(chunk)
+                output.write(chunk)
 
     def _wait_for_serial(self, marker: bytes) -> None:
         if (
