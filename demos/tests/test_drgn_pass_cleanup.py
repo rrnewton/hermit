@@ -13,15 +13,23 @@ failed pass's 94 MB snapshot copy.
 start() is run here with Hermit's launch and the QMP connection replaced, which
 is enough to see the command line Hermit would get and what a failed pass
 leaves.
+
+A pass also must not leave processes behind. The demo used to kill only the
+process group of the `hermit` it started, and safehermit runs Hermit as a
+systemd user unit outside that group, so Hermit's tracer, which the demo stops
+with SIGSTOP, and QEMU outlived every pass, about 140 MB each.
 """
 
 import contextlib
 import dataclasses
 import io
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -301,6 +309,250 @@ class ArtifactDirectoryDocumentationTest(unittest.TestCase):
             timeout=30,
         ).stdout
         self.assertRegex(usage, r"(?m)^  DEMO07_ARTIFACTS=/path +\S")
+
+
+# Stands in for a `hermit` wrapper such as safehermit. It starts two stopped
+# `sleep` processes in sessions of their own, so outside its process group as a
+# systemd unit's processes are, waits for both to exit, then does its own
+# cleanup (writes a marker file) and exits 0.
+_WRAPPER = r"""
+import os, subprocess, sys
+pid_file, marker = sys.argv[1], sys.argv[2]
+children = [subprocess.Popen(["sleep", "1000"], start_new_session=True) for _ in range(2)]
+with open(pid_file + ".partial", "w") as output:
+    output.write(" ".join(str(child.pid) for child in children))
+os.rename(pid_file + ".partial", pid_file)
+for child in children:
+    child.wait()
+with open(marker, "w") as output:
+    output.write("cleanup ran\n")
+"""
+
+
+def _stat_identity(pid: int):
+    """(state, start time) from /proc/<pid>/stat, read here independently of the demo's code."""
+    try:
+        data = Path("/proc/{}/stat".format(pid)).read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    fields = data[data.rindex(b")") + 1 :].split()
+    return fields[0].decode(), int(fields[19])
+
+
+def _alive(pid: int, start_time: int) -> bool:
+    identity = _stat_identity(pid)
+    return identity is not None and identity[0] not in ("Z", "X") and identity[1] == start_time
+
+
+def _wait_for_state(test: unittest.TestCase, pid: int, state: str) -> None:
+    deadline = time.monotonic() + 30
+    while _stat_identity(pid)[0] != state:
+        if time.monotonic() > deadline:
+            test.fail("pid {} did not reach state {}: {}".format(pid, state, _stat_identity(pid)))
+        time.sleep(0.005)
+
+
+def _kill_leftover(pid: int, start_time: int) -> None:
+    """SIGKILL a stand-in that a test left running, if the pid is still that process."""
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError:
+        return
+    try:
+        if _alive(pid, start_time):
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    finally:
+        os.close(pidfd)
+
+
+class _PausedQmp:
+    def status(self):
+        return "paused"
+
+    def execute(self, command):
+        raise AssertionError("unexpected QMP command {}".format(command))
+
+    def close(self):
+        pass
+
+
+class LeftoverProcessTest(_PassHarness):
+    """A pass, finished or failed, leaves neither QEMU nor Hermit's tracer running.
+
+    start() runs for real except for what needs QEMU: the `hermit` it starts is
+    _WRAPPER, whose two stopped `sleep` processes play QEMU and Hermit's tracer
+    and are found and frozen where start() finds and freezes the real ones.
+    """
+
+    def _run_pass(self, body_error=None):
+        config = self._config(self.outside_tmp / "artifacts")
+        pid_file = self.outside_tmp / "stand-ins.pids"
+        marker = self.outside_tmp / "wrapper-cleanup-ran"
+        real_popen = subprocess.Popen
+        stand_ins = []  # (pid, start time) of the QEMU and tracer stand-ins
+
+        def popen(command, **options):
+            return real_popen(
+                [sys.executable, "-c", _WRAPPER, str(pid_file), str(marker)], **options
+            )
+
+        def wait_for_qemu(process, qmp_socket, timeout):
+            deadline = time.monotonic() + 30
+            while not pid_file.exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("the stand-ins did not start")
+                time.sleep(0.01)
+            for pid in (int(word) for word in pid_file.read_text().split()):
+                start_time = _stat_identity(pid)[1]
+                stand_ins.append((pid, start_time))
+                self.addCleanup(_kill_leftover, pid, start_time)
+            return stand_ins[0][0]
+
+        def freeze_exact_tracer(qemu_pid, timeout=20.0):
+            # The real QEMU waits in a ptrace stop and the tracer is stopped
+            # with SIGSTOP; both stand-ins are stopped here.
+            for pid, _ in stand_ins:
+                os.kill(pid, signal.SIGSTOP)
+            for pid, _ in stand_ins:
+                _wait_for_state(self, pid, "T")
+            tracer = stand_ins[1][0]
+            return tracer, tracer
+
+        build_id = "0123abcd"
+        with contextlib.ExitStack() as stack:
+            for name, replacement in (
+                ("ensure_vmlinux", mock.Mock(return_value=config.vmlinux)),
+                ("_open_serial_pipe", mock.Mock(side_effect=lambda *_: os.pipe())),
+                ("_wait_for_qemu", wait_for_qemu),
+                ("_freeze_exact_tracer", freeze_exact_tracer),
+                ("_ram_region", mock.Mock(return_value=(0, 4096))),
+                (
+                    "_scan_vmcoreinfo",
+                    mock.Mock(return_value=(0, "BUILD-ID={}\n".format(build_id).encode())),
+                ),
+                ("_elf_build_id", mock.Mock(return_value=build_id)),
+            ):
+                stack.enter_context(mock.patch.object(dh, name, replacement))
+            stack.enter_context(mock.patch.object(dh.subprocess, "Popen", popen))
+            stack.enter_context(
+                mock.patch.object(dh.QmpClient, "connect", mock.Mock(return_value=_PausedQmp()))
+            )
+            stderr = io.StringIO()
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            guest = None
+            try:
+                with dh.program_from_hermit(config) as guest:
+                    if body_error is not None:
+                        raise body_error
+            except RuntimeError as error:
+                if error is not body_error:
+                    raise
+        return guest, stand_ins, marker, stderr.getvalue()
+
+    def _assert_nothing_left(self, guest, stand_ins, marker, stderr):
+        self.assertEqual(len(stand_ins), 2, stand_ins)
+        for name, (pid, start_time) in zip(("QEMU", "Hermit's tracer"), stand_ins):
+            self.assertFalse(
+                _alive(pid, start_time),
+                "the {} stand-in (pid {}) is still running after close(): {}".format(
+                    name, pid, _stat_identity(pid)
+                ),
+            )
+        # The wrapper was not killed: it saw both exit, ran its own cleanup and
+        # exited by itself.
+        self.assertEqual(guest._process.returncode, 0)
+        self.assertTrue(marker.exists(), "the wrapper's own cleanup did not run")
+        self.assertNotIn("still running", stderr)
+
+    def test_a_pass_that_finishes_leaves_no_process(self):
+        guest, stand_ins, marker, stderr = self._run_pass()
+        self._assert_nothing_left(guest, stand_ins, marker, stderr)
+        self.assertEqual(stderr, "")
+
+    def test_a_pass_that_fails_leaves_no_process(self):
+        error = RuntimeError("guest advanced during read")
+        guest, stand_ins, marker, stderr = self._run_pass(body_error=error)
+        self._assert_nothing_left(guest, stand_ins, marker, stderr)
+        self.assertIn("Removed the failed pass's", stderr)
+
+
+class OwnedProcessKillTest(unittest.TestCase):
+    def _stopped_sleep(self, executable: str = "sleep"):
+        child = subprocess.Popen([executable, "1000"])
+
+        def reap():
+            child.kill()
+            child.wait(timeout=30)
+
+        self.addCleanup(reap)
+        os.kill(child.pid, signal.SIGSTOP)
+        _wait_for_state(self, child.pid, "T")
+        return child, _stat_identity(child.pid)[1]
+
+    def test_the_recorded_process_is_killed_and_its_exit_confirmed(self):
+        child, start_time = self._stopped_sleep()
+        self.assertEqual(dh._kill_and_wait([("QEMU", child.pid, start_time)], 10), [])
+        # It has exited; its parent, this test, has not reaped it yet.
+        self.assertEqual(_stat_identity(child.pid)[0], "Z")
+        self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
+
+    def test_a_pid_now_held_by_another_process_is_not_signalled(self):
+        # As if the recorded process had exited and a process that started
+        # later had been given its pid.
+        child, start_time = self._stopped_sleep()
+        program = dh.HermitGuestProgram(mock.Mock())
+        program._owned_processes = [("QEMU", child.pid, start_time - 1)]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            program.close()
+        self.assertEqual(_stat_identity(child.pid), ("T", start_time))
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_a_process_that_does_not_exit_is_reported_within_the_bound(self):
+        program = dh.HermitGuestProgram(mock.Mock())
+        program._owned_processes = [("QEMU", 4242, 17)]
+        stderr = io.StringIO()
+        with mock.patch.object(dh, "_kill_if_running") as kill, mock.patch.object(
+            dh, "_is_running", return_value=True
+        ), mock.patch.object(dh, "OWNED_PROCESS_EXIT_SECONDS", 0.2), contextlib.redirect_stderr(
+            stderr
+        ):
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                RuntimeError, r"^could not stop QEMU \(pid 4242\) after the pass$"
+            ):
+                program.close()
+            elapsed = time.monotonic() - started
+        kill.assert_called_once_with(4242, 17)
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 5)
+        self.assertIn("QEMU (pid 4242) is still running 0.2 s after SIGKILL.", stderr.getvalue())
+
+    def test_a_failed_pass_reports_a_survivor_without_replacing_its_error(self):
+        program = dh.HermitGuestProgram(mock.Mock())
+        program._owned_processes = [("Hermit's tracer", 4242, 17)]
+        stderr = io.StringIO()
+        with mock.patch.object(dh, "_kill_if_running"), mock.patch.object(
+            dh, "_is_running", return_value=True
+        ), mock.patch.object(dh, "OWNED_PROCESS_EXIT_SECONDS", 0.2), contextlib.redirect_stderr(
+            stderr
+        ):
+            program.close(failed=True)
+        self.assertIn(
+            "Hermit's tracer (pid 4242) is still running 0.2 s after SIGKILL.", stderr.getvalue()
+        )
+
+    def test_the_state_is_read_after_the_last_parenthesis(self):
+        # A command name may contain ") S (", which a parse from the first ")"
+        # would take for the state of this stopped process.
+        directory = _directory(self, "/var/tmp", "drgn-comm-")
+        link = directory / "d7) S (x"
+        link.symlink_to(shutil.which("sleep"))
+        child, _ = self._stopped_sleep(str(link))
+        self.assertEqual(Path("/proc/{}/comm".format(child.pid)).read_text(), "d7) S (x\n")
+        state, start_time = dh._proc_identity(child.pid)
+        self.assertEqual(state, "T")
+        self.assertEqual(start_time, _stat_identity(child.pid)[1])
 
 
 if __name__ == "__main__":
