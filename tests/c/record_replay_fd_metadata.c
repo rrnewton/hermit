@@ -19,6 +19,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +196,43 @@ int main(int argc, char** argv) {
   expect("local-fremovexattr-after", fremovexattr(local, NAME), ENODATA);
   expect_value("local-fchmod", fchmod(local, 0600), 0);
   expect_value("close-local", close(local), 0);
+
+  // An access ACL rewrites the mode bits, which govern path calls replay runs
+  // live in the replay root. With its capabilities dropped, the guest can
+  // rename inside a mode-0 directory only because the ACL granted the owner
+  // rwx, so replay must carry each ACL into the replay root.
+  expect_value("mkdir-acl", mkdir("acl", 0700), 0);
+  expect_value("mkdir-acl-a", mkdir("acl/a", 0700), 0);
+  expect_value("mkdir-facl", mkdir("facl", 0700), 0);
+  expect_value("mkdir-facl-a", mkdir("facl/a", 0700), 0);
+  int facl = open("facl", O_RDONLY | O_DIRECTORY);
+  expect("open-facl", facl, 0);
+  struct __user_cap_header_struct cap_header = {_LINUX_CAPABILITY_VERSION_3, 0};
+  struct __user_cap_data_struct no_caps[2];
+  memset(no_caps, 0, sizeof(no_caps));
+  expect_value("capset-none", syscall(SYS_capset, &cap_header, no_caps), 0);
+  expect_value("chmod-acl-0", chmod("acl", 0), 0);
+  expect_value("chmod-facl-0", chmod("facl", 0), 0);
+  // ACL_USER_OBJ rwx, ACL_GROUP_OBJ and ACL_OTHER nothing.
+  struct {
+    uint32_t version;
+    struct {
+      uint16_t tag;
+      uint16_t perm;
+      uint32_t id;
+    } entries[3];
+  } acl = {2, {{0x01, 7, (uint32_t)-1}, {0x04, 0, (uint32_t)-1}, {0x20, 0, (uint32_t)-1}}};
+  expect_value(
+      "setxattr-acl",
+      setxattr("acl", "system.posix_acl_access", &acl, sizeof(acl), 0),
+      0);
+  expect_value(
+      "fsetxattr-acl",
+      fsetxattr(facl, "system.posix_acl_access", &acl, sizeof(acl), 0),
+      0);
+  expect_value("rename-acl", rename("acl/a", "acl/b"), 0);
+  expect_value("rename-facl", rename("facl/a", "facl/b"), 0);
+  expect_value("close-facl", close(facl), 0);
 
   printf("failures=%d\n", failures);
   return failures ? 1 : 0;

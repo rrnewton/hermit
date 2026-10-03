@@ -482,17 +482,12 @@ impl Tool for Replayer {
                 self.handle_descriptor_metadata_change(guest, syscall).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-3601): every xattr query replays from the
-            // recording, so no replayed call reads the replay root's
-            // attributes. Running a change there would only test whether that
-            // root started with the host's attributes, which it does not: it is
-            // built without them, possibly on another filesystem.
             Syscall::Fsetxattr(_)
             | Syscall::Fremovexattr(_)
             | Syscall::Setxattr(_)
             | Syscall::Lsetxattr(_)
             | Syscall::Removexattr(_)
-            | Syscall::Lremovexattr(_) => self.handle_simple(guest, syscall).await,
+            | Syscall::Lremovexattr(_) => self.handle_xattr_change(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601)
             Syscall::Getxattr(_)
@@ -1747,6 +1742,47 @@ impl Replayer {
                         "replayed descriptor metadata change {syscall:?} failed after recording returned {expected}: {error}"
                     );
                 }
+            }
+        }
+        recorded
+    }
+
+    // TODO-HUMAN-REVIEW(PR-3601)
+    /// Replays an xattr change from its recorded result. Every xattr query
+    /// also replays from the recording, so the guest never reads the replay
+    /// root's attributes directly. The kernel does: an access ACL rewrites the
+    /// mode bits and a default ACL shapes later creations, and both govern
+    /// path calls replay runs live in the replay root. So a change the
+    /// recording saw succeed is applied there too, but its live result is not
+    /// compared: the replay root is built without the host's attributes,
+    /// possibly on another filesystem, so removing an attribute that predates
+    /// the recording legitimately fails there.
+    async fn handle_xattr_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let in_replay_root = match syscall {
+            Syscall::Fsetxattr(call) => self.fd_is_in_replay_root(guest.pid(), call.fd()),
+            Syscall::Fremovexattr(call) => self.fd_is_in_replay_root(guest.pid(), call.fd()),
+            // The path calls take no dirfd; a relative path resolves against
+            // the working directory, which replay keeps inside the root.
+            Syscall::Setxattr(_)
+            | Syscall::Lsetxattr(_)
+            | Syscall::Removexattr(_)
+            | Syscall::Lremovexattr(_) => true,
+            _ => unreachable!("xattr change handler received {syscall:?}"),
+        };
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() && in_replay_root {
+            let live = guest.inject_with_retry(syscall).await;
+            if live != recorded {
+                tracing::debug!(
+                    ?syscall,
+                    ?live,
+                    ?recorded,
+                    "replay root xattr change differed"
+                );
             }
         }
         recorded
