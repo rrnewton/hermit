@@ -3243,16 +3243,15 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
                 "expected a {side} capture, found {log:?}"
             );
         }
+        // Hermit creates run 2's log before run 1 starts, so a poll sees it
+        // whatever the verdict, and a missed capture fails here.
+        let run2_log = run2_log.expect("run 2's log was not captured while the command ran");
         // After a match Hermit deletes run 2's log, so the link made while the
         // command ran is checked in its place. The match compares only INFO
         // records, and leaked guest stdout could be in a record of another level.
         let mut checked_logs = retained_logs;
         if report["verdict"] == "matched" {
-            checked_logs.push(
-                run2_log
-                    .clone()
-                    .expect("run 2's log, captured while the command ran"),
-            );
+            checked_logs.push(run2_log.clone());
         }
         for log in checked_logs {
             let contents = fs::read_to_string(&log).expect("failed to read DBT verification log");
@@ -3262,9 +3261,7 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
                 "guest stdout leaked into DBT diagnostics: {log:?}"
             );
         }
-        if let Some(run2_log) = run2_log {
-            fs::remove_file(run2_log).expect("failed to remove run 2's checked log");
-        }
+        fs::remove_file(run2_log).expect("failed to remove run 2's checked log");
     }
 }
 
