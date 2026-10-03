@@ -477,6 +477,29 @@ class RunTest(unittest.TestCase):
         self.assertEqual(calls[0]["env"]["E2E_IMPORT_RESULTS"], str(self.root / "import"))
         self.assertEqual(calls[0]["argv"][:3], ["run", "--repo-root", str(self.root / "checkout")])
 
+    def test_a_run_that_fails_before_judging_leaves_no_older_verdict(self):
+        passing_runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        cases = [
+            ("buck2 fails", passing_runs, {"buck2_status": 1}, "ci/buck-e2e/run: buck2 test (all) failed with exit 1"),
+            ("ingest.py refuses the rows", {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1")]}, {},
+             "ci/buck-e2e/run: ingest.py could not turn the run's results into rows"),
+            ("the checkout changes during the run", passing_runs, {"FAKE_BUCK2_TOUCH": str(self.tracked)},
+             "has uncommitted changes after the run"),
+        ]
+        for name, runs, options, message in cases:
+            with self.subTest(name):
+                for directory in ("import", "work"):
+                    shutil.rmtree(self.root / directory, ignore_errors=True)
+                process = self.run_buck_e2e("local", passing_runs)
+                self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+                self.assertTrue((self.root / "work" / "verdict").exists())
+                shutil.rmtree(self.root / "import")
+                process = self.run_buck_e2e("local", runs, **options)
+                self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+                self.assertIn(message, process.stderr)
+                self.assertFalse((self.root / "work" / "verdict").exists(), "an older verdict outlived a failed run")
+                subprocess.run(["git", "-C", str(self.root / "checkout"), "checkout", "-q", "--", "."], check=True)
+
     def test_a_run_whose_results_ingest_py_refuses_has_no_verdict(self):
         process = self.run_buck_e2e("local", {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1")]})
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
