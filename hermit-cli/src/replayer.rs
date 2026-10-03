@@ -472,6 +472,24 @@ impl Tool for Replayer {
             Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3591): the descriptor may be a placeholder,
+            // so the recorded result is returned without running the call.
+            Syscall::Fsync(_)
+            | Syscall::Fdatasync(_)
+            | Syscall::Syncfs(_)
+            | Syscall::Fchmod(_)
+            | Syscall::Fchown(_)
+            | Syscall::Fsetxattr(_)
+            | Syscall::Fremovexattr(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3591)
+            Syscall::Getxattr(_)
+            | Syscall::Lgetxattr(_)
+            | Syscall::Fgetxattr(_)
+            | Syscall::Listxattr(_)
+            | Syscall::Llistxattr(_)
+            | Syscall::Flistxattr(_) => self.handle_xattr_query(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#2373)
             Syscall::Flock(call) => self.handle_flock(guest, call).await,
             Syscall::Ftruncate(syscall) => Ok(self.handle_ftruncate(guest, syscall).await?),
