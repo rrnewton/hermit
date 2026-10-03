@@ -1934,6 +1934,13 @@
           "category": "c-programs",
           "test": "c-programs/fchmodat2-flags",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fchmodat2-flags",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -2544,6 +2551,13 @@
           "test": "c-programs/ioctl-fioclex",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fionread",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -4118,6 +4132,13 @@
           "category": "c-programs",
           "test": "c-programs/prctl-identity",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-identity",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -4168,6 +4189,13 @@
           "test": "c-programs/pread64-nostdlib",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -5987,6 +6015,13 @@
           "category": "c-programs",
           "test": "c-programs/thp-disable",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thp-disable",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -6233,6 +6268,13 @@
           "test": "c-programs/utimensat-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vectored-file-io",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

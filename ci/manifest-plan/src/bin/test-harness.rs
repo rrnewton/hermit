@@ -4812,7 +4812,9 @@ sys.exit(1 if failed else 0)
             .iter()
             .filter(|row| row["backend"] == "kvm")
             .collect::<Vec<_>>();
-        assert_eq!(kvm.len(), 244);
+        // Six additional KVM verify selections retain the same host-capability contract.
+        // https://github.com/rrnewton/reverie/issues/891
+        assert_eq!(kvm.len(), 244 + 6);
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))

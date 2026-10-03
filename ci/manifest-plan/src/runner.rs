@@ -8064,6 +8064,9 @@ mod tests {
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
                 + SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
+                // Six KVM verify selections; the frozen calibration stays unchanged.
+                // https://github.com/rrnewton/reverie/issues/891
+                + 6
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
