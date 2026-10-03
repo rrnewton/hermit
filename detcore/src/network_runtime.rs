@@ -820,8 +820,23 @@ impl NetworkRuntimeOwner {
         let controller = self.shared.controller.lock().unwrap().clone();
         let driver = match controller {
             Some(Ok(controller)) => {
-                self.shared
-                    .stop_resolved_driver(&controller, deadline, original.is_err())
+                // A replied observation can be transport-quiescent while the
+                // service still retains its final journal/creation receipt.
+                // Keep the same driver alive for that existing handshake and
+                // charge it to the deadline already used by native cleanup.
+                let observations = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.shared.finish_observations_after_backend(&controller),
+                )
+                .await
+                .map_err(|_| std::io::Error::other("accepted terminal transport deadline"))
+                .and_then(|result| result);
+                let driver = self.shared.stop_resolved_driver(
+                    &controller,
+                    deadline,
+                    original.is_err() || observations.is_err(),
+                );
+                observations.and(driver)
             }
             None | Some(Err(_)) => Ok(()),
         };
@@ -873,16 +888,7 @@ impl NetworkRuntimeOwner {
         };
         let operation = async {
             self.shared
-                .fd_journal
-                .lock()
-                .await
-                .finish_after_backend(&controller)
-                .await?;
-            self.shared
-                .creations
-                .lock()
-                .await
-                .finish_after_backend(&controller)
+                .finish_observations_after_backend(&controller)
                 .await?;
             let pending = self.shared.accepted.lock().unwrap().pending_collections();
             for (_, _, sequence) in pending {
@@ -941,6 +947,25 @@ impl NetworkRuntimeOwner {
 }
 
 impl RuntimeShared {
+    // Both normal GlobalState cleanup and failed-backend disposal must retire
+    // the final observation using its retained authenticated origin. The
+    // caller owns the existing absolute terminal deadline around both awaits.
+    async fn finish_observations_after_backend(
+        &self,
+        controller: &accepted_controller::Controller,
+    ) -> std::io::Result<()> {
+        self.fd_journal
+            .lock()
+            .await
+            .finish_after_backend(controller)
+            .await?;
+        self.creations
+            .lock()
+            .await
+            .finish_after_backend(controller)
+            .await
+    }
+
     /// Stop the native driver only when no terminal request can still need it.
     fn stop_resolved_driver(
         &self,
@@ -2537,6 +2562,8 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    include!("network_runtime/failed_backend_retirement.rs");
 
     #[derive(Debug, Default)]
     struct AdmissionControl {
