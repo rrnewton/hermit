@@ -273,13 +273,16 @@ fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
 
 /// An unreadable word is accepted as unstored only when part of it is
 /// unmapped: Linux's eight-byte `put_user` faults there before storing any
-/// byte. A failed read of a fully mapped word is not evidence of a fault. A
-/// seccomp filter can deny the read while the store succeeds, and the
-/// in-process backends' `process_vm_readv` cannot read a `PROT_NONE` or
-/// write-only page that Linux may still store to. Ptrace reads use
-/// `FOLL_FORCE`, so for it a mapped word that cannot be read is already
-/// abnormal. An empty map is refused because a filter that fakes a successful
-/// zero-byte read would otherwise make every word look unmapped.
+/// byte. A failed read of a fully mapped word is not evidence of a fault: a
+/// seccomp filter can deny the read while the store succeeds. Ptrace reads use
+/// `FOLL_FORCE`, so ordinary anonymous and file mappings are always readable
+/// to them. Some listed mappings are not: `MADV_GUARD_INSTALL` guard regions,
+/// `VM_PFNMAP` mappings without an `access` operation, missing pages of a
+/// userfaultfd region in SIGBUS mode, and `[vsyscall]` in xonly mode. Backends
+/// that read with `process_vm_readv` also cannot read `PROT_NONE` pages. A
+/// `gettimeofday` whose store faults on any of these ends the run rather than
+/// returning EFAULT. An empty map is refused because a filter that fakes a
+/// successful zero-byte read would otherwise make every word look unmapped.
 fn require_unmapped_unreadable_word(
     field: &'static str,
     maps: Result<Vec<(u64, u64)>, Error>,
@@ -308,8 +311,8 @@ fn require_unmapped_unreadable_word(
 
 /// What Detcore's memory reader returned for `tv_sec` and `tv_usec` before a
 /// `gettimeofday`, with the read error where it failed. Under ptrace the read
-/// ignores page protection and protection keys; the in-process backends' read
-/// respects `VM_READ`.
+/// ignores page protection and protection keys; backends that read with
+/// `process_vm_readv` respect `VM_READ`.
 type TimevalWordSnapshot = [Result<libc::time_t, Errno>; 2];
 
 const TIMEVAL_WORDS: [(&str, usize); 2] = [
@@ -399,10 +402,16 @@ fn should_repair_failed_gettimeofday_tv(backend_is_kvm: bool) -> bool {
 /// unreadable both times and not fully mapped, so that the store could only
 /// have faulted. A changed word was stored by that call, and an unreadable
 /// word that is fully mapped may have been, because a failed read is not
-/// itself a fault. Each of these failures ends the run. The in-process
-/// backends cannot read `PROT_NONE` or write-only pages, so on them a
-/// `gettimeofday` that stops on such a page ends the run rather than
-/// returning EFAULT.
+/// itself a fault. Each of these failures ends the run, including for the
+/// mapped but unreadable pages listed at `require_unmapped_unreadable_word`.
+///
+/// These checks are observations Detcore makes with its own syscalls, so they
+/// trust those syscalls' results, as every Detcore handler that reads back a
+/// result does. They catch a filter that makes a syscall fail, whether it is
+/// the guest's probe or Detcore's own read. A seccomp filter installed on
+/// Hermit itself can also make one of Detcore's own syscalls report success
+/// without running it, and that is outside this guarantee. A guest cannot
+/// install a filter: Detcore refuses `seccomp(2)` and `PR_SET_SECCOMP`.
 ///
 /// The repair never writes a word the kernel could not store, and it does not
 /// test writability by rewriting a word, because a remote write ignores
