@@ -389,7 +389,9 @@ struct Profile {
 // tests_time cases that need a PMU left test.detcore_time and its hosted twin
 // (https://github.com/rrnewton/hermit/issues/3663): 87/88 before. portable and
 // hosted-portable are unchanged because the node carries only the full label.
-const PROFILES: [Profile; 11] = [
+// full-buck-e2e is only the Buck E2E nodes; a Buck full run selects it with a
+// pruned full (buck_e2e_selection), which assert_buck_e2e_selection counts.
+const PROFILES: [Profile; 12] = [
     Profile {
         label: "full",
         direct_steps: 88,
@@ -429,6 +431,11 @@ const PROFILES: [Profile; 11] = [
     },
     // The corpus-only run type: its release build, fixtures and bucket, plus
     // the gate and producers they need.
+    Profile {
+        label: FULL_BUCK_E2E_LABEL,
+        direct_steps: 18,
+        selected_steps: 23,
+    },
     Profile {
         label: "portable-strict-compat-only",
         direct_steps: 3,
@@ -832,6 +839,7 @@ pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/rel
 fn runs_in_pinned_root(step: &Step) -> bool {
     !is_hosted_variant(step)
         && !HOST_MANIFEST_RUNS.contains(&step.tag().as_str())
+        && !is_buck_import_twin(step)
         && (is_manifest_run(step) || PINNED_ROOT_EXECUTION_STEPS.contains(&step.tag().as_str()))
 }
 
@@ -1259,6 +1267,252 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         local_assert,
         "./ci/nextest-binaries.rs assert hosted-portable",
     );
+    Ok(())
+}
+
+/// The label of the Buck E2E nodes a `--e2e-runner buck-local|buck-hybrid` full run
+/// adds to the `full` selection; see [`buck_e2e_selection`].
+pub const FULL_BUCK_E2E_LABEL: &str = "full-buck-e2e";
+/// The host node that runs every E2E cell under Buck/Tpx.
+pub const BUCK_CELLS_TAG: &str = "e2e.buck_cells";
+const BUCK_TWIN_SUFFIX: &str = "_buck";
+/// Where e2e.buck_cells leaves the Buck rows and the twins import them from.
+const BUCK_IMPORT_ROOT: &str = "$VALIDATE_RUN_STATE/buck-e2e/results";
+const BUCK_CELLS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node"#;
+/// The scorecard that judges the cargo buckets' result files, and its twin.
+const FULL_SCORECARD_TAG: &str = "full-scorecard.compatibility";
+/// The `full` nodes that exist only to build inputs for, or to run, the cargo
+/// E2E buckets. A Buck full run drops them with the buckets they serve.
+pub const BUCK_REPLACED_PRODUCERS: &[&str] = &[
+    "build.host_hermit_link",
+    "build.manifest_guests_in_pinned_root",
+    "compatprep.fixtures",
+    "privileged-build.manifest_guests_in_pinned_root",
+    "setup.manifest_plan_in_pinned_root",
+];
+
+fn is_buck_import_twin(step: &Step) -> bool {
+    step.job.ends_with(BUCK_TWIN_SUFFIX)
+        && step.manifest.is_some()
+        && step.labels == [FULL_BUCK_E2E_LABEL]
+}
+
+/// The `full` selection of a Buck E2E run: every `full` node except the cargo
+/// E2E buckets, their scorecard and [`BUCK_REPLACED_PRODUCERS`], plus the
+/// `full-buck-e2e` nodes: e2e.buck_cells, one import twin per bucket and the
+/// twin scorecard. Each twin owns its bucket's cells and writes its bucket's
+/// result files, so the selection reports the same cells at the same paths.
+///
+/// Refuses a `full` node that still depends on a replaced node, since the
+/// label closure would silently bring the cargo path back.
+pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
+    let replaced = buck_replaced_tags(committed)?;
+    let mut pruned = committed.clone();
+    for step in &mut pruned.steps {
+        if replaced.contains(&step.tag()) {
+            step.labels.retain(|label| label != "full");
+        }
+    }
+    let selected =
+        select_steps_by_labels(&pruned, &["full".to_string(), FULL_BUCK_E2E_LABEL.into()])?;
+    let kept = selected
+        .steps
+        .iter()
+        .map(Step::tag)
+        .filter(|tag| replaced.contains(tag))
+        .collect::<Vec<_>>();
+    if !kept.is_empty() {
+        let dependents = selected
+            .steps
+            .iter()
+            .filter(|step| step.deps.iter().any(|dep| kept.contains(dep)))
+            .map(Step::tag)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "the Buck E2E selection still needs replaced node(s) {kept:?}, through {dependents:?}"
+        ));
+    }
+    Ok(selected)
+}
+
+/// The cargo nodes a Buck full run replaces: every bucket and scorecard that
+/// has a `_buck` twin, and the producers only they consume.
+fn buck_replaced_tags(cfg: &DagConfig) -> Result<BTreeSet<String>, String> {
+    let tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let mut replaced = BTreeSet::new();
+    for step in &cfg.steps {
+        if step.labels != [FULL_BUCK_E2E_LABEL] || step.tag() == BUCK_CELLS_TAG {
+            continue;
+        }
+        let cargo = step
+            .tag()
+            .strip_suffix(BUCK_TWIN_SUFFIX)
+            .map(str::to_string)
+            .ok_or_else(|| format!("{} is a Buck node with no cargo counterpart", step.tag()))?;
+        if !tags.contains(&cargo) {
+            return Err(format!("{} replaces absent node {cargo}", step.tag()));
+        }
+        replaced.insert(cargo);
+    }
+    for producer in BUCK_REPLACED_PRODUCERS {
+        if !tags.contains(*producer) {
+            return Err(format!("Buck-replaced producer {producer} is absent"));
+        }
+        replaced.insert((*producer).to_string());
+    }
+    Ok(replaced)
+}
+
+/// Add the `full-buck-e2e` nodes: e2e.buck_cells, which stages the inputs and
+/// runs every cell under Buck/Tpx, one host import twin per `full` E2E bucket,
+/// and a twin of the full scorecard that waits for the twins.
+///
+/// A twin keeps its bucket's manifest selector and test-harness arguments, so
+/// it owns the same cells and writes the same result files. It only adds
+/// `E2E_IMPORT_RESULTS`, so the harness executes nothing and publishes the
+/// Buck rows instead; a cell with no row becomes an ERROR row.
+fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
+    let buckets = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            step.manifest.is_some()
+                && matches!(step.group.as_str(), "e2e" | "privileged-e2e")
+                && step.labels.iter().any(|label| label == "full")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if buckets.len() != 16 {
+        return Err(format!(
+            "the full profile has {} E2E buckets, expected 16",
+            buckets.len()
+        ));
+    }
+    let deps = [
+        BUCK_CELLS_TAG,
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+    ];
+    let mut added = Vec::new();
+    let mut bucket_tags = BTreeSet::new();
+    for bucket in &buckets {
+        let cargo = bucket.tag();
+        // A twin executes no cell, so it runs on the host (runs_in_pinned_root
+        // excludes it): keep only the payload of an authored pinned-root wrapper.
+        let payload = if bucket.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+            let argv = shell_words::split(&bucket.cmd)
+                .map_err(|error| format!("{cargo}: invalid pinned-root quoting: {error}"))?;
+            let boundary = argv
+                .iter()
+                .position(|arg| arg == "--")
+                .ok_or_else(|| format!("{cargo}: missing pinned-root payload boundary"))?;
+            match &argv[boundary..] {
+                [_, bash, dash_c, guard, name, payload]
+                    if bash == "bash"
+                        && dash_c == "-c"
+                        && name == "bash"
+                        && [PINNED_ROOT_COMMAND_GUARD, LEGACY_PINNED_ROOT_COMMAND_GUARD]
+                            .contains(&guard.as_str()) =>
+                {
+                    payload.clone()
+                }
+                _ => return Err(format!("{cargo}: unrecognized pinned-root invocation")),
+            }
+        } else {
+            bucket.cmd.clone()
+        };
+        let launcher = [
+            "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run ",
+            "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run ",
+        ]
+        .into_iter()
+        .find(|launcher| payload.matches(launcher).count() == 1)
+        .ok_or_else(|| format!("{cargo} lost its one test-harness run launcher"))?;
+        let mut twin = bucket.clone();
+        twin.job.push_str(BUCK_TWIN_SUFFIX);
+        let tag = twin.tag();
+        twin.desc = format!("{} (Buck rows)", bucket.desc);
+        twin.description = format!(
+            "Publishes the cells of {cargo} from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with {cargo}'s arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops {cargo}."
+        );
+        twin.labels = vec![FULL_BUCK_E2E_LABEL.into()];
+        twin.cmd = payload.replace(
+            launcher,
+            &format!("E2E_IMPORT_RESULTS=\"{BUCK_IMPORT_ROOT}\" target/debug/test-harness run "),
+        );
+        twin.deps = deps.iter().map(|dep| (*dep).to_string()).collect();
+        twin.env.clear();
+        twin.timeout = 300;
+        twin.cpu_timeout = 600;
+        twin.hint.resources.clear();
+        twin.hint.est_duration_s = 1.0;
+        twin.hint.rss_baseline_bytes = Some(1 << 30);
+        twin.hint.hard_mem_max_bytes = Some(3 << 30);
+        twin.hint.classification = dagrun::model::StepClass::Light;
+        twin.hint.preferred_inner_jobs = None;
+        twin.fail_fast_family = Some(tag.clone());
+        for result in twin.result_manifests.iter_mut().flatten() {
+            if let ResultManifest::StructuredTestResults(result) = result {
+                result.owner = tag.clone();
+            }
+        }
+        bucket_tags.insert(cargo);
+        added.push(twin);
+    }
+
+    let scorecard = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == FULL_SCORECARD_TAG)
+        .ok_or("the full scorecard is absent")?;
+    let scorecard_deps = scorecard
+        .deps
+        .iter()
+        .filter(|dep| bucket_tags.contains(*dep))
+        .count();
+    if scorecard_deps != bucket_tags.len() {
+        return Err(format!(
+            "{FULL_SCORECARD_TAG} waits for {scorecard_deps} of the {} full E2E buckets",
+            bucket_tags.len()
+        ));
+    }
+    let mut scorecard_twin = scorecard.clone();
+    scorecard_twin.job.push_str(BUCK_TWIN_SUFFIX);
+    scorecard_twin.labels = vec![FULL_BUCK_E2E_LABEL.into()];
+    scorecard_twin.description = format!(
+        "{FULL_SCORECARD_TAG}, run after the Buck import twins instead of the cargo buckets. {}",
+        scorecard.description
+    );
+    for dep in &mut scorecard_twin.deps {
+        if bucket_tags.contains(dep) {
+            dep.push_str(BUCK_TWIN_SUFFIX);
+        }
+    }
+    scorecard_twin.fail_fast_family = Some(scorecard_twin.tag());
+    added.push(scorecard_twin);
+
+    let mut cells = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.buck_release_artifact")
+        .ok_or("build.buck_release_artifact is absent")?
+        .clone();
+    cells.group = "e2e".into();
+    cells.job = "buck_cells".into();
+    cells.desc = "Run every E2E cell under Buck/Tpx".into();
+    cells.description = "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which passes the runner in HERMIT_VALIDATE_E2E_RUNNER and the internal buck2 in HERMIT_VALIDATE_BUCK2. On the host it regenerates the Buck third-party rules, stages the inputs Buck does not build (ci/buck-e2e/stage --from-cargo, a host cargo build in its own target directory), and runs every cell of ci/expected-e2e-plan.json under Buck (ci/buck-e2e/run --no-verdict), locally or with RE-routed cells on Meta RE. It judges nothing: the rows go to $VALIDATE_RUN_STATE/buck-e2e/results for the import twins, which own the verdicts. Any other runner value exits 2; nothing falls back to cargo.".into();
+    cells.labels = vec![FULL_BUCK_E2E_LABEL.into()];
+    cells.cmd = BUCK_CELLS_COMMAND.into();
+    cells.deps = deps[1..].iter().map(|dep| (*dep).to_string()).collect();
+    cells.timeout = 3600;
+    cells.cpu_timeout = 14400;
+    cells.hint.est_duration_s = 450.0;
+    cells.fail_fast_family = Some(BUCK_CELLS_TAG.into());
+    added.push(cells);
+
+    cfg.steps.extend(added);
     Ok(())
 }
 
@@ -1807,10 +2061,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // joined the test-harness producers (2026-10-01); 120 since
     // test.detcore_time and its hosted twin were enrolled; 121 since
     // privileged-test.pmu_detcore_time_cases took the 29 tests_time cases that
-    // need a PMU (https://github.com/rrnewton/hermit/issues/3663).
-    if expected.len() != 121 {
+    // need a PMU (https://github.com/rrnewton/hermit/issues/3663). 137 with
+    // the 16 Buck import twins.
+    if expected.len() != 137 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 121",
+            "structured result producer registry has {} entries, expected 137",
             expected.len()
         ));
     }
@@ -1954,8 +2209,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // rrcompat.manifest_compat. Envelope 2 -> 7 with the five super stress
     // probe nodes. Nextest 69 -> 71 when test.detcore_time and its hosted twin
     // were enrolled, and 72 with privileged-test.pmu_detcore_time_cases
-    // (https://github.com/rrnewton/hermit/issues/3663).
-    if actual_group_counts != [72, 40, 7, 2] {
+    // (https://github.com/rrnewton/hermit/issues/3663). TestHarness 56 with
+    // the 16 Buck import twins.
+    if actual_group_counts != [72, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2017,9 +2273,127 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
             // The corpus-only run type runs exactly the strict compatibility bucket.
             "portable-strict-compat-only" => cell.lane == "portable" && cell.category == "compat",
             "super" => false,
+            // The import twins own every cell, as the cargo buckets do in full.
+            FULL_BUCK_E2E_LABEL => true,
             _ => false,
         })
         .collect()
+}
+
+/// The Buck full selection replaces exactly the cargo E2E path and reports
+/// the same cells, each owned by exactly one node.
+fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
+    let replaced = buck_replaced_tags(cfg)?;
+    let mut expected_replaced = BUCK_REPLACED_PRODUCERS
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect::<BTreeSet<_>>();
+    expected_replaced.insert(FULL_SCORECARD_TAG.into());
+    for category in [
+        "applications",
+        "bin_c",
+        "c_programs",
+        "chaos_c",
+        "compat",
+        "data_handling",
+        "debugger_c",
+        "determinism_stress",
+        "determinism_stress_c",
+        "language_runtimes",
+        "shared_futex_c",
+        "system_utils",
+        "util_c",
+    ] {
+        expected_replaced.insert(format!("e2e.manifest_{category}"));
+    }
+    for category in ["applications", "c_programs", "system_utils"] {
+        expected_replaced.insert(format!("privileged-e2e.manifest_{category}"));
+    }
+    if replaced != expected_replaced {
+        return Err(format!(
+            "the Buck E2E selection replaces {:?}, expected {:?}",
+            replaced, expected_replaced
+        ));
+    }
+    let selected = buck_e2e_selection(cfg)?;
+    let full = select_steps_by_labels(cfg, &["full".to_string()])?;
+    let full_tags = full.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let selected_tags = selected.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    // The selection is the full profile minus the replaced nodes plus exactly
+    // the full-buck-e2e nodes (on the committed DAG: 87 - 22 + 18 = 83, pinned
+    // by committed_buck_e2e_selection_has_83_steps).
+    let added = selected_tags
+        .difference(&full_tags)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let buck_nodes = cfg
+        .steps
+        .iter()
+        .filter(|step| step.labels == [FULL_BUCK_E2E_LABEL])
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    if added != buck_nodes {
+        return Err(format!(
+            "the Buck E2E selection adds {added:?}, expected the full-buck-e2e nodes {buck_nodes:?}"
+        ));
+    }
+    let dropped = full_tags
+        .difference(&selected_tags)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if dropped != replaced {
+        return Err(format!(
+            "the Buck E2E selection drops {dropped:?}, but replaces {replaced:?}"
+        ));
+    }
+    for step in &selected.steps {
+        if step.labels == [FULL_BUCK_E2E_LABEL]
+            && step.tag() != BUCK_CELLS_TAG
+            && !step.deps.iter().any(|dep| {
+                dep == BUCK_CELLS_TAG || dep.ends_with(BUCK_TWIN_SUFFIX)
+            })
+        {
+            return Err(format!(
+                "{} does not wait for the Buck rows",
+                step.tag()
+            ));
+        }
+        // A twin reads rows it is handed on the host; inside the pinned root
+        // $VALIDATE_RUN_STATE would not name the rows e2e.buck_cells wrote.
+        if is_buck_import_twin(step)
+            && (step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh")
+                || step.cmd.matches("E2E_IMPORT_RESULTS=").count() != 1
+                || step.cmd.contains("run-with-hermit-e2e-artifact"))
+        {
+            return Err(format!(
+                "{} is not a host-side import of the Buck rows",
+                step.tag()
+            ));
+        }
+    }
+    let expected = expected_for_label("full", cells);
+    for result in &expected {
+        result_manifest_owner(&selected.steps, result)
+            .map_err(|error| format!("Buck E2E result ownership failed: {error}"))?;
+    }
+    let expected_ids = expected
+        .into_iter()
+        .map(result_identity)
+        .collect::<BTreeSet<_>>();
+    let actual_ids = selected
+        .steps
+        .iter()
+        .flat_map(|step| step.effective_result_manifests().into_owned())
+        .map(|result| result_identity(&result))
+        .collect::<BTreeSet<_>>();
+    if actual_ids != expected_ids {
+        return Err(format!(
+            "the Buck E2E selection reports {} cells, the full profile {}",
+            actual_ids.len(),
+            expected_ids.len()
+        ));
+    }
+    Ok(())
 }
 
 fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
@@ -2455,6 +2829,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     assert_tool_self_test_nodes(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
+    assert_buck_e2e_selection(cfg, cells)?;
     // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
     // since check.canonical_adapter_accept was added; +3 for the privileged
@@ -2490,9 +2865,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // 418 with privileged-test.pmu_detcore_time_cases, which runs the 29
     // tests_time cases that need a PMU (417 + 1;
     // https://github.com/rrnewton/hermit/issues/3663).
-    if cfg.steps.len() != 418 {
+    // 436 with the 18 full-buck-e2e nodes: e2e.buck_cells, the 16 bucket
+    // import twins and the scorecard twin (418 + 18).
+    if cfg.steps.len() != 436 {
         return Err(format!(
-            "superset has {} steps, expected 418",
+            "superset has {} steps, expected 436",
             cfg.steps.len()
         ));
     }
@@ -2791,7 +3168,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 && !is_hosted_variant(step)
                 && !step.deps.iter().any(|dependency| {
                     dependency
-                        == if HOST_MANIFEST_RUNS.contains(&step.tag().as_str()) {
+                        == if HOST_MANIFEST_RUNS.contains(&step.tag().as_str())
+                            || is_buck_import_twin(step)
+                        {
                             // A host-run bucket reads the host's prepared scripts.
                             "build.rust_scripts"
                         } else if step
@@ -3147,6 +3526,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_buck_e2e(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -4512,6 +4892,32 @@ sys.exit(37)
     }
 
     #[test]
+    fn committed_buck_e2e_selection_has_83_steps() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        assert_buck_e2e_selection(&committed, &cells).unwrap();
+        // 87 full nodes - 22 replaced + 18 full-buck-e2e nodes.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 83);
+
+        fn twin(cfg: &mut DagConfig) -> &mut Step {
+            cfg.steps
+                .iter_mut()
+                .find(|step| step.tag() == "e2e.manifest_c_programs_buck")
+                .unwrap()
+        }
+        let mut wrapped = committed.clone();
+        let cmd = twin(&mut wrapped).cmd.clone();
+        twin(&mut wrapped).cmd = format!("./ci/hermetic/run-in-pinned-root.sh -- {cmd}");
+        let error = assert_buck_e2e_selection(&wrapped, &cells).unwrap_err();
+        assert!(error.contains("not a host-side import"), "{error}");
+
+        let mut unlabelled = committed.clone();
+        twin(&mut unlabelled).labels.clear();
+        let error = assert_buck_e2e_selection(&unlabelled, &cells).unwrap_err();
+        assert!(error.contains("Buck E2E"), "{error}");
+    }
+
+    #[test]
     fn c_programs_nodes_refuse_an_empty_selection() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
@@ -4534,6 +4940,9 @@ sys.exit(37)
                 "privileged-only-e2e.manifest_c_programs",
                 "e2e.manifest_c_programs_on_host",
                 "privileged-only-e2e.manifest_c_programs_on_host",
+                // The full-buck-e2e import twins of the two full buckets.
+                "e2e.manifest_c_programs_buck",
+                "privileged-e2e.manifest_c_programs_buck",
             ]
             .map(str::to_owned)
         );

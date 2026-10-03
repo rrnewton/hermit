@@ -1,0 +1,79 @@
+#!/bin/bash
+# The validation DAG's e2e.buck_cells node: run every e2e manifest cell under Buck and
+# leave the rows, unjudged, where the import twins (<bucket>_buck) read them.
+#
+# usage: ci/buck-e2e/validate-node
+#        ci/buck-e2e/validate-node -h|--help
+#
+# scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH selects this node and
+# passes, through the environment:
+#   HERMIT_VALIDATE_E2E_RUNNER  buck-local (every cell locally) or buck-hybrid (RE-routed
+#                               cells on Meta RE, the rest locally). Anything else,
+#                               including cargo or unset, exits 2: nothing falls back.
+#   HERMIT_VALIDATE_BUCK2       the absolute path of the internal buck2 (a DotSlash file),
+#                               which is never committed.
+#   VALIDATE_RUN_STATE          the run's state directory. The rows go to
+#                               $VALIDATE_RUN_STATE/buck-e2e/results, Buck's event logs to
+#                               $VALIDATE_RUN_STATE/buck-e2e/work.
+# Optional: HERMIT_GIT_DEP_MIRRORS (see bootstrap/git-dep-mirrors.sh) serves Cargo.lock's
+# git dependencies from local mirrors while the third-party rules are regenerated.
+#
+# Steps, all on the host, in the checkout: regenerate the Buck third-party rules
+# (bootstrap/regenerate-rust-deps), stage the RE link inputs for buck-hybrid
+# (shim/modes/stage-re-inputs), stage the inputs Buck does not build yet with a cargo
+# build in target/buck-e2e-stage (ci/buck-e2e/stage --from-cargo), then
+# ci/buck-e2e/run --no-verdict with -c hermit_e2e.hermit=staged, so the cells test that
+# cargo-built validate-profile hermit. The buck2 daemon is killed on every exit.
+# Network steps run through with-proxy when it is installed.
+#
+# Exit status: 0 once the rows are written, whatever the cells' verdicts (the twins judge
+# them); 2 for a usage error or a missing input; otherwise the failing step's status.
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo pipefail$/{/^set /d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
+case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+    '') ;;
+    *) echo "validate-node: unexpected argument: $1 (see --help)" >&2; exit 2 ;;
+esac
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+runner=${HERMIT_VALIDATE_E2E_RUNNER:-}
+case $runner in
+    buck-local) mode=local; buck_args=() ;;
+    buck-hybrid) mode=hybrid; buck_args=(@shim/modes/hybrid) ;;
+    *)
+        echo "validate-node: HERMIT_VALIDATE_E2E_RUNNER is '${runner}', not buck-local or buck-hybrid; run scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH" >&2
+        exit 2 ;;
+esac
+buck2=${HERMIT_VALIDATE_BUCK2:-}
+if [[ $buck2 != /* || ! -f $buck2 || ! -x $buck2 ]]; then
+    echo "validate-node: HERMIT_VALIDATE_BUCK2 is '${buck2}', not an absolute path to an executable file; pass scripts/validate.rs --buck2 PATH" >&2
+    exit 2
+fi
+if [[ -z ${VALIDATE_RUN_STATE:-} ]]; then
+    echo "validate-node: VALIDATE_RUN_STATE is unset; this node runs under scripts/validate.rs" >&2
+    exit 2
+fi
+state=$VALIDATE_RUN_STATE/buck-e2e
+proxy=()
+if command -v with-proxy >/dev/null 2>&1; then proxy=(with-proxy); fi
+
+cd "$root"
+trap '"$buck2" kill >/dev/null 2>&1 || true' EXIT
+step() { echo "validate-node: $*" >&2; }
+
+step "regenerating the Buck third-party rules"
+"${proxy[@]}" ./bootstrap/regenerate-rust-deps
+if [[ $mode == hybrid ]]; then
+    step "staging the RE link inputs"
+    "${proxy[@]}" ./shim/modes/stage-re-inputs
+fi
+step "staging the inputs Buck does not build (cargo, target/buck-e2e-stage)"
+"${proxy[@]}" ./ci/buck-e2e/stage --from-cargo --target-dir target/buck-e2e-stage
+rm -rf -- "${state:?}/results"
+mkdir -p "$state/work"
+step "running every cell under Buck ($runner)"
+./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
+    --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged

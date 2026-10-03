@@ -170,6 +170,23 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
 ];
 
 pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
+    // The Buck import twins validation_dag::materialize_buck_e2e adds.
+    "e2e.manifest_applications_buck",
+    "e2e.manifest_bin_c_buck",
+    "e2e.manifest_c_programs_buck",
+    "e2e.manifest_chaos_c_buck",
+    "e2e.manifest_compat_buck",
+    "e2e.manifest_data_handling_buck",
+    "e2e.manifest_debugger_c_buck",
+    "e2e.manifest_determinism_stress_buck",
+    "e2e.manifest_determinism_stress_c_buck",
+    "e2e.manifest_language_runtimes_buck",
+    "e2e.manifest_shared_futex_c_buck",
+    "e2e.manifest_system_utils_buck",
+    "e2e.manifest_util_c_buck",
+    "privileged-e2e.manifest_applications_buck",
+    "privileged-e2e.manifest_c_programs_buck",
+    "privileged-e2e.manifest_system_utils_buck",
     "e2e.manifest_applications",
     "e2e.manifest_applications_on_host",
     "e2e.manifest_compat",

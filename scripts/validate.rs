@@ -890,6 +890,11 @@ struct Args {
     /// Explicit phase-two opt-in. Cargo remains the default; the committed DAG
     /// carries the closed mode branch and exact-artifact propagation.
     buck_release_dotslash: Option<PathBuf>,
+    /// Who runs the full level's E2E cells: [`E2E_RUNNER_CARGO`] (the manifest
+    /// buckets) or a Buck mode (`e2e.buck_cells` and the `_buck` import twins).
+    e2e_runner: &'static str,
+    /// The internal buck2 a Buck E2E runner uses. Never committed.
+    buck2: Option<PathBuf>,
 }
 
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
@@ -900,6 +905,13 @@ const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-recor
 const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
 const RELEASE_BUILDER_CARGO: &str = validate_receipt::RELEASE_BUILDER_CARGO;
 const RELEASE_BUILDER_BUCK: &str = "buck";
+const E2E_RUNNER_ENV: &str = "HERMIT_VALIDATE_E2E_RUNNER";
+const E2E_BUCK2_ENV: &str = "HERMIT_VALIDATE_BUCK2";
+const E2E_RUNNER_CARGO: &str = "cargo";
+const E2E_RUNNERS: [&str; 3] = [E2E_RUNNER_CARGO, "buck-local", "buck-hybrid"];
+/// Where `ci/buck-e2e/stage --from-cargo` (run by `e2e.buck_cells`) builds the
+/// validate-profile hermit a Buck E2E runner's cells execute.
+const BUCK_E2E_STAGED_PAYLOAD: &str = "target/buck-e2e-stage/validate/hermit";
 
 /// The binary every E2E cell of a run executes, as `build.e2e_artifact`
 /// publishes it for each builder.
@@ -923,6 +935,15 @@ fn e2e_payload_identity(release_builder: &str) -> serde_json::Value {
             "overflow_checks": true,
         })
     }
+}
+
+/// [`e2e_payload_identity`], with the path a Buck E2E runner's cells ran.
+fn ledger_e2e_payload(release_builder: &str, e2e_runner: &str) -> serde_json::Value {
+    let mut payload = e2e_payload_identity(release_builder);
+    if e2e_runner != E2E_RUNNER_CARGO {
+        payload["path"] = BUCK_E2E_STAGED_PAYLOAD.into();
+    }
+    payload
 }
 
 /// The identity above is a constant per builder. These checks tie it to the
@@ -1149,6 +1170,41 @@ fn establish_release_build_environment(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Hand the E2E runner to the nodes that read it (`e2e.buck_cells`), like
+/// [`establish_release_build_environment`]: ambient values never survive.
+fn establish_e2e_runner_environment(args: &Args) -> Result<(), String> {
+    std::env::remove_var(E2E_RUNNER_ENV);
+    std::env::remove_var(E2E_BUCK2_ENV);
+    let Some(buck2) = args.buck2.as_deref() else {
+        return Ok(());
+    };
+    if !buck2.is_absolute() {
+        return Err(format!(
+            "--buck2 requires an absolute path, got {}",
+            buck2.display()
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(buck2).map_err(|error| {
+        format!(
+            "--buck2 {} is unreadable: {error}; pass the internal buck2 (a DotSlash file)",
+            buck2.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(format!(
+            "--buck2 {} must be a nonempty executable regular file, not a symlink",
+            buck2.display()
+        ));
+    }
+    std::env::set_var(E2E_RUNNER_ENV, args.e2e_runner);
+    std::env::set_var(E2E_BUCK2_ENV, buck2);
+    Ok(())
+}
+
 fn usage() -> &'static str {
     "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
      \n\
@@ -1207,6 +1263,14 @@ fn usage() -> &'static str {
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
      \x20                  mode refuses unsupported plans and never falls back.\n\
+     \x20 --e2e-runner cargo|buck-local|buck-hybrid\n\
+     \x20                  Who runs the full level's E2E cells (default cargo). A Buck\n\
+     \x20                  runner swaps the manifest buckets for e2e.buck_cells (every\n\
+     \x20                  cell under Buck: buck-local all on this host, buck-hybrid the\n\
+     \x20                  RE-routed cells on Meta RE) and the <bucket>_buck import nodes,\n\
+     \x20                  which own the same cells and result files. Full level only.\n\
+     \x20 --buck2 PATH     Absolute path of the internal buck2 a Buck runner uses; never\n\
+     \x20                  committed. Required with a Buck runner, refused without one.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
      \x20 --run-timeout SEC  Wall budget for the WHOLE invocation (across lanes and\n\
      \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
@@ -1345,7 +1409,10 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         selected: None,
         ignore_selected_deps: false,
         buck_release_dotslash: None,
+        e2e_runner: E2E_RUNNER_CARGO,
+        buck2: None,
     };
+    let mut e2e_runner_explicit = false;
     let mut shallow = false;
     let mut selective = false;
     let mut show_plan = false;
@@ -1486,6 +1553,39 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                     }
                 }
             }
+            "--e2e-runner" => {
+                i += 1;
+                match argv.get(i).and_then(|v| E2E_RUNNERS.iter().find(|r| **r == v)) {
+                    Some(_) if e2e_runner_explicit => {
+                        eprintln!("validate: --e2e-runner may be supplied only once");
+                        return Err(2);
+                    }
+                    Some(runner) => {
+                        args.e2e_runner = runner;
+                        e2e_runner_explicit = true;
+                    }
+                    None => {
+                        eprintln!("validate: --e2e-runner needs one of cargo, buck-local, buck-hybrid");
+                        return Err(2);
+                    }
+                }
+            }
+            "--buck2" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() && args.buck2.is_none() => {
+                        args.buck2 = Some(PathBuf::from(v));
+                    }
+                    Some(_) if args.buck2.is_some() => {
+                        eprintln!("validate: --buck2 may be supplied only once");
+                        return Err(2);
+                    }
+                    _ => {
+                        eprintln!("validate: --buck2 needs the absolute path of the internal buck2");
+                        return Err(2);
+                    }
+                }
+            }
             "--label-pr" => {
                 args.label_pr = true;
                 args.no_label_pr_explicit = false;
@@ -1600,6 +1700,10 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         );
         return Err(2);
     }
+    if let Err(error) = e2e_runner_policy(&args) {
+        eprintln!("validate: {error}");
+        return Err(2);
+    }
     let output_forms = usize::from(args.show_plan_json)
         + usize::from(args.write_constructed_dag.is_some())
         + usize::from(args.write_generated_plan.is_some());
@@ -1650,6 +1754,39 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         return Err(2);
     }
     Ok(args)
+}
+
+/// A Buck E2E runner replaces only the full level's E2E buckets, so it refuses
+/// every other selection rather than running a plan nobody defined.
+fn e2e_runner_policy(args: &Args) -> Result<(), String> {
+    if args.e2e_runner == E2E_RUNNER_CARGO {
+        return match args.buck2 {
+            Some(_) => Err(
+                "--buck2 is used only by --e2e-runner buck-local|buck-hybrid; drop it or name a Buck runner"
+                    .into(),
+            ),
+            None => Ok(()),
+        };
+    }
+    let runner = args.e2e_runner;
+    if args.level != Level::Full || args.focused.is_some() || args.selected.is_some() {
+        return Err(format!(
+            "--e2e-runner {runner} replaces the E2E buckets of the complete full level only; \
+             drop the focused mode, --selected or the other level, or use --e2e-runner cargo"
+        ));
+    }
+    if args.buck_release_dotslash.is_some() {
+        return Err(format!(
+            "--e2e-runner {runner} cannot be combined with --buck-release; choose one"
+        ));
+    }
+    if args.buck2.is_none() {
+        return Err(format!(
+            "--e2e-runner {runner} needs --buck2 PATH, the absolute path of the internal buck2 \
+             (on devbig030 ~/.config/hermit/buck2.dotslash; see docs/BUCK2_OSS.md)"
+        ));
+    }
+    Ok(())
 }
 
 /// `force_full_policy_allows` (validate.sh:299): `--all` asserts the COMPLETE
@@ -5970,6 +6107,175 @@ mod focused_only_tests {
     #[test]
     fn actual_focused_selection_keeps_exact_producers_and_all_refusals() {
         only_plan_bracket(&test_source_root()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod e2e_runner_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    const BUCK2: &str = "/home/someone/.config/hermit/buck2.dotslash";
+
+    #[test]
+    fn cargo_is_the_default_and_buck2_needs_a_buck_runner() {
+        let args = parse_argv(&argv(&["full"])).unwrap();
+        assert_eq!(args.e2e_runner, E2E_RUNNER_CARGO);
+        assert!(args.buck2.is_none());
+        assert!(parse_argv(&argv(&["full", "--buck2", BUCK2])).is_err());
+        assert!(parse_argv(&argv(&["full", "--e2e-runner", "cargo", "--buck2", BUCK2])).is_err());
+    }
+
+    #[test]
+    fn buck_runners_accept_only_the_complete_full_level_with_buck2() {
+        for runner in ["buck-local", "buck-hybrid"] {
+            let args =
+                parse_argv(&argv(&["full", "--e2e-runner", runner, "--buck2", BUCK2])).unwrap();
+            assert_eq!(args.e2e_runner, runner);
+            assert_eq!(args.buck2.as_deref(), Some(Path::new(BUCK2)));
+            // Full is the default level.
+            assert!(parse_argv(&argv(&["--e2e-runner", runner, "--buck2", BUCK2])).is_ok());
+            assert!(parse_argv(&argv(&["full", "--e2e-runner", runner])).is_err());
+            for refused in [
+                vec!["quick", "--e2e-runner", runner, "--buck2", BUCK2],
+                vec!["portable-only", "--e2e-runner", runner, "--buck2", BUCK2],
+                vec!["super", "--e2e-runner", runner, "--buck2", BUCK2],
+                vec!["--privileged-only", "--e2e-runner", runner, "--buck2", BUCK2],
+                vec![
+                    "--only",
+                    "full",
+                    "e2e.manifest_compat",
+                    "--e2e-runner",
+                    runner,
+                    "--buck2",
+                    BUCK2,
+                ],
+                vec![
+                    "full",
+                    "--selected",
+                    "e2e.buck_cells",
+                    "--allow-local-off-the-record-run",
+                    "--e2e-runner",
+                    runner,
+                    "--buck2",
+                    BUCK2,
+                ],
+                vec![
+                    "full",
+                    "--buck-release",
+                    "/tmp/public-dotslash",
+                    "--e2e-runner",
+                    runner,
+                    "--buck2",
+                    BUCK2,
+                ],
+                vec!["full", "--e2e-runner", runner, "--e2e-runner", runner, "--buck2", BUCK2],
+                vec!["full", "--e2e-runner", runner, "--buck2", BUCK2, "--buck2", BUCK2],
+            ] {
+                assert!(parse_argv(&argv(&refused)).is_err(), "accepted {refused:?}");
+            }
+        }
+        for refused in [
+            vec!["full", "--e2e-runner", "buck"],
+            vec!["full", "--e2e-runner"],
+            vec!["full", "--buck2"],
+            vec!["full", "--buck2", ""],
+        ] {
+            assert!(parse_argv(&argv(&refused)).is_err(), "accepted {refused:?}");
+        }
+    }
+
+    #[test]
+    fn buck2_must_be_an_absolute_executable_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("buck2");
+        std::fs::write(&file, "#!dotslash\n").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "").unwrap();
+        exec_safe_fs::set_executable(&empty, 0o755).unwrap();
+        let mut args = parse_argv(&argv(&["full"])).unwrap();
+        args.e2e_runner = "buck-hybrid";
+        let mut check = |path: &Path| {
+            args.buck2 = Some(path.to_path_buf());
+            establish_e2e_runner_environment(&args)
+        };
+        // Not executable yet, then relative, missing, a symlink, empty.
+        assert!(check(&file).is_err());
+        exec_safe_fs::set_executable(&file, 0o755).unwrap();
+        for refused in [
+            Path::new("buck2"),
+            &dir.path().join("missing"),
+            &link,
+            &empty,
+        ] {
+            assert!(check(refused).is_err(), "accepted {}", refused.display());
+            assert!(std::env::var_os(E2E_RUNNER_ENV).is_none());
+            assert!(std::env::var_os(E2E_BUCK2_ENV).is_none());
+        }
+        check(&file).unwrap();
+        assert_eq!(std::env::var(E2E_RUNNER_ENV).unwrap(), "buck-hybrid");
+        assert_eq!(std::env::var_os(E2E_BUCK2_ENV).unwrap(), file.as_os_str());
+        args.buck2 = None;
+        args.e2e_runner = E2E_RUNNER_CARGO;
+        establish_e2e_runner_environment(&args).unwrap();
+        assert!(std::env::var_os(E2E_RUNNER_ENV).is_none());
+        assert!(std::env::var_os(E2E_BUCK2_ENV).is_none());
+    }
+
+    #[test]
+    fn a_buck_full_plan_swaps_exactly_the_buckets_for_their_buck_twins() {
+        let root = test_source_root();
+        let tmp = std::env::temp_dir();
+        let cargo = build_plan(&root, &parse_argv(&argv(&["full"])).unwrap(), &tmp).unwrap();
+        let buck = build_plan(
+            &root,
+            &parse_argv(&argv(&["full", "--e2e-runner", "buck-hybrid", "--buck2", BUCK2]))
+                .unwrap(),
+            &tmp,
+        )
+        .unwrap();
+        let tags = |plan: &Plan| plan.cfg.steps.iter().map(|step| step.tag()).collect::<BTreeSet<_>>();
+        let (cargo_tags, buck_tags) = (tags(&cargo), tags(&buck));
+        let added = buck_tags.difference(&cargo_tags).cloned().collect::<BTreeSet<_>>();
+        let dropped = cargo_tags.difference(&buck_tags).cloned().collect::<BTreeSet<_>>();
+        assert_eq!(added.len(), 18, "{added:?}");
+        assert!(added.contains("e2e.buck_cells"));
+        assert!(added.contains("full-scorecard.compatibility_buck"));
+        for tag in &added {
+            if tag != "e2e.buck_cells" {
+                let cargo_tag = tag.strip_suffix("_buck").unwrap();
+                assert!(dropped.contains(cargo_tag), "{tag} replaces nothing");
+            }
+        }
+        assert_eq!(dropped.len(), 22, "{dropped:?}");
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 18);
+        assert_eq!(buck.profile, "full");
+        assert_eq!(buck.selection_mode, "full");
+        assert!(buck.suite_complete);
+        assert!(buck.committed_selection.is_some());
+        assert!(validate_plan::undeclared_nodes(&buck.cfg).is_empty());
+    }
+
+    #[test]
+    fn the_ledger_names_the_runner_and_the_payload_it_ran() {
+        assert_eq!(
+            ledger_e2e_payload(RELEASE_BUILDER_CARGO, E2E_RUNNER_CARGO),
+            e2e_payload_identity(RELEASE_BUILDER_CARGO)
+        );
+        let buck = ledger_e2e_payload(RELEASE_BUILDER_CARGO, "buck-hybrid");
+        assert_eq!(buck["path"], BUCK_E2E_STAGED_PAYLOAD);
+        assert_eq!(buck["profile"], "validate");
+        let stage = std::fs::read_to_string(test_source_root().join("ci/buck-e2e/stage")).unwrap();
+        assert!(stage.contains("install -m 755 \"$target_dir/validate/hermit\""));
+        let node =
+            std::fs::read_to_string(test_source_root().join("ci/buck-e2e/validate-node")).unwrap();
+        assert!(node.contains("--from-cargo --target-dir target/buck-e2e-stage"));
+        assert!(node.contains("-c hermit_e2e.hermit=staged"));
     }
 }
 
@@ -11561,7 +11867,11 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 validate_envelope::L4_REPS_DEFAULT
             ));
         }
-        let mut cfg = dagrun::select_steps_by_labels(&committed, &[label.into()])?;
+        let mut cfg = if label == "full" && args.e2e_runner != E2E_RUNNER_CARGO {
+            hermit_manifest_plan::validation_dag::buck_e2e_selection(&committed)?
+        } else {
+            dagrun::select_steps_by_labels(&committed, &[label.into()])?
+        };
         let suite_complete = label == "full" && args.selected.is_none();
         let mut selection_mode = if suite_complete { "full" } else { "label" };
         if let Some(selected) = args.selected.as_deref() {
@@ -17295,8 +17605,12 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
         // probes of the strict-compat-only run type (fold 4). 40 since
         // rrcompat.manifest_compat replaced the 139 rrcompat.<program> probes
-        // of the rr-compat-only run type (fold 5).
-        assert_eq!(steps.len(), 40);
+        // of the rr-compat-only run type (fold 5). 56 since the 16
+        // full-buck-e2e import twins (<bucket>_buck), which only
+        // scripts/validate.rs --e2e-runner buck-local|buck-hybrid selects,
+        // each publish the cells of their bucket from the rows
+        // e2e.buck_cells wrote.
+        assert_eq!(steps.len(), 56);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -19795,6 +20109,10 @@ struct LedgerCtx {
     /// E2E cells execute the release binary, without debug assertions or
     /// overflow checks, so its row is neither a Cargo cache hit nor a receipt.
     release_builder: &'static str,
+    /// `cargo`, `buck-local` or `buck-hybrid`: who ran the E2E cells. A Buck
+    /// runner's cells execute the same validate profile, built by
+    /// `ci/buck-e2e/stage` at [`BUCK_E2E_STAGED_PAYLOAD`].
+    e2e_runner: &'static str,
     cache_state: String,
     commit: String,
     tree: String,
@@ -22996,7 +23314,8 @@ fn write_ledger_with_snapshot(
         "profile": ctx.profile,
         "selection_mode": ctx.selection_mode,
         "release_builder": ctx.release_builder,
-        "e2e_payload": e2e_payload_identity(ctx.release_builder),
+        "e2e_runner": ctx.e2e_runner,
+        "e2e_payload": ledger_e2e_payload(ctx.release_builder, ctx.e2e_runner),
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
         "tree": ctx.tree,
@@ -24853,6 +25172,8 @@ fn run(
     // reconstruct these values, so ambient variables cannot select a mode.
     std::env::remove_var(RELEASE_BUILD_MODE_ENV);
     std::env::remove_var(BUCK_DOTSLASH_ENV);
+    std::env::remove_var(E2E_RUNNER_ENV);
+    std::env::remove_var(E2E_BUCK2_ENV);
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -24955,6 +25276,9 @@ fn run(
 
     if let Err(error) = establish_release_build_environment(&args) {
         return RunSummary::refused(2, args.level.name(), "release build mode", vec![error]);
+    }
+    if let Err(error) = establish_e2e_runner_environment(&args) {
+        return RunSummary::refused(2, args.level.name(), "E2E runner", vec![error]);
     }
 
     let level_name = args.level.name().to_string();
@@ -25511,6 +25835,11 @@ fn run(
     } else {
         RELEASE_BUILDER_CARGO
     };
+    if args.e2e_runner != E2E_RUNNER_CARGO {
+        // Full is never cacheable today; a Buck row also records a different
+        // runner, so it must never answer a cargo request or the reverse.
+        plan.cacheable = false;
+    }
 
     if plan.committed_selection.is_none() {
         if let Err(error) =
@@ -26564,6 +26893,7 @@ fn run(
         profile: plan.profile.clone(),
         selection_mode: plan.selection_mode.into(),
         release_builder,
+        e2e_runner: args.e2e_runner,
         cache_state: cache.into(),
         commit: commit.clone(),
         tree: admitted_context
@@ -27488,6 +27818,7 @@ fn stop_test_seam(
         profile: profile.to_string(),
         selection_mode: "full".into(),
         release_builder: RELEASE_BUILDER_CARGO,
+        e2e_runner: E2E_RUNNER_CARGO,
         cache_state: cache_state(root).into(),
         commit,
         tree: git_tree(),
@@ -30834,6 +31165,7 @@ with (root/'calls.jsonl').open('a') as out:
             profile: profile.into(),
             selection_mode: "selected".into(),
             release_builder: RELEASE_BUILDER_CARGO,
+            e2e_runner: E2E_RUNNER_CARGO,
             cache_state: "cold".into(),
             commit,
             tree,
@@ -31360,8 +31692,12 @@ mod raw_census_publication_tests {
         // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
         // probes of the strict-compat-only run type (fold 4). 40 since
         // rrcompat.manifest_compat replaced the 139 rrcompat.<program> probes
-        // of the rr-compat-only run type (fold 5).
-        assert_eq!(publishers.len(), 40);
+        // of the rr-compat-only run type (fold 5). 56 since the 16
+        // full-buck-e2e import twins (<bucket>_buck), which only
+        // scripts/validate.rs --e2e-runner buck-local|buck-hybrid selects,
+        // each publish the cells of their bucket from the rows
+        // e2e.buck_cells wrote.
+        assert_eq!(publishers.len(), 56);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(
