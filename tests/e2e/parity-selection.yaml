@@ -87,7 +87,7 @@ cells:
   - test: c-programs/fork-exec-pipeline
     backends: [kvm]
   - test: c-programs/fsync-durability
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/ftruncate-sparse
     backends: [kvm, liteinst]
   - test: c-programs/getcpu-identity

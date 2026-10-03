@@ -5161,14 +5161,16 @@ mod tests {
         // https://github.com/rrnewton/reverie/issues/620
         // One epoll-pwait2 KVM candidate adds exactly one to the same counters:
         // https://github.com/rrnewton/reverie/issues/905
+        // One ordinary syncfs KVM candidate adds one to each live counter:
+        // https://github.com/rrnewton/reverie/issues/838
         assert_eq!(
             row(&counts.all),
             (
                 3700,
-                843 + 6 + 3 + 1 + 1,
-                527 + 6 + 3 + 1 + 1,
-                194 + 6 + 3 + 1 + 1,
-                177 + 6 + 3 + 1 + 1
+                843 + 6 + 3 + 1 + 1 + 1,
+                527 + 6 + 3 + 1 + 1 + 1,
+                194 + 6 + 3 + 1 + 1 + 1,
+                177 + 6 + 3 + 1 + 1 + 1
             )
         );
         let by_backend: Vec<_> = counts
@@ -5184,10 +5186,10 @@ mod tests {
                     "kvm",
                     (
                         925,
-                        250 + 6 + 3 + 1 + 1,
-                        243 + 6 + 3 + 1 + 1,
-                        77 + 6 + 3 + 1 + 1,
-                        76 + 6 + 3 + 1 + 1
+                        250 + 6 + 3 + 1 + 1 + 1,
+                        243 + 6 + 3 + 1 + 1 + 1,
+                        77 + 6 + 3 + 1 + 1 + 1,
+                        76 + 6 + 3 + 1 + 1 + 1
                     )
                 ),
                 ("liteinst", (925, 149, 146, 99, 98)),

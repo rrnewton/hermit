@@ -13,10 +13,10 @@
   "counts": {
     "all": {
       "cells": 3700,
-      "applicable": 854,
-      "selectable": 538,
-      "selected": 205,
-      "selected_selectable": 188
+      "applicable": 855,
+      "selectable": 539,
+      "selected": 206,
+      "selected_selectable": 189
     },
     "by_backend": {
       "dbt": {
@@ -28,10 +28,10 @@
       },
       "kvm": {
         "cells": 925,
-        "applicable": 261,
-        "selectable": 254,
-        "selected": 88,
-        "selected_selectable": 87
+        "applicable": 262,
+        "selectable": 255,
+        "selected": 89,
+        "selected_selectable": 88
       },
       "liteinst": {
         "cells": 925,
@@ -275,7 +275,7 @@
     {"test_id":"c-programs/fp-reduction-nondeterminism","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/fp-reduction-nondeterminism","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/fsync-durability","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/fsync-durability","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor forwards fsync and fdatasync but returns deterministic ENOSYS for syncfs"},
+    {"test_id":"c-programs/fsync-durability","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/fsync-durability","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/fsync-durability","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/ftruncate-sparse","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
