@@ -6,6 +6,7 @@ import datetime as dt
 import errno
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -29,17 +30,41 @@ WALLCLOCK_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]+"
 )
 
-# The repeat check compares Hermit's INFO log under Hermit's own canonical
-# policy, BitwiseInfoV1 (detcore/src/logdiff.rs), and normalizes nothing else:
+# The repeat check of demos 5 and 6 compares the two runs' Hermit INFO logs
+# (hermit-info.log, compare_hermit_logs). That file holds everything the demo
+# captured from Hermit's standard output and error: Hermit's tracing records,
+# the continuation lines of a multi-line record and of the run report, and what
+# the guest controller and QEMU printed. Every one of those lines is compared,
+# and only two things are normalized, both borrowed from Hermit's own canonical
+# log comparison, BitwiseInfoV1 (detcore/src/logdiff.rs):
 #
-# 1. WALLCLOCK_RE removes the real wall-clock timestamp that starts each
-#    tracing line (STRIP_WALL_CLOCK_PREFIX_V1).
+# 1. WALLCLOCK_RE removes the real wall-clock timestamp that starts a tracing
+#    record (STRIP_WALL_CLOCK_PREFIX_V1). Whether a line starts with one is
+#    still compared.
 # 2. HOST_ADDR_RE matches the one marker Hermit puts around a host-side address
 #    it prints, `<hostaddr 0x...>` (`host_addr` in logdiff.rs). Each marked value
 #    becomes its first-appearance ordinal within its own log, exactly as
 #    `canonicalize_addresses_in_line` does (CANON_ADDRESS_ORDINAL_V1), so which
 #    marked values repeat, and in what order they first appear, still has to
 #    match.
+#
+# Before saving its log, demo 5 also replaces its private run directory and QMP
+# socket path with fixed tokens (canonicalize_qemu_runtime_paths_in_file).
+#
+# This is not BitwiseInfoV1 itself. It is stricter in three ways: it compares
+# every captured line, where BitwiseInfoV1 compares only INFO records; it
+# compares bytes, so a carriage return, a line ending or a byte that is not
+# UTF-8 counts like any other byte, where Hermit refuses a log that is not UTF-8
+# and trims each record; and it removes a timestamp only at the start of a line,
+# where Hermit starts a new record at a timestamp anywhere. It does not check,
+# as BitwiseInfoV1 does, that DETLOG records are in Hermit's current structured
+# form, a property of the log's format rather than of whether the two runs
+# agree. Like BitwiseInfoV1 (log_was_truncated and matched_with_evidence in
+# logdiff.rs), it refuses a log that ends with the truncation marker of
+# Hermit's bounded log writer, and it counts a match only when each log holds at
+# least one INFO record. The demos start Hermit without HERMIT_LOG and
+# HERMIT_LOG_FILE (hermit_log_environment), so neither can change or redirect
+# what is captured.
 #
 # Every other byte must match, including the bare `0x7f...` guest addresses that
 # DETLOG prints for syscall pointer arguments. The two logs come from separate
@@ -51,8 +76,10 @@ WALLCLOCK_RE = re.compile(
 # retained logs agree: two demo 5 boot pairs (2026-09-30 and 2026-10-01;
 # 2,332,583 lines and 817,167 bare 0x7f... values per log) and one demo 6 resume
 # pair (2026-10-01; 1,604,193 lines, 320,244 values) differed in no line once the
-# wall-clock prefix was removed. A guest address that still differs means the
-# inputs differed or the execution diverged, so the repeat fails.
+# wall-clock prefix was removed. The demo 5 and demo 6 READMEs give the counts
+# this comparison reported for a pair of each on 2026-10-03. A guest address
+# that still differs means the inputs differed or the execution diverged, so the
+# repeat fails.
 #
 # Logs also carry a file's resource id, `FileContents(DetInode(N))`. Hermit
 # derives N deterministically (determinize_inode in detcore/src/tool_global.rs),
@@ -854,9 +881,95 @@ def publish_file_atomic(src: Path, dst: Path) -> None:
     os.replace(str(temporary), str(dst))
 
 
-def _strip_wallclock_prefix(line: str) -> str:
-    """Strip only the nondeterministic tracing wallclock prefix."""
-    return WALLCLOCK_RE.sub("", line, count=1)
+def canonicalize_qemu_runtime_paths_in_file(
+    path: Path, run_dir: Path, qmp_socket: Path
+) -> None:
+    """Apply canonicalize_qemu_runtime_path to the bytes of a file, in place.
+
+    The file is read and written as bytes, so every other byte, a carriage
+    return or a byte that is not UTF-8 included, is kept exactly. The rewritten
+    file replaces the old one in one rename.
+    """
+    path = Path(path)
+    data = path.read_bytes().replace(os.fsencode(str(run_dir)), b"<run-dir>")
+    try:
+        Path(qmp_socket).relative_to(run_dir)
+    except ValueError:
+        data = data.replace(os.fsencode(str(qmp_socket)), b"<qmp-socket>")
+    temporary = path.with_name("{}.tmp.{}".format(path.name, os.getpid()))
+    try:
+        temporary.write_bytes(data)
+        os.replace(str(temporary), str(path))
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+# Hermit reads these two variables as its --log and --log-file options
+# (hermit-cli/src/bin/hermit/global_opts.rs). HERMIT_LOG is a level that Hermit
+# applies to every target RUST_LOG does not name, in place of RUST_LOG's own
+# default level (EffectiveFilter in hermit-cli/src/liteinst_bootstrap.rs), so it
+# adds or removes records. HERMIT_LOG_FILE sends Hermit's tracing to that file
+# instead of standard error, so the captured log would hold no tracing record
+# at all. Either would change what the repeat check compares, so the demos
+# clear both. HERMIT_LOG_MAX_BYTES is left alone: it bounds only a log file
+# (and the --verify and run-evidence logs), never standard error.
+HERMIT_LOG_ENVIRONMENT = ("HERMIT_LOG", "HERMIT_LOG_FILE")
+
+
+def hermit_log_environment(log_filter: str) -> Dict[str, str]:
+    """The environment for a Hermit run whose INFO log a demo compares.
+
+    The caller's environment, with RUST_LOG set to ``log_filter`` and without
+    the variables in HERMIT_LOG_ENVIRONMENT.
+    """
+    environment = dict(os.environ)
+    for name in HERMIT_LOG_ENVIRONMENT:
+        environment.pop(name, None)
+    environment["RUST_LOG"] = log_filter
+    return environment
+
+
+# The line Hermit's bounded log writer ends a log with once the log reaches
+# HERMIT_LOG_MAX_BYTES (TRUNCATION_MARKER in detcore/src/logdiff.rs).
+HERMIT_LOG_TRUNCATION_MARKER = (
+    "=== HERMIT LOG TRUNCATED: reached the configured size bound "
+    "(HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run "
+    "itself continued and was NOT affected. ==="
+)
+
+
+def hermit_log_was_truncated(path: Path) -> bool:
+    """Whether the log at ``path`` ends with Hermit's truncation marker.
+
+    The test Hermit's own comparison applies (log_was_truncated in
+    detcore/src/logdiff.rs): once trailing newlines and carriage returns are
+    set aside, the file ends with the marker, and the marker is a whole line.
+    Hermit writes the marker only into a log file it bounds, never to the
+    standard error the demos capture; a log that carries it is incomplete
+    however it got there, so the comparison refuses it, as Hermit's does.
+    """
+    marker = HERMIT_LOG_TRUNCATION_MARKER.encode()
+    with Path(path).open("rb") as source:
+        end = source.seek(0, os.SEEK_END)
+        # Set aside the trailing line breaks, a block at a time.
+        while end > 0:
+            start = max(0, end - 4096)
+            source.seek(start)
+            content = source.read(end - start).rstrip(b"\r\n")
+            if content:
+                end = start + len(content)
+                break
+            end = start
+        if end < len(marker):
+            return False
+        start = max(0, end - len(marker) - 1)
+        source.seek(start)
+        tail = source.read(end - start)
+    return tail.endswith(marker) and (len(tail) == len(marker) or tail[:1] == b"\n")
 
 
 class _HostAddressOrdinals:
@@ -886,52 +999,198 @@ class _HostAddressOrdinals:
         return HOST_ADDR_RE.sub(_ordinal, line)
 
 
-def _canonical_log_line(line: str, host_addresses: _HostAddressOrdinals) -> str:
-    """Apply the canonical policy to one log line; see HOST_ADDR_RE.
+@dataclass(frozen=True)
+class HermitLogComparison:
+    """What compare_hermit_logs found.
 
-    Only the leading wall-clock timestamp is removed and only Hermit-marked host
-    addresses are renumbered. Anything else that differs is a real divergence.
+    ``difference`` is empty when the logs matched, and otherwise describes the
+    first line that differs. ``lines`` and ``info_records`` count, for the
+    first and the second log, every line and the lines that start a Hermit INFO
+    record (a wall-clock timestamp followed by ``INFO``).
     """
-    return host_addresses.substitute(_strip_wallclock_prefix(line))
+
+    difference: str
+    lines: Tuple[int, int]
+    info_records: Tuple[int, int]
 
 
-def hermit_log_diff(log1: Path, log2: Path) -> str:
-    """Return the first log divergence under the canonical policy, or ""."""
-    before: List[Tuple[int, str, str]] = []
-    with Path(log1).open(errors="replace") as left, Path(log2).open(
-        errors="replace"
-    ) as right:
-        line_number = 0
-        left_addresses = _HostAddressOrdinals()
-        right_addresses = _HostAddressOrdinals()
-        while True:
-            left_line = left.readline()
-            right_line = right.readline()
-            if not left_line and not right_line:
-                return ""
-            line_number += 1
-            canonical_left = _canonical_log_line(left_line, left_addresses)
-            canonical_right = _canonical_log_line(right_line, right_addresses)
-            if canonical_left != canonical_right:
-                context = ["  {!r}".format(item[1]) for item in before]
-                context.extend(
-                    (
-                        "- {!r}".format(canonical_left),
-                        "+ {!r}".format(canonical_right),
-                    )
+def _split_wallclock_prefix(line: str) -> Tuple[bool, str]:
+    """Whether ``line`` starts with a wall-clock timestamp, and the rest of it."""
+    match = WALLCLOCK_RE.match(line)
+    if match is None:
+        return False, line
+    return True, line[match.end():]
+
+
+def _shown_log_line(line: Optional[Tuple[bool, str]]) -> str:
+    """A compared line as a divergence report shows it; see compare_hermit_logs."""
+    if line is None:
+        return repr("")
+    stamped, text = line
+    return repr("<wall-clock> " + text if stamped else text)
+
+
+def compare_hermit_logs(log1: Path, log2: Path) -> HermitLogComparison:
+    """Compare two captured Hermit logs line by line; see HOST_ADDR_RE.
+
+    A line ends only at a newline byte and is decoded without loss, so a
+    carriage return or a byte that is not UTF-8 is compared like any other
+    byte. Only a wall-clock timestamp at the start of a line is removed
+    (whether the line had one is still compared) and only Hermit-marked host
+    addresses are numbered. Both logs are read to the end, so the counts cover
+    every line even after a difference.
+    """
+    lines = [0, 0]
+    info_records = [0, 0]
+    addresses = (_HostAddressOrdinals(), _HostAddressOrdinals())
+    before: List[str] = []
+    difference = ""
+    with Path(log1).open("rb") as first, Path(log2).open("rb") as second:
+        for line_number, raw_lines in enumerate(
+            itertools.zip_longest(first, second), start=1
+        ):
+            compared: List[Optional[Tuple[bool, str]]] = []
+            for side, raw in enumerate(raw_lines):
+                if raw is None:
+                    compared.append(None)
+                    continue
+                lines[side] += 1
+                stamped, text = _split_wallclock_prefix(
+                    raw.decode("utf-8", "surrogateescape")
                 )
-                return (
-                    "first divergence at line {} (only the wall-clock prefix "
-                    "removed and Hermit-marked host addresses numbered):\n{}"
-                ).format(line_number, "\n".join(context))
-            before.append((line_number, canonical_left, canonical_right))
-            before = before[-3:]
+                if stamped and text.startswith("INFO "):
+                    info_records[side] += 1
+                if not difference:
+                    compared.append((stamped, addresses[side].substitute(text)))
+            if difference:
+                continue
+            if compared[0] == compared[1]:
+                before.append(_shown_log_line(compared[0]))
+                before = before[-3:]
+                continue
+            context = ["  {}".format(item) for item in before]
+            context.extend(
+                (
+                    "- {}".format(_shown_log_line(compared[0])),
+                    "+ {}".format(_shown_log_line(compared[1])),
+                )
+            )
+            difference = (
+                "first divergence at line {} (only the wall-clock prefix "
+                "removed and Hermit-marked host addresses numbered):\n{}"
+            ).format(line_number, "\n".join(context))
+    return HermitLogComparison(
+        difference=difference,
+        lines=(lines[0], lines[1]),
+        info_records=(info_records[0], info_records[1]),
+    )
+
+
+# The run artifacts compare_runs compares exactly, in report order, each with
+# the label its report line uses.
+COMPARED_METADATA_FIELDS = (
+    ("qemu_version", "QEMU version"),
+    ("qemu_binary_sha256", "QEMU binary SHA-256"),
+    ("qcow2_sha256", "qcow2 SHA-256"),
+    ("serial_sha256", "serial output SHA-256"),
+    ("guest_output_sha256", "guest output SHA-256"),
+    ("guest_exit_status", "guest command exit status"),
+)
+
+
+def metadata_field_required(
+    kind: QemuRunKind,
+    schema_version: int,
+    snapshot_saved: Optional[bool],
+    field: str,
+) -> bool:
+    """Whether parse_run_metadata requires one of COMPARED_METADATA_FIELDS.
+
+    This restates, for the compared fields only, the rules parse_run_metadata
+    enforces for a row of this kind, schema and snapshot state; a test checks
+    the two against each other.
+    """
+    if field == "qemu_version":
+        return True
+    if kind is QemuRunKind.BOOT:
+        return field in ("qemu_binary_sha256", "qcow2_sha256", "serial_sha256")
+    if kind is QemuRunKind.RESUME:
+        if field == "qemu_binary_sha256":
+            return not (schema_version == 1 and snapshot_saved is False)
+        if field == "qcow2_sha256":
+            return bool(snapshot_saved)
+        if field == "guest_output_sha256":
+            return True
+        if field == "guest_exit_status":
+            return schema_version >= 3
+    return False
+
+
+def _row_description(kind: QemuRunKind, schema_version: int, snapshot_saved: Optional[bool]) -> str:
+    if kind is QemuRunKind.RESUME:
+        return "{} rows of schema {} with snapshot_saved {}".format(
+            kind.value, schema_version, "true" if snapshot_saved else "false"
+        )
+    return "{} rows of schema {}".format(kind.value, schema_version)
+
+
+def _uncompared_field(
+    anchor: QemuRunMetadata, current: QemuRunMetadata, field: str, label: str
+) -> Tuple[bool, str]:
+    """Report one of COMPARED_METADATA_FIELDS that neither run recorded.
+
+    Such a field is never passed over in silence. When a row of either run's
+    shape must record it, or a row the current code writes would, the repeat
+    cannot vouch for it and fails. Otherwise the field does not exist for these
+    runs and the line says why it was not compared.
+    """
+    for row in (anchor, current):
+        if metadata_field_required(row.kind, row.schema_version, row.snapshot_saved, field):
+            return False, (
+                "WARN: {} was not compared: neither run recorded it, although {} "
+                "must record it".format(
+                    label,
+                    _row_description(row.kind, row.schema_version, row.snapshot_saved),
+                )
+            )
+    if metadata_field_required(
+        current.kind, RUN_METADATA_SCHEMA_VERSION, current.snapshot_saved, field
+    ):
+        return False, (
+            "WARN: {} was not compared: neither run recorded it (first run schema "
+            "{}, current run schema {}; {} record it), so this repeat cannot vouch "
+            "for it".format(
+                label,
+                anchor.schema_version,
+                current.schema_version,
+                _row_description(
+                    current.kind, RUN_METADATA_SCHEMA_VERSION, current.snapshot_saved
+                ),
+            )
+        )
+    kinds = {anchor.kind, current.kind}
+    reason = "neither run recorded it"
+    if kinds == {QemuRunKind.RESUME} and field == "qcow2_sha256":
+        reason = "neither run saved a snapshot"
+    elif kinds == {QemuRunKind.RESUME} and field == "serial_sha256":
+        reason = (
+            "qemu-resume rows do not record it; the guest command's output, taken "
+            "from the serial log, is compared instead"
+        )
+    elif kinds == {QemuRunKind.BOOT} and field in (
+        "guest_output_sha256",
+        "guest_exit_status",
+    ):
+        reason = "qemu-boot runs start no guest command"
+    return True, "NOT COMPARED: {}: {}".format(label, reason)
 
 
 def compare_runs(
     anchor: QemuRunMetadata, current: QemuRunMetadata
 ) -> Tuple[bool, List[str]]:
-    """Compare exact artifacts and the INFO logs under the canonical policy."""
+    """Compare exact artifacts, and the INFO logs byte for byte apart from the
+    two normalizations borrowed from Hermit's canonical comparison (see the
+    comment above HOST_ADDR_RE)."""
     passed = True
     report: List[str] = []
     if anchor.kind is not current.kind:
@@ -948,29 +1207,14 @@ def compare_runs(
         report.append(
             "WARN: QEMU argv differs from first run; executable path or arguments changed"
         )
-    for anchor_value, current_value, label in (
-        (anchor.qemu_version, current.qemu_version, "QEMU version"),
-        (
-            anchor.qemu_binary_sha256,
-            current.qemu_binary_sha256,
-            "QEMU binary SHA-256",
-        ),
-        (anchor.qcow2_sha256, current.qcow2_sha256, "qcow2 SHA-256"),
-        (anchor.serial_sha256, current.serial_sha256, "serial output SHA-256"),
-        (
-            anchor.guest_output_sha256,
-            current.guest_output_sha256,
-            "guest output SHA-256",
-        ),
-        (
-            anchor.guest_exit_status,
-            current.guest_exit_status,
-            "guest command exit status",
-        ),
-    ):
+    for field, label in COMPARED_METADATA_FIELDS:
+        anchor_value = getattr(anchor, field)
+        current_value = getattr(current, field)
         if anchor_value is None and current_value is None:
-            continue
-        if anchor_value == current_value:
+            uncompared_passed, line = _uncompared_field(anchor, current, field, label)
+            passed = passed and uncompared_passed
+            report.append(line)
+        elif anchor_value == current_value:
             report.append("PASS: {} matches ({})".format(label, current_value))
         else:
             passed = False
@@ -980,41 +1224,70 @@ def compare_runs(
                 )
             )
 
-    # Compare the logs under the canonical policy only (see HOST_ADDR_RE). Any
-    # remaining INFO difference, a guest address included, is execution
-    # evidence and must fail the repeat, even when the VM artifacts happen to be
-    # byte-identical. In particular, a difference that begins during Python
-    # startup can propagate into virtual clock values and the QEMU execution;
-    # its origin does not make the later guest-visible log evidence optional.
+    # Compare the logs with the two canonical normalizations only (see the
+    # comment above HOST_ADDR_RE). Any remaining difference, a guest address
+    # included, is execution evidence and must fail the repeat, even when the VM
+    # artifacts happen to be byte-identical. In particular, a difference that
+    # begins during Python startup can propagate into virtual clock values and
+    # the QEMU execution; its origin does not make the later guest-visible log
+    # evidence optional.
     anchor_log = anchor.info_log
     current_log = current.info_log
-    if (
+    logs = (("first-run", anchor_log), ("current", current_log))
+    if not (
         anchor_log
         and current_log
         and Path(anchor_log).is_file()
         and Path(current_log).is_file()
     ):
-        difference = hermit_log_diff(Path(anchor_log), Path(current_log))
-        if difference:
-            passed = False
-            report.append(
-                "WARN: Hermit INFO log differs from first run with only the "
-                "wall-clock prefix removed and Hermit-marked host addresses "
-                "numbered; canonical repeat verification failed\n{}".format(
-                    difference
-                )
-            )
-        else:
-            report.append(
-                "PASS: Hermit INFO log matches first run exactly apart from the "
-                "wall-clock prefix (Hermit-marked host addresses compared by "
-                "first appearance)"
-            )
-    else:
         passed = False
         report.append(
             "WARN: Hermit INFO logs not compared because the first-run or current "
             "log is unavailable; canonical repeat verification requires both logs"
+        )
+        return passed, report
+    truncated = [name for name, log in logs if hermit_log_was_truncated(Path(log))]
+    if truncated:
+        passed = False
+        for name in truncated:
+            report.append(
+                "WARN: Hermit INFO logs not compared because the {} log ends with "
+                "Hermit's truncation marker (HERMIT_LOG_MAX_BYTES), so part of it "
+                "was discarded; canonical repeat verification requires complete "
+                "logs".format(name)
+            )
+        return passed, report
+    comparison = compare_hermit_logs(Path(anchor_log), Path(current_log))
+    if comparison.difference:
+        passed = False
+        report.append(
+            "WARN: Hermit INFO log differs from first run with only the "
+            "wall-clock prefix removed and Hermit-marked host addresses "
+            "numbered; canonical repeat verification failed\n{}".format(
+                comparison.difference
+            )
+        )
+    for (name, _), count in zip(logs, comparison.info_records):
+        if count == 0:
+            passed = False
+            report.append(
+                "WARN: the {} Hermit INFO log holds no Hermit INFO record, so it is "
+                "no evidence that the run repeated; QEMU_LOG_FILTER must keep "
+                "Hermit's INFO records (the default does){}".format(
+                    name,
+                    "; remove the saved first run with demos/clean.sh and run again"
+                    if name == "first-run"
+                    else "",
+                )
+            )
+    if not comparison.difference and all(comparison.info_records):
+        report.append(
+            "PASS: Hermit INFO log matches first run exactly apart from the "
+            "wall-clock prefix (Hermit-marked host addresses compared by "
+            "first appearance); compared {:,} lines, {:,} of which start a "
+            "Hermit INFO record".format(
+                comparison.lines[1], comparison.info_records[1]
+            )
         )
     return passed, report
 

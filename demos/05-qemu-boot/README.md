@@ -134,7 +134,9 @@ PASS: QEMU version matches (QEMU emulator version 10.1.2 (...))
 PASS: QEMU binary SHA-256 matches (...)
 PASS: qcow2 SHA-256 matches (a5813ecc0c1f0f616da1802980a810cf4590834881dacd996eada1e87efe7624)
 PASS: serial output SHA-256 matches (bf41d127c488b7fd8df9ba85c0af2c615a7973e3cc0a1e861054e5bfd5e8805f)
-PASS: Hermit INFO log matches first run exactly apart from the wall-clock prefix (Hermit-marked host addresses compared by first appearance)
+NOT COMPARED: guest output SHA-256: qemu-boot runs start no guest command
+NOT COMPARED: guest command exit status: qemu-boot runs start no guest command
+PASS: Hermit INFO log matches first run exactly apart from the wall-clock prefix (Hermit-marked host addresses compared by first appearance); compared ... lines, ... of which start a Hermit INFO record
 PASS: all repeat checks match the first run
 
 DETERMINISTIC: snapshot SHA-256 matches the previous run:
@@ -151,10 +153,13 @@ between its first line and the start of `/init`, the tail of Hermit's log, the
 QEMU package name and binary hash (they depend on your installation), and the
 random per-run directory names. In a terminal the `Waiting for first serial
 line` counter updates in place; the line shown is its final state, and the
-wait depends on host load. The `PASS: Hermit INFO log` line is shown in the
-current comparator's wording; the capture printed an earlier comparator's
-wording. Its logs pass the current comparison too: they differed in no line
-once the wall-clock prefix was removed (see below).
+wait depends on host load. The two `NOT COMPARED:` lines and the
+`PASS: Hermit INFO log` line are shown in the current wording, with the two
+counts elided; the capture printed an earlier comparator's wording, which had
+neither. That comparator read the logs as text, and by it the capture's logs
+differed in no line once the wall-clock prefix was removed (see below). The
+current comparison reads them as bytes; its counts for a pair of boots on
+2026-10-03 follow.
 
 The numbers that are the same on every boot are the point of the demo. On
 2026-09-30 a first invocation (two boots) ran from this checkout, from a copy
@@ -164,7 +169,13 @@ In all eight boots the snapshot SHA-256, the serial SHA-256, the scheduler's
 198345 turns, the virtual times,
 the timeslice statistics, and the whole Hermit log (457,618,652 bytes,
 2,332,583 lines) were identical; the logs differed in no line once each line's
-leading wall-clock timestamp was removed. The snapshot's `DATE` column is
+leading wall-clock timestamp was removed. On 2026-10-03 a first invocation of
+the current demo (Hermit 0.4.0 gb82e83b510a6) saved two logs of 457,666,750
+bytes, holding no carriage return and no line that is not UTF-8; its repeat
+check compared 2,332,846 lines, 1,936,090 of which start a Hermit INFO record,
+and found no difference. Comparing that pair again outside the demo took 10.1
+seconds, against 6.3 seconds for the earlier comparator, with the host's load
+average near 200. The snapshot's `DATE` column is
 virtual time too (`--epoch 2026-01-01T00:00:00Z` plus the boot), printed by
 `qemu-img` in the host's time zone, so it reads differently outside US Pacific
 time. The snapshot hash also depends on the QEMU build and the kernel, and the
@@ -194,15 +205,24 @@ Archived snapshot: ignored/qemu-linux/boot-anchor/boot-snapshot.qcow2
   command line, the QEMU version and binary hash, the SHA-256 of the whole
   qcow2 file (which contains the saved memory and device state), the SHA-256 of
   the serial console transcript, and Hermit's own event log. The logs are
-  compared the way Hermit's own canonical log comparison does it: the
-  wall-clock timestamp that starts each line is removed, and host addresses
-  that Hermit marks as `<hostaddr ...>` are numbered in order of first
-  appearance. Everything else, including virtual time and every guest address,
-  must match exactly; both boots get the same environment, paths and epoch,
-  and Hermit turns off address randomization in the guest, so the same boot
-  prints the same addresses.
+  compared with the two normalizations of Hermit's own canonical log
+  comparison (`BitwiseInfoV1` in `detcore/src/logdiff.rs`) and no others: the
+  wall-clock timestamp that starts a line is removed, and host addresses that
+  Hermit marks as `<hostaddr ...>` are numbered in order of first appearance.
+  Everything else, including virtual time and every guest address, must match
+  exactly; both boots get the same environment, paths and epoch, and Hermit
+  turns off address randomization in the guest, so the same boot prints the
+  same addresses. The comparison is stricter than Hermit's: it compares every
+  captured line, not only INFO records, and it compares bytes, so a carriage
+  return or a byte that is not UTF-8 counts. Like Hermit's, it refuses a log
+  that ends with the marker Hermit writes when a log reaches
+  `HERMIT_LOG_MAX_BYTES`, and it requires at least one Hermit INFO record in
+  each log, so `QEMU_LOG_FILTER` must keep them. The demo starts Hermit without
+  `HERMIT_LOG` and `HERMIT_LOG_FILE`, which would change or move the log.
 - A difference fails the run: the headline becomes `PARTIAL`, the demo exits
-  with status 1, and `WARN:` lines name what differed. After you rebuild
+  with status 1, and `WARN:` lines name what differed, which log was refused,
+  or which required value neither run recorded. A `NOT COMPARED:` line names a
+  check that does not apply to these runs and says why. After you rebuild
   Hermit, change QEMU, change the kernel, change the guest's `/init` or
   initramfs (`demos/lib/qemu-assets.sh`), edit `demos/lib/demo_common.py`
   or `demos/lib/qemu_controller.py` (the guest runs copies of both), or run
@@ -320,4 +340,5 @@ Controls (environment variables):
 | `KERNEL_IMAGE` | (download) | Use a local copy of the pinned kernel; its SHA-256 must still match. |
 | `BUSYBOX` | `busybox` on `PATH` | A statically linked BusyBox for the initramfs. |
 | `QEMU_SNAPSHOT_NAME` | `hermit-boot` | The snapshot's name inside the qcow2 file. |
+| `QEMU_LOG_FILTER` | `warn,detcore=info,reverie_ptrace::task=info` | Hermit's log filter, passed to Hermit as `RUST_LOG`; the demo removes `HERMIT_LOG` and `HERMIT_LOG_FILE` from Hermit's environment. The repeat check needs Hermit's INFO records, so a filter that keeps none fails it. A different filter also changes the log, so a saved reference run no longer applies; run `demos/clean.sh`. |
 | `QEMU_MAX_LOG_BYTES` | 768 MiB | Stop the run if Hermit's event log grows past this size. The cap still holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output; processes Hermit left running are stopped when the cap or those 60 seconds run out. Eight healthy boots on 2026-09-30 wrote 457,618,652 bytes each (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote about 253 MB. |

@@ -20,6 +20,7 @@ from demo_common import (  # noqa: E402
     banner,
     canonicalize_qcow2_snapshot_timestamp,
     canonicalize_qemu_runtime_path,
+    canonicalize_qemu_runtime_paths_in_file,
     check_dependencies,
     check_qemu_dependencies,
     compare_runs,
@@ -30,6 +31,7 @@ from demo_common import (  # noqa: E402
     extract_info_tail,
     hash_file,
     hermit_binary,
+    hermit_log_environment,
     hermit_tmp_args,
     load_committed_anchor,
     make_temp_result_dir,
@@ -295,8 +297,7 @@ def boot_once() -> str:
             "--timeout",
             str(TIMEOUT),
         ]
-        environment = os.environ.copy()
-        environment["RUST_LOG"] = LOG_FILTER
+        environment = hermit_log_environment(LOG_FILTER)
         # The guest controller imports demo_common. Suppress CPython's bytecode
         # write: the guest compiles demo_common from source on every run and
         # leaves the staged copy exactly as stage_guest_controller wrote it.
@@ -392,11 +393,7 @@ def boot_once() -> str:
             canonicalize_qemu_runtime_path(arg, run_dir, qmp_socket)
             for arg in qemu_argv
         ]
-        info_log.write_text(
-            canonicalize_qemu_runtime_path(
-                info_log.read_text(errors="replace"), run_dir, qmp_socket
-            )
-        )
+        canonicalize_qemu_runtime_paths_in_file(info_log, run_dir, qmp_socket)
         current = save_metadata(
             run_dir,
             archived_disk,

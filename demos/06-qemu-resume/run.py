@@ -30,6 +30,7 @@ from demo_common import (  # noqa: E402
     extract_info_tail,
     hash_file,
     hermit_binary,
+    hermit_log_environment,
     hermit_tmp_args,
     LogCapExceeded,
     load_anchor,
@@ -426,8 +427,7 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
         ]
         if not saved_snapshot:
             command.append("--no-save-snapshot")
-        environment = os.environ.copy()
-        environment["RUST_LOG"] = LOG_FILTER
+        environment = hermit_log_environment(LOG_FILTER)
         # The guest controller imports demo_common. Suppress CPython's bytecode
         # write: the guest compiles demo_common from source on every run and
         # leaves the staged copy exactly as stage_guest_controller wrote it.
