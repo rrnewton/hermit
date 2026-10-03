@@ -88,7 +88,6 @@ const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 pub enum CompatMode {
     PortableStrict,
     E9patch,
-    Rr,
 }
 
 impl CompatMode {
@@ -100,7 +99,6 @@ impl CompatMode {
         match self {
             CompatMode::PortableStrict => "strict",
             CompatMode::E9patch => "e9patch",
-            CompatMode::Rr => "rr",
         }
     }
 
@@ -109,7 +107,6 @@ impl CompatMode {
         match self {
             CompatMode::PortableStrict => "legacy below-L2 stripped verify",
             CompatMode::E9patch => "e9patch legacy below-L2 stripped verify",
-            CompatMode::Rr => "rr",
         }
     }
 
@@ -148,17 +145,6 @@ impl CompatMode {
                 v.push(s("--verify"));
                 v.push(s("--"));
                 v
-            }
-            // rr rows are driven through `hermit record start --verify`, matching
-            // rr_compatibility_probe rather than the plain run path.
-            CompatMode::Rr => {
-                vec![
-                    s("record"),
-                    s("start"),
-                    s("--verify"),
-                    s("--verify-strict"),
-                    s("--"),
-                ]
             }
         }
     }
@@ -220,7 +206,7 @@ impl CompatDisposition {
 /// keeps reading the real tables.
 ///
 /// `PortableStrict` gains REPORTING ONLY. Every other mode --
-/// `E9patch`, `Rr` -- consults neither table and gains nothing: a failure there is
+/// `E9patch` -- consults neither table and gains nothing: a failure there is
 /// blocking exactly as before.
 pub fn classify_compat_outcome(
     mode: CompatMode,
@@ -707,7 +693,6 @@ pub fn compat_nodes_for(
     wall_override: Option<i64>,
 ) -> Result<Vec<Step>, String> {
     let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
-    let rr_allowed: Vec<&str> = validate_corpus::RR_PASSING_LABELS.to_vec();
     let super_only = validate_corpus::portable_super_only();
     let mut out = Vec::new();
     for row in rows {
@@ -715,11 +700,6 @@ pub fn compat_nodes_for(
             if !keep.contains(&row.label) {
                 continue;
             }
-        }
-        // rr measures ONLY the labels proven to pass record/replay; the bash
-        // applies the same filter inside rr_compatibility_probe.
-        if mode == CompatMode::Rr && !rr_allowed.contains(&row.label.as_str()) {
-            continue;
         }
         // Heavy runtime workloads are deferred out of the portable profile to the
         // scheduled super suite (validate.sh:3090) — unless this IS that suite,
