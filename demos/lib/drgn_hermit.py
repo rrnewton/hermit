@@ -19,9 +19,10 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
-from typing import Iterator, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 from demo_common import hermit_tmp_args, make_socket_path
 from qemu_controller import KERNEL_COMMAND_LINE
@@ -37,6 +38,11 @@ COMMAND_IMAGE_BYTES = 4096
 # cut off at byte 512.
 GUEST_COMMAND_READ_BYTES = 512
 MAX_GUEST_COMMAND_BYTES = GUEST_COMMAND_READ_BYTES - 1
+# A failed pass prints at most this much of the end of its Hermit log: the
+# error that ends the pass names only the step that failed, and Hermit's or
+# QEMU's own reason is in the log.
+FAILED_LOG_TAIL_LINES = 40
+FAILED_LOG_TAIL_BYTES = 64 << 10
 
 
 def _write_command_image(path: Path, command: str) -> None:
@@ -424,6 +430,25 @@ def _register_init_task_object(program, address: int, drgn) -> None:
     )
 
 
+def _log_tail(path: Path, lines: int, max_bytes: int) -> Optional[List[str]]:
+    """Return the last ``lines`` lines among the last ``max_bytes`` bytes of ``path``.
+
+    Returns None when the file does not exist. A line cut by the byte limit is
+    left out.
+    """
+    try:
+        with path.open("rb") as log:
+            size = log.seek(0, os.SEEK_END)
+            log.seek(max(0, size - max_bytes))
+            data = log.read()
+    except FileNotFoundError:
+        return None
+    text = data.decode("utf-8", errors="replace").splitlines()
+    if size > max_bytes:
+        text = text[1:]
+    return text[-lines:] if lines > 0 else []
+
+
 def _proc_status_value(pid: int, key: str) -> str:
     with open("/proc/{}/status".format(pid)) as status:
         for line in status:
@@ -626,8 +651,9 @@ class HermitGuestProgram:
         # in the run directory fits only from a checkout path of at most 57
         # bytes (from a 60-byte one it is 110 bytes). make_socket_path keeps it
         # where it fits and otherwise moves it to a short directory outside
-        # host /tmp (Hermit gives QEMU a private /tmp); close() removes a moved
-        # socket.
+        # host /tmp; close() removes a moved socket. A run directory under host
+        # /tmp keeps its socket there: hermit_tmp_args, below, then gives QEMU
+        # the host's /tmp.
         qmp_socket = make_socket_path(self.run_dir / "qmp.sock", "drgn")
         self.qmp_socket = qmp_socket
         # Bidirectional serial over a `-serial pipe:` FIFO pair, not a unix
@@ -674,10 +700,34 @@ class HermitGuestProgram:
         ]
         if self.config.qemu_bios is not None:
             qemu_command[1:1] = ["-L", str(self.config.qemu_bios)]
+        # Hermit gives QEMU a private /tmp unless it is passed --tmp=/tmp, so a
+        # path under host /tmp is invisible to QEMU. Decide from every host
+        # path QEMU opens: the run directory (QMP socket, serial FIFOs and both
+        # disks), its own binary, firmware and libraries, the kernel and
+        # initramfs, and the checkout it runs in. Deciding from the checkout
+        # alone made a DEMO07_ARTIFACTS under host /tmp fail at the QMP socket.
+        # The library path is prepended to LD_LIBRARY_PATH, so it may be a list.
+        library_dirs = []  # type: List[Path]
+        if self.config.qemu_library_path is not None:
+            library_dirs = [
+                Path(part)
+                for part in str(self.config.qemu_library_path).split(os.pathsep)
+                if part
+            ]
+        tmp_args = hermit_tmp_args(
+            self.config.root,
+            self.run_dir,
+            qmp_socket,
+            self.config.qemu,
+            self.config.qemu_bios,
+            self.config.kernel,
+            self.config.initrd,
+            *library_dirs,
+        )
         command = [
             str(self.config.hermit),
             "run",
-            *hermit_tmp_args(self.config.root),
+            *tmp_args,
             "--strict",
             "--no-rcb-time",
             "--target-timeslice", "100000",
@@ -885,7 +935,12 @@ class HermitGuestProgram:
         _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
         self._frozen = True
 
-    def close(self) -> None:
+    def close(self, failed: bool = False) -> None:
+        """Stop Hermit and QEMU; after a failed pass, also report and tidy it.
+
+        ``failed`` says that the pass did not finish: its Hermit log's end is
+        printed, and its snapshot copy is removed (demo 5's is 94 MB).
+        """
         if self._memory is not None:
             os.close(self._memory)
             self._memory = None
@@ -928,13 +983,46 @@ class HermitGuestProgram:
             and self.qmp_socket.parent != self.run_dir
         ):
             self.qmp_socket.unlink(missing_ok=True)
+        if failed:
+            self._report_failed_pass()
+
+    def _report_failed_pass(self) -> None:
+        """Print the end of a failed pass's Hermit log and remove its snapshot copy."""
+        if self.run_dir is None:
+            return
+        hermit_log = self.run_dir / "hermit.log"
+        tail = _log_tail(hermit_log, FAILED_LOG_TAIL_LINES, FAILED_LOG_TAIL_BYTES)
+        if tail is None:
+            print("The failed pass has no Hermit log at {}.".format(hermit_log), file=sys.stderr)
+        elif not tail:
+            print("The failed pass's Hermit log {} is empty.".format(hermit_log), file=sys.stderr)
+        else:
+            print("End of the failed pass's Hermit log, {}:".format(hermit_log), file=sys.stderr)
+            for line in tail:
+                print("  " + line, file=sys.stderr)
+        snapshot = self.run_dir / "snapshot.qcow2"
+        try:
+            size = snapshot.stat().st_size
+            snapshot.unlink()
+        except FileNotFoundError:
+            return
+        print(
+            "Removed the failed pass's {}-byte snapshot copy {}".format(size, snapshot),
+            file=sys.stderr,
+        )
 
 
 @contextmanager
 def program_from_hermit(config: GuestConfig) -> Iterator[HermitGuestProgram]:
-    """Yield a restored snapshot guest, initially frozen for observation."""
+    """Yield a restored snapshot guest, initially frozen for observation.
+
+    A pass that fails, in start() or in the caller's block, prints the end of
+    its Hermit log and loses its snapshot copy; a pass that finishes keeps both.
+    """
     guest = HermitGuestProgram(config)
+    failed = True
     try:
         yield guest.start()
+        failed = False
     finally:
-        guest.close()
+        guest.close(failed=failed)

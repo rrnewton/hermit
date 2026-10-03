@@ -179,6 +179,7 @@ Controls (environment variables):
 | `DEMO07_SNAPSHOT_NAME` | `hermit-boot` | The snapshot's name inside the qcow2 file. |
 | `DEMO07_VMLINUX` | extracted from `bzImage` | A kernel ELF image with type information matching the guest kernel. |
 | `DEMO07_QEMU_BIOS`, `DEMO07_QEMU_LIBRARY_PATH` | unset | Firmware directory and library path for a QEMU installed in a non-standard location. |
+| `DEMO07_ARTIFACTS` | `target/demos/07-drgn-kernel` | Directory that holds one run directory per pass. It may be under the host's `/tmp`; Hermit then gives QEMU the host's `/tmp` (`hermit run --tmp=/tmp`) instead of a private one, so that QEMU can open the run directory. |
 | `QEMU_BIN`, `QEMU_ASSETS` | as in demo 5 | The QEMU binary and asset directory. |
 
 Each pass keeps its working copy of the snapshot, serial transcript, and Hermit
@@ -186,3 +187,8 @@ log under `target/demos/07-drgn-kernel/`, or under `DEMO07_ARTIFACTS` when that
 is set. `demos/clean.sh` removes the default directory. It does not remove a
 `DEMO07_ARTIFACTS` directory, which can be any path; it prints that directory's
 name instead, so that you can delete it yourself.
+
+If a pass fails, the demo prints the last 40 lines of that pass's Hermit log,
+which holds Hermit's and QEMU's own error messages, and removes the pass's
+snapshot copy (94 MB for demo 5's snapshot). The log and the rest of the run
+directory stay.

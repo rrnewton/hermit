@@ -443,9 +443,17 @@ def default_qemu_assets(root: Path) -> Path:
     )
 
 
-def hermit_tmp_args(root: Path) -> List[str]:
-    """Keep checkout-local QEMU controller/runtime paths visible to a traced guest."""
-    return ["--tmp=/tmp"] if _under_host_tmp(root) else []
+def hermit_tmp_args(root: Path, *paths: Optional[Path]) -> List[str]:
+    """Return ``--tmp=/tmp`` when a host path the traced guest opens is under host /tmp.
+
+    Without ``--tmp``, Hermit mounts a private tmpfs over the guest's /tmp, which
+    hides everything under the host's /tmp. ``root`` is the checkout, whose QEMU
+    controller and runtime paths a guest may open; ``paths`` are any other host
+    paths it opens, such as a run directory or a kernel. ``None`` entries are
+    skipped.
+    """
+    candidates = [root, *(path for path in paths if path is not None)]
+    return ["--tmp=/tmp"] if any(_under_host_tmp(path) for path in candidates) else []
 
 
 # The files the guest's QEMU controller runs: the script and the one module it
