@@ -106,16 +106,46 @@ pinned-root)
         emit_fatal "cannot create the pinned-root scratch tree"
     cp -a --reflink=auto "$B" "$R/bundle" ||
         emit_fatal "cannot place the bundle in the pinned-root scratch tree"
+    # DynamoRIO's private loader loads the DBT client's own libc, libm and libgcc_s. It
+    # searches the client's RPATH and directory, LD_LIBRARY_PATH and /lib, /lib64,
+    # /usr/lib64..., not the paths the image's nix loader knows, so in the container it
+    # finds only ld.so and the guest dies before the client connects ("DBT evidence
+    # received no image START"). The cargo flow builds the client in the container and
+    # does not hit this. So, in the private copy only, the client's directory gets a link
+    # to every library the image's own loader resolves for the client outside it,
+    # interpreter included: libc and ld.so come from one glibc, and a library the bundle
+    # ships is never replaced. The staged bundle and RE cells are unchanged.
+    link_dbt_runtime='set -eu
+r=$1
+shift
+link() { [ -e "$r/$2" ] || [ -L "$r/$2" ] || ln -s "$1" "$r/$2"; }
+deps=$(ldd "$r/libreverie_dbt_client.so" "$r/libdetcore_dbt.so")
+printf "%s\n" "$deps" | while read -r name arrow path rest; do
+    case "$arrow $path" in
+    "=> not"*) echo "cell.sh: the pinned-root image has no $name, which the DBT client needs" >&2; exit 125 ;;
+    "=> $r/"*) ;;
+    "=> /"*) link "$path" "$name" ;;
+    "("*) case $name in /*) link "$name" "${name##*/}" ;; esac ;;
+    esac
+done
+exec "$@"'
     # Outputs go through the wrapper's /results mount (E2E_RESULT_ROOT).
     out=$W/results/buck-cell-out
     o=/results/buck-cell-out
+    # Tpx kills the cell at deadline + 30 s. The wrapper gets what is left of the deadline
+    # after the copy above, and the harness that less 15 s for starting and removing the
+    # container, so a hung container is stopped here, with its artifacts, before Tpx.
+    outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
+    ((outer > 25)) || outer=25
+    deadline=$((outer - 15))
     env HERMIT_E2E_EMPTY_WORKDIR=/test VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
-        timeout --kill-after=10 $((deadline + 60)) \
+        timeout --kill-after=10 "$outer" \
         "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS -- \
+        sh -c "$link_dbt_runtime" link-dbt-runtime /src/bundle/hermit/install/rsrcs \
         env E2E_BUILD_ROOT=/src/bundle/build \
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install \
         timeout --kill-after=10 "$deadline" \
