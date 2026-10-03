@@ -172,6 +172,38 @@ const KVM_SOCKET_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
     ("kvm", "verify", "not-applicable", -3),
 ];
 
+/// Fold 3 of <https://github.com/rrnewton/hermit/issues/3448> moved the SaBRe
+/// compatibility corpus from 212 generated validation nodes into the same
+/// manifest, as SaBRe verify cells that only the sabre-compat-only run type
+/// selects. 185 of its programs were already rows, so each of their SaBRe
+/// verify rows went from not applicable to red (enabled, not selected by the
+/// full validation). The other 27 became new rows whose ptrace and SaBRe verify
+/// cells are both red for the same reason, with their other 14 rows not
+/// applicable. Three more new rows, lua-direct, perl-direct and df-direct,
+/// keep the SaBRe corpus's single-image argv for programs whose existing rows
+/// run under a bash wrapper. The plan of the full validation is unchanged.
+const SABRE_FOLD_EXISTING_ROWS: usize = 185;
+const SABRE_FOLD_NEW_ROWS: usize = 27 + 3;
+
+fn sabre_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let existing = SABRE_FOLD_EXISTING_ROWS as isize;
+    let new = SABRE_FOLD_NEW_ROWS as isize;
+    let mut deltas = vec![
+        ("sabre", "verify", "not-applicable", -existing),
+        ("sabre", "verify", "red", existing + new),
+        ("ptrace", "verify", "red", new),
+        ("native", "naked", "not-applicable", new),
+    ];
+    for backend in ["dbt", "kvm", "liteinst"] {
+        deltas.push((backend, "verify", "not-applicable", new));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", new));
+        deltas.push((backend, "replay", "not-applicable", new));
+    }
+    deltas
+}
+
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
 /// changes which lane runs it, so the total and the per-(backend, mode) counts
@@ -602,7 +634,10 @@ fn the_committed_plan_keeps_its_cell_counts() {
 fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
-    assert_eq!(rows.len(), 5776 + 208 + 16 * COMPAT_FOLD_TESTS);
+    assert_eq!(
+        rows.len(),
+        5776 + 208 + 16 * COMPAT_FOLD_TESTS + 16 * SABRE_FOLD_NEW_ROWS
+    );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
         assert_ne!(field(row, "category"), RETIRED_BUCKET, "{row}");
@@ -628,13 +663,14 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(SELECT_REPLAY_CELL_DELTAS.iter().copied())
         .chain(KVM_2026_10_03_CELL_DELTAS.iter().copied())
         .chain(KVM_SOCKET_CELL_DELTAS.iter().copied())
+        .chain(sabre_fold_cell_deltas())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
             .or_default();
         *count = count
             .checked_add_signed(delta)
-            .unwrap_or_else(|| panic!("S13 delta {delta} underflows {backend}/{mode}/{status}"));
+            .unwrap_or_else(|| panic!("delta {delta} underflows {backend}/{mode}/{status}"));
     }
     expected.retain(|_, count| *count != 0);
     assert_eq!(counts, expected);

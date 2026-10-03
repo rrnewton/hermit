@@ -20,6 +20,8 @@
 //! The extraction is corroborated by the counts the bash itself declares:
 //! `strict` dumped **191** rows against `STRICT_COMPAT_TOTAL=191`, and `sabre`
 //! dumped **212** against `SABRE_COMPAT_TOTAL=212` — exact, independent matches.
+//! (The SaBRe rows have since moved into tests/e2e/manifests/compat.yaml as the
+//! sabre-compat-only run type's cells, and `corpus-sabre.json` is gone.)
 //! `rr` dumps 174 admitted rows which the driver then filters to the 139
 //! `RR_COMPAT_PASSING_LABELS` (the bash filters at the same point, inside
 //! `rr_compatibility_probe`), and `e9patch` dumps 172 admitted rows.
@@ -126,12 +128,6 @@ pub const STRICT_COMPAT_TOTAL: usize = 193;
 /// `RR_COMPAT_EXPECTED` (validate.sh:1117). The exact set measured to pass
 /// record/replay. Raising this without a fresh sweep produces a phantom ratchet.
 pub const RR_COMPAT_EXPECTED: usize = 139;
-
-/// `SABRE_COMPAT_EXPECTED` (validate.sh:1121) — the blocking floor.
-pub const SABRE_COMPAT_EXPECTED: usize = 207;
-
-/// `SABRE_COMPAT_TOTAL` (validate.sh:1124) — the measured corpus size.
-pub const SABRE_COMPAT_TOTAL: usize = 212;
 
 /// `E9PATCH_COMPAT_TOTAL` (validate.sh:1125).
 pub const E9PATCH_COMPAT_TOTAL: usize = 155;

@@ -383,7 +383,7 @@ struct Profile {
 // 67/67 before. full, portable and hosted-portable then each lost one step
 // when check.backend_parity_suites and its _on_host twin were retired with
 // tests/backend-parity (also slice S13): 87/88, 74/75 and 68/68 before.
-const PROFILES: [Profile; 8] = [
+const PROFILES: [Profile; 9] = [
     Profile {
         label: "full",
         direct_steps: 86,
@@ -425,6 +425,13 @@ const PROFILES: [Profile; 8] = [
         label: "portable-strict-compat-only",
         direct_steps: 3,
         selected_steps: 10,
+    },
+    // The SaBRe run type: its fixtures and bucket, plus the validation's one
+    // Hermit build (the pinned-root producers and the host link) they need.
+    Profile {
+        label: "sabre-compat-only",
+        direct_steps: 2,
+        selected_steps: 13,
     },
 ];
 
@@ -559,11 +566,83 @@ fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
     dag_from_json(&text).map_err(|error| format!("invalid generated {}: {error}", path.display()))
 }
 
-fn expected_cells(root: &Path) -> Result<Vec<DagManifest>, String> {
+/// The required cells each run type's manifest bucket nodes own: the default
+/// run type's from ci/expected-e2e-plan.json (dereferencing to them), and
+/// each run type a node selects by label from the manifests themselves.
+struct Populations {
+    full: Vec<DagManifest>,
+    labelled: BTreeMap<&'static str, Vec<DagManifest>>,
+}
+
+impl std::ops::Deref for Populations {
+    type Target = Vec<DagManifest>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.full
+    }
+}
+
+impl Populations {
+    /// The required cells of the run type `label` selects: its labelled
+    /// cells when a node selects it by label, else the default run type's
+    /// subset for that profile.
+    fn for_label(&self, label: &str) -> Vec<&DagManifest> {
+        match self.labelled.get(label) {
+            Some(cells) => cells.iter().collect(),
+            None => expected_for_label(label, &self.full),
+        }
+    }
+
+    /// The cells a manifest bucket node owns.
+    fn owned_by(&self, step: &Step) -> Vec<&DagManifest> {
+        let Some(selector) = &step.manifest else {
+            return Vec::new();
+        };
+        let cells = match crate::validation_dag_static::manifest_run_type(&step.tag()) {
+            Some(label) => self.labelled.get(label).map_or(&[][..], Vec::as_slice),
+            None => &self.full[..],
+        };
+        cells
+            .iter()
+            .filter(|cell| cell.lane == selector.lane && cell.category == selector.category)
+            .collect()
+    }
+
+    fn all(&self) -> impl Iterator<Item = &DagManifest> {
+        self.full.iter().chain(self.labelled.values().flatten())
+    }
+}
+
+fn expected_cells(root: &Path) -> Result<Populations, String> {
     let path = root.join(EXPECTED_PLAN);
     let text = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    expected_cells_from_json(&text).map_err(|error| format!("invalid {}: {error}", path.display()))
+    let full = expected_cells_from_json(&text)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let manifests = crate::runner::ManifestSet::load(root)?;
+    let mut labelled = BTreeMap::new();
+    for label in crate::validation_dag_static::manifest_run_types() {
+        let cells = manifests
+            .select(&crate::runner::Selection {
+                population: Some(crate::runner::Population::Required),
+                labels: vec![label.to_string()],
+                ..Default::default()
+            })?
+            .into_iter()
+            .map(|cell| DagManifest {
+                lane: cell.test.lane.clone(),
+                category: cell.category.clone(),
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: cell.id.backend.clone(),
+            })
+            .collect::<Vec<_>>();
+        if cells.is_empty() {
+            return Err(format!("run type {label} requires no manifest cell"));
+        }
+        labelled.insert(label, cells);
+    }
+    Ok(Populations { full, labelled })
 }
 
 /// Decode the same source-owned expected population for generation and retained
@@ -712,7 +791,17 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 /// Manifest bucket nodes that run on the validation host rather than in the
 /// pinned root: the compatibility corpus exercises programs installed on the
 /// host, 31 of which the pinned image does not carry.
-pub const HOST_MANIFEST_RUNS: &[&str] = &["e2e.manifest_compat", "portablecompat.manifest_compat"];
+pub const HOST_MANIFEST_RUNS: &[&str] = &[
+    "e2e.manifest_compat",
+    "portablecompat.manifest_compat",
+    "sabrecompat.manifest_compat",
+];
+
+/// The run type a manifest bucket node selects with `test-harness run
+/// --label`, from the node's static source; `None` for the default run type.
+pub fn manifest_run_type(tag: &str) -> Option<&'static str> {
+    crate::validation_dag_static::manifest_run_type(tag)
+}
 
 /// The release Hermit compatprep.hermit_release_in_pinned_root builds, as the
 /// host sees it: the pinned root's /src/target is ignored/hermetic/split/target.
@@ -1511,7 +1600,10 @@ fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
             return Some(GeneratedPartition::PortableFocusedCompat);
         }
         "strictcompat" | "strictcompatprep" => return Some(GeneratedPartition::StrictCompat),
-        "sabrecompat" | "sabrecompatprep" => return Some(GeneratedPartition::SabreCompat),
+        // The SaBRe lane's rows are the compat.yaml cells labelled
+        // sabre-compat-only, run by the static node
+        // sabrecompat.manifest_compat; only its fixtures are generated.
+        "sabrecompatprep" => return Some(GeneratedPartition::SabreCompat),
         "e9patchcompat" | "e9patchcompatprep" => {
             return Some(GeneratedPartition::E9patchCompat);
         }
@@ -1564,7 +1656,9 @@ fn refresh_generated_partitions(
         // static node portablecompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::PortableFocusedCompat, 1usize),
         (GeneratedPartition::StrictCompat, 194usize),
-        (GeneratedPartition::SabreCompat, 213usize),
+        // 1 since the SaBRe lane's 212 probes became compat.yaml cells run by
+        // the static node sabrecompat.manifest_compat: only its fixtures remain.
+        (GeneratedPartition::SabreCompat, 1usize),
         // 175 since the one-build change of 2026-09-30 added
         // e9patchcompatprep.release_resources, which stages the release
         // resources the retired host build.runtime_release used to provide.
@@ -1628,7 +1722,7 @@ fn refresh_generated_partitions(
     Ok(committed)
 }
 
-fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
+fn attach_result_ownership(cfg: &mut DagConfig, cells: &Populations) {
     for step in &mut cfg.steps {
         let structured = step
             .result_manifests
@@ -1638,16 +1732,12 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
             .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
             .collect::<Vec<_>>();
         let hosted_portable = step.labels == [HOSTED_PORTABLE_LABEL];
-        let mut owned = if let Some(selector) = &step.manifest {
-            cells
-                .iter()
-                .filter(|cell| cell.lane == selector.lane && cell.category == selector.category)
-                .filter(|cell| !(hosted_portable && hosted_portable_excludes(cell)))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let mut owned = cells
+            .owned_by(step)
+            .into_iter()
+            .filter(|cell| !(hosted_portable && hosted_portable_excludes(cell)))
+            .cloned()
+            .collect::<Vec<_>>();
         if step.tag() == "quick.e2e_verify" {
             owned.extend(cells.iter().filter(|cell| quick_verify_cell(cell)).cloned());
         }
@@ -1672,12 +1762,13 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    // 110 since portablecompat.manifest_compat, the focused lane's corpus
+    // 111 since sabrecompat.manifest_compat, the SaBRe lane's bucket, joined
+    // them; 110 since portablecompat.manifest_compat, the focused lane's corpus
     // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
     // joined the test-harness producers (2026-10-01).
-    if expected.len() != 110 {
+    if expected.len() != 111 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 110",
+            "structured result producer registry has {} entries, expected 111",
             expected.len()
         ));
     }
@@ -1813,8 +1904,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
     // TestHarness 34 -> 36 with the compat bucket and its hosted twin, and
-    // 37 with the focused lane's portablecompat.manifest_compat.
-    if actual_group_counts != [69, 37, 2, 2] {
+    // 37 with the focused lane's portablecompat.manifest_compat, and 38 with
+    // the SaBRe lane's sabrecompat.manifest_compat.
+    if actual_group_counts != [69, 38, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2066,6 +2158,23 @@ pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs", "compat"];
 /// with diagnostic cells exists.
 pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &["compat"];
 
+/// The harness selection a manifest bucket node `tag` passes after
+/// `test-harness run`: its lane, its category, the `--label` of the run type
+/// it selects ([`manifest_run_type`]) and the category's
+/// [`manifest_selector_flags`]. The generator and validate.rs's raw-census
+/// check both read it.
+pub fn manifest_bucket_selection(tag: &str, manifest: &DagManifest) -> String {
+    let label = manifest_run_type(tag)
+        .map(|label| format!(" --label {label}"))
+        .unwrap_or_default();
+    format!(
+        "--lane {} --category {}{label} {}",
+        manifest.lane,
+        manifest.category,
+        manifest_selector_flags(&manifest.category)
+    )
+}
+
 pub fn manifest_selector_flags(category: &str) -> &'static str {
     match (
         FAIL_CLOSED_MANIFEST_BUCKETS.contains(&category),
@@ -2090,10 +2199,8 @@ fn assert_fail_closed_manifest_selectors(cfg: &DagConfig) -> Result<(), String> 
             continue;
         }
         let selector = format!(
-            "target/debug/test-harness run --lane {} --category {} {}",
-            manifest.lane,
-            manifest.category,
-            manifest_selector_flags(&manifest.category)
+            "target/debug/test-harness run {}",
+            manifest_bucket_selection(&step.tag(), manifest)
         );
         if step.cmd.contains("--allow-empty") || step.cmd.matches(selector.as_str()).count() != 1 {
             return Err(format!(
@@ -2274,7 +2381,7 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
         .ok_or_else(|| "selected graph is empty".to_string())
 }
 
-fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
+fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String> {
     // Backend parity is a scored comparison, not a gate
     // (https://github.com/rrnewton/hermit/issues/3301). No newly constructed
     // plan asks the harness for a ptrace reference run. Plans retained before
@@ -2322,9 +2429,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // left tests/backend-parity (also slice S13); -2 when
     // check.backend_parity_suites and its _on_host twin were retired with
     // tests/backend-parity (also slice S13).
-    if cfg.steps.len() != 1051 {
+    // 840 since the 212 sabrecompat.<program> probes became the one bucket
+    // sabrecompat.manifest_compat (1051 - 212 + 1).
+    if cfg.steps.len() != 840 {
         return Err(format!(
-            "superset has {} steps, expected 1051",
+            "superset has {} steps, expected 840",
             cfg.steps.len()
         ));
     }
@@ -2468,9 +2577,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         }
     }
     let focused_release = step("compatprep.hermit_release")?;
+    // sabre-compat-only left it on 2026-10-01: that run type's bucket runs the
+    // validation's one build, the e2e artifact.
     let expected_focused_labels = [
         "strict-compat-only",
-        "sabre-compat-only",
         "e9patch-compat-only",
         "rr-compat-only",
     ];
@@ -2534,10 +2644,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         "rrcompatprep",
     ] {
         let prep = step(&format!("{group}.fixtures"))?;
-        let producer = if group == "portablecompatprep" {
-            "compatprep.hermit_release_in_pinned_root"
-        } else {
-            "compatprep.hermit_release"
+        // The SaBRe run type takes the validation's one build, linked on the
+        // host by build.host_hermit_link, instead of a dedicated release build.
+        let producer = match group {
+            "portablecompatprep" => "compatprep.hermit_release_in_pinned_root",
+            "sabrecompatprep" => HOST_HERMIT_LINK_TAG,
+            _ => "compatprep.hermit_release",
         };
         if !prep.deps.iter().any(|dependency| dependency == producer)
             || prep
@@ -2663,6 +2775,30 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             missing_rust_script_dep.join(", ")
         ));
     }
+    // A bucket node that selects a run type by label carries exactly that
+    // run type's DAG label and passes exactly that `--label`; every other
+    // bucket node selects the default run type and passes none.
+    for step in cfg.steps.iter().filter(|step| step.manifest.is_some()) {
+        let tag = step.tag();
+        match crate::validation_dag_static::manifest_run_type(&tag) {
+            Some(label) => {
+                let manifest = step.manifest.as_ref().expect("filtered on manifest");
+                let flag = format!(" --category {} --label {label} ", manifest.category);
+                if step.labels != [label] || !step.cmd.contains(&flag) {
+                    return Err(format!(
+                        "{tag} selects run type {label}: it must carry only that DAG label and pass `{}`",
+                        flag.trim()
+                    ));
+                }
+            }
+            None if step.cmd.contains(" --label ") => {
+                return Err(format!(
+                    "{tag} passes --label without declaring the run type it selects"
+                ));
+            }
+            None => {}
+        }
+    }
     for profile in PROFILES {
         let direct = cfg
             .steps
@@ -2685,7 +2821,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 profile.selected_steps
             ));
         }
-        let expected_results = expected_for_label(profile.label, cells);
+        let expected_results = cells.for_label(profile.label);
         for result in &expected_results {
             result_manifest_owner(&selected.steps, result)
                 .map_err(|error| format!("{} result ownership failed: {error}", profile.label))?;
@@ -2917,7 +3053,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             ));
         }
     }
-    let known_results = cells.iter().map(result_identity).collect::<BTreeSet<_>>();
+    let known_results = cells.all().map(result_identity).collect::<BTreeSet<_>>();
     for step in &cfg.steps {
         if step.result_manifests.is_none() {
             return Err(format!("{} omits explicit result ownership", step.tag()));
@@ -3638,6 +3774,52 @@ sys.exit(37)
                 .description,
             "intentional static edit"
         );
+    }
+
+    #[test]
+    fn steps_sharing_a_result_file_never_run_in_one_run_type() {
+        // e2e.manifest_compat, portablecompat.manifest_compat,
+        // sabrecompat.manifest_compat and e2e.manifest_compat_on_host all write
+        // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
+        // only while no run type selects two of them: a run selects one label,
+        // so their label sets must be non-empty and pairwise disjoint.
+        let root = crate::git_environment::checkout_root();
+        let dag = generate(&root).unwrap();
+        let mut writers: BTreeMap<String, Vec<&Step>> = BTreeMap::new();
+        for step in &dag.steps {
+            for flag in ["--results", "--junit"] {
+                if let Some((_, rest)) = step.cmd.split_once(&format!("{flag} \"")) {
+                    let path = rest.split('"').next().unwrap().to_string();
+                    writers.entry(path).or_default().push(step);
+                }
+            }
+        }
+        let shared = writers
+            .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
+            .map_or(0, Vec::len);
+        assert_eq!(
+            shared, 4,
+            "the four manifest_compat buckets share one result file"
+        );
+        for (path, steps) in &writers {
+            for (index, first) in steps.iter().enumerate() {
+                for second in &steps[index + 1..] {
+                    assert!(
+                        !first.labels.is_empty()
+                            && !second.labels.is_empty()
+                            && !first
+                                .labels
+                                .iter()
+                                .any(|label| second.labels.contains(label)),
+                        "{} and {} both write {path} and can run in one run type ({:?} vs {:?})",
+                        first.tag(),
+                        second.tag(),
+                        first.labels,
+                        second.labels
+                    );
+                }
+            }
+        }
     }
 
     #[test]

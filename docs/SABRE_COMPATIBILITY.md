@@ -112,11 +112,30 @@ ptrace and SaBRe guest output was independently byte-identical (SHA-256
 `8504ad2cf53c948ffdd59e277fe87ecf21f65ffa4fb543989366ec9cb40272fd`).
 
 This isolated cell does not change the separate 212-program compatibility
-corpus measurement. Its latest retained `Stripped` run remains 207/212
-(97.64%) at Hermit `c4b7b1a6dc4c1bfe1f03b68ec5d2efa991d9256b`; `gcc`, `g++`, and
-`cpp` timed out, `java` had a substantive DETLOG mismatch, and `timeout` failed
-its first run. The five gaps and the `Stripped` comparator preclude B3, B4, L2,
-or any canonical parity claim.
+corpus measurement. That corpus's last retained run under the legacy per-program
+nodes was 207/212 `Stripped` (97.64%) at Hermit
+`c4b7b1a6dc4c1bfe1f03b68ec5d2efa991d9256b`, but those nodes checked only
+Hermit's exit status, not whether the guest ran on SaBRe's measured path. Since
+2026-10-01 the corpus is the SaBRe cells of `tests/e2e/manifests/compat.yaml`
+(run type `sabre-compat-only`, `scripts/validate.rs --sabre-compat-only`), which
+also enforce the execution-path contract above. Measured that day (release
+Hermit at `03bbb83581fad247251df6363f50e61e24c2957e`, `Stripped`), 62 of the
+212 SaBRe cells pass. 142 fail the execution-path contract because the guest
+starts a second program image
+(https://github.com/rrnewton/hermit/issues/3486), and eight fail for other
+recorded reasons (https://github.com/rrnewton/hermit/issues/3489,
+https://github.com/rrnewton/hermit/issues/3490,
+https://github.com/rrnewton/hermit/issues/3491,
+https://github.com/rrnewton/hermit/issues/3492 and
+https://github.com/rrnewton/hermit/issues/3494; rustc's cell, re-measured on
+2026-10-02 once its workload called the fixture's toolchain link, is one of
+the three under https://github.com/rrnewton/hermit/issues/3489). The 150 red cells stay
+enabled with `ci: false`, so the run type requires the 62. Three more SaBRe
+cells, `compat/lua-direct`, `compat/perl-direct` and `compat/df-direct`, keep
+the old corpus's single-image argv for the programs whose `compat.yaml` rows
+run under a bash wrapper; they passed 3/3, so the run type requires 65 of 215
+SaBRe cells. The `Stripped` comparator precludes B3, B4, L2, or any canonical
+parity claim.
 
 The initial post-0.2 ptrace verification plan had 194 cells. Before that
 ratchet, SaBRe was enabled for 22 (11.3%). This ratchet evaluates 157

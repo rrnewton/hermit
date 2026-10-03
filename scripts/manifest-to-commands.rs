@@ -32,6 +32,12 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+// The corpus module names its result classes through the shared CI-selection
+// types; this adapter needs only that enum.
+#[allow(dead_code)]
+#[path = "../ci/manifest-plan/src/ci_selection.rs"]
+mod ci_selection;
+
 // A `corpus:` bucket (compat.yaml) is expanded into the ordinary tests the
 // harness runs, and its argv placeholders rendered for a shell; this adapter
 // uses only that part of the shared module.

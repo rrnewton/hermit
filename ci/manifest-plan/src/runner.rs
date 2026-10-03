@@ -445,12 +445,13 @@ pub struct ModeRecipe {
     /// prints, so two runs that agree on output lacking it do not pass.
     #[serde(default)]
     pub expected_stdout_contains: BTreeMap<String, String>,
-    /// Hermit `run` flags a verify cell adds after the runner's own, for a test
-    /// whose recorded policy runs a specific configuration. Only the flags in
-    /// ALLOWED_HERMIT_ARGS are accepted, each relaxes determinism, so
-    /// `hermit_args_reason` is required and both are recorded as relaxations.
+    /// Hermit `run` flags a verify cell adds after the runner's own, per
+    /// enabled backend, for a test whose recorded policy runs a specific
+    /// configuration on that backend. Only the flags in ALLOWED_HERMIT_ARGS
+    /// are accepted, each relaxes determinism, so `hermit_args_reason` is
+    /// required and both are recorded as relaxations.
     #[serde(default)]
-    pub hermit_args: Vec<String>,
+    pub hermit_args: BTreeMap<String, Vec<String>>,
     pub hermit_args_reason: Option<String>,
     /// Guest environment variables a verify cell adds, as `--env NAME=VALUE`,
     /// after the runner's fixed guest environment. A name the runner sets is
@@ -479,6 +480,61 @@ pub struct ModeRecipe {
     /// for a corpus whose recorded verdict was a single run (the strict
     /// compatibility corpus), so a first-attempt failure stays a failure.
     pub no_retry_reason: Option<String>,
+    /// Run-type labels of this mode's cell on an enabled backend, added to the
+    /// test's own `labels` for that cell only. See [`cell_labels`].
+    #[serde(default)]
+    pub labels: BTreeMap<String, Vec<String>>,
+}
+
+/// The run type of a cell that names none: the full validation, whose
+/// required cells ci/expected-e2e-plan.json lists and whose bucket nodes (and
+/// the portable, hosted and quick profiles' subsets of them) select no label.
+pub const DEFAULT_RUN_TYPE: &str = "full";
+
+/// The run types a cell belongs to: its test's `labels`, plus its mode's
+/// `labels` for its backend, or [`DEFAULT_RUN_TYPE`] alone when both are
+/// empty. A selection keeps a cell when the cell's run types meet the
+/// selection's `--label`s, and a selection without `--label` selects the
+/// default run type, so a cell labelled only with a focused run type (such as
+/// `sabre-compat-only`) is required there and nowhere else.
+pub fn cell_labels<'a>(
+    test: &'a TestRecipe,
+    recipe: &'a ModeRecipe,
+    backend: Option<&str>,
+) -> BTreeSet<&'a str> {
+    let mut labels: BTreeSet<&str> = test.labels.iter().map(String::as_str).collect();
+    if let Some(mode_labels) = backend.and_then(|backend| recipe.labels.get(backend)) {
+        labels.extend(mode_labels.iter().map(String::as_str));
+    }
+    if labels.is_empty() {
+        labels.insert(DEFAULT_RUN_TYPE);
+    }
+    labels
+}
+
+/// Why full validation does not select a cell whose run types exclude
+/// [`DEFAULT_RUN_TYPE`], or `None` when the cell is full's.
+pub fn focused_run_type_reason(
+    test: &TestRecipe,
+    recipe: &ModeRecipe,
+    backend: Option<&str>,
+) -> Option<String> {
+    let labels = cell_labels(test, recipe, backend);
+    (!labels.contains(DEFAULT_RUN_TYPE)).then(|| {
+        format!(
+            "Only the {} run type selects this cell, by its manifest label; full validation does not.",
+            labels.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+/// The Hermit `run` flags a verify cell on `backend` adds after the runner's own.
+pub fn cell_hermit_args<'a>(recipe: &'a ModeRecipe, backend: &str) -> &'a [String] {
+    recipe
+        .hermit_args
+        .get(backend)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 /// The Hermit the harness runs: `HERMIT_BIN`, else target/debug/hermit. A
@@ -1253,8 +1309,12 @@ pub struct Selection {
     pub exclude_categories: Vec<String>,
     pub include_occasional: bool,
     pub include_manual: bool,
-    /// When non-empty, only tests carrying at least one of these labels.
+    /// When non-empty, only cells whose run types ([`cell_labels`]) include
+    /// at least one of these labels; when empty, the default run type's.
     pub labels: Vec<String>,
+    /// Every run type's cells, ignoring `labels`: a census of the cells in
+    /// the manifest (the metadata export), not a run of one run type.
+    pub all_run_types: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1421,16 +1481,29 @@ impl ManifestSet {
     }
 
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
-        // A label no test carries is a typo, not an empty run type: with
+        // A label no cell carries is a typo, not an empty run type: with
         // --allow-empty it would otherwise select nothing and pass.
         if let Some(label) = selection.labels.iter().find(|label| {
-            !self
-                .tests
-                .values()
-                .any(|(_, _, _, test)| test.labels.contains(label))
+            !self.tests.values().any(|(_, _, _, test)| {
+                test.modes.values().any(|recipe| {
+                    std::iter::once(None)
+                        .chain(recipe.backends_enabled.iter().map(|b| Some(b.as_str())))
+                        .any(|backend| cell_labels(test, recipe, backend).contains(label.as_str()))
+                })
+            })
         }) {
             return Err(format!("--label {label} names no test in any manifest"));
         }
+        // Without --label, a selection is the default run type's.
+        let wanted_labels: BTreeSet<&str> = if selection.labels.is_empty() {
+            BTreeSet::from([DEFAULT_RUN_TYPE])
+        } else {
+            selection.labels.iter().map(String::as_str).collect()
+        };
+        let labelled = |test: &TestRecipe, recipe: &ModeRecipe, backend: Option<&str>| {
+            selection.all_run_types
+                || !cell_labels(test, recipe, backend).is_disjoint(&wanted_labels)
+        };
         // An excluded category no manifest has is a typo that would exclude nothing.
         if let Some(category) = selection.exclude_categories.iter().find(|category| {
             !self
@@ -1458,11 +1531,6 @@ impl ManifestSet {
                 || selection.test.as_deref().is_some_and(|value| value != id)
                 || selection.exclude_categories.contains(category)
                 || (!selection.include_occasional && test.occasional)
-                || (!selection.labels.is_empty()
-                    && !test
-                        .labels
-                        .iter()
-                        .any(|label| selection.labels.contains(label)))
             {
                 continue;
             }
@@ -1490,6 +1558,7 @@ impl ManifestSet {
                         .as_deref()
                         .is_some_and(|backend| backend != "native")
                         || !accepted
+                        || !labelled(test, recipe, None)
                     {
                         continue;
                     }
@@ -1526,6 +1595,7 @@ impl ManifestSet {
                         .as_deref()
                         .is_some_and(|value| value != backend)
                         || selection.exclude_backends.contains(&backend)
+                        || !labelled(test, recipe, Some(&backend))
                     {
                         continue;
                     }
@@ -1942,7 +2012,13 @@ fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     let reason =
         |reason: &Option<String>| reason.as_deref().unwrap_or("reason missing").to_string();
-    for arg in &recipe.hermit_args {
+    for arg in cell
+        .id
+        .backend
+        .as_deref()
+        .map(|backend| cell_hermit_args(recipe, backend))
+        .unwrap_or_default()
+    {
         relaxations.push(format!("{arg}: {}", reason(&recipe.hermit_args_reason)));
     }
     if recipe.comparator == Some(Comparator::Stripped) {
@@ -3532,7 +3608,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     // Validation admits these relaxations only on a verify recipe, and a
     // replay cell does not inherit them: `record start` has no such flags.
-    argv.extend(mode_recipe.hermit_args.iter().cloned());
+    argv.extend(cell_hermit_args(mode_recipe, backend).iter().cloned());
     if mode_recipe.compare_io_buffers == Some(false) {
         argv.push("--no-detlog-io-buffers".into());
     }
@@ -6072,17 +6148,27 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
     {
         return Err(format!("{id}: no_retry_reason must be substantive"));
     }
-    // Each flag at most once. An exact repeat would repeat a relaxation
-    // identity, which the scorecard refuses; two values for one flag would
-    // leave the effective configuration to Hermit's argument order.
-    let mut seen_flags = BTreeSet::new();
-    for arg in &recipe.hermit_args {
-        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-        if !seen_flags.insert(flag) {
-            return Err(format!("{id}: hermit_args repeats `{flag}`"));
+    for (backend, args) in &recipe.hermit_args {
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: hermit_args names backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if args.is_empty() {
+            return Err(format!("{id}: hermit_args for `{backend}` is empty"));
+        }
+        // Each flag at most once. An exact repeat would repeat a relaxation
+        // identity, which the scorecard refuses; two values for one flag would
+        // leave the effective configuration to Hermit's argument order.
+        let mut seen_flags = BTreeSet::new();
+        for arg in args {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if !seen_flags.insert(flag) {
+                return Err(format!("{id}: hermit_args repeats `{flag}`"));
+            }
         }
     }
-    for arg in &recipe.hermit_args {
+    for arg in recipe.hermit_args.values().flatten() {
         let allowed = ALLOWED_HERMIT_ARGS
             .iter()
             .any(|flag| match flag.strip_suffix('=') {
@@ -6156,6 +6242,17 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         return Err(format!(
             "{id}: comparator stripped cannot establish the bitwise_parity it asserts"
         ));
+    }
+    for (backend, labels) in &recipe.labels {
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: {mode} labels name backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if labels.is_empty() {
+            return Err(format!("{id}: {mode} labels for `{backend}` are empty"));
+        }
+        validate_labels(&format!("{id}: {mode} on {backend}"), labels)?;
     }
     for (backend, reason) in &recipe.diagnostic {
         if !stripped {
@@ -6920,10 +7017,13 @@ mod tests {
     fn verify_extensions_are_verify_only_reasoned_and_allowlisted() {
         let accepted = ModeRecipe {
             backends_enabled: vec!["ptrace".into()],
-            hermit_args: vec![
-                "--no-virtualize-cpuid".into(),
-                "--max-timeslice=disabled".into(),
-            ],
+            hermit_args: BTreeMap::from([(
+                "ptrace".into(),
+                vec![
+                    "--no-virtualize-cpuid".into(),
+                    "--max-timeslice=disabled".into(),
+                ],
+            )]),
             hermit_args_reason: Some("the corpus records this configuration".into()),
             env: BTreeMap::from([("TMPDIR".into(), "/tmp".into())]),
             comparator: Some(Comparator::Stripped),
@@ -6954,27 +7054,33 @@ mod tests {
             "true",
         ] {
             refused(
-                &|r| r.hermit_args = vec![flag.into()],
+                &|r| r.hermit_args = BTreeMap::from([("ptrace".into(), vec![flag.into()])]),
                 "verify",
                 "is not one of",
             );
         }
         refused(
             &|r| {
-                r.hermit_args = vec![
-                    "--no-virtualize-cpuid".into(),
-                    "--no-virtualize-cpuid".into(),
-                ]
+                r.hermit_args = BTreeMap::from([(
+                    "ptrace".into(),
+                    vec![
+                        "--no-virtualize-cpuid".into(),
+                        "--no-virtualize-cpuid".into(),
+                    ],
+                )])
             },
             "verify",
             "repeats `--no-virtualize-cpuid`",
         );
         refused(
             &|r| {
-                r.hermit_args = vec![
-                    "--max-timeslice=1".into(),
-                    "--max-timeslice=disabled".into(),
-                ]
+                r.hermit_args = BTreeMap::from([(
+                    "ptrace".into(),
+                    vec![
+                        "--max-timeslice=1".into(),
+                        "--max-timeslice=disabled".into(),
+                    ],
+                )])
             },
             "verify",
             "repeats `--max-timeslice`",
@@ -6993,6 +7099,36 @@ mod tests {
             &|r| r.hermit_args.clear(),
             "verify",
             "hermit_args_reason without hermit_args",
+        );
+        // Flags belong to an enabled backend, and a named backend has some.
+        refused(
+            &|r| {
+                r.hermit_args =
+                    BTreeMap::from([("sabre".into(), vec!["--no-virtualize-cpuid".into()])])
+            },
+            "verify",
+            "hermit_args names backend `sabre`, which is not in backends_enabled",
+        );
+        refused(
+            &|r| r.hermit_args = BTreeMap::from([("ptrace".into(), Vec::new())]),
+            "verify",
+            "hermit_args for `ptrace` is empty",
+        );
+        // Run-type labels name an enabled backend and are well formed.
+        refused(
+            &|r| r.labels = BTreeMap::from([("sabre".into(), vec!["sabre-compat-only".into()])]),
+            "verify",
+            "labels name backend `sabre`, which is not in backends_enabled",
+        );
+        refused(
+            &|r| r.labels = BTreeMap::from([("ptrace".into(), Vec::new())]),
+            "verify",
+            "labels for `ptrace` are empty",
+        );
+        refused(
+            &|r| r.labels = BTreeMap::from([("ptrace".into(), vec!["Bad".into()])]),
+            "verify",
+            "is not lowercase-words-with-dashes",
         );
         refused(
             &|r| r.comparator_reason = None,
@@ -7110,7 +7246,8 @@ mod tests {
         )
         .unwrap();
         let mut test = five_modes();
-        test.modes.get_mut("verify").unwrap().hermit_args = vec!["--chaos".into()];
+        test.modes.get_mut("verify").unwrap().hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--chaos".into()])]);
         let document = ManifestDocument {
             test: vec![test],
             ..document
@@ -7147,7 +7284,8 @@ mod tests {
     fn declared_relaxations_are_recorded_on_the_cell() {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.hermit_args = vec!["--no-virtualize-cpuid".into()];
+        mode.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
         mode.hermit_args_reason = Some("corpus configuration".into());
         mode.comparator = Some(Comparator::Stripped);
         mode.comparator_reason = Some("corpus verdict policy".into());
@@ -7188,6 +7326,60 @@ mod tests {
         }
     }
 
+    /// A mode's per-backend labels put that backend's cell in their run type
+    /// alone; the test's other cells stay in the default (full) run type, and
+    /// per-backend hermit_args reach only their backend's cell.
+    #[test]
+    fn a_cell_labelled_by_its_mode_belongs_to_that_run_type_alone() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.backends_enabled.push("sabre".into());
+        mode.backends_disabled.remove("sabre");
+        mode.labels = BTreeMap::from([("sabre".into(), vec!["sabre-compat-only".into()])]);
+        mode.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
+        mode.hermit_args_reason = Some("fixture configuration".into());
+        let mode = &test.modes["verify"];
+        validate_mode_extensions(&test.id, "verify", mode).unwrap();
+        assert_eq!(cell_hermit_args(mode, "ptrace"), ["--no-virtualize-cpuid"]);
+        assert!(cell_hermit_args(mode, "sabre").is_empty());
+        assert_eq!(
+            cell_labels(&test, mode, Some("sabre")),
+            BTreeSet::from(["sabre-compat-only"])
+        );
+        assert_eq!(
+            cell_labels(&test, mode, Some("ptrace")),
+            BTreeSet::from([DEFAULT_RUN_TYPE])
+        );
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let backends = |labels: &[&str], population: Population| {
+            set.select(&Selection {
+                population: Some(population),
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.backend.unwrap())
+            .collect::<Vec<_>>()
+        };
+        for population in [Population::Required, Population::Enabled] {
+            assert_eq!(backends(&[], population), ["ptrace"]);
+            assert_eq!(backends(&["full"], population), ["ptrace"]);
+            assert_eq!(backends(&["sabre-compat-only"], population), ["sabre"]);
+            assert_eq!(
+                backends(&["full", "sabre-compat-only"], population),
+                ["ptrace", "sabre"]
+            );
+        }
+    }
+
     #[test]
     fn labels_select_only_the_tests_that_carry_them() {
         let mut strict = recipe(true);
@@ -7217,9 +7409,31 @@ mod tests {
             .map(|cell| cell.id.test)
             .collect::<Vec<_>>()
         };
+        // An unlabelled test belongs to the default run type, full, so both
+        // tests are full's; only the labelled one is strict-compat's.
         assert_eq!(selected(&[]), ["fixture/plain", "fixture/strict"]);
-        assert_eq!(selected(&["full"]), ["fixture/strict"]);
-        assert_eq!(selected(&["strict-compat", "full"]), ["fixture/strict"]);
+        assert_eq!(selected(&["full"]), ["fixture/plain", "fixture/strict"]);
+        assert_eq!(selected(&["strict-compat"]), ["fixture/strict"]);
+        assert_eq!(
+            selected(&["strict-compat", "full"]),
+            ["fixture/plain", "fixture/strict"]
+        );
+        // Without full among its labels, a labelled test leaves the default
+        // run type.
+        let mut set = set;
+        set.tests.get_mut("fixture/strict").unwrap().3.labels = vec!["strict-compat".into()];
+        let selected = |labels: &[&str]| {
+            set.select(&Selection {
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.test)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(&[]), ["fixture/plain"]);
+        assert_eq!(selected(&["strict-compat"]), ["fixture/strict"]);
         let error = set
             .select(&Selection {
                 labels: vec!["full".into(), "super".into()],
@@ -7232,7 +7446,8 @@ mod tests {
     fn extended_verify_spec(comparator: Option<Comparator>) -> CellRunSpec {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.hermit_args = vec!["--no-virtualize-cpuid".into()];
+        mode.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
         mode.hermit_args_reason = Some("fixture configuration".into());
         mode.env = BTreeMap::from([("TMPDIR".into(), "/tmp".into())]);
         mode.comparator = comparator;

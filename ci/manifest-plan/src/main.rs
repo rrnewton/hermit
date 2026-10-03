@@ -1332,6 +1332,10 @@ fn validate_mode_with_cpu(
         "cpu_timeout_seconds",
         "slow_reason",
     ];
+    if mode != "naked" {
+        // Per-backend run-type labels (runner::cell_labels).
+        allowed.push("labels");
+    }
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
@@ -2036,10 +2040,15 @@ mod tests {
     const VERIFY_EXTENSIONS: &str = r#"
 ci = true
 backends_enabled = ["ptrace"]
-hermit_args = ["--no-virtualize-cpuid"]
 hermit_args_reason = "the corpus records this configuration"
 comparator = "stripped"
 comparator_reason = "the corpus verdict policy is the stripped comparison"
+
+[hermit_args]
+ptrace = ["--no-virtualize-cpuid"]
+
+[labels]
+ptrace = ["strict-compat"]
 
 [env]
 TMPDIR = "/tmp"
