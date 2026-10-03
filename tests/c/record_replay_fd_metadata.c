@@ -161,9 +161,8 @@ int main(int argc, char** argv) {
   // path calls mix there. The replay root is built without the host's
   // attributes: the directory's user.pre, which the test harness set before
   // recording, is absent from it, yet replacing, removing and re-creating it
-  // must replay what the recording saw. Replay refuses a set the replay root
-  // cannot take, so the replace passes only because replay drops
-  // XATTR_REPLACE.
+  // must replay what the recording saw. No live call reads a user attribute
+  // back (queries replay from the recording), so the replay root may lack it.
   if (chdir(argv[1]) != 0) {
     perror("chdir");
     return 2;
