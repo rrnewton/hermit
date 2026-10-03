@@ -3871,11 +3871,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The lookup buffer only serves the virtual update, so a scratch
             // stack that cannot hold it, for example one next to the guard
             // page, must not keep the guest's own call from reaching Linux.
+            // The commit writes page by page, so it can fail after writing a
+            // lower writable page; those bytes are put back first.
             Err(_) => {
                 info!(
                     "Guest stack scratch cannot hold the utimensat target lookup; \
                      leaving the virtual mtime unchanged."
                 );
+                restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
                 return self.utimensat_without_lookup(guest, call, staged).await;
             }
         };
