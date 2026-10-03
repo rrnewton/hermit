@@ -307,6 +307,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
+    "privileged-test.pmu_detcore_time_cases",
     "privileged-test.cli_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
@@ -384,11 +385,15 @@ struct Profile {
 // 67/67 before. full, portable and hosted-portable then each lost one step
 // when check.backend_parity_suites and its _on_host twin were retired with
 // tests/backend-parity (also slice S13): 87/88, 74/75 and 68/68 before.
+// full then gained privileged-test.pmu_detcore_time_cases when the 29
+// tests_time cases that need a PMU left test.detcore_time and its hosted twin
+// (https://github.com/rrnewton/hermit/issues/3663): 87/88 before. portable and
+// hosted-portable are unchanged because the node carries only the full label.
 const PROFILES: [Profile; 11] = [
     Profile {
         label: "full",
-        direct_steps: 87,
-        selected_steps: 88,
+        direct_steps: 88,
+        selected_steps: 89,
     },
     Profile {
         label: "portable",
@@ -1800,10 +1805,12 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // them; 110 since portablecompat.manifest_compat, the focused lane's corpus
     // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
     // joined the test-harness producers (2026-10-01); 120 since
-    // test.detcore_time and its hosted twin were enrolled.
-    if expected.len() != 120 {
+    // test.detcore_time and its hosted twin were enrolled; 121 since
+    // privileged-test.pmu_detcore_time_cases took the 29 tests_time cases that
+    // need a PMU (https://github.com/rrnewton/hermit/issues/3663).
+    if expected.len() != 121 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 120",
+            "structured result producer registry has {} entries, expected 121",
             expected.len()
         ));
     }
@@ -1812,9 +1819,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 42 {
+    // 43 since privileged-test.pmu_detcore_time_cases joined it
+    // (https://github.com/rrnewton/hermit/issues/3663).
+    if expected_counts.len() != 43 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 42",
+            "Nextest expected-count registry has {} entries, expected 43",
             expected_counts.len()
         ));
     }
@@ -1944,8 +1953,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // lane's strictcompat.manifest_compat, and 40 with the rr lane's
     // rrcompat.manifest_compat. Envelope 2 -> 7 with the five super stress
     // probe nodes. Nextest 69 -> 71 when test.detcore_time and its hosted twin
-    // were enrolled.
-    if actual_group_counts != [71, 40, 7, 2] {
+    // were enrolled, and 72 with privileged-test.pmu_detcore_time_cases
+    // (https://github.com/rrnewton/hermit/issues/3663).
+    if actual_group_counts != [72, 40, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2477,9 +2487,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // 415 since the 100 superstress repetition nodes became one node per
     // probe (510 - 100 + 5).
     // 417 when test.detcore_time and its hosted twin were enrolled (415 + 2).
-    if cfg.steps.len() != 417 {
+    // 418 with privileged-test.pmu_detcore_time_cases, which runs the 29
+    // tests_time cases that need a PMU (417 + 1;
+    // https://github.com/rrnewton/hermit/issues/3663).
+    if cfg.steps.len() != 418 {
         return Err(format!(
-            "superset has {} steps, expected 417",
+            "superset has {} steps, expected 418",
             cfg.steps.len()
         ));
     }
