@@ -16,6 +16,7 @@
 #        ci/buck-e2e/stage --bundle DIR                       copy them from a prebuilt bundle
 #                                                             (bin/ build/ src/ run-state/
 #                                                             hermit/{hermit,install} PROVENANCE.json)
+#        ci/buck-e2e/stage -h|--help
 # Cells use the Buck-built hermit unless -c hermit_e2e.hermit=staged. Reflinks when it can.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
         --from-cargo) mode=cargo; shift ;;
         --bundle) mode=bundle; bundle=$(realpath "$2"); shift 2 ;;
         --target-dir) target_dir=$2; shift 2 ;;
+        -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "ci/buck-e2e/stage: unknown argument $1" >&2; exit 2 ;;
     esac
 done
