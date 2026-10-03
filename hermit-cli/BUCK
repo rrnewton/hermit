@@ -29,7 +29,24 @@ hermit_build_env = {
 # that changes no compiled source rebuilds nothing and stays cached. Without
 # that flag the release targets still refuse to compile unstamped.
 release_unstamped = read_root_config("hermit_release", "unstamped", "false") == "true"
-release_provenance_features = [] if release_unstamped else ["buck-release-provenance"]
+
+# The release targets' cargo features, passed to both as their last argument,
+# `**release_features`.
+# A stamped build adds the buck-release-provenance cfg. Each case spells out its
+# whole list because scripts/check-buck-reindeer-features.rs reads only literal
+# `features` lists, never a variable or a concatenation.
+release_features = {"features": [
+    "dbt",
+    "e9patch",
+    "liteinst",
+    "sabre",
+]} if release_unstamped else {"features": [
+    "buck-release-provenance",
+    "dbt",
+    "e9patch",
+    "liteinst",
+    "sabre",
+]}
 release_build_env = hermit_build_env if release_unstamped else {
     "CARGO_PKG_VERSION": read_root_config("hermit_release", "version", ""),
     "HERMIT_BUILD_DATE": read_root_config("hermit_release", "build_date", ""),
@@ -153,12 +170,6 @@ rust_library(
     ),
     crate = "hermit",
     env = release_build_env,
-    features = release_provenance_features + [
-        "dbt",
-        "e9patch",
-        "liteinst",
-        "sabre",
-    ],
     preferred_linkage = "static",
     deps = [
         "fbsource//third-party/rust:addr2line",
@@ -192,6 +203,7 @@ rust_library(
         "//hermetic_infra/reverie:reverie-rpc-transport",
         "//hermetic_infra/reverie:reverie-sabre-stats",
     ],
+    **release_features
 )
 
 rust_binary(
@@ -199,12 +211,6 @@ rust_binary(
     srcs = glob(["src/bin/**/*.rs"]),
     crate = "hermit",
     env = release_build_env,
-    features = release_provenance_features + [
-        "dbt",
-        "e9patch",
-        "liteinst",
-        "sabre",
-    ],
     link_style = "static_pic",
     rustc_flags = [
         "-C",
@@ -248,6 +254,7 @@ rust_binary(
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
+    **release_features
 )
 
 configured_alias(
