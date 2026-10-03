@@ -775,7 +775,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The wait4 argument-error regression
     // (wait4_argument_errors_match_linux_and_preserve_children) retains all 28
     // prior identities selected after the node's five named skips.
-    ("test.detcore_misc", 29),
+    // The 31 readdir_order tests
+    // (https://github.com/rrnewton/hermit/pull/3226) retain all 29 prior
+    // identities selected after the node's five named skips (measured 60).
+    ("test.detcore_misc", 60),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -966,8 +969,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 29-test tests_misc selection.
-    ("test.detcore_misc_on_host", 29),
+    // The host node carries the identical 60-test tests_misc selection.
+    ("test.detcore_misc_on_host", 60),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
