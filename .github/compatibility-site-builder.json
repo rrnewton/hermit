@@ -1,6 +1,6 @@
 {
   "schema": 1,
   "parent_repository": "rrnewton/dev-hermit",
-  "parent_commit": "51a5a5cd1c14fa0e98a86b97bf9cd07fb2954ed0",
+  "parent_commit": "d8fc0887bd38ec7b50a00375addcc7b5b45617c9",
   "hermit_commit": "f4055eb9cae4a6a71ddfeb202f0fdf67cb57c4a6"
 }
