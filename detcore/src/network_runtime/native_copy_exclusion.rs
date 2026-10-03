@@ -271,7 +271,7 @@ impl RuntimeShared {
         root: &Arc<ForegroundRoot>,
         source: &ForegroundStoreSource,
     ) -> std::io::Result<()> {
-        if owned.closed || owned.copy_exclusion.is_some() || !root.is_current(source.owner()) {
+        if owned.closed || owned.copy_exclusion.is_some() || owned.source_read_active() || !root.is_current(source.owner()) {
             return Err(std::io::Error::other(
                 "copy exclusion lacks open exact-root native admission",
             ));

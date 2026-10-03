@@ -45,6 +45,7 @@ mod joined_native_worker;
 pub(crate) mod native_birth;
 pub(crate) mod native_birth_outcome;
 mod native_copy_exclusion;
+mod native_source_interval;
 mod openat_observation;
 pub(crate) mod original_connect;
 pub(crate) mod original_send;
@@ -87,6 +88,7 @@ pub(crate) use joined_native_worker::JoinedNativeWorkerReceipt;
 pub(crate) use native_copy_exclusion::NativeCopyExclusion;
 pub(crate) use native_copy_exclusion::ReceiveRetryAdmission;
 pub(crate) use native_copy_exclusion::ReceiveRetryOrigin;
+pub(crate) use native_source_interval::NativeSourceInterval;
 pub(crate) use physical::ForegroundRoot;
 #[cfg(test)]
 pub(crate) use physical::InitialDescriptor;
@@ -156,10 +158,19 @@ type NativeWorkerHandle = std::sync::Arc<NativeWorker>;
 struct NativeWorkers {
     closed: bool,
     copy_exclusion: Option<std::sync::Arc<native_copy_exclusion::Interval>>,
+    // Weak locally: the caller and backend's actual join registry retain the
+    // interval across cancellation, without introducing an ownership cycle.
+    source_read: std::sync::Weak<native_source_interval::Interval>,
     tasks: Vec<NativeWorkerHandle>,
     // A joined prefix is invalidated by every actual new submission. This is
     // execution bookkeeping, never semantic Call or physical result authority.
     submission_generation: u64,
+}
+
+impl NativeWorkers {
+    fn source_read_active(&self) -> bool {
+        self.source_read.upgrade().is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -412,6 +423,11 @@ impl RuntimeShared {
         let (send, receive) = tokio::sync::oneshot::channel();
         let worker = {
             let mut owned = self.native_workers.lock().unwrap();
+            if owned.source_read_active() {
+                let error = "native submission attempted during retained source-read interval".to_string();
+                self.native_terminal_failure.lock().unwrap().get_or_insert(error.clone());
+                return Err(std::io::Error::other(error));
+            }
             if require_idle && !owned.tasks.is_empty() {
                 return Err(std::io::Error::other(
                     "native stream release requires all prior workers to be joined",
@@ -630,6 +646,7 @@ impl RuntimeShared {
     fn native_workers_terminated(&self) -> bool {
         let owned = self.native_workers.lock().unwrap();
         owned.closed
+            && !owned.source_read_active()
             && !owned
                 .copy_exclusion
                 .as_ref()

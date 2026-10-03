@@ -12,6 +12,7 @@
 mod foreground_epoll;
 mod foreground_poll;
 mod foreground_store;
+mod native_source_read;
 mod original_connect;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
@@ -13679,6 +13680,61 @@ mod tests {
         pause_selected: Option<(&'a tokio::sync::Notify, &'a tokio::sync::Notify)>,
         // Opt-in in-process global view, as production local dispatch sees it.
         expose_local_global: bool,
+        // Controlled backend result only; this does not issue a SourceStop.
+        native_source_reply: Option<Result<Vec<u8>, reverie::syscalls::NativeUserReadError>>,
+        native_source_calls: Vec<(usize, usize)>,
+        native_source_events: Arc<Mutex<Vec<&'static str>>>,
+        forbid_ordinary_memory: bool,
+    }
+
+    struct OwnedReadMemory {
+        forbid: bool,
+    }
+
+    impl reverie::syscalls::MemoryAccess for OwnedReadMemory {
+        fn read<'a, A>(&self, address: A, bytes: &mut [u8]) -> Result<usize, reverie::Errno>
+        where
+            A: Into<reverie::syscalls::Addr<'a, u8>>,
+        {
+            assert!(!self.forbid, "source worker fixture used ordinary memory read");
+            reverie::syscalls::LocalMemory::new().read(address, bytes)
+        }
+
+        fn write(
+            &mut self,
+            address: reverie::syscalls::AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, reverie::Errno> {
+            assert!(!self.forbid, "source worker fixture used ordinary memory write");
+            reverie::syscalls::LocalMemory::new().write(address, bytes)
+        }
+
+        fn write_with_user_access(
+            &mut self,
+            address: reverie::syscalls::AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, reverie::Errno> {
+            assert!(!self.forbid, "source worker fixture used ordinary memory write");
+            reverie::syscalls::LocalMemory::new().write_with_user_access(address, bytes)
+        }
+
+        fn read_vectored(
+            &self,
+            remote: &[std::io::IoSlice],
+            local: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, reverie::Errno> {
+            assert!(!self.forbid, "source worker fixture used ordinary memory read");
+            reverie::syscalls::LocalMemory::new().read_vectored(remote, local)
+        }
+
+        fn write_vectored(
+            &mut self,
+            local: &[std::io::IoSlice],
+            remote: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, reverie::Errno> {
+            assert!(!self.forbid, "source worker fixture used ordinary memory write");
+            reverie::syscalls::LocalMemory::new().write_vectored(local, remote)
+        }
     }
 
     #[reverie::tool]
@@ -13710,7 +13766,7 @@ mod tests {
 
     #[reverie::tool]
     impl Guest<Detcore> for OwnedReadGuest<'_> {
-        type Memory = reverie::syscalls::LocalMemory;
+        type Memory = OwnedReadMemory;
         type Stack = ExternalRegistrationStack;
 
         fn tid(&self) -> reverie::Pid {
@@ -13730,7 +13786,37 @@ mod tests {
         }
 
         fn memory(&self) -> Self::Memory {
-            reverie::syscalls::LocalMemory::new()
+            OwnedReadMemory {
+                forbid: self.forbid_ordinary_memory,
+            }
+        }
+
+        async fn read_native_source(
+            &mut self,
+            address: usize,
+            length: usize,
+            retention: Box<dyn Send + Sync>,
+        ) -> Result<Vec<u8>, reverie::syscalls::NativeUserReadError> {
+            self.native_source_calls.push((address, length));
+            let Some(reply) = self.native_source_reply.take() else {
+                return Err(reverie::syscalls::NativeUserReadError::Refused(
+                    reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend,
+                ));
+            };
+            let events = self.native_source_events.clone();
+            events.lock().unwrap().push("submitted");
+            // An actual joined worker retains the opaque resource box. Its
+            // bytes are an explicit fixture premise, not native memory proof.
+            let (reply, retention) = tokio::task::spawn_blocking(move || {
+                events.lock().unwrap().push("worker");
+                (reply, retention)
+            })
+            .await
+            .expect("controlled source worker must join");
+            self.native_source_events.lock().unwrap().push("joined");
+            drop(retention);
+            self.native_source_events.lock().unwrap().push("retired");
+            reply
         }
 
         fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
@@ -13851,6 +13937,10 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             pause_selected: None,
             expose_local_global: false,
+            native_source_reply: None,
+            native_source_calls: Vec::new(),
+            native_source_events: Arc::new(Mutex::new(Vec::new())),
+            forbid_ordinary_memory: false,
         }
     }
 

@@ -509,8 +509,12 @@ fi
 # vendored DynamoRIO and third-party trees above remain byte-identical.
 # Compiler/generator selection and both measured limits are unchanged.
 # This is source-identity carry, not a new timing or backend qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 489e53e117c573f2e1c160a29d0e2adba528a2fc ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 489e53e117c573f2e1c160a29d0e2adba528a2fc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a7c44b226b06f0f01b1731f79327e593b2872784 (2026-10-03): the
+# source-worker/ptrace and numeric-memory API changes since489 leave the entire
+# reverie-dbt tree byte-identical. No build setting or measured limit changes;
+# this is source-identity carry, not new timing or backend qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a7c44b226b06f0f01b1731f79327e593b2872784 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a7c44b226b06f0f01b1731f79327e593b2872784 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

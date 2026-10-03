@@ -73,6 +73,9 @@ impl ForegroundRoot {
     pub(crate) fn owner(&self) -> NetworkStreamOwner {
         self.owner
     }
+    pub(crate) fn logical_process(&self) -> crate::types::DetPid {
+        self._logical_process
+    }
     pub(crate) fn process(&self) -> i32 {
         self.process
     }

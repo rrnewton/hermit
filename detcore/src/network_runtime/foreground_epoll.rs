@@ -5,6 +5,20 @@ use super::*;
 use crate::network_replay::NetworkStreamOwner;
 
 impl NetworkRuntimeResources {
+    pub(crate) fn reserve_replay_source_interval(
+        &self,
+        prefix: &JoinedNativePrefix,
+    ) -> std::io::Result<NativeSourceInterval> {
+        if !Arc::ptr_eq(&prefix.root, &self.foreground_root(prefix.root.owner())?) {
+            return Err(std::io::Error::other("Replay source changed its registered physical root"));
+        }
+        let mut owned = self.shared.native_workers.lock().unwrap();
+        if !prefix.shared.ptr_eq(&Arc::downgrade(&self.shared)) {
+            return Err(std::io::Error::other("Replay source changed its original joined runtime"));
+        }
+        self.shared.reserve_source_interval(&mut owned, prefix.root.clone(), prefix.generation)
+    }
+
     pub(crate) fn bind_foreground_metadata(
         &self,
         owner: NetworkStreamOwner,
@@ -56,7 +70,7 @@ impl NetworkRuntimeResources {
     ) -> std::io::Result<JoinedNativePrefix> {
         let (generation, workers) = {
             let owned = self.shared.native_workers.lock().unwrap();
-            if owned.closed || !root.is_current(root.owner()) {
+            if owned.closed || owned.source_read_active() || !root.is_current(root.owner()) {
                 return Err(std::io::Error::other(
                     "foreground prefix lost open root custody",
                 ));
@@ -85,6 +99,7 @@ impl NetworkRuntimeResources {
         let owned = self.shared.native_workers.lock().unwrap();
         if !prefix.shared.ptr_eq(&Arc::downgrade(&self.shared))
             || owned.closed
+            || owned.source_read_active()
             || owned.submission_generation != prefix.generation
             || !prefix.root.is_current(prefix.root.owner())
         {
@@ -234,6 +249,7 @@ impl NetworkRuntimeResources {
         if !prefix.shared.ptr_eq(&Arc::downgrade(&self.shared))
             || owned.closed
             || owned.copy_exclusion.is_some()
+            || owned.source_read_active()
             || !owned.tasks.is_empty()
             || owned.submission_generation != prefix.generation
             || !prefix.root.is_current(prefix.root.owner())

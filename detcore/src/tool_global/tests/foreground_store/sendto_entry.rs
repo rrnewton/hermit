@@ -111,6 +111,118 @@ fn assert_replay_reader_released(f: &ReplayIssuerFixture, guest: &OwnedReadGuest
     assert!(guest.thread.original_file_metadata.is_none());
 }
 
+// These replies are controlled backend premises. The real Tool callback,
+// source preparation/revalidation, worker join and engine consumption run;
+// this does not establish native SourceStop acquisition or ptrace custody.
+async fn controlled_source_callback(case: usize) {
+    use reverie::syscalls::NativeUserReadError;
+    use reverie::syscalls::NativeUserReadRefusal;
+
+    for flags in [libc::MSG_NOSIGNAL, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT] {
+        let mut f = fixture(false, None).await;
+        let engine = f.state.network_engine.as_ref().unwrap();
+        let before_trace = engine.lock().unwrap().native_trace_fixture();
+        let before_turn = f.state.sched.lock().unwrap().turn;
+        let tool: Detcore = Detcore::new(f.tid, &f.config);
+        let thread = std::mem::replace(&mut f.thread, tool.init_thread_state(f.tid, None));
+        let mut guest = owned_read_guest(&f.config, &f.state, thread);
+        guest.expose_local_global = true;
+        guest.forbid_ordinary_memory = true;
+        guest.native_source_reply = Some(match case {
+            0 => Ok(b"abc".to_vec()),
+            1 => Err(NativeUserReadError::Refused(
+                NativeUserReadRefusal::UnsupportedBackend,
+            )),
+            2 => Ok(b"bad".to_vec()),
+            _ => unreachable!(),
+        });
+        let before_count = guest.thread.stats.syscall_count;
+        let before_time = guest.thread.thread_logical_time.as_nanos();
+        // Deliberately inaccessible numeric source. The selected three bytes
+        // end at a page boundary; the unselected fourth byte must not enter
+        // the source API or cause a cross-page range refusal.
+        let result = tool
+            .handle_syscall_event(&mut guest, send(f.binding.slot.fd, 4093, 4, flags).into())
+            .await;
+        assert_replay_reader_released(&f, &guest);
+        assert_eq!(guest.native_source_calls, [(4093, 3)]);
+        assert_eq!(
+            *guest.native_source_events.lock().unwrap(),
+            ["submitted", "worker", "joined", "retired"]
+        );
+        assert!(guest.native_source_reply.is_none());
+        assert_eq!(engine.lock().unwrap().native_trace_fixture(), before_trace);
+        assert_eq!(f.state.sched.lock().unwrap().turn, before_turn);
+        assert_eq!(guest.thread.stats.syscall_count, before_count + 1);
+        assert_eq!(
+            guest.thread.thread_logical_time.as_nanos(),
+            before_time + LogicalTime::from_nanos(crate::syscall_time::cost_ns(Sysno::sendto))
+        );
+        assert!(
+            !guest
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| matches!(
+                    request,
+                    GlobalRequest::Network(NetworkRequest::TransmitStream { .. })
+                ))
+        );
+        if case == 0 {
+            assert_eq!(result.unwrap(), 3);
+            assert!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .transmit_stream_read_limit(f.binding.open_file, 4)
+                    .is_err()
+            );
+        } else {
+            let Error::Tool(error) = result.unwrap_err() else {
+                panic!("controlled source failure must remain a Tool error")
+            };
+            if case == 1 {
+                assert_eq!(
+                    error.to_string(),
+                    "shared network engine refused operation: V4 Sendto Replay positive prefix requires source-stop/MM-bound read custody"
+                );
+            } else {
+                let refusal = error
+                    .downcast_ref::<crate::network_failure::NetworkPolicyRefusal>()
+                    .expect("mismatched bytes must preserve the typed Replay refusal");
+                assert_eq!(
+                    refusal.reason(),
+                    crate::network_failure::NetworkRefusalReason::OutboundMismatch
+                );
+            }
+            assert_eq!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .transmit_stream_read_limit(f.binding.open_file, 4)
+                    .unwrap(),
+                3
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sendto_tool_replay_joined_source_commits_only_selected_partial_prefix() {
+    controlled_source_callback(0).await;
+}
+
+#[tokio::test]
+async fn sendto_tool_replay_joined_source_refusal_releases_without_consumption() {
+    controlled_source_callback(1).await;
+}
+
+#[tokio::test]
+async fn sendto_tool_replay_joined_source_mismatch_releases_without_consumption() {
+    controlled_source_callback(2).await;
+}
+
 #[tokio::test]
 async fn sendto_tool_replay_zero_prefix_errno_never_reads_payload() {
     for flags in [libc::MSG_NOSIGNAL, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT] {

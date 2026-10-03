@@ -5297,6 +5297,23 @@ impl NetworkReplayEngine {
         outcome
     }
 
+    /// A positive Replay source selection is tied to this monotone frontier.
+    /// Consuming an equally sized successor cannot preserve the original value.
+    pub(crate) fn replay_transmit_offset(
+        &self,
+        open_file: OpenFileId,
+    ) -> Result<u64, NetworkReplayError> {
+        if self.mode() != NetworkEngineMode::Replay {
+            return Err(NetworkReplayError::WrongMode);
+        }
+        let channel = self.bound_channel(open_file)?;
+        let state = self.channels.get(&channel).ok_or(NetworkReplayError::UnknownChannel(channel))?;
+        if state.transport.is_datagram() || state.local_write_closed {
+            return Err(NetworkReplayError::TransportMismatch(channel));
+        }
+        Ok(state.transmitted)
+    }
+
     /// Inspect the next accepted prefix before touching the original guest
     /// buffer. This consumes nothing; transmit_stream still checks every byte
     /// and advances the same queue exactly once under the foreground turn.

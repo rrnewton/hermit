@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use reverie::syscalls::AddrMut;
-use reverie::syscalls::AddrSliceMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::RemoteIoVec;
 
 use super::*;
 use crate::memory::MemoryMetadata;
@@ -404,16 +404,23 @@ impl NetworkReplayEngine {
         let bytes = &store.source.bytes()[store.source_offset..store.source_offset + store.length];
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let local = [std::io::IoSlice::new(bytes)];
-            let mut remote = unsafe { AddrSliceMut::from_raw_parts(address, store.length) };
             // Preserve page-level partial results in the single native call.
             // The complete selection is <=512 bytes, spanning at most two pages.
-            let result = if let Some((mut first, mut second)) = remote.split_at_page_boundary() {
-                let mut destinations = unsafe { [first.as_ioslice_mut(), second.as_ioslice_mut()] };
-                memory.write_native_user_vectored(tid, &local, &mut destinations)
+            // Remote destinations remain numeric, never references in this process.
+            const PAGE_SIZE: usize = 4096;
+            let first_len = store.length.min(PAGE_SIZE - address.as_raw() % PAGE_SIZE);
+            let first = RemoteIoVec::new(address, first_len).map_err(|error| error.into_raw())?;
+            let result = if first_len < store.length {
+                let tail = address
+                    .as_raw()
+                    .checked_add(first_len)
+                    .and_then(AddrMut::from_raw)
+                    .ok_or(libc::EFAULT)?;
+                let second = RemoteIoVec::new(tail, store.length - first_len)
+                    .map_err(|error| error.into_raw())?;
+                memory.write_native_user_vectored(tid, &local, &[first, second])
             } else {
-                let mut page = unsafe { AddrSliceMut::from_raw_parts(address, store.length) };
-                let mut destinations = unsafe { [page.as_ioslice_mut()] };
-                memory.write_native_user_vectored(tid, &local, &mut destinations)
+                memory.write_native_user_vectored(tid, &local, &[first])
             };
             result.map_err(|error| error.into_raw())
         })) {

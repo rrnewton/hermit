@@ -123,9 +123,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.4.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -266,9 +266,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flate2"
@@ -896,7 +896,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reverie-core"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -922,7 +922,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "bincode",
  "libc",
@@ -940,7 +940,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "syscalls",
 ]
@@ -948,7 +948,7 @@ dependencies = [
 [[package]]
 name = "reverie-preload"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "bincode",
  "libc",
@@ -959,7 +959,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -976,12 +976,13 @@ dependencies = [
 [[package]]
 name = "reverie-ptrace"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
  "bytes",
+ "cc",
  "close-err",
  "futures 0.3.33",
  "goblin",
@@ -1007,7 +1008,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1021,7 +1022,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -1079,7 +1080,7 @@ dependencies = [
 [[package]]
 name = "safeptrace"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=489e53e117c573f2e1c160a29d0e2adba528a2fc#489e53e117c573f2e1c160a29d0e2adba528a2fc"
+source = "git+https://github.com/rrnewton/reverie.git?rev=a7c44b226b06f0f01b1731f79327e593b2872784#a7c44b226b06f0f01b1731f79327e593b2872784"
 dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",

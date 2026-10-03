@@ -3131,13 +3131,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let maximum = guest.local_global_state().unwrap().replay_sendto_read_limit(
                     guest.tid(), guest.thread_state(), &read, call.size(),
                 ).map_err(engine_rpc_error)?;
-                // A numeric guest address and a destination-write range do not
-                // own an outbound source read. Keep the selected prefix intact
-                // until the backend can retain the exact source stop and MM
-                // through the read worker's actual join. In particular, never
-                // read the requested tail beyond a recorded partial success.
                 if maximum != 0 {
-                    return Err(engine_error("V4 Sendto Replay positive prefix requires source-stop/MM-bound read custody"));
+                    // Only the selected recorded prefix is read, never the
+                    // requested tail. Record's original native Sendto path is
+                    // separate and supplies its bytes from the real producer.
+                    let prepared = guest.local_global_state().unwrap()
+                        .prepare_replay_transmit_source(
+                            guest.tid(), guest.thread_state(), &read,
+                            (call.buf().ok_or(Errno::EFAULT)?.as_raw(), maximum, call.flags()),
+                        ).await.map_err(engine_rpc_error)?;
+                    let bytes = guest.read_native_source(
+                        prepared.address(), prepared.length(), prepared.retention(),
+                    ).await.map_err(|error| {
+                        // Preserve the existing explicit unsupported-backend
+                        // refusal; no unsafe memory() fallback or guest errno.
+                        tracing::error!(%error, "Replay source worker refused");
+                        engine_error("V4 Sendto Replay positive prefix requires source-stop/MM-bound read custody")
+                    })?;
+                    let outcome = guest.local_global_state().ok_or_else(||
+                        engine_error("Replay source lost actual local state")
+                    )?.finish_replay_transmit_source(
+                        guest.tid(), guest.thread_state(), prepared, bytes,
+                    ).map_err(engine_rpc_error)?;
+                    return match outcome {
+                        NetworkStreamTransmit::Accepted(count) => Ok(count as i64),
+                        NetworkStreamTransmit::Error(errno) => errno_result(errno),
+                    };
                 }
                 // A recorded errno has no source bytes. Preserve that outcome
                 // without touching even an inaccessible original payload.

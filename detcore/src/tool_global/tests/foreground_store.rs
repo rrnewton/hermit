@@ -6,6 +6,7 @@ mod fd_identity;
 mod scalar_recvfrom;
 mod raw_poll;
 mod sendto_entry;
+mod native_source_read;
 
 use std::cell::Cell;
 use std::io::IoSlice;
@@ -15,6 +16,7 @@ use reverie::Errno;
 use reverie::InjectedSyscallEvent as Event;
 use reverie::Tool;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::RemoteIoVec;
 use reverie::syscalls::Sysno;
 
 use super::*;
@@ -104,11 +106,18 @@ impl MemoryAccess for NativeMemory<'_> {
         &mut self,
         expected: i32,
         local: &[IoSlice],
-        remote: &mut [IoSliceMut],
+        remote: &[RemoteIoVec],
     ) -> Result<usize, Errno> {
         assert_eq!(expected, self.tid);
         assert_eq!(self.checks.get(), 1);
         self.writes += 1;
+        let remote: Vec<_> = remote
+            .iter()
+            .map(|span| libc::iovec {
+                iov_base: span.address() as *mut libc::c_void,
+                iov_len: span.length(),
+            })
+            .collect();
         let raw = Errno::result(unsafe {
             libc::process_vm_writev(
                 expected,
@@ -3820,11 +3829,18 @@ impl MemoryAccess for ScalarForegroundMemory {
         &mut self,
         expected: i32,
         local: &[IoSlice],
-        remote: &mut [IoSliceMut],
+        remote: &[RemoteIoVec],
     ) -> Result<usize, Errno> {
         assert_eq!(expected, self.tid);
         assert!(self.checked.get());
         self.events.lock().unwrap().push("native-write");
+        let remote: Vec<_> = remote
+            .iter()
+            .map(|span| libc::iovec {
+                iov_base: span.address() as *mut libc::c_void,
+                iov_len: span.length(),
+            })
+            .collect();
         Errno::result(unsafe {
             libc::process_vm_writev(
                 expected,
