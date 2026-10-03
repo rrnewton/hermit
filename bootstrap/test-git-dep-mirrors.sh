@@ -5,7 +5,8 @@
 # without) served from complete mirrors exports one insteadOf entry each,
 # appended after the caller's own GIT_CONFIG_* entries, and the git executable
 # then resolves each locked URL to its mirror. Refuse: a missing mirror, a mirror
-# without a pinned commit, a lockfile with no git sources and a mirror directory
+# without a pinned commit, two sources that would share a mirror, a lockfile with
+# no git sources and a mirror directory
 # that does not exist each fail and export no GIT_CONFIG_COUNT. Coverage: run
 # against the repository's own Cargo.lock with an empty directory, the refusal
 # names every git source it locks, so no source format slips past the parser.
@@ -122,6 +123,13 @@ lockfile=$tmp/Cargo.lock dir=$tmp/stale
 out=$(apply)
 refuses "stale mirror" "$tmp/stale/b.git lacks $rev_b2"
 if grep -qF "lacks $rev_b1" <<<"$out"; then fail "stale mirror: refused a commit it holds: $out"; fi
+
+# Refuse: two sources whose last component names the same mirror.
+sed "s|$url_b|https://example.invalid/other/a|" "$tmp/Cargo.lock" >"$tmp/collide.lock"
+git -C "$mirrors/a.git" fetch -q "$tmp/up/b" "+refs/heads/main:refs/heads/b"
+lockfile=$tmp/collide.lock dir=$mirrors
+out=$(apply)
+refuses "shared mirror" "would share the mirror $mirrors/a.git"
 
 # Refuse: no git sources, and no mirror directory.
 grep -v '^source = "git+' "$tmp/Cargo.lock" >"$tmp/registry-only.lock"

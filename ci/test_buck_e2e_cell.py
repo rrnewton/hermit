@@ -200,7 +200,7 @@ class CellTest(unittest.TestCase):
         self.calls = self.tmp / "calls.jsonl"
         self.calls.touch()
 
-    def run_cell(self, **env: str) -> tuple[dict, dict | None]:
+    def run_cell(self, backend: str = BACKEND, **env: str) -> tuple[dict, dict | None]:
         artifacts = self.tmp / "tpx" / "artifacts"
         annotations = self.tmp / "tpx" / "annotations"
         shutil.rmtree(self.tmp / "tpx", ignore_errors=True)
@@ -212,10 +212,10 @@ class CellTest(unittest.TestCase):
             "HERMIT_E2E_BUNDLE": str(self.bundle),
             "HERMIT_E2E_ROUTE": "local",
             "FAKE_CALLS": str(self.calls),
-            "FAKE_SLUG": SLUG,
+            "FAKE_SLUG": SLUG.removesuffix("-" + BACKEND) + "-" + backend,
         }
         base.update(env)
-        proc = subprocess.run(["bash", str(CELL_SH), TEST, MODE, BACKEND], env=base,
+        proc = subprocess.run(["bash", str(CELL_SH), TEST, MODE, backend], env=base,
                               capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
@@ -294,6 +294,24 @@ class CellTest(unittest.TestCase):
         stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
         self.assertIn("the pinned-root image has no libzstd.so.1, which the DBT client needs", stderr)
         self.assertEqual(result["harness_rc"], 125)
+
+    def test_interpreter_named_by_its_path_is_linked_by_its_name(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                FAKE_LDD_EXTRA="/lib64/ld-other.so.2 => /nix/store/o/ld-other.so.2 (0x1)")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["rsrcs"]["ld-other.so.2"], "/nix/store/o/ld-other.so.2")
+
+    def test_non_dbt_cell_gets_no_links_and_needs_no_client(self) -> None:
+        for lib in ("libreverie_dbt_client.so", "libdetcore_dbt.so"):
+            (self.bundle / "hermit" / "install" / "rsrcs" / lib).unlink()
+        done, result = self.run_cell("ptrace", HERMIT_E2E_CONTAINER="pinned-root", FAKE_LDD_RC="1")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertEqual(wrapper["command"][0], "env", wrapper["command"])
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["rsrcs"], {"libshipped.so": None})
+        self.assertEqual(result["harness_rc"], 0)
 
     def test_ldd_failure_is_an_error(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_LDD_RC="1")
