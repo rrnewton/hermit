@@ -226,6 +226,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/patch-reverie-dbt-buck.rs --check-inventory
 	./scripts/core-review-protocol-lint-test.sh
 	python3 ./ci/test_audit_test_binary_registration.py
+	python3 ./ci/test_buck_e2e_ingest.py
 	./ci/run-with-reverie-dbt-budget-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
