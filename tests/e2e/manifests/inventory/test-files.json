@@ -1424,6 +1424,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/network_replay_executable_source_probe.c",
+      "runner": "detcore/src/tool_global/tests/executable_source_native.rs",
+      "why": "tests/c/network_replay_executable_source_probe.c is owned by detcore/src/tool_global/tests/executable_source_native.rs: its two component tests compile this freestanding static x86_64 guest and exec it through their NativeTool with TracerBuilder, bind its read-only executable bytes to the actual stopped Sendto, and check the real adapter/Global/caller capture and worker join for successful consumption or typed OutboundMismatch. The guest depends on the owner intercepting its fd-7 Sendto; a standalone E2E cell would not establish those component premises or check those oracles."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/network_replay_tcp_bracket.c",
       "runner": "hermit-cli/tests/record_replay.rs network_only module",
       "why": "tests/c/network_replay_tcp_bracket.c is owned by hermit-cli/tests/record_replay.rs network_only module: the integration driver starts its bounded external controller, records one exact TCP stream, replays it offline across a fixed scheduler population, and checks cross-run invariants and fail-closed mismatches that a standalone manifest cell cannot express."
