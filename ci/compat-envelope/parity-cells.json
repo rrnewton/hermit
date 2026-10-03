@@ -12,7 +12,7 @@
   },
   "counts": {
     "all": {
-      "cells": 3700,
+      "cells": 3716,
       "applicable": 977,
       "selectable": 669,
       "selected": 297,
@@ -20,28 +20,28 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 925,
+        "cells": 929,
         "applicable": 85,
         "selectable": 26,
         "selected": 16,
         "selected_selectable": 2
       },
       "kvm": {
-        "cells": 925,
+        "cells": 929,
         "applicable": 264,
         "selectable": 257,
         "selected": 91,
         "selected_selectable": 90
       },
       "liteinst": {
-        "cells": 925,
+        "cells": 929,
         "applicable": 149,
         "selectable": 146,
         "selected": 99,
         "selected_selectable": 98
       },
       "sabre": {
-        "cells": 925,
+        "cells": 929,
         "applicable": 479,
         "selectable": 240,
         "selected": 91,
@@ -226,6 +226,10 @@
     {"test_id":"c-programs/eventfd-semantics","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/eventfd-semantics","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/eventfd-semantics","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
+    {"test_id":"c-programs/external-io-signal-interrupt","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: backend_reports_signal_interrupted_external_io is false on DBT, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222"},
+    {"test_id":"c-programs/external-io-signal-interrupt","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: backend_reports_signal_interrupted_external_io is false on KVM, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222"},
+    {"test_id":"c-programs/external-io-signal-interrupt","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: backend_reports_signal_interrupted_external_io is false on LiteInst, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222"},
+    {"test_id":"c-programs/external-io-signal-interrupt","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: backend_reports_signal_interrupted_external_io is false on SaBRe, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222"},
     {"test_id":"c-programs/faccessat2-flags","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
     {"test_id":"c-programs/faccessat2-flags","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/faccessat2-flags","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
@@ -958,6 +962,14 @@
     {"test_id":"c-programs/sigprocmask-state","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately"},
     {"test_id":"c-programs/sigprocmask-state","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately"},
     {"test_id":"c-programs/sigprocmask-state","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
+    {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify DBT separately"},
+    {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify KVM separately"},
+    {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify LiteInst separately"},
+    {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify SaBRe separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: backend_reports_signal_interrupted_external_io is false on DBT, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify DBT separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: backend_reports_signal_interrupted_external_io is false on KVM, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify KVM separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: backend_reports_signal_interrupted_external_io is false on LiteInst, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify LiteInst separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: backend_reports_signal_interrupted_external_io is false on SaBRe, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify SaBRe separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
@@ -1138,6 +1150,10 @@
     {"test_id":"c-programs/timer-family-identity","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM does not complete a guest on the authoring host; qualify KVM separately"},
     {"test_id":"c-programs/timer-family-identity","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: LiteInst preload handshake fails on the authoring host; qualify LiteInst separately"},
     {"test_id":"c-programs/timer-family-identity","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not buildable on the authoring host (cmake absent); qualify SaBRe separately"},
+    {"test_id":"c-programs/timerfd-semantics","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Not measured for this fixture; qualify DBT separately"},
+    {"test_id":"c-programs/timerfd-semantics","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: Not measured for this fixture; qualify KVM separately"},
+    {"test_id":"c-programs/timerfd-semantics","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Not measured for this fixture; qualify LiteInst separately"},
+    {"test_id":"c-programs/timerfd-semantics","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not measured for this fixture; qualify SaBRe separately"},
     {"test_id":"c-programs/umask-mode","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
     {"test_id":"c-programs/umask-mode","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/umask-mode","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
