@@ -311,14 +311,20 @@ class ArtifactDirectoryDocumentationTest(unittest.TestCase):
         self.assertRegex(usage, r"(?m)^  DEMO07_ARTIFACTS=/path +\S")
 
 
-# Stands in for a `hermit` wrapper such as safehermit. It starts two stopped
-# `sleep` processes in sessions of their own, so outside its process group as a
+# Stands in for a `hermit` wrapper such as safehermit. It starts two `sleep`
+# processes in sessions of their own, so outside its process group as a
 # systemd unit's processes are, waits for both to exit, then does its own
-# cleanup (writes a marker file) and exits 0.
+# cleanup (writes a marker file) and exits 0. Given a program named
+# qemu-system-* and the pass's -qmp argument, its first process runs that
+# program with that argument instead, as the QEMU that _find_qemu looks for.
 _WRAPPER = r"""
 import os, subprocess, sys
 pid_file, marker = sys.argv[1], sys.argv[2]
-children = [subprocess.Popen(["sleep", "1000"], start_new_session=True) for _ in range(2)]
+sleeper = ["sleep", "1000"]
+qemu = sleeper
+if len(sys.argv) > 3:
+    qemu = [sys.argv[3], "-c", "import time; time.sleep(1000)", "-qmp", sys.argv[4]]
+children = [subprocess.Popen(command, start_new_session=True) for command in (qemu, sleeper)]
 with open(pid_file + ".partial", "w") as output:
     output.write(" ".join(str(child.pid) for child in children))
 os.rename(pid_file + ".partial", pid_file)
@@ -384,19 +390,29 @@ class LeftoverProcessTest(_PassHarness):
     and are found and frozen where start() finds and freezes the real ones.
     """
 
-    def _run_pass(self, body_error=None):
+    def _run_pass(self, body_error=None, qmp_error=None):
+        """Run one pass; with ``qmp_error``, the pass fails with it while waiting for QMP.
+
+        That is before start() looks for QEMU, so the QEMU stand-in is then a
+        program named qemu-system-x86_64 that carries the pass's -qmp argument,
+        and QEMU's TracerPid names the tracer stand-in.
+        """
         config = self._config(self.outside_tmp / "artifacts")
         pid_file = self.outside_tmp / "stand-ins.pids"
         marker = self.outside_tmp / "wrapper-cleanup-ran"
+        qemu_program = self.outside_tmp / "qemu-system-x86_64"
+        qemu_program.symlink_to(sys.executable)
         real_popen = subprocess.Popen
+        real_status_value = dh._proc_status_value
         stand_ins = []  # (pid, start time) of the QEMU and tracer stand-ins
 
         def popen(command, **options):
-            return real_popen(
-                [sys.executable, "-c", _WRAPPER, str(pid_file), str(marker)], **options
-            )
+            wrapper = [sys.executable, "-c", _WRAPPER, str(pid_file), str(marker)]
+            if qmp_error is not None:
+                wrapper += [str(qemu_program), command[command.index("-qmp") + 1]]
+            return real_popen(wrapper, **options)
 
-        def wait_for_qemu(process, qmp_socket, timeout):
+        def read_stand_ins():
             deadline = time.monotonic() + 30
             while not pid_file.exists():
                 if time.monotonic() > deadline:
@@ -406,7 +422,29 @@ class LeftoverProcessTest(_PassHarness):
                 start_time = _stat_identity(pid)[1]
                 stand_ins.append((pid, start_time))
                 self.addCleanup(_kill_leftover, pid, start_time)
+
+        def wait_for_qemu(process, qmp_socket, timeout):
+            read_stand_ins()
             return stand_ins[0][0]
+
+        def connect(path, process, timeout):
+            if qmp_error is None:
+                return _PausedQmp()
+            read_stand_ins()
+            # QEMU waits in a ptrace stop, as in a pass that hung under Hermit.
+            os.kill(stand_ins[0][0], signal.SIGSTOP)
+            _wait_for_state(self, stand_ins[0][0], "T")
+            raise qmp_error
+
+        def status_value(pid, key):
+            # The tracer stand-in does not really ptrace the QEMU stand-in.
+            if qmp_error is not None and stand_ins:
+                tracer = stand_ins[1][0]
+                if pid == stand_ins[0][0] and key == "TracerPid":
+                    return str(tracer)
+                if pid == tracer and key == "Tgid":
+                    return str(tracer)
+            return real_status_value(pid, key)
 
         def freeze_exact_tracer(qemu_pid, timeout=20.0):
             # The real QEMU waits in a ptrace stop and the tracer is stopped
@@ -431,23 +469,25 @@ class LeftoverProcessTest(_PassHarness):
                     mock.Mock(return_value=(0, "BUILD-ID={}\n".format(build_id).encode())),
                 ),
                 ("_elf_build_id", mock.Mock(return_value=build_id)),
+                ("_proc_status_value", status_value),
             ):
                 stack.enter_context(mock.patch.object(dh, name, replacement))
             stack.enter_context(mock.patch.object(dh.subprocess, "Popen", popen))
+            stack.enter_context(mock.patch.object(dh.QmpClient, "connect", connect))
+            program = dh.HermitGuestProgram(config)
             stack.enter_context(
-                mock.patch.object(dh.QmpClient, "connect", mock.Mock(return_value=_PausedQmp()))
+                mock.patch.object(dh, "HermitGuestProgram", mock.Mock(return_value=program))
             )
             stderr = io.StringIO()
             stack.enter_context(contextlib.redirect_stderr(stderr))
-            guest = None
             try:
-                with dh.program_from_hermit(config) as guest:
+                with dh.program_from_hermit(config):
                     if body_error is not None:
                         raise body_error
-            except RuntimeError as error:
-                if error is not body_error:
+            except (RuntimeError, TimeoutError) as error:
+                if error is not body_error and error is not qmp_error:
                     raise
-        return guest, stand_ins, marker, stderr.getvalue()
+        return program, stand_ins, marker, stderr.getvalue()
 
     def _assert_nothing_left(self, guest, stand_ins, marker, stderr):
         self.assertEqual(len(stand_ins), 2, stand_ins)
@@ -472,6 +512,15 @@ class LeftoverProcessTest(_PassHarness):
     def test_a_pass_that_fails_leaves_no_process(self):
         error = RuntimeError("guest advanced during read")
         guest, stand_ins, marker, stderr = self._run_pass(body_error=error)
+        self._assert_nothing_left(guest, stand_ins, marker, stderr)
+        self.assertIn("Removed the failed pass's", stderr)
+
+    def test_a_pass_that_fails_before_qemu_is_found_leaves_no_process(self):
+        # As in a pass whose QEMU hung under Hermit before it created its QMP
+        # socket: start() had not looked for QEMU yet.
+        error = TimeoutError("QMP socket did not become ready: qmp.sock (timed out)")
+        guest, stand_ins, marker, stderr = self._run_pass(qmp_error=error)
+        self.assertIsNone(guest._qemu_pid)
         self._assert_nothing_left(guest, stand_ins, marker, stderr)
         self.assertIn("Removed the failed pass's", stderr)
 
@@ -553,6 +602,21 @@ class OwnedProcessKillTest(unittest.TestCase):
         state, start_time = dh._proc_identity(child.pid)
         self.assertEqual(state, "T")
         self.assertEqual(start_time, _stat_identity(child.pid)[1])
+
+    def test_a_tracer_is_returned_only_while_the_pid_is_the_recorded_process(self):
+        child, start_time = self._stopped_sleep()
+        values = {(child.pid, "TracerPid"): "777", (777, "Tgid"): "770"}
+        with mock.patch.object(dh, "_proc_status_value", lambda pid, key: values[(pid, key)]):
+            self.assertEqual(dh._tracer_of(child.pid, start_time), 770)
+            # A later process given this pid: its tracer is not Hermit's.
+            self.assertIsNone(dh._tracer_of(child.pid, start_time - 1))
+            values[(child.pid, "TracerPid")] = "0"
+            self.assertIsNone(dh._tracer_of(child.pid, start_time))
+        # Read for real: a process stopped by SIGSTOP has no tracer.
+        self.assertIsNone(dh._tracer_of(child.pid, start_time))
+        gone = subprocess.Popen(["true"])
+        gone.wait(timeout=30)
+        self.assertIsNone(dh._tracer_of(gone.pid, 0))
 
 
 if __name__ == "__main__":

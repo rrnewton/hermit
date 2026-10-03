@@ -518,6 +518,23 @@ def _kill_if_running(pid: int, start_time: int) -> None:
             os.close(pidfd)
 
 
+def _tracer_of(pid: int, start_time: int) -> Optional[int]:
+    """The thread-group id of the process ptrace-tracing ``pid``, or None.
+
+    None also when ``pid`` is no longer the process that started at
+    ``start_time``, checked after the read, so a reused pid's tracer is never
+    returned.
+    """
+    try:
+        tracer = int(_proc_status_value(pid, "TracerPid"))
+        tracer_tgid = int(_proc_status_value(tracer, "Tgid")) if tracer else 0
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not tracer_tgid or not _is_running(pid, start_time):
+        return None
+    return tracer_tgid
+
+
 def _kill_and_wait(
     processes: List[Tuple[str, int, int]], timeout: float
 ) -> List[Tuple[str, int, int]]:
@@ -1046,7 +1063,10 @@ class HermitGuestProgram:
         # elsewhere: safehermit runs it as a systemd user unit, where the
         # tracer, stopped since the last observation, and QEMU outlived every
         # pass. A pid is signalled only while it still has the start time
-        # recorded when start() found it, so a reused pid is left alone.
+        # recorded when start(), or here a pass that failed first, found it,
+        # so a reused pid is left alone.
+        if self._process is not None and self._process.poll() is None:
+            self._own_unrecorded_processes()
         survivors = []  # type: List[Tuple[str, int, int]]
         if self._owned_processes:
             survivors = _kill_and_wait(self._owned_processes, OWNED_PROCESS_EXIT_SECONDS)
@@ -1112,6 +1132,25 @@ class HermitGuestProgram:
         identity = _proc_identity(pid)
         if identity is not None:
             self._owned_processes.append((name, pid, identity[1]))
+
+    def _own_unrecorded_processes(self) -> None:
+        """Find QEMU and Hermit's tracer when the pass failed before start() recorded them.
+
+        A pass can fail while Hermit still runs, for instance waiting for QMP,
+        before start() looks for QEMU. QEMU's command line names this pass's
+        QMP socket, and QEMU's tracer is Hermit's, so neither can belong to
+        another run.
+        """
+        recorded = {name: (pid, start) for name, pid, start in self._owned_processes}
+        if "QEMU" not in recorded and self.qmp_socket is not None:
+            qemu_pid = _find_qemu(self.qmp_socket)
+            if qemu_pid is not None:
+                self._own_process("QEMU", qemu_pid)
+                recorded = {name: (pid, start) for name, pid, start in self._owned_processes}
+        if "QEMU" in recorded and "Hermit's tracer" not in recorded:
+            tracer_tgid = _tracer_of(*recorded["QEMU"])
+            if tracer_tgid is not None:
+                self._own_process("Hermit's tracer", tracer_tgid)
 
     def _report_failed_pass(self) -> None:
         """Print the end of a failed pass's Hermit log and remove its snapshot copy."""
