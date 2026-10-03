@@ -26,6 +26,16 @@
 //!   of those retries it would have made. History after a failed attempt that
 //!   does not earn a retry here is dropped, so that attempt is the cell's
 //!   verdict.
+//! - Only a FAIL (a product failure) that the policy retries continues an
+//!   imported history; an ERROR always ends it, whatever the policy says. The
+//!   one retry an executed run makes after an ERROR, the skid-overshoot retry
+//!   (`skid_overshoot_only_reports`,
+//!   <https://github.com/rrnewton/hermit/issues/1845>), is admitted only for
+//!   an attempt this run executed and classified itself: its admission rests
+//!   on the retained evidence of both attempts, which a row another runner
+//!   wrote cannot be trusted to carry completely. An imported history that
+//!   reaches a typed skid-overshoot ERROR therefore ends there (fail closed),
+//!   and that infrastructure ERROR is the cell's verdict.
 //! - A PASS counts only if the producer recorded complete evidence for the
 //!   execution that passed: that row's run id in `evidence_complete_executions`
 //!   in the bucket's `summary.json`. Evidence from another execution of the
@@ -69,7 +79,8 @@ pub fn bucket_dir(root: &Path, lane: &str, category: &str) -> PathBuf {
 /// The decisions an executed run makes for itself, applied to imported rows.
 pub struct ImportPolicy<'a> {
     /// Whether this run would retry after `row` (its retry setting and the
-    /// cell's `no_retry_reason`).
+    /// cell's `no_retry_reason`). It is consulted only for a FAIL row: an
+    /// imported ERROR is never retried, whatever this says.
     pub earns_retry: &'a dyn Fn(&SelectedCell, &CellResult) -> bool,
     /// Why this machine cannot run the cell, if it cannot.
     pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
@@ -372,9 +383,12 @@ pub fn load(
                         // Keep the history up to the first attempt this run
                         // would not have retried. A PASS is already the last
                         // row, so only a failed attempt can drop later ones.
+                        // Only a retried FAIL continues it: an ERROR, such as
+                        // a typed skid overshoot this run would retry had it
+                        // executed the attempt itself, ends it (fail closed).
                         let kept = found
                             .iter()
-                            .position(|row| !(policy.earns_retry)(cell, row))
+                            .position(|row| row.outcome != "FAIL" || !(policy.earns_retry)(cell, row))
                             .map_or(found.len(), |terminal| terminal + 1);
                         dropped_retries += found.len() - kept;
                         found.truncate(kept);

@@ -34,6 +34,9 @@ use hermit_manifest_plan::runner::SelectedCell;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::backend_capability;
+use hermit_manifest_plan::runner::cell_declared_stdout;
+use hermit_manifest_plan::runner::cell_expected_guest_exit;
+use hermit_manifest_plan::runner::cell_relaxations;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
@@ -44,6 +47,7 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::runner::validate_source_snapshot;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
@@ -2614,13 +2618,146 @@ enum Retries {
     Off,
 }
 
-/// Whether this finished attempt of `cell` is retried: a retryable product
-/// failure of a cell that has not declared `no_retry_reason`, in a run that
-/// has not turned retries off.
+/// Why a finished attempt is retried.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryCause {
+    /// A measured product failure ([`cell_result_is_retryable`]).
+    ProductFailure,
+    /// A verify cell whose only failure is Hermit's typed precise-timer
+    /// overshoot ([`skid_overshoot_only_reports`]), carrying the number of
+    /// `HERMIT_SKID_OVERSHOOT` reports. It is counted and reported as a
+    /// SKID-RETRY (<https://github.com/rrnewton/hermit/issues/1845>).
+    SkidOvershoot { reports: u64 },
+}
+
+/// Why this finished attempt of `cell` is retried, or `None` when it is not.
+///
+/// Retries apply only in a run that has not turned them off, and only to a
+/// cell that has not declared `no_retry_reason`, so `--no-retry` measurements
+/// and the single-attempt compatibility corpus keep exactly one attempt. The
+/// shared [`MAX_ATTEMPTS_PER_CELL`] caps both causes together. Every other
+/// failure, including a divergence, timeout or no-result that coincides with
+/// an overshoot report, has no cause and is final.
+fn attempt_retry_cause(
+    retries: Retries,
+    cell: &SelectedCell,
+    result: &CellResult,
+) -> Option<RetryCause> {
+    if retries != Retries::Framework || !retries_product_failures(cell) {
+        return None;
+    }
+    if cell_result_is_retryable(result.outcome.as_str(), result.failure_class) {
+        return Some(RetryCause::ProductFailure);
+    }
+    // The skid rule admits the guest disposition, checks the stdout
+    // assertions and applies the comparator the row records, so the row must
+    // record exactly what this cell's manifest declares; an imported row
+    // recorded under another declaration or recipe does not choose its own.
+    if result.expected_guest_exit != cell_expected_guest_exit(cell)
+        || result.declared_stdout.as_ref() != Some(&cell_declared_stdout(cell))
+        || result.relaxations != cell_relaxations(cell)
+    {
+        return None;
+    }
+    skid_overshoot_only_reports(result).map(|reports| RetryCause::SkidOvershoot { reports })
+}
+
+/// Whether this finished attempt of `cell` is retried; see
+/// [`attempt_retry_cause`].
 fn attempt_earns_retry(retries: Retries, cell: &SelectedCell, result: &CellResult) -> bool {
-    retries == Retries::Framework
-        && retries_product_failures(cell)
-        && cell_result_is_retryable(result.outcome.as_str(), result.failure_class)
+    attempt_retry_cause(retries, cell, result).is_some()
+}
+
+/// One SKID-RETRY of a cell's history: the retried attempt, its overshoot
+/// report count, and the outcome the cell's complete history selected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SkidRetry {
+    test: String,
+    mode: String,
+    backend: Option<String>,
+    attempt: u64,
+    reports: u64,
+    final_outcome: String,
+}
+
+/// Every SKID-RETRY in `histories`.
+///
+/// Every row but the last of a history is an attempt the harness retried (or,
+/// for imported rows, one this run's policy would have retried), so the cause
+/// is recomputed from that row with the same rule that launched the retry. An
+/// imported history continues only past a FAIL ([`imported_results`]), so it
+/// never contributes a SKID-RETRY.
+fn skid_retries(
+    retries: Retries,
+    cells: &[SelectedCell],
+    histories: &[Vec<CellResult>],
+) -> Vec<SkidRetry> {
+    let mut found = Vec::new();
+    for (cell, history) in cells.iter().zip(histories) {
+        let Some((_, retried)) = history.split_last() else {
+            continue;
+        };
+        let final_outcome = match cell_result_after_retries(history) {
+            Ok(result) => result.outcome.clone(),
+            Err(_) => "ERROR".into(),
+        };
+        for row in retried {
+            if let Some(RetryCause::SkidOvershoot { reports }) =
+                attempt_retry_cause(retries, cell, row)
+            {
+                found.push(SkidRetry {
+                    test: row.test.clone(),
+                    mode: row.mode.clone(),
+                    backend: row.backend.clone(),
+                    attempt: row.attempt,
+                    reports,
+                    final_outcome: final_outcome.clone(),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// The line printed for a typed skid attempt that is not followed by a retry.
+///
+/// `history` is the cell's history ending with that attempt, and `imported`
+/// says whether its rows were imported (`E2E_IMPORT_RESULTS`). At the shared
+/// cap the line is `SKID-RETRY LIMIT`; below it the line is
+/// `SKID-RETRY NOT MADE`, which says why: an imported history never continues
+/// past an ERROR, so an imported skid attempt never earns its retry (fail
+/// closed, [`imported_results`]); an executed one is retried unless its row
+/// could not be published. Either way it names the outcome
+/// [`cell_result_after_retries`] selects from the whole history, which is not
+/// always ERROR: a product failure earlier in the history outranks a final
+/// infrastructure error.
+fn unretried_skid_line(
+    test: &str,
+    mode: &str,
+    backend: Option<&str>,
+    attempt: u64,
+    reports: u64,
+    history: &[CellResult],
+    imported: bool,
+) -> String {
+    let selected = match cell_result_after_retries(history) {
+        Ok(result) => format!("{} (attempt {})", result.outcome, result.attempt),
+        Err(error) => format!("ERROR (the history is inconsistent: {error})"),
+    };
+    let backend = backend.unwrap_or("native");
+    if attempt >= MAX_ATTEMPTS_PER_CELL {
+        format!(
+            "SKID-RETRY LIMIT {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is {selected}"
+        )
+    } else if imported {
+        format!(
+            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but it is an imported attempt, and an imported history never continues past an ERROR, so its producer's later attempts are dropped; the cell's selected outcome is {selected}"
+        )
+    } else {
+        format!(
+            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but this run has no later attempt of the cell; the cell's selected outcome is {selected}"
+        )
+    }
 }
 
 /// The selection `run` applies for `args`: its filters, over the required
@@ -2861,13 +2998,20 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 suffix
             };
             let effective_will_retry = published && will_retry;
-            let retry_note = if effective_will_retry {
-                format!(
+            let skid_reports = match attempt_retry_cause(args.retries, &cells[index], &result) {
+                Some(RetryCause::SkidOvershoot { reports }) => Some(reports),
+                _ => None,
+            };
+            let retry_note = match (effective_will_retry, skid_reports) {
+                (true, Some(reports)) => format!(
+                    " [SKID-RETRY: attempt {} of at most {} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)) and nothing else; retrying this cell only]",
+                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                ),
+                (true, None) => format!(
                     " [attempt {} of at most {}; retrying this cell only]",
                     result.attempt, MAX_ATTEMPTS_PER_CELL
-                )
-            } else {
-                String::new()
+                ),
+                (false, _) => String::new(),
             };
             println!(
                 "{} {} ({}/{}){}{}",
@@ -2878,8 +3022,34 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 retry_note,
                 located
             );
+            let unretried_skid = match (effective_will_retry, skid_reports) {
+                (false, Some(reports)) => Some((
+                    reports,
+                    result.test.clone(),
+                    result.mode.clone(),
+                    result.backend.clone(),
+                    result.attempt,
+                )),
+                _ => None,
+            };
 
             attempt_results[index].push(result);
+            if let Some((reports, test, mode, backend, attempt)) = unretried_skid {
+                // A skid attempt that is not retried: say why, and which outcome
+                // the cell's whole history selected, where the cell finishes.
+                println!(
+                    "{}",
+                    unretried_skid_line(
+                        &test,
+                        &mode,
+                        backend.as_deref(),
+                        attempt,
+                        reports,
+                        &attempt_results[index],
+                        imported.is_some(),
+                    )
+                );
+            }
             if !effective_will_retry {
                 let result = match cell_result_after_retries(&attempt_results[index]) {
                     Ok(result) => result.clone(),
@@ -2957,11 +3127,27 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .into_iter()
         .map(|(_, result)| result)
         .collect::<Vec<_>>();
+    // Every SKID-RETRY stays visible: a count on the summary line, one line
+    // per retry, and both in summary.json. Each retried attempt's row is also
+    // kept in results.jsonl.
+    let skid_retried = skid_retries(args.retries, &cells, &attempt_results);
     if expected > 0 {
         println!(
-            "test-harness: completed {} cell(s) with up to {} concurrent worker(s)",
+            "test-harness: completed {} cell(s) with up to {} concurrent worker(s); SKID-RETRY count {}",
             results.len(),
-            capacity.workers_for(expected)
+            capacity.workers_for(expected),
+            skid_retried.len()
+        );
+    }
+    for retry in &skid_retried {
+        println!(
+            "test-harness: SKID-RETRY {} ({}/{}): attempt {} recorded {} HERMIT_SKID_OVERSHOOT report(s) and was retried; final outcome {}",
+            retry.test,
+            retry.mode,
+            retry.backend.as_deref().unwrap_or("native"),
+            retry.attempt,
+            retry.reports,
+            retry.final_outcome
         );
     }
     let host_inapplicable = results
@@ -3003,6 +3189,20 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         // not fail the run. Counted and named separately so they stay visible.
         "diagnostic_failures": diagnostic_cells.len(),
         "diagnostic_failure_cells": diagnostic_cells,
+        // Retries of a verify attempt whose only failure was Hermit's typed
+        // precise-timer overshoot (https://github.com/rrnewton/hermit/issues/1845).
+        "skid_retries": skid_retried.len(),
+        "skid_retry_cells": skid_retried
+            .iter()
+            .map(|retry| serde_json::json!({
+                "test": retry.test,
+                "mode": retry.mode,
+                "backend": retry.backend,
+                "attempt": retry.attempt,
+                "overshoot_reports": retry.reports,
+                "final_outcome": retry.final_outcome,
+            }))
+            .collect::<Vec<_>>(),
         "host_inapplicable": host_inapplicable,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
         "host_inapplicable_cells": results
@@ -3771,6 +3971,900 @@ report.write_bytes((root/'verification.json').read_bytes())
                     .all(|call| call["kind"] != "normalize" && call["kind"] != "compare"),
                 "{scenario}: E2E_KEEP_VERIFY_LOGS launched a log-diff: {calls:#?}"
             );
+        }
+    }
+
+    /// A verify attempt whose only failure is Hermit's typed precise-timer
+    /// overshoot earns one SKID-RETRY, which is counted on the summary line,
+    /// named in summary.json and kept as a row; a second overshoot fails the
+    /// cell loudly (<https://github.com/rrnewton/hermit/issues/1845>). An
+    /// overshoot report without its stderr markers, a run with `--no-retry`,
+    /// a divergence that merely prints the markers, and an overshoot beside a
+    /// rejected guest disposition (run 1 exited 1 so Hermit wrote its skid
+    /// report without a comparison, or a compared run 2 died from a signal)
+    /// are never SKID-RETRIES. Neither is an overshoot whose compared runs
+    /// printed something other than the cell's declared `expected_stdout`:
+    /// that attempt keeps the skid infrastructure ERROR, with a reason naming
+    /// both, is never retried, and the cell stays red.
+    /// The cap line names the outcome the whole history selects: after a
+    /// divergence and then an overshoot, that is the divergence's FAIL.
+    /// Imported (`E2E_IMPORT_RESULTS`), the skid-then-pass history never
+    /// earns its SKID-RETRY (fail closed): it ends at the skid attempt, whose
+    /// infrastructure ERROR is the cell's verdict, and a forged PASS after it
+    /// is never published.
+    #[test]
+    fn a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::runner::Selection;
+        use serde_json::json;
+
+        const CHILD: &str = "HERMIT_SKID_RETRY_FIXTURE";
+        // Where an import-mode child publishes, beside the executed run's
+        // output it imports.
+        const IMPORT_OUT: &str = "HERMIT_SKID_RETRY_FIXTURE_IMPORT_OUT";
+        const TEST: &str =
+            "tests::a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry";
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            let fixture = PathBuf::from(fixture);
+            let out = std::env::var_os(IMPORT_OUT).map_or_else(|| fixture.clone(), PathBuf::from);
+            let mut values = vec![
+                "--category".to_string(),
+                "parity".into(),
+                "--ci-only".into(),
+                "--prebuilt".into(),
+                "--jobs".into(),
+                "1".into(),
+                "--results".into(),
+                out.join("results.jsonl").display().to_string(),
+                "--junit".into(),
+                out.join("junit.xml").display().to_string(),
+            ];
+            if fs::read_to_string(fixture.join("scenario")).unwrap() == "skid-no-retry" {
+                values.push("--no-retry".into());
+            }
+            let args = parse(values.into_iter());
+            validate_args("run", &args);
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let code = super::run(&root, &manifests, &args);
+            std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+        }
+
+        let output = json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_bytes": 0, "stderr_bytes": 0});
+        let matched = json!({
+            "verified": true, "bitwise_parity": true, "verdict": "matched",
+            "no_result_reason": null, "infrastructure_error": null,
+            "comparison": {"strictness": "canonical", "display_name": "BitwiseInfoV1",
+                "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+                "record_envelope": "all_records_v1", "virtualize_time": true,
+                "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+                "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false, "skip_commit": false, "skip_detlog": false},
+            "compared_log_messages": {"left": 2, "right": 2},
+            "compared_outputs": {"left": output, "right": output},
+            "guest_exit_code": 0, "guest_signal": null,
+            "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null, "first_divergent_syscall": null,
+            "first_divergent_left_message": null, "first_divergent_right_message": null
+        });
+        let mut skid = matched.clone();
+        skid["verified"] = json!(false);
+        skid["bitwise_parity"] = json!(false);
+        skid["verdict"] = json!("infrastructure_error");
+        skid["infrastructure_error"] = json!({"kind": "skid_overshoot", "count": 2});
+        let mut diverged = matched.clone();
+        diverged["verified"] = json!(false);
+        diverged["bitwise_parity"] = json!(false);
+        diverged["verdict"] = json!("diverged");
+        diverged["first_divergent_scheduler_turn"] = json!(4);
+        diverged["first_divergent_virtual_nanoseconds"] = json!(7);
+        diverged["first_divergent_record"] = json!(9);
+        diverged["first_divergent_syscall"] = json!(2);
+        diverged["first_divergent_left_message"] = json!("left");
+        diverged["first_divergent_right_message"] = json!("right");
+        // Hermit's skid report when run 1 exited 1, which the verify policy
+        // rejects: no comparison, and run 1's rejected status.
+        let rejected = json!({
+            "verified": false, "bitwise_parity": false, "verdict": "infrastructure_error",
+            "no_result_reason": null,
+            "infrastructure_error": {"kind": "skid_overshoot", "count": 2},
+            "comparison": null, "compared_log_messages": null, "compared_outputs": null,
+            "runtime": null, "guest_exit_code": 1, "guest_signal": null,
+            "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null, "first_divergent_syscall": null,
+            "first_divergent_left_message": null, "first_divergent_right_message": null
+        });
+        // A completed comparison whose run 2 died from SIGSEGV.
+        let mut crashed = skid.clone();
+        crashed["compared_outputs"]["right"]["exit_code"] = json!(null);
+        crashed["compared_outputs"]["right"]["signal"] = json!(11);
+        for report in [&matched, &skid, &diverged, &rejected, &crashed] {
+            hermit_manifest_plan::canonical_verdict::VerificationReport::from_current_json_slice(
+                &serde_json::to_vec(report).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let real_cell = |test: &str| {
+            manifests
+                .select(&Selection {
+                    test: Some(test.into()),
+                    mode: Some("verify".into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+
+        // (scenario, harness exit success, attempts launched, SKID-RETRY count)
+        for (scenario, succeeds, launched, skid_retries) in [
+            ("skid-then-match", true, 2, 1),
+            ("skid-then-match-sabre", true, 2, 1),
+            ("skid-twice", false, 2, 1),
+            ("skid-no-retry", false, 1, 0),
+            ("unmarked-skid", false, 1, 0),
+            ("diverged-marked", false, 2, 0),
+            ("diverged-then-skid", false, 2, 0),
+            ("rejected-guest-skid", false, 1, 0),
+            ("crashed-operand-skid", false, 1, 0),
+            ("skid-wrong-stdout", false, 1, 0),
+        ] {
+            let fixture = std::env::temp_dir().join(format!(
+                "hermit-harness-skid-retry-{}-{:?}-{scenario}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&fixture);
+            fs::create_dir(&fixture).unwrap();
+            let path = fixture.as_path();
+            // The SaBRe scenario runs the same history on the one backend
+            // whose rows carry execution-path evidence.
+            let backend = if scenario == "skid-then-match-sabre" {
+                "sabre"
+            } else {
+                "ptrace"
+            };
+            fs::write(path.join("scenario"), scenario).unwrap();
+            for (name, report) in [
+                ("matched", &matched),
+                ("skid", &skid),
+                ("diverged", &diverged),
+                ("rejected", &rejected),
+                ("crashed", &crashed),
+            ] {
+                fs::write(
+                    path.join(format!("{name}.json")),
+                    serde_json::to_vec(report).unwrap(),
+                )
+                .unwrap();
+            }
+            let manifests_dir = path.join("tests/e2e/manifests");
+            fs::create_dir_all(&manifests_dir).unwrap();
+            fs::write(
+                manifests_dir.join("defaults.yaml"),
+                "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+            )
+            .unwrap();
+            let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+                "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+                "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+                "liteinst": "Not selected by this control"
+            }});
+            let mut verify = if backend == "sabre" {
+                json!({"ci": true, "backends_enabled": ["sabre"],
+                    "backends_disabled": {"ptrace": "Not selected", "kvm": "Not selected", "dbt": "Not selected", "liteinst": "Not selected"}})
+            } else {
+                json!({"ci": true, "backends_enabled": ["ptrace"],
+                    "backends_disabled": {"kvm": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}})
+            };
+            if scenario == "skid-wrong-stdout" {
+                // Every fixture report records empty stdout from both runs, so
+                // the skid attempt violates this declaration; no retry follows.
+                verify["expected_stdout"] = json!({"ptrace": "skid-control-ok\n"});
+            }
+            fs::write(
+                manifests_dir.join("parity.yaml"),
+                serde_json::to_vec(&json!({
+                    "schema": 3, "bucket": "parity", "test": [{
+                        "id": "parity/skid", "description": "Precise-timer overshoot retry control",
+                        "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                        "observation": {"status": true, "stdout": true, "stderr": true},
+                        "modes": {
+                            "verify": verify,
+                            "naked": {"ci": false, "backends_enabled": [],
+                                "backends_disabled": {"native": "Not selected by this CI control"}},
+                            "chaos": disabled, "replay": disabled, "custom": disabled
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let hermit = path.join("fake-hermit");
+            fs::write(
+                &hermit,
+                r#"#!/usr/bin/python3
+import json,os,pathlib,sys
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+if '--help' in a:
+ print('--verify-strict');sys.exit(0)
+if 'run' in a:a=a[a.index('run'):]
+if not a or a[0]!='run':sys.exit(0)
+calls=root/'invocations'
+n=len(calls.read_text().splitlines()) if calls.exists() else 0
+with calls.open('a') as f:f.write(json.dumps(a)+'\n')
+plan={'skid-then-match':['skid','matched'],'skid-then-match-sabre':['skid','matched'],
+ 'skid-twice':['skid','skid'],
+ 'skid-no-retry':['skid'],'unmarked-skid':['unmarked'],'diverged-marked':['diverged','diverged'],
+ 'diverged-then-skid':['diverged','skid'],'rejected-guest-skid':['rejected'],
+ 'crashed-operand-skid':['crashed'],'skid-wrong-stdout':['skid','matched']}
+kind=plan[(root/'scenario').read_text()][n]
+report=pathlib.Path(a[a.index('--verify-json')+1])
+logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
+logdir.mkdir(parents=True,exist_ok=True)
+(logdir/'run1_log_fixture.log').write_text('INFO detcore: shared\nINFO detcore: complete\n')
+report.write_bytes((root/(('skid' if kind=='unmarked' else kind)+'.json')).read_bytes())
+evidence=os.environ.get('HERMIT_SABRE_PATH_EVIDENCE')
+if evidence:
+ line='{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}\n'
+ pathlib.Path(evidence).write_text(line+line)
+if kind in ('skid','diverged','rejected','crashed'):
+ sys.stderr.write('HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829\n'
+  'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2\n')
+sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'diverged':1}[kind])
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+            let result = Command::new("timeout")
+                .args(["--kill-after=2s", "60s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD, path)
+                .env("HERMIT_BIN", &hermit)
+                .env("E2E_RESULT_ROOT", path.join("artifacts"))
+                .env("E2E_BUILD_ROOT", path.join("build"))
+                .env("E2E_RUN_ID", "skid-retry-control")
+                .env("E2E_MACHINE_SHORTNAME", "skid-control")
+                .env("E2E_KERNEL_VERSION", "skid-control")
+                .env("E2E_KEEP_VERIFY_LOGS", "1")
+                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+            assert_eq!(
+                result.status.code(),
+                Some(if succeeds { 0 } else { 1 }),
+                "{scenario}: {stdout}\n{stderr}"
+            );
+            let calls = fs::read_to_string(path.join("invocations")).unwrap();
+            assert_eq!(calls.lines().count(), launched, "{scenario}: {calls}");
+            let rows = fs::read_to_string(path.join("results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), launched, "{scenario}: {rows:#?}");
+            for (position, row) in rows.iter().enumerate() {
+                assert_eq!(row.attempt, position as u64 + 1, "{scenario}");
+                row.require_current_classification().unwrap();
+            }
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("summary.json")).unwrap()).unwrap();
+            assert_eq!(summary["skid_retries"], json!(skid_retries), "{scenario}");
+            assert!(
+                stdout.contains(&format!("; SKID-RETRY count {skid_retries}\n")),
+                "{scenario}: the summary line must carry the SKID-RETRY count: {stdout}"
+            );
+            let first = &rows[0];
+            match scenario {
+                "skid-then-match" | "skid-then-match-sabre" | "skid-twice" => {
+                    let final_outcome = if succeeds { "PASS" } else { "ERROR" };
+                    assert_eq!(first.outcome, "ERROR", "{scenario}");
+                    assert_eq!(rows[1].outcome, final_outcome, "{scenario}");
+                    assert_eq!(
+                        summary["skid_retry_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": backend,
+                            "attempt": 1, "overshoot_reports": 2, "final_outcome": final_outcome,
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "test-harness: SKID-RETRY parity/skid (verify/{backend}): attempt 1 recorded 2 HERMIT_SKID_OVERSHOOT report(s) and was retried; final outcome {final_outcome}"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert_eq!(
+                        stdout.contains(&format!(
+                            "SKID-RETRY LIMIT parity/skid (verify/{backend}): attempt 2 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is ERROR (attempt 2)\n"
+                        )),
+                        !succeeds,
+                        "{scenario}: the cap must be loud exactly when it is reached: {stdout}"
+                    );
+                    assert!(
+                        !stdout.contains("SKID-RETRY NOT MADE"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert_eq!(
+                        summary["errors"],
+                        json!(usize::from(!succeeds)),
+                        "{scenario}"
+                    );
+                    // A history that ends at a skid attempt below the cap
+                    // names the missing retry, and why, without claiming the
+                    // cap was reached.
+                    assert_eq!(
+                        super::unretried_skid_line(
+                            "parity/skid",
+                            "verify",
+                            Some(backend),
+                            1,
+                            2,
+                            &rows[..1],
+                            false
+                        ),
+                        format!(
+                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but this run has no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
+                        ),
+                        "{scenario}"
+                    );
+                    assert_eq!(
+                        super::unretried_skid_line(
+                            "parity/skid",
+                            "verify",
+                            Some(backend),
+                            1,
+                            2,
+                            &rows[..1],
+                            true
+                        ),
+                        format!(
+                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt, and an imported history never continues past an ERROR, so its producer's later attempts are dropped; the cell's selected outcome is ERROR (attempt 1)"
+                        ),
+                        "{scenario}"
+                    );
+                }
+                "diverged-then-skid" => {
+                    // The retry was earned by the product failure, so it is
+                    // not a SKID-RETRY; the capped skid attempt is still named,
+                    // and the selected outcome is the earlier FAIL, not ERROR.
+                    assert_eq!(first.outcome, "FAIL", "{scenario}");
+                    assert_eq!(rows[1].outcome, "ERROR", "{scenario}");
+                    assert_eq!(summary["skid_retry_cells"], json!([]), "{scenario}");
+                    assert!(!stdout.contains("SKID-RETRY:"), "{scenario}: {stdout}");
+                    assert!(
+                        stdout.contains("[attempt 1 of at most 2; retrying this cell only]"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        stdout.contains(
+                            "SKID-RETRY LIMIT parity/skid (verify/ptrace): attempt 2 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is FAIL (attempt 1)\n"
+                        ),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        !stdout.contains("test-harness: SKID-RETRY "),
+                        "{scenario}: {stdout}"
+                    );
+                }
+                _ => {
+                    assert_eq!(summary["skid_retry_cells"], json!([]), "{scenario}");
+                    assert!(!stdout.contains("SKID-RETRY:"), "{scenario}: {stdout}");
+                    assert!(!stdout.contains("SKID-RETRY LIMIT"), "{scenario}: {stdout}");
+                    assert!(
+                        !stdout.contains("SKID-RETRY NOT MADE"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        !stdout.contains("test-harness: SKID-RETRY "),
+                        "{scenario}: {stdout}"
+                    );
+                }
+            }
+            match scenario {
+                "skid-no-retry" => {
+                    // The same row would have earned a retry in a framework run.
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            first
+                        ),
+                        Some(super::RetryCause::SkidOvershoot { reports: 2 })
+                    );
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Off,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            first
+                        ),
+                        None
+                    );
+                    // A row that declares exit 7 and whose compared runs both
+                    // exited 7 is skid-only by its own declaration, but the
+                    // real cell declares no expected exit, so it chooses none.
+                    let mut sevens = skid.clone();
+                    sevens["guest_exit_code"] = json!(7);
+                    sevens["compared_outputs"]["left"]["exit_code"] = json!(7);
+                    sevens["compared_outputs"]["right"]["exit_code"] = json!(7);
+                    let mut redeclared = first.clone();
+                    redeclared.expected_guest_exit =
+                        Some(hermit_manifest_plan::runner::ExpectedGuestExit {
+                            code: Some(7),
+                            signal: None,
+                            reason: "an imported row's own declaration".into(),
+                        });
+                    let sevens = serde_json::to_string(&sevens).unwrap();
+                    redeclared.attempts[0].verification_report_sha256 = Some({
+                        use sha2::Digest;
+                        format!("{:x}", sha2::Sha256::digest(sevens.as_bytes()))
+                    });
+                    redeclared.attempts[0].verification_report = Some(sevens);
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&redeclared),
+                        Some(2),
+                        "{redeclared:#?}"
+                    );
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            &redeclared
+                        ),
+                        None
+                    );
+                    // Likewise a row recorded under a stdout declaration the
+                    // real cell does not make: its compared runs meet its own
+                    // (an empty exact stdout), so the skid rule accepts it,
+                    // but the real cell declares no stdout assertion.
+                    let mut restated = first.clone();
+                    restated.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+                        exact: Some(String::new()),
+                        contains: None,
+                    });
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&restated),
+                        Some(2),
+                        "{restated:#?}"
+                    );
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            &restated
+                        ),
+                        None
+                    );
+                    // A row whose report is not the bytes its recorded digest
+                    // names (an imported or edited row) earns no retry: the
+                    // skid rule decides nothing from such a report.
+                    for (label, digest) in [("missing", None), ("mismatched", Some("0".repeat(64)))]
+                    {
+                        let mut undigested = first.clone();
+                        undigested.attempts[0].verification_report_sha256 = digest;
+                        assert_eq!(
+                            super::attempt_retry_cause(
+                                super::Retries::Framework,
+                                &real_cell("c-programs/getrusage-self-accounting"),
+                                &undigested
+                            ),
+                            None,
+                            "a {label} report digest: {undigested:#?}"
+                        );
+                    }
+                    // A single-attempt compatibility cell keeps one attempt.
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("compat/cat"),
+                            first
+                        ),
+                        None
+                    );
+                }
+                "unmarked-skid" => {
+                    assert_eq!(first.outcome, "ERROR", "{scenario}");
+                    assert_eq!(first.error_kind.as_deref(), Some("infrastructure"));
+                }
+                "rejected-guest-skid" | "crashed-operand-skid" => {
+                    // The same typed skid ERROR as an earned retry, refused
+                    // only for its guest disposition, and the real cell would
+                    // refuse it too.
+                    assert_eq!(first.outcome, "ERROR", "{scenario}");
+                    assert_eq!(first.error_kind.as_deref(), Some("infrastructure"));
+                    assert_eq!(
+                        first.reason.as_deref(),
+                        Some("verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)"),
+                        "{scenario}"
+                    );
+                    assert_eq!(summary["errors"], json!(1), "{scenario}");
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            first
+                        ),
+                        None,
+                        "{scenario}"
+                    );
+                }
+                "diverged-marked" => {
+                    // The ordinary product-failure retry, never a SKID-RETRY.
+                    assert!(rows.iter().all(|row| row.outcome == "FAIL"), "{rows:#?}");
+                    assert!(
+                        stdout.contains("[attempt 1 of at most 2; retrying this cell only]"),
+                        "{stdout}"
+                    );
+                }
+                "skid-wrong-stdout" => {
+                    // A typed, marked overshoot whose compared runs both
+                    // printed something other than the declared stdout: the
+                    // skid infrastructure ERROR every row reader accepts, with
+                    // a reason that names the overshoot and the violated
+                    // assertion, never retried and never a SKID-RETRY. The row
+                    // records the declaration it was decided under.
+                    let reason = format!(
+                        "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s), and its compared runs violate a declared stdout assertion: {}",
+                        hermit_manifest_plan::runner::expected_stdout_mismatch_reason(
+                            "first",
+                            0,
+                            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                            16,
+                            "4aab145057a66c842ce881dbe313e2caf4bf7e5e57c8bf60b07ffc097e59f20a",
+                        )
+                    );
+                    assert_eq!(
+                        (
+                            first.outcome.as_str(),
+                            first.error_kind.as_deref(),
+                            first.reason.as_deref(),
+                            first.failure_class,
+                        ),
+                        (
+                            "ERROR",
+                            Some("infrastructure"),
+                            Some(reason.as_str()),
+                            Some(
+                                hermit_manifest_plan::runner::FailureClass::UnderstoodInfrastructureFailure
+                            ),
+                        ),
+                        "{rows:#?}"
+                    );
+                    assert_eq!(first.attempts.len(), 1, "{rows:#?}");
+                    assert_eq!(
+                        first.declared_stdout,
+                        Some(hermit_manifest_plan::runner::DeclaredStdout {
+                            exact: Some("skid-control-ok\n".into()),
+                            contains: None,
+                        }),
+                        "{rows:#?}"
+                    );
+                    assert_eq!(summary["errors"], json!(1), "{scenario}");
+                    assert_eq!(super::skid_overshoot_only_reports(first), None);
+                    // The same attempt with the plain skid reason, as an older
+                    // producer would have labelled it, is still refused: the
+                    // row's recorded declaration is re-decided against the
+                    // report's digests.
+                    let mut relabelled = first.clone();
+                    let skid_reason = "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)";
+                    relabelled.reason = Some(skid_reason.into());
+                    relabelled.attempts[0].reason = Some(skid_reason.into());
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&relabelled),
+                        None,
+                        "{relabelled:#?}"
+                    );
+                    let mut undeclared = relabelled.clone();
+                    undeclared.declared_stdout =
+                        Some(hermit_manifest_plan::runner::DeclaredStdout::default());
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&undeclared),
+                        Some(2),
+                        "the relabelled row differs from a qualifying one only in its declaration"
+                    );
+                    assert!(!stdout.contains("retrying this cell only"), "{stdout}");
+                }
+                _ => {}
+            }
+            if scenario.starts_with("skid-then-match") {
+                // The same history imported (`E2E_IMPORT_RESULTS`) as a Buck
+                // run leaves it: each attempt is its own producer execution
+                // with its own run id and CPU observations bound to that
+                // execution's outer attempt 1, from a clean tree, and each has
+                // an evidence-complete record. An imported history never
+                // continues past an ERROR, so the skid retry, the one retry an
+                // executed run makes after an infrastructure ERROR, is never
+                // admitted from imported rows (fail closed): the history ends
+                // at the skid attempt, one infrastructure ERROR with no
+                // SKID-RETRY, and the producer's PASS is dropped. That holds
+                // for the intact history, which names the retry it did not
+                // make, and for every forged PASS after it (a missing or wrong
+                // report digest, no report, a correctly hashed diverged
+                // report, relaxations the cell's recipe does not select, or a
+                // SaBRe execution path its own retained evidence does not
+                // decide): none is ever published. A skid row its own evidence
+                // does not decide as typed skid-only (one whose comparison
+                // compared no log messages, that was recorded under other
+                // relaxations, or whose SaBRe path its own evidence does not
+                // decide) ends the history the same way, without naming a
+                // retry.
+                enum Expect {
+                    TypedSkid,
+                    Untyped,
+                }
+                let sha256 = |text: &str| {
+                    use sha2::Digest;
+                    format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
+                };
+                let diverged_raw = serde_json::to_string(&diverged).unwrap();
+                let mut vacuous = skid.clone();
+                vacuous["compared_log_messages"] = json!({"left": 0, "right": 0});
+                let vacuous_raw = serde_json::to_string(&vacuous).unwrap();
+                let clean_path = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+                let fallback_path = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+                let fallback_evidence = format!("{clean_path}\n{fallback_path}\n");
+                if backend == "sabre" {
+                    // The executed history is a genuine SaBRe one: each row's
+                    // recorded path is the eligible summary of the two clean
+                    // records its attempt retained.
+                    for row in &rows {
+                        assert_eq!(
+                            row.execution_path.as_ref().map(|path| &path["eligible"]),
+                            Some(&json!(true)),
+                            "{rows:#?}"
+                        );
+                        assert_eq!(
+                            hermit_manifest_plan::runner::retained_execution_path_error(row),
+                            None
+                        );
+                    }
+                }
+                let variants = if backend == "sabre" {
+                    vec![
+                        ("import-control", Expect::TypedSkid),
+                        ("import-pathless-pass", Expect::TypedSkid),
+                        ("import-pathless-recomputed-pass", Expect::TypedSkid),
+                        ("import-fallback-pass", Expect::TypedSkid),
+                        ("import-fallback-recomputed-pass", Expect::TypedSkid),
+                        ("import-misdigested-path-pass", Expect::TypedSkid),
+                        ("import-unselected-pass", Expect::TypedSkid),
+                        ("import-pathless-skid", Expect::Untyped),
+                        ("import-fallback-recomputed-skid", Expect::Untyped),
+                        ("import-misdigested-path-skid", Expect::Untyped),
+                    ]
+                } else {
+                    vec![
+                        ("import-control", Expect::TypedSkid),
+                        ("import-undigested-pass", Expect::TypedSkid),
+                        ("import-misdigested-pass", Expect::TypedSkid),
+                        ("import-reportless-pass", Expect::TypedSkid),
+                        ("import-diverged-pass", Expect::TypedSkid),
+                        ("import-relaxed-pass", Expect::TypedSkid),
+                        ("import-vacuous-skid", Expect::Untyped),
+                        ("import-relaxed-skid", Expect::Untyped),
+                    ]
+                };
+                for (variant, expect) in variants {
+                    let mut imported = rows.clone();
+                    for (number, row) in imported.iter_mut().enumerate() {
+                        row.run_id = format!("skid-producer-{}", number + 1);
+                        row.source_tree_dirty = false;
+                        let observations = row
+                            .cpu_observations
+                            .as_mut()
+                            .expect("an executed row carries CPU observations");
+                        observations.binding.run_id = row.run_id.clone();
+                        observations.binding.outer_attempt = 1;
+                    }
+                    // A `-skid` variant edits the skid row, every other one
+                    // the PASS after it.
+                    let row = &mut imported[usize::from(!variant.ends_with("-skid"))];
+                    match variant {
+                        "import-undigested-pass" => {
+                            row.attempts[0].verification_report_sha256 = None;
+                        }
+                        "import-misdigested-pass" => {
+                            row.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+                        }
+                        "import-reportless-pass" => {
+                            row.attempts[0].verification_report = None;
+                            row.attempts[0].verification_report_sha256 = None;
+                        }
+                        "import-diverged-pass" => {
+                            row.attempts[0].verification_report_sha256 =
+                                Some(sha256(&diverged_raw));
+                            row.attempts[0].verification_report = Some(diverged_raw.clone());
+                        }
+                        "import-vacuous-skid" => {
+                            row.attempts[0].verification_report_sha256 = Some(sha256(&vacuous_raw));
+                            row.attempts[0].verification_report = Some(vacuous_raw.clone());
+                        }
+                        "import-relaxed-pass" | "import-relaxed-skid" => {
+                            row.relaxations.push("--no-rcb-time: fixture reason".into());
+                        }
+                        "import-pathless-pass"
+                        | "import-pathless-recomputed-pass"
+                        | "import-pathless-skid" => {
+                            row.attempts[0].sabre_path_evidence = None;
+                            row.attempts[0].sabre_path_evidence_sha256 = None;
+                            if variant == "import-pathless-recomputed-pass" {
+                                // The summary of no records.
+                                let path = row.execution_path.as_mut().unwrap();
+                                path["complete"] = json!(false);
+                                path["execution_count"] = json!(0);
+                                path["guest_rpc_observed"] = json!(false);
+                                path["eligible"] = json!(false);
+                                path["executions"] = json!([]);
+                            }
+                        }
+                        "import-fallback-pass"
+                        | "import-fallback-recomputed-pass"
+                        | "import-fallback-recomputed-skid" => {
+                            row.attempts[0].sabre_path_evidence_sha256 =
+                                Some(sha256(&fallback_evidence));
+                            row.attempts[0].sabre_path_evidence = Some(fallback_evidence.clone());
+                            if variant != "import-fallback-pass" {
+                                // The summary of a run that used one ptrace
+                                // fallback site.
+                                let path = row.execution_path.as_mut().unwrap();
+                                path["ptrace_fallback_sites"] = json!(1);
+                                path["eligible"] = json!(false);
+                                path["executions"][1]["ptrace_fallback_sites"] = json!(1);
+                            }
+                        }
+                        "import-misdigested-path-pass" | "import-misdigested-path-skid" => {
+                            row.attempts[0].sabre_path_evidence_sha256 = Some("0".repeat(64));
+                        }
+                        "import-unselected-pass" => {
+                            // The attempt ran ptrace, and its CPU observations
+                            // record the same command, so only the backend
+                            // the row claims is wrong.
+                            let selected = row.attempts[0].argv.clone();
+                            let mut unselected = selected.clone();
+                            let at = unselected
+                                .iter()
+                                .position(|arg| arg == "--backend")
+                                .unwrap();
+                            unselected[at + 1] = "ptrace".into();
+                            row.attempts[0].argv = unselected.clone();
+                            let observations = row.cpu_observations.as_mut().unwrap();
+                            let mut rebound = 0;
+                            for invocation in &mut observations.invocations {
+                                if invocation.command.argv == selected {
+                                    invocation.command.argv = unselected.clone();
+                                    rebound += 1;
+                                }
+                            }
+                            assert_eq!(rebound, 1, "{rows:#?}");
+                        }
+                        _ => {}
+                    }
+                    let import = path.join(variant).join("import");
+                    let bucket = hermit_manifest_plan::imported_results::bucket_dir(
+                        &import, "portable", "parity",
+                    );
+                    fs::create_dir_all(&bucket).unwrap();
+                    fs::write(
+                        bucket.join("results.jsonl"),
+                        imported
+                            .iter()
+                            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                            .collect::<String>(),
+                    )
+                    .unwrap();
+                    let evidence = imported
+                        .iter()
+                        .map(|row| {
+                            json!({"test": row.test, "mode": row.mode,
+                                "backend": row.backend, "run_id": row.run_id})
+                        })
+                        .collect::<Vec<_>>();
+                    fs::write(
+                        bucket.join("summary.json"),
+                        serde_json::to_vec(&json!({"evidence_complete_executions": evidence}))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let out = path.join(variant).join("out");
+                    fs::create_dir_all(&out).unwrap();
+                    let result = Command::new("timeout")
+                        .args(["--kill-after=2s", "60s"])
+                        .arg(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture"])
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env(CHILD, path)
+                        .env(IMPORT_OUT, &out)
+                        .env("E2E_IMPORT_RESULTS", &import)
+                        .env("HERMIT_BIN", &hermit)
+                        .env("E2E_RESULT_ROOT", path.join(variant).join("artifacts"))
+                        .env("E2E_BUILD_ROOT", path.join("build"))
+                        .env("E2E_RUN_ID", "skid-import-consumer")
+                        .env("E2E_MACHINE_SHORTNAME", "skid-control")
+                        .env("E2E_KERNEL_VERSION", "skid-control")
+                        .env("DAGRUN_TEST_COUNTS_PATH", out.join("counts.json"))
+                        .output()
+                        .unwrap();
+                    let context = format!(
+                        "{scenario} {variant}: {}\n{}",
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    // The cell's verdict is the skid ERROR, which fails the run.
+                    assert_eq!(result.status.code(), Some(1), "{context}");
+                    assert!(
+                        String::from_utf8_lossy(&result.stderr).contains(
+                            "0 have no result; 1 producer retr(ies) this run would not have made were dropped"
+                        ),
+                        "{context}"
+                    );
+                    // Import mode launches no Hermit.
+                    let calls = fs::read_to_string(path.join("invocations")).unwrap();
+                    assert_eq!(calls.lines().count(), launched, "{context}");
+                    let published = fs::read_to_string(out.join("results.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let summary: serde_json::Value =
+                        serde_json::from_slice(&fs::read(out.join("summary.json")).unwrap())
+                            .unwrap();
+                    let stdout = String::from_utf8_lossy(&result.stdout);
+                    // The skid row itself, as its producer wrote it, and
+                    // nothing after it.
+                    assert_eq!(published.len(), 1, "{context}");
+                    let row = &published[0];
+                    assert_eq!(
+                        (row.attempt, row.outcome.as_str(), row.error_kind.as_deref()),
+                        (1, "ERROR", Some("infrastructure")),
+                        "{context}"
+                    );
+                    assert_eq!(summary["skid_retries"], json!(0), "{context}");
+                    assert_eq!(summary["skid_retry_cells"], json!([]), "{context}");
+                    assert!(stdout.contains("; SKID-RETRY count 0\n"), "{context}");
+                    assert!(!stdout.contains("SKID-RETRY:"), "{context}");
+                    let not_made = format!(
+                        "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt, and an imported history never continues past an ERROR, so its producer's later attempts are dropped; the cell's selected outcome is ERROR (attempt 1)\n"
+                    );
+                    assert_eq!(
+                        stdout.contains(&not_made),
+                        matches!(expect, Expect::TypedSkid),
+                        "{context}"
+                    );
+                }
+            }
+            fs::remove_dir_all(&fixture).unwrap();
         }
     }
 

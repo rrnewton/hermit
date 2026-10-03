@@ -535,7 +535,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci` over this node's selection measured 834
     // at 5c4251450a21, and the full validation of c1312a563dc5, which has the
     // first four, ran 832.
-    ("test.regular_crates", 834),
+    // runner::tests::only_a_typed_skid_overshoot_and_nothing_else_is_a_skid_only_row,
+    // runner::tests::a_skid_attempt_that_breaks_a_declared_stdout_assertion_is_not_skid_only,
+    // runner::tests::a_skid_row_records_the_cells_declared_stdout and
+    // test-harness
+    // tests::a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry,
+    // added with the SKID-RETRY of
+    // https://github.com/rrnewton/hermit/issues/1845, retain all 834 prior
+    // identities.
+    ("test.regular_crates", 838),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -639,7 +647,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests::kvm_reports_stored_metadata_timestamps_only_for_sequential_tool_threads,
     // added with KVM's stored host file timestamps (562b7dd7a635), retains
     // all 815 prior identities.
-    ("test.hermit_unit", 816),
+    // verify::tests::skid_overshoot_refusal_keeps_a_refused_comparisons_reason
+    // (a skid overshoot no longer erases a refused comparison's reason, so the
+    // SKID-RETRY of https://github.com/rrnewton/hermit/issues/1845 cannot
+    // retry it) retains all 816 prior identities.
+    ("test.hermit_unit", 817),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -952,7 +964,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same eighteen
     // https://github.com/rrnewton/hermit/pull/3635 tests.
     // The host twin selects the same 562b7dd7a635 test.
-    ("test.hermit_unit_on_host", 816),
+    // The host twin selects the same
+    // https://github.com/rrnewton/hermit/issues/1845 test.
+    ("test.hermit_unit_on_host", 817),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -979,8 +993,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three fold-4 variant tests retain all 822 prior identities.
     // The three fold-5 replay-variant tests retain all 825 prior identities.
     // The six later cpu_evidence, glibc_compat and runner tests listed for
-    // test.regular_crates retain all 828 prior identities.
-    ("test.regular_crates_on_host", 834),
+    // test.regular_crates retain all 828 prior identities, and the four
+    // SKID-RETRY tests of https://github.com/rrnewton/hermit/issues/1845 listed
+    // there retain all 834.
+    ("test.regular_crates_on_host", 838),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

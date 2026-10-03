@@ -1927,6 +1927,8 @@ mod tests {
                     detail: "fixture comparator refusal".into(),
                 }
             }),
+            refused_log_comparison: (verdict == Verdict::NoResult)
+                .then(|| "fixture comparator refusal".into()),
             guest_status: ExitStatus::Exited(guest_exit),
             comparison: ComparisonSpec::new(
                 LogCompareStrictness::Canonical,

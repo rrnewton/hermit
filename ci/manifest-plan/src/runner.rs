@@ -735,7 +735,7 @@ fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
 }
 
 /// The declared guest disposition for a selected verify or replay cell.
-fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
+pub fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
     expectation_recipe(cell)?.expected_guest_exit.clone()
 }
 
@@ -755,6 +755,15 @@ fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
         .expected_stdout_contains
         .get(backend)
         .cloned()
+}
+
+/// Both stdout assertions a selected verify or replay cell declares for its
+/// backend, in the form a skid attempt records them ([`DeclaredStdout`]).
+pub fn cell_declared_stdout(cell: &SelectedCell) -> DeclaredStdout {
+    DeclaredStdout {
+        exact: cell_expected_stdout(cell),
+        contains: cell_expected_stdout_contains(cell),
+    }
 }
 
 /// A per-backend stdout assertion is verify-only and keyed by enabled backends.
@@ -1085,6 +1094,35 @@ fn check_expected_stdout_contains(
             expected_stdout_contains_mismatch_reason(captured_bytes, &captured_sha256, text),
         ))
     }
+}
+
+/// The first declared stdout assertion of `spec` that the compared runs of
+/// `report` do not satisfy: the exact `expected_stdout`
+/// ([`check_expected_stdout`]), then the `expected_stdout_contains` text
+/// searched in the verify stdout captured at `stdout_path`
+/// ([`check_expected_stdout_contains`]). `None` when the cell declares
+/// neither or every declared assertion holds.
+fn declared_stdout_error(
+    spec: &CellRunSpec,
+    report: &VerificationReport,
+    stdout_path: &Path,
+) -> Option<ExpectedStdoutError> {
+    if let Some(Err(error)) = spec
+        .expected_stdout
+        .as_deref()
+        .map(|expected| check_expected_stdout(expected, report))
+    {
+        return Some(error);
+    }
+    spec.expected_stdout_contains
+        .as_deref()
+        .and_then(|text| match fs::read(stdout_path) {
+            Ok(captured) => check_expected_stdout_contains(text, &captured, report).err(),
+            Err(error) => Some(ExpectedStdoutError::Unevidenced(format!(
+                "cannot read captured verify stdout {}: {error}, so the declared expected_stdout_contains cannot be checked",
+                stdout_path.display()
+            ))),
+        })
 }
 
 pub fn validate_expected_guest_exit(
@@ -1993,7 +2031,12 @@ fn supports_test_workdir(mode: &str, _backend: &str) -> bool {
     matches!(mode, "verify" | "replay" | "chaos" | "custom")
 }
 
-fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
+/// The relaxations a row of `cell` records ([`CellResult::relaxations`]): each
+/// weaker-than-default setting its manifest recipe selects, with its reason.
+/// A retained row whose relaxations differ was recorded under another recipe,
+/// so its evidence does not decide this cell. The recipe of the cell's own
+/// mode must exist, as it does for every planned cell.
+pub fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     let recipe = &cell.test.modes[&cell.id.mode];
     let mut relaxations = Vec::new();
     if recipe.compare_io_buffers == Some(false) {
@@ -2119,6 +2162,18 @@ pub fn terminal_diagnostic_reason<'a>(
 /// Whether relaxations record the stripped comparator with a reason.
 pub fn records_stripped_comparator(relaxations: &[String]) -> bool {
     recorded_relaxation_reason(relaxations, STRIPPED_COMPARATOR_RELAXATION_PREFIX).is_some()
+}
+
+/// The comparator a verify row was judged by, as its relaxations record it:
+/// `stripped` when they record the stripped comparator with a reason
+/// ([`records_stripped_comparator`]), the runner's default `strict`
+/// otherwise. A row that records it malformed is therefore held to `strict`.
+pub fn row_comparator(result: &CellResult) -> Comparator {
+    if records_stripped_comparator(&result.relaxations) {
+        Comparator::Stripped
+    } else {
+        Comparator::Strict
+    }
 }
 
 /// The reason of the one non-blank relaxation with `prefix`; `None` when there
@@ -2359,6 +2414,16 @@ pub struct AttemptResult {
     pub reason: Option<String>,
 }
 
+/// The stdout assertions a verify cell declares for its backend: the exact
+/// `expected_stdout` and the `expected_stdout_contains` text, each absent
+/// when the cell declares none.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredStdout {
+    pub exact: Option<String>,
+    pub contains: Option<String>,
+}
+
 /// One test-harness cell observation written to `results.jsonl`.
 ///
 /// This is not [`crate::ledger::CellResult`]. That type is the validation
@@ -2531,6 +2596,18 @@ pub struct CellResult {
     /// so rows for ordinary cells are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_guest_exit: Option<ExpectedGuestExit>,
+    /// The stdout assertions this verify cell declares, recorded on every row
+    /// with at least one attempt whose retained verification report has the
+    /// verdict `infrastructure_error`, and absent from every other row, so
+    /// rows for ordinary cells are unchanged.
+    ///
+    /// [`skid_overshoot_only_reports`] re-decides these assertions from each
+    /// attempt's own report and captured stdout instead of trusting how the
+    /// attempt was classified, and a row without this record (one written
+    /// before it existed) never has a skid-only history
+    /// (<https://github.com/rrnewton/hermit/issues/1845>).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_stdout: Option<DeclaredStdout>,
 }
 
 impl CellResult {
@@ -3050,6 +3127,289 @@ pub fn cell_result_and_attempts_after_retries(
         .map(|result| result.attempt)
         .ok_or_else(|| "cell result has no attempts".to_string())?;
     Ok((selected, attempts))
+}
+
+/// The reason the runner records for a verify attempt whose verification
+/// report is Hermit's typed `skid_overshoot` infrastructure error.
+///
+/// The classifier writes this reason and [`skid_overshoot_only_reports`] reads
+/// it back, so the retry gate keys on exactly the text the classifier
+/// produced and on nothing a guest could print.
+pub fn skid_overshoot_reason(count: u64) -> String {
+    format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
+}
+
+/// The number of `HERMIT_SKID_OVERSHOOT` reports behind `result`, when, and
+/// only when, the cell is a verify cell and its failure is a precise-timer
+/// overshoot and nothing else
+/// (<https://github.com/rrnewton/hermit/issues/1845>).
+///
+/// A precise timer is armed `skid_margin` retired conditional branches before
+/// its target and then single-stepped to it. When the counter's overflow
+/// interrupt lands more than `skid_margin` branches late, the guest has
+/// already run past the target and the preemption point cannot be moved back.
+/// Hermit then refuses the comparison with the typed verdict
+/// `infrastructure_error` / `skid_overshoot` and exit status 122, taking the
+/// count from its own in-process counter rather than from guest-visible text.
+/// Such an attempt measured the host's interrupt latency, not the guest's
+/// determinism, so a fresh attempt of the same cell is a new measurement.
+///
+/// Every condition below must hold; a single unmet one returns `None`, which
+/// leaves the attempt to the ordinary rules:
+///
+/// - the cell is a `verify` cell whose row is an `ERROR` with no typed
+///   product result, failure class `understood_infrastructure_failure`, error
+///   kind `infrastructure`, and the reason of its first attempt (so a later
+///   cell-level override, such as the Hermit binary changing during the cell,
+///   is not mistaken for a skid);
+/// - it has at least one inner attempt, the inner attempts' indices are
+///   nonempty and distinct (as the runner writes them, and as the pressure
+///   test's and the stress series' history readers require), and every inner
+///   attempt is a skid
+///   attempt: an `ERROR` with error kind `infrastructure` that did not time
+///   out, exited with Hermit's policy-refusal status
+///   (`HERMIT_POLICY_REFUSAL_EXIT`, 122) and no signal, whose retained
+///   verification report is the exact bytes its recorded
+///   `verification_report_sha256` names and parses as a current report with verdict
+///   `infrastructure_error` and `skid_overshoot` count greater than zero and
+///   no `no_result_reason`, whose reason is [`skid_overshoot_reason`] of that
+///   count, and whose stderr carries at least one `HERMIT_SKID_OVERSHOOT `
+///   line and the line `HERMIT_POLICY_REFUSAL class=policy-refusal
+///   cause=skid-overshoot count=<that count>`, no other Hermit classification
+///   line ([`HERMIT_CLASSIFICATION_PREFIXES`]), and no comparator refusal line
+///   (`REFUSING to compare:`);
+/// - every such report records a completed comparison of both runs (its
+///   `comparison` and `compared_outputs` are present) that meets the
+///   requirements of the comparator the row records ([`row_comparator`]),
+///   the same requirements the classifier applies before it accepts a skid
+///   report: for `strict`, a canonical comparison
+///   ([`VerificationReport::require_canonical_comparison`]); for `stripped`,
+///   the stripped comparison ([`require_stripped_comparison`]); and its guest
+///   disposition and both compared runs' dispositions are the one the cell
+///   accepts ([`accepted_guest_disposition`] of the row's
+///   `expected_guest_exit`);
+/// - every such report satisfies the backend evidence a passing attempt of
+///   the row's backend must carry ([`dispatch_record_error`] finds nothing in
+///   its `runtime`), and the row's execution-path evidence is the one its own
+///   retained attempts decide ([`retained_execution_path_error`] finds
+///   nothing: SaBRe evidence bytes that match their digests, summarized to
+///   the row's recorded `execution_path`, eligible). Both are checked only on
+///   a `PASS` elsewhere, so an `ERROR` attempt would otherwise reach a retry
+///   without them.
+///
+/// - the row records the stdout assertions its cell declares
+///   ([`CellResult::declared_stdout`]), and every attempt's own evidence
+///   satisfies them: the exact `expected_stdout` is checked against both
+///   compared runs' stdout digests in the attempt's report
+///   ([`check_expected_stdout`]), and the `expected_stdout_contains` text is
+///   searched in the attempt's captured stdout, which must be the bytes of
+///   both compared runs ([`check_expected_stdout_contains`]). An assertion
+///   that fails or cannot be decided, or a row that records no declaration
+///   (one written before the record existed), disqualifies the row.
+///
+/// The classifier decides the same assertions first: a skid attempt whose
+/// compared runs violate one, or whose assertion cannot be checked, keeps the
+/// plain skid attempt's infrastructure classification, but its reason names
+/// the assertion as well as the overshoot count, so it is not
+/// [`skid_overshoot_reason`] of the count. The re-decision above is what
+/// makes a row the classifier did not produce (an imported row, or one from
+/// an older producer) unable to claim a skid-only history by its labels
+/// alone, and the report digest is what ties the re-decided report to the
+/// bytes the runner read.
+///
+/// The last condition is positive evidence that both guests ran to an
+/// accepted end. Hermit also writes a `skid_overshoot` report, exits 122 and
+/// prints only the skid refusal line when the overshoot sits beside a second
+/// failure:
+///
+/// - run 1 ended with a status the verify policy rejects (a crash, a signal,
+///   an unexpected exit code): no second run or comparison happened, and the
+///   report carries that rejected disposition;
+/// - run 1 or run 2 failed for another reason (a tracer error, a run timeout,
+///   a container death) while also overshooting: Hermit attaches the
+///   overshoot to that error, and the report has no comparison;
+/// - both runs completed but one ended differently (run 2 crashed): the
+///   comparison's divergence becomes the skid verdict, and
+///   `compared_outputs` carries the crash.
+///
+/// None of these is skid-only, and a passing fresh attempt must not replace
+/// them.
+///
+/// A `diverged` or `no_result` report, a timeout, a missing or unreadable
+/// report, an environmental block, any other exit status, a stderr marker
+/// without the typed report, or a typed report without the stderr markers
+/// never qualifies. Neither does an overshoot whose comparison the comparator
+/// refused (a log cut at its size bound): Hermit then writes the refusal as
+/// the report (verdict `no_result`, reason `comparison_refused`) and prints
+/// the `REFUSING to compare:` line, and that refusal is a second failure a
+/// fresh attempt must not hide. The `no_result_reason` guard below repeats
+/// the report parser's own refusal of a reason beside any other verdict, so
+/// the predicate does not depend on that parser alone. The
+/// skid report's own first-divergence fields are not a second class: Hermit
+/// decides the verdict's precedence, and an overshoot moves the preemption
+/// point, so its two runs are expected to differ there.
+pub fn skid_overshoot_only_reports(result: &CellResult) -> Option<u64> {
+    if result.mode != "verify"
+        || result.outcome != "ERROR"
+        || result.result.is_some()
+        || result.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
+        || result.error_kind.as_deref() != Some("infrastructure")
+        || retained_execution_path_error(result).is_some()
+    {
+        return None;
+    }
+    let first = result.attempts.first()?;
+    if result.reason != first.reason {
+        return None;
+    }
+    let mut indices = BTreeSet::new();
+    if result
+        .attempts
+        .iter()
+        .any(|attempt| attempt.index.trim().is_empty() || !indices.insert(attempt.index.as_str()))
+    {
+        return None;
+    }
+    let declared = result.declared_stdout.as_ref()?;
+    let accepted = accepted_guest_disposition(result.expected_guest_exit.as_ref());
+    let backend = result.backend.as_deref();
+    let comparator = row_comparator(result);
+    result.attempts.iter().try_fold(0u64, |reports, attempt| {
+        reports.checked_add(attempt_skid_overshoot_reports(
+            attempt, declared, accepted, backend, comparator,
+        )?)
+    })
+}
+
+/// Whether `attempt` retains a verification report whose verdict is
+/// `infrastructure_error`, the attempts whose rows record the cell's declared
+/// stdout assertions ([`CellResult::declared_stdout`]).
+fn attempt_has_infrastructure_report(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| report.verdict == Verdict::InfrastructureError)
+}
+
+/// The guest disposition, as `(exit code, signal)`, that a verify cell
+/// accepts from each run: the one its manifest declares in
+/// `expected_guest_exit`, or a clean exit 0 when it declares none. These are
+/// the dispositions Hermit's `--verify` admits to a comparison for the cell,
+/// in the representation the verification report records.
+pub fn accepted_guest_disposition(
+    expected: Option<&ExpectedGuestExit>,
+) -> (Option<i32>, Option<i32>) {
+    expected.map_or((Some(0), None), |expected| (expected.code, expected.signal))
+}
+
+/// The prefixes of the one-line classifications Hermit prints when it stops
+/// for a reason of its own: a policy refusal, an internal failure, a signal
+/// death or a run timeout. A skid attempt's stderr may carry exactly one kind
+/// of these, its own skid refusal; any other is a second failure.
+pub const HERMIT_CLASSIFICATION_PREFIXES: [&str; 4] = [
+    "HERMIT_POLICY_REFUSAL",
+    "HERMIT_INTERNAL_FAILURE",
+    "HERMIT_SIGNAL_DEATH",
+    "HERMIT_RUN_TIMEOUT",
+];
+
+/// The line Hermit's log comparator prints when it declines to compare two
+/// logs, a no-result rather than a match or a difference.
+const COMPARISON_REFUSAL_PREFIX: &str = "REFUSING to compare:";
+
+/// The overshoot count of one inner attempt that is a typed skid attempt of a
+/// cell on `backend` declaring the stdout assertions `declared`, accepting
+/// the guest disposition `accepted` and judged by `comparator`, as defined by
+/// [`skid_overshoot_only_reports`].
+fn attempt_skid_overshoot_reports(
+    attempt: &AttemptResult,
+    declared: &DeclaredStdout,
+    accepted: (Option<i32>, Option<i32>),
+    backend: Option<&str>,
+    comparator: Comparator,
+) -> Option<u64> {
+    if attempt.outcome != "ERROR"
+        || attempt.timed_out
+        || attempt.error_kind.as_deref() != Some("infrastructure")
+        || attempt.status != Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+        || attempt.signal.is_some()
+    {
+        return None;
+    }
+    // The retained report must be the bytes the runner read and hashed: every
+    // decision below is made from it.
+    let raw = attempt.verification_report.as_deref()?;
+    if attempt.verification_report_sha256.as_deref() != Some(hex_digest(raw.as_bytes()).as_str()) {
+        return None;
+    }
+    let report = current_verification_report(raw.as_bytes()).ok()?;
+    if report.verdict != Verdict::InfrastructureError || report.no_result_reason.is_some() {
+        return None;
+    }
+    // The backend evidence a passing attempt must carry.
+    if backend
+        .and_then(|backend| dispatch_record_error(backend, report.runtime.as_ref()))
+        .is_some()
+    {
+        return None;
+    }
+    // Both runs completed, were compared, and ended as the cell accepts.
+    let outputs = report.compared_outputs.as_ref()?;
+    if report.comparison.is_none()
+        || (report.guest_exit_code, report.guest_signal) != accepted
+        || [&outputs.left, &outputs.right]
+            .into_iter()
+            .any(|output| (output.exit_code, output.signal) != accepted)
+    {
+        return None;
+    }
+    // The comparison is the complete one the comparator requires, the check
+    // the classifier makes before it reports a skid attempt as one: an
+    // incomplete comparison is incomplete verification evidence instead.
+    let complete = match comparator {
+        Comparator::Strict => report.require_canonical_comparison(),
+        Comparator::Stripped => require_stripped_comparison(&report),
+    };
+    if complete.is_err() {
+        return None;
+    }
+    // The cell's declared stdout assertions, re-decided from this attempt's
+    // own report and captured stdout rather than read from its labels.
+    if declared
+        .exact
+        .as_deref()
+        .is_some_and(|expected| check_expected_stdout(expected, &report).is_err())
+        || declared.contains.as_deref().is_some_and(|text| {
+            check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report).is_err()
+        })
+    {
+        return None;
+    }
+    let InfrastructureError::SkidOvershoot { count } = report.infrastructure_error?;
+    let refusal =
+        format!("HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={count}");
+    let mut overshoot_marked = false;
+    let mut refusal_marked = false;
+    for line in attempt.stderr.lines() {
+        let line = line.trim_end();
+        if line.starts_with("HERMIT_SKID_OVERSHOOT ") {
+            overshoot_marked = true;
+        } else if line == refusal {
+            refusal_marked = true;
+        } else if line.starts_with(COMPARISON_REFUSAL_PREFIX)
+            || HERMIT_CLASSIFICATION_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        {
+            return None;
+        }
+    }
+    (count > 0
+        && overshoot_marked
+        && refusal_marked
+        && attempt.reason.as_deref() == Some(skid_overshoot_reason(count).as_str()))
+    .then_some(count)
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
@@ -4004,21 +4364,58 @@ fn execute_spec_until(
                                 }
                                 .err()
                             });
+                            let skid_reason = match report.infrastructure_error.as_ref() {
+                                Some(InfrastructureError::SkidOvershoot { count }) => {
+                                    skid_overshoot_reason(*count)
+                                }
+                                None => unreachable!(
+                                    "typed report parser requires an infrastructure error"
+                                ),
+                            };
+                            // When both runs completed and were compared, the
+                            // cell's declared stdout assertions are decided
+                            // before the refusal is accepted as the attempt's
+                            // only failure. An overshoot moves a preemption
+                            // point and nothing else, so compared runs that
+                            // agree on the wrong bytes, or omit the declared
+                            // marker, carry the same product defect they carry
+                            // without one. Such an attempt, and one whose
+                            // assertion the evidence cannot decide, keeps the
+                            // skid infrastructure ERROR it always had, because
+                            // every reader of a result row (the validation
+                            // series writer, the pressure test and the stress
+                            // series) accepts an `infrastructure_error` report
+                            // only on that classification. Its reason names
+                            // both the overshoot and the assertion, and it is
+                            // never retried, never a pass and never a
+                            // skid-only attempt: the skid predicate requires
+                            // the plain skid reason and re-decides the row's
+                            // recorded declaration from the attempt's own
+                            // evidence (https://github.com/rrnewton/hermit/issues/1845).
+                            let stdout_error = report
+                                .compared_outputs
+                                .as_ref()
+                                .filter(|_| comparison_error.is_none() && output.timeout.is_none())
+                                .and_then(|_| declared_stdout_error(spec, &report, &stdout_path));
                             if let Some(error) = comparison_error {
                                 outcome = "ERROR".into();
                                 error_kind = Some("incomplete-verification-evidence".into());
                                 reason = Some(error);
+                            } else if let Some(error) = stdout_error {
+                                outcome = "ERROR".into();
+                                error_kind = Some("infrastructure".into());
+                                reason = Some(match error {
+                                    ExpectedStdoutError::Unevidenced(error) => format!(
+                                        "{skid_reason}, and a declared stdout assertion cannot be checked: {error}"
+                                    ),
+                                    ExpectedStdoutError::Mismatch(error) => format!(
+                                        "{skid_reason}, and its compared runs violate a declared stdout assertion: {error}"
+                                    ),
+                                });
                             } else {
                                 outcome = "ERROR".into();
                                 error_kind = Some("infrastructure".into());
-                                reason = Some(match report.infrastructure_error.as_ref() {
-                                    Some(InfrastructureError::SkidOvershoot { count }) => format!(
-                                        "verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"
-                                    ),
-                                    None => unreachable!(
-                                        "typed report parser requires an infrastructure error"
-                                    ),
-                                });
+                                reason = Some(skid_reason);
                             }
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
@@ -4097,47 +4494,20 @@ fn execute_spec_until(
                         {
                             outcome = "FAIL".into();
                             reason = Some(error);
-                        } else if let Some(Err(error)) = spec
-                            .expected_stdout
-                            .as_deref()
-                            .filter(|_| output.timeout.is_none())
-                            .map(|expected| check_expected_stdout(expected, &report))
+                        } else if let Some(error) = output
+                            .timeout
+                            .is_none()
+                            .then(|| declared_stdout_error(spec, &report, &stdout_path))
+                            .flatten()
                         {
                             // Two runs agreeing on the wrong bytes is still a
-                            // failure when the cell names the exact bytes.
+                            // failure when the cell names the exact bytes, and
+                            // so are agreeing runs that omit the guest's
+                            // success marker.
                             match error {
                                 ExpectedStdoutError::Unevidenced(error) => {
                                     outcome = "ERROR".into();
-                                    error_kind =
-                                        Some("incomplete-verification-evidence".into());
-                                    reason = Some(error);
-                                }
-                                ExpectedStdoutError::Mismatch(error) => {
-                                    outcome = "FAIL".into();
-                                    reason = Some(error);
-                                }
-                            }
-                        } else if let Some(Err(error)) = spec
-                            .expected_stdout_contains
-                            .as_deref()
-                            .filter(|_| output.timeout.is_none())
-                            .map(|text| match fs::read(&stdout_path) {
-                                Ok(captured) => {
-                                    check_expected_stdout_contains(text, &captured, &report)
-                                }
-                                Err(error) => Err(ExpectedStdoutError::Unevidenced(format!(
-                                    "cannot read captured verify stdout {}: {error}, so the declared expected_stdout_contains cannot be checked",
-                                    stdout_path.display()
-                                ))),
-                            })
-                        {
-                            // Agreeing runs that omit the guest's success
-                            // marker are still a failure.
-                            match error {
-                                ExpectedStdoutError::Unevidenced(error) => {
-                                    outcome = "ERROR".into();
-                                    error_kind =
-                                        Some("incomplete-verification-evidence".into());
+                                    error_kind = Some("incomplete-verification-evidence".into());
                                     reason = Some(error);
                                 }
                                 ExpectedStdoutError::Mismatch(error) => {
@@ -5475,10 +5845,15 @@ fn run_cell_inner(
         .try_fold(preparation_cpu_usage_usec, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
         });
+    let declared_stdout = attempts
+        .iter()
+        .any(attempt_has_infrastructure_report)
+        .then(|| cell_declared_stdout(cell));
     Ok(CellResult {
         cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        declared_stdout,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -5562,6 +5937,7 @@ pub fn infrastructure_error_result(
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        declared_stdout: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -5637,6 +6013,7 @@ pub fn host_inapplicable_result(
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        declared_stdout: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -5753,15 +6130,70 @@ pub(crate) fn execution_path_ineligible(execution_path: Option<&JsonValue>) -> b
     execution_path.is_some_and(|evidence| evidence["eligible"] != true)
 }
 
+/// Whether a Hermit command line selects the SaBRe backend, the executions
+/// that write SaBRe execution-path evidence.
+fn argv_selects_sabre(argv: &[String]) -> bool {
+    argv.windows(2)
+        .any(|window| window[0] == "--backend" && window[1] == "sabre")
+}
+
+/// Why `result`'s recorded execution path is not the eligible one its own
+/// retained attempts decide, if it is not.
+///
+/// The runner summarizes a row's SaBRe execution-path evidence from the
+/// evidence files its attempts wrote ([`summarize_sabre_path_evidence`]) and
+/// fails a `PASS` whose summary is ineligible. A retained row carries the
+/// summary as a label beside each attempt's retained evidence text and the
+/// digest of the bytes the runner read, so a reader admitting such a row
+/// re-decides the summary instead of trusting the label: every attempt
+/// selects SaBRe exactly when the row's backend is `sabre`, every attempt's
+/// retained evidence text is the bytes its `sabre_path_evidence_sha256`
+/// names (both absent for an attempt that wrote none), and the summary of
+/// those retained attempts is valid, equals the row's `execution_path`, and
+/// is eligible ([`execution_path_ineligible`] is false). A row of another
+/// backend therefore has no evidence and no `execution_path`.
+pub fn retained_execution_path_error(result: &CellResult) -> Option<String> {
+    let sabre = result.backend.as_deref() == Some("sabre");
+    for attempt in &result.attempts {
+        let index = attempt.index.as_str();
+        if argv_selects_sabre(&attempt.argv) != sabre {
+            return Some(format!(
+                "inner attempt {index}'s command line does not select the row's backend {:?}",
+                result.backend
+            ));
+        }
+        if attempt.sabre_path_evidence_sha256
+            != attempt
+                .sabre_path_evidence
+                .as_deref()
+                .map(|text| hex_digest(text.as_bytes()))
+        {
+            return Some(format!(
+                "inner attempt {index}'s retained SaBRe path evidence is not the bytes its sabre_path_evidence_sha256 names"
+            ));
+        }
+    }
+    let summary = match summarize_sabre_path_evidence(&result.attempts) {
+        Ok(summary) => summary,
+        Err(error) => return Some(error),
+    };
+    if summary != result.execution_path {
+        return Some(
+            "the row's execution_path is not the summary of its retained SaBRe path evidence"
+                .into(),
+        );
+    }
+    execution_path_ineligible(summary.as_ref()).then(|| {
+        "the row's SaBRe execution path is incomplete or used fallback/native sites".into()
+    })
+}
+
 pub(crate) fn summarize_sabre_path_evidence(
     attempts: &[AttemptResult],
 ) -> Result<Option<JsonValue>, String> {
-    let is_sabre = attempts.iter().any(|attempt| {
-        attempt
-            .argv
-            .windows(2)
-            .any(|window| window[0] == "--backend" && window[1] == "sabre")
-    });
+    let is_sabre = attempts
+        .iter()
+        .any(|attempt| argv_selects_sabre(&attempt.argv));
     if !is_sabre {
         return Ok(None);
     }
@@ -5790,12 +6222,7 @@ pub(crate) fn summarize_sabre_path_evidence(
         // candidate. Only executions which actually selected SaBRe can emit
         // SaBRe path evidence; counting the ptrace operand would turn every
         // otherwise-valid SaBRe parity measurement into an incomplete path.
-        .filter(|attempt| {
-            attempt
-                .argv
-                .windows(2)
-                .any(|window| window[0] == "--backend" && window[1] == "sabre")
-        })
+        .filter(|attempt| argv_selects_sabre(&attempt.argv))
         .map(|attempt| {
             if attempt.argv.iter().any(|arg| arg == "--verify") {
                 2
@@ -12060,6 +12487,7 @@ backends_disabled:
             reason: None,
             artifact_dir: "/repo/artifacts".into(),
             expected_guest_exit: None,
+            declared_stdout: None,
         }
     }
 
@@ -13208,6 +13636,771 @@ exit "$(cat "$PWD/exit-status")"
         );
     }
 
+    /// The verify row `run_cell_inner` publishes for `attempts`: the same
+    /// outcome, reason and error-kind fold, then the same typed result and
+    /// failure class, and the same declared-stdout record for a cell that
+    /// declares no stdout assertion.
+    fn verify_row_from_attempts(attempts: Vec<AttemptResult>) -> CellResult {
+        let outcome = if attempts.iter().all(|attempt| attempt.outcome == "PASS") {
+            "PASS"
+        } else if attempts.iter().any(|attempt| attempt.outcome == "ERROR") {
+            "ERROR"
+        } else {
+            "FAIL"
+        }
+        .to_string();
+        let reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
+        let error_kind = attempts
+            .iter()
+            .find_map(|attempt| attempt.error_kind.clone());
+        let result = observed_result("verify", &outcome, &attempts, error_kind.as_deref());
+        let failure_class = failure_class(&outcome, result, error_kind.as_deref());
+        let declared_stdout = attempts
+            .iter()
+            .any(attempt_has_infrastructure_report)
+            .then(DeclaredStdout::default);
+        CellResult {
+            outcome,
+            result,
+            failure_class,
+            error_kind,
+            reason,
+            attempts,
+            declared_stdout,
+            ..cell_result_that_located_nothing()
+        }
+    }
+
+    /// The stderr Hermit writes when it refuses a verify comparison after two
+    /// overshoot reports, copied from the failed validate attempt in
+    /// <https://github.com/rrnewton/hermit/issues/1845>.
+    const SKID_STDERR: &str = "printf '%s\\n' \
+        'HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829' \
+        'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2' \
+        'Error: observed 2 HERMIT_SKID_OVERSHOOT report(s); refusing the result' >&2";
+
+    /// Hermit's skid report after a completed comparison of two runs that
+    /// both exited 0, the shape every observed overshoot had.
+    fn skid_report_value(count: u64) -> VerificationReport {
+        let mut report = parity_fixture_verification(Verdict::Matched);
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+        report
+    }
+
+    fn skid_report(count: u64) -> String {
+        serde_json::to_string(&skid_report_value(count)).unwrap()
+    }
+
+    /// The report Hermit's `write_skid_overshoot_without_comparison_json`
+    /// writes: no comparison, and the guest disposition it was handed (run 1's
+    /// status, or none when the run returned only an error).
+    fn skid_report_without_comparison(
+        count: u64,
+        guest_exit_code: Option<i32>,
+        guest_signal: Option<i32>,
+    ) -> String {
+        let mut report = VerificationReport::no_result();
+        report.verdict = Verdict::InfrastructureError;
+        report.no_result_reason = None;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+        report.guest_exit_code = guest_exit_code;
+        report.guest_signal = guest_signal;
+        let json = serde_json::to_string(&report).unwrap();
+        current_verification_report(json.as_bytes()).unwrap();
+        json
+    }
+
+    /// Only a verify row whose every attempt is Hermit's typed overshoot
+    /// refusal, with its exit status and both stderr markers, is skid-only
+    /// (<https://github.com/rrnewton/hermit/issues/1845>). Each other row here
+    /// differs from the qualifying one in one respect and must not qualify.
+    #[test]
+    fn only_a_typed_skid_overshoot_and_nothing_else_is_a_skid_only_row() {
+        let skid = || {
+            attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+                Some(&skid_report(2)),
+            )
+        };
+        let qualifying = verify_row_from_attempts(vec![skid()]);
+        assert_eq!(qualifying.outcome, "ERROR");
+        assert_eq!(qualifying.result, None);
+        assert_eq!(
+            qualifying.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(skid_overshoot_only_reports(&qualifying), Some(2));
+        assert_eq!(
+            qualifying.declared_stdout,
+            Some(DeclaredStdout::default()),
+            "a row with an infrastructure report records its declared stdout"
+        );
+
+        // A row without the declared-stdout record, as an older producer
+        // wrote it, cannot have its stdout assertions re-decided and so never
+        // qualifies, however its attempts are labelled.
+        let mut legacy = qualifying.clone();
+        legacy.declared_stdout = None;
+        assert_eq!(skid_overshoot_only_reports(&legacy), None);
+
+        // Every inner attempt must be a skid attempt, and their counts add.
+        let mut second = skid();
+        second.index = "2".into();
+        let two = verify_row_from_attempts(vec![skid(), second]);
+        assert_eq!(skid_overshoot_only_reports(&two), Some(4));
+
+        let not_skid_only = |label: &str, row: &CellResult| {
+            assert_eq!(
+                skid_overshoot_only_reports(row),
+                None,
+                "{label} must not be treated as a skid-only row: {row:?}"
+            );
+        };
+
+        // Each negative row below must be classified exactly as the qualifying
+        // row is, so that only the predicate's own guard can refuse it.
+        let classified_as_skid = |label: &str, row: &CellResult| {
+            assert_eq!(
+                (
+                    row.outcome.as_str(),
+                    row.result,
+                    row.failure_class,
+                    row.error_kind.as_deref(),
+                    row.reason.as_deref(),
+                ),
+                (
+                    "ERROR",
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                    Some("infrastructure"),
+                    row.attempts[0].reason.as_deref(),
+                ),
+                "{label} must reach the predicate as a typed skid row: {row:?}"
+            );
+            assert!(
+                row.attempts[0]
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.ends_with("HERMIT_SKID_OVERSHOOT report(s)")),
+                "{label} must carry the classifier's skid reason: {row:?}"
+            );
+        };
+
+        // Each inner attempt names a distinct, nonempty index, as the runner
+        // numbers them; a history that repeats or omits one is not a history
+        // the runner wrote.
+        let mut repeated = two.clone();
+        repeated.attempts[1].index = repeated.attempts[0].index.clone();
+        classified_as_skid("a history that repeats an attempt index", &repeated);
+        not_skid_only("a history that repeats an attempt index", &repeated);
+        for blank in ["", " "] {
+            let mut unnumbered = qualifying.clone();
+            unnumbered.attempts[0].index = blank.into();
+            classified_as_skid("an attempt without an index", &unnumbered);
+            not_skid_only("an attempt without an index", &unnumbered);
+        }
+
+        // The retained report must be the bytes its recorded digest names.
+        let mut undigested = qualifying.clone();
+        undigested.attempts[0].verification_report_sha256 = None;
+        classified_as_skid("an attempt without a report digest", &undigested);
+        not_skid_only("an attempt without a report digest", &undigested);
+        let mut misdigested = qualifying.clone();
+        misdigested.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+        classified_as_skid("an attempt whose report digest is wrong", &misdigested);
+        not_skid_only("an attempt whose report digest is wrong", &misdigested);
+        // Report bytes rewritten under the original digest are refused, and
+        // the same bytes qualify once their own digest is recorded, so only
+        // the digest guard separates the two.
+        let mut rewritten = qualifying.clone();
+        let changed = format!(
+            "{} ",
+            rewritten.attempts[0]
+                .verification_report
+                .as_deref()
+                .unwrap()
+        );
+        current_verification_report(changed.as_bytes()).unwrap();
+        rewritten.attempts[0].verification_report = Some(changed.clone());
+        classified_as_skid("a report rewritten under its old digest", &rewritten);
+        not_skid_only("a report rewritten under its old digest", &rewritten);
+        rewritten.attempts[0].verification_report_sha256 = Some(hex_digest(changed.as_bytes()));
+        assert_eq!(skid_overshoot_only_reports(&rewritten), Some(2));
+
+        let skid_with_stderr = |stderr_lines: &[&str], report: &str, status: i32| {
+            let printed = stderr_lines
+                .iter()
+                .map(|line| format!("'{line}'"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; printf '%s\\n' {printed} >&2; exit {status}"),
+                Some(report),
+            )
+        };
+        const OVERSHOOT_LINE: &str = "HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829";
+        const REFUSAL_LINE: &str =
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2";
+        // The fixture builder itself qualifies when given both markers.
+        let rebuilt = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE, REFUSAL_LINE],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid("the rebuilt qualifying row", &rebuilt);
+        assert_eq!(skid_overshoot_only_reports(&rebuilt), Some(2));
+
+        // A real ptrace skid report carries each run's dispatch record, and
+        // qualifies with it. The backend evidence a passing attempt must
+        // carry is checked only on a PASS by the classifier, so a skid
+        // attempt without it reaches the predicate as a typed skid row and
+        // the predicate itself must refuse it.
+        let mut dispatched = skid_report_value(2);
+        dispatched.runtime =
+            with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap()).runtime;
+        let skid_with_report = |report: &VerificationReport| {
+            let json = serde_json::to_string(report).unwrap();
+            current_verification_report(json.as_bytes()).unwrap();
+            verify_row_from_attempts(vec![skid_with_stderr(
+                &[OVERSHOOT_LINE, REFUSAL_LINE],
+                &json,
+                122,
+            )])
+        };
+        let with_dispatch = skid_with_report(&dispatched);
+        classified_as_skid("a skid report with ptrace dispatch records", &with_dispatch);
+        assert_eq!(skid_overshoot_only_reports(&with_dispatch), Some(2));
+        let mut relabeled = dispatched.clone();
+        relabeled
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .backend = "liteinst".into();
+        let relabeled = skid_with_report(&relabeled);
+        classified_as_skid(
+            "a skid report whose run 1 names another backend",
+            &relabeled,
+        );
+        not_skid_only(
+            "a skid report whose run 1 names another backend",
+            &relabeled,
+        );
+        let mut undispatched = dispatched.clone();
+        undispatched
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run2
+            .as_mut()
+            .unwrap()
+            .dispatch = None;
+        let undispatched = skid_with_report(&undispatched);
+        classified_as_skid(
+            "a skid report without run 2's dispatch record",
+            &undispatched,
+        );
+        not_skid_only(
+            "a skid report without run 2's dispatch record",
+            &undispatched,
+        );
+        // SaBRe execution-path evidence turns only a PASS into a FAIL, so the
+        // predicate re-decides a skid row's path from the evidence its own
+        // attempts retained. A genuine SaBRe skid row qualifies: each attempt
+        // selects SaBRe, retains two clean evidence records (one per run)
+        // under the digest of their bytes, and the row records their summary.
+        const CLEAN_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        const FALLBACK_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        let clean_evidence = format!("{CLEAN_PATH}\n{CLEAN_PATH}\n");
+        let fallback_evidence = format!("{CLEAN_PATH}\n{FALLBACK_PATH}\n");
+        let mut sabre_report = dispatched.clone();
+        let sabre_runtime = sabre_report.runtime.as_mut().unwrap();
+        for stats in [sabre_runtime.run1.as_mut(), sabre_runtime.run2.as_mut()] {
+            stats.unwrap().dispatch.as_mut().unwrap().backend = "sabre".into();
+        }
+        let sabre_report = serde_json::to_string(&sabre_report).unwrap();
+        let with_sabre_evidence = |row: &mut CellResult, evidence: Option<&str>| {
+            for attempt in &mut row.attempts {
+                attempt.sabre_path_evidence = evidence.map(str::to_owned);
+                attempt.sabre_path_evidence_sha256 =
+                    evidence.map(|text| hex_digest(text.as_bytes()));
+            }
+        };
+        let recompute_path = |row: &mut CellResult| {
+            row.execution_path = summarize_sabre_path_evidence(&row.attempts).unwrap();
+        };
+        let mut genuine_sabre = verify_row_from_attempts(vec![attempt_from_script(
+            "sabre",
+            &format!(
+                "printf %s \"$1\" > \"$2\"; printf '%s\\n' '{OVERSHOOT_LINE}' '{REFUSAL_LINE}' >&2; exit 122"
+            ),
+            Some(&sabre_report),
+        )]);
+        genuine_sabre.backend = Some("sabre".into());
+        genuine_sabre.attempts[0].argv = ["hermit", "--backend", "sabre", "run", "--verify"]
+            .map(String::from)
+            .to_vec();
+        with_sabre_evidence(&mut genuine_sabre, Some(&clean_evidence));
+        recompute_path(&mut genuine_sabre);
+        assert_eq!(
+            genuine_sabre.execution_path.as_ref().unwrap()["eligible"],
+            true
+        );
+        classified_as_skid("a genuine SaBRe skid row", &genuine_sabre);
+        assert_eq!(retained_execution_path_error(&genuine_sabre), None);
+        assert_eq!(skid_overshoot_only_reports(&genuine_sabre), Some(2));
+        // Its evidence removed, under its recorded path or with the path
+        // recomputed from what is left (an incomplete, ineligible path).
+        let mut pathless = genuine_sabre.clone();
+        with_sabre_evidence(&mut pathless, None);
+        not_skid_only(
+            "a SaBRe skid row without evidence under its recorded path",
+            &pathless,
+        );
+        recompute_path(&mut pathless);
+        assert_eq!(pathless.execution_path.as_ref().unwrap()["eligible"], false);
+        not_skid_only("a SaBRe skid row without evidence", &pathless);
+        // Its evidence under a digest that does not name those bytes.
+        let mut misdigested_path = genuine_sabre.clone();
+        misdigested_path.attempts[0].sabre_path_evidence_sha256 =
+            Some(hex_digest(fallback_evidence.as_bytes()));
+        not_skid_only(
+            "a SaBRe skid row whose evidence digest names other bytes",
+            &misdigested_path,
+        );
+        // A run that used a ptrace fallback site, under the recorded eligible
+        // path or with the path recomputed.
+        let mut fallback = genuine_sabre.clone();
+        with_sabre_evidence(&mut fallback, Some(&fallback_evidence));
+        not_skid_only(
+            "a SaBRe skid row with fallback evidence under an eligible path",
+            &fallback,
+        );
+        recompute_path(&mut fallback);
+        assert_eq!(fallback.execution_path.as_ref().unwrap()["eligible"], false);
+        not_skid_only("a SaBRe skid row that used a fallback site", &fallback);
+        // A SaBRe row whose command line does not select SaBRe writes no
+        // evidence the summary reads, so it cannot stand for a SaBRe run.
+        let mut unselected = genuine_sabre.clone();
+        unselected.attempts[0].argv = ["hermit", "run", "--verify"].map(String::from).to_vec();
+        recompute_path(&mut unselected);
+        assert_eq!(unselected.execution_path, None);
+        not_skid_only(
+            "a SaBRe skid row whose command line does not select SaBRe",
+            &unselected,
+        );
+        // A ptrace row has no SaBRe path: a recorded path, eligible or not,
+        // and a command line that selects SaBRe are both refused.
+        let mut off_path = with_dispatch.clone();
+        off_path.execution_path = Some(serde_json::json!({"eligible": false}));
+        not_skid_only(
+            "a skid row whose SaBRe execution path is ineligible",
+            &off_path,
+        );
+        let mut labelled_path = with_dispatch.clone();
+        labelled_path.execution_path = Some(serde_json::json!({"eligible": true}));
+        not_skid_only(
+            "a ptrace skid row that records an eligible SaBRe path",
+            &labelled_path,
+        );
+        let mut ptrace_selecting_sabre = with_dispatch.clone();
+        ptrace_selecting_sabre.attempts[0].argv =
+            ["hermit", "--backend", "sabre", "run", "--verify"]
+                .map(String::from)
+                .to_vec();
+        with_sabre_evidence(&mut ptrace_selecting_sabre, Some(&clean_evidence));
+        recompute_path(&mut ptrace_selecting_sabre);
+        not_skid_only(
+            "a ptrace skid row whose command line selects SaBRe",
+            &ptrace_selecting_sabre,
+        );
+        assert_eq!(skid_overshoot_only_reports(&with_dispatch), Some(2));
+
+        // The retained comparison must be the complete one the row's
+        // comparator requires, as the classifier requires before it reports
+        // a skid attempt as one. A strict skid report that compared no INFO
+        // messages is incomplete verification evidence when executed, and a
+        // row carrying it under its own correct digest is refused.
+        let mut vacuous = skid_report_value(2);
+        vacuous.compared_log_messages.as_mut().unwrap().left = 0;
+        vacuous.compared_log_messages.as_mut().unwrap().right = 0;
+        let vacuous = serde_json::to_string(&vacuous).unwrap();
+        let executed = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&vacuous),
+        );
+        assert_eq!(
+            (executed.outcome.as_str(), executed.error_kind.as_deref()),
+            ("ERROR", Some("incomplete-verification-evidence")),
+            "{executed:?}"
+        );
+        let mut incomplete = qualifying.clone();
+        incomplete.attempts[0].verification_report = Some(vacuous.clone());
+        incomplete.attempts[0].verification_report_sha256 = Some(hex_digest(vacuous.as_bytes()));
+        classified_as_skid("a skid row whose comparison is vacuous", &incomplete);
+        not_skid_only("a skid row whose comparison is vacuous", &incomplete);
+        // The comparator is the one the row's relaxations record. A canonical
+        // report does not satisfy the stripped comparator, and a stripped
+        // skid report qualifies only in a row that records the stripped
+        // comparator, which is also the only way the classifier reports one
+        // as a skid attempt.
+        let stripped_relaxation = vec![format!(
+            "{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture reason"
+        )];
+        let mut canonical_as_stripped = qualifying.clone();
+        canonical_as_stripped.relaxations = stripped_relaxation.clone();
+        assert_eq!(row_comparator(&canonical_as_stripped), Comparator::Stripped);
+        not_skid_only(
+            "a stripped row carrying a canonical skid report",
+            &canonical_as_stripped,
+        );
+        let mut stripped_skid =
+            with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
+        stripped_skid.verified = false;
+        stripped_skid.verdict = Verdict::InfrastructureError;
+        stripped_skid.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count: 2 });
+        let strict_executed = attempt_with_report(
+            None,
+            Comparator::Strict,
+            stripped_skid.clone(),
+            &format!("{SKID_STDERR}; exit 122"),
+            5,
+        );
+        assert_eq!(
+            strict_executed.error_kind.as_deref(),
+            Some("incomplete-verification-evidence"),
+            "{strict_executed:?}"
+        );
+        let mut stripped_row = verify_row_from_attempts(vec![attempt_with_report(
+            None,
+            Comparator::Stripped,
+            stripped_skid,
+            &format!("{SKID_STDERR}; exit 122"),
+            5,
+        )]);
+        stripped_row.relaxations = stripped_relaxation;
+        classified_as_skid("a stripped skid row", &stripped_row);
+        assert_eq!(skid_overshoot_only_reports(&stripped_row), Some(2));
+        let mut stripped_as_strict = stripped_row.clone();
+        stripped_as_strict.relaxations.clear();
+        assert_eq!(row_comparator(&stripped_as_strict), Comparator::Strict);
+        not_skid_only(
+            "a strict row carrying a stripped skid report",
+            &stripped_as_strict,
+        );
+
+        // The typed report without either stderr marker.
+        let unmarked = verify_row_from_attempts(vec![skid_with_stderr(&[], &skid_report(2), 122)]);
+        classified_as_skid("a typed report without stderr markers", &unmarked);
+        not_skid_only("a typed report without stderr markers", &unmarked);
+        // The refusal line without any HERMIT_SKID_OVERSHOOT line.
+        let no_overshoot_line = verify_row_from_attempts(vec![skid_with_stderr(
+            &[REFUSAL_LINE],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid(
+            "a refusal line without an overshoot line",
+            &no_overshoot_line,
+        );
+        not_skid_only(
+            "a refusal line without an overshoot line",
+            &no_overshoot_line,
+        );
+        // An overshoot line without the refusal line.
+        let no_refusal_line = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid(
+            "an overshoot line without the refusal line",
+            &no_refusal_line,
+        );
+        not_skid_only(
+            "an overshoot line without the refusal line",
+            &no_refusal_line,
+        );
+        // Both markers beside a second Hermit classification line.
+        let second_class = verify_row_from_attempts(vec![skid_with_stderr(
+            &[
+                OVERSHOOT_LINE,
+                "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Signaled(9)",
+                REFUSAL_LINE,
+            ],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid("a second Hermit classification line", &second_class);
+        not_skid_only("a second Hermit classification line", &second_class);
+        // Both markers beside the comparator's refusal banner.
+        let refused_banner = verify_row_from_attempts(vec![skid_with_stderr(
+            &[
+                OVERSHOOT_LINE,
+                "REFUSING to compare: both logs were truncated at the configured size bound. This is a NO-RESULT, not a difference and not a match.",
+                REFUSAL_LINE,
+            ],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid("a comparator refusal banner", &refused_banner);
+        not_skid_only("a comparator refusal banner", &refused_banner);
+        // Hermit's real shape when an overshoot coincides with a log cut at its
+        // size bound: the report is the comparator's refusal (verdict
+        // no_result, reason comparison_refused), while the exit status and
+        // both stderr markers still carry the overshoot. The classifier keeps
+        // the refusal as incomplete evidence, so it never reaches a retry.
+        const REFUSAL_DETAIL: &str = "both logs were truncated at the configured size bound";
+        let mut refused = VerificationReport::no_result();
+        refused.no_result_reason = Some(
+            crate::canonical_verdict::NoResultReason::ComparisonRefused {
+                detail: REFUSAL_DETAIL.into(),
+            },
+        );
+        let refused = verify_row_from_attempts(vec![skid_with_stderr(
+            &[
+                OVERSHOOT_LINE,
+                "REFUSING to compare: both logs were truncated at the configured size bound. This is a NO-RESULT, not a difference and not a match.",
+                REFUSAL_LINE,
+            ],
+            &serde_json::to_string(&refused).unwrap(),
+            122,
+        )]);
+        assert_eq!(
+            (
+                refused.outcome.as_str(),
+                refused.error_kind.as_deref(),
+                refused.reason.as_deref(),
+            ),
+            (
+                "ERROR",
+                Some("incomplete-verification-evidence"),
+                Some(REFUSAL_DETAIL),
+            ),
+            "an overshoot whose comparison was refused keeps the refusal: {refused:?}"
+        );
+        assert_ne!(
+            refused.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+            "{refused:?}"
+        );
+        not_skid_only("an overshoot whose comparison was refused", &refused);
+        // The same refusal without the banner line is still not a skid row:
+        // the report, not the stderr scan, refuses it.
+        let mut refused_report = VerificationReport::no_result();
+        refused_report.no_result_reason = Some(
+            crate::canonical_verdict::NoResultReason::ComparisonRefused {
+                detail: REFUSAL_DETAIL.into(),
+            },
+        );
+        let unbannered = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE, REFUSAL_LINE],
+            &serde_json::to_string(&refused_report).unwrap(),
+            122,
+        )]);
+        assert_eq!(unbannered.outcome, "ERROR", "{unbannered:?}");
+        assert_eq!(
+            unbannered.error_kind.as_deref(),
+            Some("incomplete-verification-evidence"),
+            "{unbannered:?}"
+        );
+        not_skid_only("a refused comparison report with skid markers", &unbannered);
+        // The markers and the typed report, but not Hermit's refusal status.
+        let wrong_status = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE, REFUSAL_LINE],
+            &skid_report(2),
+            1,
+        )]);
+        classified_as_skid("a skid report with a non-refusal exit", &wrong_status);
+        not_skid_only("a skid report with a non-refusal exit", &wrong_status);
+        // The stderr refusal line names a different count than the report.
+        let miscounted = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&skid_report(3)),
+        );
+        not_skid_only(
+            "a refusal line whose count differs from the report",
+            &verify_row_from_attempts(vec![miscounted]),
+        );
+        // The stderr markers with a no-result report.
+        let no_result = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&serde_json::to_string(&VerificationReport::no_result()).unwrap()),
+        );
+        not_skid_only(
+            "stderr markers with a no_result report",
+            &verify_row_from_attempts(vec![no_result]),
+        );
+        // The stderr markers with a diverged report.
+        let mut diverged = canonical_verification_report();
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_scheduler_turn = Some(4);
+        diverged.first_divergent_virtual_nanoseconds = Some(7);
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_syscall = Some(2);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        let diverged = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 1"),
+            Some(&serde_json::to_string(&diverged).unwrap()),
+        );
+        let diverged = verify_row_from_attempts(vec![diverged]);
+        assert_eq!(diverged.outcome, "FAIL", "{diverged:?}");
+        not_skid_only("stderr markers with a diverged report", &diverged);
+        // Hermit's reports for an overshoot beside a second failure, in the
+        // shapes its writers produce, each with both markers and exit 122.
+        // Every one reaches the predicate as a typed skid row, so only the
+        // completed-comparison and guest-disposition guard refuses it.
+        let marked = |report: &str| {
+            verify_row_from_attempts(vec![skid_with_stderr(
+                &[OVERSHOOT_LINE, REFUSAL_LINE],
+                report,
+                122,
+            )])
+        };
+        for (label, report) in [
+            // Run 1 exited 1, which the verify policy rejects: no run 2.
+            (
+                "an overshoot after run 1 exited with a rejected code",
+                skid_report_without_comparison(2, Some(1), None),
+            ),
+            // Run 1 died from SIGSEGV: the rejected disposition is a signal.
+            (
+                "an overshoot after run 1 died from a signal",
+                skid_report_without_comparison(2, None, Some(11)),
+            ),
+            // Run 1 failed for another reason and returned only an error.
+            (
+                "an overshoot attached to a failed run 1",
+                skid_report_without_comparison(2, None, None),
+            ),
+            // Run 2 failed for another reason; the report keeps run 1's
+            // accepted status but has no comparison.
+            (
+                "an overshoot attached to a failed run 2",
+                skid_report_without_comparison(2, Some(0), None),
+            ),
+        ] {
+            let row = marked(&report);
+            classified_as_skid(label, &row);
+            not_skid_only(label, &row);
+        }
+        // Both runs were compared, but run 2 died from SIGSEGV.
+        let mut crashed = skid_report_value(2);
+        let outputs = crashed.compared_outputs.as_mut().unwrap();
+        outputs.right.exit_code = None;
+        outputs.right.signal = Some(11);
+        let crashed = marked(&serde_json::to_string(&crashed).unwrap());
+        classified_as_skid("a compared run 2 that died from a signal", &crashed);
+        not_skid_only("a compared run 2 that died from a signal", &crashed);
+        // Two shapes Hermit's writers do not produce, so each remaining
+        // guard is exercised alone: compared outputs without the comparison
+        // they came from, and a guest disposition that contradicts them.
+        let mut uncompared = skid_report_value(2);
+        uncompared.comparison = None;
+        uncompared.compared_log_messages = None;
+        let uncompared = marked(&serde_json::to_string(&uncompared).unwrap());
+        classified_as_skid("compared outputs without a comparison", &uncompared);
+        not_skid_only("compared outputs without a comparison", &uncompared);
+        let mut contradicted = skid_report_value(2);
+        contradicted.guest_exit_code = None;
+        contradicted.guest_signal = Some(11);
+        let contradicted = marked(&serde_json::to_string(&contradicted).unwrap());
+        classified_as_skid(
+            "a guest signal beside clean compared outputs",
+            &contradicted,
+        );
+        not_skid_only(
+            "a guest signal beside clean compared outputs",
+            &contradicted,
+        );
+        // Both runs exited 7 and were compared, in a cell that declares no
+        // expected exit: 7 is not a disposition this cell accepts.
+        let mut sevens = skid_report_value(2);
+        sevens.guest_exit_code = Some(7);
+        let outputs = sevens.compared_outputs.as_mut().unwrap();
+        outputs.left.exit_code = Some(7);
+        outputs.right.exit_code = Some(7);
+        let sevens = serde_json::to_string(&sevens).unwrap();
+        let undeclared = marked(&sevens);
+        classified_as_skid("a compared exit 7 the cell does not declare", &undeclared);
+        not_skid_only("a compared exit 7 the cell does not declare", &undeclared);
+        // The same report in a cell that declares exit 7 is skid-only, and
+        // the clean-exit report is not.
+        let mut declared = marked(&sevens);
+        declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        classified_as_skid("a compared exit 7 the cell declares", &declared);
+        assert_eq!(
+            skid_overshoot_only_reports(&declared),
+            Some(2),
+            "{declared:?}"
+        );
+        let mut clean_in_declared = qualifying.clone();
+        clean_in_declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        not_skid_only(
+            "a compared exit 0 in a cell that declares exit 7",
+            &clean_in_declared,
+        );
+
+        // A skid attempt next to a passing one is a mixed history.
+        let mut passed = skid();
+        passed.outcome = "PASS".into();
+        passed.error_kind = None;
+        passed.reason = None;
+        passed.index = "2".into();
+        not_skid_only(
+            "a skid attempt next to a passing attempt",
+            &verify_row_from_attempts(vec![skid(), passed]),
+        );
+
+        let mut timed_out = qualifying.clone();
+        timed_out.attempts[0].timed_out = true;
+        not_skid_only("a timed-out attempt", &timed_out);
+        let mut signaled = qualifying.clone();
+        signaled.attempts[0].signal = Some(9);
+        not_skid_only("a signaled attempt", &signaled);
+        let mut binary_changed = qualifying.clone();
+        binary_changed.reason = Some("Hermit binary changed while the cell was executing".into());
+        not_skid_only("a cell whose Hermit binary changed", &binary_changed);
+        let mut blocked = qualifying.clone();
+        blocked.result = Some(ObservedResult::InfrastructureError);
+        not_skid_only("a row that also carries an environmental block", &blocked);
+        let mut replay = qualifying.clone();
+        replay.mode = "replay".into();
+        not_skid_only("a replay row", &replay);
+        let mut unreadable = qualifying.clone();
+        unreadable.attempts[0].verification_report = None;
+        not_skid_only("an attempt with no retained report", &unreadable);
+        // The row and its attempt both name a count other than the report's
+        // and the refusal line's, so only the count/reason guard differs.
+        let mut relabeled = qualifying.clone();
+        relabeled.reason = Some(skid_overshoot_reason(1));
+        relabeled.attempts[0].reason = Some(skid_overshoot_reason(1));
+        not_skid_only("an attempt whose reason names another count", &relabeled);
+        let mut no_attempts = qualifying.clone();
+        no_attempts.attempts.clear();
+        not_skid_only("a row with no attempts", &no_attempts);
+        let mut product = qualifying;
+        product.failure_class = Some(FailureClass::ProductFailure);
+        not_skid_only("a product failure", &product);
+    }
+
     /// A backend this runner could not start and a backend that ran but recorded
     /// no comparison must stay visible while carrying different error kinds.
     ///
@@ -13889,6 +15082,67 @@ cp "{}" "$verdict"
         assert_eq!(reread.expected_guest_exit, None);
     }
 
+    /// A row whose attempt carries an `infrastructure_error` report records
+    /// the cell's declared stdout assertions, so a later reader can re-decide
+    /// them from the attempt's own evidence before treating the row as
+    /// skid-only (<https://github.com/rrnewton/hermit/issues/1845>). Every
+    /// other row keeps the historical shape, without the key.
+    #[test]
+    fn a_skid_row_records_the_cells_declared_stdout() {
+        let (skid_result, skid_row) = expected_exit_row(
+            None,
+            skid_report_value(2),
+            &format!("{SKID_STDERR}; exit 122"),
+        );
+        assert_eq!(
+            (
+                skid_result.outcome.as_str(),
+                skid_result.error_kind.as_deref()
+            ),
+            ("ERROR", Some("infrastructure")),
+            "{skid_result:?}"
+        );
+        assert_eq!(
+            skid_row["declared_stdout"],
+            serde_json::json!({"exact": null, "contains": null}),
+            "{skid_row}"
+        );
+        assert_eq!(skid_overshoot_only_reports(&skid_result), Some(2));
+        let reread: CellResult = serde_json::from_value(skid_row).unwrap();
+        assert_eq!(reread.declared_stdout, Some(DeclaredStdout::default()));
+        assert_eq!(skid_overshoot_only_reports(&reread), Some(2));
+
+        let (plain_result, plain_row) =
+            expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert_eq!(plain_result.outcome, "PASS", "{:?}", plain_result.reason);
+        assert!(
+            !plain_row
+                .as_object()
+                .unwrap()
+                .contains_key("declared_stdout"),
+            "{plain_row}"
+        );
+
+        // The record is the verify recipe's declaration for the cell's
+        // backend, exactly what the classifier checked.
+        let mut declared = ptrace_cell("verify");
+        let recipe = declared.test.modes.get_mut("verify").unwrap();
+        recipe.expected_stdout = BTreeMap::from([("ptrace".to_string(), "golden\n".to_string())]);
+        recipe.expected_stdout_contains =
+            BTreeMap::from([("ptrace".to_string(), "gold".to_string())]);
+        assert_eq!(
+            cell_declared_stdout(&declared),
+            DeclaredStdout {
+                exact: Some("golden\n".into()),
+                contains: Some("gold".into()),
+            }
+        );
+        assert_eq!(
+            cell_declared_stdout(&ptrace_cell("verify")),
+            DeclaredStdout::default()
+        );
+    }
+
     /// Only a verify cell carries a declaration; the same recipe field on any
     /// other mode is not authority for a nonzero pass there.
     #[test]
@@ -14364,6 +15618,288 @@ cp "{}" "$verdict"
         assert!(
             error.contains("is not the second compared run's stdout"),
             "{error}"
+        );
+    }
+
+    /// A skid attempt's compared runs still answer to the cell's declared
+    /// stdout assertions (<https://github.com/rrnewton/hermit/issues/1845>).
+    /// Runs that agree on the wrong bytes, or omit the declared marker, and a
+    /// capture that cannot decide the marker, each keep the skid
+    /// infrastructure ERROR classification, the one shape every reader of a
+    /// result row accepts beside an `infrastructure_error` report, with a
+    /// reason that names both the overshoot and the assertion. None of them
+    /// is a skid-only row, so none earns the skid retry or counts as a
+    /// skid-recovered pass, even relabelled with the plain skid reason; the
+    /// same attempt with its assertions met stays one.
+    ///
+    /// The predicate re-decides the row's recorded declaration from each
+    /// attempt's own evidence, so a row an older producer classified without
+    /// the assertions (an attempt labelled `infrastructure` whatever its
+    /// stdout) qualifies only when its record shows no assertion it breaks,
+    /// and never without the record.
+    #[test]
+    fn a_skid_attempt_that_breaks_a_declared_stdout_assertion_is_not_skid_only() {
+        let skid_with = |first: &str, second: &str| {
+            let mut report = skid_report_value(2);
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            outputs.left.stdout_sha256 = hex_digest(first.as_bytes());
+            outputs.left.stdout_bytes = first.len() as u64;
+            outputs.right.stdout_sha256 = hex_digest(second.as_bytes());
+            outputs.right.stdout_bytes = second.len() as u64;
+            report
+        };
+        let ending = format!("{SKID_STDERR}; exit 122");
+        let golden = "syscall-file-io-ok count=5\n";
+        let unmarked = "syscall-file-io count=5\n";
+        let marker = "-ok ";
+        let skid = skid_overshoot_reason(2);
+        // The row `run_cell_inner` publishes for a cell declaring `exact`
+        // and/or `contains`.
+        let declaring = |mut row: CellResult, exact: Option<&str>, contains: Option<&str>| {
+            row.declared_stdout = Some(DeclaredStdout {
+                exact: exact.map(str::to_string),
+                contains: contains.map(str::to_string),
+            });
+            row
+        };
+
+        // A violating attempt is published in exactly the shape of a plain
+        // skid attempt: only its reason differs. With the plain skid reason
+        // restored, the row's recorded declaration alone still refuses it.
+        let refused_whatever_its_reason = |label: &str, row: CellResult| {
+            assert_eq!(
+                (
+                    row.outcome.as_str(),
+                    row.result,
+                    row.failure_class,
+                    row.error_kind.as_deref()
+                ),
+                (
+                    "ERROR",
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                    Some("infrastructure")
+                ),
+                "{label}: {row:?}"
+            );
+            let attempt = &row.attempts[0];
+            let report = current_verification_report(
+                attempt.verification_report.as_deref().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                (report.verdict, report.infrastructure_error),
+                (
+                    Verdict::InfrastructureError,
+                    Some(InfrastructureError::SkidOvershoot { count: 2 })
+                ),
+                "{label}: {row:?}"
+            );
+            assert_eq!(
+                skid_overshoot_only_reports(&row),
+                None,
+                "{label} must not be a skid-only row"
+            );
+            let mut relabelled = row;
+            relabelled.reason = Some(skid.clone());
+            relabelled.attempts[0].reason = Some(skid.clone());
+            assert_eq!(
+                skid_overshoot_only_reports(&relabelled),
+                None,
+                "{label} must not be a skid-only row with the plain skid reason"
+            );
+        };
+
+        // Controls: the same skid attempts with every declared assertion met.
+        for (label, exact, contains) in [
+            ("exact stdout met", Some(golden), None),
+            ("marker met", None, Some(marker)),
+            ("both met", Some(golden), Some(marker)),
+        ] {
+            let met = attempt_with_stdout_assertions(
+                exact,
+                contains,
+                skid_with(golden, golden),
+                golden,
+                &ending,
+            );
+            assert_eq!(
+                (met.outcome.as_str(), met.error_kind.as_deref()),
+                ("ERROR", Some("infrastructure")),
+                "{label}: {met:?}"
+            );
+            let row = declaring(verify_row_from_attempts(vec![met]), exact, contains);
+            assert_eq!(
+                (row.outcome.as_str(), row.result, row.failure_class),
+                (
+                    "ERROR",
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure)
+                ),
+                "{label}: {row:?}"
+            );
+            assert_eq!(
+                skid_overshoot_only_reports(&row),
+                Some(2),
+                "{label} must stay a skid-only row"
+            );
+        }
+
+        let empty_sha = hex_digest(b"");
+        let golden_sha = hex_digest(golden.as_bytes());
+        let unmarked_sha = hex_digest(unmarked.as_bytes());
+        for (label, exact, contains, report, captured, reason) in [
+            (
+                "agreeing on the wrong bytes",
+                Some(golden),
+                None,
+                skid_with("", ""),
+                "",
+                expected_stdout_mismatch_reason(
+                    "first",
+                    0,
+                    &empty_sha,
+                    golden.len() as u64,
+                    &golden_sha,
+                ),
+            ),
+            (
+                "the second run printing the wrong bytes",
+                Some(golden),
+                None,
+                skid_with(golden, unmarked),
+                golden,
+                expected_stdout_mismatch_reason(
+                    "second",
+                    unmarked.len() as u64,
+                    &unmarked_sha,
+                    golden.len() as u64,
+                    &golden_sha,
+                ),
+            ),
+            (
+                "omitting the declared marker",
+                None,
+                Some(marker),
+                skid_with(unmarked, unmarked),
+                unmarked,
+                expected_stdout_contains_mismatch_reason(
+                    unmarked.len() as u64,
+                    &unmarked_sha,
+                    marker,
+                ),
+            ),
+        ] {
+            let failed = attempt_with_stdout_assertions(exact, contains, report, captured, &ending);
+            let expected = format!(
+                "{skid}, and its compared runs violate a declared stdout assertion: {reason}"
+            );
+            assert_eq!(
+                (
+                    failed.outcome.as_str(),
+                    failed.error_kind.as_deref(),
+                    failed.reason.as_deref(),
+                ),
+                ("ERROR", Some("infrastructure"), Some(expected.as_str())),
+                "{label} beside an overshoot names both: {failed:?}"
+            );
+            let row = declaring(verify_row_from_attempts(vec![failed]), exact, contains);
+            refused_whatever_its_reason(label, row);
+        }
+
+        // A capture that is not the compared bytes cannot decide the marker.
+        let foreign = attempt_with_stdout_assertions(
+            None,
+            Some(marker),
+            skid_with(unmarked, unmarked),
+            golden,
+            &ending,
+        );
+        assert_eq!(
+            (foreign.outcome.as_str(), foreign.error_kind.as_deref()),
+            ("ERROR", Some("infrastructure")),
+            "{foreign:?}"
+        );
+        let prefix = format!(
+            "{skid}, and a declared stdout assertion cannot be checked: captured verify stdout ("
+        );
+        assert!(
+            foreign
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(&prefix)),
+            "{foreign:?}"
+        );
+        let row = declaring(verify_row_from_attempts(vec![foreign]), None, Some(marker));
+        refused_whatever_its_reason("a capture unlike the compared runs", row);
+
+        // Rows an older producer wrote: each attempt was classified without
+        // the cell's assertions, so it carries the plain skid label whatever
+        // its compared runs printed. Only the row's recorded declaration,
+        // re-decided against the attempt's own evidence, can admit it.
+        let imported = |first: &str, second: &str, captured: &str| {
+            let attempt = attempt_with_stdout_assertions(
+                None,
+                None,
+                skid_with(first, second),
+                captured,
+                &ending,
+            );
+            assert_eq!(
+                (attempt.outcome.as_str(), attempt.error_kind.as_deref()),
+                ("ERROR", Some("infrastructure")),
+                "{attempt:?}"
+            );
+            verify_row_from_attempts(vec![attempt])
+        };
+        let mut unrecorded = imported("", "", "");
+        unrecorded.declared_stdout = None;
+        assert_eq!(
+            skid_overshoot_only_reports(&unrecorded),
+            None,
+            "a row without the record never qualifies"
+        );
+        for (label, row) in [
+            (
+                "an empty pair under a declared golden",
+                declaring(imported("", "", ""), Some(golden), None),
+            ),
+            (
+                "a second run off the declared golden",
+                declaring(imported(golden, unmarked, golden), Some(golden), None),
+            ),
+            (
+                "an empty pair under a declared marker",
+                declaring(imported("", "", ""), None, Some(marker)),
+            ),
+            (
+                "an unmarked pair under a declared marker",
+                declaring(imported(unmarked, unmarked, unmarked), None, Some(marker)),
+            ),
+            (
+                "a capture unlike the compared runs under a declared marker",
+                declaring(imported(unmarked, unmarked, golden), None, Some(marker)),
+            ),
+        ] {
+            assert_eq!(
+                skid_overshoot_only_reports(&row),
+                None,
+                "{label} must not be a skid-only row: {row:?}"
+            );
+        }
+        assert_eq!(
+            skid_overshoot_only_reports(&declaring(imported("", "", ""), None, None)),
+            Some(2),
+            "a recorded row declaring nothing keeps its skid-only reading"
+        );
+        assert_eq!(
+            skid_overshoot_only_reports(&declaring(
+                imported(golden, golden, golden),
+                Some(golden),
+                Some(marker)
+            )),
+            Some(2),
+            "a recorded row whose evidence meets its declaration keeps it"
         );
     }
 

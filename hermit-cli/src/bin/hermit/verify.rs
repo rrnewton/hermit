@@ -515,6 +515,14 @@ pub struct VerificationOutcome {
     /// Why verification did not reach a verdict. None for a completed match or
     /// divergence; current no-result producers must provide a typed reason.
     pub no_result_reason: Option<NoResultReason>,
+    /// The log comparator's exact refusal (a log cut at its size bound), kept
+    /// even when an observed output or exit-status difference selected
+    /// [`Verdict::Diverged`] and so left [`Self::no_result_reason`] empty. The
+    /// ordinary report does not carry it, because the report schema allows a
+    /// `no_result_reason` only beside a `no_result` verdict;
+    /// [`write_skid_overshoot_verification_json`] reads it so that an overshoot
+    /// cannot erase the refusal.
+    pub refused_log_comparison: Option<String>,
     /// Exit status of the second (replay / repeat) run, propagated verbatim.
     pub guest_status: ExitStatus,
     /// The exact common output/log comparison used for [`Self::verdict`],
@@ -710,6 +718,21 @@ pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Re
 /// Write a completed comparison that cannot be accepted because precise PMU
 /// timer delivery passed its target. The comparison remains available for
 /// diagnosis, while the canonical verdict makes the refusal unambiguous.
+///
+/// A comparison the comparator itself refused (a log cut at its size bound)
+/// is written as that refusal instead: verdict `no_result` with its
+/// `comparison_refused` reason. That holds whether the comparator selected
+/// `no_result` or, because an output or exit-status difference was also
+/// observed, `diverged`; the overshoot already made that difference
+/// unattributable, and the refusal must not disappear with it. The report
+/// schema allows a `no_result_reason` only beside a `no_result` verdict, so
+/// one report cannot carry both causes, and converting this one to an
+/// overshoot would erase the refusal. The refusal is the failure a fresh
+/// attempt could hide: a reader that may retry a pure overshoot
+/// (<https://github.com/rrnewton/hermit/issues/1845>) must not mistake this
+/// attempt for one. The overshoot itself is still reported, by the
+/// `HERMIT_SKID_OVERSHOOT` lines on stderr and by the caller's skid-overshoot
+/// exit status.
 pub fn write_skid_overshoot_verification_json(
     path: &Path,
     outcome: &VerificationOutcome,
@@ -719,6 +742,22 @@ pub fn write_skid_overshoot_verification_json(
         count > 0,
         "a skid-overshoot report requires a positive count"
     );
+    let refusal = outcome.refused_log_comparison.clone().or_else(|| {
+        match (&outcome.verdict, &outcome.no_result_reason) {
+            (Verdict::NoResult, Some(NoResultReason::ComparisonRefused { detail })) => {
+                Some(detail.clone())
+            }
+            _ => None,
+        }
+    });
+    if let Some(detail) = refusal {
+        let refused = VerificationOutcome {
+            verdict: Verdict::NoResult,
+            no_result_reason: Some(NoResultReason::ComparisonRefused { detail }),
+            ..outcome.clone()
+        };
+        return write_report_json(path, &verification_report(&refused));
+    }
     let mut report = verification_report(outcome);
     report.verified = false;
     report.bitwise_parity = false;
@@ -1542,6 +1581,7 @@ fn compare_two_runs_with_unsupported_scan(
         let no_result_reason =
             (verdict == Verdict::NoResult).then(|| NoResultReason::ComparisonRefused {
                 detail: comparison_refusal_reason
+                    .clone()
                     .expect("a refused comparison retains its producer reason"),
             });
 
@@ -1552,6 +1592,7 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(VerificationOutcome {
             verdict,
             no_result_reason,
+            refused_log_comparison: comparison_refusal_reason,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1569,6 +1610,7 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
             no_result_reason: None,
+            refused_log_comparison: None,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -3793,6 +3835,84 @@ mod tests {
         assert_eq!(report.guest_exit_code, Some(0));
     }
 
+    /// An overshoot that coincides with a refused comparison is written as
+    /// the refusal. The log cut at its size bound is a separate failure that
+    /// a fresh attempt must not be allowed to hide, and the report schema
+    /// allows its reason only beside a `no_result` verdict
+    /// (<https://github.com/rrnewton/hermit/issues/1845>).
+    ///
+    /// That holds whichever verdict the comparator selected: with identical
+    /// outputs it selects `no_result`, and when an output or exit-status
+    /// difference is also observed it selects `diverged` and its ordinary
+    /// report carries no refusal reason. A divergence with intact logs is the
+    /// control: it has no refusal to keep, so the overshoot report is written.
+    #[test]
+    fn skid_overshoot_refusal_keeps_a_refused_comparisons_reason() {
+        let same = output(0, b"hello\n", b"");
+        for (label, right, comparator_verdict) in [
+            ("identical outputs", same.clone(), Verdict::NoResult),
+            ("stdout", output(0, b"goodbye\n", b""), Verdict::Diverged),
+            (
+                "stderr",
+                output(0, b"hello\n", b"oops\n"),
+                Verdict::Diverged,
+            ),
+            ("exit status", output(3, b"hello\n", b""), Verdict::Diverged),
+        ] {
+            let file = NamedTempFile::new().unwrap();
+            let path = file.path().to_path_buf();
+            let (log1, log2) = logs_truncated_at_the_bound();
+            let outcome = compare(&same, log1, &right, log2).unwrap();
+            assert_eq!(outcome.verdict, comparator_verdict, "{label}");
+            if comparator_verdict == Verdict::Diverged {
+                // Without an overshoot nothing changes: the divergence is the
+                // report, as `an_observed_difference_outranks_a_refused_comparison`
+                // requires.
+                let ordinary = verification_report(&outcome);
+                assert_eq!(ordinary.verdict, Verdict::Diverged, "{label}");
+                assert_eq!(ordinary.no_result_reason, None, "{label}");
+            }
+
+            write_skid_overshoot_verification_json(&path, &outcome, 3).unwrap();
+
+            let report = VerificationReport::from_current_json_value(
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report.verdict, Verdict::NoResult, "{label}");
+            assert_eq!(report.infrastructure_error, None, "{label}");
+            assert!(
+                matches!(
+                    report.no_result_reason.as_ref(),
+                    Some(NoResultReason::ComparisonRefused { detail })
+                        if detail.contains("truncated at the configured size bound")
+                ),
+                "{label}: the overshoot report must keep the comparator's refusal: {report:?}"
+            );
+            assert!(!report.verified, "{label}");
+            assert!(!report.bitwise_parity, "{label}");
+            assert_eq!(report.comparison, None, "{label}");
+            assert_eq!(report.compared_outputs, None, "{label}");
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        let (log1, log2) = empty_logs();
+        let outcome = compare(&same, log1, &output(0, b"goodbye\n", b""), log2).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        assert_eq!(outcome.refused_log_comparison, None);
+        write_skid_overshoot_verification_json(file.path(), &outcome, 3).unwrap();
+        let report = VerificationReport::from_current_json_value(
+            serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::InfrastructureError);
+        assert_eq!(
+            report.infrastructure_error,
+            Some(InfrastructureError::SkidOvershoot { count: 3 })
+        );
+        assert_eq!(report.no_result_reason, None);
+    }
+
     #[test]
     fn skid_overshoot_before_comparison_is_not_reported_as_no_result() {
         let file = NamedTempFile::new().unwrap();
@@ -4047,6 +4167,7 @@ mod tests {
         let diverged = VerificationOutcome {
             verdict: Verdict::Diverged,
             no_result_reason: None,
+            refused_log_comparison: None,
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),

@@ -77,7 +77,9 @@ use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
+use hermit_manifest_plan::runner::retained_execution_path_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
+use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
 use hermit_manifest_plan::stress_series::SeriesPressureComparison;
@@ -6079,10 +6081,21 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
 /// their own framework-written attempt ordinal. The scorecard keys its duplicate
 /// guard on all three values, so retries remain distinct without changing what a
 /// repetition means.
+///
+/// Only a product-failure attempt (or a legacy row that records no failure
+/// class) is a divergence observation. An attempt the framework classified as
+/// an infrastructure, prerequisite or no-result failure is not one, even when
+/// it carries first-divergence coordinates: a typed precise-timer overshoot
+/// moves the preemption point, so its report names where the two runs parted,
+/// and it may now be retried
+/// (<https://github.com/rrnewton/hermit/issues/1845>). Turning such a row into a
+/// determinism failure would manufacture a product observation from
+/// infrastructure evidence.
 fn earlier_attempts_that_located(rows: &[CellResult], terminal: u64) -> Vec<&CellResult> {
     let mut earlier: Vec<&CellResult> = rows
         .iter()
         .filter(|row| row.attempt < terminal)
+        .filter(|row| matches!(row.failure_class, None | Some(FailureClass::ProductFailure)))
         .filter(|row| {
             row.first_divergent_record.is_some()
                 || row.first_divergent_syscall.is_some()
@@ -6427,8 +6440,19 @@ fn repeated_result_description(
 /// INCOMPLETE rather than CLEAN. CLEAN also requires every repetition to have
 /// been observed with an intact result history: a pass whose retained
 /// evidence contradicts itself (`unknown_history_repetitions`) is not clean.
+///
+/// A pass that needed the framework retry only because every earlier attempt
+/// was a typed skid-overshoot refusal (`infrastructure_recovered_passes`) is
+/// not a recovered product failure: that attempt measured the host's
+/// interrupt latency, not the guest
+/// (<https://github.com/rrnewton/hermit/issues/1845>). It never makes a cell
+/// FLAKY, and because it is still a retried repetition it never lets the cell
+/// read CLEAN either, so alone it leaves the cell INCOMPLETE.
 fn flake_verdict(counts: RepeatedOutcomeCounts) -> &'static str {
-    let passes_after_retry = counts.terminal_passes.saturating_sub(counts.clean_passes);
+    let passes_after_retry = counts
+        .terminal_passes
+        .saturating_sub(counts.clean_passes)
+        .saturating_sub(counts.infrastructure_recovered_passes);
     if counts.product_failures > 0 || passes_after_retry > 0 {
         if counts.terminal_passes > 0 {
             "FLAKY"
@@ -6455,6 +6479,10 @@ struct RepeatedOutcomeCounts {
     qualifying_passes: usize,
     clean_passes: usize,
     terminal_passes: usize,
+    /// Terminal passes whose every earlier attempt was a typed skid-overshoot
+    /// refusal ([`passed_after_skid_retries_only`]). Each is also a terminal
+    /// pass and a retried repetition, and never a clean pass.
+    infrastructure_recovered_passes: usize,
     product_failures: usize,
     infrastructure_failures: usize,
     prerequisite_failures: usize,
@@ -7117,9 +7145,51 @@ struct RepeatedCellTally {
     terminal_passes: usize,
     clean_passes: usize,
     infrastructure_errors: usize,
+    /// Passes recovered only from typed skid-overshoot refusals; like
+    /// `infrastructure_errors`, they make the result incomplete.
+    infrastructure_recovered: usize,
     retried: usize,
     total: usize,
     counts: RepeatedOutcomeCounts,
+}
+
+/// Whether a repetition's terminal pass recovered only from typed
+/// skid-overshoot refusals: the runner's own history validation
+/// ([`cell_result_after_retries`]: contiguous attempts from 1, the shared
+/// maximum, nothing after a PASS) selects a PASS row that is not attempt 1,
+/// every inner attempt of that PASS row is a qualifying subrun
+/// ([`qualifying_subruns`]: a nonempty set of distinctly indexed PASS
+/// attempts whose retained reports match their digests, with no error kind,
+/// no timeout and no adverse category such as a canonical divergence), the
+/// PASS row's execution path is the eligible one its own retained attempts
+/// decide ([`retained_execution_path_error`]), every row records the PASS
+/// row's relaxations (so each was judged by the same comparator and recipe),
+/// and every other row is one the runner's own retry predicate,
+/// [`skid_overshoot_only_reports`], accepts.
+///
+/// That refusal is the one infrastructure failure the runner retries
+/// (<https://github.com/rrnewton/hermit/issues/1845>). It measured the host's
+/// counter-interrupt latency, not the guest, so the pass after it is not a
+/// recovered product failure. An earlier product failure, any earlier attempt
+/// the predicate refuses, or a history the runner would not have produced
+/// (duplicate, missing or out-of-order attempts, no PASS row) keeps the
+/// ordinary reading: a pass after a retry is a flake. So does a selected PASS
+/// row that retains any subrun other than a clean pass, such as an
+/// authentic, correctly hashed canonical divergence under its own index: a
+/// retained product failure is never discounted as infrastructure.
+fn passed_after_skid_retries_only(result: &str, rows: &[CellResult]) -> bool {
+    let Ok(selected) = cell_result_after_retries(rows) else {
+        return false;
+    };
+    result == "pass"
+        && selected.outcome == "PASS"
+        && selected.attempt > 1
+        && qualifying_subruns(&selected.mode, &selected.attempts)
+        && retained_execution_path_error(selected).is_none()
+        && rows.iter().all(|row| {
+            row.relaxations == selected.relaxations
+                && (row.attempt == selected.attempt || skid_overshoot_only_reports(row).is_some())
+        })
 }
 
 /// What one repetition's retained evidence established, as `fold_repetition`
@@ -7168,16 +7238,37 @@ fn fold_repetition(
     tally.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
     tally.infrastructure_errors +=
         usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
-    tally.retried += usize::from(retained_attempts > 1);
-    let counts = &mut tally.counts;
-    counts.expected_repetitions += 1;
-    counts.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
-    counts.retried_repetitions += usize::from(retained_attempts > 1);
     let inner_history = if rows.is_empty() {
         None
     } else {
         Some(inner_pressure_history(rows))
     };
+    // Skid-recovery credit is granted only to a history that passed the
+    // inner-history validation above (every outer row's inner attempts
+    // present, with nonempty distinct indices and retained reports whose
+    // digests match) and whose validated inner categories are all
+    // infrastructure failures: a history the runner would not have written,
+    // or one that retains a product failure, a no-result or a prerequisite
+    // failure anywhere, keeps the ordinary reading, under which a pass after
+    // a retry is a flake. `passed_after_skid_retries_only` already requires
+    // skid-only earlier rows (every inner attempt an infrastructure ERROR) and
+    // a selected PASS of qualifying subruns (no category at all), so the
+    // category condition restates that requirement on the validated history
+    // rather than adding a new one.
+    let recovered_from_infrastructure = retained_attempts > 1
+        && matches!(
+            &inner_history,
+            Some(Ok(categories)) if categories
+                .iter()
+                .all(|category| *category == RepetitionClassification::InfrastructureFailure)
+        )
+        && passed_after_skid_retries_only(result, rows);
+    tally.infrastructure_recovered += usize::from(recovered_from_infrastructure);
+    tally.retried += usize::from(retained_attempts > 1);
+    let counts = &mut tally.counts;
+    counts.expected_repetitions += 1;
+    counts.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
+    counts.retried_repetitions += usize::from(retained_attempts > 1);
     // A typed NoResult stamp legitimately has no comparison. Only
     // that one verified reader refusal may be explained here; missing
     // captures, golden output or other artifact errors stay incomplete.
@@ -7195,6 +7286,7 @@ fn fold_repetition(
     if result == "pass" {
         counts.observed_repetitions += 1;
         counts.terminal_passes += 1;
+        counts.infrastructure_recovered_passes += usize::from(recovered_from_infrastructure);
         counts.qualifying_passes += usize::from(
             evidence_error_count == 0
                 && sample_evidence_errors.is_empty()
@@ -7246,9 +7338,11 @@ fn print_repeated_cell_table(
     println!("Retries: {retries}");
     println!();
     println!(
-        "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
+        "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Skid-recovered passes | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |");
+    println!(
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
+    );
     let mut verdicts = BTreeMap::<&'static str, usize>::new();
     let mut repeated_cells = Vec::new();
     for cell in cells {
@@ -7256,6 +7350,7 @@ fn print_repeated_cell_table(
             terminal_passes,
             clean_passes,
             infrastructure_errors,
+            infrastructure_recovered,
             retried,
             total,
             counts,
@@ -7263,17 +7358,18 @@ fn print_repeated_cell_table(
         let result = repeated_result_description(
             terminal_passes,
             clean_passes,
-            infrastructure_errors,
+            infrastructure_errors + infrastructure_recovered,
             retried,
             total,
         );
         let verdict = flake_verdict(counts);
         *verdicts.entry(verdict).or_default() += 1;
         println!(
-            "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
+            "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
             display_id(cell),
             counts.product_failures,
             counts.infrastructure_failures,
+            counts.infrastructure_recovered_passes,
             counts.prerequisite_failures,
             counts.no_results,
             counts.mixed_repetitions + counts.missing_repetitions,
@@ -7312,6 +7408,7 @@ fn repeated_cell_summary(cell: &CellId, counts: RepeatedOutcomeCounts, result: &
         "qualifying_passes": counts.qualifying_passes,
         "terminal_product_failures": counts.product_failures,
         "infrastructure_failures": counts.infrastructure_failures,
+        "infrastructure_recovered_passes": counts.infrastructure_recovered_passes,
         "prerequisite_failures": counts.prerequisite_failures,
         "no_results": counts.no_results,
         "mixed_repetitions": counts.mixed_repetitions,
@@ -7360,6 +7457,9 @@ fn verify_repetition_summary_json(
         let infrastructure_failures = cell
             .get("infrastructure_failures")
             .and_then(JsonValue::as_u64);
+        let infrastructure_recovered = cell
+            .get("infrastructure_recovered_passes")
+            .and_then(JsonValue::as_u64);
         let prerequisite_failures = cell
             .get("prerequisite_failures")
             .and_then(JsonValue::as_u64);
@@ -7380,6 +7480,7 @@ fn verify_repetition_summary_json(
             || qualifying.is_none()
             || product_failures.is_none()
             || infrastructure_failures.is_none()
+            || infrastructure_recovered.is_none()
             || prerequisite_failures.is_none()
             || no_results.is_none()
             || mixed.is_none()
@@ -7388,10 +7489,18 @@ fn verify_repetition_summary_json(
             || classification.is_none()
             || promotion_candidate.is_none()
             || cell.get("result").and_then(JsonValue::as_str).is_none()
+            || cell.get("verdict").and_then(JsonValue::as_str).is_none()
         {
             return Err("summary JSON has an incomplete repeated-cell result".into());
         }
-        if terminal_passes > total || clean_passes > terminal_passes || retried > total {
+        // A skid-recovered pass is a terminal pass that is neither clean nor
+        // unretried.
+        if terminal_passes > total
+            || clean_passes > terminal_passes
+            || retried > total
+            || infrastructure_recovered.unwrap() > terminal_passes.unwrap() - clean_passes.unwrap()
+            || infrastructure_recovered > retried
+        {
             return Err("summary JSON has impossible repeated-cell counts".into());
         }
         let counts = RepeatedOutcomeCounts {
@@ -7400,6 +7509,7 @@ fn verify_repetition_summary_json(
             qualifying_passes: qualifying.unwrap() as usize,
             clean_passes: clean_passes.unwrap() as usize,
             terminal_passes: terminal_passes.unwrap() as usize,
+            infrastructure_recovered_passes: infrastructure_recovered.unwrap() as usize,
             product_failures: product_failures.unwrap() as usize,
             infrastructure_failures: infrastructure_failures.unwrap() as usize,
             prerequisite_failures: prerequisite_failures.unwrap() as usize,
@@ -7413,6 +7523,7 @@ fn verify_repetition_summary_json(
         if total != expected
             || qualifying > clean_passes
             || unknown_history > expected
+            || cell.get("verdict").and_then(JsonValue::as_str) != Some(flake_verdict(counts))
             || classification != Some(expected_classification.as_str())
             || promotion_candidate
                 != Some(expected_classification == PressureSampleClassification::PromotionCandidate)
@@ -7443,6 +7554,7 @@ fn repeated_summary_line(
     terminal_passes: usize,
     clean_passes: usize,
     infrastructure_errors: usize,
+    infrastructure_recovered: usize,
     retried: usize,
     total: usize,
 ) -> String {
@@ -7450,14 +7562,26 @@ fn repeated_summary_line(
         metadata,
         terminal_passes,
         clean_passes,
-        infrastructure_errors,
+        infrastructure_errors + infrastructure_recovered,
         retried,
         total,
     );
     if metadata.is_exact() {
         if result == "incomplete" {
+            let mut reasons = Vec::new();
+            if infrastructure_errors > 0 || infrastructure_recovered == 0 {
+                reasons.push(format!(
+                    "{infrastructure_errors} check(s) have no trustworthy result"
+                ));
+            }
+            if infrastructure_recovered > 0 {
+                reasons.push(format!(
+                    "{infrastructure_recovered} check(s) passed only after a typed skid-overshoot retry"
+                ));
+            }
             format!(
-                "Repeated result: {terminal_passes}/{total} terminally passed; {clean_passes}/{total} passed cleanly; incomplete because {infrastructure_errors} check(s) have no trustworthy result."
+                "Repeated result: {terminal_passes}/{total} terminally passed; {clean_passes}/{total} passed cleanly; incomplete because {}.",
+                reasons.join(" and ")
             )
         } else {
             format!(
@@ -8315,6 +8439,19 @@ fn summarize(
                                 verification_report_path(&earlier_artifact_dir).display()
                             )
                         })?;
+                        // The emitted row is a divergence observation, so its
+                        // retained report must be a typed divergence; coordinates
+                        // alone do not make one
+                        // (<https://github.com/rrnewton/hermit/issues/1845>).
+                        let earlier_verdict = earlier_verification
+                            .get("verdict")
+                            .and_then(JsonValue::as_str);
+                        if earlier_verdict != Some("diverged") {
+                            return Err(format!(
+                                "earlier attempt {} located a divergence, but its retained verification report has verdict {:?}, not diverged",
+                                earlier_row.attempt, earlier_verdict
+                            ));
+                        }
                         let earlier_verification_logs = retained_verification_logs(
                             cell,
                             &earlier_artifact_dir,
@@ -8504,6 +8641,7 @@ fn summarize(
             terminal_passes,
             clean_passes,
             infrastructure_errors,
+            infrastructure_recovered,
             retried,
             total,
             counts,
@@ -8512,7 +8650,7 @@ fn summarize(
             &metadata,
             terminal_passes,
             clean_passes,
-            infrastructure_errors,
+            infrastructure_errors + infrastructure_recovered,
             retried,
             total,
         );
@@ -8523,6 +8661,7 @@ fn summarize(
                 terminal_passes,
                 clean_passes,
                 infrastructure_errors,
+                infrastructure_recovered,
                 retried,
                 total,
             )
@@ -8547,11 +8686,13 @@ fn summarize(
             },
         );
         let infrastructure_errors: usize = repeated.values().map(|t| t.infrastructure_errors).sum();
+        let infrastructure_recovered: usize =
+            repeated.values().map(|t| t.infrastructure_recovered).sum();
         let result = top_level_repeated_result_description(
             &metadata,
             repeated_terminal_pass_count,
             repeated_clean_pass_count,
-            infrastructure_errors,
+            infrastructure_errors + infrastructure_recovered,
             retried_repetitions,
             repeated_total_count,
         );
@@ -8562,6 +8703,7 @@ fn summarize(
                 repeated_terminal_pass_count,
                 repeated_clean_pass_count,
                 infrastructure_errors,
+                infrastructure_recovered,
                 retried_repetitions,
                 repeated_total_count,
             )
@@ -10235,6 +10377,7 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
         qualifying_passes,
         clean_passes: qualifying_passes,
         terminal_passes,
+        infrastructure_recovered_passes: 0,
         product_failures,
         infrastructure_failures,
         prerequisite_failures,
@@ -11145,6 +11288,43 @@ fn flake_verdict_self_test() -> Result<(), String> {
             },
             "FLAKY",
         ),
+        // A pass that the runner reached only by retrying a typed skid
+        // overshoot is an infrastructure recovery: never a product flake, and
+        // never clean either.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 9,
+                terminal_passes: 10,
+                infrastructure_recovered_passes: 1,
+                retried_repetitions: 1,
+                ..base
+            },
+            "INCOMPLETE",
+        ),
+        // A skid recovery does not absorb a second retried pass whose earlier
+        // attempt was a product failure.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 8,
+                terminal_passes: 10,
+                infrastructure_recovered_passes: 1,
+                retried_repetitions: 2,
+                ..base
+            },
+            "FLAKY",
+        ),
+        // Nor does it hide a terminal product failure elsewhere.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 8,
+                terminal_passes: 9,
+                infrastructure_recovered_passes: 1,
+                product_failures: 1,
+                retried_repetitions: 1,
+                ..base
+            },
+            "FLAKY",
+        ),
         (
             RepeatedOutcomeCounts {
                 product_failures: 10,
@@ -11337,6 +11517,61 @@ fn self_test(root: &Path) -> Result<(), String> {
         let clean = read_result_rows(&path)?;
         if !earlier_attempts_that_located(&clean, 2).is_empty() {
             return Err("an earlier attempt that located nothing must not be reported".into());
+        }
+        // A typed precise-timer overshoot carries the coordinates where the
+        // moved preemption point made the runs part, and it is retried
+        // (https://github.com/rrnewton/hermit/issues/1845). Followed by a PASS it
+        // is an infrastructure attempt, never an earlier divergence
+        // observation; the same holds for a no-result attempt. A typed product
+        // failure with the same coordinates still is one.
+        for (label, classification, expected) in [
+            (
+                "skid overshoot",
+                r#""outcome":"ERROR","failure_class":"understood_infrastructure_failure","reason":"verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)","error_kind":"infrastructure""#,
+                0,
+            ),
+            (
+                "no result",
+                r#""outcome":"ERROR","failure_class":"no_result","reason":"comparison refused","error_kind":"infrastructure""#,
+                0,
+            ),
+            (
+                "typed product failure",
+                r#""outcome":"FAIL","failure_class":"product_failure","result":"determinism-failure","reason":null,"error_kind":null"#,
+                1,
+            ),
+        ] {
+            // Drop the unclassified reason fields first: the classification
+            // supplies its own.
+            let classified = diverged
+                .replace(r#","reason":null,"error_kind":null"#, "")
+                .replace(r#""outcome":"FAIL""#, classification);
+            if classified == diverged || !classified.contains(classification) {
+                return Err(format!(
+                    "the {label} history fixture did not apply its classification"
+                ));
+            }
+            fs::write(&path, format!("{classified}\n{passed}\n"))
+                .map_err(|e| format!("cannot write {label} history fixture: {e}"))?;
+            let history = read_result_rows(&path)?;
+            if history[0].first_divergent_record != Some(93) {
+                return Err(format!(
+                    "the {label} fixture must keep its first-divergence coordinates"
+                ));
+            }
+            let earlier = earlier_attempts_that_located(&history, 2);
+            if earlier.len() != expected {
+                return Err(format!(
+                    "an earlier {label} attempt with coordinates followed by PASS must yield {expected} earlier observation(s), got {}",
+                    earlier.len()
+                ));
+            }
+            let reported = cell_result_after_retries(&history)?;
+            if reported.attempt != 2 || reported.outcome != "PASS" {
+                return Err(format!(
+                    "the passing retry after an earlier {label} attempt must remain the reported row"
+                ));
+            }
         }
         fs::remove_file(&path)
             .map_err(|e| format!("cannot remove divergence history fixture: {e}"))?;
@@ -13669,22 +13904,24 @@ fn self_test(root: &Path) -> Result<(), String> {
         );
     }
     let exact_red_heading = summary_heading(&repeated_metadata);
-    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 1, 0, 0, 2);
-    let retried_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 1, 0, 1, 2);
-    let all_recovered_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 0, 0, 2, 2);
-    let all_failed_exact_red_result = repeated_summary_line(&repeated_metadata, 0, 0, 0, 2, 2);
+    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 1, 0, 0, 0, 2);
+    let retried_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 1, 0, 0, 1, 2);
+    let all_recovered_exact_red_result =
+        repeated_summary_line(&repeated_metadata, 2, 0, 0, 0, 2, 2);
+    let all_failed_exact_red_result = repeated_summary_line(&repeated_metadata, 0, 0, 0, 0, 2, 2);
     let red_batch_heading = summary_heading(&red_batch_result_metadata);
-    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 2);
+    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 0, 2);
     let one_recovered_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 2, 1, 0, 1, 2);
+        repeated_summary_line(&red_batch_result_metadata, 2, 1, 0, 0, 1, 2);
     let recovered_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 2, 2);
-    let failed_red_batch_result = repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 2, 2);
+        repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 0, 2, 2);
+    let failed_red_batch_result =
+        repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 0, 2, 2);
     let green_batch_heading = summary_heading(&green_batch_metadata);
-    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 2);
+    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 0, 2);
     let disabled_batch_heading = summary_heading(&disabled_batch_result_metadata);
     let disabled_batch_result =
-        repeated_summary_line(&disabled_batch_result_metadata, 1, 1, 0, 0, 2);
+        repeated_summary_line(&disabled_batch_result_metadata, 1, 1, 0, 0, 0, 2);
     if exact_red_heading != "# Repeated red-cell results"
         || exact_red_result != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
         || retried_exact_red_result
@@ -14619,6 +14856,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         reason: None,
         artifact_dir: sample_artifact_dir.to_string_lossy().into_owned(),
         expected_guest_exit: None,
+        declared_stdout: None,
     };
     if !result_row_matches_cell(
         &result_row,
@@ -14961,6 +15199,500 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .contains("already retained")
         {
             return Err(format!("verdicts counted a copied row twice: {written}"));
+        }
+        // A pass the runner reached only by retrying a typed skid overshoot
+        // (https://github.com/rrnewton/hermit/issues/1845) is an
+        // infrastructure recovery: INCOMPLETE, counted and named, never a
+        // product FLAKY and never CLEAN. The same pass after a product
+        // failure, or after an infrastructure attempt the skid predicate
+        // refuses (a second classification, a row without its
+        // declared-stdout record, compared runs that break the declared
+        // stdout, or a strict comparison that compared no log messages),
+        // keeps the FLAKY reading.
+        let mut skid = pass.clone();
+        skid.outcome = "ERROR".into();
+        skid.result = None;
+        skid.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        skid.error_kind = Some("infrastructure".into());
+        skid.reason = Some(hermit_manifest_plan::runner::skid_overshoot_reason(2));
+        skid.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout::default());
+        {
+            let attempt = &mut skid.attempts[0];
+            attempt.outcome = "ERROR".into();
+            attempt.error_kind = Some("infrastructure".into());
+            attempt.status = Some(122);
+            attempt.reason = skid.reason.clone();
+            attempt.stderr = [
+                "HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829",
+                "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2",
+                "Error: observed 2 HERMIT_SKID_OVERSHOOT report(s); refusing the result",
+                "",
+            ]
+            .join("\n");
+            let mut report: JsonValue = serde_json::from_str(
+                attempt
+                    .verification_report
+                    .as_deref()
+                    .ok_or("matched pass fixture lost its report")?,
+            )
+            .map_err(|e| format!("invalid matched report fixture: {e}"))?;
+            report["verified"] = json!(false);
+            report["bitwise_parity"] = json!(false);
+            report["verdict"] = json!("infrastructure_error");
+            report["infrastructure_error"] = json!({"kind": "skid_overshoot", "count": 2});
+            let raw = serde_json::to_string(&report)
+                .map_err(|e| format!("cannot encode skid report fixture: {e}"))?;
+            attempt.verification_report_sha256 =
+                Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+            attempt.verification_report = Some(raw);
+        }
+        if skid_overshoot_only_reports(&skid) != Some(2) {
+            return Err(format!(
+                "the skid fixture is not the runner's skid-only row: {skid:?}"
+            ));
+        }
+        let mut marked_twice = skid.clone();
+        marked_twice.attempts[0]
+            .stderr
+            .push_str("HERMIT_INTERNAL_FAILURE class=internal-failure cause=fixture\n");
+        if skid_overshoot_only_reports(&marked_twice).is_some() {
+            return Err("a second classification still read as skid-only".into());
+        }
+        // A row an older producer wrote carries no declared-stdout record, so
+        // its stdout assertions cannot be re-decided and it is never
+        // skid-only, however its attempts are labelled.
+        let mut legacy = skid.clone();
+        legacy.declared_stdout = None;
+        if skid_overshoot_only_reports(&legacy).is_some() {
+            return Err("a row without its declared-stdout record read as skid-only".into());
+        }
+        // Both compared runs printed nothing, so a declared exact stdout is
+        // violated. The runner publishes that attempt in the plain skid row's
+        // shape with a reason naming both; with either reason it is never
+        // skid-only, because the row's declaration is re-decided against the
+        // report's stdout digests.
+        let mut violated = skid.clone();
+        violated.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+            exact: Some("skid-control-ok\n".into()),
+            contains: None,
+        });
+        if skid_overshoot_only_reports(&violated).is_some() {
+            return Err("a skid attempt breaking its declared stdout read as skid-only".into());
+        }
+        let violated_reason = format!(
+            "{}, and its compared runs violate a declared stdout assertion: fixture",
+            hermit_manifest_plan::runner::skid_overshoot_reason(2)
+        );
+        violated.reason = Some(violated_reason.clone());
+        violated.attempts[0].reason = Some(violated_reason);
+        if skid_overshoot_only_reports(&violated).is_some() {
+            return Err("a skid attempt naming a broken stdout assertion read as skid-only".into());
+        }
+        // A history the runner would not have written: an inner attempt
+        // without an index, two inner attempts sharing one, or a retained
+        // report that is not the bytes its recorded digest names. The skid
+        // predicate refuses each.
+        let mut unnumbered = skid.clone();
+        unnumbered.attempts[0].index = String::new();
+        let mut repeated_index = skid.clone();
+        let again = repeated_index.attempts[0].clone();
+        repeated_index.attempts.push(again);
+        let mut misdigested = skid.clone();
+        misdigested.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+        for (case, row) in [
+            ("an unnumbered inner attempt", &unnumbered),
+            ("repeated inner indices", &repeated_index),
+            ("a mismatched report digest", &misdigested),
+        ] {
+            if skid_overshoot_only_reports(row).is_some() {
+                return Err(format!("a skid row with {case} read as skid-only: {row:?}"));
+            }
+        }
+        // A skid report whose strict comparison compared no log messages, its
+        // digest recomputed so only the comparison is incomplete. Fresh
+        // classification refuses that report as incomplete verification
+        // evidence, so the skid predicate refuses it too.
+        let mut vacuous = skid.clone();
+        {
+            let attempt = &mut vacuous.attempts[0];
+            let mut report: JsonValue = serde_json::from_str(
+                attempt
+                    .verification_report
+                    .as_deref()
+                    .ok_or("skid fixture lost its report")?,
+            )
+            .map_err(|e| format!("invalid skid report fixture: {e}"))?;
+            report["compared_log_messages"] = json!({"left": 0, "right": 0});
+            let raw = serde_json::to_string(&report)
+                .map_err(|e| format!("cannot encode vacuous report fixture: {e}"))?;
+            attempt.verification_report_sha256 =
+                Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+            attempt.verification_report = Some(raw);
+        }
+        if skid_overshoot_only_reports(&vacuous).is_some() {
+            return Err("a skid report that compared no log messages read as skid-only".into());
+        }
+        // A skid row recorded under a relaxation the PASS row does not
+        // record. Alone it is still the runner's skid-only row (the
+        // relaxation selects no other comparator), so only the recovery
+        // predicate's same-relaxations check refuses the history.
+        let mut relaxed = skid.clone();
+        relaxed
+            .relaxations
+            .push("--no-rcb-time: fixture reason".into());
+        if skid_overshoot_only_reports(&relaxed) != Some(2) {
+            return Err(format!(
+                "the relaxed skid fixture is not otherwise skid-only: {relaxed:?}"
+            ));
+        }
+        let mut retry_pass = pass.clone();
+        retry_pass.attempt = 2;
+        // A selected PASS row labelled with an eligible SaBRe execution path
+        // its own retained attempts do not decide.
+        let mut forged_path_pass = retry_pass.clone();
+        forged_path_pass.execution_path = Some(json!({"eligible": true}));
+        if retained_execution_path_error(&forged_path_pass).is_none()
+            || retained_execution_path_error(&retry_pass).is_some()
+        {
+            return Err(format!(
+                "the forged execution-path fixture does not isolate the path label: {forged_path_pass:?}"
+            ));
+        }
+        // The same defects on the selected PASS row. The recovery predicate's
+        // qualifying-subrun check refuses these, and so does the inner-history
+        // validation.
+        let mut unnumbered_pass = retry_pass.clone();
+        unnumbered_pass.attempts[0].index = String::new();
+        let mut misdigested_pass = retry_pass.clone();
+        misdigested_pass.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+        // A selected PASS row that also retains an authentic subrun under its
+        // own index, its report the bytes its digest names: a canonical
+        // divergence (a product failure the inner history validates) or a
+        // skid refusal (an infrastructure failure). Neither PASS consists of
+        // qualifying subruns, so neither earns recovery credit.
+        let mut adverse_pass = retry_pass.clone();
+        {
+            let mut subrun = adverse_pass.attempts[0].clone();
+            subrun.index = format!("{}-diverged", subrun.index);
+            subrun.outcome = "FAIL".into();
+            subrun.status = Some(1);
+            let mut report: JsonValue = serde_json::from_str(
+                subrun
+                    .verification_report
+                    .as_deref()
+                    .ok_or("matched pass fixture lost its report")?,
+            )
+            .map_err(|e| format!("invalid matched report fixture: {e}"))?;
+            report["verified"] = json!(false);
+            report["bitwise_parity"] = json!(false);
+            report["verdict"] = json!("diverged");
+            let raw = serde_json::to_string(&report)
+                .map_err(|e| format!("cannot encode diverged report fixture: {e}"))?;
+            subrun.verification_report_sha256 =
+                Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+            subrun.verification_report = Some(raw);
+            adverse_pass.attempts.push(subrun);
+        }
+        let mut infrastructure_subrun_pass = retry_pass.clone();
+        {
+            let mut subrun = skid.attempts[0].clone();
+            subrun.index = format!("{}-skid", subrun.index);
+            infrastructure_subrun_pass.attempts.push(subrun);
+        }
+        for (case, row, categories) in [
+            (
+                "a canonical divergence",
+                &adverse_pass,
+                BTreeSet::from([
+                    RepetitionClassification::ProductFailure,
+                    RepetitionClassification::InfrastructureFailure,
+                ]),
+            ),
+            (
+                "a skid refusal",
+                &infrastructure_subrun_pass,
+                BTreeSet::from([RepetitionClassification::InfrastructureFailure]),
+            ),
+        ] {
+            let validated = inner_pressure_history(&[skid.clone(), row.clone()]);
+            if validated.as_ref() != Ok(&categories) {
+                return Err(format!(
+                    "skid then a PASS retaining {case} is not an intact history carrying {categories:?}: {validated:?}"
+                ));
+            }
+            if qualifying_subruns(&row.mode, &row.attempts) {
+                return Err(format!(
+                    "a PASS retaining {case} consisted of qualifying subruns"
+                ));
+            }
+        }
+        let mut product = first_row.clone();
+        product.attempt = 1;
+        // The recovery reading needs a history the runner itself validates,
+        // ending in the selected PASS, with only skid-only rows before it.
+        let mut skid_second = skid.clone();
+        skid_second.attempt = 2;
+        for (case, result, rows, recovered) in [
+            (
+                "skid then pass",
+                "pass",
+                vec![skid.clone(), retry_pass.clone()],
+                true,
+            ),
+            (
+                "terminal result is not pass",
+                "fail",
+                vec![skid.clone(), retry_pass.clone()],
+                false,
+            ),
+            ("unretried pass", "pass", vec![pass.clone()], false),
+            ("missing attempt 1", "pass", vec![retry_pass.clone()], false),
+            (
+                "duplicate attempt 1",
+                "pass",
+                vec![skid.clone(), pass.clone()],
+                false,
+            ),
+            (
+                "no pass row",
+                "pass",
+                vec![skid.clone(), skid_second.clone()],
+                false,
+            ),
+            (
+                "pass before skid",
+                "pass",
+                vec![pass.clone(), skid_second.clone()],
+                false,
+            ),
+            (
+                "product then pass",
+                "pass",
+                vec![product.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "second class then pass",
+                "pass",
+                vec![marked_twice.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "unrecorded skid then pass",
+                "pass",
+                vec![legacy.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "stdout-violating skid then pass",
+                "pass",
+                vec![violated.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "skid then unnumbered pass",
+                "pass",
+                vec![skid.clone(), unnumbered_pass.clone()],
+                false,
+            ),
+            (
+                "skid then misdigested pass",
+                "pass",
+                vec![skid.clone(), misdigested_pass.clone()],
+                false,
+            ),
+            (
+                "skid then pass retaining a divergence",
+                "pass",
+                vec![skid.clone(), adverse_pass.clone()],
+                false,
+            ),
+            (
+                "skid then pass retaining a skid refusal",
+                "pass",
+                vec![skid.clone(), infrastructure_subrun_pass.clone()],
+                false,
+            ),
+            (
+                "vacuous skid then pass",
+                "pass",
+                vec![vacuous.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "relaxed skid then pass",
+                "pass",
+                vec![relaxed.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "skid then forged-path pass",
+                "pass",
+                vec![skid.clone(), forged_path_pass.clone()],
+                false,
+            ),
+        ] {
+            if passed_after_skid_retries_only(result, &rows) != recovered {
+                return Err(format!(
+                    "skid recovery predicate misread the {case} history (expected {recovered})"
+                ));
+            }
+        }
+        // Skid-recovery credit needs the skid predicate, a selected PASS of
+        // qualifying subruns, and an intact inner history whose categories
+        // are all infrastructure failures; each history refused by any of
+        // them keeps base's FLAKY reading, with no credit. A PASS retaining a
+        // canonical divergence or a skid refusal is an intact history, so it
+        // is refused with no unknown history and no evidence error.
+        for (name, earlier, later, verdict, recovered, history_intact) in [
+            (
+                "verdicts-skid-recovered",
+                &skid,
+                &retry_pass,
+                "INCOMPLETE",
+                1,
+                true,
+            ),
+            (
+                "verdicts-second-class-recovered",
+                &marked_twice,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-product-recovered",
+                &product,
+                &retry_pass,
+                "FLAKY",
+                0,
+                false,
+            ),
+            (
+                "verdicts-unrecorded-skid-recovered",
+                &legacy,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-stdout-violating-skid-recovered",
+                &violated,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-unnumbered-skid-recovered",
+                &unnumbered,
+                &retry_pass,
+                "FLAKY",
+                0,
+                false,
+            ),
+            (
+                "verdicts-repeated-index-skid-recovered",
+                &repeated_index,
+                &retry_pass,
+                "FLAKY",
+                0,
+                false,
+            ),
+            (
+                "verdicts-misdigested-skid-recovered",
+                &misdigested,
+                &retry_pass,
+                "FLAKY",
+                0,
+                false,
+            ),
+            (
+                "verdicts-skid-then-unnumbered-pass",
+                &skid,
+                &unnumbered_pass,
+                "FLAKY",
+                0,
+                false,
+            ),
+            (
+                "verdicts-skid-then-misdigested-pass",
+                &skid,
+                &misdigested_pass,
+                "FLAKY",
+                0,
+                false,
+            ),
+            (
+                "verdicts-skid-then-diverged-subrun-pass",
+                &skid,
+                &adverse_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-skid-subrun-pass",
+                &skid,
+                &infrastructure_subrun_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-vacuous-skid-recovered",
+                &vacuous,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+        ] {
+            let root = scratch.join(name);
+            let run = format!("{name}-1");
+            let mut first = observation(earlier, &sample_b, &run);
+            first.artifact_dir = format!("{}/attempt-1", first.artifact_dir);
+            let mut second = observation(later, &sample_b, &run);
+            second.artifact_dir = format!("{}/attempt-2", second.artifact_dir);
+            write(&root, &sample_b, 1, &[first, second])?;
+            for number in 2..=3 {
+                write(
+                    &root,
+                    &sample_b,
+                    number,
+                    &[observation(&pass, &sample_b, &format!("{name}-{number}"))],
+                )?;
+            }
+            let (outcome, written) = judge(&root, 3)?;
+            let summary = &written["cells"][0];
+            let expected_result = if recovered == 1 {
+                "incomplete"
+            } else {
+                "flaky"
+            };
+            if !outcome.as_ref().is_err_and(|error| {
+                error.contains("1 of 1 cell(s) are not CLEAN") && error.contains(verdict)
+            }) || written["cells"].as_array().map(Vec::len) != Some(1)
+                || written["retried_repetitions"] != json!(1)
+                || summary["verdict"] != json!(verdict)
+                || summary["result"] != json!(expected_result)
+                || summary["passes"] != json!(3)
+                || summary["clean_passes"] != json!(2)
+                || summary["retried_repetitions"] != json!(1)
+                || summary["terminal_product_failures"] != json!(0)
+                || summary["infrastructure_failures"] != json!(0)
+                || summary["infrastructure_recovered_passes"] != json!(recovered)
+                || summary["promotion_candidate"] != json!(false)
+                || (history_intact
+                    && (summary["unknown_history_repetitions"] != json!(0)
+                        || summary["evidence_errors"] != json!([])))
+            {
+                return Err(format!(
+                    "{name}: a retried pass was misjudged: {outcome:?} {written}"
+                ));
+            }
         }
         // Only an all-CLEAN collection succeeds; each refusal below turns the
         // same three clean repetitions red through one altered repetition.
@@ -15999,6 +16731,58 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("mutated repetition-accounting JSON was accepted".into());
     }
+    // A skid-recovered pass survives the summary round trip as INCOMPLETE. A
+    // summary that drops or inflates the recovery count, relabels a product
+    // flake as a recovery, or forges either verdict is refused.
+    let skid_recovered_counts = RepeatedOutcomeCounts {
+        infrastructure_recovered_passes: 1,
+        ..repeated_counts(2, 2, 1, 0, 1)
+    };
+    let skid_recovered_json = json!({
+        "probe_disabled": false,
+        "attempted": 3,
+        "retried_repetitions": 1,
+        "repeated_cells": [repeated_cell_summary(&sample_a, skid_recovered_counts, "incomplete")],
+    });
+    if skid_recovered_json["repeated_cells"][0]["verdict"] != "INCOMPLETE"
+        || skid_recovered_json["repeated_cells"][0]["infrastructure_recovered_passes"] != 1
+        || skid_recovered_json["repeated_cells"][0]["promotion_candidate"] != false
+    {
+        return Err(format!(
+            "a skid-recovered pass lost its summary accounting: {skid_recovered_json}"
+        ));
+    }
+    verify_repetition_summary_json(&skid_recovered_json, 3, 1)?;
+    let mut missing_recovery = skid_recovered_json.clone();
+    missing_recovery["repeated_cells"][0]
+        .as_object_mut()
+        .expect("repeated-cell fixture is an object")
+        .remove("infrastructure_recovered_passes");
+    let mut inflated_recovery = skid_recovered_json.clone();
+    inflated_recovery["repeated_cells"][0]["infrastructure_recovered_passes"] = json!(2);
+    let mut flake_relabeled = skid_recovered_json.clone();
+    flake_relabeled["repeated_cells"][0]["infrastructure_recovered_passes"] = json!(0);
+    let mut recovery_called_clean = skid_recovered_json.clone();
+    recovery_called_clean["repeated_cells"][0]["verdict"] = json!("CLEAN");
+    let mut flake_called_incomplete = json!({
+        "probe_disabled": false,
+        "attempted": 3,
+        "retried_repetitions": 1,
+        "repeated_cells": [repeated_cell_summary(&sample_a, repeated_counts(2, 2, 1, 0, 1), "flaky")],
+    });
+    verify_repetition_summary_json(&flake_called_incomplete, 3, 1)?;
+    flake_called_incomplete["repeated_cells"][0]["verdict"] = json!("INCOMPLETE");
+    for (name, forged) in [
+        ("missing recovery count", &missing_recovery),
+        ("inflated recovery count", &inflated_recovery),
+        ("recovery relabeled as a product flake", &flake_relabeled),
+        ("recovery called CLEAN", &recovery_called_clean),
+        ("product flake called INCOMPLETE", &flake_called_incomplete),
+    ] {
+        if verify_repetition_summary_json(forged, 3, 1).is_ok() {
+            return Err(format!("summary JSON with a {name} was accepted: {forged}"));
+        }
+    }
     let nested_results = scratch.join("series-layout");
     let nested_cell = nested_results
         .join("cells")
@@ -16335,6 +17119,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .to_string_lossy()
             .into_owned(),
         expected_guest_exit: None,
+        declared_stdout: None,
     };
     if !result_row_matches_cell(
         &repeated_result_row,
