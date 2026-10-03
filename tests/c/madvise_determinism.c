@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -84,6 +85,14 @@ static int check_semantic_advice(
   if (madvise(read_only, page_size, MADV_DONTNEED) != 0 ||
       read_only[1] != original) {
     return 6;
+  }
+
+  /* Dropping a page of this program's own text, which replay maps from the
+   * real executable, leaves it intact. */
+  unsigned char* text = (unsigned char*)((uintptr_t)&check_semantic_advice &
+                                         ~(uintptr_t)(page_size - 1));
+  if (madvise(text, page_size, MADV_DONTNEED) != 0) {
+    return 12;
   }
 
   /* MADV_WIPEONFORK applies to the anonymous page, then fails at the file

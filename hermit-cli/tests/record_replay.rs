@@ -1861,9 +1861,10 @@ fn record_node_eventfd_epoll_sequence() {
         return;
     };
 
-    // Node's worker wake order can change the DETLOG order while preserving the
-    // recorded event stream, descriptor state, exit status, and guest output.
-    record_then_replay_command(
+    // Node issues madvise(MADV_DONTNEED), which record/replay used to refuse
+    // (https://github.com/rrnewton/hermit/issues/3537). Replay must match the
+    // recording bitwise, not just in its stdout.
+    canonical_record_replay_command(
         "node-eventfd-epoll-sequence",
         node,
         &[OsStr::new("-e"), OsStr::new("console.log(42)")],
