@@ -2315,6 +2315,123 @@ pub struct AcceptedReceiptReadback {
     /// Original final actor observation, authenticated within close + one second.
     pub terminal_observed_ns: u64,
 }
+/// Original startup actor identity, without reconstructed terminal custody.
+pub(crate) struct IncompleteResourceActor {
+    pub unit: String,
+    pub invocation: String,
+    pub cgroup: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Incomplete execution source for a separate resource-absence certificate.
+/// This cannot construct an AcceptedPublication or a successful readback.
+pub(crate) struct IncompleteResourceSource {
+    pub run: [u8; 16],
+    pub artifact: ProviderArtifact,
+    pub actors: [IncompleteResourceActor; 2],
+    pub original_ids: Vec<(u32, u32)>,
+    pub closed_ns: u64,
+}
+
+pub(crate) fn incomplete_resource_source(
+    prefix: &[u8],
+    stdout: &[u8],
+    label: &str,
+    root: &crate::unix_guard_package::RecoveryDirectoryIdentity,
+    files: [&File; 3],
+) -> io::Result<IncompleteResourceSource> {
+    receipt_label(label)?;
+    let text = std::str::from_utf8(prefix).map_err(io::Error::other)?;
+    let rows: Vec<_> = text.lines().collect();
+    if rows.len() != 2 || !text.ends_with('\n') {
+        return Err(io::Error::other(
+            "accepted incomplete source row population differs",
+        ));
+    }
+    // Reject duplicate keys before the existing typed original parsers run.
+    for row in &rows {
+        serde_json::from_str::<UniqueReceiptJson>(row)?;
+    }
+    let before: BeforeReceipt = serde_json::from_str(rows[0])?;
+    let started: StartedReceipt = serde_json::from_str(rows[1])?;
+    if before.schema != 1
+        || started.schema != 1
+        || before.stage != "accepted_before_launch"
+        || started.stage != "accepted_started"
+        || before.label != label
+        || started.label != label
+        || &before.root != root
+    {
+        return Err(io::Error::other(
+            "accepted incomplete source identity differs",
+        ));
+    }
+    validate_startup(&started.observed, &before.artifact)?;
+    if !matches!(
+        before.artifact.topology,
+        detcore::network_runtime::ProviderTopology::FtraceV1 { .. }
+    ) || before.artifact.wire_format != detcore::network_runtime::ProviderWireFormat::Abi9Copy5
+    {
+        return Err(io::Error::other(
+            "accepted incomplete source topology differs",
+        ));
+    }
+    for (file, original) in files.into_iter().zip(&before.files) {
+        if &receipt_identity(file)? != original {
+            return Err(io::Error::other(
+                "accepted incomplete original file differs",
+            ));
+        }
+    }
+    let stdout = std::str::from_utf8(stdout).map_err(io::Error::other)?;
+    strict_service_transcript(stdout)?;
+    let first: UniqueReceiptJson = serde_json::from_str(stdout.lines().next().unwrap())?;
+    let inventories = first.0["inventories"]
+        .as_array()
+        .filter(|v| v.len() == 1)
+        .ok_or_else(|| io::Error::other("accepted incomplete inventory population differs"))?;
+    let mut original_ids = inventory(&inventories[0])?;
+    validate_ids(&original_ids, [24, 49, 49])?;
+    original_ids.sort_unstable();
+    let closed_ns = closed_inventory(stdout, started.observed.run, &original_ids)?;
+    let second: UniqueReceiptJson = serde_json::from_str(stdout.lines().nth(1).unwrap())?;
+    let close = &second.0["close_receipts"][0];
+    if close["close"] != serde_json::json!({"returned":0,"errno":null,"operation":"ap_close"}) {
+        return Err(io::Error::other(
+            "accepted incomplete close operation differs",
+        ));
+    }
+    for inventory in [&inventories[0], &close["inventory"]] {
+        if !inventory.as_object().is_some_and(|v| v.len() == 4)
+            || inventory["status"]
+                != serde_json::json!({"returned":0,"errno":null,"operation":"ap_identifiers"})
+            || !inventory["ids"].as_array().is_some_and(|ids| {
+                ids.iter()
+                    .all(|id| id.as_object().is_some_and(|v| v.len() == 2))
+            })
+        {
+            return Err(io::Error::other(
+                "accepted incomplete inventory operation differs",
+            ));
+        }
+    }
+    let actors =
+        [started.observed.loader, started.observed.query].map(|actor| IncompleteResourceActor {
+            unit: actor.unit,
+            invocation: actor.invocation,
+            cgroup: actor.cgroup,
+            device: actor.device,
+            inode: actor.inode,
+        });
+    Ok(IncompleteResourceSource {
+        run: started.observed.run,
+        artifact: before.artifact,
+        actors,
+        original_ids,
+        closed_ns,
+    })
+}
 /// Independently read one exact three-file accepted population through the
 /// authenticated root. Failure, partial, duplicate and extra rows refuse.
 pub fn validate_accepted_receipt(
