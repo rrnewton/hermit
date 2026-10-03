@@ -183,8 +183,9 @@ directory listing on the serial console; the color escape codes are left out
 above. The first run prints the kernel download instead of the `(cached)` line.
 
 The BusyBox and initramfs hashes depend on your BusyBox binary, and the
-initramfs hash also on this directory's `init`. The kernel
-hash, the pipeline hash, and pi come from pinned inputs and should match
+initramfs hash also on this directory's `init`, your `cpio` and `gzip`, and the
+kind of filesystem the checkout is on (see [How it works](#how-it-works)). The
+kernel hash, the pipeline hash, and pi come from pinned inputs and should match
 exactly. The other run-specific values in this section are an example from one
 run, not values to expect: the console hash, `compared_info_messages`, the
 message counts in Hermit's summary below, and the scheduler turns, system
@@ -321,9 +322,15 @@ stages and printed its PASS line without `stages=5`; it took 154 seconds.
 command `init` runs and that its shell honors `set -o pipefail`; either gap
 would otherwise show only inside the guest, after the boot. It then puts the
 BusyBox binary, its applet links, and the [`init`](init) script into a
-compressed cpio archive, fixing everything that normally varies between hosts:
-file order, owners, timestamps, archive inode numbers, and the gzip header. The
-same BusyBox therefore always gives the same initramfs.
+compressed cpio archive, fixing everything that normally varies between hosts
+or invocations: file modes (which would otherwise follow your umask), file
+order, owners, timestamps, archive inode numbers, and the gzip header. The same
+BusyBox, `init`, `cpio`, and `gzip` therefore give the same initramfs under any
+umask, as long as the checkout's `target/qemu-busybox/`, where the archive is
+assembled, is on the same kind of filesystem: `cpio` also records each
+directory's link count as the filesystem reports it (btrfs reports 1, ext4 2
+plus the number of subdirectories), and GNU `cpio` 2.13 has no option to leave
+it out.
 
 [`boot_qemu.sh`](boot_qemu.sh) checks its inputs and then replaces itself with
 QEMU, configured to leave nothing to chance: the `q35` machine with the `max`

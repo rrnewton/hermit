@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build the demo 9 initramfs: a static BusyBox plus the /init script beside
-# this file, archived reproducibly so the same BusyBox gives the same bytes.
+# this file, archived reproducibly. The same BusyBox, /init, cpio, and gzip
+# give the same bytes under any umask, on the same kind of filesystem (see the
+# note above the archive step).
 
 set -euo pipefail
 
@@ -66,7 +68,26 @@ while IFS= read -r applet; do
   ln -s /bin/busybox "$root/$applet"
 done < <("$busybox" --list-full)
 
-# Fix every archive input that otherwise varies across hosts or invocations.
+# Set every mode explicitly, because cpio stores modes as it finds them: the
+# directories, /etc/passwd, and /etc/group were created under the caller's
+# umask. Symbolic links are left alone: their mode is always 0777, and chmod
+# would follow them to /bin/busybox. The build directory, which becomes the
+# archive's root entry, keeps 0700, the mode mktemp gives it. Under the usual
+# umask 022 these are the modes earlier builds stored, so those builds' bytes
+# do not change.
+find "$root" -type d -exec chmod 0755 {} +
+find "$root" -type f -exec chmod 0644 {} +
+chmod 0755 "$root/bin/busybox" "$root/init"
+chmod 0700 "$root"
+
+# Fix the other archive inputs that vary across hosts or invocations:
+# timestamps, ownership, entry order, inode numbers, and the gzip header
+# timestamp. The same BusyBox binary, /init, cpio, and gzip then yield a
+# byte-identical initramfs whatever the caller's umask, when the build
+# directory is on the same kind of filesystem: cpio also stores each
+# directory's link count as the filesystem reports it (btrfs reports 1, ext4
+# 2 plus the number of subdirectories), and GNU cpio 2.13 has no option to omit
+# it.
 find "$root" -exec touch -h -d @0 {} +
 (
   cd "$root"
