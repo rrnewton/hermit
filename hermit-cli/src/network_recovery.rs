@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+mod accepted_failed;
 mod accepted_only;
 mod original;
 #[cfg(test)]
@@ -274,7 +275,9 @@ impl ResourceRecoveryContext {
         })
     }
     pub(crate) fn accepted_resolved(&self, root: BorrowedFd<'_>, label: &str) -> bool {
-        self.resolve(0, root, label).is_ok() || accepted_only::resolve(self, root, label).is_ok()
+        self.resolve(0, root, label).is_ok()
+            || accepted_only::resolve(self, root, label).is_ok()
+            || accepted_failed::resolve(self, root, label).is_ok()
     }
     pub(crate) fn unix_resolved(
         &self,
