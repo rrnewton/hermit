@@ -1439,8 +1439,11 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         twin.job.push_str(BUCK_TWIN_SUFFIX);
         let tag = twin.tag();
         twin.desc = format!("{} (Buck rows)", bucket.desc);
+        // Lead with the counterpart's own description: the twin owns exactly
+        // its cells, so what that says about the selection holds here too.
         twin.description = format!(
-            "Publishes the cells of {cargo} from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with {cargo}'s arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops {cargo}."
+            "{} Buck import twin: publishes the cells of {cargo} from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with {cargo}'s arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops {cargo}.",
+            bucket.description
         );
         twin.labels = vec![FULL_BUCK_E2E_LABEL.into()];
         twin.cmd = payload.replace(
@@ -1449,7 +1452,9 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         );
         twin.deps = deps.iter().map(|dep| (*dep).to_string()).collect();
         twin.env.clear();
-        twin.timeout = 300;
+        // The import's parity post-pass counts its bound from the step start,
+        // so dagrun must not kill the step first.
+        twin.timeout = crate::parity::PARITY_STEP_WALL_FLOOR.as_secs();
         twin.cpu_timeout = 600;
         twin.hint.resources.clear();
         twin.hint.est_duration_s = 1.0;
