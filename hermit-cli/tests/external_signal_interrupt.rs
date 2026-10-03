@@ -288,7 +288,8 @@ fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> Gu
     if verify_report.is_some() {
         command.arg("--log=info");
     }
-    command.args(["run", "--backend", backend, "--strict"]);
+    // `--backend` is a global option and goes before the subcommand.
+    command.args(["--backend", backend, "run", "--strict"]);
     if let FutexMode::Polling = mode {
         command.arg("--debug-futex-mode=polling");
     }
