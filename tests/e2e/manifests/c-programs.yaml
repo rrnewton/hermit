@@ -17512,10 +17512,13 @@ test:
         guest_args:
           ptrace:
             - --require-small-determinized
+            - --require-large-determinized
           kvm:
             - --require-small-determinized
+            - --require-large-determinized
           liteinst:
             - --require-small-determinized
+            - --require-large-determinized
         backends_disabled:
           dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
@@ -17535,9 +17538,10 @@ test:
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
-        # --require-small-determinized asserts strict mode's sorted directory
-        # order. A recording keeps the host's order and replay reproduces it,
-        # so replay checks replay fidelity with the guest's report-only form.
+        # --require-small-determinized and --require-large-determinized assert
+        # strict mode's sorted directory order. A recording keeps the host's
+        # order and replay reproduces it, so replay checks replay fidelity with
+        # the guest's report-only form.
         guest_args:
           ptrace: []
       chaos:

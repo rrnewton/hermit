@@ -12784,8 +12784,12 @@ exit "$(cat "$PWD/exit-status")"
                 cell.id.test
             );
             if cell.id.test == "c-programs/readdir-order-identity" {
-                assert_eq!(mode.guest_args[candidate], ["--require-small-determinized"]);
-                assert_eq!(mode.guest_args["ptrace"], ["--require-small-determinized"]);
+                let required = [
+                    "--require-small-determinized",
+                    "--require-large-determinized",
+                ];
+                assert_eq!(mode.guest_args[candidate], required);
+                assert_eq!(mode.guest_args["ptrace"], required);
             }
         }
     }
