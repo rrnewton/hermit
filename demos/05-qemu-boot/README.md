@@ -124,7 +124,7 @@ PASS: QEMU version matches (QEMU emulator version 10.1.2 (...))
 PASS: QEMU binary SHA-256 matches (...)
 PASS: qcow2 SHA-256 matches (a5813ecc0c1f0f616da1802980a810cf4590834881dacd996eada1e87efe7624)
 PASS: serial output SHA-256 matches (bf41d127c488b7fd8df9ba85c0af2c615a7973e3cc0a1e861054e5bfd5e8805f)
-PASS: exact Hermit log matches first run after normalizing wallclock timestamps, host inode numbers, and env-dependent guest addresses
+PASS: Hermit INFO log matches first run exactly apart from the wall-clock prefix (Hermit-marked host addresses compared by first appearance)
 PASS: all repeat checks match the first run
 
 DETERMINISTIC: snapshot SHA-256 matches the previous run:
@@ -141,7 +141,10 @@ between its first line and the start of `/init`, the tail of Hermit's log, the
 QEMU package name and binary hash (they depend on your installation), and the
 random per-run directory names. In a terminal the `Waiting for first serial
 line` counter updates in place; the line shown is its final state, and the
-wait depends on host load.
+wait depends on host load. The `PASS: Hermit INFO log` line is shown in the
+current comparator's wording; the capture printed an earlier comparator's
+wording. Its logs pass the current comparison too: they differed in no line
+once the wall-clock prefix was removed (see below).
 
 The numbers that are the same on every boot are the point of the demo. On
 2026-09-30 a first invocation (two boots) ran from this checkout, from a copy
@@ -180,10 +183,14 @@ Archived snapshot: ignored/qemu-linux/boot-anchor/boot-snapshot.qcow2
 - The repeat check compares five things with the reference run: QEMU's
   command line, the QEMU version and binary hash, the SHA-256 of the whole
   qcow2 file (which contains the saved memory and device state), the SHA-256 of
-  the serial console transcript, and Hermit's own event log. Before comparing
-  the logs it removes only wall-clock timestamps, host inode numbers, and a few
-  guest addresses that depend on the environment; everything else, including
-  virtual time, must match exactly.
+  the serial console transcript, and Hermit's own event log. The logs are
+  compared the way Hermit's own canonical log comparison does it: the
+  wall-clock timestamp that starts each line is removed, and host addresses
+  that Hermit marks as `<hostaddr ...>` are numbered in order of first
+  appearance. Everything else, including virtual time and every guest address,
+  must match exactly; both boots get the same environment, paths and epoch,
+  and Hermit turns off address randomization in the guest, so the same boot
+  prints the same addresses.
 - A difference fails the run: the headline becomes `PARTIAL`, the demo exits
   with status 1, and `WARN:` lines name what differed. After you rebuild
   Hermit, change QEMU, change the kernel, edit `demos/lib/demo_common.py`
