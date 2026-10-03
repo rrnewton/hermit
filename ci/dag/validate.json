@@ -1777,6 +1777,13 @@
           "category": "c-programs",
           "test": "c-programs/epoll-pwait2",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/epoll-pwait2",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {

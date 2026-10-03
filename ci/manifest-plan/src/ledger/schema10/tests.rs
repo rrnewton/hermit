@@ -783,10 +783,12 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
     // This reconstructed plan uses today's population, including six earlier and
     // three socket KVM verify cells from https://github.com/rrnewton/reverie/issues/891.
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One epoll-pwait2 KVM row joins the reconstructed population:
+    // https://github.com/rrnewton/reverie/issues/905
     assert_eq!(
         restored,
-        282 + 6 + 3 + 1,
-        "288 portable and 4 privileged folded cells"
+        282 + 6 + 3 + 1 + 1,
+        "289 portable and 4 privileged folded cells"
     );
     serde_json::to_string(&expected).unwrap()
 }
@@ -959,7 +961,8 @@ fn generated_plan_populations_preserve_command_policy() {
     // KVM verify cells; keep the earlier populations as explicit baselines.
     // Three more socket KVM verify selections: https://github.com/rrnewton/reverie/issues/891.
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-    let total = 900 + compat + select + 6 + 3 + 1;
+    // One epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
+    let total = 900 + compat + select + 6 + 3 + 1 + 1;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1002,7 +1005,8 @@ fn generated_plan_populations_preserve_command_policy() {
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
     assert_eq!(
         hosted_cells.len(),
-        893 + compat + select + 6 + 3 + 1 - (241 + 6 + 3 + 1)
+        // The new KVM row is also excluded from hosted runs: https://github.com/rrnewton/reverie/issues/905.
+        893 + compat + select + 6 + 3 + 1 + 1 - (241 + 6 + 3 + 1 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1050,7 +1054,8 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat + select + 6 + 3 + 1,
+            // This pre-exclusion shape also owns the new KVM row: https://github.com/rrnewton/reverie/issues/905.
+            893 + compat + select + 6 + 3 + 1 + 1,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1169,7 +1174,8 @@ fn generated_plan_populations_preserve_command_policy() {
             // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
             assert_eq!(
                 expected_relations.len(),
-                if active { 174 + 6 + 3 + 1 } else { 0 }
+                // One epoll-pwait2 KVM relation: https://github.com/rrnewton/reverie/issues/905.
+                if active { 174 + 6 + 3 + 1 + 1 } else { 0 }
             );
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
@@ -1177,7 +1183,8 @@ fn generated_plan_populations_preserve_command_policy() {
             );
             if active {
                 for (backend, count) in [
-                    ("kvm", 75 + 6 + 3 + 1),
+                    // The same sole added candidate: https://github.com/rrnewton/reverie/issues/905.
+                    ("kvm", 75 + 6 + 3 + 1 + 1),
                     ("liteinst", 97),
                     ("sabre", 1),
                     ("dbt", 1),

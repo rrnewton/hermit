@@ -8559,6 +8559,8 @@ mod tests {
                 + 3
                 // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
                 + 1
+                // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
+                + 1
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
@@ -12747,7 +12749,8 @@ exit "$(cat "$PWD/exit-status")"
         // The three socket candidates join the six earlier KVM selections.
         // https://github.com/rrnewton/reverie/issues/891
         // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-        assert_eq!(candidates.len(), 174 + 6 + 3 + 1);
+        // One epoll-pwait2 KVM candidate: https://github.com/rrnewton/reverie/issues/905.
+        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12758,7 +12761,7 @@ exit "$(cat "$PWD/exit-status")"
             by_backend,
             BTreeMap::from([
                 ("dbt", 1),
-                ("kvm", 75 + 6 + 3 + 1),
+                ("kvm", 75 + 6 + 3 + 1 + 1),
                 ("liteinst", 97),
                 ("sabre", 1)
             ])
