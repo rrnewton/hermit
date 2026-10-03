@@ -164,7 +164,13 @@ impl RecordVersion {
 // recorded instead of running live. A successful chdir or fchdir carries a
 // Bytes event naming the directory it entered. An older reader would
 // desynchronize on these events.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11f);
+// 0x11f -> 0x120: descriptor syncs and metadata changes (fsync, fdatasync,
+// syncfs, fchmod, fchown, fsetxattr, fremovexattr) record a Return event, the
+// xattr queries (getxattr, lgetxattr, fgetxattr and the listxattr family)
+// record a Bytes event (Return for a zero-size query), and zero-count read and
+// pread64 calls are recorded instead of running live. An older reader would
+// desynchronize on these events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x120);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -189,7 +195,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x120;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -612,6 +618,33 @@ mod tests {
                 delivered.contains(&Sysno::chdir) && delivered.contains(&Sysno::getcwd),
                 "{phase} must deliver chdir and getcwd so replay uses recorded results"
             );
+            // A replayed descriptor may be a placeholder, so these must
+            // return recorded results rather than run
+            // (https://github.com/rrnewton/hermit/issues/3591).
+            for sysno in [
+                Sysno::fsync,
+                Sysno::fdatasync,
+                Sysno::syncfs,
+                Sysno::fchmod,
+                Sysno::fchown,
+                Sysno::fsetxattr,
+                Sysno::fremovexattr,
+                Sysno::setxattr,
+                Sysno::lsetxattr,
+                Sysno::removexattr,
+                Sysno::lremovexattr,
+                Sysno::getxattr,
+                Sysno::lgetxattr,
+                Sysno::fgetxattr,
+                Sysno::listxattr,
+                Sysno::llistxattr,
+                Sysno::flistxattr,
+            ] {
+                assert!(
+                    delivered.contains(&sysno),
+                    "{phase} must deliver {sysno} so replay uses its recorded result"
+                );
+            }
             assert!(
                 !delivered.contains(&Sysno::umask),
                 "{phase} must leave unlisted PassThrough umask unsubscribed"

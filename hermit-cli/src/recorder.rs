@@ -442,6 +442,26 @@ impl Tool for Recorder {
             Sysno::fadvise64,
             Sysno::flock,
             Sysno::ftruncate,
+            // Descriptor syncs, metadata changes and xattr calls: replay
+            // returns the recorded results, because a replayed descriptor may
+            // be a placeholder, and reapplies changes inside the replay root.
+            Sysno::fsync,
+            Sysno::fdatasync,
+            Sysno::syncfs,
+            Sysno::fchmod,
+            Sysno::fchown,
+            Sysno::fsetxattr,
+            Sysno::fremovexattr,
+            Sysno::setxattr,
+            Sysno::lsetxattr,
+            Sysno::removexattr,
+            Sysno::lremovexattr,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::fgetxattr,
+            Sysno::listxattr,
+            Sysno::llistxattr,
+            Sysno::flistxattr,
             Sysno::dup,
             Sysno::dup2,
             Sysno::dup3,
@@ -593,6 +613,32 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Getcwd(syscall) => self.handle_getcwd(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601): descriptor syncs and metadata changes
+            // record only their result. Replay returns it for a placeholder
+            // descriptor and reapplies a change to a file in the replay root.
+            Syscall::Fsync(_)
+            | Syscall::Fdatasync(_)
+            | Syscall::Syncfs(_)
+            | Syscall::Fchmod(_)
+            | Syscall::Fchown(_)
+            | Syscall::Fsetxattr(_)
+            | Syscall::Fremovexattr(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601): path xattr changes share the other
+            // path mutations' result-only recording.
+            Syscall::Setxattr(_)
+            | Syscall::Lsetxattr(_)
+            | Syscall::Removexattr(_)
+            | Syscall::Lremovexattr(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601)
+            Syscall::Getxattr(_)
+            | Syscall::Lgetxattr(_)
+            | Syscall::Fgetxattr(_)
+            | Syscall::Listxattr(_)
+            | Syscall::Llistxattr(_)
+            | Syscall::Flistxattr(_) => self.handle_xattr_query(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
