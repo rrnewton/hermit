@@ -5618,8 +5618,10 @@ sys.exit(1 if failed else 0)
         // type's bucket, which also runs on the host, and +1 for
         // sabrecompat.manifest_compat, the SaBRe run type's host bucket, and
         // +1 for strictcompat.manifest_compat, the strict run type's, and +1
-        // for rrcompat.manifest_compat, the rr run type's.
-        assert_eq!((pinned, direct), (19, 21));
+        // for rrcompat.manifest_compat, the rr run type's. +16 direct for
+        // the full-buck-e2e import twins (<bucket>_buck), which import the
+        // rows e2e.buck_cells wrote on the host and so run outside the root.
+        assert_eq!((pinned, direct), (19, 37));
     }
 
     /// With the committed parity selection, the full profile's harness
