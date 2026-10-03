@@ -60,6 +60,8 @@ use reverie::syscalls::OFlag;
 use reverie::syscalls::Openat;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
+use reverie::syscalls::SockFlag;
+use reverie::syscalls::Socket;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Unlinkat;
@@ -256,6 +258,7 @@ fn remember_materialized_path(
 
 use crate::desync::DesyncError;
 use crate::event::OpenMaterialization;
+use crate::event::SocketShape;
 use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
@@ -514,6 +517,19 @@ impl Tool for Replayer {
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
+            // these must not run live in replay. bind/listen would contend for
+            // host addresses and accept would wait for a peer that, in replay,
+            // never connects.
+            Syscall::Bind(_) | Syscall::Listen(_) | Syscall::Shutdown(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            Syscall::Accept(call) => self.handle_accept(guest, syscall, call.into()).await,
+            Syscall::Accept4(call) => self.handle_accept(guest, syscall, call).await,
+            Syscall::Socketpair(call) => self.handle_socketpair(guest, call).await,
+            Syscall::Recvmmsg(call) => self.handle_recvmmsg(guest, call).await,
+            Syscall::Sendmmsg(call) => self.handle_sendmmsg(guest, call).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
@@ -1268,6 +1284,44 @@ impl Replayer {
             );
         }
     }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    /// Reserve replay FD `fd` for a socket the recording received from the
+    /// kernel (for example by `accept`). An unconnected socket of the recorded
+    /// shape keeps later live socket calls, such as a replayed `setsockopt`,
+    /// valid; without a recorded shape this falls back to an eventfd.
+    pub(super) async fn reserve_replay_socket<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        shape: Option<SocketShape>,
+        flags: SockFlag,
+    ) {
+        let Some(shape) = shape else {
+            return self
+                .reserve_replay_fd(guest, fd, flags.contains(SockFlag::SOCK_CLOEXEC))
+                .await;
+        };
+        let socket = Socket::new()
+            .with_family(shape.domain)
+            .with_type(
+                shape.r#type | (flags & (SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK)).bits(),
+            )
+            .with_protocol(shape.protocol);
+        let placeholder = guest
+            .inject_with_retry(socket)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("could not reserve replay FD {fd} with a {shape:?} socket: {error}")
+            });
+        if placeholder != i64::from(fd) {
+            let _ = guest.inject(Close::new().with_fd(placeholder as i32)).await;
+            panic!(
+                "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
+            );
+        }
+    }
+
     pub(super) fn fd_is_in_replay_root(&self, pid: Pid, fd: libc::c_int) -> bool {
         let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
         let Ok(metadata) = std::fs::metadata(&path) else {

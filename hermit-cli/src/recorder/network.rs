@@ -10,6 +10,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Accept4;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
@@ -18,17 +19,23 @@ use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
+use reverie::syscalls::Recvmmsg;
 use reverie::syscalls::Recvmsg;
+use reverie::syscalls::Sendmmsg;
+use reverie::syscalls::Socketpair;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
+use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
+use crate::event::RecvmmsgEvent;
 use crate::event::RecvmsgEvent;
 use crate::event::SockOptEvent;
+use crate::event::SocketShape;
 use crate::event::SyscallEvent;
 
 fn read_bytes<M: MemoryAccess>(
@@ -43,6 +50,84 @@ fn read_bytes<M: MemoryAccess>(
     let mut bytes = vec![0; length];
     memory.read_exact(address.cast(), &mut bytes)?;
     Ok(bytes)
+}
+
+/// Capture what a successful receive of `result` bytes wrote through `output`,
+/// a `msghdr` whose name and control buffers held `name_capacity` and
+/// `control_capacity` bytes before the call. Shared by `recvmsg` and every
+/// message of `recvmmsg`.
+fn capture_recvmsg<M: MemoryAccess>(
+    memory: &M,
+    name_capacity: usize,
+    control_capacity: usize,
+    output: &libc::msghdr,
+    result: i64,
+) -> Result<RecvmsgEvent, Errno> {
+    let iovecs = crate::read_iovecs(memory, output)?;
+    let mut remaining = usize::try_from(result).map_err(|_| Errno::EINVAL)?;
+    let mut buffers = Vec::with_capacity(iovecs.len());
+    for iovec in iovecs {
+        let length = remaining.min(iovec.iov_len);
+        buffers.push(read_bytes(memory, iovec.iov_base, length)?);
+        remaining -= length;
+    }
+
+    let name_length = name_capacity.min(output.msg_namelen as usize);
+    let control_length = control_capacity.min(output.msg_controllen);
+
+    Ok(RecvmsgEvent {
+        result,
+        iovs: buffers,
+        name: read_bytes(memory, output.msg_name, name_length)?,
+        name_len: output.msg_namelen,
+        control: read_bytes(memory, output.msg_control, control_length)?,
+        control_len: output.msg_controllen,
+        flags: output.msg_flags,
+    })
+}
+
+/// Read `count` consecutive `mmsghdr` entries starting at `address`.
+fn read_mmsghdrs<M: MemoryAccess>(
+    memory: &M,
+    address: usize,
+    count: usize,
+) -> Result<Vec<libc::mmsghdr>, Errno> {
+    // SAFETY: `mmsghdr` is a plain C record and an all-zero value is a valid
+    // staging value that is immediately overwritten by `read_values`.
+    let mut headers: Vec<libc::mmsghdr> =
+        (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    if count != 0 {
+        let address = Addr::<libc::mmsghdr>::from_raw(address).ok_or(Errno::EFAULT)?;
+        memory.read_values(address, &mut headers)?;
+    }
+    Ok(headers)
+}
+
+/// Query the domain, type and protocol of the guest's socket `fd`.
+fn guest_socket_shape(pid: reverie::Pid, fd: libc::c_int) -> Option<SocketShape> {
+    use std::os::fd::AsRawFd;
+
+    let socket = crate::fd::duplicate_guest_fd(pid, fd).ok()?;
+    let option = |name: libc::c_int| {
+        let mut value: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid for writes of the sizes passed.
+        let status = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        (status == 0).then_some(value)
+    };
+    Some(SocketShape {
+        domain: option(libc::SO_DOMAIN)?,
+        r#type: option(libc::SO_TYPE)?,
+        protocol: option(libc::SO_PROTOCOL)?,
+    })
 }
 
 fn pollfd_address<'a>(address: AddrMut<'a, PollFd>, index: usize) -> Option<AddrMut<'a, PollFd>> {
@@ -315,30 +400,173 @@ impl Recorder {
                 let (name_capacity, control_capacity) = input?;
                 let message_address = syscall.msg().ok_or(Errno::EFAULT)?;
                 let output: libc::msghdr = guest.memory().read_value(message_address)?;
-                let iovecs = crate::read_iovecs(&guest.memory(), &output)?;
-                let mut remaining = usize::try_from(result).map_err(|_| Errno::EINVAL)?;
-                let mut buffers = Vec::with_capacity(iovecs.len());
-                for iovec in iovecs {
-                    let length = remaining.min(iovec.iov_len);
-                    buffers.push(read_bytes(&guest.memory(), iovec.iov_base, length)?);
-                    remaining -= length;
-                }
-
-                let name_length = name_capacity.min(output.msg_namelen as usize);
-                let control_length = control_capacity.min(output.msg_controllen);
-
-                Ok(SyscallEvent::Recvmsg(RecvmsgEvent {
+                capture_recvmsg(
+                    &guest.memory(),
+                    name_capacity,
+                    control_capacity,
+                    &output,
                     result,
-                    iovs: buffers,
-                    name: read_bytes(&guest.memory(), output.msg_name, name_length)?,
-                    name_len: output.msg_namelen,
-                    control: read_bytes(&guest.memory(), output.msg_control, control_length)?,
-                    control_len: output.msg_controllen,
-                    flags: output.msg_flags,
-                }))
+                )
+                .map(SyscallEvent::Recvmsg)
             }),
         );
 
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    /// Record every message a `recvmmsg` received through the same capture as
+    /// `recvmsg`, plus the remaining timeout Linux writes back.
+    pub(super) async fn handle_recvmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Recvmmsg,
+    ) -> Result<i64, Errno> {
+        // Linux silently clamps vlen to UIO_MAXIOV.
+        let vlen = (syscall.vlen() as usize).min(libc::UIO_MAXIOV as usize);
+        // Reduced to plain capacities so no raw pointer is held across the
+        // await, which would make this future non-`Send`.
+        let input: Result<Vec<(usize, usize)>, Errno> = syscall
+            .mmsg()
+            .ok_or(Errno::EFAULT)
+            .and_then(|address| read_mmsghdrs(&guest.memory(), address.as_raw(), vlen))
+            .map(|headers| {
+                headers
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.msg_hdr.msg_namelen as usize,
+                            header.msg_hdr.msg_controllen,
+                        )
+                    })
+                    .collect()
+            });
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|received| {
+                let input = input?;
+                let received = usize::try_from(received).map_err(|_| Errno::EINVAL)?;
+                assert!(received <= input.len());
+                let address = syscall.mmsg().ok_or(Errno::EFAULT)?.as_raw();
+                let output = read_mmsghdrs(&guest.memory(), address, received)?;
+                let messages = input
+                    .iter()
+                    .zip(&output)
+                    .map(|((name_capacity, control_capacity), output)| {
+                        capture_recvmsg(
+                            &guest.memory(),
+                            *name_capacity,
+                            *control_capacity,
+                            &output.msg_hdr,
+                            i64::from(output.msg_len),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let timeout = syscall
+                    .timeout()
+                    .map(|address| guest.memory().read_value(address))
+                    .transpose()?;
+                Ok(SyscallEvent::Recvmmsg(RecvmmsgEvent { messages, timeout }))
+            }),
+        );
+
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    /// Record the `msg_len` of every message a `sendmmsg` sent.
+    pub(super) async fn handle_sendmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Sendmmsg,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|sent| {
+                let sent = usize::try_from(sent).map_err(|_| Errno::EINVAL)?;
+                let address = syscall.msgvec().ok_or(Errno::EFAULT)?.as_raw();
+                let headers = read_mmsghdrs(&guest.memory(), address, sent)?;
+                Ok(SyscallEvent::Sendmmsg(
+                    headers.iter().map(|header| header.msg_len).collect(),
+                ))
+            }),
+        );
+
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    /// Record the fd, peer address and socket shape of an `accept`/`accept4`,
+    /// so replay can reproduce the connection without a live peer.
+    pub(super) async fn handle_accept<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        call: Accept4,
+    ) -> Result<i64, Errno> {
+        // Reverie types addrlen as a usize; Linux reads and writes a socklen_t.
+        let addr_len_address = call
+            .addrlen()
+            .map(|address| address.cast::<libc::socklen_t>());
+        // Linux reads the address capacity only when an address buffer is given.
+        let capacity = match (call.sockaddr(), addr_len_address) {
+            (Some(_), Some(address)) => Some(guest.memory().read_value(address)),
+            _ => None,
+        };
+        let result = guest.inject(syscall).await;
+
+        let event = result.and_then(|fd| {
+            let fd = i32::try_from(fd).map_err(|_| Errno::EINVAL)?;
+            let (addr, addr_len) = match (call.sockaddr(), addr_len_address, capacity) {
+                (Some(addr), Some(addr_len_address), Some(capacity)) => {
+                    let capacity: libc::socklen_t = capacity?;
+                    let addr_len: libc::socklen_t = guest.memory().read_value(addr_len_address)?;
+                    let bytes = read_bytes(
+                        &guest.memory(),
+                        addr.as_raw() as *mut libc::c_void,
+                        capacity.min(addr_len) as usize,
+                    )?;
+                    (bytes, Some(addr_len))
+                }
+                _ => (Vec::new(), None),
+            };
+            Ok(SyscallEvent::Accept(AcceptEvent {
+                fd,
+                addr,
+                addr_len,
+                shape: guest_socket_shape(guest.pid(), fd),
+            }))
+        });
+
+        self.record_event(guest, event);
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550)
+    /// Record the two fds a `socketpair` wrote to the guest.
+    pub(super) async fn handle_socketpair<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Socketpair,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        let event = result.and_then(|_| {
+            let fds = guest
+                .memory()
+                .read_value(syscall.usockvec().ok_or(Errno::EFAULT)?)?;
+            Ok(SyscallEvent::Socketpair(fds))
+        });
+
+        self.record_event(guest, event);
         result
     }
 
@@ -376,6 +604,43 @@ mod tests {
     use reverie::syscalls::PollFlags;
 
     use super::*;
+
+    /// recvmsg and every recvmmsg message share this capture: it must keep only
+    /// the received prefix of each iovec and only the part of the name that fit
+    /// the guest's buffer, while preserving the full kernel-written lengths.
+    #[test]
+    fn capture_recvmsg_keeps_received_prefix_and_truncated_name() {
+        let mut first = *b"abcd";
+        let mut second = *b"efgh";
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        let mut name = *b"NAME";
+        // SAFETY: an all-zero msghdr is valid; the fields used are set below.
+        let mut output: libc::msghdr = unsafe { std::mem::zeroed() };
+        output.msg_iov = iovecs.as_mut_ptr();
+        output.msg_iovlen = iovecs.len();
+        output.msg_name = name.as_mut_ptr().cast();
+        // The kernel reports the full 16-byte address it could not fit.
+        output.msg_namelen = 16;
+        output.msg_flags = libc::MSG_TRUNC;
+
+        let event = capture_recvmsg(&LocalMemory::new(), 2, 0, &output, 6).unwrap();
+
+        assert_eq!(event.result, 6);
+        assert_eq!(event.iovs, vec![b"abcd".to_vec(), b"ef".to_vec()]);
+        assert_eq!(event.name, b"NA".to_vec());
+        assert_eq!(event.name_len, 16);
+        assert!(event.control.is_empty());
+        assert_eq!(event.flags, libc::MSG_TRUNC);
+    }
 
     #[test]
     fn capture_poll_keeps_outputs_on_efault() {

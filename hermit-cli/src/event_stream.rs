@@ -261,12 +261,14 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
     Some(match sysno {
         close | fchdir | dup | time | unlink => 1,
         access | stat | fstat | lstat | dup2 | clock_gettime | clock_getres | gettimeofday
-        | settimeofday | mkdir | statfs | fstatfs | ftruncate | kill | listen | rt_sigpending => 2,
+        | settimeofday | mkdir | statfs | fstatfs | ftruncate | kill | listen | rt_sigpending
+        | shutdown => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
-        | readlink | unlinkat | open | execve | close_range | tgkill => 3,
-        pread64 | pwrite64 | newfstatat | fadvise64 | openat => 4,
-        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl => 5,
+        | readlink | unlinkat | open | execve | close_range | tgkill | bind | accept => 3,
+        pread64 | pwrite64 | newfstatat | fadvise64 | openat | accept4 | socketpair | sendmmsg => 4,
+        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl
+        | recvmmsg => 5,
         recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
         _ => return None,
     })

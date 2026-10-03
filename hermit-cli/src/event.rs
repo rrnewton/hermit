@@ -104,6 +104,52 @@ pub enum SyscallEvent {
     Exec(ExecEvent),
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
+    // Audit the socket fd-creation and multi-message event schema.
+    /// A successful `accept`/`accept4`: the new fd, the peer address written
+    /// back to the guest, and the kind of placeholder replay must install.
+    Accept(AcceptEvent),
+    /// The two fds a successful `socketpair` wrote to the guest.
+    Socketpair([i32; 2]),
+    /// The `msg_len` of every message a successful `sendmmsg` sent.
+    Sendmmsg(Vec<u32>),
+    /// Every message a successful `recvmmsg` received, plus the remaining
+    /// timeout Linux wrote back.
+    Recvmmsg(RecvmmsgEvent),
+}
+
+/// The domain, type and protocol of a socket, as reported by `SO_DOMAIN`,
+/// `SO_TYPE` and `SO_PROTOCOL`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SocketShape {
+    pub domain: libc::c_int,
+    pub r#type: libc::c_int,
+    pub protocol: libc::c_int,
+}
+
+/// Recorded outputs of a successful `accept`/`accept4`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcceptEvent {
+    /// The fd the kernel returned.
+    pub fd: i32,
+    /// The (possibly truncated) peer address written back to the guest.
+    pub addr: Vec<u8>,
+    /// The peer address length written back, if the guest passed an address.
+    pub addr_len: Option<libc::socklen_t>,
+    /// The accepted socket's shape, so replay can reserve the fd with a real,
+    /// unconnected socket on which later live socket calls such as
+    /// `setsockopt` still succeed. `None` if it could not be queried.
+    pub shape: Option<SocketShape>,
+}
+
+/// Recorded outputs of a successful `recvmmsg`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecvmmsgEvent {
+    /// One entry per received message; `RecvmsgEvent::result` is its `msg_len`.
+    pub messages: Vec<RecvmsgEvent>,
+    /// The remaining timeout written back, if the guest passed one.
+    pub timeout: Option<Timespec>,
 }
 
 /// Recorded output and signal side effects of a read syscall.
