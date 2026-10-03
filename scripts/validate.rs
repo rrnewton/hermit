@@ -2321,6 +2321,10 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("VALIDATE_RUN_STATE")
             .env_remove(RUN_STATE_SCOPE_REEXEC_ENV)
             .env_remove(OWN_SCOPE_DEADLINE_ENV)
+            // Both fixture runs share this checkout's ignored/validate, so an
+            // inherited run id names one durable log for both and the second
+            // child refuses it as already existing.
+            .env_remove("E2E_RUN_ID")
             .env_remove(PARENT_ENV)
             .env_remove(TOOL_ROOT_ENV)
             .env_remove(TOOL_AUTHORITY_ENV)
