@@ -31,7 +31,9 @@
 //!   the toolchain, and the absolute durable log path together, so a downstream
 //!   reader can never pair a bare `pass` with inferred coverage.
 //! * **`HERMIT_DIR` is a USER-facing setting.** Validation never writes there.
-//!   Run state goes to `target/validation/`, durable logs to `ignored/validate/`.
+//!   Run state goes to `target/validation/`, durable logs to the parent's validation
+//!   state directory: `validate_tmp/` once migrated, `ignored/validate/` before.
+//!   Records name it `ignored/validate/` either way; see `lib/validation_state.rs`.
 //!
 //! # CLI
 //!
@@ -99,6 +101,9 @@ mod validate_receipt;
 
 #[path = "lib/validate_runtime.rs"]
 mod validate_runtime;
+
+#[path = "lib/validation_state.rs"]
+mod validation_state;
 
 #[path = "lib/validate_classification.rs"]
 mod validate_classification;
@@ -2326,6 +2331,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("E2E_RESULT_ROOT")
             .env_remove("E2E_BUILD_ROOT")
             .env_remove(PARENT_ENV)
+            // The enclosing front door's state directory belongs to the real
+            // parent, not to this clone; inheriting it would refuse the child.
+            .env_remove(validation_state::STATE_DIR_ENV)
             .env_remove(TOOL_ROOT_ENV)
             .env_remove(TOOL_AUTHORITY_ENV)
             .env_remove(TOOL_CONTENT_SHA256_ENV)
@@ -6550,7 +6558,13 @@ fn resolve_cgroups(
 /// having run. Teeing here means the log exists whether the run came from
 /// `validate-run`, `make validate`, or a bare invocation.
 struct DurableLog {
+    /// The recorded name, always spelled `<parent>/ignored/validate/...`; the
+    /// receipt, summary and invocation record carry this one.
     path: PathBuf,
+    /// Where the bytes are. Equal to `path` before migration and under
+    /// `<parent>/validate_tmp/` after it; every reader that opens or walks the
+    /// file without following symlinks uses this one.
+    physical: PathBuf,
     tee: std::process::Child,
     orig_stdout: i32,
     orig_stderr: i32,
@@ -6574,14 +6588,22 @@ impl DurableLog {
     }
 }
 
-/// Durable log path. Always ABSOLUTE — `verify_receipt.sh` (the merge gate)
-/// requires the recorded path to start with `/`. Never under `HERMIT_DIR`: that
-/// is a user-facing setting and validation must not write there.
-fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
-    let dir = match std::env::var(PARENT_ENV) {
-        Ok(p) if !p.is_empty() => PathBuf::from(p).join("ignored").join("validate"),
-        _ => root.join("ignored").join("validate"),
+/// Durable log path, as `(recorded, physical)`. Both are ABSOLUTE —
+/// `verify_receipt.sh` (the merge gate) requires the recorded path to start
+/// with `/`. Never under `HERMIT_DIR`: that is a user-facing setting and
+/// validation must not write there.
+///
+/// The recorded path always names `<parent>/ignored/validate/`, which is what
+/// receipts, ledger rows and their validators expect. The physical path is in
+/// the parent's validation state directory (`validation_state`), which is the
+/// same directory before migration and `<parent>/validate_tmp/` after it.
+fn durable_log_path(root: &Path, profile: &str, sha: &str) -> (PathBuf, PathBuf) {
+    let base = match std::env::var(PARENT_ENV) {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => root.to_path_buf(),
     };
+    let dir = base.join(validation_state::LEGACY_STATE_DIR);
+    let physical_dir = validation_state::Layout::detect(&base).state_dir(&base);
     let sha12: String = sha.chars().take(12).collect();
     let supplied = std::env::var("E2E_RUN_ID").ok().filter(|value| {
         !value.is_empty()
@@ -6600,7 +6622,10 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
             std::process::id()
         )
     });
-    durable_log_path_for_run(&dir, profile, &sha12, &run)
+    (
+        durable_log_path_for_run(&dir, profile, &sha12, &run),
+        durable_log_path_for_run(&physical_dir, profile, &sha12, &run),
+    )
 }
 
 fn durable_log_path_for_run(dir: &Path, profile: &str, sha12: &str, run: &str) -> PathBuf {
@@ -8106,20 +8131,20 @@ fn setup_durable_log(
     state: Option<&validate_admission::VerifiedStateRoot>,
 ) -> Result<DurableLog, u8> {
     use std::os::unix::io::AsRawFd;
-    let path = durable_log_path(root, profile, sha);
+    let (path, physical) = durable_log_path(root, profile, sha);
     let reserved = (|| -> Result<_, String> {
         if let Some(state) = state {
             let retained = state.create(&state.locator(&path)?)?;
             let file = retained.file.try_clone().map_err(|e| e.to_string())?;
             Ok((file, Some(retained)))
         } else {
-            if let Some(dir) = path.parent() {
+            if let Some(dir) = physical.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&path)
+                .open(&physical)
                 .map_err(|e| e.to_string())?;
             Ok((file, None))
         }
@@ -8163,8 +8188,12 @@ fn setup_durable_log(
     }
     drop(tee.stdin.take());
     eprintln!("validate: durable log: {}", path.display());
+    if physical != path {
+        eprintln!("validate: durable log bytes: {}", physical.display());
+    }
     Ok(DurableLog {
         path,
+        physical,
         tee,
         orig_stdout,
         orig_stderr,
@@ -20688,6 +20717,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 .env_remove("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
                 .env_remove("HERMIT_VALIDATE_STOP_TEST_EXIT_EARLY")
                 .env_remove(PARENT_ENV)
+                .env_remove(validation_state::STATE_DIR_ENV)
                 .env_remove(TOOL_ROOT_ENV)
                 .env_remove(validate_runtime::ACTIVE_ENV)
                 .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
@@ -20726,6 +20756,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             for unexpected in [
                 checkout.join("target/validation"),
                 checkout.join("ignored/validate"),
+                checkout.join("validate_tmp"),
                 parent.join("ledger"),
             ] {
                 if unexpected.exists() {
@@ -24385,11 +24416,19 @@ fn path_is_outside(path: &Path, boundary: &Path) -> bool {
 fn create_safe_cache(root: &Path, parent: Option<&Path>) -> Result<PathBuf, String> {
     let boundary = cargo_manifest_boundary(root);
     let mut bases = Vec::new();
+    // The cache lives in the validation state directory, entered by its
+    // physical name: the symlink check below refuses a symlinked final
+    // component, and a migrated parent's `ignored/validate` is one.
+    let state_cache = |base: &Path| {
+        validation_state::Layout::detect(base)
+            .state_dir(base)
+            .join("cache")
+    };
     if let Some(parent) = parent {
-        bases.push(parent.join("ignored/validate/cache"));
+        bases.push(state_cache(parent));
     }
     if let Some(outside) = boundary.parent() {
-        bases.push(outside.join("ignored/validate/cache"));
+        bases.push(state_cache(outside));
     }
     bases.push(std::env::temp_dir().join("hermit-validate-cache"));
     bases.dedup();
@@ -24975,6 +25014,15 @@ fn run(
             // this path for its ledger, so do not make every child rediscover it.
             std::env::set_var(PARENT_ENV, parent);
         }
+    }
+    // A front door that names the validation state directory has already
+    // moved it. Refuse before anything is written if this driver would put
+    // bytes anywhere else, rather than split one run across two directories.
+    if let Err(error) = validation_state::check_configured(
+        parent.as_deref(),
+        std::env::var_os(validation_state::STATE_DIR_ENV).as_deref(),
+    ) {
+        return RunSummary::refused(2, &level_name, "validation state directory", vec![error]);
     }
     let (tool_root, mut verified_state_root) = match configured_tool_selection(parent.as_deref()) {
         Ok(selection) => selection,
@@ -26077,6 +26125,12 @@ fn run(
         .as_ref()
         .map(|d| d.path.clone())
         .unwrap_or_default();
+    // The same file under its physical name. Records keep `log_path`; anything
+    // that derives sibling directories or measures the bytes uses this one.
+    let log_physical = durable_slot
+        .as_ref()
+        .map(|d| d.physical.clone())
+        .unwrap_or_default();
     // Now that the log exists, tell the holder record where it is, so a validate
     // REFUSED against this one can print a command to tail it. Gated on actually
     // holding the lock: a nested payload must never rewrite the outer run's
@@ -26086,7 +26140,7 @@ fn run(
     }
     let (e2e_result_root, fresh_result_root) = match configure_e2e_result_root(
         &root,
-        &log_path,
+        &log_physical,
         &tmp.join("e2e-build"),
     ) {
         Ok(path) => path,
@@ -26105,8 +26159,9 @@ fn run(
         }
     };
     eprintln!("validate: per-cell results: {}", e2e_result_root.display());
-    let mut raw_census = fresh_result_root
-        .and_then(|held| RawCensusAuthority::prepare(held, &log_path, admitted_context.as_ref()));
+    let mut raw_census = fresh_result_root.and_then(|held| {
+        RawCensusAuthority::prepare(held, &log_physical, admitted_context.as_ref())
+    });
 
     let prepared_evidence = match cumulative_selection {
         Some(selected) => {
@@ -26333,7 +26388,7 @@ fn run(
             keep_going,
             verbosity,
             cgroups.clone(),
-            &log_path,
+            &log_physical,
             deadline,
             true,
         );

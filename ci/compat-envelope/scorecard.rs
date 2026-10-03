@@ -13176,12 +13176,7 @@ fn retained_binding_candidates(
             }
             row.validate_timeout_policy()?;
             normalise_recorded_root(&mut row);
-            if let Some(prefix) = path
-                .ancestors()
-                .find(|p| p.file_name().is_some_and(|n| n == "ignored"))
-                .and_then(Path::parent)
-                .and_then(Path::to_str)
-            {
+            if let Some(prefix) = retained_workspace_prefix(path) {
                 normalise_recorded_prefix(&mut row, prefix);
             }
             let id = row.id().ok_or("retained binding row has no backend")?;
@@ -13399,12 +13394,7 @@ fn attempt_input_witnesses(
                 serde_json::from_str(line).map_err(|error| error.to_string())?;
             normalise_recorded_root(&mut row);
             if retained {
-                if let Some(prefix) = path
-                    .ancestors()
-                    .find(|p| p.file_name().is_some_and(|n| n == "ignored"))
-                    .and_then(Path::parent)
-                    .and_then(Path::to_str)
-                {
+                if let Some(prefix) = retained_workspace_prefix(path) {
                     normalise_recorded_prefix(&mut row, prefix);
                 }
             }
@@ -16220,12 +16210,7 @@ fn read_retained_results(
     }
 
     let history = git_history_ranks(root)?;
-    let retained_workspace = result_root
-        .ancestors()
-        .find(|path| path.file_name().is_some_and(|name| name == "ignored"))
-        .and_then(Path::parent)
-        .and_then(Path::to_str)
-        .map(str::to_string);
+    let retained_workspace = retained_workspace_prefix(result_root).map(str::to_string);
     let mut grouped: BTreeMap<(CellId, String, String), Vec<ResultCandidate>> = BTreeMap::new();
     let mut rows_scanned = 0usize;
     for path in &files {
@@ -17600,6 +17585,23 @@ fn normalise_recorded_root(row: &mut ResultRow) {
     row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
 }
 
+/// The workspace that holds a retained result path, as text: the parent of the
+/// path's nearest `ignored` ancestor (`<workspace>/ignored/validate/...`) or,
+/// once the parent's validation state directory has moved, of its nearest
+/// `validate_tmp` ancestor (`<workspace>/validate_tmp/...`). Callers resolve
+/// result roots before they get here, so a moved state directory arrives under
+/// its physical name and would otherwise lose its normalisation silently.
+fn retained_workspace_prefix(path: &Path) -> Option<&str> {
+    path.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name == "ignored" || name == "validate_tmp")
+        })
+        .and_then(Path::parent)
+        .and_then(Path::to_str)
+}
+
 fn normalise_recorded_prefix(row: &mut ResultRow, prefix: &str) {
     if prefix.is_empty() || prefix == RECORDED_ROOT || !prefix.starts_with('/') {
         return;
@@ -17623,6 +17625,42 @@ fn normalise_recorded_prefix(row: &mut ResultRow, prefix: &str) {
     }
     rewrite_recorded_root(&mut row.cwd, prefix);
     row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
+}
+
+#[cfg(test)]
+mod retained_workspace_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn both_state_directory_spellings_name_the_same_workspace() {
+        for (path, expected) in [
+            (
+                "/work/dev-hermit/ignored/validate/e2e/run-1/results.jsonl",
+                Some("/work/dev-hermit"),
+            ),
+            (
+                "/work/dev-hermit/validate_tmp/e2e/run-1/results.jsonl",
+                Some("/work/dev-hermit"),
+            ),
+            (
+                "/work/dev-hermit/validate_tmp/artifacts/run-1",
+                Some("/work/dev-hermit"),
+            ),
+            // The nearest ancestor wins, as it always has for `ignored`.
+            (
+                "/work/ignored/dev-hermit/validate_tmp/e2e/results.jsonl",
+                Some("/work/ignored/dev-hermit"),
+            ),
+            ("/work/dev-hermit/results/results.jsonl", None),
+            ("/work/dev-hermit/validate_tmpx/results.jsonl", None),
+        ] {
+            assert_eq!(
+                retained_workspace_prefix(Path::new(path)),
+                expected,
+                "{path}"
+            );
+        }
+    }
 }
 
 fn recorded_shell_quote(value: &str) -> String {

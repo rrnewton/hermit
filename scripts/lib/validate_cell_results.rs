@@ -660,11 +660,10 @@ pub fn retain_coverage_evidence(
         &cells_document,
         &registration,
     )?;
-    let artifact_dir = parent
-        .join("ignored")
-        .join("validate")
-        .join("artifacts")
-        .join(run_id);
+    // Bytes go to the physical state directory; the ledger names them with
+    // the logical `ignored/validate/...` spelling (see `validation_state`).
+    let layout = crate::validation_state::Layout::detect(parent);
+    let artifact_dir = layout.state_dir(parent).join("artifacts").join(run_id);
     fs::create_dir_all(&artifact_dir).map_err(|error| {
         format!(
             "cannot create retained coverage directory {}: {error}",
@@ -677,11 +676,12 @@ pub fn retain_coverage_evidence(
     bytes.push(b'\n');
     fs::write(&artifact, &bytes)
         .map_err(|error| format!("cannot publish {}: {error}", artifact.display()))?;
-    let relative = artifact
-        .strip_prefix(parent)
-        .map_err(|_| "retained coverage artifact is outside parent root")?
-        .to_string_lossy()
-        .into_owned();
+    let relative = layout.logical(
+        &artifact
+            .strip_prefix(parent)
+            .map_err(|_| "retained coverage artifact is outside parent root")?
+            .to_string_lossy(),
+    );
     let e2e = document.get("e2e").expect("constructed e2e scope");
     let binaries = document
         .get("integration_test_binaries")
@@ -854,11 +854,8 @@ pub fn retain_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let population_bytes = serde_json::to_vec(&selected_values)
         .map_err(|error| format!("cannot encode selected cell population: {error}"))?;
-    let artifact_dir = parent
-        .join("ignored")
-        .join("validate")
-        .join("artifacts")
-        .join(&run_id);
+    let layout = crate::validation_state::Layout::detect(parent);
+    let artifact_dir = layout.state_dir(parent).join("artifacts").join(&run_id);
     fs::create_dir_all(&artifact_dir).map_err(|error| {
         format!(
             "cannot create retained cell artifact {}: {error}",
@@ -886,11 +883,12 @@ pub fn retain_snapshot(
             artifact.display()
         )
     })?;
-    let relative = artifact
-        .strip_prefix(parent)
-        .map_err(|_| "retained cell artifact is outside parent root")?
-        .to_string_lossy()
-        .into_owned();
+    let relative = layout.logical(
+        &artifact
+            .strip_prefix(parent)
+            .map_err(|_| "retained cell artifact is outside parent root")?
+            .to_string_lossy(),
+    );
     let recorded_count = u64::try_from(cells.len())
         .map_err(|_| "retained cell count does not fit the ledger type")?;
     let selected_count = u64::try_from(selected.len())
@@ -2135,6 +2133,34 @@ mod tests {
         assert_eq!(
             bytes, expected_bytes,
             "the shared type must preserve artifact bytes"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_cells_on_a_migrated_parent_are_named_logically() {
+        let root = fixture_root();
+        fs::create_dir_all(root.join("validate_tmp")).unwrap();
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        std::os::unix::fs::symlink("../validate_tmp", root.join("ignored/validate")).unwrap();
+        let results = root.join("results");
+        let commit = "1313131313131313131313131313131313131313";
+        let row = result_row("validate-migrated", commit);
+        write_result(&results, &row);
+        let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        assert_eq!(
+            retained.evidence["artifact"]["path"],
+            "ignored/validate/artifacts/validate-migrated/cell-results.jsonl"
+        );
+        let physical = root.join("validate_tmp/artifacts/validate-migrated/cell-results.jsonl");
+        let bytes = fs::read(&physical).unwrap();
+        assert_eq!(hex_digest(&bytes), retained.evidence["artifact"]["sha256"]);
+        assert!(
+            fs::symlink_metadata(root.join("ignored/validate"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "retention must write through the physical directory, not replace the link"
         );
         fs::remove_dir_all(root).unwrap();
     }
