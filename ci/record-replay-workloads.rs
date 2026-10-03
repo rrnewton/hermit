@@ -59,6 +59,10 @@ pub const C_SOURCES: [(&str, &str); 28] = [
         "tests/c/record_replay_path_queries.c",
     ),
     (
+        "c_record_replay_fd_metadata",
+        "tests/c/record_replay_fd_metadata.c",
+    ),
+    (
         "c_record_replay_mkdir_eexist",
         "tests/c/record_replay_mkdir_eexist.c",
     ),

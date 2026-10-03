@@ -1285,6 +1285,12 @@
       "why": "tests/c/record_replay_fd_close.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_fd_metadata.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_fd_metadata.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that descriptor syncs, fchmod/fchown, xattr queries and zero-length reads replay from the recording rather than against a placeholder descriptor."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_replay_file_state.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

@@ -1787,9 +1787,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }])?;
                 return Ok(0);
             }
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            // Zero-count reads only serve to detect errors. Their result goes
+            // through record/replay: a replayed descriptor may be a placeholder
+            // whose own zero-count read fails differently.
+            // TODO-HUMAN-REVIEW(#3591)
+            return self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
         }
 
         let needs_procfs_snapshot = guest
@@ -1890,9 +1894,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            // Zero-count reads only serve to detect errors; as for read, the
+            // result goes through record/replay.
+            // TODO-HUMAN-REVIEW(#3591)
+            return self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;

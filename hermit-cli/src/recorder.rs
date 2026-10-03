@@ -442,6 +442,22 @@ impl Tool for Recorder {
             Sysno::fadvise64,
             Sysno::flock,
             Sysno::ftruncate,
+            // Descriptor syncs, metadata changes and xattr queries: replay
+            // returns the recorded results, because a replayed descriptor may
+            // be a placeholder.
+            Sysno::fsync,
+            Sysno::fdatasync,
+            Sysno::syncfs,
+            Sysno::fchmod,
+            Sysno::fchown,
+            Sysno::fsetxattr,
+            Sysno::fremovexattr,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::fgetxattr,
+            Sysno::listxattr,
+            Sysno::llistxattr,
+            Sysno::flistxattr,
             Sysno::dup,
             Sysno::dup2,
             Sysno::dup3,
@@ -593,6 +609,26 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Getcwd(syscall) => self.handle_getcwd(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3591): descriptor syncs and metadata changes
+            // record only their result. Replay's descriptor may be a
+            // placeholder, and no later replayed call reads the metadata back
+            // from the replay root: stat, open and exec results are recorded.
+            Syscall::Fsync(_)
+            | Syscall::Fdatasync(_)
+            | Syscall::Syncfs(_)
+            | Syscall::Fchmod(_)
+            | Syscall::Fchown(_)
+            | Syscall::Fsetxattr(_)
+            | Syscall::Fremovexattr(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3591)
+            Syscall::Getxattr(_)
+            | Syscall::Lgetxattr(_)
+            | Syscall::Fgetxattr(_)
+            | Syscall::Listxattr(_)
+            | Syscall::Llistxattr(_)
+            | Syscall::Flistxattr(_) => self.handle_xattr_query(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,

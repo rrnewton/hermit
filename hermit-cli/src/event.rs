@@ -8,9 +8,11 @@
 
 use reverie::Errno;
 use reverie::RdtscResult;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::StatBuf;
 use reverie::syscalls::StatxBuf;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Timeval;
 use reverie::syscalls::Timezone;
@@ -30,6 +32,23 @@ pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<
         ioctl::Request::SIOCETHTOOL(_) | ioctl::Request::Other(SIOCETHTOOL, _) => {
             Some(Errno::ENODEV)
         }
+        _ => None,
+    }
+}
+
+// TODO-HUMAN-REVIEW(#3591)
+/// Returns the output buffer and its size for an xattr query (`getxattr`,
+/// `lgetxattr`, `fgetxattr` and the `listxattr` family), or `None` for any
+/// other syscall. A zero size only asks for the length the value needs: the
+/// kernel copies nothing out and returns that length.
+pub(crate) fn xattr_query_output(syscall: &Syscall) -> Option<(Option<AddrMut<'_, u8>>, usize)> {
+    match syscall {
+        Syscall::Getxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
+        Syscall::Lgetxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
+        Syscall::Fgetxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
+        Syscall::Listxattr(call) => Some((call.list().map(|a| a.cast()), call.size())),
+        Syscall::Llistxattr(call) => Some((call.list().map(|a| a.cast()), call.size())),
+        Syscall::Flistxattr(call) => Some((call.list().map(|a| a.cast()), call.size())),
         _ => None,
     }
 }

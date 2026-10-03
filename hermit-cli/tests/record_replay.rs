@@ -2193,6 +2193,22 @@ fn record_path_queries_and_legacy_mutations() {
     );
 }
 
+/// fsync, fdatasync, syncfs, fchmod, fchown, the xattr calls and zero-length
+/// reads must replay from the recording
+/// (https://github.com/rrnewton/hermit/issues/3591). The file lives in a host
+/// directory the replay chroot lacks, so replay's descriptor is a placeholder
+/// and a live call there answers EINVAL or EOPNOTSUPP.
+#[test]
+fn record_fd_metadata_calls() {
+    let _guard = hermit_record_lock();
+    let host_dir = tempfile::tempdir().expect("failed to create host directory");
+    canonical_record_replay_command(
+        "descriptor metadata calls",
+        &workload("c_record_replay_fd_metadata").path,
+        &[host_dir.path().as_os_str()],
+    );
+}
+
 /// A working directory that was removed has no path: procfs names it
 /// "<dir> (deleted)", which is not a directory replay could enter. Recording
 /// must refuse such an fchdir loudly rather than store that text.
