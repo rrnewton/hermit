@@ -2172,15 +2172,18 @@ fn record_path_queries_and_legacy_mutations() {
     let _guard = hermit_record_lock();
     // Host directories absent from the replay chroot: a replayed chdir that
     // stayed put would make the second round's link collide with the first.
+    // "via" is a host symlink the replay chroot lacks, so only a replay that
+    // enters the recorded directory resolves "via/.." to "first".
     let host_dirs = tempfile::tempdir().expect("failed to create host directories");
-    let first = host_dirs.path().join("first");
-    let second = host_dirs.path().join("second");
-    std::fs::create_dir(&first).expect("failed to create first host directory");
-    std::fs::create_dir(&second).expect("failed to create second host directory");
+    let base = host_dirs.path();
+    std::fs::create_dir_all(base.join("first/sub")).expect("failed to create first host directory");
+    std::fs::create_dir(base.join("second")).expect("failed to create second host directory");
+    std::os::unix::fs::symlink("first/sub", base.join("via"))
+        .expect("failed to create host directory symlink");
     canonical_record_replay_command(
         "path queries and legacy path mutations",
         &workload("c_record_replay_path_queries").path,
-        &[first.as_os_str(), second.as_os_str()],
+        &[base.as_os_str()],
     );
 }
 

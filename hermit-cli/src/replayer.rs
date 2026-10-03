@@ -45,6 +45,7 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Chdir;
 use reverie::syscalls::Close;
 use reverie::syscalls::Dup3;
 use reverie::syscalls::EfdFlags;
@@ -465,7 +466,7 @@ impl Tool for Replayer {
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598)
-            Syscall::Chdir(_) => self.handle_chdir(guest, syscall).await,
+            Syscall::Chdir(call) => self.handle_chdir(guest, call).await,
             Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
@@ -1688,51 +1689,63 @@ impl Replayer {
 
     // TODO-HUMAN-REVIEW(#3598)
     /// Replay `chdir(2)` from its recorded result and move the replay
-    /// process's working directory with it. The recorded target is first
-    /// created inside the replay root, as for a recorded `O_DIRECTORY` open, so
-    /// the re-issued chdir cannot leave the process in its previous directory:
-    /// every later `AT_FDCWD`-relative or legacy relative-path replay mutation
-    /// trusts `/proc/<pid>/cwd`, and a stale one would land them elsewhere.
+    /// process's working directory with it. A successful recording carries the
+    /// directory the chdir actually entered; that directory is created inside
+    /// the replay root, as for a recorded `O_DIRECTORY` open, and entered by
+    /// that resolved name. The spelled path is not reused because it may cross
+    /// a host symlink or `..` that the replay root lacks. Every later
+    /// `AT_FDCWD`-relative or legacy relative-path replay mutation trusts
+    /// `/proc/<pid>/cwd`, so a stale or wrong directory would land them
+    /// elsewhere; the resulting cwd is checked against the recording.
     async fn handle_chdir<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        syscall: Syscall,
+        syscall: Chdir,
     ) -> Result<i64, Errno> {
-        let recorded = next_event!(guest, Return);
-        if let Ok(expected) = recorded {
-            let Syscall::Chdir(call) = syscall else {
-                unreachable!("chdir replay requested for {syscall:?}")
-            };
-            let path = call
-                .path()
-                .ok_or(Errno::EFAULT)
-                .and_then(|path| path.read(&guest.memory()))
-                .unwrap_or_else(|error| {
-                    panic!("could not decode successful recorded chdir: {error}")
-                });
-            self.materialize_recorded_directory(
-                guest,
-                syscall,
-                libc::AT_FDCWD,
-                &path,
-                OFlag::empty(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("failed to materialize recorded chdir target {path:?}: {error}")
-            });
-            match guest.inject_with_retry(syscall).await {
-                Ok(actual) => assert_eq!(
-                    actual, expected,
-                    "replayed chdir returned a different result"
-                ),
-                Err(error) => {
-                    panic!(
-                        "replayed chdir {syscall:?} failed after recording returned {expected}: {error}"
-                    );
-                }
-            }
+        let entered = PathBuf::from(std::ffi::OsString::from_vec(next_event!(guest, Bytes)?));
+        assert!(
+            entered.is_absolute(),
+            "recorded chdir entered a relative directory {entered:?}"
+        );
+        self.materialize_recorded_directory(
+            guest,
+            syscall.into(),
+            libc::AT_FDCWD,
+            &entered,
+            OFlag::empty(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to materialize recorded chdir target {entered:?}: {error}")
+        });
+        let entered_bytes = entered.as_os_str().as_bytes();
+        let mut path = [0_u8; 512];
+        let result = if entered_bytes.len() < path.len() {
+            path[..entered_bytes.len()].copy_from_slice(entered_bytes);
+            let mut stack = guest.stack().await;
+            let path_addr = stack.push(path);
+            let path_ptr = PathPtr::from_ptr(unsafe {
+                path_addr.cast::<u8>().as_ptr().cast::<libc::c_char>()
+            })
+            .expect("guest stack address is non-null");
+            let _path_guard = stack.commit()?;
+            guest
+                .inject_with_retry(Chdir::new().with_path(Some(path_ptr)))
+                .await
+        } else {
+            // Too long for the injection stack: re-issue the guest's own
+            // spelling and rely on the cwd check below to catch a mismatch.
+            guest.inject_with_retry(syscall).await
+        };
+        if let Err(error) = result {
+            panic!("replayed chdir into recorded {entered:?} failed: {error}");
         }
-        recorded
+        let actual = crate::record_replay_path::process_cwd_path(guest.tid())
+            .unwrap_or_else(|error| panic!("could not read replayed chdir directory: {error}"));
+        assert_eq!(
+            actual, entered,
+            "replayed chdir entered a different directory than the recording"
+        );
+        Ok(0)
     }
 
     async fn handle_fchdir<G: Guest<Self>>(

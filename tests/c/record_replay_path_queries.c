@@ -56,14 +56,45 @@ static long create(const char* path) {
   return fd < 0 ? -1 : 0;
 }
 
-// Each argument names a directory that exists on the host but not in the
-// replay chroot. Replay must still move its working directory there, or both
-// rounds of relative mutations land in one stale directory and the second link
+// The directories under the argument exist on the host but not in the replay
+// chroot. Replay must still move its working directory there, or both rounds
+// of relative mutations land in one stale directory and the second link
 // collides with the first.
-static void mutate_in(const char* dir) {
+static void mutate_in(const char* base, const char* name) {
+  char dir[4096];
+  snprintf(dir, sizeof(dir), "%s/%s", base, name);
   expect("chdir_host_dir", syscall(SYS_chdir, dir), 0);
   expect("create_f", create("f"), 0);
   expect("link_f_g", syscall(SYS_link, "f", "g"), 0);
+}
+
+static void host_directory_rounds(const char* base) {
+  char path[4096];
+  mutate_in(base, "first");
+  mutate_in(base, "second");
+
+  // fchdir back into the first host directory: its "f" must be reachable
+  // relative to the restored working directory.
+  snprintf(path, sizeof(path), "%s/first", base);
+  int dirfd = open(path, O_RDONLY | O_DIRECTORY);
+  expect("open_host_dir", dirfd < 0 ? -1 : 0, 0);
+  expect("chdir_root_before_fchdir", syscall(SYS_chdir, "/"), 0);
+  expect("fchdir_host_dir", syscall(SYS_fchdir, dirfd), 0);
+  expect("link_f_h", syscall(SYS_link, "f", "h"), 0);
+  if (dirfd >= 0) {
+    close(dirfd);
+  }
+
+  // "via" is a host symlink to first/sub, so "via/.." is first, not base.
+  // Replay has no such symlink; a replayed chdir that followed the spelling
+  // would land in base, and base's own link to "q" below would then collide.
+  snprintf(path, sizeof(path), "%s/via/..", base);
+  expect("chdir_via_symlink_parent", syscall(SYS_chdir, path), 0);
+  expect("create_p_in_first", create("p"), 0);
+  expect("link_p_q_in_first", syscall(SYS_link, "p", "q"), 0);
+  expect("chdir_base", syscall(SYS_chdir, base), 0);
+  expect("create_p_in_base", create("p"), 0);
+  expect("link_p_q_in_base", syscall(SYS_link, "p", "q"), 0);
 }
 
 int main(int argc, char** argv) {
@@ -96,20 +127,8 @@ int main(int argc, char** argv) {
   expect(
       "chdir_missing", syscall(SYS_chdir, "/nonexistent/hermit"), ENOENT);
 
-  for (int i = 1; i < argc; i++) {
-    mutate_in(argv[i]);
-  }
   if (argc > 1) {
-    // fchdir back into the first host directory: its "f" must be reachable
-    // relative to the restored working directory.
-    int dirfd = open(argv[1], O_RDONLY | O_DIRECTORY);
-    expect("open_host_dir", dirfd < 0 ? -1 : 0, 0);
-    expect("chdir_root_before_fchdir", syscall(SYS_chdir, "/"), 0);
-    expect("fchdir_host_dir", syscall(SYS_fchdir, dirfd), 0);
-    expect("link_f_h", syscall(SYS_link, "f", "h"), 0);
-    if (dirfd >= 0) {
-      close(dirfd);
-    }
+    host_directory_rounds(argv[1]);
   }
 
   char dir[] = "/tmp/hermit-rr-paths.XXXXXX";
@@ -130,7 +149,7 @@ int main(int argc, char** argv) {
   expect("rmdir", syscall(SYS_rmdir, "e"), 0);
   expect("rename_missing", syscall(SYS_rename, "missing", "x"), ENOENT);
 
-  struct stat st;
+  struct stat st = {0};
   expect("stat_b", stat("b", &st), 0);
   printf("b_mode=%o b_nlink=%lu\n", st.st_mode & 07777, st.st_nlink);
   if ((st.st_mode & 07777) != 0600 || st.st_nlink != 2) {

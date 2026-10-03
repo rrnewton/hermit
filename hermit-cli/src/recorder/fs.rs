@@ -7,6 +7,7 @@
  */
 
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -15,6 +16,7 @@ use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Chdir;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
@@ -857,6 +859,32 @@ impl Recorder {
                 let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
                 guest.memory().read_exact(addr, &mut buf)?;
                 Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Record a successful `chdir(2)` as the directory it actually entered.
+    /// The spelled path may go through host symlinks or `..` components that
+    /// the replay root lacks, so replay moves to this resolved name instead.
+    pub(super) async fn handle_chdir<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Chdir,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.map(|_| {
+                let cwd = crate::record_replay_path::process_cwd_path(guest.tid()).unwrap_or_else(
+                    |error| {
+                        panic!("could not read the directory a recorded chdir entered: {error}")
+                    },
+                );
+                SyscallEvent::Bytes(cwd.into_os_string().into_vec())
             }),
         );
 

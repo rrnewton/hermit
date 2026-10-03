@@ -159,7 +159,12 @@ impl RecordVersion {
 // Return for a NULL `res`). An older reader would desynchronize on these events.
 // 0x11d -> 0x11e: guest-semantic madvise advice, which detcore used to refuse
 // with ENOSYS, now reaches the recorder and replayer and emits a Madvise event.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11e);
+// 0x11e -> 0x11f: faccessat, faccessat2, chdir, getcwd and the legacy path
+// mutations (rename, link, symlink, chmod, chown, lchown, mknod, rmdir) are
+// recorded instead of running live. A successful chdir carries a Bytes event
+// naming the directory it entered. An older reader would desynchronize on
+// these events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -184,7 +189,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
