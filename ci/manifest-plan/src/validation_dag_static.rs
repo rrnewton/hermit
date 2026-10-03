@@ -610,7 +610,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // version_names_a_revision_only_when_the_build_was_stamped
     // (https://github.com/rrnewton/hermit/pull/3547) retains all 102 prior
     // selected CLI identities.
-    ("test.cli", 103),
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths
+    // (https://github.com/rrnewton/hermit/pull/3564) retains all 103 prior
+    // selected CLI identities.
+    ("test.cli", 104),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
