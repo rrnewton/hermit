@@ -23,7 +23,7 @@ import tempfile
 import time
 from typing import Iterator, Optional, Tuple
 
-from demo_common import hermit_tmp_args
+from demo_common import hermit_tmp_args, make_socket_path
 
 
 XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -602,6 +602,7 @@ class HermitGuestProgram:
         self.metrics = []  # type: list[ObservationMetrics]
         self.run_dir = None  # type: Optional[Path]
         self.serial_log = None  # type: Optional[Path]
+        self.qmp_socket = None  # type: Optional[Path]
 
     def start(self) -> "HermitGuestProgram":
         for path in (
@@ -618,7 +619,16 @@ class HermitGuestProgram:
         self.run_dir = Path(tempfile.mkdtemp(prefix="run.", dir=str(self.config.artifact_dir)))
         self.serial_log = self.run_dir / "serial.log"
         hermit_log = self.run_dir / "hermit.log"
-        qmp_socket = self.run_dir / "qmp.sock"
+        # QEMU, under Hermit, creates the QMP socket at this path and this
+        # process connects to it from outside, so the path must fit the 107
+        # bytes AF_UNIX allows. In run.sh's default artifact directory the path
+        # in the run directory fits only from a checkout path of at most 57
+        # bytes (from a 60-byte one it is 110 bytes). make_socket_path keeps it
+        # where it fits and otherwise moves it to a short directory outside
+        # host /tmp (Hermit gives QEMU a private /tmp); close() removes a moved
+        # socket.
+        qmp_socket = make_socket_path(self.run_dir / "qmp.sock", "drgn")
+        self.qmp_socket = qmp_socket
         # Bidirectional serial over a `-serial pipe:` FIFO pair, not a unix
         # socket: a socket chardev's always-pollable descriptor lets QEMU's main
         # loop starve the -icount vCPU under `hermit --no-rcb-time`. QEMU opens
@@ -883,6 +893,14 @@ class HermitGuestProgram:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait(timeout=10)
+        # A socket that make_socket_path moved out of the run directory would
+        # otherwise stay behind in the shared relocation directory.
+        if (
+            self.qmp_socket is not None
+            and self.run_dir is not None
+            and self.qmp_socket.parent != self.run_dir
+        ):
+            self.qmp_socket.unlink(missing_ok=True)
 
 
 @contextmanager
