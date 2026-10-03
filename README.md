@@ -272,8 +272,11 @@ single-threaded C program: attaching to `run --gdbserver`, hitting a source
 breakpoint, continuing, reading the stack and evaluating variables, and, for a
 recording, `stepBack` and `reverseContinue`, including `stepBack` after a
 `stepOut` or `next` and a `reverseContinue` back to the replay's entry (the
-`hermit_dap_*` tests in `hermit-cli/tests/cli.rs`). Other GDB versions are not
-tested. Reverse replay patches GDB's DAP server internals, so under a GDB whose
+`hermit_dap_*` tests in `hermit-cli/tests/cli.rs`). One known case fails:
+after a `stepOut` that starts at a recursive call's return address, a later
+`stepBack` to the caller's closing line cannot land exactly (see the
+limitation below), so it fails with an error instead. Other GDB versions are
+not tested. Reverse replay patches GDB's DAP server internals, so under a GDB whose
 DAP server lacks them it refuses to start: the client's first request gets a
 failed response naming the missing hook, and the adapter writes the same
 message to its stderr and exits. It refuses the same way when `readelf` or
@@ -367,6 +370,26 @@ does not start a source line, such as the return address a `stepOut` stops at,
 `stepBack` restarts the replay once more to count the earlier passes through
 it, and may first run the current replay forward to the next source line. This
 first implementation favors correctness over speed.
+
+`stepBack` goes back to the previous stop or line arrival, not to the previous
+instruction GDB's own reverse-step would reach. When the client stops in a
+one-line loop, for example by stepping out of the loop body's call, then
+continues past the loop, `stepBack` returns to that stop. It skips the later
+passes through the loop's line, which the client never stopped at and which
+start no new source line. A `stepOut` from a function without debug
+information reports the stop with reason `stopped` rather than `step`.
+
+Known limitation: the adapter finds line arrivals with breakpoints on every
+source line, and Reverie's gdbstub can lose one of them. It saves and restores
+a whole 8-byte word for each software breakpoint, so when GDB removes a
+breakpoint to step over it, a breakpoint up to 7 bytes after it is erased for
+the rest of that resume. The adapter records each stop's stack pointer and
+checks it when it replays to that stop. If the replay lands in another frame,
+the adapter puts it back at the client's current stop, sends a `stopped`
+event for it, and fails the `stepBack` or `reverseContinue` with an error that
+says it could not reach the earlier stop exactly. It never reports a stop at
+the wrong time in another frame. The check cannot tell two passes through the
+same frame apart, such as two iterations of a loop.
 
 ```bash
 dapper proxy --control-port 4711 from-config hermit-dap-replay.json

@@ -160,21 +160,38 @@ fn replay_command(options: &ReplayOptions) -> Result<Vec<String>, String> {
 /// startup. A startup refusal written through them never reaches the client,
 /// so the extension writes it through these duplicates instead. They survive
 /// the exec below on purpose; the extension closes them once startup
-/// succeeds.
+/// succeeds. Without them the extension can only write a refusal to GDB's own
+/// stderr, so a failed duplicate is reported here, while this process's
+/// stderr still reaches the client's log.
 fn client_fds() -> String {
-    let duplicate = |fd: BorrowedFd<'_>| nix::unistd::dup(fd).ok();
+    let duplicate = |name: &'static str, fd: BorrowedFd<'_>| {
+        nix::unistd::dup(fd).map_err(|error| format!("{name} ({error})"))
+    };
     match (
-        duplicate(io::stdin().as_fd()),
-        duplicate(io::stdout().as_fd()),
-        duplicate(io::stderr().as_fd()),
+        duplicate("stdin", io::stdin().as_fd()),
+        duplicate("stdout", io::stdout().as_fd()),
+        duplicate("stderr", io::stderr().as_fd()),
     ) {
-        (Some(input), Some(output), Some(error)) => format!(
+        (Ok(input), Ok(output), Ok(error)) => format!(
             "({}, {}, {})",
             input.into_raw_fd(),
             output.into_raw_fd(),
             error.into_raw_fd()
         ),
-        _ => "None".to_string(),
+        (input, output, error) => {
+            // Dropping the duplicates that did succeed closes them.
+            let failed: Vec<String> = [input.err(), output.err(), error.err()]
+                .into_iter()
+                .flatten()
+                .collect();
+            eprintln!(
+                "hermit-dap: could not duplicate {}; if managed replay refuses to \
+                 start, its reason goes only to GDB's stderr, which GDB's DAP \
+                 interpreter does not pass to the client",
+                failed.join(", ")
+            );
+            "None".to_string()
+        }
     }
 }
 

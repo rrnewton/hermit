@@ -52,8 +52,11 @@ _REFUSAL_REQUEST_TIMEOUT = 30.0
 _ADVANCE_LIMIT = 100
 
 
-def _read_client_request(fd, timeout):
-    # One Content-Length framed DAP message from FD, or None if none arrives.
+def _read_client_messages(fd, timeout):
+    # Yield the Content-Length framed DAP messages that arrive on FD within
+    # TIMEOUT seconds. A message that is not a JSON object yields None, and so
+    # does a header block without a usable Content-Length, after which the
+    # stream cannot be framed and nothing more is read.
     deadline = time.monotonic() + timeout
     data = b""
     while True:
@@ -66,30 +69,39 @@ def _read_client_request(fd, timeout):
                     try:
                         length = int(value.strip())
                     except ValueError:
-                        return None
-            if length is None:
-                return None
+                        length = None
+            if length is None or length < 0:
+                yield None
+                return
             body = data[header_end + 4 :]
             if len(body) >= length:
+                data = body[length:]
                 try:
-                    return json.loads(body[:length])
+                    message = json.loads(body[:length])
                 except ValueError:
-                    return None
+                    message = None
+                yield message if isinstance(message, dict) else None
+                continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
+            return
         ready, _, _ = select.select([fd], [], [], remaining)
         if not ready:
-            return None
+            return
         chunk = os.read(fd, 65536)
         if not chunk:
-            return None
+            return
         data += chunk
 
 
 def _write_all(fd, data):
     while data:
         data = data[os.write(fd, data) :]
+
+
+def _write_message(fd, message):
+    body = json.dumps(message).encode()
+    _write_all(fd, "Content-Length: {}\r\n\r\n".format(len(body)).encode() + body)
 
 
 def _refuse(message):
@@ -101,37 +113,50 @@ def _refuse(message):
     # 17.2 measured: zero bytes reach either stream). hermit-dap.rs therefore
     # hands this script duplicates of its own stdin, stdout and stderr: the
     # message goes to stderr, and the client's first request, normally
-    # `initialize`, gets a failed DAP response that carries it.
+    # `initialize`, gets a failed DAP response that carries it. A client that
+    # sends no request in time, or a header block this cannot frame, gets the
+    # message as an `output` event instead.
     text = "hermit-dap: " + message
-    if _client_fds is not None:
-        client_in, client_out, client_err = _client_fds
-        try:
-            _write_all(client_err, (text + "\n").encode())
-        except OSError:
-            pass
-        try:
-            request = _read_client_request(client_in, _REFUSAL_REQUEST_TIMEOUT)
-        except OSError:
-            request = None
-        if isinstance(request, dict) and request.get("type") == "request":
-            body = json.dumps(
-                {
-                    "seq": 1,
-                    "type": "response",
-                    "request_seq": request.get("seq", 0),
-                    "command": request.get("command", ""),
-                    "success": False,
-                    "message": text,
-                    "body": {"error": {"id": 1, "format": text, "showUser": True}},
-                }
-            ).encode()
-            try:
-                _write_all(
-                    client_out,
-                    "Content-Length: {}\r\n\r\n".format(len(body)).encode() + body,
-                )
-            except OSError:
-                pass
+    if _client_fds is None:
+        # hermit-dap.rs could not duplicate its streams and has said so on its
+        # own stderr. GDB's stderr is the only remaining route; it may not
+        # reach the client, but it is all there is.
+        gdb.write(text + "\n", gdb.STDERR)
+        os._exit(1)
+    client_in, client_out, client_err = _client_fds
+    try:
+        _write_all(client_err, (text + "\n").encode())
+    except OSError:
+        pass
+    request = None
+    try:
+        for incoming in _read_client_messages(client_in, _REFUSAL_REQUEST_TIMEOUT):
+            if incoming is None or incoming.get("type") == "request":
+                request = incoming
+                break
+    except OSError:
+        request = None
+    if request is not None:
+        reply = {
+            "seq": 1,
+            "type": "response",
+            "request_seq": request.get("seq", 0),
+            "command": request.get("command", ""),
+            "success": False,
+            "message": text,
+            "body": {"error": {"id": 1, "format": text, "showUser": True}},
+        }
+    else:
+        reply = {
+            "seq": 1,
+            "type": "event",
+            "event": "output",
+            "body": {"category": "important", "output": text + "\n"},
+        }
+    try:
+        _write_message(client_out, reply)
+    except OSError:
+        pass
     os._exit(1)
 
 
@@ -215,6 +240,19 @@ def _recording():
     return not _suppress_events or _advancing
 
 
+def _stack_pointer():
+    # The stopped thread's stack pointer: the frame identity of a history
+    # entry. A deterministic replay reaches the same execution point with the
+    # same stack pointer every time, and two activations of one function at
+    # different call depths (recursion) never share it. Two passes of a loop
+    # in one activation do share it, so it catches a rewind that lands in the
+    # wrong frame, not one that lands in the wrong pass of the same frame.
+    try:
+        return int(gdb.newest_frame().read_register("sp"))
+    except (gdb.error, AttributeError, ValueError):
+        return None
+
+
 def _append_line(pc, file, line, thread_id):
     # One entry per arrival at a line address. Reverse requests count earlier
     # entries with the same pc to choose which hit of a temporary breakpoint
@@ -222,6 +260,7 @@ def _append_line(pc, file, line, thread_id):
     _history.append(
         {
             "pc": pc,
+            "sp": _stack_pointer(),
             "file": os.path.realpath(file),
             "line": line,
             "thread_id": thread_id,
@@ -299,6 +338,7 @@ class _StopAddressBreakpoint(gdb.Breakpoint):
             if int(gdb.newest_frame().pc()) == self.pc:
                 position = _source_position(None) or {
                     "pc": self.pc,
+                    "sp": _stack_pointer(),
                     "file": None,
                     "line": 0,
                     "thread_id": gdb.selected_thread().global_num,
@@ -370,6 +410,7 @@ def _source_position(event):
             ]
         return {
             "pc": int(frame.pc()),
+            "sp": _stack_pointer(),
             "file": os.path.realpath(sal.symtab.fullname()),
             "line": sal.line,
             "thread_id": gdb.selected_thread().global_num,
@@ -496,8 +537,18 @@ def _restart_replay():
     frames._clear_frame_ids(None)
 
 
-def _run_to(pc, occurrence):
-    # Continue the replay to the OCCURRENCE-th arrival at PC since it started.
+class _WrongFrame(Exception):
+    # A rewind stopped at the right address but in another frame than the
+    # history entry it was aiming for, so the arrival count it relied on was
+    # wrong. Reported to the client as an error instead of a stop at the
+    # wrong time.
+    pass
+
+
+def _run_to(pc, occurrence, sp=None):
+    # Continue the replay to the OCCURRENCE-th arrival at PC since it started,
+    # and check that it stopped in the frame whose stack pointer is SP (when
+    # SP is known).
     target = gdb.Breakpoint(
         "*{:#x}".format(pc),
         type=gdb.BP_BREAKPOINT,
@@ -509,6 +560,17 @@ def _run_to(pc, occurrence):
         gdb.execute("continue", from_tty=False, to_string=True)
         if int(gdb.newest_frame().pc()) != pc:
             raise gdb.error("replay did not stop at the requested source position")
+        landed = _stack_pointer()
+        if sp is not None and landed != sp:
+            raise _WrongFrame(
+                "arrival {} at {:#x} has stack pointer {}, but the history entry "
+                "was recorded with {:#x}".format(
+                    occurrence,
+                    pc,
+                    "unknown" if landed is None else "{:#x}".format(landed),
+                    sp,
+                )
+            )
     finally:
         if target.is_valid():
             target.delete()
@@ -532,7 +594,8 @@ class _ArrivalCounter(gdb.Breakpoint):
 
 def _count_arrivals(pc, marker):
     # Restart the replay and count its arrivals at PC before it reaches
-    # MARKER, a (pc, occurrence) pair, or before it exits when MARKER is None.
+    # MARKER, a (pc, occurrence, sp) triple, or before it exits when MARKER is
+    # None.
     global _suppress_events
 
     disabled_breakpoints = []
@@ -597,13 +660,23 @@ def _line_entry_after(index):
     )
 
 
-def _occurrence(index):
+def _occurrence(index, advance=True):
     # Which arrival at its pc, counted from the start of the replay, the
-    # history entry at INDEX is.
+    # history entry at INDEX is. ADVANCE=False refuses to run the live replay
+    # forward (below), for when the live replay is not where the history
+    # ends.
     entry = _history[index]
     pc = entry["pc"]
     if _arrival_leader(pc) is not None:
-        # A line breakpoint records every arrival at a line address.
+        # A line breakpoint is meant to record every arrival at a line
+        # address, but it can miss one. Reverie's gdbstub (pinned d8c16b6)
+        # saves and restores a whole 8-byte word for each software
+        # breakpoint, so removing one breakpoint, as GDB does to step over it,
+        # can erase the int3 of a line breakpoint up to 7 bytes after it for
+        # the rest of that resume. Measured: a stepOut from a recursive call's
+        # return address skips the caller's closing line. The count is then
+        # short, and _run_to's stack pointer check turns the wrong landing it
+        # causes into an error.
         return sum(1 for earlier in _history[: index + 1] if earlier["pc"] == pc)
 
     # No line breakpoint covers PC: the history holds the arrival the client
@@ -616,6 +689,8 @@ def _occurrence(index):
     # would also count the arrivals after the current position, which the
     # history does not hold.
     marker_index = _line_entry_after(index)
+    if marker_index is None and not advance:
+        raise gdb.error("no later source line to count arrivals against")
     alive = True
     for _ in range(_ADVANCE_LIMIT):
         if marker_index is not None or not alive:
@@ -630,7 +705,9 @@ def _occurrence(index):
         later = _history[index + 1 :]
     else:
         marker = _history[marker_index]
-        arrivals = _count_arrivals(pc, (marker["pc"], _occurrence(marker_index)))
+        arrivals = _count_arrivals(
+            pc, (marker["pc"], _occurrence(marker_index), marker.get("sp"))
+        )
         later = _history[index + 1 : marker_index]
     occurrence = arrivals - sum(1 for entry_after in later if entry_after["pc"] == pc)
     if occurrence < 1:
@@ -638,18 +715,20 @@ def _occurrence(index):
     return occurrence
 
 
-def _rewind(target_index, reason, breakpoint_ids=None):
+def _rewind(target_index, reason, breakpoint_ids=None, occurrence=None):
     # Restart the replay and stop it where the history entry at TARGET_INDEX
-    # was, or at the replay's entry when TARGET_INDEX is negative. Returns the
-    # body of the stopped event.
+    # was, or at the replay's entry when TARGET_INDEX is negative. OCCURRENCE
+    # is the entry's arrival count when the caller has it already. Returns the
+    # body of the stopped event. Raises _WrongFrame, with the history left
+    # alone, when the replay stops in another frame than the entry's.
     global _last_stopped
     global _suppress_events
 
     position = None
-    occurrence = 0
     if target_index >= 0:
         position = _history[target_index]
-        occurrence = _occurrence(target_index)
+        if occurrence is None:
+            occurrence = _occurrence(target_index)
     disabled_breakpoints = []
     _last_stopped = None
     _suppress_events = True
@@ -659,7 +738,7 @@ def _rewind(target_index, reason, breakpoint_ids=None):
             breakpoint.enabled = False
         _restart_replay()
         if position is not None:
-            _run_to(position["pc"], occurrence)
+            _run_to(position["pc"], occurrence, position.get("sp"))
 
         body = dict(_last_stopped or {})
         body["reason"] = reason
@@ -681,6 +760,43 @@ def _rewind(target_index, reason, breakpoint_ids=None):
     return body
 
 
+class _StayedAtCurrentStop(Exception):
+    # A reverse request could not reach its target exactly and put the replay
+    # back at the client's current stop. BODY is the stopped event for that
+    # stop: the restart invalidated the client's frame ids.
+    def __init__(self, message, body):
+        super().__init__(message)
+        self.body = body
+
+
+def _rewind_or_stay(target_index, reason, breakpoint_ids=None):
+    # _rewind, except that when the replay lands in the wrong frame it is put
+    # back at the client's current stop, the last history entry, and the
+    # request fails with _StayedAtCurrentStop instead of reporting a stop at
+    # the wrong time.
+    current_index = len(_history) - 1
+    try:
+        return _rewind(target_index, reason, breakpoint_ids)
+    except _WrongFrame as wrong:
+        problem = str(wrong)
+    if current_index < 0:
+        raise gdb.error("the rewind landed in the wrong frame: " + problem)
+    # The live replay is now somewhere else, so counting the current stop's
+    # arrival must not run it forward. Entries after CURRENT_INDEX that the
+    # count above recorded came from the real path and may be used.
+    occurrence = _occurrence(current_index, advance=False)
+    body = _rewind(current_index, "step", None, occurrence)
+    body["description"] = "Returned to the current stop"
+    raise _StayedAtCurrentStop(
+        "Hermit could not reach the earlier stop exactly, so the replay stays "
+        "at the current stop ({}). See "
+        "https://github.com/rrnewton/hermit/pull/3545 for the known cause.".format(
+            problem
+        ),
+        body,
+    )
+
+
 def _report_reverse_failure(operation, error):
     server.send_event(
         "output",
@@ -690,6 +806,34 @@ def _report_reverse_failure(operation, error):
         },
     )
     server.send_event("terminated")
+
+
+def _reverse_request(operation, run):
+    # Run a reverse request's rewind on GDB's thread while the request is still
+    # in flight, so that a failure becomes the request's failed response. The
+    # request is registered with defer_events=False: the events of the replay
+    # restart must reach _send_event while _suppress_events still hides them,
+    # not after the response. The stopped event goes out after the response.
+    # The delayed functions bind their values as default arguments: Python
+    # deletes an except clause's "as" name when the clause ends, before the
+    # delayed function runs.
+    try:
+        body = server.send_gdb_with_response(run)
+    except _StayedAtCurrentStop as stayed:
+        server.call_function_later(
+            lambda body=stayed.body: server.send_event("stopped", body)
+        )
+        raise DAPException(str(stayed))
+    except DAPException:
+        # Raised before the replay was touched (bad arguments).
+        raise
+    except BaseException as error:
+        # The replay is in an unknown state: end the session.
+        server.call_function_later(
+            lambda error=error: _report_reverse_failure(operation, error)
+        )
+        raise
+    server.call_function_later(lambda: server.send_event("stopped", body))
 
 
 def _step_back(thread_id, granularity):
@@ -702,24 +846,17 @@ def _step_back(thread_id, granularity):
         if position["thread_id"] == thread_id and not position["counted"]
     ]
     target_index = matching[-2] if len(matching) >= 2 else -1
-    server.send_event("stopped", _rewind(target_index, "step"))
+    return _rewind_or_stay(target_index, "step")
 
 
 @capability("supportsStepBack")
-@request("stepBack", on_dap_thread=True)
+@request("stepBack", on_dap_thread=True, defer_events=False)
 def step_back(
     *, threadId: int, singleThread: bool = False, granularity: str = "statement", **args
 ):
     if singleThread:
         raise DAPException("Hermit reverse execution restarts the whole replay")
-
-    def run():
-        try:
-            _step_back(threadId, granularity)
-        except Exception as error:
-            _report_reverse_failure("stepBack", error)
-
-    server.call_function_later(lambda: server.send_gdb(run))
+    _reverse_request("stepBack", lambda: _step_back(threadId, granularity))
 
 
 def _visible_breakpoints_by_pc():
@@ -749,26 +886,17 @@ def _reverse_continue(thread_id):
         -1,
     )
     if target_index >= 0:
-        body = _rewind(
+        return _rewind_or_stay(
             target_index, "breakpoint", breakpoints[_history[target_index]["pc"]]
         )
-    else:
-        body = _rewind(target_index, "entry")
-    server.send_event("stopped", body)
+    return _rewind_or_stay(target_index, "entry")
 
 
-@request("reverseContinue", on_dap_thread=True)
+@request("reverseContinue", on_dap_thread=True, defer_events=False)
 def reverse_continue(*, threadId: int, singleThread: bool = False, **args):
     if singleThread:
         raise DAPException("Hermit reverse execution restarts the whole replay")
-
-    def run():
-        try:
-            _reverse_continue(threadId)
-        except Exception as error:
-            _report_reverse_failure("reverseContinue", error)
-
-    server.call_function_later(lambda: server.send_gdb(run))
+    _reverse_request("reverseContinue", lambda: _reverse_continue(threadId))
 
 
 def _kill_replay_for_disconnect():

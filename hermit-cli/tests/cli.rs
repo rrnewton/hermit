@@ -7047,6 +7047,12 @@ fn hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording() {
 /// readelf. The PATH case runs first: if the real GDB is itself refused, the
 /// test skips like the other replay tests (or fails under
 /// `HERMIT_REQUIRE_DAP_GDB`).
+///
+/// The PATH refusal is then driven twice more with a client whose first
+/// message is not a request: a framed event before `initialize` (skipped, so
+/// `initialize` still gets the failed response), and a header block with no
+/// Content-Length, which cannot be framed and so gets the refusal as an
+/// `output` event instead of nothing.
 #[test]
 fn hermit_dap_replay_refusal_reaches_the_client() {
     const TEST: &str = "hermit_dap_replay_refusal_reaches_the_client";
@@ -7129,6 +7135,64 @@ fn hermit_dap_replay_refusal_reaches_the_client() {
     }
     let status = dap.exit_status(DAP_TIMEOUT);
     if status.success() || !dap.adapter_stderr().contains(&refusal) {
+        dap.fail(&format!(
+            "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
+        ));
+    }
+
+    let no_readelf = |stderr: &str| {
+        let mut adapter = dap_replay_adapter(
+            hermit_dap,
+            &gdb,
+            "no-such-recording",
+            &data_dir,
+            unused_local_port(),
+        );
+        adapter.env("PATH", &empty_path);
+        DapClient::spawn(adapter, work.path().join(stderr))
+    };
+
+    let mut dap = no_readelf("event-first.stderr");
+    let event = r#"{"seq":1,"type":"event","event":"hermitTestNotARequest"}"#;
+    let sent = write!(dap.stdin, "Content-Length: {}\r\n\r\n{event}", event.len())
+        .and_then(|()| dap.stdin.flush());
+    if let Err(error) = sent {
+        dap.fail(&format!("could not send the leading event: {error}"));
+    }
+    dap.next_seq = 1;
+    let response = dap.initialize_response();
+    if response["success"] != false
+        || !response["message"]
+            .as_str()
+            .is_some_and(|text| text.contains(&message))
+    {
+        dap.fail(&format!(
+            "after a leading event, initialize must still get the refusal: {response}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() {
+        dap.fail(&format!("the refused adapter must exit nonzero ({status})"));
+    }
+
+    let mut dap = no_readelf("no-content-length.stderr");
+    let sent = write!(dap.stdin, "X-Not-Dap: 1\r\n\r\n{{}}").and_then(|()| dap.stdin.flush());
+    if let Err(error) = sent {
+        dap.fail(&format!("could not send the unframed header: {error}"));
+    }
+    let output = dap.wait_for("the refusal as an output event", DAP_TIMEOUT, |incoming| {
+        incoming["type"] == "event" && incoming["event"] == "output"
+    });
+    if !output["body"]["output"]
+        .as_str()
+        .is_some_and(|text| text.contains(&message))
+    {
+        dap.fail(&format!(
+            "an unframed first message must get the refusal as output: {output}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() || !dap.adapter_stderr().contains(&message) {
         dap.fail(&format!(
             "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
         ));
@@ -7367,6 +7431,320 @@ fn hermit_dap_replay_steps_back_through_repeated_and_shared_addresses() {
         ],
         ("x", "1"),
     );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// The recursive guest of the stepBack test below. `depth(3)` recurses to
+/// `depth(0)`; line 5 holds the recursive call and its return address.
+const DAP_RECURSION_SOURCE: &str = r#"#include <stdio.h>
+
+static int depth(int n) {
+  if (n == 0) return 0;
+  int r = depth(n - 1);
+  return r + 1;
+}
+
+int main(void) {
+  int d = depth(3);
+  printf("d=%d\n", d);
+  return 0;
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TEST BELOW ARE THIS LAYOUT: 4 is the base case,
+// 5 the recursive call, 6 `return r + 1;`, 7 the closing brace, 10 main's call.
+
+/// stepBack in recursion must land in the right activation or fail the
+/// request; it must never report a stop in another activation as the previous
+/// step.
+///
+/// Stopped in `depth(0)`, two stepOuts reach `depth(2)` at the recursive
+/// call's return address, and three nexts walk lines 6 and 7 of `depth(2)` to
+/// line 6 of `depth(3)`. The previous stop is line 7 of `depth(2)`.
+///
+/// The second stepOut starts at the return address it also targets, and GDB
+/// steps over a line breakpoint on the way. Reverie's gdbstub (pinned
+/// d8c16b6) restores a whole 8-byte word when it removes a software
+/// breakpoint, which erases the line-7 breakpoint 6 bytes further on for the
+/// rest of that stepOut, so the history misses `depth(1)`'s line 7. Counting
+/// arrivals at line 7 then picks `depth(1)`'s: measured before the frame
+/// check, stepBack reported a `step` stop at line 7 with n = 1 and four
+/// frames. With the frame check the request fails, the replay is put back at
+/// the current stop, and a `next` from there still works. With the Reverie
+/// fix (restore one byte), the history is complete and stepBack lands
+/// exactly; measured with a locally patched Reverie, the first branch below
+/// passes. Either branch proves the property; a stop in the wrong
+/// activation fails both.
+#[test]
+fn hermit_dap_replay_step_back_in_recursion_lands_exactly_or_refuses() {
+    const TEST: &str = "hermit_dap_replay_step_back_in_recursion_lands_exactly_or_refuses";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_compile(work.path(), "recursion", DAP_RECURSION_SOURCE);
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "d=3");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+
+    for n in ["3", "2", "1", "0"] {
+        let what = format!("the base-case check with n = {n}");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(
+            &what,
+            &stop,
+            &thread,
+            "breakpoint",
+            &[("depth", 4)],
+            ("n", n),
+        );
+    }
+    let what = "stepOut into depth(1)";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 5), ("depth", 5), ("depth", 5), ("main", 10)],
+        ("n", "1"),
+    );
+    let what = "stepOut into depth(2)";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 5), ("depth", 5), ("main", 10)],
+        ("n", "2"),
+    );
+    // (what, expected frames, expected n) for each `next`.
+    type Frames<'a> = &'a [(&'a str, u64)];
+    let walk: [(&str, Frames<'_>, &str); 3] = [
+        (
+            "next to line 6 of depth(2)",
+            &[("depth", 6), ("depth", 5), ("main", 10)],
+            "2",
+        ),
+        (
+            "next to line 7 of depth(2)",
+            &[("depth", 7), ("depth", 5), ("main", 10)],
+            "2",
+        ),
+        (
+            "next to line 6 of depth(3)",
+            &[("depth", 6), ("main", 10)],
+            "3",
+        ),
+    ];
+    for (what, frames, n) in walk {
+        let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+        dap.assert_stop(what, &stop, &thread, "step", frames, ("n", n));
+    }
+
+    let what = "stepBack to line 7 of depth(2)";
+    let seq = dap.request("stepBack", serde_json::json!({"threadId": thread}));
+    let response = dap.wait_for("the stepBack response", DAP_REVERSE_TIMEOUT, |message| {
+        message["type"] == "response" && message["request_seq"] == seq
+    });
+    let stop = dap.stopped(what, DAP_REVERSE_TIMEOUT);
+    if response["success"] == true {
+        dap.assert_stop(
+            what,
+            &stop,
+            &thread,
+            "step",
+            &[("depth", 7), ("depth", 5), ("main", 10)],
+            ("n", "2"),
+        );
+    } else {
+        if !response["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("could not reach the earlier stop exactly"))
+        {
+            dap.fail(&format!(
+                "a failed stepBack must say it could not land exactly: {response}"
+            ));
+        }
+        let at_current = [("depth", 6), ("main", 10)];
+        let what = "the current stop after the refused stepBack";
+        dap.assert_stop(what, &stop, &thread, "step", &at_current, ("n", "3"));
+        let what = "next to line 7 of depth(3) after the refused stepBack";
+        let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+        dap.assert_stop(
+            what,
+            &stop,
+            &thread,
+            "step",
+            &[("depth", 7), ("main", 10)],
+            ("n", "3"),
+        );
+    }
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// The guest of the one-line-loop stepBack test below: a loop on one source
+/// line whose body calls `sq`, which is linked from an object without debug
+/// information.
+const DAP_ONE_LINE_LOOP_SOURCE: &str = r#"#include <stdio.h>
+int sq(int x);
+int main(void) {
+  int total = 0;
+  for (int i = 0; i < 3; i++) total += sq(i);
+  printf("total=%d\n", total);
+  return 0;
+}
+"#;
+/// The loop's line in [`DAP_ONE_LINE_LOOP_SOURCE`].
+const DAP_ONE_LINE_LOOP_LINE: u64 = 5;
+/// The `printf` line in [`DAP_ONE_LINE_LOOP_SOURCE`].
+const DAP_ONE_LINE_LOOP_PRINT_LINE: u64 = 6;
+
+/// stepBack from after a one-line loop must return to the pass where the
+/// client stopped, not to a later pass of the same address.
+///
+/// The client stops in `sq` for i = 0, steps out to the return address in the
+/// loop's line, then continues to line 6. The replay passes that return
+/// address twice more (i = 1 and i = 2) without stopping, and no line
+/// breakpoint covers it, so only the stop-address breakpoint records those
+/// passes. stepBack goes to the previous stop the client saw: i = 0, with
+/// total still 0. Without the stop-address breakpoint, without the
+/// subtraction of the passes it recorded, or with stepBack targeting one of
+/// those recorded passes, it lands at i = 2 with total = 1.
+#[test]
+fn hermit_dap_replay_step_back_skips_later_passes_of_a_one_line_loop() {
+    const TEST: &str = "hermit_dap_replay_step_back_skips_later_passes_of_a_one_line_loop";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let sq = work.path().join("sq.c");
+    fs::write(&sq, "int sq(int x) { return x * x; }\n").expect("failed to write sq.c");
+    let sq_object = work.path().join("sq.o");
+    let output = Command::new("cc")
+        .args(["-O0", "-fno-pie", "-c"])
+        .arg(&sq)
+        .arg("-o")
+        .arg(&sq_object)
+        .output()
+        .expect("failed to run cc for sq.o");
+    assert!(
+        output.status.success(),
+        "compiling sq.c without debug information failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let source = work.path().join("oneline.c");
+    fs::write(&source, DAP_ONE_LINE_LOOP_SOURCE).expect("failed to write oneline.c");
+    let program = work.path().join("oneline");
+    let output = Command::new("cc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg(&sq_object)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to run cc for the one-line-loop guest");
+    assert!(
+        output.status.success(),
+        "compiling the one-line-loop guest failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "total=5");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_ONE_LINE_LOOP_PRINT_LINE,
+    );
+    let breakpoints = dap.call(
+        "setFunctionBreakpoints",
+        serde_json::json!({"breakpoints": [{"name": "sq"}]}),
+        DAP_TIMEOUT,
+    );
+    if breakpoints["body"]["breakpoints"][0]["verified"] != true {
+        dap.fail(&format!("the breakpoint on sq must resolve: {breakpoints}"));
+    }
+    let stop = dap.resume("continue", &thread, "the stop in sq", DAP_TIMEOUT);
+    if stop["reason"] != "function breakpoint" && stop["reason"] != "breakpoint" {
+        dap.fail(&format!("expected a breakpoint stop in sq, got {stop}"));
+    }
+    dap.call(
+        "setFunctionBreakpoints",
+        serde_json::json!({"breakpoints": []}),
+        DAP_TIMEOUT,
+    );
+    let in_loop = [("main", DAP_ONE_LINE_LOOP_LINE)];
+    let what = "stepOut of sq to the loop's first pass";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    // GDB reports a stepOut of a function without debug information with
+    // reason "stopped", not "step"; the position is what matters here.
+    let reason = stop["reason"].as_str().unwrap_or_default().to_owned();
+    dap.assert_stop(what, &stop, &thread, &reason, &in_loop, ("i", "0"));
+    let what = "the breakpoint after the loop";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "breakpoint",
+        &[("main", DAP_ONE_LINE_LOOP_PRINT_LINE)],
+        ("total", "5"),
+    );
+
+    let what = "stepBack to the loop's first pass";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &in_loop, ("i", "0"));
+    let trace = dap.call(
+        "stackTrace",
+        serde_json::json!({"threadId": thread}),
+        DAP_TIMEOUT,
+    );
+    let frame = trace["body"]["stackFrames"][0]["id"].clone();
+    let total = dap.call(
+        "evaluate",
+        serde_json::json!({"expression": "total", "frameId": frame, "context": "watch"}),
+        DAP_TIMEOUT,
+    );
+    if total["body"]["result"] != "0" {
+        dap.fail(&format!(
+            "{what}: expected total = 0 before the first pass adds to it, got {total}"
+        ));
+    }
 
     dap.call(
         "disconnect",
