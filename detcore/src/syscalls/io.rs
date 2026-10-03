@@ -677,7 +677,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
                                 break Err(Errno::ERESTARTNOHAND.into());
                             }
-                            Err(errno) => break Err(errno.into()),
+                            Err(error) => break Err(error),
                         }
                     } else if signaled {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
@@ -716,7 +716,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         break result.map_err(Into::into);
                     }
                     if let Some(signals) = signals.as_mut()
-                        && !signals.is_blocking()
+                        && signals.needs_block()
                         && let Err(error) = signals.block(guest, mask_cell).await
                     {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
@@ -932,7 +932,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 self.write_select_remaining(guest, call, deadline).await?;
                                 break Err(Errno::ERESTARTNOHAND.into());
                             }
-                            Err(errno) => break Err(errno.into()),
+                            Err(error) => break Err(error),
                         }
                     } else if signaled {
                         self.write_select_remaining(guest, call, deadline).await?;
@@ -970,7 +970,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         break result.map_err(Into::into);
                     }
                     if let Some(signals) = signals.as_mut()
-                        && !signals.is_blocking()
+                        && signals.needs_block()
                         && let Err(error) = signals.block(guest, mask_cell).await
                     {
                         self.write_select_remaining(guest, call, deadline).await?;
