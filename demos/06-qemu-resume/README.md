@@ -87,7 +87,7 @@ PASS: QEMU version matches (QEMU emulator version 10.1.2 (...))
 PASS: QEMU binary SHA-256 matches (...)
 PASS: qcow2 SHA-256 matches (9f2cc4675b3e641386c358d8ef8234e100ec829ad4de63577fb3e98cf8a79c66)
 PASS: guest output SHA-256 matches (42a2dfb7b01dab06b2fc0b36483d3f75aaa7d33d239a636b3ae2daf9b0f81f06)
-PASS: exact Hermit log matches first run after normalizing wallclock timestamps, host inode numbers, and env-dependent guest addresses
+PASS: Hermit INFO log matches first run exactly apart from the wall-clock prefix (Hermit-marked host addresses compared by first appearance)
 PASS: all repeat checks match the first run
 
 DETERMINISTIC: snapshot SHA-256 matches the previous run:
@@ -104,14 +104,17 @@ Elided (`...`): your Hermit version and path, the tail of Hermit's log, the
 QEMU package name and binary hash, and the per-run directory names (a
 timestamp and a process ID). The wall-clock times (`16.3s`) depend on host
 load; in a terminal the `Hermit/QEMU resume` counter updates in place until it
-reads `done`. The directory named `28ba533b...` is the SHA-256 of the command
-string `uname -a`. Your hashes and virtual times will match these only with the
-same QEMU build, kernel and demo 5 snapshot. As in demo 5, a saved reference
-run no longer applies after you rebuild Hermit, change QEMU or the kernel,
-replace demo 5's snapshot, edit `demos/lib/demo_common.py` or
-`demos/lib/qemu_controller.py`, or run the demo with a different Python
-interpreter: the interpreter that runs `run.py` is also the guest's controller
-program. Run `demos/clean.sh` to start over.
+reads `done`. The `PASS: Hermit INFO log` line is shown in the current
+comparator's wording; the capture printed an earlier comparator's wording. Its
+logs pass the current comparison too: they differed in no line once the
+wall-clock prefix was removed (see below). The directory named `28ba533b...`
+is the SHA-256 of the command string `uname -a`. Your hashes and virtual times
+will match these only with the same QEMU build, kernel and demo 5 snapshot. As
+in demo 5, a saved reference run no longer applies after you rebuild Hermit,
+change QEMU or the kernel, replace demo 5's snapshot, edit
+`demos/lib/demo_common.py` or `demos/lib/qemu_controller.py`, or run the demo
+with a different Python interpreter: the interpreter that runs `run.py` is also
+the guest's controller program. Run `demos/clean.sh` to start over.
 
 On 2026-09-30 six `uname -a` resumes ran: two in a first invocation in this
 checkout, one `make -C demos demo6`, one `make -C demos group3`, and two in a
