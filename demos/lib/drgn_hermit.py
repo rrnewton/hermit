@@ -1067,8 +1067,14 @@ class HermitGuestProgram:
         # so a reused pid is left alone.
         if self._process is not None and self._process.poll() is None:
             self._own_unrecorded_processes()
+        stopped = []  # type: List[str]
         survivors = []  # type: List[Tuple[str, int, int]]
         if self._owned_processes:
+            stopped = [
+                name
+                for name, pid, start_time in self._owned_processes
+                if _is_running(pid, start_time)
+            ]
             survivors = _kill_and_wait(self._owned_processes, OWNED_PROCESS_EXIT_SECONDS)
             self._owned_processes = survivors
             for name, pid, _ in survivors:
@@ -1118,7 +1124,7 @@ class HermitGuestProgram:
         ):
             self.qmp_socket.unlink(missing_ok=True)
         if failed:
-            self._report_failed_pass()
+            self._report_failed_pass(stopped)
         elif survivors:
             # A failed pass is already raising; this would replace its error.
             raise RuntimeError(
@@ -1152,8 +1158,12 @@ class HermitGuestProgram:
             if tracer_tgid is not None:
                 self._own_process("Hermit's tracer", tracer_tgid)
 
-    def _report_failed_pass(self) -> None:
-        """Print the end of a failed pass's Hermit log and remove its snapshot copy."""
+    def _report_failed_pass(self, stopped: Optional[List[str]] = None) -> None:
+        """Print the end of a failed pass's Hermit log and remove its snapshot copy.
+
+        ``stopped`` names the processes close() killed. Hermit logs the SIGKILL
+        of its tracer as its own failure, so the report says where it came from.
+        """
         if self.run_dir is None:
             return
         hermit_log = self.run_dir / "hermit.log"
@@ -1166,6 +1176,14 @@ class HermitGuestProgram:
             print("End of the failed pass's Hermit log, {}:".format(hermit_log), file=sys.stderr)
             for line in tail:
                 print("  " + line, file=sys.stderr)
+        if stopped:
+            print(
+                "The demo stopped {} with SIGKILL before reading the log; a SIGKILL that "
+                "the log reports is this cleanup, not the pass's failure.".format(
+                    " and ".join(stopped)
+                ),
+                file=sys.stderr,
+            )
         snapshot = self.run_dir / "snapshot.qcow2"
         try:
             size = snapshot.stat().st_size

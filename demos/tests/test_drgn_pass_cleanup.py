@@ -202,6 +202,8 @@ class FailedPassTest(_PassHarness):
         # QEMU's reason, the log's last line, is among them; older lines are not.
         self.assertIn("  " + self.LOG_LINES[-1], lines)
         self.assertNotIn("  " + self.LOG_LINES[-shown - 1], lines)
+        # Hermit had exited by itself, so the demo stopped nothing.
+        self.assertNotIn("SIGKILL", stderr)
 
     def test_a_failed_start_removes_the_snapshot_copy(self):
         artifact_dir = self.outside_tmp / "artifacts"
@@ -504,6 +506,13 @@ class LeftoverProcessTest(_PassHarness):
         self.assertTrue(marker.exists(), "the wrapper's own cleanup did not run")
         self.assertNotIn("still running", stderr)
 
+    # Hermit logs its tracer's SIGKILL as its own failure (container-child-exit),
+    # so a failed pass's report says that the demo sent it.
+    STOPPED_NOTE = (
+        "The demo stopped QEMU and Hermit's tracer with SIGKILL before reading the log; "
+        "a SIGKILL that the log reports is this cleanup, not the pass's failure."
+    )
+
     def test_a_pass_that_finishes_leaves_no_process(self):
         guest, stand_ins, marker, stderr = self._run_pass()
         self._assert_nothing_left(guest, stand_ins, marker, stderr)
@@ -514,6 +523,7 @@ class LeftoverProcessTest(_PassHarness):
         guest, stand_ins, marker, stderr = self._run_pass(body_error=error)
         self._assert_nothing_left(guest, stand_ins, marker, stderr)
         self.assertIn("Removed the failed pass's", stderr)
+        self.assertIn(self.STOPPED_NOTE, stderr)
 
     def test_a_pass_that_fails_before_qemu_is_found_leaves_no_process(self):
         # As in a pass whose QEMU hung under Hermit before it created its QMP
@@ -523,6 +533,7 @@ class LeftoverProcessTest(_PassHarness):
         self.assertIsNone(guest._qemu_pid)
         self._assert_nothing_left(guest, stand_ins, marker, stderr)
         self.assertIn("Removed the failed pass's", stderr)
+        self.assertIn(self.STOPPED_NOTE, stderr)
 
 
 class OwnedProcessKillTest(unittest.TestCase):
