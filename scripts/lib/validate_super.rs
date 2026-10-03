@@ -53,7 +53,8 @@ const SUPER_PROBE_JOBS_ENV: &str = "HERMIT_SUPER_STRESS_JOBS";
 const SUPER_PROBE_NODE_SLACK_S: i64 = 60;
 
 /// Memory cap for one probe node, all of its concurrent repetitions included.
-/// Measured 2026-10-02 on devbig030 with 20 repetitions at once, each Hermit
+/// Measured 2026-10-02 on the host recorded in docs/TESTING_ENVIRONMENTS.md
+/// under "Named measurement hosts", with 20 repetitions at once, each Hermit
 /// call in its own safehermit cgroup: the 20 per-repetition peaks summed to
 /// 1052, 1226 and 1433 MiB for the strict, pipeline and record probes (largest
 /// single repetition 73 MiB), so 4 GiB is 2.8 times the largest sum. The KVM
