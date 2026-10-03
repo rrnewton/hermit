@@ -5134,9 +5134,17 @@ mod tests {
         // Six earlier and three socket KVM verify enables add applicable, selectable and selected cells;
         // the full matrix still has the same 2252 candidate identities.
         // https://github.com/rrnewton/reverie/issues/891
+        // The poll-readiness KVM verify enable adds one more:
+        // https://github.com/rrnewton/reverie/issues/620
         assert_eq!(
             row(&counts.all),
-            (2252, 628 + 6 + 3, 527 + 6 + 3, 194 + 6 + 3, 177 + 6 + 3)
+            (
+                2252,
+                628 + 6 + 3 + 1,
+                527 + 6 + 3 + 1,
+                194 + 6 + 3 + 1,
+                177 + 6 + 3 + 1
+            )
         );
         let by_backend: Vec<_> = counts
             .by_backend
@@ -5149,7 +5157,13 @@ mod tests {
                 ("dbt", (563, 85, 26, 16, 2)),
                 (
                     "kvm",
-                    (563, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
+                    (
+                        563,
+                        250 + 6 + 3 + 1,
+                        243 + 6 + 3 + 1,
+                        77 + 6 + 3 + 1,
+                        76 + 6 + 3 + 1
+                    )
                 ),
                 ("liteinst", (563, 149, 146, 99, 98)),
                 ("sabre", (563, 144, 112, 2, 1)),

@@ -18,6 +18,8 @@
 # Six KVM verify cells were enabled after passing their unchanged probes:
 # https://github.com/rrnewton/reverie/issues/891
 # Their entries below follow the existing rule; this is no parity-pass claim.
+# So does poll-readiness's KVM entry, enabled for
+# https://github.com/rrnewton/reverie/issues/620.
 #
 # After editing this file, regenerate the snapshot with:
 #   cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write
@@ -158,7 +160,7 @@ cells:
   - test: c-programs/pipe2-flags
     backends: [kvm, liteinst]
   - test: c-programs/poll-readiness
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/prctl-identity
     backends: [dbt, kvm, liteinst]
   - test: c-programs/prctl-pdeathsig
