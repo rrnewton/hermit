@@ -74,10 +74,6 @@ fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>,
     }
 }
 
-fn replay_root(pid: Pid) -> Option<PathBuf> {
-    std::fs::canonicalize(format!("/proc/{}/root", pid.as_raw())).ok()
-}
-
 fn same_guest_open_file_description(
     pid: Pid,
     left: libc::c_int,
@@ -1329,10 +1325,16 @@ impl Replayer {
         if !metadata.file_type().is_dir() {
             return false;
         }
-        let Some(root) = replay_root(pid) else {
+        // Compare directory objects, not procfs link text. The guest may live in
+        // a mount namespace the replayer cannot name, such as a private tmpfs at
+        // `/test`, where the two link texts never share a prefix.
+        let (Ok(root), Ok(directory)) = (
+            crate::record_replay_path::open_process_root(pid),
+            crate::record_replay_path::open_process_directory_fd(pid, fd),
+        ) else {
             return false;
         };
-        std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(root))
+        crate::record_replay_path::directory_is_beneath(&root, &directory).unwrap_or(false)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1364,37 +1366,73 @@ impl Replayer {
         Ok(request)
     }
 
-    fn open_path_in_replay_root<G: Guest<Self>>(
+    /// Decides whether a recorded regular-file open names a file replay may
+    /// open for real: a file replay itself materialized, a file the open creates,
+    /// or, for `O_TMPFILE`, a directory. Resolution starts from descriptors for
+    /// the guest's root and base directory, so it sees the guest's mounts and
+    /// symlinks rather than the replayer's. An `O_CREAT` open first creates the
+    /// missing parent directories inside the replay root.
+    fn open_materializes_in_replay_root<G: Guest<Self>>(
         &self,
         guest: &G,
         dirfd: libc::c_int,
         path: &Path,
-    ) -> Option<PathBuf> {
-        let root = replay_root(guest.pid())?;
-
-        let candidate = if let Ok(relative) = path.strip_prefix(Path::new("/")) {
-            root.join(relative)
+        flags: OFlag,
+    ) -> bool {
+        let pid = guest.pid();
+        let Ok(root) = crate::record_replay_path::open_process_root(pid) else {
+            return false;
+        };
+        let start = if path.is_absolute() {
+            crate::record_replay_path::open_process_root(pid)
+        } else if dirfd == libc::AT_FDCWD {
+            crate::record_replay_path::open_process_cwd(pid)
         } else {
-            let base = if dirfd == libc::AT_FDCWD {
-                format!("/proc/{}/cwd", guest.pid().as_raw())
-            } else {
-                format!("/proc/{}/fd/{dirfd}", guest.pid().as_raw())
-            };
-            let base = std::fs::canonicalize(base).ok()?;
-            if !base.starts_with(&root) {
-                return None;
-            }
-            base.join(path)
+            crate::record_replay_path::open_process_directory_fd(pid, dirfd)
         };
-
-        let resolved = match std::fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(_) => {
-                let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
-                parent.join(candidate.file_name()?)
-            }
+        let Ok(start) = start else {
+            return false;
         };
-        resolved.starts_with(&root).then_some(resolved)
+        if !crate::record_replay_path::directory_is_beneath(&root, &start).unwrap_or(false) {
+            return false;
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if flags.contains(OFlag::O_CREAT)
+            && let Some(parent) = parent
+        {
+            let _ = crate::record_replay_path::ensure_directory_path_follow_final(
+                &root, &start, parent,
+            );
+        }
+        let metadata =
+            |object: &OwnedFd| std::fs::metadata(format!("/proc/self/fd/{}", object.as_raw_fd()));
+        match crate::record_replay_path::resolve_existing_path(&root, &start, path, false) {
+            Ok(resolved) => match metadata(&resolved.object) {
+                Ok(found) if flags.contains(OFlag::O_TMPFILE) => found.is_dir(),
+                Ok(found) if found.file_type().is_file() => {
+                    materialized_file_is_registered(pid, &found)
+                }
+                _ => false,
+            },
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOENT)
+                    && flags.contains(OFlag::O_CREAT)
+                    && !flags.contains(OFlag::O_TMPFILE) =>
+            {
+                // Only the final component may be missing.
+                match parent {
+                    None => true,
+                    Some(parent) => crate::record_replay_path::resolve_existing_path(
+                        &root, &start, parent, false,
+                    )
+                    .and_then(|resolved| metadata(&resolved.object))
+                    .is_ok_and(|found| found.is_dir()),
+                }
+            }
+            Err(_) => false,
+        }
     }
 
     fn materialize_recorded_directory<G: Guest<Self>>(
@@ -1456,40 +1494,16 @@ impl Replayer {
             let (dirfd, path, flags) = self.open_request(guest, syscall).unwrap_or_else(|error| {
                 panic!("could not decode successful recorded open: {error}")
             });
-            let candidate = (event.materialize == OpenMaterialization::RegularFile)
-                .then(|| self.open_path_in_replay_root(guest, dirfd, &path))
-                .flatten();
-            if let Some(candidate) = &candidate
-                && flags.contains(OFlag::O_CREAT)
-                && let Some(parent) = candidate.parent()
-            {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let materialize = if event.materialize == OpenMaterialization::Directory {
-                self.materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
+            let materialize = match event.materialize {
+                OpenMaterialization::Directory => self
+                    .materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
                     .unwrap_or_else(|error| {
                         panic!("failed to materialize recorded open directory: {error}")
-                    })
-            } else {
-                candidate.as_ref().is_some_and(|candidate| {
-                    if flags.contains(OFlag::O_TMPFILE) {
-                        return candidate.is_dir();
-                    }
-                    match (event.materialize, std::fs::metadata(candidate)) {
-                        (OpenMaterialization::RegularFile, Ok(metadata))
-                            if metadata.file_type().is_file() =>
-                        {
-                            materialized_file_is_registered(guest.pid(), &metadata)
-                        }
-                        (OpenMaterialization::RegularFile, Err(error))
-                            if error.kind() == std::io::ErrorKind::NotFound
-                                && flags.contains(OFlag::O_CREAT) =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    }
-                })
+                    }),
+                OpenMaterialization::RegularFile => {
+                    self.open_materializes_in_replay_root(guest, dirfd, &path, flags)
+                }
+                OpenMaterialization::None => false,
             };
             if materialize {
                 match guest.inject_with_retry(syscall).await {

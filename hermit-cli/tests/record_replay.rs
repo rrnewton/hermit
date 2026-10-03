@@ -225,6 +225,58 @@ fn public_record_replay_preserves_distinct_forked_child_streams() {
     assert_eq!(replay.stdout, recording.stdout);
 }
 
+/// `--mount=type=tmpfs` gives the guest a tmpfs in a mount namespace the
+/// replayer cannot name, as the E2E harness does for `/test`. Replay must
+/// decide what lies inside the guest root from directory objects rather than
+/// procfs link text. `rm -rf` removes entries relative to directory
+/// descriptors; replay used to skip those removals and then fail the final
+/// `rmdir` with ENOTEMPTY (https://github.com/rrnewton/hermit/issues/3592).
+#[test]
+fn record_replay_removes_a_tree_on_a_guest_private_tmpfs() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest tmpfs mountpoint");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!(
+            "--mount=type=tmpfs,target={}",
+            mountpoint.path().display()
+        ))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "mkdir -p w/sub/deeper && echo hi > w/sub/f && echo there > w/sub/deeper/g \
+             && rm -rf w && test ! -e w && echo removed",
+        ]);
+    let output = command_output(command, "record/replay of rm -rf on a guest tmpfs");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("removed\n"),
+        "the guest did not remove its tree:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+    assert!(
+        fs::read_dir(mountpoint.path())
+            .expect("read host view of the mountpoint")
+            .next()
+            .is_none(),
+        "the guest tmpfs leaked into the host mount namespace, so this test no \
+         longer separates the two namespaces"
+    );
+}
+
 #[test]
 fn public_record_replay_handles_a_deep_serial_fork_chain() {
     const INNER: &str = "HERMIT_DEEP_FORK_STREAM_RECORD_REPLAY_INNER";
