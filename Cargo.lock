@@ -525,6 +525,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "detcore-liteinst"
+version = "0.4.0"
+dependencies = [
+ "hermit-detcore",
+ "libc",
+ "reverie-liteinst",
+]
+
+[[package]]
 name = "detcore-model"
 version = "0.4.0"
 dependencies = [
