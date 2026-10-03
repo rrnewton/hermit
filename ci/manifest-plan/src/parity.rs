@@ -5466,7 +5466,8 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 3700);
+        // Four new c-programs tests add four cells each, one per non-ptrace backend.
+        assert_eq!(parsed.cells.len(), 3700 + 16);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
