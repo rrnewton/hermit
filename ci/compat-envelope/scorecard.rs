@@ -1488,6 +1488,13 @@ enum ValidateRowEvidence {
         result: Option<ObservedResult>,
         failures: BTreeMap<usize, ExpectedOutputFailure>,
     },
+    /// Every comparison attempt of a verify row that declares the stripped
+    /// comparator matched under the runner's stripped rule
+    /// (`require_stripped_comparison`). It is the pass the runner recorded,
+    /// at the schema-10 exit-and-stream-equality tier below canonical
+    /// comparison, so it carries no check identity and no INFO-message
+    /// counts and raises no canonical, bitwise or parity count.
+    StrippedMatched,
 }
 
 impl ValidateRowEvidence {
@@ -1503,7 +1510,12 @@ impl ValidateRowEvidence {
                 CheckIdentity::parity(report),
                 StampComparisonVerdict::Diverged,
             ),
-            Self::NotRun { .. } | Self::Unavailable { .. } | Self::ExpectedOutputFailed { .. } => {
+            // A stripped match names no complete canonical policy, so it
+            // cannot become a regression baseline.
+            Self::NotRun { .. }
+            | Self::Unavailable { .. }
+            | Self::ExpectedOutputFailed { .. }
+            | Self::StrippedMatched => {
                 return (None, None);
             }
         };
@@ -2688,6 +2700,7 @@ impl ResultRow {
         let mut right_info_messages = BTreeSet::new();
         let mut divergence_positions = Vec::new();
         let mut saw_canonical_match = false;
+        let mut saw_stripped_match = false;
         let mut saw_no_result = false;
         let mut saw_not_run = false;
         let mut unavailable = None;
@@ -2845,10 +2858,28 @@ impl ResultRow {
 
             match report.verdict {
                 canonical_verdict::Verdict::Matched | canonical_verdict::Verdict::Diverged => {
+                    // A verified match under the stripped comparison makes no
+                    // bitwise claim. It is the runner's pass for a row that
+                    // declares the stripped comparator, and nothing more: a
+                    // canonical match without bitwise parity stays refused
+                    // below as internally inconsistent.
+                    let stripped_match = report.verdict == canonical_verdict::Verdict::Matched
+                        && report.verified
+                        && !report.bitwise_parity
+                        && report.comparison.as_ref().is_some_and(|comparison| {
+                            comparison.strictness
+                                == canonical_verdict::LogCompareStrictness::Stripped
+                        });
                     match report.verdict {
                         canonical_verdict::Verdict::Matched
-                            if report.verified && report.bitwise_parity =>
+                            if (report.verified && report.bitwise_parity) || stripped_match =>
                         {
+                            if stripped_match && !self.declares_stripped_comparator() {
+                                return Err(format!(
+                                    "attempt {} stripped match report belongs to a row that does not declare the stripped comparator",
+                                    index + 1
+                                ));
+                            }
                             if !self.matched_attempt_passed(index, attempt, &report)? {
                                 if self.outcome == "PASS" {
                                     return Err(format!(
@@ -2976,6 +3007,22 @@ impl ResultRow {
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| format!("attempt {} has invalid shell_command", index + 1))?
                         .into();
+                    if stripped_match {
+                        // The runner's own stripped rule stands in for the
+                        // exact BitwiseInfoV1 policy check below. A report
+                        // that fails it earns no credit, as a canonical one
+                        // that fails that check earns none.
+                        match require_stripped_comparison(&report) {
+                            Ok(()) => saw_stripped_match = true,
+                            Err(error) => {
+                                unavailable.get_or_insert(format!(
+                                    "attempt {} cannot support a green result: {error}",
+                                    index + 1
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                     single.outcome = if report.verdict == canonical_verdict::Verdict::Matched {
                         "PASS".into()
                     } else {
@@ -3148,7 +3195,21 @@ impl ResultRow {
             }
         }
 
+        // One row is one comparator. A stripped match beside a canonical
+        // comparison is not evidence this file can rank.
+        if saw_stripped_match && (saw_canonical_match || !divergence_positions.is_empty()) {
+            return Err("row mixes stripped and canonical comparison attempts".into());
+        }
+
         if let Some(report) = self.backend_parity.as_ref() {
+            // A stripped operand makes no bitwise claim, so it cannot
+            // establish parity in either direction.
+            if saw_stripped_match {
+                return Err(
+                    "backend parity row has a stripped operand, which cannot establish parity"
+                        .into(),
+                );
+            }
             let candidate_backend = self
                 .backend
                 .as_deref()
@@ -3322,7 +3383,7 @@ impl ResultRow {
                 failures: expected_output_failures,
             });
         }
-        if saw_not_run && !saw_canonical_match {
+        if saw_not_run && !saw_canonical_match && !saw_stripped_match {
             return Ok(ValidateRowEvidence::NotRun {
                 reason: unavailable.clone().unwrap_or_else(|| {
                     "NO_RESULT: no attempt completed a canonical comparison".into()
@@ -3339,7 +3400,7 @@ impl ResultRow {
         if !DivergenceCoordinates::from_row(self).is_empty() {
             return Err("matched row carries a divergence coordinate".into());
         }
-        if !saw_canonical_match {
+        if !saw_canonical_match && !saw_stripped_match {
             return Ok(ValidateRowEvidence::Unavailable {
                 reason: "cell emitted no typed verification report".into(),
                 result: no_verdict_result,
@@ -3353,6 +3414,9 @@ impl ResultRow {
                 ),
                 result: no_verdict_result,
             });
+        }
+        if saw_stripped_match {
+            return Ok(ValidateRowEvidence::StrippedMatched);
         }
         Ok(ValidateRowEvidence::Matched {
             left_info_messages,
@@ -9801,7 +9865,9 @@ fn apply_pressure_summary(
 /// attention most.
 #[derive(Clone, Debug, Default)]
 struct ValidateFold {
-    /// Rows whose canonical comparison passed.
+    /// Rows whose comparison passed: a canonical match, or a stripped match on
+    /// a row that declares the stripped comparator. A stripped pass records no
+    /// canonical comparison, so it raises no canonical or parity count.
     passed: usize,
     /// Rows that carried at least one of the four divergence coordinates.
     located: usize,
@@ -10036,6 +10102,10 @@ fn apply_validate_results_from(
                     Some(report),
                     None,
                 ),
+                // The runner's pass, with no INFO-message comparison to fold.
+                ValidateRowEvidence::StrippedMatched => {
+                    (Some(ObservedResult::Pass), None, None, None)
+                }
                 ValidateRowEvidence::NotRun { reason, result }
                 | ValidateRowEvidence::Unavailable { reason, result } => {
                     (result, None, None, Some(reason))
@@ -16305,7 +16375,9 @@ fn read_retained_results(
                 continue;
             }
             match candidate.evidence(&id, ResultInput::Retained)? {
-                ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {
+                ValidateRowEvidence::Matched { .. }
+                | ValidateRowEvidence::Diverged { .. }
+                | ValidateRowEvidence::StrippedMatched => {
                     ordinary.push(candidate);
                 }
                 ValidateRowEvidence::ParityMatched { .. }
@@ -16381,7 +16453,9 @@ fn read_retained_results(
             | ValidateRowEvidence::ExpectedOutputFailed { .. } => {
                 continue;
             }
-            ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => false,
+            ValidateRowEvidence::Matched { .. }
+            | ValidateRowEvidence::Diverged { .. }
+            | ValidateRowEvidence::StrippedMatched => false,
             ValidateRowEvidence::ParityMatched { .. }
             | ValidateRowEvidence::ParityDiverged { .. } => true,
         };
@@ -32726,6 +32800,599 @@ mod post_verdict_transaction_tests {
         row
     }
 
+    /// The relaxation the runner records on a verify row that declares the
+    /// stripped comparator, as the compatibility corpus rows carry it.
+    pub(super) const STRIPPED_RELAXATION: &str = "comparator=stripped: The corpus verdict is Hermit's default --verify comparison (exit status, streams and stripped logs); it is below L2 and is never counted as bitwise parity";
+
+    /// The report the real Hermit wrote for `run --strict --verify
+    /// --base-env=minimal -- /bin/echo hermit-compat` at hermit d44bbbb79acd:
+    /// its default, stripped comparison. A copy of the runner's test-only
+    /// `PRODUCER_STRIPPED_REPORT`, which this file cannot import.
+    pub(super) const PRODUCER_STRIPPED_REPORT: &str = r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","no_result_reason":null,"infrastructure_error":null,"comparison":{"strictness":"stripped","display_name":"Stripped","compare_logs":true,"compare_io_buffers":true,"log_scope":"deterministic","record_envelope":"all_records_v1","virtualize_time":true,"strip_lines":true,"canonicalize_addresses":false,"full_trace":false,"exact_remainder":false,"stripped_prefixes":["real-wall-clock-prefix/v1","unsafe-numeric-address-and-path-normalization/v1"],"canonicalizations":[],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":243,"right":243},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0},"right":{"exit_code":0,"signal":null,"stdout_sha256":"26d1520b716304e2aab518cbf28242104d67fc9127d28c3de4193abe8aa87ba1","stdout_bytes":14,"stderr_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stderr_bytes":0}},"runtime":{"run1":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40},"run2":{"scheduler_turns":6,"virtual_nanoseconds":4126085,"syscalls":40}},"guest_exit_code":0,"guest_signal":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_left_message":null,"first_divergent_right_message":null}"#;
+
+    /// The refusal of a matched report that is neither a bitwise canonical
+    /// match nor a stripped one.
+    const INCONSISTENT_MATCH: &str = "attempt 1 typed match report is internally inconsistent";
+
+    /// `row` with `report` as its one attempt's verification report, the
+    /// report digest recomputed.
+    fn with_report(row: &JsonValue, report: &JsonValue) -> JsonValue {
+        let mut row = row.clone();
+        let report = serde_json::to_string(report).unwrap();
+        row["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        row["attempts"][0]["verification_report"] = report.into();
+        row
+    }
+
+    /// `row` with `edit` applied to its one attempt's verification report,
+    /// the report digest recomputed.
+    fn with_edited_report(row: &JsonValue, edit: &dyn Fn(&mut JsonValue)) -> JsonValue {
+        let mut report: JsonValue =
+            serde_json::from_str(row["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        edit(&mut report);
+        with_report(row, &report)
+    }
+
+    /// The runner's row for a compatibility-corpus verify cell that declares
+    /// the stripped comparator: its one attempt ran Hermit's default `--verify`
+    /// comparison, which matched, and passed. This is the shape of the rows
+    /// the write-back refused as internally inconsistent in
+    /// https://github.com/rrnewton/hermit/issues/3655.
+    fn stripped_row(measured: &str) -> (CellId, JsonValue) {
+        let id = CellId {
+            lane: "portable".into(),
+            category: "compat".into(),
+            test: "compat/addr2line".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        };
+        let mut row = result_row(measured);
+        for (key, value) in [
+            ("lane", &id.lane),
+            ("category", &id.category),
+            ("test", &id.test),
+            ("mode", &id.mode),
+            ("backend", &id.backend),
+        ] {
+            row[key] = value.clone().into();
+        }
+        let argv = vec!["hermit", "run", "--strict", "--verify", "--", "fixture"];
+        row["argv"] = serde_json::json!(argv);
+        row["effective_args"] = serde_json::json!(&argv[1..]);
+        row["shell_command"] = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        )
+        .into();
+        for key in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+            row["attempts"][0][key] = row[key].clone();
+        }
+        row["relaxations"] = serde_json::json!([STRIPPED_RELAXATION]);
+        let report: JsonValue = serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        (id, with_report(&row, &report))
+    }
+
+    /// The canonical `BitwiseInfoV1` report of the base fixture, under
+    /// verify's policy (virtual time): a bitwise match.
+    fn verify_canonical_report(measured: &str) -> JsonValue {
+        let mut report: JsonValue = serde_json::from_str(
+            result_row(measured)["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report["comparison"]["virtualize_time"] = true.into();
+        report
+    }
+
+    fn fold_depth() -> BTreeMap<String, SourceDepth> {
+        BTreeMap::from([(
+            "hermit".to_string(),
+            SourceDepth {
+                commits: 20,
+                first_parent: 20,
+            },
+        )])
+    }
+
+    /// The runner admits a stripped PASS on a verify row that declares the
+    /// stripped comparator (`require_stripped_comparison`); the compatibility
+    /// corpus is made of such rows. The scorecard credits the same pass and
+    /// nothing more: no canonical comparison, no parity comparison, no check
+    /// identity and no regression-baseline verdict. Drive it through the
+    /// validate fold and the production write-back beside a canonical sibling
+    /// that keeps all of those, and require the `verify-results` admission
+    /// gate to agree on both rows.
+    #[test]
+    fn a_declared_stripped_match_is_a_pass_that_raises_no_bitwise_count() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let sibling = fixture.row.clone();
+        let sibling_id = fixture.id.clone();
+        assert!(
+            fixture.cells().cells.iter().any(|cell| cell.id == id),
+            "the compatibility cell must be in the catalogue"
+        );
+        fixture.publish_rows(&[sibling, stripped]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        assert!(matches!(
+            candidates[&id][0].evidence(&id, ResultInput::Current),
+            Ok(ValidateRowEvidence::StrippedMatched)
+        ));
+        let check = |tracked: &TrackedCells, label: &str| {
+            let cell = |cell_id: &CellId| {
+                tracked
+                    .cells
+                    .iter()
+                    .find(|cell| &cell.id == cell_id)
+                    .unwrap()
+            };
+            let compat = cell(&id);
+            assert_eq!(
+                compat
+                    .observations
+                    .iter()
+                    .flat_map(|observation| observation.results.iter().copied())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([ObservedResult::Pass]),
+                "{label}: the stripped cell did not keep the runner's pass"
+            );
+            assert!(
+                compat
+                    .observations
+                    .iter()
+                    .any(|observation| observation.hermit_shas.contains(&measured)),
+                "{label}: the pass does not name the measured source"
+            );
+            assert!(
+                compat.observations.iter().all(|observation| {
+                    observation.canonical_comparisons.is_empty()
+                        && observation.backend_parity_comparisons.is_empty()
+                }),
+                "{label}: a stripped pass recorded a canonical or parity comparison"
+            );
+            let stamp = compat
+                .last_tested
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: the stripped cell is unstamped"));
+            assert_eq!(stamp.hermit_sha, measured, "{label}");
+            assert!(
+                stamp.check.is_none() && stamp.comparison_verdict.is_none(),
+                "{label}: a stripped pass became a regression baseline"
+            );
+            let canonical = cell(&sibling_id);
+            assert!(
+                canonical
+                    .observations
+                    .iter()
+                    .any(|observation| !observation.canonical_comparisons.is_empty()),
+                "{label}: the canonical sibling lost its canonical comparison"
+            );
+            assert_eq!(
+                canonical
+                    .last_tested
+                    .as_ref()
+                    .and_then(|stamp| stamp.comparison_verdict),
+                Some(StampComparisonVerdict::Matched),
+                "{label}: the canonical sibling lost its comparison verdict"
+            );
+        };
+        let mut tracked = fixture.cells();
+        let fold = apply_validate_results(
+            &mut tracked,
+            &candidates,
+            &measured,
+            "tree-1",
+            &fold_depth(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fold.passed, 2, "{:?}", fold.errored);
+        assert!(fold.reads_all_green(), "{fold:?}");
+        check(&tracked, "fold");
+        assert_eq!(
+            verify_candidate_set(
+                &BTreeSet::from([id.clone(), sibling_id.clone()]),
+                candidates
+            ),
+            Ok(CandidateAdmission {
+                passed: 2,
+                stripped: 1,
+                diagnostic_failures: Vec::new(),
+            })
+        );
+        fixture.publish().unwrap();
+        check(&fixture.cells(), "write-back");
+    }
+
+    /// The other arm, unchanged: a matched report under the canonical
+    /// comparator that claims no bitwise parity is internally inconsistent,
+    /// whether or not its row declares the stripped comparator. Both readers
+    /// refuse it, and the write-back refuses it and leaves history untouched.
+    #[test]
+    fn a_canonical_match_without_bitwise_parity_stays_refused() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let mut report = verify_canonical_report(&measured);
+        report["bitwise_parity"] = false.into();
+        let declared = with_report(&stripped, &report);
+        let mut undeclared = declared.clone();
+        undeclared["relaxations"] = serde_json::json!([]);
+        for (label, row) in [("declared stripped", declared), ("undeclared", undeclared)] {
+            fixture.publish_rows(std::slice::from_ref(&row));
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            let error = candidates[&id][0]
+                .evidence(&id, ResultInput::Current)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the report was admitted"));
+            assert!(error.contains(INCONSISTENT_MATCH), "{label}: {error}");
+            let error = verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+                .expect_err(&format!("{label}: verify-results admitted the report"));
+            assert!(
+                error.contains("cannot support a green result"),
+                "{label} verify-results: {error}"
+            );
+            let error = fixture.publish().unwrap_err();
+            assert!(error.contains(INCONSISTENT_MATCH), "{label}: {error}");
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "{label} changed history"
+            );
+        }
+    }
+
+    /// A stripped match is the runner's pass only on a row that declares the
+    /// stripped comparator with a reason. On any other row both readers
+    /// refuse it, and the write-back leaves history untouched.
+    #[test]
+    fn a_stripped_match_on_a_row_that_does_not_declare_it_is_refused() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        for (label, relaxations) in [
+            ("no declaration", serde_json::json!([])),
+            ("no reason", serde_json::json!(["comparator=stripped: "])),
+        ] {
+            let mut row = stripped.clone();
+            row["relaxations"] = relaxations;
+            fixture.publish_rows(std::slice::from_ref(&row));
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            let error = candidates[&id][0]
+                .evidence(&id, ResultInput::Current)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the stripped match was admitted"));
+            assert!(
+                error.contains(
+                    "attempt 1 stripped match report belongs to a row that does not declare the stripped comparator"
+                ),
+                "{label}: {error}"
+            );
+            let error = verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+                .expect_err(&format!("{label}: verify-results admitted the row"));
+            assert!(
+                error.contains("cannot support a green result"),
+                "{label} verify-results: {error}"
+            );
+            let error = fixture.publish().unwrap_err();
+            assert!(
+                error.contains("does not declare the stripped comparator"),
+                "{label}: {error}"
+            );
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "{label} changed history"
+            );
+        }
+    }
+
+    /// The runner's stripped rule is the whole of what a stripped pass proves,
+    /// so a stripped match that fails it earns no credit: a comparison without
+    /// virtual time, or over no events, is incomplete evidence. The fold keeps
+    /// the row as errored beside a sibling that still passes, and
+    /// `verify-results` refuses it with the runner's own reason.
+    #[test]
+    fn a_stripped_match_the_runners_rule_refuses_earns_no_credit() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let sibling = fixture.row.clone();
+        let sibling_id = fixture.id.clone();
+        for (label, row) in [
+            (
+                "real time",
+                with_edited_report(&stripped, &|report| {
+                    report["comparison"]["virtualize_time"] = false.into()
+                }),
+            ),
+            (
+                "no compared events",
+                with_edited_report(&stripped, &|report| {
+                    report["compared_log_messages"] = serde_json::json!({"left": 0, "right": 0})
+                }),
+            ),
+        ] {
+            fixture.publish_rows(&[sibling.clone(), row]);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            match candidates[&id][0].evidence(&id, ResultInput::Current) {
+                Ok(ValidateRowEvidence::Unavailable { reason, result }) => {
+                    assert!(
+                        reason.contains(
+                            "attempt 1 cannot support a green result: stripped verification did not compare non-vacuous stripped evidence"
+                        ),
+                        "{label}: {reason}"
+                    );
+                    assert_eq!(result, None, "{label}");
+                }
+                other => panic!("{label}: the incomplete stripped match was credited: {other:?}"),
+            }
+            let mut tracked = fixture.cells();
+            let fold = apply_validate_results(
+                &mut tracked,
+                &candidates,
+                &measured,
+                "tree-1",
+                &fold_depth(),
+                true,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{label}: the fold was aborted: {error}"));
+            assert_eq!(fold.passed, 1, "{label}: the sibling did not pass");
+            assert_eq!(fold.errored.len(), 1, "{label}: {:?}", fold.errored);
+            assert!(
+                fold.errored[0].contains(&display_id(&id)),
+                "{label}: {:?}",
+                fold.errored
+            );
+            let compat = tracked.cells.iter().find(|cell| cell.id == id).unwrap();
+            assert!(
+                compat
+                    .observations
+                    .iter()
+                    .all(|observation| !observation.results.contains(&ObservedResult::Pass)),
+                "{label}: the incomplete stripped match was credited as a pass"
+            );
+            let error = verify_candidate_set(
+                &BTreeSet::from([id.clone(), sibling_id.clone()]),
+                candidates,
+            )
+            .expect_err(&format!("{label}: verify-results admitted the row"));
+            assert!(
+                error.contains("cannot support a green result"),
+                "{label} verify-results: {error}"
+            );
+        }
+    }
+
+    /// A mixed write-back transaction: a stripped pass and a canonical match
+    /// from the same run, each with its series event, publish together. Each
+    /// cell keeps exactly one observation, because its series event is the
+    /// validate row's own and is represented rather than projected a second
+    /// time, and only the canonical cell carries a canonical comparison.
+    #[test]
+    fn a_transaction_publishes_a_stripped_pass_beside_a_canonical_match() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let sibling = fixture.row.clone();
+        let sibling_id = fixture.id.clone();
+        fixture.publish_rows(&[sibling, stripped.clone()]);
+        let event = |cell_id: &CellId, event_id: &str, comparison: Option<JsonValue>| {
+            let mut series = serde_json::json!({
+                "cell": series_cell_key(cell_id), "tree": measured, "outcome": "passed",
+                "result": "pass", "failure_class": null, "run_index": 1, "attempt": 1,
+                "num_runs": 1, "source_tree_dirty": false, "machine_shortname": "fixture",
+                "kernel_version": "fixture",
+                "host_capabilities": {
+                    "cpuid-faulting": {"present": false, "evidence": "synthetic fixture"},
+                    "kvm": {"present": false, "evidence": "synthetic fixture"}}
+            });
+            if let Some(comparison) = comparison {
+                series["comparison"] = comparison;
+            }
+            serde_json::json!({
+                "schema": "stress-series/v3", "event_id": event_id,
+                "event_type": "series.observation", "emitted_at": "2026-09-22T00:00:00Z",
+                "team": "hermit", "host": "fixture", "producer": "validate",
+                "run_id": stripped["run_id"], "series": series
+            })
+        };
+        publish_raw_snapshot(
+            &mut fixture,
+            &[
+                event(&sibling_id, "canonical-pass", None),
+                event(
+                    &id,
+                    "stripped-pass",
+                    Some(serde_json::json!({"strictness": "stripped", "bitwise_parity": false})),
+                ),
+            ],
+        )
+        .unwrap();
+        let published = fixture.cells();
+        let cell = |cell_id: &CellId| {
+            published
+                .cells
+                .iter()
+                .find(|cell| &cell.id == cell_id)
+                .unwrap()
+        };
+        let compat = cell(&id);
+        assert_eq!(compat.observations.len(), 1, "{:?}", compat.observations);
+        let observation = &compat.observations[0];
+        assert!(
+            observation.event_ids.is_empty() && observation.hermit_shas.contains(&measured),
+            "{observation:?}"
+        );
+        assert_eq!(observation.results, BTreeSet::from([ObservedResult::Pass]));
+        assert!(
+            observation.canonical_comparisons.is_empty()
+                && observation.backend_parity_comparisons.is_empty(),
+            "a stripped pass recorded a canonical or parity comparison"
+        );
+        let canonical = cell(&sibling_id);
+        assert_eq!(
+            canonical.observations.len(),
+            1,
+            "{:?}",
+            canonical.observations
+        );
+        assert!(!canonical.observations[0].canonical_comparisons.is_empty());
+    }
+
+    /// The two arms in one transaction: a stripped pass does not carry a
+    /// canonical match without bitwise parity through with it. The write-back
+    /// refuses the transaction, in either row order, as it refuses that report
+    /// alone, and history is unchanged.
+    #[test]
+    fn a_stripped_pass_does_not_carry_a_refused_canonical_match_through() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let refused = with_edited_report(&fixture.row, &|report| {
+            report["bitwise_parity"] = false.into()
+        });
+        let refused_id = fixture.id.clone();
+        for (label, rows) in [
+            ("refused first", [refused.clone(), stripped.clone()]),
+            ("stripped first", [stripped.clone(), refused.clone()]),
+        ] {
+            fixture.publish_rows(&rows);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            assert!(
+                matches!(
+                    candidates[&id][0].evidence(&id, ResultInput::Current),
+                    Ok(ValidateRowEvidence::StrippedMatched)
+                ),
+                "{label}"
+            );
+            let error = fixture.publish().unwrap_err();
+            assert!(
+                error.contains(INCONSISTENT_MATCH) && error.contains(&display_id(&refused_id)),
+                "{label}: {error}"
+            );
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "{label} changed history"
+            );
+        }
+    }
+
+    /// One row is one comparator: a row whose attempts hold a stripped match
+    /// and a canonical match, in either order, is refused rather than ranked,
+    /// and `verify-results` refuses it too.
+    #[test]
+    fn a_row_mixing_stripped_and_canonical_attempts_is_refused() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let canonical = with_report(&stripped, &verify_canonical_report(&measured));
+        let stripped_attempt = stripped["attempts"][0].clone();
+        let canonical_attempt = canonical["attempts"][0].clone();
+        for (label, first, second) in [
+            ("stripped first", &stripped_attempt, &canonical_attempt),
+            ("canonical first", &canonical_attempt, &stripped_attempt),
+        ] {
+            let mut row = stripped.clone();
+            let mut second = second.clone();
+            second["index"] = "2".into();
+            row["attempts"] = serde_json::json!([first, second]);
+            fixture.publish_rows(std::slice::from_ref(&row));
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            let error = candidates[&id][0]
+                .evidence(&id, ResultInput::Current)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the mixed row was admitted"));
+            assert!(
+                error.contains("row mixes stripped and canonical comparison attempts"),
+                "{label}: {error}"
+            );
+            let error = verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+                .expect_err(&format!("{label}: verify-results admitted the mixed row"));
+            assert!(
+                error.contains("cannot support a green result"),
+                "{label} verify-results: {error}"
+            );
+        }
+    }
+
+    /// The runner's red stays red under the stripped comparator: a nonzero
+    /// exit the row does not declare, after a stripped match, is the runner's
+    /// crash-error. The fold retains it beside a sibling that still passes,
+    /// and `verify-results` names it as non-passing.
+    #[test]
+    fn a_stripped_match_the_runner_failed_is_retained_red() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let sibling = fixture.row.clone();
+        let sibling_id = fixture.id.clone();
+        let mut failed = with_matched_exit(&stripped, 3);
+        failed["attempts"][0]["outcome"] = "FAIL".into();
+        failed["outcome"] = "FAIL".into();
+        failed["result"] = "crash-error".into();
+        failed["failure_class"] = "product_failure".into();
+        fixture.publish_rows(&[sibling, failed]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        match candidates[&id][0].evidence(&id, ResultInput::Current) {
+            Ok(ValidateRowEvidence::Unavailable { reason, result }) => {
+                assert!(
+                    reason.contains(
+                        "matched comparison belongs to an attempt the runner did not pass"
+                    ),
+                    "{reason}"
+                );
+                assert_eq!(result, Some(ObservedResult::CrashError));
+            }
+            other => panic!("the red was not retained: {other:?}"),
+        }
+        let mut tracked = fixture.cells();
+        let fold = apply_validate_results(
+            &mut tracked,
+            &candidates,
+            &measured,
+            "tree-1",
+            &fold_depth(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fold.passed, 1, "the sibling did not pass");
+        assert_eq!(fold.errored.len(), 1, "{:?}", fold.errored);
+        let results = tracked
+            .cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .unwrap()
+            .observations
+            .iter()
+            .flat_map(|observation| observation.results.iter().copied())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(results, BTreeSet::from([ObservedResult::CrashError]));
+        let error = verify_candidate_set(
+            &BTreeSet::from([id.clone(), sibling_id.clone()]),
+            candidates,
+        )
+        .expect_err("verify-results admitted the red");
+        assert!(
+            error.contains("0 missing, 1 non-passing") && error.contains(&display_id(&id)),
+            "{error}"
+        );
+    }
+
     /// A declared verify cell is an ordinary comparable cell whose series row
     /// retains the complete attempt audit, so the reason a nonzero guest exit
     /// passed outlives the transient raw run artifacts. Drive that audit
@@ -36154,6 +36821,36 @@ mod evidence_identity_tests {
         assert_ne!(
             changed.evidence_identity().unwrap(),
             "9193b921e05087f3768cab0a30625ab20f42b54731c0c5f2caffe2b157b67ee3"
+        );
+    }
+
+    /// A stripped comparison makes no bitwise claim, so a backend parity row
+    /// whose attempts and operands were compared that way cannot establish
+    /// parity, even on a row that declares the stripped comparator.
+    #[test]
+    fn a_stripped_operand_cannot_establish_backend_parity() {
+        let stripped: JsonValue =
+            serde_json::from_str(post_verdict_transaction_tests::PRODUCER_STRIPPED_REPORT).unwrap();
+        let report = serde_json::to_string(&stripped).unwrap();
+        let mut row = serde_json::to_value(parity()).unwrap();
+        for attempt in row["attempts"].as_array_mut().unwrap() {
+            attempt["verification_report_sha256"] =
+                format!("{:x}", Sha256::digest(report.as_bytes())).into();
+            attempt["verification_report"] = report.clone().into();
+        }
+        for operand in ["reference", "candidate"] {
+            row["backend_parity"][operand]["verification"] = stripped.clone();
+            row["backend_parity"][operand]["output"] = stripped["compared_outputs"]["left"].clone();
+        }
+        row["relaxations"] =
+            serde_json::json!([post_verdict_transaction_tests::STRIPPED_RELAXATION]);
+        let row: ResultRow = serde_json::from_value(row).unwrap();
+        let error = row.comparison_evidence().unwrap_err();
+        assert!(
+            error.contains(
+                "backend parity row has a stripped operand, which cannot establish parity"
+            ),
+            "{error}"
         );
     }
 
