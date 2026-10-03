@@ -5683,7 +5683,11 @@ sys.exit(1 if failed else 0)
         // Six earlier and three socket KVM verify candidates satisfy the unchanged selection rule.
         // https://github.com/rrnewton/reverie/issues/891
         // So does the poll-readiness KVM candidate: https://github.com/rrnewton/reverie/issues/620
-        assert_eq!((selection.len(), lines), (194 + 6 + 3 + 1, 194 + 6 + 3 + 1));
+        // The epoll-pwait2 candidate adds one: https://github.com/rrnewton/reverie/issues/905
+        assert_eq!(
+            (selection.len(), lines),
+            (194 + 6 + 3 + 1 + 1, 194 + 6 + 3 + 1 + 1)
+        );
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
             .iter()
@@ -5705,7 +5709,8 @@ sys.exit(1 if failed else 0)
             // The same six earlier and three socket cells are reported; four unreported cells stay fixed.
             // https://github.com/rrnewton/reverie/issues/891
             // The poll-readiness KVM cell is reported too: https://github.com/rrnewton/reverie/issues/620
-            (628 + 6 + 3 + 1, 624 + 6 + 3 + 1, 4),
+            // The epoll-pwait2 candidate is reported too: https://github.com/rrnewton/reverie/issues/905
+            (628 + 6 + 3 + 1 + 1, 624 + 6 + 3 + 1 + 1, 4),
             "{unreported:?}"
         );
     }
@@ -5750,7 +5755,8 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/reverie/issues/891
         // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
         // One poll-readiness selection: https://github.com/rrnewton/reverie/issues/620.
-        assert_eq!(kvm.len(), 244 + 6 + 3 + 1);
+        // One epoll-pwait2 selection: https://github.com/rrnewton/reverie/issues/905.
+        assert_eq!(kvm.len(), 244 + 6 + 3 + 1 + 1);
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))
