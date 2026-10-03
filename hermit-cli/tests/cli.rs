@@ -8109,7 +8109,8 @@ fn hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointe
 /// `h0` the two activations have 8 frames, and the newest 7 (`h0` to `h6`)
 /// have the same pc and stack pointer in both; only frame 7, `main`'s return
 /// address (line 26 against line 27), differs. Checked with `bt` and
-/// `gdb.Frame.read_register("sp")` in GDB 17.2 on devbig030.
+/// `gdb.Frame.read_register("sp")` in GDB 17.2 on the hermit-dap measurement
+/// host recorded in docs/TESTING_ENVIRONMENTS.md.
 const DAP_HELPER_CHAIN_SOURCE: &str = r#"#include <stdio.h>
 
 static int h0(int x) {
@@ -8681,8 +8682,9 @@ fn dap_deep_recursion_session(test: &str, depth: u32, bound: Duration) -> Option
 /// replay runs forward. Unwinding every frame for it made that cost the square
 /// of the stack depth, so the identity holds only the newest 8 frames. One
 /// `continue` from the attach stop to `bottom` passes about 2000 line
-/// arrivals at stack depths up to 1000. Measured on devbig030 with GDB 17.2
-/// and Reverie 4f125805, it took 2.51 s to 2.66 s in eight runs with 8
+/// arrivals at stack depths up to 1000. Measured on the hermit-dap measurement
+/// host recorded in docs/TESTING_ENVIRONMENTS.md with GDB 17.2 and Reverie
+/// 4f125805, it took 2.51 s to 2.66 s in eight runs with 8
 /// frames, and 63.45 s with every frame. The bound, 20 s (times
 /// `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER` when set), is 7.5 times the slowest
 /// capped run and 3.2 times under the uncapped one.
