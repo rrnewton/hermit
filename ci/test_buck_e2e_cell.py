@@ -42,7 +42,7 @@ SLUG = "c-programs-cpuid-probe-verify-dbt"
 
 # test-harness, for `run ... --results F --junit F --tpx-json F`: records its argv and
 # the environment cell.sh gives it, then writes one PASS row, its test_done and the
-# verify evidence a passing verify cell must return; FAKE_OUTCOME=FAIL writes a FAIL row and
+# verify evidence a passing verify cell must return (see FAKE_VERDICT); FAKE_OUTCOME=FAIL writes a FAIL row and
 # exits 1, as the harness does. HARNESS_ROOT_MAP maps a container
 # path prefix to the host directory behind it, the way the fake wrapper's mounts would.
 FAKE_HARNESS = r"""#!/usr/bin/env python3
@@ -88,10 +88,14 @@ with open(tpx, "w") as f:
 celldir = os.path.join(host(os.environ["E2E_RESULT_ROOT"]), "runs", os.environ["E2E_RUN_ID"],
                        os.environ["FAKE_SLUG"])
 os.makedirs(os.path.join(celldir, "verify-logs"), exist_ok=True)
+# Like hermit --keep-logs: a matched verify keeps only run 1's (golden) log, anything else
+# keeps both. FAKE_VERDICT overrides the verdict, FAKE_DETLOGS ("1", "2", "12" or "")
+# which logs survive.
+verdict = os.environ.get("FAKE_VERDICT", "matched")
 with open(os.path.join(celldir, "verify-1.json"), "w") as f:
-    f.write("{}\n")
-for n in (1, 2):
-    with open(os.path.join(celldir, "verify-logs", "run%d_log_detlog" % n), "w") as f:
+    f.write(json.dumps({"verdict": verdict}) + "\n")
+for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
+    with open(os.path.join(celldir, "verify-logs", "run%s_log_detlog" % n), "w") as f:
         f.write("detlog\n")
 sys.exit(0 if outcome == "PASS" else 1)
 """
@@ -369,6 +373,34 @@ class CellTest(unittest.TestCase):
         self.assertEqual(result["container"], "")
         self.assertEqual(result["empty_workdir"], "")
 
+
+    def assert_evidence(self, complete: bool, **env: str) -> None:
+        done, result = self.run_cell(**env)
+        details = json.loads(done["details"])
+        if complete:
+            self.assertEqual(done["status"], "passed", done)
+            self.assertTrue(result["evidence_complete"], result)
+        else:
+            self.assertEqual(done["status"], "failed", done)
+            self.assertEqual(details["outcome"], "ERROR")
+            self.assertIn("detlogs", details["reason"])
+            self.assertFalse(result["evidence_complete"], result)
+
+    def test_matched_verify_with_only_the_golden_log_is_complete(self) -> None:
+        self.assert_evidence(True)
+        self.assert_evidence(True, FAKE_VERDICT="matched", FAKE_DETLOGS="1")
+
+    def test_matched_verify_without_the_golden_log_is_an_error(self) -> None:
+        self.assert_evidence(False, FAKE_VERDICT="matched", FAKE_DETLOGS="2")
+        self.assert_evidence(False, FAKE_VERDICT="matched", FAKE_DETLOGS="")
+
+    def test_matched_verify_that_kept_both_logs_is_an_error(self) -> None:
+        # hermit deletes run 2's log after a match; finding it means the retention changed.
+        self.assert_evidence(False, FAKE_VERDICT="matched", FAKE_DETLOGS="12")
+
+    def test_unmatched_passing_verify_needs_both_logs(self) -> None:
+        self.assert_evidence(True, FAKE_VERDICT="diverged", FAKE_DETLOGS="12")
+        self.assert_evidence(False, FAKE_VERDICT="diverged", FAKE_DETLOGS="1")
 
 class _Anything:
     """Stand-in for Buck builtins defs.bzl names at load time but these tests never call."""
