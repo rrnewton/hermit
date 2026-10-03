@@ -31,12 +31,16 @@ demos/06-qemu-resume/run.py
 ```
 
 With no argument the guest runs `uname -a`. Pass any single-line shell command
-to run it inside the guest instead:
+of up to 511 bytes to run it inside the guest instead:
 
 ```bash
 demos/06-qemu-resume/run.py 'ls /'
 demos/06-qemu-resume/run.py 'cat /proc/meminfo | head -n 3'
 ```
+
+The guest reads only the first 512 bytes of the disk that carries its command,
+and the newline after the command has to fit in them too, so `run.py` refuses a
+longer command (counted in UTF-8 bytes) before it resumes anything.
 
 `make -C demos demo6` runs the default command, and
 `make -C demos demo6 DEMO6_COMMAND='ls /'` runs another simple one. Quote a
@@ -197,10 +201,10 @@ configuration as demo 5, plus an option to load the `hermit-boot` snapshot at
 start-up. The command travels to the guest on a small raw disk, `/dev/vda`,
 that demo 5 attached (holding `WAIT`) before it saved the snapshot. Before QEMU
 starts, the demo writes the command into that disk image. When the guest
-resumes, its `/init` loop reads the disk, finds a command instead of `WAIT`,
-and runs it between the `__HERMIT_COMMAND_BEGIN__` and `__HERMIT_COMMAND_END__`
-markers. The command is on disk before the guest runs, so nothing depends on
-when the host sends it. The controller ([`lib/qemu_controller.py`](../lib/qemu_controller.py))
+resumes, its `/init` loop reads the disk's first 512 bytes, finds a command
+instead of `WAIT`, and runs it between the `__HERMIT_COMMAND_BEGIN__` and
+`__HERMIT_COMMAND_END__` markers. The command is on disk before the guest runs,
+so nothing depends on when the host sends it. The controller ([`lib/qemu_controller.py`](../lib/qemu_controller.py))
 waits for the end marker and asks QEMU to save a snapshot named
 `command-<first 16 hex digits of the command's SHA-256>`.
 

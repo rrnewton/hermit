@@ -30,19 +30,28 @@ XZ_MAGIC = b"\xfd7zXZ\x00"
 ELF_MAGIC = b"\x7fELF"
 VMCOREINFO_MARKER = b"OSRELEASE="
 COMMAND_IMAGE_BYTES = 4096
+# The guest's init reads only the first 512 bytes of the command disk
+# (`dd bs=512 count=1` in demos/lib/qemu-assets.sh), so the command and the
+# newline that ends it must fit in those 512 bytes; a longer command would run
+# cut off at byte 512.
+GUEST_COMMAND_READ_BYTES = 512
+MAX_GUEST_COMMAND_BYTES = GUEST_COMMAND_READ_BYTES - 1
 
 
 def _write_command_image(path: Path, command: str) -> None:
     """Write the fixed-size command disk consumed by the resumed guest."""
     if "\n" in command or "\r" in command:
         raise ValueError("command-disk command must be one line")
-    payload = command.encode("utf-8") + b"\n"
-    if len(payload) > COMMAND_IMAGE_BYTES:
+    encoded = command.encode("utf-8")
+    if len(encoded) > MAX_GUEST_COMMAND_BYTES:
         raise ValueError(
-            "guest command is {} bytes, over the {}-byte image".format(
-                len(payload), COMMAND_IMAGE_BYTES
+            "guest command is {} bytes; the guest reads only the first {} bytes "
+            "of its command disk, so a command can be at most {} bytes (UTF-8) "
+            "plus the newline after it".format(
+                len(encoded), GUEST_COMMAND_READ_BYTES, MAX_GUEST_COMMAND_BYTES
             )
         )
+    payload = encoded + b"\n"
     path.write_bytes(payload + b"\0" * (COMMAND_IMAGE_BYTES - len(payload)))
 
 
