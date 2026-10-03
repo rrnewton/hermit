@@ -237,11 +237,6 @@ fn ensure_prepared_helpers(source: &Path, root: &Path, deadline: u64) {
         quoted(&bootstrap.join("producer.stdout")),
         quoted(&bootstrap.join("producer.stderr")),
     );
-    let cfg = DagConfig {
-        steps: vec![step],
-        ..Default::default()
-    };
-    fs::write(bootstrap.join("dag.json"), dag_to_json(&cfg)).unwrap();
     fs::write(
         bootstrap.join("mode.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -252,18 +247,102 @@ fn ensure_prepared_helpers(source: &Path, root: &Path, deadline: u64) {
         .unwrap(),
     )
     .unwrap();
+    run_preparation_step(&bootstrap, step, deadline);
+}
+
+/// Wall-clock cap of [`prepare_cpu_wrapper`]'s one Cargo build, in seconds.
+const CPU_WRAPPER_WALL_SECONDS: i64 = 600;
+/// CPU cap of the same build. It runs at one Cargo job, like the cases.
+const CPU_WRAPPER_CPU_SECONDS: i64 = 900;
+
+/// Build the standalone Nextest CPU wrapper once, before the timed cases, with
+/// the cases' own environment and private Cargo target directory.
+///
+/// Every case still runs `ci/run-nextest-counted.sh`, and its standalone path
+/// still invokes this same `build-cpu-wrapper` operation inside the case's
+/// 180-second cap. After this step that invocation is a Cargo freshness check
+/// of an up-to-date target. Without it, the first case compiled the
+/// `hermit-manifest-plan` package and its roughly 90 dependency crates from
+/// scratch at one job inside that cap. A GitHub-hosted runner was still
+/// compiling dependencies when the cap expired, in
+/// https://github.com/rrnewton/hermit/actions/runs/37134916002 and
+/// https://github.com/rrnewton/hermit/actions/runs/37126714210. That build is
+/// not the behaviour the cases measure, so it gets its own declared caps here,
+/// still inside the fixture deadline, instead of a longer case cap.
+fn prepare_cpu_wrapper(source: &Path, root: &Path, target: &Path, deadline: u64) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let prepare = root.join("cpu-wrapper");
+    fs::create_dir_all(prepare.join("tmp")).unwrap();
+    let command = format!(
+        "cd {} || exit $?; export PATH={}:\"$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT={}; \
+         export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
+         export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; set +e; \
+         {} --force {} build-cpu-wrapper >{} 2>{}; \
+         prepare_status=$?; cat {}; cat {} >&2; exit \"$prepare_status\"",
+        quoted(source),
+        quoted(&source.join("ci/rust-script-bin")),
+        quoted(&source.join("target/ci/rust-scripts")),
+        quoted(target),
+        quoted(&prepare.join("tmp")),
+        quoted(&source.join("ci/rust-script-bin/rust-script")),
+        quoted(&source.join("ci/nextest-binaries.rs")),
+        quoted(&prepare.join("producer.stdout")),
+        quoted(&prepare.join("producer.stderr")),
+        quoted(&prepare.join("producer.stdout")),
+        quoted(&prepare.join("producer.stderr")),
+    );
+    let step = step_with_caps(
+        "fixture",
+        "cpu-wrapper",
+        "standalone Nextest CPU wrapper for the real Nextest fixture cases",
+        command,
+        Vec::new(),
+        CPU_WRAPPER_WALL_SECONDS,
+        CPU_WRAPPER_CPU_SECONDS,
+        2 * 1024 * 1024 * 1024,
+    );
+    run_preparation_step(&prepare, step, deadline);
+    // The operation prints the wrapper it built. It must be an executable file
+    // in the fixture's private target, the directory every case builds into.
+    let stdout = fs::read_to_string(prepare.join("producer.stdout")).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "one CPU wrapper path: {stdout:?}");
+    let wrapper = Path::new(lines[0]).canonicalize().unwrap();
+    let metadata = fs::metadata(&wrapper).unwrap();
+    assert!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "CPU wrapper {} is not an executable file",
+        wrapper.display()
+    );
+    assert!(
+        wrapper.starts_with(target.canonicalize().unwrap()),
+        "CPU wrapper {} is outside the fixture target {}",
+        wrapper.display(),
+        target.display()
+    );
+}
+
+/// Run one fixture preparation step alone, retain its graph and result in
+/// `dir`, and require a single clean, successful attempt.
+fn run_preparation_step(dir: &Path, step: dagrun::model::Step, deadline: u64) {
+    let cfg = DagConfig {
+        steps: vec![step],
+        ..Default::default()
+    };
+    fs::write(dir.join("dag.json"), dag_to_json(&cfg)).unwrap();
     let result = run_lane_once(
         &cfg,
         1,
         true,
         0,
         None,
-        &bootstrap.join("driver.log"),
+        &dir.join("driver.log"),
         Some(deadline),
         false,
     );
     fs::write(
-        bootstrap.join("result.json"),
+        dir.join("result.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "complete":result.complete,"ok":result.ok,"run_timed_out":result.run_timed_out,
             "attempts":result.attempts.len(),
@@ -401,6 +480,8 @@ fn actual_nextest_results_and_publication_failures() {
         "deadline_monotonic_ns":deadline,"inherited_step_started_ns":step_started_ns,
         "inherited_deadline_ns":inherited_deadline_ns,"claimed_nested":claimed_nested,
         "per_case_wall_seconds":180,"per_case_cpu_seconds":300,
+        "cpu_wrapper_wall_seconds":CPU_WRAPPER_WALL_SECONDS,
+        "cpu_wrapper_cpu_seconds":CPU_WRAPPER_CPU_SECONDS,
         "declared_memory_bytes":2_u64*1024*1024*1024,"dag_width":1,"cargo_jobs":1,"nextest_retries":0,
         "per_case_cgroup_binding":null,"cargo_home_env":cargo_home,
         "cargo_home_policy":"conventional explicit/default Cargo home; ownership not inferred",
@@ -409,6 +490,7 @@ fn actual_nextest_results_and_publication_failures() {
         "evidence":root,"diagnostic_only":true,"admission":null,
     })).unwrap()).unwrap();
     ensure_prepared_helpers(&source, &root, deadline);
+    prepare_cpu_wrapper(&source, &root, &target, deadline);
     for (index, (name, failing, deny_publish, mismatch, expected_class)) in [
         (
             "writable-pass",
