@@ -131,7 +131,7 @@ cells:
   - test: c-programs/mmap-layout-pointer-order
     backends: [kvm, liteinst]
   - test: c-programs/msync-writeback
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/name-to-handle-refusal
     backends: [kvm, liteinst]
   - test: c-programs/no-new-privs-refusal

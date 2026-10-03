@@ -13,10 +13,10 @@
   "counts": {
     "all": {
       "cells": 3700,
-      "applicable": 856,
-      "selectable": 540,
-      "selected": 207,
-      "selected_selectable": 190
+      "applicable": 857,
+      "selectable": 541,
+      "selected": 208,
+      "selected_selectable": 191
     },
     "by_backend": {
       "dbt": {
@@ -28,10 +28,10 @@
       },
       "kvm": {
         "cells": 925,
-        "applicable": 263,
-        "selectable": 256,
-        "selected": 90,
-        "selected_selectable": 89
+        "applicable": 264,
+        "selectable": 257,
+        "selected": 91,
+        "selected_selectable": 90
       },
       "liteinst": {
         "cells": 925,
@@ -511,7 +511,7 @@
     {"test_id":"c-programs/mmap-stress-determinism","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/mmap-stress-determinism","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/msync-writeback","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/msync-writeback","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM msync returns 0 but its in-memory mapping model does not flush MAP_SHARED writes to the backing file, so the pread write-through checks fail and it observes ok=3 instead of ok=5"},
+    {"test_id":"c-programs/msync-writeback","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/msync-writeback","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/msync-writeback","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/name-to-handle-at-eopnotsupp","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},

@@ -8565,6 +8565,8 @@ mod tests {
                 + 1
                 // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
                 + 1
+                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+                + 1
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
@@ -12765,7 +12767,8 @@ exit "$(cat "$PWD/exit-status")"
         // One epoll-pwait2 KVM candidate: https://github.com/rrnewton/reverie/issues/905.
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1);
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12776,7 +12779,7 @@ exit "$(cat "$PWD/exit-status")"
             by_backend,
             BTreeMap::from([
                 ("dbt", 1),
-                ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1),
+                ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
                 ("liteinst", 97),
                 ("sabre", 1)
             ])

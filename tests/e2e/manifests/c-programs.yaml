@@ -14612,15 +14612,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: true
+          kvm: true
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM msync returns 0 but its in-memory mapping model does not flush MAP_SHARED writes to the backing file, so the pread write-through checks fail and it observes ok=3 instead of ok=5
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false

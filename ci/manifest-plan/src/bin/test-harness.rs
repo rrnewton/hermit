@@ -5689,9 +5689,13 @@ sys.exit(1 if failed else 0)
         // The epoll-pwait2 candidate adds one: https://github.com/rrnewton/reverie/issues/905
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
         assert_eq!(
             (selection.len(), lines),
-            (194 + 6 + 3 + 1 + 1 + 1 + 1, 194 + 6 + 3 + 1 + 1 + 1 + 1)
+            (
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1
+            )
         );
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
@@ -5725,9 +5729,10 @@ sys.exit(1 if failed else 0)
             // The epoll-pwait2 candidate is reported too: https://github.com/rrnewton/reverie/issues/905
             // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
             // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+            // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
             (
-                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1,
-                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1,
+                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1 + 1,
+                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1 + 1,
                 4 + 30,
             ),
             "{unreported:?}"
@@ -5782,7 +5787,8 @@ sys.exit(1 if failed else 0)
         // One epoll-pwait2 selection: https://github.com/rrnewton/reverie/issues/905.
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        assert_eq!(kvm.len(), 244 + 6 + 3 + 1 + 1 + 1 + 1);
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        assert_eq!(kvm.len(), 244 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))
