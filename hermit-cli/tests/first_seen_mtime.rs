@@ -186,7 +186,11 @@ fn canonical_host_mtimes_survive_first_sight_and_others_read_as_epoch() {
 
 /// `cp -p` copies the mtime that the guest's stat reported onto the host file.
 /// Before the fix a Nix store file read as the epoch, so its copy really got
-/// the epoch as its host mtime; now it gets the store's 1.
+/// the epoch as its host mtime; now it gets the store's 1. The guest must also
+/// read 1 back from the copy: stdenv copies its sources with `cp -pr`, and
+/// before explicit utimensat mtimes reached the virtual mtime
+/// (https://github.com/rrnewton/hermit/issues/3565) the copy read as the time
+/// it was written.
 #[test]
 fn cp_preserve_copies_a_canonical_mtime_to_the_host() {
     let root =
@@ -196,7 +200,18 @@ fn cp_preserve_copies_a_canonical_mtime_to_the_host() {
     set_mtime(&source, 1, 0);
     let copy = root.path().join("copy");
 
-    hermit_run(&[], r#"cp -p "$1" "$2""#, &[&source, &copy]);
+    let output = hermit_run(
+        &[],
+        r#"cp -p "$1" "$2" && date -r "$2" +%s.%N"#,
+        &[&source, &copy],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        "1.000000000\n",
+        "the guest did not read the copied canonical mtime back from the copy\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert_eq!(
         host_mtime(&copy),
         Duration::new(1, 0),
