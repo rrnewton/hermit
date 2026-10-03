@@ -615,7 +615,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_replay_path::tests::procfs_symlinks_are_refused_only_when_requested
     // (replay-root containment refuses procfs symlinks) and retains all 796
     // prior identities.
-    ("test.hermit_unit", 797),
+    // In-guest LiteInst (https://github.com/rrnewton/hermit/pull/3635) adds
+    // eighteen tests and retains all 797 prior identities (`cargo nextest list
+    // --profile ci` measured +18): run::liteinst_in_guest_refuses_options_it_cannot_honour,
+    // run::liteinst_host_hybrid_is_not_subject_to_the_in_guest_refusals,
+    // error::tests::in_guest_liteinst_refusal_is_serialized_as_a_policy_refusal,
+    // five interp::tests::startup_* ELF-reader tests, two
+    // script::test::kernel_script_* #! parser tests, and eight
+    // tests::in_guest_liteinst_* / tests::liteinst_runtime_selector_* tests.
+    ("test.hermit_unit", 815),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -797,7 +805,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_backend_stats_report_the_guests_own_dispatch_paths
     // (https://github.com/rrnewton/hermit/pull/3564) retains all 119 prior
     // selected CLI identities.
-    ("test.cli", 120),
+    // liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch,
+    // liteinst_in_guest_selector_rejects_unknown_values and
+    // liteinst_in_guest_refuses_verify_without_reading_stdin
+    // (https://github.com/rrnewton/hermit/pull/3635) retain all 120 prior
+    // selected CLI identities (`cargo nextest list --profile ci` measured +3).
+    // Its two other CLI tests are #[ignore]d: they need the in-guest runtime
+    // library, which this selection does not build.
+    ("test.cli", 123),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -840,7 +855,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_backend_stats_report_the_guests_own_dispatch_paths
     // (https://github.com/rrnewton/hermit/pull/3564), as in test.cli; all 119
     // prior identities retained.
-    ("test.cli_on_host", 120),
+    // The three https://github.com/rrnewton/hermit/pull/3635 in-guest LiteInst
+    // refusal tests, as in test.cli; all 120 prior identities retained.
+    ("test.cli_on_host", 123),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 38),
@@ -889,7 +906,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3522).
     // The host node carries the identical selection.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3603 test.
-    ("test.hermit_unit_on_host", 797),
+    // The host twin selects the same eighteen
+    // https://github.com/rrnewton/hermit/pull/3635 tests.
+    ("test.hermit_unit_on_host", 815),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image

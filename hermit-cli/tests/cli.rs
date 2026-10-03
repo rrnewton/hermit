@@ -11933,6 +11933,533 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     }
 }
 
+/// In-guest LiteInst (`HERMIT_LITEINST_IN_GUEST=1`,
+/// https://github.com/rrnewton/hermit/issues/3520) cannot deliver Detcore's
+/// preemption timer yet: the in-guest Tool host refuses `set_timer` with
+/// `ENOSYS`, which Detcore treats as fatal. A run with the default maximum
+/// timeslice must be REFUSED before dispatch, not fail inside the guest. The
+/// refusal comes from argument validation, so it holds in builds without the
+/// `liteinst` feature or runtime too.
+#[test]
+fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "in-guest LiteInst must refuse a maximum timeslice it cannot enforce. Got \
+         {:?}. stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pass --max-timeslice=disabled"),
+        "the refusal must say how to run without the timer. stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// The selector accepts only "unset" (the ptrace-hosted hybrid) and `1`, so a
+/// typo cannot silently pick the hybrid.
+#[test]
+fn liteinst_in_guest_selector_rejects_unknown_values() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "yes")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("HERMIT_LITEINST_IN_GUEST=\"yes\" is not a LiteInst runtime selection"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// In-guest LiteInst refuses `--verify`, and must refuse it before `--verify`
+/// snapshots stdin. The snapshot reads stdin to its end, so a refusal checked
+/// after it would wait for input that may never come instead of exiting. Stdin
+/// here is a pipe that the test holds open and never writes to.
+#[test]
+fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
+    use std::io::Read;
+
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut child = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--verify",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("failed to run hermit");
+    let held_stdin = child.stdin.take().expect("stdin is piped");
+    let deadline = Instant::now() + DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("cannot poll hermit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "hermit was still running {DEADLINE:?} after start with stdin open: the \
+                 --verify refusal waited for input"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    drop(held_stdin);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout is piped")
+        .read_to_string(&mut stdout)
+        .expect("cannot read hermit's stdout");
+    child
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("cannot read hermit's stderr");
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "status {status:?}, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--verify compares Detcore's internal logs"),
+        "the refusal must name --verify. stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("unreachable"), "the guest must not run");
+}
+
+/// A statically linked guest has no dynamic loader to load the in-guest
+/// runtime, so under in-guest LiteInst it would run entirely unmonitored. It
+/// must be refused before it starts.
+///
+/// The CLI reports a missing runtime library as an unavailable backend before
+/// it starts the container, and the program refusal is made inside the
+/// container, where the guest is spawned. So this test needs the runtime too.
+/// The refusal logic itself is covered without it by the
+/// `in_guest_liteinst_*` unit tests in `hermit-cli/src/lib.rs`.
+///
+/// The guest is a hand-assembled 157-byte static x86-64 executable that writes
+/// `RAN\n` and exits 0. It is run natively first, so the refusal cannot pass
+/// because the image was broken.
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_refuses_a_statically_linked_guest() {
+    const BASE: u64 = 0x40_0000;
+    const HEADERS: usize = 64 + 56;
+    #[rustfmt::skip]
+    const CODE: &[u8] = &[
+        0xb8, 0x01, 0x00, 0x00, 0x00,             // mov eax, 1 (write)
+        0xbf, 0x01, 0x00, 0x00, 0x00,             // mov edi, 1
+        0x48, 0x8d, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 16]
+        0xba, 0x04, 0x00, 0x00, 0x00,             // mov edx, 4
+        0x0f, 0x05,                               // syscall
+        0xb8, 0x3c, 0x00, 0x00, 0x00,             // mov eax, 60 (exit)
+        0x31, 0xff,                               // xor edi, edi
+        0x0f, 0x05,                               // syscall
+        b'R', b'A', b'N', b'\n',
+    ];
+
+    fn put(image: &mut [u8], offset: usize, value: &[u8]) {
+        image[offset..offset + value.len()].copy_from_slice(value);
+    }
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let size = (HEADERS + CODE.len()) as u64;
+    let mut image = vec![0u8; HEADERS];
+    image.extend_from_slice(CODE);
+    put(&mut image, 0, b"\x7fELF\x02\x01\x01"); // 64-bit, little-endian, version 1
+    put(&mut image, 16, &2u16.to_le_bytes()); // ET_EXEC
+    put(&mut image, 18, &62u16.to_le_bytes()); // EM_X86_64
+    put(&mut image, 20, &1u32.to_le_bytes()); // EV_CURRENT
+    put(&mut image, 24, &(BASE + HEADERS as u64).to_le_bytes()); // e_entry
+    put(&mut image, 32, &64u64.to_le_bytes()); // e_phoff
+    put(&mut image, 52, &64u16.to_le_bytes()); // e_ehsize
+    put(&mut image, 54, &56u16.to_le_bytes()); // e_phentsize
+    put(&mut image, 56, &1u16.to_le_bytes()); // e_phnum
+    // One PT_LOAD maps the whole file, readable and executable, at BASE. There
+    // is no PT_INTERP, so the kernel starts it with no dynamic loader.
+    put(&mut image, 64, &1u32.to_le_bytes()); // PT_LOAD
+    put(&mut image, 68, &5u32.to_le_bytes()); // PF_R | PF_X
+    put(&mut image, 80, &BASE.to_le_bytes()); // p_vaddr
+    put(&mut image, 88, &BASE.to_le_bytes()); // p_paddr
+    put(&mut image, 96, &size.to_le_bytes()); // p_filesz
+    put(&mut image, 104, &size.to_le_bytes()); // p_memsz
+    put(&mut image, 112, &0x1000u64.to_le_bytes()); // p_align
+    assert_eq!(image.len(), 157);
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = directory.path().join("static-ran");
+    fs::write(&guest, &image).unwrap();
+    fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let native = Command::new(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("cannot run the static guest natively");
+    assert!(native.status.success(), "native run: {:?}", native.status);
+    assert_eq!(native.stdout, b"RAN\n", "native run");
+
+    let guest_arg = guest.to_str().expect("UTF-8 temporary path");
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--",
+        guest_arg,
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "status {:?}, stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("is statically linked") && stderr.contains(guest_arg),
+        "the refusal must name the program and why. stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("RAN"),
+        "the guest must not run"
+    );
+}
+
+/// In-guest LiteInst runs Detcore's Tool in the guest preload, with no ptrace
+/// tracer on the guest.
+///
+/// The guest is observed from OUTSIDE hermit. It cannot answer this question
+/// about itself: Detcore virtualizes `/proc/<pid>/status` and reports
+/// `TracerPid: 1` under every backend (`sanitize_status` in
+/// `detcore/src/procfs.rs`), so a guest-side probe reads 1 under in-guest
+/// LiteInst as well and cannot tell the backends apart.
+///
+/// The guest is `/bin/cat <fifo>`. Once a non-blocking open of the FIFO for
+/// writing stops failing with `ENXIO`, the guest has reached its own `open`,
+/// past the preload bootstrap, and it then blocks reading until this test
+/// writes. While it is parked there the test reads the guest's host
+/// `/proc/<pid>/status` and `/proc/<pid>/maps`. The ptrace backend is the
+/// control for both checks: it must show a nonzero `TracerPid` and no in-guest
+/// runtime mapping, so neither assertion can pass vacuously.
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const IN_GUEST_RUNTIME: &str = "/libdetcore_liteinst.so";
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Unblocks and reaps the run on every exit path, including a failed
+    /// assertion, so a guest parked on the FIFO cannot outlive the test.
+    struct Run {
+        fifo: PathBuf,
+        child: Option<std::process::Child>,
+    }
+    impl Drop for Run {
+        fn drop(&mut self) {
+            let Some(mut child) = self.child.take() else {
+                return;
+            };
+            // An `O_RDWR` open of a FIFO never blocks on Linux and counts as a
+            // writer, so closing it hands a parked reader end-of-file.
+            drop(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.fifo),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            // SAFETY: `killpg` has no memory-safety preconditions; the group was
+            // created for this run by `process_group(0)`.
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+    }
+
+    struct GuestView {
+        tracer_pids: Vec<String>,
+        runtime_mapped: bool,
+    }
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let command_for = |backend: &str, program: &[&str]| {
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--max-timeslice=disabled",
+            "--",
+        ];
+        args.extend(program);
+        let mut command = hermit_command(&args);
+        if backend == "liteinst" {
+            command.env("HERMIT_LITEINST_IN_GUEST", "1");
+        }
+        command
+    };
+    let check_stderr = |backend: &str, stderr: &str| {
+        if backend == "liteinst" {
+            assert!(
+                stderr.contains(
+                    "hermit: [liteinst in-guest] Detcore Tool hosted by the guest preload"
+                ),
+                "stderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("[liteinst host hybrid]"),
+                "stderr:\n{stderr}"
+            );
+        }
+    };
+    let tracer_pid = |status: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("TracerPid:"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("no TracerPid line in:\n{status}"))
+    };
+
+    let output = command_for("liteinst", &["/bin/echo", "hello", "in-guest"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "status {:?}, stderr:\n{stderr}",
+        output.status
+    );
+    check_stderr("liteinst", &stderr);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello in-guest\n");
+
+    let observe = |backend: &str| -> GuestView {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the FIFO directory");
+        let fifo = dir.path().join("guest-blocks-here");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("NUL in temp path");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path and mode has no
+        // additional preconditions.
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo {fifo:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        let fifo_arg = fifo.to_str().expect("temp path is not UTF-8");
+        let mut command = command_for(backend, &["/bin/cat", fifo_arg]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut run = Run {
+            fifo: fifo.clone(),
+            child: Some(command.spawn().expect("failed to spawn hermit")),
+        };
+
+        let deadline = Instant::now() + DEADLINE;
+        let mut writer = loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(file) => break file,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    let child = run.child.as_mut().expect("run is live");
+                    if let Ok(Some(status)) = child.try_wait() {
+                        panic!(
+                            "{backend}: hermit exited {status:?} before the guest opened {fifo:?}"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{backend}: the guest never opened {fifo:?}: {error}"),
+            }
+        };
+
+        let fifo_bytes = fifo.as_os_str().as_bytes();
+        let guests: Vec<u32> = fs::read_dir("/proc")
+            .expect("failed to list /proc")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                    let argv = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline[..]);
+                    argv.split(|byte| *byte == 0)
+                        .eq([b"/bin/cat".as_slice(), fifo_bytes])
+                })
+            })
+            .collect();
+        assert_eq!(
+            guests.len(),
+            1,
+            "{backend}: expected exactly one guest `/bin/cat {fifo:?}`, found {guests:?}"
+        );
+        let guest = guests[0];
+        let tracer_pids = (0..3)
+            .map(|_| {
+                let status = fs::read_to_string(format!("/proc/{guest}/status"))
+                    .unwrap_or_else(|error| panic!("{backend}: guest {guest} status: {error}"));
+                thread::sleep(Duration::from_millis(50));
+                tracer_pid(&status)
+            })
+            .collect();
+        let maps = fs::read_to_string(format!("/proc/{guest}/maps"))
+            .unwrap_or_else(|error| panic!("{backend}: guest {guest} maps: {error}"));
+        let runtime_mapped = maps.lines().any(|line| line.ends_with(IN_GUEST_RUNTIME));
+
+        writer
+            .write_all(b"released\n")
+            .expect("failed to write to the FIFO");
+        drop(writer);
+        let mut child = run.child.take().expect("run is live");
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll hermit") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                run.child = Some(child);
+                panic!("{backend}: the guest did not exit after the FIFO was released");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_string(&mut stdout)
+            .expect("failed to read stdout");
+        child
+            .stderr
+            .take()
+            .expect("piped stderr")
+            .read_to_string(&mut stderr)
+            .expect("failed to read stderr");
+        assert!(
+            status.success(),
+            "{backend}: status {status:?}, stderr:\n{stderr}"
+        );
+        assert_eq!(stdout, "released\n", "{backend}: stderr:\n{stderr}");
+        check_stderr(backend, &stderr);
+        GuestView {
+            tracer_pids,
+            runtime_mapped,
+        }
+    };
+
+    let control = observe("ptrace");
+    assert!(
+        control.tracer_pids.iter().all(|pid| pid != "0"),
+        "under the ptrace backend the guest's host TracerPid read {:?}, so this probe \
+         cannot see a tracer and proves nothing about in-guest LiteInst",
+        control.tracer_pids
+    );
+    assert!(
+        !control.runtime_mapped,
+        "the ptrace guest maps {IN_GUEST_RUNTIME}, so the mapping check cannot tell \
+         the backends apart"
+    );
+    let in_guest = observe("liteinst");
+    assert_eq!(
+        in_guest.tracer_pids,
+        ["0", "0", "0"],
+        "in-guest LiteInst left a ptrace tracer on the guest"
+    );
+    assert!(
+        in_guest.runtime_mapped,
+        "the in-guest Detcore runtime {IN_GUEST_RUNTIME} is not mapped into the guest"
+    );
+}
+
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
 /// backend must get the same refusal as an available one
 /// (https://github.com/rrnewton/hermit/issues/3418). Before the fix the run
