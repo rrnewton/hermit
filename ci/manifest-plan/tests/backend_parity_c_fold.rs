@@ -18,12 +18,12 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1097 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1100 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
 //!    added (895 portable and 5 privileged), the 189 portable cells of the
 //!    compatibility-corpus fold, the 2 portable select replay cells and the 6
 //!    portable KVM verify selections, after applying the later lane moves listed
-//!    in `LATER_LANE_MOVES` (now 1090 portable and 7 privileged).
+//!    in `LATER_LANE_MOVES` (now 1093 portable and 7 privileged).
 //! 3. The committed compatibility cell table has 9008 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
@@ -161,6 +161,15 @@ const KVM_2026_10_03_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
 const KVM_2026_10_03_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
     ("kvm", "verify", "green", 6),
     ("kvm", "verify", "not-applicable", -6),
+];
+
+/// Three further socket KVM verify selections from
+/// <https://github.com/rrnewton/reverie/issues/891>; preserve the earlier six
+/// and all frozen pre-fold populations as independent additive changes.
+const KVM_SOCKET_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[("portable", "kvm", "verify", 3)];
+const KVM_SOCKET_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 3),
+    ("kvm", "verify", "not-applicable", -3),
 ];
 
 /// Cells that later changes moved between lanes after the fold, as
@@ -490,15 +499,15 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6,
-            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 - moved_out("portable")
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 - moved_out("portable")
                 + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6, 7),
+        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3, 7),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -539,6 +548,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .chain(COMPAT_FOLD_PLAN_ADDITIONS)
         .chain(SELECT_REPLAY_PLAN_ADDITIONS)
         .chain(KVM_2026_10_03_PLAN_ADDITIONS)
+        .chain(KVM_SOCKET_PLAN_ADDITIONS)
     {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
@@ -559,7 +569,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // and 276 portable plus 3 privileged backend-parity-c cells before the fold,
     // plus the 29 portable and 1 privileged c-programs cells S13 added and the
     // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS` and
-    // six portable KVM verify cells of `KVM_2026_10_03_PLAN_ADDITIONS`.
+    // six portable KVM verify cells of `KVM_2026_10_03_PLAN_ADDITIONS` and
+    // three socket KVM verify cells of `KVM_SOCKET_PLAN_ADDITIONS`.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -580,7 +591,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         BTreeMap::from([
             (
                 ("portable".into(), "c-programs".into()),
-                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3
             ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
@@ -616,6 +627,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(compat_fold_cell_deltas())
         .chain(SELECT_REPLAY_CELL_DELTAS.iter().copied())
         .chain(KVM_2026_10_03_CELL_DELTAS.iter().copied())
+        .chain(KVM_SOCKET_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))

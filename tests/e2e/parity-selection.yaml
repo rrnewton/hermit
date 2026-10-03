@@ -202,11 +202,11 @@ cells:
   - test: c-programs/socket-epoll-ordering
     backends: [kvm, liteinst]
   - test: c-programs/socket-options
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/socketpair-flags
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/sockname-unnamed
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/stat-metadata-identity
     backends: [kvm, liteinst]
   - test: c-programs/statfs-free-determinism

@@ -14366,10 +14366,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor accepts setsockopt but getsockopt returns ENOPROTOOPT for SO_REUSEADDR/SO_KEEPALIVE/SO_BROADCAST, so the option round-trip observes ok=0 instead of ok=6
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -14490,10 +14490,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor implements getsockname but returns ENOSYS for getpeername on an AF_UNIX socket pair, so the peer-name checks fail and it observes ok=4 instead of ok=6
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -15527,10 +15527,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor getsockopt implements SO_TYPE but returns ENOPROTOOPT for SO_DOMAIN and SO_ACCEPTCONN, so the socket-introspection contract observes ok=5 instead of ok=7
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false

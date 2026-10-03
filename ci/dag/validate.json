@@ -5494,6 +5494,13 @@
           "category": "c-programs",
           "test": "c-programs/socket-options",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-options",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -5550,6 +5557,13 @@
           "category": "c-programs",
           "test": "c-programs/socketpair-flags",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socketpair-flags",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -5558,6 +5572,13 @@
           "test": "c-programs/socketpair-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sockname-unnamed",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

@@ -13,10 +13,10 @@
   "counts": {
     "all": {
       "cells": 2252,
-      "applicable": 634,
-      "selectable": 533,
-      "selected": 200,
-      "selected_selectable": 183
+      "applicable": 637,
+      "selectable": 536,
+      "selected": 203,
+      "selected_selectable": 186
     },
     "by_backend": {
       "dbt": {
@@ -28,10 +28,10 @@
       },
       "kvm": {
         "cells": 563,
-        "applicable": 256,
-        "selectable": 249,
-        "selected": 83,
-        "selected_selectable": 82
+        "applicable": 259,
+        "selectable": 252,
+        "selected": 86,
+        "selected_selectable": 85
       },
       "liteinst": {
         "cells": 563,
@@ -1003,7 +1003,7 @@
     {"test_id":"c-programs/socket-ioctl-timestamp","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/socket-ioctl-timestamp","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/socket-options","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/socket-options","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor accepts setsockopt but getsockopt returns ENOPROTOOPT for SO_REUSEADDR/SO_KEEPALIVE/SO_BROADCAST, so the option round-trip observes ok=0 instead of ok=6"},
+    {"test_id":"c-programs/socket-options","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/socket-options","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/socket-options","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/socket-timestamp-edge-cases","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
@@ -1019,11 +1019,11 @@
     {"test_id":"c-programs/socket-timestamp-timeval","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/socket-timestamp-timeval","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/socketpair-flags","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/socketpair-flags","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor getsockopt implements SO_TYPE but returns ENOPROTOOPT for SO_DOMAIN and SO_ACCEPTCONN, so the socket-introspection contract observes ok=5 instead of ok=7"},
+    {"test_id":"c-programs/socketpair-flags","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/socketpair-flags","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/socketpair-flags","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/sockname-unnamed","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/sockname-unnamed","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor implements getsockname but returns ENOSYS for getpeername on an AF_UNIX socket pair, so the peer-name checks fail and it observes ok=4 instead of ok=6"},
+    {"test_id":"c-programs/sockname-unnamed","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/sockname-unnamed","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/sockname-unnamed","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/splice-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"not selectable: dbt verify is not selected by full validation: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence."},

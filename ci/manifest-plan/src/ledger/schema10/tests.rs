@@ -780,12 +780,12 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
     // tests c-programs/pid-probe (portable) and c-programs/cpuid-probe (privileged),
     // plus the ptrace replay cell https://github.com/rrnewton/hermit/pull/3580
     // selected for the folded test c-programs/poll-readiness (portable).
-    // This reconstructed plan uses today's population, including six more portable
-    // KVM verify cells from https://github.com/rrnewton/reverie/issues/891.
+    // This reconstructed plan uses today's population, including six earlier and
+    // three socket KVM verify cells from https://github.com/rrnewton/reverie/issues/891.
     assert_eq!(
         restored,
-        282 + 6,
-        "284 portable and 4 privileged folded cells"
+        282 + 6 + 3,
+        "287 portable and 4 privileged folded cells"
     );
     serde_json::to_string(&expected).unwrap()
 }
@@ -956,7 +956,8 @@ fn generated_plan_populations_preserve_command_policy() {
     let select = crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
     // https://github.com/rrnewton/reverie/issues/891 selects six more portable
     // KVM verify cells; keep the earlier populations as explicit baselines.
-    let total = 900 + compat + select + 6;
+    // Three more socket KVM verify selections: https://github.com/rrnewton/reverie/issues/891.
+    let total = 900 + compat + select + 6 + 3;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -995,8 +996,11 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    // The six new KVM cells are also excluded, so the hosted total is unchanged.
-    assert_eq!(hosted_cells.len(), 893 + compat + select + 6 - (241 + 6));
+    // The six earlier and three socket KVM cells are also excluded, so the hosted total is unchanged.
+    assert_eq!(
+        hosted_cells.len(),
+        893 + compat + select + 6 + 3 - (241 + 6 + 3)
+    );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1043,7 +1047,7 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat + select + 6,
+            893 + compat + select + 6 + 3,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1157,17 +1161,23 @@ fn generated_plan_populations_preserve_command_policy() {
                 .cloned()
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
-            // These pre-fold-shaped plans use today's population, including six more KVM cells.
+            // These pre-fold-shaped plans use today's population, including six earlier and three socket KVM cells.
             // https://github.com/rrnewton/reverie/issues/891
-            assert_eq!(expected_relations.len(), if active { 174 + 6 } else { 0 });
+            assert_eq!(
+                expected_relations.len(),
+                if active { 174 + 6 + 3 } else { 0 }
+            );
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
                 expected_relations
             );
             if active {
-                for (backend, count) in
-                    [("kvm", 75 + 6), ("liteinst", 97), ("sabre", 1), ("dbt", 1)]
-                {
+                for (backend, count) in [
+                    ("kvm", 75 + 6 + 3),
+                    ("liteinst", 97),
+                    ("sabre", 1),
+                    ("dbt", 1),
+                ] {
                     assert_eq!(
                         expected_relations
                             .iter()

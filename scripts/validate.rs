@@ -14712,10 +14712,10 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // (tag, withheld, selected), measured from ci/expected-e2e-plan.json: the
     // kvm-backend rows of each bucket against all of its rows.
     // https://github.com/rrnewton/reverie/issues/891 adds six portable KVM
-    // verify cells to both the selected and KVM-withheld populations.
+    // verify cells to both populations; three socket cells add another explicit +3.
     let portable_partial: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
-        ("e2e.manifest_c_programs", 195 + 6, 744 + 6),
+        ("e2e.manifest_c_programs", 195 + 6 + 3, 744 + 6 + 3),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
@@ -14790,15 +14790,15 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|b| b.lane == "portable" && b.category == "c-programs")
         .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
-    if c_programs.selected != 744 + 6 || c_programs.withheld != 0 {
+    if c_programs.selected != 744 + 6 + 3 || c_programs.withheld != 0 {
         return Err(format!(
-            "host-inapplicable cells: with KVM present all 750 portable/c-programs cells must be \
+            "host-inapplicable cells: with KVM present all 753 portable/c-programs cells must be \
              counted and none withheld: {c_programs:?}"
         ));
     }
     let absent = read_bucket_cells(root, &kvm_absent)?;
     let withheld: usize = absent.iter().map(|b| b.withheld).sum();
-    if withheld != 244 + 6
+    if withheld != 244 + 6 + 3
         || absent
             .iter()
             .any(|b| b.withheld > 0 && b.capabilities != ["kvm"])
@@ -14932,7 +14932,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  host-inapplicable cells: plan rows 250 kvm withheld / 750 portable c-programs counted, \
+        "  host-inapplicable cells: plan rows 253 kvm withheld / 753 portable c-programs counted, \
          portable 8 running recorded / 0 withheld, full 10 running recorded / 1 withheld, \
          qualifying 2 complete / violating 2 NO_RESULT, attribution 1 shared / 2 refused"
     );
@@ -15008,11 +15008,11 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     };
 
     // (tag, kvm cells, selected cells), measured from ci/expected-e2e-plan.json.
-    // The +6 portable KVM verify selections are documented at
+    // The +6 earlier and +3 socket KVM verify selections are documented at
     // https://github.com/rrnewton/reverie/issues/891.
     let portable: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
-        ("e2e.manifest_c_programs", 195 + 6, 744 + 6),
+        ("e2e.manifest_c_programs", 195 + 6 + 3, 744 + 6 + 3),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
@@ -15030,7 +15030,8 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         ("privileged-only-e2e.manifest_c_programs", 1, 4),
         ("privileged-only-e2e.manifest_system_utils", 1, 2),
     ];
-    let c_programs: &[(&str, usize, usize)] = &[("e2e.manifest_c_programs", 195 + 6, 744 + 6)];
+    let c_programs: &[(&str, usize, usize)] =
+        &[("e2e.manifest_c_programs", 195 + 6 + 3, 744 + 6 + 3)];
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
         &'a str,
@@ -15219,8 +15220,8 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 247 \
-         kvm cells, --only full and --only portable c-programs 201 of 750, full 11 nodes, \
+        "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 250 \
+         kvm cells, --only full and --only portable c-programs 204 of 753, full 11 nodes, \
          privileged 3 nodes) with the graph unchanged; every capability present admits all 5 \
          unchanged; 3 kvm-free selections admitted with KVM absent; unreadable plan refused"
     );
@@ -16977,7 +16978,9 @@ mod nextest_timeout_tests {
             // https://github.com/rrnewton/reverie/issues/891.
             900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
                 + hermit_manifest_plan::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
-                + 6,
+                + 6
+                // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
+                + 3,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {

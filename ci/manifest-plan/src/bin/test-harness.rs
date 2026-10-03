@@ -5680,9 +5680,9 @@ sys.exit(1 if failed else 0)
         // cell, so the selected cells and their reports are unchanged.
         assert_eq!(nodes, 16);
         let lines = reported.values().map(Vec::len).sum::<usize>();
-        // Six more KVM verify candidates satisfy the unchanged selection rule.
+        // Six earlier and three socket KVM verify candidates satisfy the unchanged selection rule.
         // https://github.com/rrnewton/reverie/issues/891
-        assert_eq!((selection.len(), lines), (194 + 6, 194 + 6));
+        assert_eq!((selection.len(), lines), (194 + 6 + 3, 194 + 6 + 3));
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
             .iter()
@@ -5701,9 +5701,9 @@ sys.exit(1 if failed else 0)
             .collect::<Vec<_>>();
         assert_eq!(
             (applicable.len(), explicitly.len(), unreported.len()),
-            // The same six applicable cells are reported; the four unreported cells stay fixed.
+            // The same six earlier and three socket cells are reported; four unreported cells stay fixed.
             // https://github.com/rrnewton/reverie/issues/891
-            (628 + 6, 624 + 6, 4),
+            (628 + 6 + 3, 624 + 6 + 3, 4),
             "{unreported:?}"
         );
     }
@@ -5746,7 +5746,8 @@ sys.exit(1 if failed else 0)
             .collect::<Vec<_>>();
         // Six additional KVM verify selections retain the same host-capability contract.
         // https://github.com/rrnewton/reverie/issues/891
-        assert_eq!(kvm.len(), 244 + 6);
+        // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
+        assert_eq!(kvm.len(), 244 + 6 + 3);
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))

@@ -8339,6 +8339,9 @@ mod tests {
                 // Six KVM verify selections; the frozen calibration stays unchanged.
                 // https://github.com/rrnewton/reverie/issues/891
                 + 6
+                // Three socket KVM verify selections from the same issue; assertions stay exact.
+                // https://github.com/rrnewton/reverie/issues/891
+                + 3
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
@@ -12524,7 +12527,9 @@ exit "$(cat "$PWD/exit-status")"
         // pid-probe, which adds the one portable dbt candidate.
         // Six more portable KVM verify cells preserve the same parity argument contract.
         // https://github.com/rrnewton/reverie/issues/891
-        assert_eq!(candidates.len(), 174 + 6);
+        // The three socket candidates join the six earlier KVM selections.
+        // https://github.com/rrnewton/reverie/issues/891
+        assert_eq!(candidates.len(), 174 + 6 + 3);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12533,7 +12538,12 @@ exit "$(cat "$PWD/exit-status")"
         }
         assert_eq!(
             by_backend,
-            BTreeMap::from([("dbt", 1), ("kvm", 75 + 6), ("liteinst", 97), ("sabre", 1)])
+            BTreeMap::from([
+                ("dbt", 1),
+                ("kvm", 75 + 6 + 3),
+                ("liteinst", 97),
+                ("sabre", 1)
+            ])
         );
         assert!(
             candidates
@@ -12562,7 +12572,7 @@ exit "$(cat "$PWD/exit-status")"
         }
     }
 
-    /// The kvm, liteinst and sabre candidates pinned above (75 + 6, 97 and 1) used to
+    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3, 97 and 1) used to
     /// add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
