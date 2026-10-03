@@ -15,9 +15,9 @@
 #   local   every cell runs locally (-c hermit_e2e.routing=local), one invocation.
 #   --buck2 PATH  the buck2 to run (default: $BUCK2, else buck2 on PATH). ingest.py
 #           fetches the results with testx ($TESTX, else testx on PATH).
-#   --no-verdict  stop after ingesting: leave the rows in IMPORT_DIR for the validation
-#           DAG's manifest bucket nodes to judge (ci/buck-e2e/validate-node), and exit 0
-#           whatever the cells' verdicts are.
+#   --no-verdict  stop after ingesting: leave the rows in IMPORT_DIR unjudged, for a caller
+#           that judges them itself (`test-harness run` in import mode, as verdict.py does),
+#           and exit 0 whatever the cells' verdicts are. No validation-DAG node does this yet.
 #
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
@@ -33,7 +33,7 @@
 #
 # ci/buck-e2e/verdict.py then judges the rows as the cargo flow's e2e nodes judge theirs:
 # the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
-# Its result files go to --work/verdict, which each run replaces.
+# Its result files go to --work/verdict, which each run removes first (with --no-verdict too).
 # Exit status: 0 when every plan cell passes (an excused diagnostic failure is printed and,
 # as in the cargo flow, does not fail the run), or, with --no-verdict, once the rows are
 # in IMPORT_DIR; 1 when any cell is FAIL or ERROR or has no result (without --no-verdict),
@@ -128,8 +128,11 @@ python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" 
     echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
     exit 1
 }
-((verdict)) || exit 0
 rm -rf -- "${work:?}/verdict"
+((verdict)) || {
+    echo "ci/buck-e2e/run: --no-verdict: the rows in $out are unjudged; this run has no verdict" >&2
+    exit 0
+}
 status=0
 python3 "$here/verdict.py" --plan "$root/ci/expected-e2e-plan.json" --import-dir "$out" \
     --out "$work/verdict" --harness "$here/staged/bin/test-harness" --repo-root "$root" || status=$?
