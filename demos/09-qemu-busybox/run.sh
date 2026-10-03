@@ -197,9 +197,20 @@ fi
 # Check the workload in both modes: two runs can agree perfectly on a guest
 # that never did its job. Under --verify, Hermit writes the first run's
 # stdout to the real stdout, so the console log is available either way.
-marker=HERMIT-QEMU-BUSYBOX-PASS
-grep -Fq "$marker" "$console_log" || fail \
-  "guest exited without marker $marker; inspect $console_log"
+# /init prints the PASS line only after every stage of its workload exited 0,
+# and otherwise a FAIL line naming the stage. An /init from before it checked
+# its stages printed the bare marker unconditionally, so that line alone is
+# not accepted.
+marker='HERMIT-QEMU-BUSYBOX-PASS stages=5'
+if failure=$(grep -a -m 1 -F HERMIT-QEMU-BUSYBOX-FAIL "$console_log"); then
+  fail "the guest workload failed (${failure%$'\r'}); inspect $console_log"
+fi
+if ! grep -Fq "$marker" "$console_log"; then
+  if grep -Fq HERMIT-QEMU-BUSYBOX-PASS "$console_log"; then
+    fail "the initramfs's /init does not check its workload stages: it printed HERMIT-QEMU-BUSYBOX-PASS without stages=5. Rebuild $initramfs_image with $script_dir/build-initramfs.sh, or unset INITRAMFS_IMAGE; inspect $console_log"
+  fi
+  fail "guest exited without marker $marker; inspect $console_log"
+fi
 clock_failures='Unable to calibrate against PIT|Clocksource .* skewed|Marking TSC unstable|No current clocksource'
 if grep -Eq "^\[[[:space:]]*[0-9]+\.[0-9]+\].*($clock_failures)" "$console_log"; then
   fail "nested Linux reported a rejected clock failure; inspect $console_log"
