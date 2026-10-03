@@ -43,6 +43,11 @@ MAX_GUEST_COMMAND_BYTES = GUEST_COMMAND_READ_BYTES - 1
 # QEMU's own reason is in the log.
 FAILED_LOG_TAIL_LINES = 40
 FAILED_LOG_TAIL_BYTES = 64 << 10
+# close() kills QEMU and Hermit's tracer by pid and waits at most this long for
+# both to exit, then at most HERMIT_EXIT_SECONDS for the process the demo
+# started (Hermit, or a wrapper that runs it) to exit by itself.
+OWNED_PROCESS_EXIT_SECONDS = 10.0
+HERMIT_EXIT_SECONDS = 10.0
 
 
 def _write_command_image(path: Path, command: str) -> None:
@@ -461,6 +466,77 @@ def _proc_state(pid: int) -> str:
     return _proc_status_value(pid, "State")
 
 
+def _proc_identity(pid: int) -> Optional[Tuple[str, int]]:
+    """Return the state and start time of process ``pid``, or None if there is none.
+
+    They are fields 3 and 22 of /proc/<pid>/stat. The start time, in clock
+    ticks since boot, tells a process apart from a later one that reuses its pid.
+    """
+    try:
+        with open("/proc/{}/stat".format(pid), "rb") as stat:
+            data = stat.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # Field 2, the command name, is in parentheses and may itself contain
+    # spaces and parentheses, so the remaining fields follow the last ")".
+    fields = data[data.rindex(b")") + 1 :].split()
+    return fields[0].decode("ascii"), int(fields[19])
+
+
+def _is_running(pid: int, start_time: int) -> bool:
+    """Whether ``pid`` is still the process that started at ``start_time`` and has not exited."""
+    identity = _proc_identity(pid)
+    return (
+        identity is not None
+        and identity[0] not in ("Z", "X", "x")
+        and identity[1] == start_time
+    )
+
+
+def _kill_if_running(pid: int, start_time: int) -> None:
+    """Send SIGKILL to ``pid`` only if it is still the process that started at ``start_time``."""
+    try:
+        # A pidfd refers to the process that had the pid when it was opened, so
+        # a start time that still matches after opening it identifies the
+        # process the signal reaches, even if the pid is reused meanwhile.
+        pidfd = os.pidfd_open(pid)  # type: Optional[int]
+    except ProcessLookupError:
+        return
+    except (AttributeError, OSError):
+        pidfd = None  # No pidfd support: check, then signal by pid.
+    try:
+        if not _is_running(pid, start_time):
+            return
+        if pidfd is None:
+            os.kill(pid, signal.SIGKILL)
+        else:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+def _kill_and_wait(
+    processes: List[Tuple[str, int, int]], timeout: float
+) -> List[Tuple[str, int, int]]:
+    """SIGKILL each (name, pid, start time) and wait up to ``timeout`` seconds for all to exit.
+
+    Returns the processes still running when the wait ends. A process that has
+    exited, even if not yet reaped, or whose pid now belongs to a process with a
+    different start time, counts as gone and is not signalled.
+    """
+    for _, pid, start_time in processes:
+        _kill_if_running(pid, start_time)
+    deadline = time.monotonic() + timeout
+    while True:
+        running = [process for process in processes if _is_running(process[1], process[2])]
+        if not running or time.monotonic() >= deadline:
+            return running
+        time.sleep(0.02)
+
+
 def _find_qemu(qmp_socket: Path) -> Optional[int]:
     qmp_argument = "unix:{},server=on,wait=off".format(qmp_socket)
     for entry in os.listdir("/proc"):
@@ -612,6 +688,8 @@ class HermitGuestProgram:
         self._process_group = None  # type: Optional[int]
         self._qemu_pid = None  # type: Optional[int]
         self._tracer_tgid = None  # type: Optional[int]
+        # (name, pid, start time) of each process close() must kill by pid.
+        self._owned_processes = []  # type: List[Tuple[str, int, int]]
         self._memory = None  # type: Optional[int]
         self._qmp = None  # type: Optional[QmpClient]
         self._serial_read_fd = None  # type: Optional[int]
@@ -764,7 +842,9 @@ class HermitGuestProgram:
                 raise RuntimeError("QEMU did not start with guest CPUs paused")
 
         self._qemu_pid = _wait_for_qemu(self._process, qmp_socket, self.config.timeout)
+        self._own_process("QEMU", self._qemu_pid)
         _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
+        self._own_process("Hermit's tracer", self._tracer_tgid)
         self._frozen = True
         first, last = _ram_region(self._qemu_pid, self.config.ram_bytes)
         self._ram_first = first
@@ -940,6 +1020,9 @@ class HermitGuestProgram:
 
         ``failed`` says that the pass did not finish: its Hermit log's end is
         printed, and its snapshot copy is removed (demo 5's is 94 MB).
+
+        QEMU or Hermit's tracer still running after close() has killed it and
+        waited is reported; after a pass that finished, close() then raises.
         """
         if self._memory is not None:
             os.close(self._memory)
@@ -958,8 +1041,39 @@ class HermitGuestProgram:
                 except OSError:
                     pass
                 setattr(self, attribute, None)
-        # Hermit runs in its own process group (start_new_session), so one
-        # signal stops it together with QEMU and anything else it started.
+        # Kill QEMU and Hermit's tracer by pid. The process-group SIGKILL below
+        # does not reach them when `hermit` is a wrapper that runs Hermit
+        # elsewhere: safehermit runs it as a systemd user unit, where the
+        # tracer, stopped since the last observation, and QEMU outlived every
+        # pass. A pid is signalled only while it still has the start time
+        # recorded when start() found it, so a reused pid is left alone.
+        survivors = []  # type: List[Tuple[str, int, int]]
+        if self._owned_processes:
+            survivors = _kill_and_wait(self._owned_processes, OWNED_PROCESS_EXIT_SECONDS)
+            self._owned_processes = survivors
+            for name, pid, _ in survivors:
+                print(
+                    "{} (pid {}) is still running {:g} s after SIGKILL.".format(
+                        name, pid, OWNED_PROCESS_EXIT_SECONDS
+                    ),
+                    file=sys.stderr,
+                )
+            # Without its tracer Hermit exits, and a wrapper then finishes its
+            # own cleanup (safehermit stops and resets its unit), which the
+            # process-group SIGKILL below would cut short.
+            if self._process is not None:
+                try:
+                    self._process.wait(timeout=HERMIT_EXIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    print(
+                        "Hermit (pid {}) is still running {:g} s after its tracer "
+                        "and QEMU stopped; killing its process group.".format(
+                            self._process.pid, HERMIT_EXIT_SECONDS
+                        ),
+                        file=sys.stderr,
+                    )
+        # Hermit runs in its own process group (start_new_session); this stops
+        # whatever is still running in it, Hermit included.
         if (
             self._process_group is not None
             and self._process is not None
@@ -985,6 +1099,19 @@ class HermitGuestProgram:
             self.qmp_socket.unlink(missing_ok=True)
         if failed:
             self._report_failed_pass()
+        elif survivors:
+            # A failed pass is already raising; this would replace its error.
+            raise RuntimeError(
+                "could not stop {} after the pass".format(
+                    ", ".join("{} (pid {})".format(name, pid) for name, pid, _ in survivors)
+                )
+            )
+
+    def _own_process(self, name: str, pid: int) -> None:
+        """Record ``pid``, found just now, and its start time for close() to kill."""
+        identity = _proc_identity(pid)
+        if identity is not None:
+            self._owned_processes.append((name, pid, identity[1]))
 
     def _report_failed_pass(self) -> None:
         """Print the end of a failed pass's Hermit log and remove its snapshot copy."""
