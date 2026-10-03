@@ -1753,36 +1753,48 @@ impl Replayer {
     /// root's attributes directly. The kernel does: an access ACL rewrites the
     /// mode bits and a default ACL shapes later creations, and both govern
     /// path calls replay runs live in the replay root. So a change the
-    /// recording saw succeed is applied there too, but its live result is not
-    /// compared: the replay root is built without the host's attributes,
-    /// possibly on another filesystem, so removing an attribute that predates
-    /// the recording legitimately fails there.
+    /// recording saw succeed also establishes its end state there.
+    ///
+    /// The replay root is built without the host's attributes, so its starting
+    /// state may differ from the recording's. A set therefore runs without
+    /// XATTR_CREATE or XATTR_REPLACE: whatever was there, the attribute ends up
+    /// holding the recorded value. A removal ends in the recorded state whether
+    /// it removes the attribute or finds none (ENODATA). Any other failure,
+    /// such as another filesystem refusing the value, leaves the replay root
+    /// short of the recorded state and is reported; a later live call that
+    /// depends on it then diverges loudly in its own handler.
     async fn handle_xattr_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Errno> {
-        let in_replay_root = match syscall {
-            Syscall::Fsetxattr(call) => self.fd_is_in_replay_root(guest.pid(), call.fd()),
-            Syscall::Fremovexattr(call) => self.fd_is_in_replay_root(guest.pid(), call.fd()),
-            // The path calls take no dirfd; a relative path resolves against
-            // the working directory, which replay keeps inside the root.
-            Syscall::Setxattr(_)
-            | Syscall::Lsetxattr(_)
-            | Syscall::Removexattr(_)
-            | Syscall::Lremovexattr(_) => true,
+        let pid = guest.pid();
+        // The path calls take no dirfd; a relative path resolves against the
+        // working directory, which replay keeps inside the root.
+        let (in_replay_root, live_call, is_removal) = match syscall {
+            Syscall::Fsetxattr(call) => (
+                self.fd_is_in_replay_root(pid, call.fd()),
+                Syscall::Fsetxattr(call.with_flags(0)),
+                false,
+            ),
+            Syscall::Setxattr(call) => (true, Syscall::Setxattr(call.with_flags(0)), false),
+            Syscall::Lsetxattr(call) => (true, Syscall::Lsetxattr(call.with_flags(0)), false),
+            Syscall::Fremovexattr(call) => {
+                (self.fd_is_in_replay_root(pid, call.fd()), syscall, true)
+            }
+            Syscall::Removexattr(_) | Syscall::Lremovexattr(_) => (true, syscall, true),
             _ => unreachable!("xattr change handler received {syscall:?}"),
         };
         let recorded = next_event!(guest, Return);
         if recorded.is_ok() && in_replay_root {
-            let live = guest.inject_with_retry(syscall).await;
-            if live != recorded {
-                tracing::debug!(
+            match guest.inject_with_retry(live_call).await {
+                Ok(_) => {}
+                Err(Errno::ENODATA) if is_removal => {}
+                Err(error) => tracing::warn!(
                     ?syscall,
-                    ?live,
-                    ?recorded,
-                    "replay root xattr change differed"
-                );
+                    %error,
+                    "replay root could not take the recorded xattr change"
+                ),
             }
         }
         recorded
