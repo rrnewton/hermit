@@ -9528,6 +9528,65 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_census_that_keeps_failing_still_stops_the_command() {
+        // The refusal above never clears here: every fresh census takes 1 s and
+        // fails, and its refusal is served again for 500 ms, as proccpu does
+        // (https://github.com/rrnewton/hermit/issues/3377). The command must
+        // still be stopped and reaped through the accounting stop, at least
+        // the grace after the first failed census returned. The grace is only
+        // checked when a sample returns, so the census running when it expires
+        // adds its own length: there is no fixed stop time.
+        let root = cpu_reader_test_root("reader-slow-permanent-failure");
+        let (child, started, mut observation) =
+            spawn_cpu_reader_fixture(&root, "permanent", "exec sleep 30", true);
+        let pid = child.id();
+        let mut censuses = 0;
+        let mut last_census_returned: Option<Instant> = None;
+        let mut first_census_returned: Option<Instant> = None;
+        let result = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(15),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_| {
+                if last_census_returned
+                    .is_none_or(|returned| returned.elapsed() >= Duration::from_millis(500))
+                {
+                    censuses += 1;
+                    std::thread::sleep(Duration::from_secs(1));
+                    let returned = Instant::now();
+                    last_census_returned = Some(returned);
+                    first_census_returned.get_or_insert(returned);
+                }
+                Err("fixture scan deadline".into())
+            },
+        );
+        let error = result
+            .map(|_| ())
+            .expect_err("a census that never succeeds must stop the command");
+        assert!(error.contains("sampling: fixture scan deadline"), "{error}");
+        assert_eq!(
+            observation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        assert!(first_census_returned.unwrap().elapsed() >= CELL_CPU_ACCOUNTING_GRACE);
+        // The cached refusal ends 500 ms after the first census returns, inside
+        // the grace, so a fresh census ran before the stop.
+        assert!(censuses >= 2, "{censuses}");
+        assert!(owned_child_is_reaped(pid));
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.valid_polls, 0);
+        assert!(live.unavailable_polls >= 2);
+        measured_final_cpu(&observation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn live_cpu_conversion_refuses_unrepresentable_values() {
         assert_eq!(live_cpu_usage_usec(42, 0.0), Ok(0));
         assert_eq!(live_cpu_usage_usec(42, 0.125), Ok(125_000));
