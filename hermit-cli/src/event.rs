@@ -107,6 +107,9 @@ pub enum SyscallEvent {
     /// The result and mutable output fields of a raw `select` or `pselect6`
     /// call.
     Select(SelectEvent),
+    /// The result of a guest-semantic `madvise` and the file-backed contents
+    /// replay must restore over its anonymous replacement mappings.
+    Madvise(MadviseEvent),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -309,6 +312,31 @@ pub struct MmapEvent {
     /// The contents of the memory map. Note that this may be less than the
     /// requested `length`.
     pub buf: Vec<u8>,
+}
+
+/// Recorded outcome of a guest-semantic `madvise`.
+///
+/// Replay maps recorded files as anonymous memory, so advice whose effect
+/// depends on the backing store cannot simply run live.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MadviseEvent {
+    pub result: Result<i64, Errno>,
+    /// Length of the prefix of the advised range that replay applies live.
+    /// It is shorter than the guest's length when Linux stopped at a
+    /// file-backed mapping that replay represents anonymously.
+    pub live_len: usize,
+    /// File-backed contents observed after the call, which replay writes
+    /// over the zero pages its anonymous mappings expose.
+    pub refills: Vec<MadviseRefill>,
+}
+
+/// Contents of one file-backed range after a recorded `madvise`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MadviseRefill {
+    pub addr: usize,
+    pub bytes: Vec<u8>,
+    /// `PROT_*` bits of the mapping, restored after replay writes the bytes.
+    pub prot: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
