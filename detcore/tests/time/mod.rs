@@ -826,15 +826,20 @@ fn tod_gettimeofday_null_tv_faulting_tz_fails() {
 
 /// Installs a seccomp filter in the calling process that makes `time(2)` fail
 /// with EFAULT without running it: every call, or with `only_tloc`, only a
-/// call whose `tloc` is that address.
-fn install_time_efault_filter(only_tloc: Option<usize>) {
+/// call whose `tloc` is that address. It also makes `ptrace(PTRACE_PEEKDATA)`
+/// at each address in `deny_peekdata_at` fail with EPERM, so a tracer in this
+/// process cannot read those guest words.
+fn install_time_efault_filter(only_tloc: Option<usize>, deny_peekdata_at: &[usize]) {
     const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
-    // Offsets of `nr`, `arch` and the two halves of `args[0]` in
-    // `struct seccomp_data`.
+    // Offsets of `nr`, `arch` and the two halves of `args[0]` and `args[2]`
+    // in `struct seccomp_data`.
     const NR: u32 = 0;
     const ARCH: u32 = 4;
     const ARG0_LO: u32 = 16;
     const ARG0_HI: u32 = 20;
+    // `ptrace(request, pid, addr, data)`: `addr` is `args[2]`.
+    const ARG2_LO: u32 = 32;
+    const ARG2_HI: u32 = 36;
     let stmt = |code: u32, k: u32| libc::sock_filter {
         code: code as u16,
         jt: 0,
@@ -853,7 +858,29 @@ fn install_time_efault_filter(only_tloc: Option<usize>) {
         libc::BPF_RET | libc::BPF_K,
         libc::SECCOMP_RET_ERRNO | libc::EFAULT as u32,
     );
+    let eperm = stmt(
+        libc::BPF_RET | libc::BPF_K,
+        libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+    );
     let mut filter = vec![load(ARCH), jeq(AUDIT_ARCH_X86_64, 1, 0), allow, load(NR)];
+    if !deny_peekdata_at.is_empty() {
+        let per_addr = 5 * deny_peekdata_at.len() as u8;
+        filter.extend([
+            jeq(libc::SYS_ptrace as u32, 0, 2 + per_addr),
+            load(ARG0_LO),
+            jeq(libc::PTRACE_PEEKDATA, 0, per_addr),
+        ]);
+        for &addr in deny_peekdata_at {
+            filter.extend([
+                load(ARG2_LO),
+                jeq(addr as u32, 0, 3),
+                load(ARG2_HI),
+                jeq((addr >> 32) as u32, 0, 1),
+                eperm,
+            ]);
+        }
+        filter.push(load(NR));
+    }
     match only_tloc {
         None => filter.extend([jeq(libc::SYS_time as u32, 0, 1), efault, allow]),
         Some(tloc) => filter.extend([
@@ -895,7 +922,15 @@ const RESUMED_AFTER_FAULT: &str = "resumed-after-faulting-gettimeofday";
 /// host time. Detcore emulates the guest's own `seccomp(2)` and refuses
 /// `PR_SET_NO_NEW_PRIVS`, so the filter is installed on this test thread, which
 /// forks the guest and so passes the filter on to it.
-fn seccomp_efault_time_probe_stops_the_run(only_probe_address: bool, expected: &str) {
+///
+/// With `deny_peekdata`, the filter also stops the tracer, which runs on this
+/// thread, from reading `tv`, so the pre-call snapshot and the post-probe read
+/// both fail although `tv` is mapped and the host stored its time there.
+fn seccomp_efault_time_probe_stops_the_run(
+    only_probe_address: bool,
+    deny_peekdata: bool,
+    expected: &str,
+) {
     let config = detcore::Config {
         virtualize_time: true,
         ..Default::default()
@@ -903,7 +938,12 @@ fn seccomp_efault_time_probe_stops_the_run(only_probe_address: bool, expected: &
     // Mapped before the fork, so the guest has it at the same address.
     let (page, _) = map_pages(1);
     let tv_raw = page.expose_provenance();
-    install_time_efault_filter(only_probe_address.then_some(tv_raw));
+    let tv_words = [
+        tv_raw,
+        tv_raw + std::mem::offset_of!(libc::timeval, tv_usec),
+    ];
+    let deny_peekdata_at: &[usize] = if deny_peekdata { &tv_words } else { &[] };
+    install_time_efault_filter(only_probe_address.then_some(tv_raw), deny_peekdata_at);
     let outcome = test_fn_with_config::<Detcore, _>(
         move || {
             let tv_addr = ptr::with_exposed_provenance_mut::<libc::timeval>(tv_raw);
@@ -946,12 +986,17 @@ fn seccomp_efault_time_probe_stops_the_run(only_probe_address: bool, expected: &
 
 #[test]
 fn tod_gettimeofday_faulting_tz_seccomp_efault_for_every_time_call_stops_the_run() {
-    seccomp_efault_time_probe_stops_the_run(false, "time(NULL) control probe failed");
+    seccomp_efault_time_probe_stops_the_run(false, false, "time(NULL) control probe failed");
 }
 
 #[test]
 fn tod_gettimeofday_faulting_tz_seccomp_efault_for_the_probe_address_stops_the_run() {
-    seccomp_efault_time_probe_stops_the_run(true, "the word changed during the call");
+    seccomp_efault_time_probe_stops_the_run(true, false, "the word changed during the call");
+}
+
+#[test]
+fn tod_gettimeofday_faulting_tz_seccomp_efault_with_unreadable_mapped_tv_stops_the_run() {
+    seccomp_efault_time_probe_stops_the_run(true, true, "the word is mapped but could not be read");
 }
 
 fn raw_getimeofday_delta() {

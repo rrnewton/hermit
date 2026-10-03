@@ -27,6 +27,7 @@ use tracing::info;
 use tracing::trace;
 
 use crate::detlog;
+use crate::procmaps;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -122,9 +123,17 @@ enum TvRepairFailureKind {
     /// filter, produced the EFAULT, so it says nothing about `tv`.
     ControlProbeFailed(Errno),
     /// A word at or after the one whose store probe returned EFAULT no longer
-    /// matches what the guest could read before the call, so the original call
-    /// stored it and the EFAULT did not come from the store.
+    /// reads as it did before the call, so the original call stored it and the
+    /// EFAULT did not come from the store.
     StoppedWordChanged,
+    /// A word at or after the one whose store probe returned EFAULT could not
+    /// be read before or after the call, although every byte of it is mapped.
+    /// The read failure may not be a fault: a seccomp filter can deny the
+    /// read while the store went through, so nothing shows the word unstored.
+    StoppedWordUnreadable,
+    /// The guest's memory map, needed to tell an unmapped word from an
+    /// unreadable one, could not be read or was empty.
+    MapsUnavailable,
     /// The exact overwrite after a successful probe failed. The probe just
     /// stored host seconds, so the run cannot safely continue.
     OverwriteFailed(Errno),
@@ -155,6 +164,12 @@ impl std::fmt::Display for TvRepairFailure {
             TvRepairFailureKind::StoppedWordChanged => f.write_str(
                 "the word changed during the call although its store probe returned EFAULT",
             ),
+            TvRepairFailureKind::StoppedWordUnreadable => f.write_str(
+                "the word is mapped but could not be read, so its store probe's EFAULT is unconfirmed",
+            ),
+            TvRepairFailureKind::MapsUnavailable => {
+                f.write_str("the guest's memory map could not be read")
+            }
             TvRepairFailureKind::OverwriteFailed(errno) => {
                 write!(f, "virtual-time overwrite failed: {errno}")
             }
@@ -211,15 +226,25 @@ fn require_native_time_control_probe(
     }
 }
 
+/// How a word that Linux did not store reads after the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoppedWord {
+    /// Readable, with the value it held before the call.
+    Unchanged,
+    /// Unreadable both before and after the call. This proves nothing by
+    /// itself; see [`require_unmapped_unreadable_word`].
+    Unreadable,
+}
+
 /// A word Linux did not store keeps both its contents and its readability.
 fn require_unchanged_stopped_word(
     field: &'static str,
-    before: Option<libc::time_t>,
+    before: Result<libc::time_t, Errno>,
     after: Result<libc::time_t, Errno>,
-) -> Result<(), Error> {
+) -> Result<StoppedWord, Error> {
     match (before, after) {
-        (Some(before), Ok(after)) if before == after => Ok(()),
-        (None, Err(_)) => Ok(()),
+        (Ok(before), Ok(after)) if before == after => Ok(StoppedWord::Unchanged),
+        (Err(_), Err(_)) => Ok(StoppedWord::Unreadable),
         _ => Err(tv_repair_error(
             field,
             TvRepairFailureKind::StoppedWordChanged,
@@ -227,9 +252,65 @@ fn require_unchanged_stopped_word(
     }
 }
 
-/// The guest-readable contents of `tv_sec` and `tv_usec` before a
-/// `gettimeofday`, `None` where the word cannot be read.
-type TimevalWordSnapshot = [Option<libc::time_t>; 2];
+/// Whether every byte of the `time_t` at `word` lies in one of `ranges`, the
+/// half-open address ranges of the guest's mappings.
+fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
+    let Some(end) = word.checked_add(std::mem::size_of::<libc::time_t>() as u64) else {
+        return false;
+    };
+    ranges.sort_unstable();
+    let mut covered = word;
+    for (start, stop) in ranges {
+        if start <= covered && covered < stop {
+            covered = stop;
+            if covered >= end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// An unreadable word is accepted as unstored only when part of it is
+/// unmapped: Linux's eight-byte `put_user` faults there before storing any
+/// byte. A failed read of a fully mapped word is not evidence of a fault. A
+/// seccomp filter can deny the read while the store succeeds, and the
+/// in-process backends' `process_vm_readv` cannot read a `PROT_NONE` or
+/// write-only page that Linux may still store to. Ptrace reads use
+/// `FOLL_FORCE`, so for it a mapped word that cannot be read is already
+/// abnormal. An empty map is refused because a filter that fakes a successful
+/// zero-byte read would otherwise make every word look unmapped.
+fn require_unmapped_unreadable_word(
+    field: &'static str,
+    maps: Result<Vec<(u64, u64)>, Error>,
+    word: u64,
+) -> Result<(), Error> {
+    let ranges = match maps {
+        Ok(ranges) if !ranges.is_empty() => ranges,
+        Ok(_) => {
+            error!("gettimeofday tv repair: the guest's memory map is empty");
+            return Err(tv_repair_error(field, TvRepairFailureKind::MapsUnavailable));
+        }
+        Err(err) => {
+            error!("gettimeofday tv repair: reading the guest's memory map: {err}");
+            return Err(tv_repair_error(field, TvRepairFailureKind::MapsUnavailable));
+        }
+    };
+    if time_word_is_fully_mapped(ranges, word) {
+        Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::StoppedWordUnreadable,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// What Detcore's memory reader returned for `tv_sec` and `tv_usec` before a
+/// `gettimeofday`, with the read error where it failed. Under ptrace the read
+/// ignores page protection and protection keys; the in-process backends' read
+/// respects `VM_READ`.
+type TimevalWordSnapshot = [Result<libc::time_t, Errno>; 2];
 
 const TIMEVAL_WORDS: [(&str, usize); 2] = [
     ("tv_sec", std::mem::offset_of!(Timeval, tv_sec)),
@@ -245,8 +326,8 @@ where
     T: RecordOrReplay,
 {
     TIMEVAL_WORDS.map(|(field, offset)| {
-        let addr = timeval_word_addr(field, tv_addr, offset).ok()?;
-        guest.memory().read_value(addr).ok()
+        let addr = timeval_word_addr(field, tv_addr, offset).map_err(|_| Errno::EFAULT)?;
+        guest.memory().read_value(addr)
     })
 }
 
@@ -314,12 +395,14 @@ fn should_repair_failed_gettimeofday_tv(backend_is_kvm: bool) -> bool {
 /// First, `time(NULL)` is injected: it stores nothing and cannot fail on
 /// Linux, so any error means the probes are not reaching the native call.
 /// Second, every word from the stopped one onward must still read exactly as
-/// it did before the original call, readable with the same value or
-/// unreadable both times; a changed word was stored by that call. Both
-/// failures end the run. A filter that returns EFAULT only for this probe's
-/// exact address, on a word the guest can write but not read, passes both
-/// checks; no observation that leaves the guest's memory untouched can tell
-/// that case apart.
+/// it did before the original call: readable with the same value, or
+/// unreadable both times and not fully mapped, so that the store could only
+/// have faulted. A changed word was stored by that call, and an unreadable
+/// word that is fully mapped may have been, because a failed read is not
+/// itself a fault. Each of these failures ends the run. The in-process
+/// backends cannot read `PROT_NONE` or write-only pages, so on them a
+/// `gettimeofday` that stops on such a page ends the run rather than
+/// returning EFAULT.
 ///
 /// The repair never writes a word the kernel could not store, and it does not
 /// test writability by rewriting a word, because a remote write ignores
@@ -366,7 +449,14 @@ where
                 {
                     let addr = timeval_word_addr(field, tv_addr, offset)?;
                     let after = guest.memory().read_value(addr);
-                    require_unchanged_stopped_word(field, before[stopped], after)?;
+                    match require_unchanged_stopped_word(field, before[stopped], after)? {
+                        StoppedWord::Unchanged => {}
+                        StoppedWord::Unreadable => {
+                            let maps = procmaps::from_pid(guest.pid(), |_| true)
+                                .map(|maps| maps.into_iter().map(|map| map.address).collect());
+                            require_unmapped_unreadable_word(field, maps, addr.as_raw() as u64)?;
+                        }
+                    }
                 }
                 break;
             }
@@ -446,7 +536,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let time_ns = guest_clock_time(guest).await;
 
         let repair_on_efault = should_repair_failed_gettimeofday_tv(guest.config().backend_is_kvm);
-        // What the guest could read in `tv` before the call; the repair uses it
+        // What Detcore could read in `tv` before the call; the repair uses it
         // to confirm which words a failing call left alone.
         let before = match call.tv() {
             Some(tp) if repair_on_efault => Some(snapshot_timeval_words(guest, tp.into())),
@@ -1024,12 +1114,20 @@ mod tests {
 
         #[test]
         fn a_stopped_word_must_keep_its_contents_and_readability() {
-            require_unchanged_stopped_word("tv_sec", Some(7), Ok(7)).unwrap();
-            require_unchanged_stopped_word("tv_sec", None, Err(Errno::EFAULT)).unwrap();
+            assert_eq!(
+                require_unchanged_stopped_word("tv_sec", Ok(7), Ok(7)).unwrap(),
+                StoppedWord::Unchanged
+            );
+            for (before, after) in [(Errno::EFAULT, Errno::EFAULT), (Errno::EIO, Errno::EPERM)] {
+                assert_eq!(
+                    require_unchanged_stopped_word("tv_sec", Err(before), Err(after)).unwrap(),
+                    StoppedWord::Unreadable
+                );
+            }
             for (before, after) in [
-                (Some(7), Ok(1_791_041_091)),
-                (Some(7), Err(Errno::EFAULT)),
-                (None, Ok(7)),
+                (Ok(7), Ok(1_791_041_091)),
+                (Ok(7), Err(Errno::EFAULT)),
+                (Err(Errno::EFAULT), Ok(7)),
             ] {
                 let error = require_unchanged_stopped_word("tv_usec", before, after)
                     .expect_err("a changed stopped word means the call stored it");
@@ -1038,6 +1136,44 @@ mod tests {
                     TvRepairFailure {
                         field: "tv_usec",
                         kind: TvRepairFailureKind::StoppedWordChanged,
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn an_unreadable_word_is_unstored_only_if_part_of_it_is_unmapped() {
+            const PAGE: u64 = 0x1000;
+            let two_pages = || Ok(vec![(3 * PAGE, 4 * PAGE), (2 * PAGE, 3 * PAGE)]);
+            // Outside every mapping, and straddling either end of the mapped pages.
+            for word in [1, 2 * PAGE - 4, 4 * PAGE - 4, 5 * PAGE, u64::MAX - 3] {
+                require_unmapped_unreadable_word("tv_sec", two_pages(), word).unwrap();
+            }
+            // Inside one page, and across the boundary of two adjacent mappings.
+            for word in [2 * PAGE, 3 * PAGE - 4, 4 * PAGE - 8] {
+                let error = require_unmapped_unreadable_word("tv_usec", two_pages(), word)
+                    .expect_err("a failed read of a mapped word is not a fault");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_usec",
+                        kind: TvRepairFailureKind::StoppedWordUnreadable,
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn an_unreadable_word_needs_a_readable_nonempty_map() {
+            let unreadable = Err(Error::Errno(Errno::EPERM));
+            for maps in [Ok(Vec::new()), unreadable] {
+                let error = require_unmapped_unreadable_word("tv_sec", maps, 1)
+                    .expect_err("without a map an unreadable word proves nothing");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_sec",
+                        kind: TvRepairFailureKind::MapsUnavailable,
                     }
                 );
             }

@@ -667,7 +667,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two time-probe confirmation controls (the time(NULL) control probe and
     // the unchanged-stopped-word check) and two EFAULT failed-syscall display
     // controls retain all 868 prior identities: 868 + 4 = 872.
-    ("test.detcore_unit", 872),
+    // Two unreadable-stopped-word controls (the unmapped-word check and the
+    // memory-map availability check) retain all 872 prior identities:
+    // 872 + 2 = 874.
+    ("test.detcore_unit", 874),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -679,7 +682,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
     // identities: 28 + 2 = 30.
-    ("test.detcore_time", 30),
+    // The unreadable-mapped-tv seccomp regression retains all 30 prior
+    // identities: 30 + 1 = 31.
+    ("test.detcore_time", 31),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
@@ -852,8 +857,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 850 prior
     // identities.
     // The host node carries the identical library/binary selection.
-    ("test.detcore_time_on_host", 30),
-    ("test.detcore_unit_on_host", 872),
+    ("test.detcore_time_on_host", 31),
+    ("test.detcore_unit_on_host", 874),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3336,7 +3341,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"detcore_time"########,
         desc: r########"Detcore time integration cases (tests_time, serial execution)"########,
-        description: r########"MEASURED 2026-09-29 at hermit 905903e0a7ed on devbig014: five serial runs of the node's selection, cargo nextest run -p hermit-detcore --test tests_time -j 1 invoked directly rather than through run-nextest-counted.sh, each in its own systemd-run --user --scope unit, each ran 28 of 28 tests with 0 skipped. Their cgroup memory.peak values were 114012160, 111661056, 111734784, 115081216, and 113618944 bytes. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20% (138097460 bytes), the same relation the previous 128 MiB had to its 80302080-byte maximum, and the 1-GiB hard cap supplies conservative headroom. Exact -j1 wall times were 5.32, 6.12, 5.44, 5.68, and 5.40 seconds, so est_duration_s rounds the maximum upward to 7 seconds. A sixth run of the same form used 7.12 CPU-seconds (cgroup cpu.stat usage_usec) against the 7200-CPU-second cap. The selection is now 30 cases: 26 #[test] functions plus the bottom, middle, default, and top variants of tod_gettimeofday_delta. The two added after these measurements, tod_gettimeofday_faulting_tz_seccomp_efault_for_every_time_call_stops_the_run and tod_gettimeofday_faulting_tz_seccomp_efault_for_the_probe_address_stops_the_run, each run one short guest in about 0.02 seconds, so the estimates above stand. Twenty-eight of them construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 23 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, and max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000. proc_stat_btime_is_fixed_for_a_fractional_epoch and target_timeslice_yields_at_syscall_boundaries_without_pmu explicitly disable max_timeslice. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. The PMU- and PKU-dependent cases remain together so validation covers the shipped tests_time binary without silent skips."########,
+        description: r########"MEASURED 2026-09-29 at hermit 905903e0a7ed on devbig014: five serial runs of the node's selection, cargo nextest run -p hermit-detcore --test tests_time -j 1 invoked directly rather than through run-nextest-counted.sh, each in its own systemd-run --user --scope unit, each ran 28 of 28 tests with 0 skipped. Their cgroup memory.peak values were 114012160, 111661056, 111734784, 115081216, and 113618944 bytes. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20% (138097460 bytes), the same relation the previous 128 MiB had to its 80302080-byte maximum, and the 1-GiB hard cap supplies conservative headroom. Exact -j1 wall times were 5.32, 6.12, 5.44, 5.68, and 5.40 seconds, so est_duration_s rounds the maximum upward to 7 seconds. A sixth run of the same form used 7.12 CPU-seconds (cgroup cpu.stat usage_usec) against the 7200-CPU-second cap. The selection is now 31 cases: 27 #[test] functions plus the bottom, middle, default, and top variants of tod_gettimeofday_delta. The three added after these measurements, tod_gettimeofday_faulting_tz_seccomp_efault_for_every_time_call_stops_the_run, tod_gettimeofday_faulting_tz_seccomp_efault_for_the_probe_address_stops_the_run, and tod_gettimeofday_faulting_tz_seccomp_efault_with_unreadable_mapped_tv_stops_the_run, each run one short guest in about 0.02 seconds, so the estimates above stand. Twenty-nine of them construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 24 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, and max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000. proc_stat_btime_is_fixed_for_a_fractional_epoch and target_timeslice_yields_at_syscall_boundaries_without_pmu explicitly disable max_timeslice. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. The PMU- and PKU-dependent cases remain together so validation covers the shipped tests_time binary without silent skips."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
