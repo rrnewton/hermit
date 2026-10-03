@@ -1787,9 +1787,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }])?;
                 return Ok(0);
             }
-            // Zero-count reads only serve to detect errors. Their result goes
-            // through record/replay: a replayed descriptor may be a placeholder
-            // whose own zero-count read fails differently.
+            // A zero-count read transfers nothing on a file or stream, but on a
+            // datagram or SEQPACKET socket it consumes a pending message. Its
+            // result goes through record/replay: a replayed descriptor may be
+            // a placeholder whose own zero-count read fails differently.
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601)
             return self
                 .record_or_replay_preserving_tool_errors(guest, call)
@@ -1894,8 +1896,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if call.len() == 0 {
-            // Zero-count reads only serve to detect errors; as for read, the
-            // result goes through record/replay.
+            // As for read, a zero-count pread's result goes through
+            // record/replay.
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601)
             return self
                 .record_or_replay_preserving_tool_errors(guest, call)

@@ -6,11 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// Descriptor syncs, metadata changes, xattr queries and zero-length reads
-// whose results must come from the recording. The file lives in a host
+// Descriptor syncs, metadata changes, xattr calls and zero-length reads
+// whose results must come from the recording. The first file lives in a host
 // directory absent from the replay chroot, so replay hands the guest a
 // placeholder descriptor: a live fsync, fchmod or fgetxattr there answers
-// EINVAL or EOPNOTSUPP instead of the recorded result. Every result is checked
+// EINVAL or EOPNOTSUPP instead of the recorded result. The second file exists
+// in the replay root, where descriptor and path xattr calls must agree. Every result is checked
 // against its expected value, so record and replay cannot agree on a wrong
 // failure and still pass.
 
@@ -146,6 +147,35 @@ int main(int argc, char** argv) {
     failures++;
   }
   close(fd);
+
+  // A file the guest creates in its working directory exists in the replay
+  // root too (replay enters the recorded directory), so path calls there run
+  // live and must see the attributes descriptor calls set or removed.
+  if (chdir(argv[1]) != 0) {
+    perror("chdir");
+    return 2;
+  }
+  int local = open("local", O_CREAT | O_RDWR | O_TRUNC, 0644);
+  expect("open-local", local, 0);
+  expect("local-fsetxattr", fsetxattr(local, NAME, VALUE, strlen(VALUE), 0), 0);
+  expect("local-removexattr", removexattr("local", NAME), 0);
+  expect("local-fremovexattr-gone", fremovexattr(local, NAME), ENODATA);
+  expect("local-fsetxattr-again", fsetxattr(local, NAME, "v2", 2, 0), 0);
+  expect(
+      "local-setxattr-create",
+      setxattr("local", NAME, VALUE, strlen(VALUE), XATTR_CREATE),
+      EEXIST);
+  expect(
+      "local-lsetxattr-replace",
+      lsetxattr("local", NAME, VALUE, strlen(VALUE), XATTR_REPLACE),
+      0);
+  memset(buf, 0, sizeof(buf));
+  expect_xattr_value(
+      "local-fgetxattr", fgetxattr(local, NAME, buf, sizeof(buf)), buf);
+  expect("local-lremovexattr", lremovexattr("local", NAME), 0);
+  expect("local-fremovexattr-after", fremovexattr(local, NAME), ENODATA);
+  expect("local-fchmod", fchmod(local, 0600), 0);
+  close(local);
 
   printf("failures=%d\n", failures);
   return failures ? 1 : 0;

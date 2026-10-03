@@ -474,13 +474,22 @@ impl Tool for Replayer {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601): the descriptor may be a placeholder,
             // so the recorded result is returned without running the call.
-            Syscall::Fsync(_)
-            | Syscall::Fdatasync(_)
-            | Syscall::Syncfs(_)
-            | Syscall::Fchmod(_)
+            Syscall::Fsync(_) | Syscall::Fdatasync(_) | Syscall::Syncfs(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Fchmod(_)
             | Syscall::Fchown(_)
             | Syscall::Fsetxattr(_)
-            | Syscall::Fremovexattr(_) => self.handle_simple(guest, syscall).await,
+            | Syscall::Fremovexattr(_) => {
+                self.handle_descriptor_metadata_change(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601)
+            Syscall::Setxattr(_)
+            | Syscall::Lsetxattr(_)
+            | Syscall::Removexattr(_)
+            | Syscall::Lremovexattr(_) => self.handle_confined_path_mutation(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601)
             Syscall::Getxattr(_)
@@ -1636,6 +1645,11 @@ impl Replayer {
             | Syscall::Chown(_)
             | Syscall::Lchown(_)
             | Syscall::Mknod(_) => true,
+            // TODO-HUMAN-REVIEW(PR-3601): the path xattr calls take no dirfd.
+            Syscall::Setxattr(_)
+            | Syscall::Lsetxattr(_)
+            | Syscall::Removexattr(_)
+            | Syscall::Lremovexattr(_) => true,
             Syscall::Utimensat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Symlinkat(call) => self.dirfd_is_confined(pid, call.newdirfd()),
             Syscall::Linkat(call) => {
@@ -1698,6 +1712,44 @@ impl Replayer {
                 Err(error) => {
                     panic!(
                         "replayed path mutation {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
+        }
+        recorded
+    }
+
+    // TODO-HUMAN-REVIEW(PR-3601)
+    /// Replays a metadata change made through a descriptor: fchmod, fchown,
+    /// fsetxattr or fremovexattr. A placeholder descriptor has no metadata to
+    /// change, so the recorded result stands alone. A file in the replay root
+    /// gets the change reapplied, because later path calls such as
+    /// removexattr or chmod run there and must find what the recording
+    /// found.
+    async fn handle_descriptor_metadata_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let fd = match syscall {
+            Syscall::Fchmod(call) => call.fd(),
+            Syscall::Fchown(call) => call.fd(),
+            Syscall::Fsetxattr(call) => call.fd(),
+            Syscall::Fremovexattr(call) => call.fd(),
+            _ => unreachable!("descriptor metadata handler received {syscall:?}"),
+        };
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded
+            && self.fd_is_in_replay_root(guest.pid(), fd)
+        {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed descriptor metadata change returned a different result"
+                ),
+                Err(error) => {
+                    panic!(
+                        "replayed descriptor metadata change {syscall:?} failed after recording returned {expected}: {error}"
                     );
                 }
             }
