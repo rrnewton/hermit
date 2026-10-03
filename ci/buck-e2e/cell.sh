@@ -95,14 +95,16 @@ pinned-root)
     [[ -x $wrapper ]] || emit_fatal "the bundle source has no executable ci/hermetic/run-in-pinned-root.sh"
     "$wrapper" --check-image >"$W/check-image.log" 2>&1 ||
         emit_fatal "pinned-root image unavailable: $(tr '\n' ' ' <"$W/check-image.log")(build it with ci/hermetic/build-image.sh)"
-    # The bundle is mounted read-only at /src/bundle through hard links in the scratch
-    # (a copy where links cannot cross filesystems), with the mountpoints the wrapper
-    # adds under /src created first, so nothing in buck-out is written.
+    # /src is mounted read-write, as in the cargo flow (--src-rw): hermit writes its
+    # private verify and engagement summaries into its working directory, the bundle's
+    # src/, when no enclosing git checkout ignores `ignored/`. /src/bundle is therefore
+    # a private copy (a reflink on btrfs, about 1 s), never hard links, so nothing in
+    # buck-out is written. The mountpoints the wrapper adds under /src are created first.
     R=$W/root
     mkdir -p "$R/target" "$R/agent-utils/rs/target" "$R/agent-utils/rs/.agent-utils-locks" \
         "$R/agent-utils/rs/.agent-utils-snapshots" "$W/results/buck-cell-out" "$W/pinned" ||
         emit_fatal "cannot create the pinned-root scratch tree"
-    cp -al "$B" "$R/bundle" 2>/dev/null || { rm -rf "${R:?}/bundle"; cp -a --reflink=auto "$B" "$R/bundle"; } ||
+    cp -a --reflink=auto "$B" "$R/bundle" ||
         emit_fatal "cannot place the bundle in the pinned-root scratch tree"
     # Outputs go through the wrapper's /results mount (E2E_RESULT_ROOT).
     out=$W/results/buck-cell-out
@@ -111,7 +113,7 @@ pinned-root)
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 $((deadline + 60)) \
-        "$wrapper" --src "$R" --out "$W/pinned" \
+        "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS -- \
         env E2E_BUILD_ROOT=/src/bundle/build \
