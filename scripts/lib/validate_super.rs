@@ -387,33 +387,66 @@ pub const STRESS_PROBES: &[StressProbe] = &[
 /// `kvm_backend_available` (validate.sh:2272) is a readable+writable `/dev/kvm`;
 /// `dbt_backend_available` (validate.sh:2276) is a real probe run, which is why
 /// it must be a node — at plan time the debug binary does not exist yet.
-fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
+fn availability_nodes(debug_bin: &str, build_dep: &str, reps: i64) -> Vec<Step> {
     let dbg = shell_quote(debug_bin);
     vec![
-        node(
-            "superstress",
-            "kvm_available",
-            "KVM backend availability (gates the KVM stress rows)",
-            "test -r /dev/kvm && test -w /dev/kvm".to_string(),
-            vec![build_dep.to_string()],
-            30,
-            30,
-            256 * 1024 * 1024,
-        ),
-        node(
-            "superstress",
-            "dbt_available",
-            "DBT backend availability (gates the DBT stress rows)",
-            format!(
-                "{dbg} --log=info --backend dbt run --strict --verify -- \
-                 /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
+        described(
+            node(
+                "superstress",
+                "kvm_available",
+                "KVM backend availability (gates the KVM stress rows)",
+                "test -r /dev/kvm && test -w /dev/kvm".to_string(),
+                vec![build_dep.to_string()],
+                30,
+                30,
+                256 * 1024 * 1024,
             ),
-            vec![build_dep.to_string()],
-            60,
-            120,
-            SUPER_PROBE_MEM_BYTES,
+            format!(
+                "Runs `test -r /dev/kvm && test -w /dev/kvm` after {build_dep}, the port of \
+                 validate.sh's kvm_backend_available. Its only dependent is superstress.kvm_verify, \
+                 which runs {reps} repetitions of `hermit --backend kvm run --verify` of /bin/echo \
+                 with the debug binary; when this node fails, that node is skipped and the super \
+                 stress table prints \"SKIP kvm-verify backend unavailable (availability node \
+                 failed; 0/{reps} ran)\". Like the KVM stress node, it is nonblocking in the super \
+                 profile, so a failure is reported but does not turn the run red. A host or container \
+                 without /dev/kvm, or one where the validating user cannot open it read-write, makes \
+                 it fail."
+            ),
+        ),
+        described(
+            node(
+                "superstress",
+                "dbt_available",
+                "DBT backend availability (gates the DBT stress rows)",
+                format!(
+                    "{dbg} --log=info --backend dbt run --strict --verify -- \
+                 /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
+                ),
+                vec![build_dep.to_string()],
+                60,
+                120,
+                SUPER_PROBE_MEM_BYTES,
+            ),
+            format!(
+                "Runs one real DBT run with the debug Hermit after {build_dep}: `hermit --log=info \
+             --backend dbt run --strict --verify -- /bin/echo hermit-dbt-probe`, the port of \
+                 validate.sh's dbt_backend_available. It is a node because the debug binary does not \
+                 exist when the plan is built. Its only dependent is superstress.dbt_verify, {reps} \
+                 repetitions of `hermit --backend dbt run --verify` of /bin/echo; when this probe \
+                 fails, that node is skipped and the super stress table prints \"SKIP dbt-verify \
+                 backend unavailable\". Both nodes are nonblocking in the super profile, so their \
+                 failures are reported, not gated. A strict-mode refusal or a divergence between the \
+                 two runs makes it exit nonzero; its output goes to /dev/null, so the node log does \
+                 not say which."
+            ),
         ),
     ]
+}
+
+/// Attach an inventory paragraph to a node built by [`node`].
+fn described(mut step: Step, description: String) -> Step {
+    step.description = description;
+    step
 }
 
 /// Build every stress node: two availability probes plus one node per probe
@@ -426,7 +459,7 @@ pub fn stress_nodes(
     release_dep: &str,
     debug_dep: &str,
 ) -> Vec<Step> {
-    let mut out = availability_nodes(debug_bin, debug_dep);
+    let mut out = availability_nodes(debug_bin, debug_dep, reps);
     for probe in STRESS_PROBES {
         let stem = probe.job_stem();
         let base_dep = match probe {

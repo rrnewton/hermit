@@ -11677,6 +11677,11 @@ fn generated_focused_compat_partition(
             "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
             fixtures.display()
         );
+    } else if mode == CompatMode::E9patch {
+        prep.description = format!(
+            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after compatprep.hermit_release and the files-only NSS fixture: {REAL_COMPAT_FIXTURE_CONTENTS}. Every {namespace} probe depends on it, and the rows that run tests/compat/real_compat_workload.sh read these run-owned files through REAL_COMPAT_FIXTURES instead of the checkout. A fixture that fails to build or a missing host tool stops the e9patch-compat-only profile before any probe runs.",
+            fixtures.display()
+        );
     }
 
     let mut steps = Vec::new();
@@ -11699,9 +11704,16 @@ fn generated_focused_compat_partition(
             9 * 1024 * 1024 * 1024,
         );
         install.labels = vec![label.into()];
+        install.description = format!(
+            "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The {namespace} probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe."
+        );
         let mut nss = nsswitch_fixture_node(&nsswitch);
         nss.group = format!("{namespace}prep");
         nss.labels = vec![label.into()];
+        nss.description = format!(
+            "Writes a files-only nsswitch.conf (every database, aliases through shadow, set to \"files\") to {} with mkdir and printf. The six probes whoami, groups, pinky, logname, tar and chown bind it read-only over /etc/nsswitch.conf, because they look up user and group names that the host may resolve through an identity daemon; pinning them to files keeps that host race out of the e9patch compatibility measurement. It runs after release_resources, and the lane's fixtures node waits for it. It fails only if the run-state directory cannot be created or written, which shows as a mkdir or printf error.",
+            nsswitch.display()
+        );
         nss.deps = vec![install.tag()];
         prep.deps.push(nss.tag());
         steps.push(install);
@@ -11812,8 +11824,11 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     // sabre-compat-only, run by the static node sabrecompat.manifest_compat
     // against the validation's one Hermit build; this node prepares the files
     // those rows read, at the path the rows name.
-    let mut sabre_prep =
-        prepare_fixtures_node_dep("sabrecompatprep.fixtures", &portable_fixtures, "build.host_hermit_link");
+    let mut sabre_prep = prepare_fixtures_node_dep(
+        "sabrecompatprep.fixtures",
+        &portable_fixtures,
+        "build.host_hermit_link",
+    );
     sabre_prep.group = "sabrecompatprep".into();
     sabre_prep.desc = "Prepare the fixture files the SaBRe run type's compat cells read".into();
     sabre_prep.description = format!(
@@ -11883,6 +11898,15 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     );
     super_prep.group = "super-compatprep".into();
     super_prep.labels = vec!["super".into()];
+    super_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after super.build_release_hermit: {REAL_COMPAT_FIXTURE_CONTENTS}. The super-only compatibility rows ({}) depend on it; the rows that run tests/compat/real_compat_workload.sh read these files through REAL_COMPAT_FIXTURES, and rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops those rows.",
+        super_fixtures.display(),
+        validate_corpus::portable_super_only()
+            .keys()
+            .map(|label| format!("compat.{label}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     steps.push(super_prep);
     let only = validate_corpus::portable_super_only()
         .keys()

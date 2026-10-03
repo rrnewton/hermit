@@ -713,7 +713,24 @@ pub fn compat_nodes_for(
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
         argv.extend(mode.run_args(&row.label, nsswitch));
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
-        out.push(node(
+        let description = match mode {
+            CompatMode::E9patch => format!(
+                "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
+                mode.corpus_name()
+            ),
+            CompatMode::PortableStrict => match super_only.get(row.label.as_str()) {
+                Some(workload) if only.is_some() => format!(
+                    "Runs the {label} row of the portable strict compatibility corpus, a {workload}, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's {COMPAT_TIMEOUT_S}-second budget; here it gets {wall} seconds and runs after {fixtures}, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
+                    label = row.label,
+                    fixtures = gate_dep.unwrap_or("its fixtures node"),
+                ),
+                _ => format!(
+                    "Runs the {label} row of the portable strict compatibility corpus as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend, comparing the two runs with the Stripped comparator of plain --verify. A syscall strict mode refuses or output that differs between the runs turns it red.",
+                    label = row.label,
+                ),
+            },
+        };
+        let mut step = node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.display_name(), row.label),
@@ -726,7 +743,9 @@ pub fn compat_nodes_for(
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
-        ));
+        );
+        step.description = description;
+        out.push(step);
     }
     if out.is_empty() {
         return Err(format!("compatibility mode {mode:?} selected zero probes"));
