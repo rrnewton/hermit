@@ -11,9 +11,9 @@
 // directory absent from the replay chroot, so replay hands the guest a
 // placeholder descriptor: a live fsync, fchmod or fgetxattr there answers
 // EINVAL or EOPNOTSUPP instead of the recorded result. The second file exists
-// in the replay root, where descriptor and path xattr calls must agree. Every result is checked
-// against its expected value, so record and replay cannot agree on a wrong
-// failure and still pass.
+// in the replay root, where descriptor and path xattr calls must agree. Every
+// result is checked against its expected value, so record and replay cannot
+// agree on a wrong failure and still pass.
 
 #define _GNU_SOURCE
 
@@ -33,7 +33,8 @@
 static int failures;
 
 // Print a result and require it to succeed (expected_errno == 0) or to fail
-// with expected_errno.
+// with expected_errno. A call with one correct success value uses
+// expect_value instead, so any other nonnegative result fails.
 static void expect(const char* name, long result, int expected_errno) {
   int actual_errno = result < 0 ? errno : 0;
   if (result < 0) {
@@ -102,13 +103,13 @@ int main(int argc, char** argv) {
   expect_value("pread-null-zero", syscall(SYS_pread64, fd, NULL, 0, 0), 0);
   expect_value("read-eof-null", syscall(SYS_read, fd, NULL, 16), 0);
 
-  expect("fsync", fsync(fd), 0);
-  expect("fdatasync", fdatasync(fd), 0);
-  expect("syncfs", syncfs(fd), 0);
-  expect("fchmod", fchmod(fd, 0600), 0);
-  expect("fchown", fchown(fd, -1, -1), 0);
+  expect_value("fsync", fsync(fd), 0);
+  expect_value("fdatasync", fdatasync(fd), 0);
+  expect_value("syncfs", syncfs(fd), 0);
+  expect_value("fchmod", fchmod(fd, 0600), 0);
+  expect_value("fchown", fchown(fd, -1, -1), 0);
 
-  expect("fsetxattr", fsetxattr(fd, NAME, VALUE, strlen(VALUE), 0), 0);
+  expect_value("fsetxattr", fsetxattr(fd, NAME, VALUE, strlen(VALUE), 0), 0);
   // A zero size asks only for the length; the buffer is not touched.
   expect_value(
       "fgetxattr-size", fgetxattr(fd, NAME, NULL, 0), (long)strlen(VALUE));
@@ -129,7 +130,10 @@ int main(int argc, char** argv) {
   long listed = flistxattr(fd, buf, sizeof(buf));
   expect_list("flistxattr", listed, buf);
   if (listed != size) {
-    printf("UNEXPECTED flistxattr: %ld bytes, size query said %ld\n", listed, size);
+    printf(
+        "UNEXPECTED flistxattr: %ld bytes, size query said %ld\n",
+        listed,
+        size);
     failures++;
   }
   memset(buf, 0, sizeof(buf));
@@ -137,16 +141,16 @@ int main(int argc, char** argv) {
   memset(buf, 0, sizeof(buf));
   expect_list("llistxattr", llistxattr(path, buf, sizeof(buf)), buf);
 
-  expect("fremovexattr", fremovexattr(fd, NAME), 0);
+  expect_value("fremovexattr", fremovexattr(fd, NAME), 0);
   expect("fgetxattr-removed", fgetxattr(fd, NAME, buf, sizeof(buf)), ENODATA);
 
   struct stat st;
-  expect("fstat", fstat(fd, &st), 0);
+  expect_value("fstat", fstat(fd, &st), 0);
   if ((st.st_mode & 07777) != 0600) {
     printf("UNEXPECTED fstat mode %o\n", st.st_mode & 07777);
     failures++;
   }
-  close(fd);
+  expect_value("close", close(fd), 0);
 
   // A file the guest creates in its working directory exists in the replay
   // root too (replay enters the recorded directory), so path calls there run
@@ -157,25 +161,26 @@ int main(int argc, char** argv) {
   }
   int local = open("local", O_CREAT | O_RDWR | O_TRUNC, 0644);
   expect("open-local", local, 0);
-  expect("local-fsetxattr", fsetxattr(local, NAME, VALUE, strlen(VALUE), 0), 0);
-  expect("local-removexattr", removexattr("local", NAME), 0);
+  expect_value(
+      "local-fsetxattr", fsetxattr(local, NAME, VALUE, strlen(VALUE), 0), 0);
+  expect_value("local-removexattr", removexattr("local", NAME), 0);
   expect("local-fremovexattr-gone", fremovexattr(local, NAME), ENODATA);
-  expect("local-fsetxattr-again", fsetxattr(local, NAME, "v2", 2, 0), 0);
+  expect_value("local-fsetxattr-again", fsetxattr(local, NAME, "v2", 2, 0), 0);
   expect(
       "local-setxattr-create",
       setxattr("local", NAME, VALUE, strlen(VALUE), XATTR_CREATE),
       EEXIST);
-  expect(
+  expect_value(
       "local-lsetxattr-replace",
       lsetxattr("local", NAME, VALUE, strlen(VALUE), XATTR_REPLACE),
       0);
   memset(buf, 0, sizeof(buf));
   expect_xattr_value(
       "local-fgetxattr", fgetxattr(local, NAME, buf, sizeof(buf)), buf);
-  expect("local-lremovexattr", lremovexattr("local", NAME), 0);
+  expect_value("local-lremovexattr", lremovexattr("local", NAME), 0);
   expect("local-fremovexattr-after", fremovexattr(local, NAME), ENODATA);
-  expect("local-fchmod", fchmod(local, 0600), 0);
-  close(local);
+  expect_value("local-fchmod", fchmod(local, 0600), 0);
+  expect_value("close-local", close(local), 0);
 
   printf("failures=%d\n", failures);
   return failures ? 1 : 0;
