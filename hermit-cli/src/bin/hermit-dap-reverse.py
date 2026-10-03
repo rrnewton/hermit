@@ -240,24 +240,39 @@ def _recording():
     return not _suppress_events or _advancing
 
 
+# The frame identity holds the newest _FRAME_IDENTITY_DEPTH frames: frame 0
+# and up to 7 of its callers. The cap exists because the identity is taken at
+# every line arrival the history records during forward execution, and GDB
+# spends about 60 microseconds unwinding each frame. A full chain therefore
+# makes a forward run cost the square of the stack depth: one continue past a
+# recursion 1000 deep took 121.79 s with the full chain and 4.77 s with the
+# cap (devbig030, GDB 17.2). With the cap the cost per arrival is bounded.
+_FRAME_IDENTITY_DEPTH = 8
+
+
 def _frame_identity():
     # The frame identity of a history entry: a (pc, stack pointer) pair for
-    # every frame of the stopped thread, newest first. An older frame's pc is
-    # its return address and its stack pointer is the canonical frame address
-    # of the frame it called. A deterministic replay reaches the same
-    # execution point with the same chain every time.
+    # each of the newest _FRAME_IDENTITY_DEPTH frames of the stopped thread,
+    # newest first. An older frame's pc is its return address and its stack
+    # pointer is the canonical frame address of the frame it called. A
+    # deterministic replay reaches the same execution point with the same
+    # chain every time.
     #
     # The chain tells apart two activations of one function at different call
     # depths (recursion: the stack pointers differ) and two calls from
     # different call sites at the same depth (sibling calls: a caller's
-    # return address differs). It cannot tell apart two passes of a loop in
-    # one activation, or two calls from the same call site at the same depth
-    # (a call inside a loop): their chains are equal. GDB stops unwinding at
-    # main by default, so frames that called main are not part of the chain.
+    # return address differs), as long as that caller is among the newest
+    # _FRAME_IDENTITY_DEPTH frames. It cannot tell apart two passes of a loop
+    # in one activation, two calls from the same call site at the same depth
+    # (a call inside a loop), or two arrivals whose newest frames are all
+    # equal and which differ only further out (the same helper chain more
+    # than _FRAME_IDENTITY_DEPTH frames deep, entered from two call sites in
+    # one caller): their chains are equal. GDB stops unwinding at main by
+    # default, so frames that called main are never part of the chain.
     identity = []
     try:
         frame = gdb.newest_frame()
-        while frame is not None:
+        while frame is not None and len(identity) < _FRAME_IDENTITY_DEPTH:
             identity.append((int(frame.pc()), int(frame.read_register("sp"))))
             frame = frame.older()
     except (gdb.error, AttributeError, ValueError):

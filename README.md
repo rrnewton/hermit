@@ -387,23 +387,34 @@ breakpoint up to 7 bytes after it was erased for the rest of that resume. That
 was fixed in https://github.com/rrnewton/reverie/pull/890.
 
 As a check on the count, the adapter records a frame identity with every stop
-and line arrival: the program counter and stack pointer of each frame GDB
-unwinds, from the innermost frame out to `main` (GDB does not unwind past
-`main` by default). When it replays to a stop, it compares the identity where
-the replay landed. If they differ, it puts the replay back at the client's
-current stop, sends a `stopped` event for it, and fails the `stepBack` or
-`reverseContinue` with an error saying it could not reach the earlier stop
-exactly. If it cannot put the replay back either, the request fails and the
-adapter ends the session: it sends an `output` event saying why, then
-`terminated`.
+and line arrival: the program counter and stack pointer of the innermost
+frame and of up to 7 of its callers, 8 frames at most (GDB does not unwind
+past `main` by default, so a shallower stack gives fewer). When it replays to
+a stop, it compares the identity where the replay landed. If they differ, it
+puts the replay back at the client's current stop, sends a `stopped` event for
+it, and fails the `stepBack` or `reverseContinue` with an error saying it
+could not reach the earlier stop exactly. If it cannot put the replay back
+either, the request fails and the adapter ends the session: it sends an
+`output` event saying why, then `terminated`.
 
 The frame identity tells apart two activations of a function at different
 call depths, such as recursive calls, and two calls at the same depth from
-different call sites, such as `g(1)` and `g(2)` on consecutive lines. It
-cannot tell apart two passes through the same activation, such as two
-iterations of a loop, or two calls from the same call site at the same depth,
-such as a call inside a loop. Their identities are equal, so a wrong count
-there would land at the wrong pass without an error.
+different call sites, such as `g(1)` and `g(2)` on consecutive lines, as long
+as the calling frame is among the 8. It cannot tell apart two passes through
+the same activation, such as two iterations of a loop, two calls from the
+same call site at the same depth, such as a call inside a loop, or two
+arrivals whose 8 innermost frames are all equal and which differ only further
+out, such as the same chain of helper calls more than 8 frames deep entered
+from two call sites in one caller. Their identities are equal, so a wrong
+count there would land at the wrong pass without an error.
+
+The identity is limited to 8 frames because the adapter takes it at every
+line arrival while the replay runs forward, and unwinding every frame made
+forward execution cost the square of the stack depth. Measured on devbig030
+with GDB 17.2, one `continue` past a recursion 300 calls deep took 12.15 s
+with every frame and 1.59 s with 8; past a recursion 1000 calls deep it took
+121.79 s with every frame and 4.77 s with 8. A `stepBack` from there took
+1.0 s at depth 300 and 1.3 s at depth 1000 either way.
 
 ```bash
 dapper proxy --control-port 4711 from-config hermit-dap-replay.json
