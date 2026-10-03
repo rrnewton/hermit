@@ -125,6 +125,31 @@ jobs:
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
         rustup toolchain install "$channel" --profile minimal
         RUSTUP_TOOLCHAIN="$channel" cargo install rust-script --version 0.36.0 --locked
+    - name: Add swap for the compatibility rebuild
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      timeout-minutes: 5
+      # The rebuild's projection child peaked at 13.85 GB on 2026-10-03 (9.77 GB
+      # on 2026-10-01), and the step's cgroup reached ~16.2 GB of the runner's
+      # 16.77 GB. The next two runs ran out of memory in stage1.projection
+      # (https://github.com/rrnewton/dev-hermit/issues/515). This swap is the
+      # stopgap until the projection streams its input; remove it then.
+      run: |
+        set -euo pipefail
+        swapfile=/mnt/compatibility-rebuild.swap
+        free -g
+        df -h /mnt
+        sudo fallocate -l 16G "$swapfile"
+        sudo chmod 600 "$swapfile"
+        sudo mkswap "$swapfile"
+        sudo swapon "$swapfile"
+        size=$(swapon --show=NAME,SIZE --bytes --noheadings | awk -v f="$swapfile" '$1 == f { print $2 }')
+        if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size < 16 * 1024 * 1024 * 1024 - 4096 )); then
+          echo "::error::swapfile $swapfile is not active at 16 GiB (swapon reports '${size}')"
+          swapon --show
+          exit 1
+        fi
+        swapon --show
+        free -g
     - name: Rebuild from the current published cell ledger
       id: website-rebuild
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
