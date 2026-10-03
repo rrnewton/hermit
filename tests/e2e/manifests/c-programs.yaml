@@ -12157,10 +12157,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor returns ENOTTY for the FIONREAD pipe ioctl; FIONBIO is supported
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -13230,10 +13230,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor does not implement preadv2/pwritev2 (syscalls 327/328); it returns ENOSYS, mirroring its missing classic pwritev/preadv
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -14113,10 +14113,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_THP_DISABLE/PR_GET_THP_DISABLE; ptrace and DBT drive the full transparent-hugepage flag round-trip
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -14939,13 +14939,14 @@ test:
         ci:
           ptrace: true
           dbt: false
+          kvm: true
           liteinst: true
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
           - liteinst
         backends_disabled:
-          kvm: 'inherited from the L1 KVM prctl_identity gap: PR_SET_NAME returns ENOSYS so the guest exits non-zero and there is no L2 run to verify'
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
         ci_disabled_reason:
           dbt:
@@ -15340,10 +15341,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor returns deterministic ENOSYS for pwritev/preadv (positioned vectored I/O); plain writev/readv are supported but the positioned variants are not
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -15464,10 +15465,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor returns ENOSYS for fchmodat2 (syscall 452); ptrace and DBT forward it to the host
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
