@@ -75,15 +75,19 @@ provisioned=(
   ".initramfs-version"         # initramfs cache version
 )
 
-# Temporary files an interrupted run may leave behind.
+# Temporary files an interrupted run may leave behind. Each pattern is quoted
+# whole, so it stays a pattern here and is expanded only under the asset
+# directory below. With the `*` outside the quotes, it would expand here,
+# against the directory clean.sh was started from, and the names it matched
+# there would be removed instead.
 transient_globs=(
-  "run-metadata.json.tmp."*
-  "hermit-boot.qcow2.tmp."*
-  ".bzImage."*
-  ".initramfs.cpio.gz."*
-  ".initramfs-version."*
-  ".vmlinux."*
-  ".vmlinux-types."*
+  "run-metadata.json.tmp.*"
+  "hermit-boot.qcow2.tmp.*"
+  ".bzImage.*"
+  ".initramfs.cpio.gz.*"
+  ".initramfs-version.*"
+  ".vmlinux.*"
+  ".vmlinux-types.*"
 )
 
 # Result directories under target/ for demos that do not use the asset
@@ -120,6 +124,8 @@ if [ -d "$ASSETS" ]; then
     remove_path "$ASSETS/$name"
   done
 
+  # $glob is unquoted so that it expands, to nothing when nothing matches; the
+  # patterns contain no spaces, so splitting leaves each one a single word.
   shopt -s nullglob
   for glob in "${transient_globs[@]}"; do
     for path in "$ASSETS"/$glob; do
