@@ -13,10 +13,10 @@
   "counts": {
     "all": {
       "cells": 3700,
-      "applicable": 853,
-      "selectable": 537,
-      "selected": 204,
-      "selected_selectable": 187
+      "applicable": 854,
+      "selectable": 538,
+      "selected": 205,
+      "selected_selectable": 188
     },
     "by_backend": {
       "dbt": {
@@ -28,10 +28,10 @@
       },
       "kvm": {
         "cells": 925,
-        "applicable": 260,
-        "selectable": 253,
-        "selected": 87,
-        "selected_selectable": 86
+        "applicable": 261,
+        "selectable": 254,
+        "selected": 88,
+        "selected_selectable": 87
       },
       "liteinst": {
         "cells": 925,
@@ -211,7 +211,7 @@
     {"test_id":"c-programs/epoll-determinism","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/epoll-determinism","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/epoll-pwait2","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/epoll-pwait2","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor returns deterministic ENOSYS for epoll_pwait2 (syscall 441); it implements the classic epoll_wait but not the newer wait entry point"},
+    {"test_id":"c-programs/epoll-pwait2","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/epoll-pwait2","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/epoll-pwait2","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/epoll-readiness","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
