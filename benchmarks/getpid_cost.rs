@@ -1260,18 +1260,24 @@ mod tests {
         assert_eq!(median_and_mad(&[1.0, 2.0, 3.0, 100.0]), (2.5, 1.0));
     }
 
-    /// A LiteInst record in the shape reverie prints, with `direct` hooked
-    /// calls and `trapped` first-site traps.
+    /// A LiteInst record in the shape Hermit prints at reverie d766df20, with
+    /// `direct` hooked calls and `trapped` first-site traps. The trailing
+    /// `dispatch=` field is the shared dispatch record; only the `paths[...]`
+    /// list before it is read.
     fn liteinst_record(direct: u64, trapped: u64) -> String {
         format!(
-            "x INFO backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 distinct_rips_patched=1 patch_candidates=1 decisions[direct_pun=1,relocated=0,straddler_fallback=0,other_fallback=0] paths[first_site_seccomp={trapped},ptrace_installation=0,in_guest_sigsys=0,direct_hook={direct},fallback_refusal=0] classified_candidates=1"
+            "x DEBUG backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 distinct_rips_patched=1 patch_candidates=1 decisions[direct_pun=1,relocated=0,straddler_fallback=0,other_fallback=0] paths[first_site_seccomp={trapped},ptrace_installation=0,in_guest_sigsys=0,in_guest_nested_sigsys=0,in_guest_nested_hook=0,in_guest_physical_sigsys=0,fallback_completion_sigsys=0,cacheline_straddler=0,unpatchable_or_other=0,direct_hook={direct},fallback_refusal=0,patching_disabled=0] classified_candidates=1 cacheline_straddlers=0 non_straddling=1 instruction_lengths[2=1] straddle_prefix[] dispatch=dispatch stats v1 backend=liteinst dispatches={dispatches} trapped={trapped} direct={direct} [signal_traps=0 patched_direct_calls={direct} ptrace_seccomp_stops={trapped} ptrace_sigtrap_stops={direct} sigill_marker_hits=0 ptrace_syscall_entry_stops=0 ptrace_syscall_exit_stops=0 refusals=0] sites[candidates=1 patched=1 fell_back=0] processes=1",
+            dispatches = direct + trapped
         )
     }
+
+    /// A ptrace record in the shape Hermit prints at reverie d766df20.
+    const PTRACE_RECORD: &str = "x DEBUG backend run complete backend=ptrace stats=ptrace activity stats: tracees_started=1 stop_events=40 exited_tracees=1 seccomp_stops=38 signal_stops=0 exec_stops=1 child_stops[fork=0,vfork=0,clone=0] vfork_done_stops=0 dispatch=dispatch stats v1 backend=ptrace dispatches=38 trapped=38 direct=0 [signal_traps=0 patched_direct_calls=0 ptrace_seccomp_stops=38 ptrace_sigtrap_stops=0 sigill_marker_hits=0 ptrace_syscall_entry_stops=0 ptrace_syscall_exit_stops=0 refusals=0] sites[candidates=0 patched=0 fell_back=0] processes=1";
 
     #[test]
     fn check_stats_run_needs_one_record_for_its_own_backend() {
         let own = liteinst_record(100, 1);
-        let other = "x INFO backend run complete backend=ptrace stats=metrics=none".to_string();
+        let other = PTRACE_RECORD.to_string();
         assert_eq!(
             check_stats_run("liteinst", &Outcome::Ok, &[own.clone()]),
             Ok(Some(100))
@@ -1296,9 +1302,9 @@ mod tests {
     fn check_stats_run_refuses_a_liteinst_record_without_a_direct_hook_count() {
         // A record without a readable paths list, or without direct_hook, is
         // refused rather than read as zero.
-        let bare = "x INFO backend run complete backend=liteinst stats=LiteInst ...".to_string();
+        let bare = "x DEBUG backend run complete backend=liteinst stats=LiteInst ...".to_string();
         assert!(check_stats_run("liteinst", &Outcome::Ok, &[bare]).is_err());
-        let no_hook = "x INFO backend run complete backend=liteinst stats=LiteInst paths[first_site_seccomp=1]".to_string();
+        let no_hook = "x DEBUG backend run complete backend=liteinst stats=LiteInst paths[first_site_seccomp=1]".to_string();
         assert!(
             check_stats_run("liteinst", &Outcome::Ok, &[no_hook])
                 .unwrap_err()
@@ -1392,7 +1398,7 @@ mod tests {
         // Other backends have no zero-call run and are judged on their own
         // record alone.
         let mut baseline = None;
-        let ptrace = ["x INFO backend run complete backend=ptrace stats=metrics=none".to_string()];
+        let ptrace = [PTRACE_RECORD.to_string()];
         assert_eq!(
             stats_verdict("ptrace", 100, &Outcome::Ok, &ptrace, &mut baseline),
             Ok(())
@@ -1430,8 +1436,15 @@ mod tests {
                 ("first_site_seccomp".to_string(), 1),
                 ("ptrace_installation".to_string(), 0),
                 ("in_guest_sigsys".to_string(), 0),
+                ("in_guest_nested_sigsys".to_string(), 0),
+                ("in_guest_nested_hook".to_string(), 0),
+                ("in_guest_physical_sigsys".to_string(), 0),
+                ("fallback_completion_sigsys".to_string(), 0),
+                ("cacheline_straddler".to_string(), 0),
+                ("unpatchable_or_other".to_string(), 0),
                 ("direct_hook".to_string(), 7),
                 ("fallback_refusal".to_string(), 0),
+                ("patching_disabled".to_string(), 0),
             ]
         );
         assert_eq!(dispatch_paths("no list here"), None);
@@ -1441,11 +1454,8 @@ mod tests {
 
     #[test]
     fn stats_records_keeps_only_marked_lines() {
-        let stderr = "noise\nbackend run complete backend=ptrace stats=metrics=none\nmore\n";
-        assert_eq!(
-            stats_records(stderr),
-            ["backend run complete backend=ptrace stats=metrics=none"]
-        );
+        let stderr = format!("noise\n{PTRACE_RECORD}\nmore\n");
+        assert_eq!(stats_records(&stderr), [PTRACE_RECORD]);
         assert!(stats_records("").is_empty());
     }
 
