@@ -2617,11 +2617,22 @@ async fn dispatch_backend(
         #[cfg(feature = "liteinst")]
         {
             let preload = liteinst_runtime_library_path()?;
-            let (exit_status, mut global_state) =
-                reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                    command, config, preload,
-                )
-                .await?;
+            let stats_request = backend_stats::request();
+            let (exit_status, mut global_state, stats) = if stats_request.is_enabled() {
+                let (exit_status, global_state, stats) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (exit_status, global_state, Some(stats))
+            } else {
+                let (exit_status, global_state) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (exit_status, global_state, None)
+            };
             if liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
@@ -2629,6 +2640,11 @@ async fn dispatch_backend(
             global_state
                 .clean_up(print_summary, print_summary_to_json_file)
                 .await;
+            backend_stats::report(
+                backend,
+                stats_request,
+                &backend_stats::LiteinstStatsSource(stats),
+            );
             return Ok(exit_status);
         }
         #[cfg(not(feature = "liteinst"))]
@@ -2876,11 +2892,22 @@ async fn dispatch_output_backend(
         {
             command.stdin(output_backend_stdin()?);
             let preload = liteinst_runtime_library_path()?;
-            let (output, mut global_state) =
-                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                    command, config, preload,
-                )
-                .await?;
+            let stats_request = backend_stats::request();
+            let (output, mut global_state, stats) = if stats_request.is_enabled() {
+                let (output, global_state, stats) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+                        Detcore,
+                    >(command, config, preload)
+                    .await?;
+                (output, global_state, Some(stats))
+            } else {
+                let (output, global_state) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (output, global_state, None)
+            };
             let status = output.status;
             if liteinst_requires_forced_shutdown(status) {
                 global_state.force_shutdown_with_error();
@@ -2889,6 +2916,11 @@ async fn dispatch_output_backend(
             global_state
                 .clean_up(print_summary, print_summary_to_json_file)
                 .await;
+            backend_stats::report(
+                backend,
+                stats_request,
+                &backend_stats::LiteinstStatsSource(stats),
+            );
             return Ok(Output {
                 status,
                 stdout: output.stdout,
