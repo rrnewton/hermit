@@ -781,9 +781,128 @@ impl KernelSignalState {
 
 /// Read `tid`'s signal state from the kernel.
 pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalState, Errno> {
+    #[cfg(test)]
+    if let Some(result) = signal_state_read_seam::scripted(pid, tid) {
+        return result;
+    }
     let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
     let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
     KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// Why a blocked wait ended the run instead of returning to the guest
+/// (https://github.com/rrnewton/hermit/issues/3146). A wait call cannot return
+/// the underlying error natively, and resuming the guest after the second
+/// failure would leave every blockable signal blocked in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedWaitSignalError {
+    /// The thread still exists, but its signal state could not be read from
+    /// `/proc` (`errno` is `ESRCH` for an unreadable file, `EIO` for one that
+    /// does not parse).
+    StateUnreadable { pid: Pid, tid: Pid, errno: Errno },
+    /// The guest's own signal mask could not be put back after the wait blocked
+    /// every signal. `last_error` is the last injected call's error.
+    MaskNotRestored {
+        pid: Pid,
+        tid: Pid,
+        attempts: usize,
+        last_error: Option<Errno>,
+    },
+}
+
+impl std::fmt::Display for BlockedWaitSignalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StateUnreadable { pid, tid, errno } => write!(
+                f,
+                "cannot read the signal state of guest thread {tid} (process {pid}) from \
+                 /proc while it waits: {errno}"
+            ),
+            Self::MaskNotRestored {
+                pid,
+                tid,
+                attempts,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "cannot restore the signal mask of guest thread {tid} (process {pid}) \
+                     after a blocked wait ({attempts} attempts"
+                )?;
+                if let Some(errno) = last_error {
+                    write!(f, ", last error {errno}")?;
+                }
+                f.write_str("); it would resume with every signal blocked")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockedWaitSignalError {}
+
+/// Whether thread `tid` of process `pid` no longer exists.
+fn guest_thread_is_gone(pid: Pid, tid: Pid) -> bool {
+    // SAFETY: signal 0 only checks that the thread exists and may be signalled.
+    let result = unsafe { libc::syscall(libc::SYS_tgkill, pid.as_raw(), tid.as_raw(), 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Read the signal state of `tid`, which is stopped inside a blocked wait.
+///
+/// The read's own error never reaches the guest, because no wait call returns
+/// `ESRCH` or `EIO` for it. If the thread no longer exists (it was killed while
+/// it waited), the call ends with `ERESTARTNOINTR`, which no thread observes.
+/// Otherwise the run ends with [`BlockedWaitSignalError::StateUnreadable`].
+pub(crate) fn read_wait_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalState, Error> {
+    match read_kernel_signal_state(pid, tid) {
+        Ok(state) => Ok(state),
+        Err(_) if guest_thread_is_gone(pid, tid) => Err(Errno::ERESTARTNOINTR.into()),
+        Err(errno) => Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::StateUnreadable { pid, tid, errno },
+        ))),
+    }
+}
+
+/// A test seam in front of the `/proc` read in [`read_kernel_signal_state`].
+#[cfg(test)]
+pub(crate) mod signal_state_read_seam {
+    use std::cell::RefCell;
+
+    use reverie::Pid;
+    use reverie::syscalls::Errno;
+
+    use super::KernelSignalState;
+
+    type Script = Box<dyn FnMut(Pid, Pid) -> Option<Result<KernelSignalState, Errno>>>;
+
+    thread_local! {
+        static SCRIPT: RefCell<Option<Script>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the installed script when dropped.
+    pub(crate) struct Installed(());
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            SCRIPT.with(|script| script.borrow_mut().take());
+        }
+    }
+
+    /// Answer this thread's reads with `script`; `None` falls through to `/proc`.
+    pub(crate) fn install(
+        script: impl FnMut(Pid, Pid) -> Option<Result<KernelSignalState, Errno>> + 'static,
+    ) -> Installed {
+        SCRIPT.with(|slot| *slot.borrow_mut() = Some(Box::new(script)));
+        Installed(())
+    }
+
+    pub(super) fn scripted(pid: Pid, tid: Pid) -> Option<Result<KernelSignalState, Errno>> {
+        SCRIPT.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .and_then(|script| script(pid, tid))
+        })
+    }
 }
 
 /// Whether the scheduler tracks which pending `SIGCHLD`s a gated wait may count.
@@ -1611,9 +1730,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // reads them when it commits a wake, not here
                         // (https://github.com/rrnewton/hermit/issues/3146).
                         let signal_watch = if signal_interruption {
-                            let state = match read_kernel_signal_state(guest.pid(), guest.tid()) {
+                            // A failed read is never the call's errno
+                            // (`read_wait_signal_state`).
+                            let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
                                 Ok(state) => state,
-                                Err(errno) => break Err(Error::Errno(errno)),
+                                Err(error) => break Err(error),
                             };
                             // A timed `FUTEX_WAIT` lets a default job-control stop
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
