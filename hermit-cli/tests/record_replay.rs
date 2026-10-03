@@ -2218,14 +2218,13 @@ fn record_refuses_a_removed_working_directory() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_ne!(
+    // The refusal is a recorder panic, which exits with the internal-failure
+    // status. Anything else, including timeout's 124 or a SIGKILL after a
+    // hang, is not the refusal this test pins.
+    assert_eq!(
         output.status.code(),
-        Some(124),
-        "removed-cwd recording hung: {rendered}"
-    );
-    assert!(
-        !output.status.success(),
-        "removed-cwd recording reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "removed-cwd recording did not refuse with the internal-failure status: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stderr.contains("has been removed"),
