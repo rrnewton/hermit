@@ -34,6 +34,7 @@ use reverie::syscalls::ProtFlags;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
+use reverie::syscalls::StatxMask;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -2987,7 +2988,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     //   - using virtual inode instead of real inodes. The virtual inodes
     //     increase monolitically and won't be re-used (like ext4)
     //   - use logical modtime which could be used by program like GNU make
-    //     to determine file changes
+    //     to determine file changes. A file first seen with a canonical host
+    //     mtime (`CANONICAL_FILE_MTIME_SECONDS`, e.g. the Nix store's 1) keeps
+    //     it; any other first-seen file reports the epoch.
+    //   - atime, ctime and btime always report the epoch: the kernel sets ctime
+    //     and btime itself, so even for a Nix store file they are real
+    //     timestamps, and Hermit keeps no per-file atime.
     async fn determinize_stat<G, S>(
         &self,
         guest: &mut G,
@@ -3002,6 +3008,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let mut stat: DetStat = stat.into();
         let (d_ino, global_mtime) = match inode_override {
+            // The container's stdio streams have fixed inodes and always
+            // report the epoch: whatever backs them on the host (a pipe, a
+            // terminal, a redirected file) is not part of the guest's view.
             Some(inode) => {
                 let nanos = cfg
                     .epoch
@@ -3010,7 +3019,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     as u64;
                 (inode, LogicalTime::from_nanos(nanos))
             }
-            None => determinize_inode(guest, stat.inode).await,
+            None => {
+                // statx fills stx_mtime only when it reports STATX_MTIME.
+                let observed = if stat.mask.contains(StatxMask::STATX_MTIME) {
+                    ObservedMtime::from_host_mtime(stat.mtime.tv_sec, stat.mtime.tv_nsec)
+                } else {
+                    ObservedMtime::Unobserved
+                };
+                determinize_inode_observing_mtime(guest, stat.inode, observed).await
+            }
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
 

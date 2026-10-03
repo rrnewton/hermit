@@ -696,7 +696,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The dispatch_stats binary adds ptrace_reports_seccomp_stops_and_no_patching
     // and debug_log_carries_the_report_without_a_summary_file; both retain all
     // 189 prior identities.
-    ("test.hermit_integration", 191),
+    // first_seen_mtime adds the canonical first-seen mtime and cp -p tests
+    // (https://github.com/rrnewton/hermit/issues/3639); they retain all 191
+    // prior identities.
+    ("test.hermit_integration", 193),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -842,7 +845,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3534).
     // The host twin also selects the two dispatch_stats tests
     // (https://github.com/rrnewton/hermit/pull/3522).
-    ("test.hermit_integration_on_host", 191),
+    // The host twin also selects the two first_seen_mtime tests
+    // (https://github.com/rrnewton/hermit/issues/3639).
+    ("test.hermit_integration_on_host", 193),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -3320,7 +3325,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test first_seen_mtime --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -3340,6 +3345,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"epoll_determinism"########,
             r########"epoll_pwait_zero_timeout_progress"########,
             r########"file_nr_determinism"########,
+            r########"first_seen_mtime"########,
             r########"fp_reduction_determinism"########,
             r########"futex2_refusal"########,
             r########"hashseed_determinism"########,

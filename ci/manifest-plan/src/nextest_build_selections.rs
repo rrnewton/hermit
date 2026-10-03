@@ -82,6 +82,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "file_nr_determinism",
             "--test",
+            "first_seen_mtime",
+            "--test",
             "fp_reduction_determinism",
             "--test",
             "futex2_refusal",
@@ -603,7 +605,20 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "191");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "193");
+            // The canonical first-seen mtime regression
+            // (https://github.com/rrnewton/hermit/issues/3639).
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "first_seen_mtime"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "first_seen_mtime")
+            );
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "reopened_pipe_progress"])
