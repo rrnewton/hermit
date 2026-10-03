@@ -62,6 +62,9 @@ static __attribute__((noinline)) s64 exe_observe(struct task_struct *task,
 /* Called only by the existing actual ptrace_request entry/return observers.
  * No opcode from a helper return or userspace callback synthesizes this event. */
 static __attribute__((noinline)) int executable_source_enter(u64 *ctx,struct ap_task_command *c) {
+    /* Only the armed PRSTATUS GET belongs to this command. The backend's
+     * separate XSTATE capture may run before collection of this receipt. */
+    if(ctx[1]!=AP_PTRACE_GETREGSET || ctx[2]!=AP_NT_PRSTATUS)return 0;
     struct task_struct *task=(struct task_struct *)ctx[0];
     u32 slot=ap_command_slot(c->command);
     struct ap_executable_source *e=lookup(&executable_sources,&slot);
@@ -86,6 +89,7 @@ static __attribute__((noinline)) int executable_source_enter(u64 *ctx,struct ap_
     return 0;
 }
 static __attribute__((noinline)) int executable_source_returned(u64 *ctx,struct ap_task_command *c) {
+    if(ctx[1]!=AP_PTRACE_GETREGSET || ctx[2]!=AP_NT_PRSTATUS)return 0;
     struct task_struct *task=(struct task_struct *)ctx[0];u32 slot=ap_command_slot(c->command);
     struct ap_executable_source *e=lookup(&executable_sources,&slot);
     struct ap_command_result *r=result(c->command);

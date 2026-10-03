@@ -86,6 +86,46 @@ static void phase(bool exit,s64 raw) {
 }
 #define CHECK(x) do {assert(x);checks++;} while(0)
 #define VALID() ap_executable_source_matches(&submitted,&completion,&row,AP_GROUPED_CONNECT_IMAGE)
+static void unrelated_ptrace_requests(void) {
+    for(unsigned stage=0;stage<3;stage++) {
+        reset();
+        if(stage>=1)phase(false,0);
+        if(stage>=2)phase(true,0);
+        const struct ap_executable_source saved_row=row;
+        const struct ap_command_result saved_completion=completion;
+        const struct ap_task_command saved_submitted=submitted;
+        const unsigned saved_published=published,saved_find_calls=find_calls;
+        const u64 saved_failures=failures;
+        for(unsigned other=0;other<2;other++) {
+            /* The backend must perform its real XSTATE GET after PRSTATUS.
+             * Neither that request nor another ptrace operation belongs to
+             * this command, even before ENTERED or after DONE before collect. */
+            u64 ctx[]={(u64)&target,other?AP_PTRACE_GETREGSET+1:AP_PTRACE_GETREGSET,
+                other?AP_NT_PRSTATUS:0x202,0xdeadbeef,0};
+            executable_source_enter(ctx,&submitted);
+            CHECK(!memcmp(&row,&saved_row,sizeof(row)) &&
+                !memcmp(&completion,&saved_completion,sizeof(completion)) &&
+                !memcmp(&submitted,&saved_submitted,sizeof(submitted)) &&
+                published==saved_published && find_calls==saved_find_calls && failures==saved_failures);
+            executable_source_returned(ctx,&submitted);
+            CHECK(!memcmp(&row,&saved_row,sizeof(row)) &&
+                !memcmp(&completion,&saved_completion,sizeof(completion)) &&
+                !memcmp(&submitted,&saved_submitted,sizeof(submitted)) &&
+                published==saved_published && find_calls==saved_find_calls && failures==saved_failures);
+        }
+        if(stage==0)phase(false,0);
+        if(stage<2)phase(true,0);
+        CHECK(VALID() && published==1 && find_calls==2 && !failures);
+        phase(false,0);
+        CHECK(failures && published==1 && find_calls==2);
+    }
+    reset();
+    u64 wrong_iov[]={(u64)&target,AP_PTRACE_GETREGSET,AP_NT_PRSTATUS,(u64)&iov+8,0};
+    executable_source_enter(wrong_iov,&submitted);
+    CHECK(row.problem && !published && !find_calls && !VALID());
+    executable_source_returned(wrong_iov,&submitted);
+    CHECK(row.problem && published==1 && !VALID());
+}
 int main(void) {
     reset();phase(false,0);CHECK(!VALID() && !published && row.phases==3);phase(true,0);
     CHECK(VALID() && published==1 && find_calls==2 && !failures);
@@ -118,5 +158,7 @@ int main(void) {
     reset();phase(false,0);phase(false,0);CHECK(failures && !published);
     reset();phase(false,0);phase(true,-14);CHECK(!VALID() && row.ptrace_return==-14 && completion.returned==-14);
     reset();phase(false,0);phase(true,0);phase(true,0);CHECK(failures && published==1);
+    CHECK(checks==77); /* All original controls ran before the additive cases. */
+    unrelated_ptrace_requests();
     printf("executable actual producer: %u checks\n",checks);return 0;
 }
