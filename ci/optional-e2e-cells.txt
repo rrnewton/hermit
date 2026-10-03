@@ -16,7 +16,6 @@ c-programs/copy-file-range-refusal-probe verify dbt
 c-programs/cpu-virtualization verify dbt
 c-programs/dbt-execveat-unsupported verify dbt
 c-programs/dbt-execveat-unsupported verify sabre
-c-programs/dbt-pid-virtualization verify ptrace
 c-programs/dbt-self-sigqueue verify dbt
 c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/dup-shared-offset verify dbt
