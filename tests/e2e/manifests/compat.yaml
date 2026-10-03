@@ -81,7 +81,9 @@ corpus:
   # also runs on SaBRe, except the four the SaBRe corpus never had. Until
   # 2026-10-01 that corpus was ci/compat/corpus-sabre.json, run as 212
   # separate sabrecompat.<program> validation nodes; its rows that agreed
-  # with this corpus run these rows' argv here.
+  # with this corpus run these rows' argv here. None of these SaBRe cells is
+  # required until https://github.com/rrnewton/hermit/issues/3652 is fixed
+  # (see `unselected`).
   focused:
     - label: sabre-compat-only
       backend: sabre
@@ -100,7 +102,10 @@ corpus:
           had no shell-build row)
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
-  # issue, so the SaBRe run type does not require it.
+  # issue, so the SaBRe run type does not require it. Until
+  # https://github.com/rrnewton/hermit/issues/3652 is fixed every SaBRe cell
+  # is unselected (the group citing it below), so the SaBRe run type gates no
+  # SaBRe cell, only its ptrace cells.
   unselected:
     - backend: sabre
       result: crash-error
@@ -178,6 +183,44 @@ corpus:
       rows:
         [
           iostat, mpstat-softirqs
+        ]
+    # The 65 SaBRe cells the run type would otherwise gate: they pass with a
+    # host-built release Hermit, but the validation's one Hermit build, the
+    # pinned-root E2E artifact, ships a libdetcore_sabre.so that needs
+    # GLIBC_2.38, so on a glibc 2.34 host (devbig030) all 65 end no_result
+    # (validation of 57883eff8 on 2026-10-03). Until that is fixed the SaBRe
+    # run type gates no SaBRe cell, only its ptrace cells.
+    - backend: sabre
+      result: unavailable
+      evidence: https://github.com/rrnewton/hermit/issues/3652
+      reason: >-
+        The pinned-root E2E artifact's libdetcore_sabre.so needs GLIBC_2.38,
+        so on a host with an older glibc the guest cannot load it and SaBRe
+        intercepts no system call (no_result); the cell passes with a
+        host-built Hermit
+      rows:
+        [
+          arch, b2sum, base32, base64, basename, bash, bracket, cal, cat,
+          cksum, curl, date, df-direct, dirname, du, echo, expr, findmnt, free,
+          getopt, groups, head, hostname, id, kill, ls, lsirq, lsmod,
+          lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
+          openssl, perl-direct, pidstat-disk, pinky, pr, printf, ps, pwd,
+          python3, readlink, realpath, ruby, sha1sum, sha224sum, sha256sum,
+          sha384sum, sha512sum, sleep, stat, sum, sysctl-random-uuid, test,
+          "true", uname, uptime, users, vmstat, vmstat-disk, wc, wc-lines,
+          whoami
+        ]
+    - backend: ptrace
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/2110
+      reason: >-
+        Detcore panics with "signal_guest: thread should be parked in the
+        scheduler" while timeout waits in rt_sigsuspend for its child (1 of
+        1 in the validation of 57883eff8); locally 1 of 40 runs diverged at
+        the same rt_sigsuspend
+      rows:
+        [
+          timeout
         ]
     - backend: ptrace
       result: determinism-failure

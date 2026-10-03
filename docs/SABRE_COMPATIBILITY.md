@@ -133,9 +133,18 @@ the three under https://github.com/rrnewton/hermit/issues/3489). The 150 red cel
 enabled with `ci: false`, so the run type requires the 62. Three more SaBRe
 cells, `compat/lua-direct`, `compat/perl-direct` and `compat/df-direct`, keep
 the old corpus's single-image argv for the programs whose `compat.yaml` rows
-run under a bash wrapper; they passed 3/3, so the run type requires 65 of 215
-SaBRe cells. The `Stripped` comparator precludes B3, B4, L2, or any canonical
-parity claim.
+run under a bash wrapper; they passed 3/3, so 65 of the 215 SaBRe cells pass
+with a host-built release Hermit. The `Stripped` comparator precludes B3, B4,
+L2, or any canonical parity claim.
+
+For now the run type gates no SaBRe cell: all 65 are also `ci: false`, citing
+https://github.com/rrnewton/hermit/issues/3652. A validation builds Hermit once,
+in the pinned root, and that build's `libdetcore_sabre.so` needs `GLIBC_2.38`.
+The guest already has the host's C library loaded, so on a host with an older
+glibc (devbig030 has 2.34) the plugin cannot load and SaBRe intercepts no
+system call. The validation of `57883eff8` on 2026-10-03 ended all 65 cells
+with no result. Until that issue is fixed, the run type requires only its 27
+ptrace cells.
 
 The initial post-0.2 ptrace verification plan had 194 cells. Before that
 ratchet, SaBRe was enabled for 22 (11.3%). This ratchet evaluates 157
