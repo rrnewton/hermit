@@ -737,10 +737,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3639); they retain all 191
     // prior identities.
     // utimensat_mtime adds
-    // explicit_mtimes_are_reported_by_stat_and_verify_strictly
-    // (https://github.com/rrnewton/hermit/issues/3565); it retains all 193
+    // explicit_mtimes_are_reported_by_stat_and_verify_strictly and
+    // a_renamed_over_target_does_not_get_the_explicit_mtime
+    // (https://github.com/rrnewton/hermit/issues/3565); they retain all 193
     // prior identities.
-    ("test.hermit_integration", 194),
+    ("test.hermit_integration", 195),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -906,9 +907,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3522).
     // The host twin also selects the two first_seen_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3639).
-    // The host twin also selects the utimensat_mtime test
+    // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
-    ("test.hermit_integration_on_host", 194),
+    ("test.hermit_integration_on_host", 195),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

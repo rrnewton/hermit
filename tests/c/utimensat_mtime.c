@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -68,6 +69,37 @@ static void set_mtime(const char* path, long sec, long nsec) {
     perror("utimensat");
     exit(2);
   }
+}
+
+// Calls utimensat with the stack pointer 64 bytes above an unmapped page, so
+// that Hermit has no scratch space below it for its own bookkeeping, and
+// returns the raw result. The kernel itself does not touch the stack.
+static long utimensat_on_short_stack(const char* path, const struct timespec* times) {
+  long page = sysconf(_SC_PAGESIZE);
+  char* map =
+      mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (map == MAP_FAILED || munmap(map, page) != 0) {
+    perror("short stack");
+    exit(2);
+  }
+  char* sp = map + page + 64;
+  register long flags __asm__("r10") = 0;
+  long ret;
+  __asm__ volatile(
+      "mov %%rsp, %%r12\n\t"
+      "mov %[sp], %%rsp\n\t"
+      "syscall\n\t"
+      "mov %%r12, %%rsp"
+      : "=a"(ret)
+      : "0"((long)SYS_utimensat),
+        "D"((long)AT_FDCWD),
+        "S"(path),
+        "d"(times),
+        "r"(flags),
+        [sp] "r"(sp)
+      : "rcx", "r11", "r12", "memory");
+  munmap(map + page, page);
+  return ret;
 }
 
 int main(void) {
@@ -149,11 +181,22 @@ int main(void) {
     failures++;
   }
 
+  // Hermit's bookkeeping must not keep the call from reaching Linux when the
+  // guest's stack has no room for it.
+  struct timespec short_stack[2] = {{0, UTIME_OMIT}, {EARLY + 6, 13}};
+  long ret = utimensat_on_short_stack("a", short_stack);
+  if (ret != 0) {
+    fprintf(stderr, "utimensat on a short stack returned %ld\n", ret);
+    failures++;
+  }
+
   // A later write still moves the mtime off the explicitly set value.
+  set_mtime("a", EARLY + 5, 11);
+  expect_mtime("utimensat before write", "a", EARLY + 5, 11);
   write_file("a");
   struct timespec rewritten = mtime_of("a");
-  if (rewritten.tv_sec == EARLY + 2 && rewritten.tv_nsec == 7000) {
-    fprintf(stderr, "write after utimes left the mtime unchanged\n");
+  if (rewritten.tv_sec == EARLY + 5 && rewritten.tv_nsec == 11) {
+    fprintf(stderr, "write after utimensat left the mtime unchanged\n");
     failures++;
   }
 
