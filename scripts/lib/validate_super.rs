@@ -340,7 +340,11 @@ impl StressProbe {
         let slug = self.slug();
         // --verbose makes timeout say which signal it sent, in the repetition's
         // log, so the result line names a timeout only when timeout sent one: an
-        // exit status of 124 or 137 alone could also be Hermit's own.
+        // exit status of 124 or 137 alone could also be Hermit's own. The line
+        // must also agree with the exit status timeout returns after sending
+        // that signal, because the guest's output shares the log. The outer
+        // subshell writes to the log too, so bash's report of a killed job is
+        // tagged with its repetition rather than left untagged on stderr.
         let bound = format!(
             "timeout --verbose --kill-after={SUPER_PROBE_KILL_GRACE_S} {SUPER_PROBE_TIMEOUT_S} "
         );
@@ -355,7 +359,7 @@ impl StressProbe {
              running=0; \
              for rep in $(seq 1 {reps}); do \
              if [ \"$running\" -ge \"$width\" ]; then wait -n; running=$((running - 1)); fi; \
-             ( ( {repetition} ) >\"$state/$rep.log\" 2>&1; rc=$?; times >\"$state/$rep.times\"; echo \"$rc\" >\"$state/$rep.rc\" ) & \
+             ( ( {repetition} ); rc=$?; times >\"$state/$rep.times\"; echo \"$rc\" >\"$state/$rep.rc\" ) >\"$state/$rep.log\" 2>&1 & \
              running=$((running + 1)); \
              done; \
              wait; \
@@ -364,18 +368,18 @@ impl StressProbe {
              rc=$(cat \"$state/$rep.rc\" 2>/dev/null); rc=${{rc:-none}}; \
              cpu=$(awk 'NR == 2 {{ gsub(/s/, \"\"); split($1, u, \"m\"); split($2, k, \"m\"); printf \"%.2f\", u[1] * 60 + u[2] + k[1] * 60 + k[2] }}' \"$state/$rep.times\" 2>/dev/null); cpu=${{cpu:-0}}; \
              log=\"$state/$rep.log\"; \
-             if grep -q 'timeout: sending signal KILL' \"$log\" 2>/dev/null; then cause=' (timeout sent SIGKILL {SUPER_PROBE_KILL_GRACE_S} s after the {SUPER_PROBE_TIMEOUT_S} s bound)'; \
-             elif grep -q 'timeout: sending signal TERM' \"$log\" 2>/dev/null; then cause=' (timed out after {SUPER_PROBE_TIMEOUT_S} s)'; \
+             if [ \"$rc\" = 137 ] && grep -q 'timeout: sending signal KILL' \"$log\" 2>/dev/null; then cause=' (timeout sent SIGKILL {SUPER_PROBE_KILL_GRACE_S} s after the {SUPER_PROBE_TIMEOUT_S} s bound)'; \
+             elif [ \"$rc\" = 124 ] && grep -q 'timeout: sending signal TERM' \"$log\" 2>/dev/null; then cause=' (timed out after {SUPER_PROBE_TIMEOUT_S} s)'; \
              else case $rc in \
              none) cause=' (wrote no exit status)';; \
-             137) cause=' (SIGKILL that its timeout did not send)';; \
+             137) cause=' (SIGKILL not sent by its timeout, e.g. the OOM killer)';; \
              *) cause=;; \
              esac; fi; \
              result=pass; [ \"$rc\" = 0 ] || result=fail; \
              if [ \"${{cpu%.*}}\" -ge {SUPER_PROBE_CPU_TIMEOUT_S} ]; then result=fail; cause=\"$cause (used $cpu CPU seconds; the per-repetition bound is {SUPER_PROBE_CPU_TIMEOUT_S})\"; fi; \
              [ \"$result\" = pass ] || failed=$((failed + 1)); \
              echo \"super stress {slug} repetition $rep/{reps}: $result, exit $rc, $cpu CPU s$cause\"; \
-             sed \"s|^|  [$rep] |\" \"$log\" 2>/dev/null; \
+             awk -v r=\"$rep\" '{{ print \"  [\" r \"] \" $0 }}' \"$log\" 2>/dev/null; \
              rows+=(\"$(printf '{slug}/repetition-%02d' \"$rep\")\" \"$result\" 1); \
              done; \
              ./ci/write-structured-test-counts.sh {reps} 0 \"${{rows[@]}}\" || exit 2; \
@@ -751,8 +755,10 @@ pub fn self_test(root: &Path) -> Result<String, String> {
 
 /// Run a probe node's generated command against a stand-in Hermit, so the
 /// shell itself is exercised and not only inspected: each repetition's row and
-/// result line, the node's exit status, the per-repetition log, the width
-/// bound, and a malformed width.
+/// result line with its cause, the node's exit status, the per-repetition log,
+/// the width bound, and a malformed width. A `timeout` shim first on PATH runs
+/// the real GNU timeout with a 1 s bound and 1 s kill grace, so the causes are
+/// matched against timeout's own messages.
 fn stress_standin_bracket(root: &Path) -> Result<String, String> {
     let dir = std::env::temp_dir().join(format!(
         "validate-super-standin-self-test-{}",
@@ -766,38 +772,71 @@ fn stress_standin_bracket(root: &Path) -> Result<String, String> {
     result
 }
 
-fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
+fn write_executable(path: &Path, script: &str) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    const REPS: i64 = 6;
+    std::fs::write(path, script)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot make {} executable: {error}", path.display()))
+}
+
+fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
+    const REPS: i64 = 9;
     const WIDTH: usize = 3;
     let probe = StressProbe::PtraceStrictVerify;
     let slug = probe.slug();
     // The probe's last argument is hermit-super-<repetition>. Each repetition
     // records how many repetitions were running when it started, so the width
-    // bound is measured rather than assumed.
+    // bound is measured rather than assumed. Repetition 3 ends its output
+    // without a newline; 5 outlives the bound; 6 also ignores SIGTERM; 7 prints
+    // timeout's KILL message itself; 8 and 9 exit 137 and 124 themselves.
     let standin = dir.join("hermit");
-    let script = format!(
+    write_executable(
+        &standin,
+        &format!(
+            "#!/usr/bin/env bash\n\
+             rep=${{!#}}; rep=${{rep##*-}}; d={dir}\n\
+             mkdir \"$d/running.$rep\"\n\
+             ls -d \"$d\"/running.* | wc -l >\"$d/peak.$rep\"\n\
+             sleep 0.2\n\
+             rmdir \"$d/running.$rep\"\n\
+             case $rep in\n\
+             2) exit 7;;\n\
+             3) printf 'hermit-super-3'; exit 0;;\n\
+             4) echo \"stand-in diagnostic $rep\" >&2; exit 3;;\n\
+             5) sleep 5;;\n\
+             6) trap '' TERM; sleep 5;;\n\
+             7) echo \"timeout: sending signal KILL to command 'x'\"; exit 5;;\n\
+             8) exit 137;;\n\
+             9) exit 124;;\n\
+             esac\n\
+             echo \"hermit-super-$rep\"\n",
+            dir = shell_quote(&dir.to_string_lossy())
+        ),
+    )?;
+    // The node calls `timeout --verbose --kill-after=G T <command...>`; the
+    // shim drops its own directory from PATH and keeps only the command.
+    let shim_dir = dir.join("bin");
+    std::fs::create_dir_all(&shim_dir)
+        .map_err(|error| format!("cannot create super stand-in shim dir: {error}"))?;
+    write_executable(
+        &shim_dir.join("timeout"),
         "#!/usr/bin/env bash\n\
-         rep=${{!#}}; rep=${{rep##*-}}; d={dir}\n\
-         mkdir \"$d/running.$rep\"\n\
-         ls -d \"$d\"/running.* | wc -l >\"$d/peak.$rep\"\n\
-         sleep 0.2\n\
-         rmdir \"$d/running.$rep\"\n\
-         case $rep in 2) exit 7;; 4) echo \"stand-in diagnostic $rep\" >&2; exit 3;; esac\n\
-         echo \"hermit-super-$rep\"\n",
-        dir = shell_quote(&dir.to_string_lossy())
+         PATH=${PATH#*:} exec timeout --verbose --kill-after=1 1 \"${@:4}\"\n",
+    )?;
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
     );
-    std::fs::write(&standin, script)
-        .map_err(|error| format!("cannot write super stand-in: {error}"))?;
-    std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("cannot make super stand-in executable: {error}"))?;
     let command = probe.node_command(REPS, &standin.to_string_lossy(), "/nonexistent", dir);
     let run = |width: &str, counts: &Path| {
         std::process::Command::new("bash")
             .arg("-c")
             .arg(&command)
             .current_dir(root)
+            .env("PATH", &path)
             .env("DAGRUN_TEST_COUNTS_PATH", counts)
             .env(SUPER_PROBE_JOBS_ENV, width)
             .output()
@@ -807,27 +846,54 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
     let counts = dir.join("counts.json");
     let output = run(&WIDTH.to_string(), &counts)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.code() != Some(1) {
         return Err(format!(
-            "super stand-in node with two failed repetitions exited {:?}, not 1:\n{stdout}",
+            "super stand-in node with failed repetitions exited {:?}, not 1:\n{stdout}{stderr}",
             output.status.code()
         ));
     }
-    for (rep, verdict) in [
-        (1, "pass, exit 0,"),
-        (2, "fail, exit 7,"),
-        (3, "pass, exit 0,"),
-        (4, "fail, exit 3,"),
-        (5, "pass, exit 0,"),
-        (6, "pass, exit 0,"),
+    if !stderr.is_empty() {
+        return Err(format!(
+            "super stand-in node wrote untagged stderr:\n{stderr}"
+        ));
+    }
+    let killed = format!(
+        " (timeout sent SIGKILL {SUPER_PROBE_KILL_GRACE_S} s after the {SUPER_PROBE_TIMEOUT_S} s bound)"
+    );
+    let timed_out = format!(" (timed out after {SUPER_PROBE_TIMEOUT_S} s)");
+    let own_kill = " (SIGKILL not sent by its timeout, e.g. the OOM killer)";
+    for (rep, verdict, cause) in [
+        (1, "pass, exit 0,", ""),
+        (2, "fail, exit 7,", ""),
+        (3, "pass, exit 0,", ""),
+        (4, "fail, exit 3,", ""),
+        (5, "fail, exit 124,", timed_out.as_str()),
+        (6, "fail, exit 137,", killed.as_str()),
+        (7, "fail, exit 5,", ""),
+        (8, "fail, exit 137,", own_kill),
+        (9, "fail, exit 124,", ""),
     ] {
-        let line = format!("super stress {slug} repetition {rep}/{REPS}: {verdict}");
-        if !stdout.contains(&line) {
-            return Err(format!("super stand-in output lacks {line:?}:\n{stdout}"));
+        let prefix = format!("super stress {slug} repetition {rep}/{REPS}: {verdict} ");
+        let suffix = format!(" CPU s{cause}");
+        if !stdout
+            .lines()
+            .any(|line| line.starts_with(&prefix) && line.ends_with(&suffix))
+        {
+            return Err(format!(
+                "super stand-in output lacks {prefix:?}...{suffix:?}:\n{stdout}"
+            ));
         }
     }
-    for line in ["  [1] hermit-super-1\n", "  [4] stand-in diagnostic 4\n"] {
-        if !stdout.contains(line) {
+    let first_after_three = format!("super stress {slug} repetition 4/{REPS}:");
+    for line in [
+        "  [1] hermit-super-1\n".to_string(),
+        format!("  [3] hermit-super-3\n{first_after_three}"),
+        "  [4] stand-in diagnostic 4\n".to_string(),
+        "  [5] timeout: sending signal TERM".to_string(),
+        "  [6] timeout: sending signal KILL".to_string(),
+    ] {
+        if !stdout.contains(&line) {
             return Err(format!(
                 "super stand-in output lacks the repetition log line {line:?}:\n{stdout}"
             ));
@@ -845,17 +911,14 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
         .filter(|row| row["result"] == "fail")
         .filter_map(|row| row["id"].as_str())
         .collect::<Vec<_>>();
-    let expected_failed = [
-        format!("{slug}/repetition-02"),
-        format!("{slug}/repetition-04"),
-    ];
+    let expected_failed = [2, 4, 5, 6, 7, 8, 9].map(|rep| format!("{slug}/repetition-{rep:02}"));
     if document["executed_tests"] != REPS
         || rows.len() != REPS as usize
-        || rows.iter().filter(|row| row["result"] == "pass").count() != 4
+        || rows.iter().filter(|row| row["result"] == "pass").count() != 2
         || failed != expected_failed
     {
         return Err(format!(
-            "super stand-in rows are not 4 passes and failed repetitions 02 and 04: {text}"
+            "super stand-in rows are not passes 01 and 03 with the rest failed: {text}"
         ));
     }
     let mut peak = 0;
@@ -868,9 +931,9 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
             .map_err(|error| format!("super stand-in repetition {rep} peak: {error}"))?;
         peak = peak.max(observed);
     }
-    if peak > WIDTH {
+    if !(2..=WIDTH).contains(&peak) {
         return Err(format!(
-            "super stand-in ran {peak} repetitions at once with width {WIDTH}"
+            "super stand-in ran at most {peak} repetitions at once with width {WIDTH}"
         ));
     }
 
@@ -883,7 +946,9 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "stand-in probe node: 4/{REPS} passed, repetitions 02 and 04 failed as planted, at most {peak} of width {WIDTH} at once, malformed width refused"
+        "stand-in probe node: 2/{REPS} passed, the planted failures carried their causes \
+         (real timeout TERM and KILL, own 137, own 124 and a printed timeout message), \
+         at most {peak} of width {WIDTH} at once, malformed width refused"
     ))
 }
 
