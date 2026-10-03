@@ -1750,20 +1750,28 @@ impl Replayer {
     // TODO-HUMAN-REVIEW(PR-3601)
     /// Replays an xattr change from its recorded result. Every xattr query
     /// also replays from the recording, so the guest never reads the replay
-    /// root's attributes directly. The kernel does: an access ACL rewrites the
-    /// mode bits and a default ACL shapes later creations, and both govern
-    /// path calls replay runs live in the replay root. So a change the
-    /// recording saw succeed also establishes its end state there.
+    /// root's attributes directly. The kernel does, for a few names: an access
+    /// ACL rewrites the mode bits, a default ACL shapes later creations, and a
+    /// file capability sets what a later exec grants. Those govern calls
+    /// replay runs live, so a change to one of them that the recording saw
+    /// succeed on a file in the replay root must establish its end state
+    /// there, or replay refuses to continue. A change to any other name is
+    /// carried over where the replay root can take it and otherwise kept
+    /// virtual: nothing that replay runs live can observe it.
     ///
     /// The replay root is built without the host's attributes, so its starting
     /// state may differ from the recording's. A set therefore runs without
     /// XATTR_CREATE or XATTR_REPLACE: whatever was there, the attribute ends up
-    /// holding the recorded value. A removal ends in the recorded state whether
-    /// it removes the attribute or finds none (ENODATA). As for other path
-    /// mutations, a path absent from the replay root (ENOENT, ENOTDIR) or a
-    /// read-only one (EROFS) keeps the change virtual: no later live call can
-    /// reach it there either. Any other failure would leave the replay root
-    /// short of the recorded state, so replay refuses to continue.
+    /// holding the recorded value. A removal that finds no attribute (ENODATA)
+    /// ends in the recorded state too.
+    ///
+    /// A file the replay root lacks (a placeholder descriptor, ENOENT or
+    /// ENOTDIR) or cannot write (EROFS) keeps the change virtual, as other
+    /// path mutations do: tools that copy a file's ACL to their output, such
+    /// as strip, do this to files outside the recorded tree. The exception is
+    /// setting a file capability. Exec materializes such a file in the replay
+    /// root from its contents and mode alone, so the capability would be
+    /// missing when the recording had it.
     async fn handle_xattr_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1772,34 +1780,74 @@ impl Replayer {
         let pid = guest.pid();
         // The path calls take no dirfd; a relative path resolves against the
         // working directory, which replay keeps inside the root.
-        let (in_replay_root, live_call, is_removal) = match syscall {
-            Syscall::Fsetxattr(call) => (
-                self.fd_is_in_replay_root(pid, call.fd()),
-                Syscall::Fsetxattr(call.with_flags(0)),
-                false,
-            ),
-            Syscall::Setxattr(call) => (true, Syscall::Setxattr(call.with_flags(0)), false),
-            Syscall::Lsetxattr(call) => (true, Syscall::Lsetxattr(call.with_flags(0)), false),
-            Syscall::Fremovexattr(call) => {
-                (self.fd_is_in_replay_root(pid, call.fd()), syscall, true)
+        let (in_replay_root, name, live_call, is_removal) = {
+            let memory = guest.memory();
+            let read = |name: Option<reverie::syscalls::CStrPtr<'_>>| {
+                name.ok_or(Errno::EFAULT)
+                    .and_then(|name| name.read(&memory))
+            };
+            match syscall {
+                Syscall::Fsetxattr(call) => (
+                    self.fd_is_in_replay_root(pid, call.fd()),
+                    read(call.name()),
+                    Syscall::Fsetxattr(call.with_flags(0)),
+                    false,
+                ),
+                Syscall::Setxattr(call) => (
+                    true,
+                    read(call.name()),
+                    Syscall::Setxattr(call.with_flags(0)),
+                    false,
+                ),
+                Syscall::Lsetxattr(call) => (
+                    true,
+                    read(call.name()),
+                    Syscall::Lsetxattr(call.with_flags(0)),
+                    false,
+                ),
+                Syscall::Fremovexattr(call) => (
+                    self.fd_is_in_replay_root(pid, call.fd()),
+                    read(call.name()),
+                    syscall,
+                    true,
+                ),
+                Syscall::Removexattr(call) => (true, read(call.name()), syscall, true),
+                Syscall::Lremovexattr(call) => (true, read(call.name()), syscall, true),
+                _ => unreachable!("xattr change handler received {syscall:?}"),
             }
-            Syscall::Removexattr(_) | Syscall::Lremovexattr(_) => (true, syscall, true),
-            _ => unreachable!("xattr change handler received {syscall:?}"),
         };
-        let recorded = next_event!(guest, Return);
-        if recorded.is_ok() && in_replay_root {
-            match guest.inject_with_retry(live_call).await {
-                Ok(_) => {}
-                Err(Errno::ENODATA) if is_removal => {}
-                Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
-                    tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
-                }
-                Err(error) => {
-                    panic!("replay root could not take recorded xattr change {syscall:?}: {error}")
-                }
+        let recorded = next_event!(guest, Return)?;
+        let name = name.unwrap_or_else(|error| {
+            panic!("could not read the name of recorded xattr change {syscall:?}: {error}")
+        });
+        let is_capability = name.to_bytes() == b"security.capability";
+        let governs_live_calls = is_capability
+            || matches!(
+                name.to_bytes(),
+                b"system.posix_acl_access" | b"system.posix_acl_default"
+            );
+        // A placeholder descriptor names a file the replay root lacks.
+        let outcome = if in_replay_root {
+            guest.inject_with_retry(live_call).await.map(drop)
+        } else {
+            Err(Errno::ENOENT)
+        };
+        match outcome {
+            Ok(()) => {}
+            Err(Errno::ENODATA) if is_removal => {}
+            Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS))
+                if is_removal || !is_capability =>
+            {
+                tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
             }
+            Err(error) if !governs_live_calls => {
+                tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
+            }
+            Err(error) => panic!(
+                "replay root could not take recorded change to {name:?} {syscall:?}: {error}"
+            ),
         }
-        recorded
+        Ok(recorded)
     }
 
     // TODO-HUMAN-REVIEW(#3598)
