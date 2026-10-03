@@ -2852,6 +2852,12 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
 /// more. Exactly one record is required because the activation check Hermit
 /// runs first happens before logging is set up.
 ///
+/// Hermit reports from two call sites, one per way of running the guest: a
+/// plain `run` waits for the exit status, while `--verify` (and `analyze`)
+/// capture the output. Both are checked. Under `--verify` each of the two
+/// compared runs writes its DEBUG log to its own retained file, so each file
+/// must hold exactly one record from its own run.
+///
 /// `process_reports=0` is today's architecture, not a gap: the ptrace host
 /// counts every hook entry itself, so no guest process submits a report.
 /// When Detcore moves into the guest (https://github.com/rrnewton/hermit/issues/3520)
@@ -2862,12 +2868,11 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
     liteinst_runtime::ensure_liteinst_runtime();
     let hermit = liteinst_runtime::hermit_binary();
     let hermit_path = hermit.to_str().expect("Hermit test binary path is UTF-8");
-    let run = |log: &[&str]| {
+    let run = |log: &[&str], run_flags: &[&str]| {
         let mut args = log.to_vec();
+        args.extend(["--backend", "liteinst", "run"]);
+        args.extend(run_flags);
         args.extend([
-            "--backend",
-            "liteinst",
-            "run",
             "--strict",
             "--env=HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE=1",
             "--",
@@ -2889,41 +2894,77 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
         );
         stderr(&output)
     };
+    let check_record = |source: &str, text: &str| {
+        let records: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("backend run complete"))
+            .collect();
+        let [record] = records[..] else {
+            panic!(
+                "expected exactly one backend statistics record in {source}, found {records:#?}"
+            );
+        };
+        assert!(
+            record.contains(
+                "backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 "
+            ),
+            "{source}: {record}"
+        );
+        let direct_hooks: u64 = record
+            .split_once("direct_hook=")
+            .and_then(|(_, rest)| {
+                rest.split(|character: char| !character.is_ascii_digit())
+                    .next()
+            })
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no direct_hook count in {source}: {record}"));
+        assert!(
+            direct_hooks >= 31,
+            "the probe makes 31 hooked calls, but {source} counts {direct_hooks}: {record}"
+        );
+    };
 
     for log in [&[][..], &["--log", "info"][..]] {
-        let stderr = run(log);
+        let stderr = run(log, &[]);
         assert!(
             !stderr.contains("backend run complete"),
             "the record is DEBUG-only, but {log:?} printed it:\n{stderr}"
         );
     }
 
-    let stderr = run(&["--log", "debug"]);
-    let records: Vec<&str> = stderr
-        .lines()
-        .filter(|line| line.contains("backend run complete"))
-        .collect();
-    let [record] = records[..] else {
-        panic!("expected exactly one backend statistics record, found {records:#?}");
-    };
-    assert!(
-        record.contains(
-            "backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 "
-        ),
-        "{record}"
+    check_record("the run's stderr", &run(&["--log", "debug"], &[]));
+
+    let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create LiteInst verify-log directory");
+    let log_dir = logs
+        .path()
+        .to_str()
+        .expect("verify-log directory path is UTF-8");
+    let verify_stderr = run(
+        &["--log", "debug"],
+        &["--verify", "--keep-logs", "--verify-log-dir", log_dir],
     );
-    let direct_hooks: u64 = record
-        .split_once("direct_hook=")
-        .and_then(|(_, rest)| {
-            rest.split(|character: char| !character.is_ascii_digit())
-                .next()
-        })
-        .and_then(|digits| digits.parse().ok())
-        .unwrap_or_else(|| panic!("no direct_hook count in {record}"));
     assert!(
-        direct_hooks >= 31,
-        "the probe makes 31 hooked calls, but the record counts {direct_hooks}: {record}"
+        verify_stderr.contains("Success: deterministic. Determinism verified."),
+        "{verify_stderr}"
     );
+    for prefix in ["run1_log_", "run2_log_"] {
+        let captures: Vec<PathBuf> = fs::read_dir(logs.path())
+            .expect("failed to read the retained verify-log directory")
+            .map(|entry| entry.expect("failed to read a verify-log entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect();
+        let [capture] = &captures[..] else {
+            panic!("expected exactly one {prefix} capture, found {captures:?}");
+        };
+        let text = fs::read_to_string(capture)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", capture.display()));
+        check_record(&capture.display().to_string(), &text);
+    }
 }
 
 #[test]
