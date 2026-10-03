@@ -13,10 +13,10 @@
   "counts": {
     "all": {
       "cells": 2252,
-      "applicable": 628,
-      "selectable": 527,
-      "selected": 194,
-      "selected_selectable": 177
+      "applicable": 634,
+      "selectable": 533,
+      "selected": 200,
+      "selected_selectable": 183
     },
     "by_backend": {
       "dbt": {
@@ -28,10 +28,10 @@
       },
       "kvm": {
         "cells": 563,
-        "applicable": 250,
-        "selectable": 243,
-        "selected": 77,
-        "selected_selectable": 76
+        "applicable": 256,
+        "selectable": 249,
+        "selected": 83,
+        "selected_selectable": 82
       },
       "liteinst": {
         "cells": 563,
@@ -243,7 +243,7 @@
     {"test_id":"c-programs/fchmod-bits","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/fchmod-bits","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/fchmodat2-flags","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/fchmodat2-flags","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor returns ENOSYS for fchmodat2 (syscall 452); ptrace and DBT forward it to the host"},
+    {"test_id":"c-programs/fchmodat2-flags","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/fchmodat2-flags","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/fchmodat2-flags","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/fcntl-owner","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
@@ -371,7 +371,7 @@
     {"test_id":"c-programs/ioctl-fioclex","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/ioctl-fioclex","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/ioctl-fionread","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/ioctl-fionread","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor returns ENOTTY for the FIONREAD pipe ioctl; FIONBIO is supported"},
+    {"test_id":"c-programs/ioctl-fionread","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/ioctl-fionread","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/ioctl-fionread","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/ioctl-siocethtool","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
@@ -683,7 +683,7 @@
     {"test_id":"c-programs/prctl-dumpable","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/prctl-dumpable","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/prctl-identity","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml, but not selectable: dbt verify is not selected by full validation: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence."},
-    {"test_id":"c-programs/prctl-identity","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: inherited from the L1 KVM prctl_identity gap: PR_SET_NAME returns ENOSYS so the guest exits non-zero and there is no L2 run to verify"},
+    {"test_id":"c-programs/prctl-identity","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/prctl-identity","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/prctl-identity","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/prctl-option-policy","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Only ptrace was qualified when this cell was added; qualify DBT separately rather than asserting it untested"},
@@ -699,7 +699,7 @@
     {"test_id":"c-programs/pread64-nostdlib","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/pread64-nostdlib","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/preadv2-flags","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/preadv2-flags","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor does not implement preadv2/pwritev2 (syscalls 327/328); it returns ENOSYS, mirroring its missing classic pwritev/preadv"},
+    {"test_id":"c-programs/preadv2-flags","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/preadv2-flags","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/preadv2-flags","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/print-memaddrs","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
@@ -1115,7 +1115,7 @@
     {"test_id":"c-programs/tee-enosys","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/tee-enosys","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/thp-disable","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/thp-disable","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_THP_DISABLE/PR_GET_THP_DISABLE; ptrace and DBT drive the full transparent-hugepage flag round-trip"},
+    {"test_id":"c-programs/thp-disable","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/thp-disable","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/thp-disable","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/thread-self-procfs-handoff","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
@@ -1171,7 +1171,7 @@
     {"test_id":"c-programs/utimensat-determinism","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/utimensat-determinism","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/vectored-file-io","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
-    {"test_id":"c-programs/vectored-file-io","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor returns deterministic ENOSYS for pwritev/preadv (positioned vectored I/O); plain writev/readv are supported but the positioned variants are not"},
+    {"test_id":"c-programs/vectored-file-io","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/vectored-file-io","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/vectored-file-io","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"c-programs/vectored-io","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
