@@ -1750,16 +1750,17 @@ impl Replayer {
     // TODO-HUMAN-REVIEW(PR-3601)
     /// Replays an xattr change from its recorded result. Every xattr query
     /// also replays from the recording, so the guest never reads the replay
-    /// root's attributes directly. The kernel does, for some names: an access
-    /// ACL rewrites the mode bits, a default ACL shapes later creations, a file
-    /// capability sets what a later exec grants, and the other `security.`
-    /// names are labels that security modules (SELinux, Smack, IMA, EVM)
-    /// consult on access and exec. Those govern calls replay runs live, so a
-    /// change to one of them that the recording saw succeed on a file in the
-    /// replay root must establish its end state there, even a read-only one
-    /// (EROFS), or replay refuses to continue. A change to any other name is
-    /// carried over where the replay root can take it and otherwise kept
-    /// virtual: nothing that replay runs live can observe it.
+    /// root's attributes directly. The kernel and filesystems do, for every
+    /// namespace but `user.`: `system.` holds POSIX and NFSv4 ACLs, which
+    /// govern access and later creations; `security.` holds file capabilities
+    /// and the labels security modules (SELinux, Smack, IMA, EVM) consult on
+    /// access and exec; `trusted.` is read by filesystems such as overlayfs.
+    /// Those govern calls replay runs live, so a change to one of them that
+    /// the recording saw succeed on a file in the replay root must establish
+    /// its end state there, even a read-only one (EROFS), or replay refuses to
+    /// continue. A `user.` change is carried over where the replay root can
+    /// take it and otherwise kept virtual: nothing that replay runs live can
+    /// observe it.
     ///
     /// The replay root is built without the host's attributes, so its starting
     /// state may differ from the recording's. A set therefore runs without
@@ -1821,10 +1822,7 @@ impl Replayer {
         let name = name.unwrap_or_else(|error| {
             panic!("could not read the name of recorded xattr change {syscall:?}: {error}")
         });
-        let governs_live_calls = matches!(
-            name.to_bytes(),
-            b"system.posix_acl_access" | b"system.posix_acl_default"
-        ) || name.to_bytes().starts_with(b"security.");
+        let governs_live_calls = !name.to_bytes().starts_with(b"user.");
         // A placeholder descriptor names a file the replay root lacks.
         let outcome = if in_replay_root {
             guest.inject_with_retry(live_call).await.map(drop)
