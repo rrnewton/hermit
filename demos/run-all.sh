@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the selected Hermit demos, with one log and one summary row per demo.
-# Exits 1 if any selected demo fails. Otherwise it exits 4 if it could not
+# Exits 1 if any selected demo fails; a demo that exits 0 without printing its
+# own SUCCESS line has failed. Otherwise it exits 4 if it could not
 # create, write, or read its log directory, a demo's log, or its summary, since
 # a result is then unknown or unrecorded, and 3 if at least one demo was
 # skipped or only saved its first run (and so produced no result). `--help`
@@ -26,6 +27,11 @@ With no option, run the quick demos 1-3.
                     2  demos 4, 8, 9        (analyze, btrfs, QEMU BusyBox)
                     3  demos 5, 6, 7        (QEMU snapshot, resume, drgn)
 
+A demo passes only when it exits 0 and its own last result line,
+`=== Demo N: <title>: SUCCESS ===` with N its own number, says SUCCESS. A demo
+that exits 0 without that line, for example after stopping silently or after
+printing only another demo's result, is recorded as FAIL.
+
 A demo that cannot run on this host prints a SKIPPED line and is recorded as
 SKIP; demo 8 does this until its prepare-assets.sh has been run. Demos 5 and 6
 compare each run with a reference run that their first run saves. The sweep
@@ -40,6 +46,7 @@ ERROR: its result is unknown.
 Exit status:
   0  every selected demo passed
   1  at least one selected demo failed
+     (including one that exited 0 without its own SUCCESS line)
   2  usage error
   3  no selected demo failed, but at least one was skipped
      or saved its first run and compared nothing
@@ -95,6 +102,16 @@ if [ "${#demos[@]}" -eq 0 ]; then
   echo "error: no demos selected" >&2
   exit 2
 fi
+
+# A demo passes only on its own result line, `=== Demo N: ...`, so the sweep
+# must know each target's demo number. Only DEMO_SWEEP_TARGETS can name another
+# target, and it is refused before anything runs.
+for demo in "${demos[@]}"; do
+  if ! [[ "$demo" =~ ^demo[1-9][0-9]*$ ]]; then
+    echo "error: $demo is not a demo target (demo1, demo2, ...); the sweep cannot tell whether it passed" >&2
+    exit 2
+  fi
+done
 
 # Without a demo's log the sweep cannot tell a skip from a pass, so refuse to
 # start, before any demo runs, when the logs and the summary have nowhere to go.
@@ -161,18 +178,21 @@ for demo in "${demos[@]}"; do
         "$demo" "$rc" "$duration" "$log"
     fi
   else
-    # A demo exits 0 in three cases that only its log separates. It passed.
-    # Or it cannot run here and printed a SKIPPED line (demo 8 does this when
-    # its prepared assets are absent). Or it saved its first run as its
-    # reference run and compared nothing: its last result line,
-    # `=== Demo N: <title>: <result> ===`, says FIRST RUN SAVED. A demo that
-    # then ran again and compared prints a later SUCCESS or PARTIAL line, so
-    # only the last result line counts. grep exits 0 when a line matches, 1
-    # when none does, and 2 or more when it cannot read the log; -a makes it
-    # print the matching lines even when the log holds binary bytes, such as
-    # a guest's serial output. A log that tee could not write completely is
-    # not read at all.
-    status=PASS
+    # A demo exits 0 in cases that only its log separates. It passed: its own
+    # last result line, `=== Demo N: <title>: <result> ===` with N its own
+    # number, says SUCCESS. Or it cannot run here and printed a SKIPPED line
+    # (demo 8 does this when its prepared assets are absent). Or it saved its
+    # first run as its reference run and compared nothing: its last result
+    # line says FIRST RUN SAVED. A demo that then ran again and compared
+    # prints a later SUCCESS or PARTIAL line, so only the last result line
+    # counts. Anything else -- no result line at all, a PARTIAL, or only the
+    # lines of another demo, such as demo 5 run first to make the boot
+    # snapshot that demos 6 and 7 need -- is not a pass, and the demo failed.
+    # grep exits 0 when a line matches, 1 when none does, and 2 or more when
+    # it cannot read the log; -a makes it print the matching lines even when
+    # the log holds binary bytes, such as a guest's serial output. A log that
+    # tee could not write completely is not read at all.
+    status=""
     if [ -n "$log_error" ]; then
       status=ERROR
     else
@@ -183,9 +203,22 @@ for demo in "${demos[@]}"; do
       elif [ "$grep_rc" -eq 1 ]; then
         result_lines="$(grep -aE '^=== Demo [0-9]+: .+: (FIRST RUN SAVED|SUCCESS|PARTIAL) ===$' "$log")"
         grep_rc=$?
-        if [ "$grep_rc" -le 1 ] &&
-          [[ "${result_lines##*$'\n'}" == *": FIRST RUN SAVED ===" ]]; then
-          status=UNCOMPARED
+        if [ "$grep_rc" -le 1 ]; then
+          own_result=""
+          while IFS= read -r result_line; do
+            case "$result_line" in
+              "=== Demo ${demo#demo}: "*) own_result=$result_line ;;
+            esac
+          done <<<"$result_lines"
+          if [[ "$own_result" != *": SUCCESS ===" &&
+            "$own_result" != *": FIRST RUN SAVED ===" ]]; then
+            status=NO_SUCCESS_LINE
+          elif [[ "$own_result" == *": FIRST RUN SAVED ===" ]] ||
+            [[ "${result_lines##*$'\n'}" == *": FIRST RUN SAVED ===" ]]; then
+            status=UNCOMPARED
+          else
+            status=PASS
+          fi
         fi
       fi
       if [ "$grep_rc" -gt 1 ]; then
@@ -194,6 +227,16 @@ for demo in "${demos[@]}"; do
       fi
     fi
     case "$status" in
+      NO_SUCCESS_LINE)
+        status=FAIL
+        failures=$((failures + 1))
+        printf '=== %s: FAIL (exit 0 without its own "=== Demo %s: <title>: SUCCESS ===" line, %ss; log %s) ===\n' \
+          "$demo" "${demo#demo}" "$duration" "$log" >&2
+        if [ "${GITHUB_ACTIONS:-}" = true ]; then
+          printf '::error title=%s failed::exit 0 without its SUCCESS line after %ss; inspect %s\n' \
+            "$demo" "$duration" "$log"
+        fi
+        ;;
       SKIP)
         skips=$((skips + 1))
         skipped+=("$demo")
