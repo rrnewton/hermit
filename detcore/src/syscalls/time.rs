@@ -275,10 +275,11 @@ fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
 /// unmapped: Linux's eight-byte `put_user` faults there before storing any
 /// byte. A failed read of a fully mapped word is not evidence of a fault: a
 /// seccomp filter can deny the read while the store succeeds. Ptrace reads use
-/// `FOLL_FORCE`, so ordinary anonymous and file mappings are always readable
-/// to them. Some listed mappings are not: `MADV_GUARD_INSTALL` guard regions,
-/// `VM_PFNMAP` mappings without an `access` operation, missing pages of a
-/// userfaultfd region in SIGBUS mode, and `[vsyscall]` in xonly mode. Backends
+/// `FOLL_FORCE`, which bypasses page permissions, but some listed mappings
+/// still refuse the read: file pages beyond end of file, hardware-poisoned
+/// pages, `MADV_GUARD_INSTALL` guard regions, `VM_PFNMAP` mappings without an
+/// `access` operation, missing pages of a userfaultfd region in SIGBUS mode,
+/// and `[vsyscall]` in xonly mode. Backends
 /// that read with `process_vm_readv` also cannot read `PROT_NONE` pages. A
 /// `gettimeofday` whose store faults on any of these ends the run rather than
 /// returning EFAULT. An empty map is refused because a filter that fakes a
