@@ -2180,6 +2180,12 @@ fn record_path_queries_and_legacy_mutations() {
     std::fs::create_dir(base.join("second")).expect("failed to create second host directory");
     std::os::unix::fs::symlink("first/sub", base.join("via"))
         .expect("failed to create host directory symlink");
+    // A resolved working directory longer than the replayer's 512-byte
+    // injection buffer, reached through a short symlink.
+    let deep = (0..6).fold(base.join("long"), |path, _| path.join("d".repeat(100)));
+    std::fs::create_dir_all(&deep).expect("failed to create deep host directory");
+    std::os::unix::fs::symlink(&deep, base.join("longvia"))
+        .expect("failed to create deep host directory symlink");
     canonical_record_replay_command(
         "path queries and legacy path mutations",
         &workload("c_record_replay_path_queries").path,

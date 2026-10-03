@@ -76,11 +76,20 @@ static void host_directory_rounds(const char* base) {
   // fchdir back into the first host directory: its "f" must be reachable
   // relative to the restored working directory.
   snprintf(path, sizeof(path), "%s/first", base);
-  int dirfd = open(path, O_RDONLY | O_DIRECTORY);
+  // Without O_DIRECTORY the replayed open yields a placeholder descriptor,
+  // so replay cannot fchdir through the descriptor itself.
+  int dirfd = open(path, O_RDONLY);
   expect("open_host_dir", dirfd < 0 ? -1 : 0, 0);
-  expect("chdir_root_before_fchdir", syscall(SYS_chdir, "/"), 0);
+  // Leave from second after giving it an "x" linked to "y": a replayed fchdir
+  // that left the working directory there would collide on first's own link.
+  snprintf(path, sizeof(path), "%s/second", base);
+  expect("chdir_second_before_fchdir", syscall(SYS_chdir, path), 0);
+  expect("create_x_in_second", create("x"), 0);
+  expect("link_x_y_in_second", syscall(SYS_link, "x", "y"), 0);
   expect("fchdir_host_dir", syscall(SYS_fchdir, dirfd), 0);
   expect("link_f_h", syscall(SYS_link, "f", "h"), 0);
+  expect("create_x_in_first", create("x"), 0);
+  expect("link_x_y_in_first", syscall(SYS_link, "x", "y"), 0);
   if (dirfd >= 0) {
     close(dirfd);
   }
@@ -95,6 +104,31 @@ static void host_directory_rounds(const char* base) {
   expect("chdir_base", syscall(SYS_chdir, base), 0);
   expect("create_p_in_base", create("p"), 0);
   expect("link_p_q_in_base", syscall(SYS_link, "p", "q"), 0);
+
+  // A working directory longer than the replayer's injection buffer, entered
+  // through the short host symlink "longvia" to "long/d.../d..." (six
+  // 100-byte components). Neither exists in the replay chroot, so only a
+  // replay that enters the recorded resolved directory succeeds.
+  char component[101];
+  memset(component, 'd', 100);
+  component[100] = '\0';
+  char deep[4096];
+  snprintf(deep, sizeof(deep), "%s/long", base);
+  for (int i = 0; i < 6; i++) {
+    size_t used = strlen(deep);
+    snprintf(deep + used, sizeof(deep) - used, "/%s", component);
+  }
+  snprintf(path, sizeof(path), "%s/longvia", base);
+  expect("chdir_longvia", syscall(SYS_chdir, path), 0);
+  char cwd[4096];
+  long length = syscall(SYS_getcwd, cwd, sizeof(cwd));
+  expect("getcwd_deep", length, 0);
+  if (length <= 512 || strcmp(cwd, deep) != 0) {
+    printf("UNEXPECTED getcwd_deep: length %ld\n", length);
+    failures++;
+  }
+  expect("create_f_deep", create("f"), 0);
+  expect("link_f_g_deep", syscall(SYS_link, "f", "g"), 0);
 }
 
 int main(int argc, char** argv) {

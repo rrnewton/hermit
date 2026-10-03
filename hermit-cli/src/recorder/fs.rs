@@ -16,7 +16,6 @@ use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
-use reverie::syscalls::Chdir;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
@@ -866,13 +865,14 @@ impl Recorder {
     }
 
     // TODO-HUMAN-REVIEW(#3598)
-    /// Record a successful `chdir(2)` as the directory it actually entered.
-    /// The spelled path may go through host symlinks or `..` components that
-    /// the replay root lacks, so replay moves to this resolved name instead.
-    pub(super) async fn handle_chdir<G: Guest<Self>>(
+    /// Record a successful `chdir(2)` or `fchdir(2)` as the directory it
+    /// actually entered. The spelled path may go through host symlinks or `..`
+    /// components that the replay root lacks, and an fchdir descriptor may be
+    /// a replay placeholder, so replay moves to this resolved name instead.
+    pub(super) async fn handle_working_directory_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        syscall: Chdir,
+        syscall: Syscall,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
@@ -880,9 +880,7 @@ impl Recorder {
             guest,
             result.map(|_| {
                 let cwd = crate::record_replay_path::process_cwd_path(guest.tid()).unwrap_or_else(
-                    |error| {
-                        panic!("could not read the directory a recorded chdir entered: {error}")
-                    },
+                    |error| panic!("could not record the directory {syscall:?} entered: {error}"),
                 );
                 SyscallEvent::Bytes(cwd.into_os_string().into_vec())
             }),

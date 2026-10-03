@@ -161,9 +161,9 @@ impl RecordVersion {
 // with ENOSYS, now reaches the recorder and replayer and emits a Madvise event.
 // 0x11e -> 0x11f: faccessat, faccessat2, chdir, getcwd and the legacy path
 // mutations (rename, link, symlink, chmod, chown, lchown, mknod, rmdir) are
-// recorded instead of running live. A successful chdir carries a Bytes event
-// naming the directory it entered. An older reader would desynchronize on
-// these events.
+// recorded instead of running live. A successful chdir or fchdir carries a
+// Bytes event naming the directory it entered. An older reader would
+// desynchronize on these events.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
