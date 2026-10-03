@@ -77,7 +77,8 @@ Options:
                       directory (default: <repository>/target/release/hermit)
   --backends LIST     comma-separated subset of ptrace,liteinst
                       (default: ptrace,liteinst)
-  --counts LIST       comma-separated call counts, at least two distinct
+  --counts LIST       comma-separated call counts, at least two distinct;
+                      LiteInst also needs the largest to be at least 2
                       (default: 0,25000,50000,100000)
   --iterations N      measured runs per variant and count (default: 5)
   --warmups N         unmeasured runs per variant and count (default: 1)
@@ -98,9 +99,12 @@ sample gets no fit, and the harness then exits 1.
 
 Every run starts without RUST_LOG, HERMIT_LOG and HERMIT_LOG_FILE. After
 timing, one run per backend at the largest count sets
-RUST_LOG=hermit::backend_stats=debug; it must pass the same check and print
-exactly one \"backend run complete backend=<backend> stats=\" record on
-stderr, or the harness exits 1.
+RUST_LOG=hermit::backend_stats=debug, and LiteInst gets the same run with
+zero calls first. Each must pass the same check and print exactly one
+\"backend run complete backend=<backend> stats=\" record on stderr. For
+LiteInst, the record's direct_hook count less the zero-call run's must be at
+least the largest count minus 1, which shows that the fixture's getpid site
+was patched. Otherwise that backend gets no fit and the harness exits 1.
 
 Wall times come from polling each run every 500 microseconds, so a sample
 can read up to one poll interval long.
@@ -437,6 +441,55 @@ fn check_hooked_calls(calls: u64, direct: u64, baseline: u64) -> Result<(), Stri
     Ok(())
 }
 
+/// The call counts of one backend's statistics runs, in order. LiteInst first
+/// runs the fixture with zero calls, so that hooks taken at start-up and exit
+/// sites can be subtracted from the measured run's; every backend then runs
+/// at the largest count.
+fn stats_run_counts(backend: &str, largest: u64) -> Vec<u64> {
+    let baseline_run = (backend == "liteinst").then_some(0);
+    baseline_run.into_iter().chain([largest]).collect()
+}
+
+/// The verdict on one statistics run, in [`stats_run_counts`] order. LiteInst's
+/// zero-call run stores its `direct_hook` count in `baseline`; the measured run
+/// is then checked against it by [`check_hooked_calls`], and is refused if the
+/// zero-call run was rejected.
+fn stats_verdict(
+    backend: &str,
+    calls: u64,
+    outcome: &Outcome,
+    records: &[String],
+    baseline: &mut Option<u64>,
+) -> Result<(), String> {
+    match check_stats_run(backend, outcome, records)? {
+        None => Ok(()),
+        Some(direct) if calls == 0 => {
+            *baseline = Some(direct);
+            Ok(())
+        }
+        Some(direct) => match *baseline {
+            Some(baseline) => check_hooked_calls(calls, direct, baseline),
+            None => Err(
+                "the zero-call run was rejected, so the getpid site's hooks cannot be told from start-up and exit hooks".to_string(),
+            ),
+        },
+    }
+}
+
+/// One statistics run: backend, call count, outcome, records and verdict.
+type StatsRun = (String, u64, String, Vec<String>, Result<(), String>);
+
+/// Whether every statistics run of `variant` was accepted, judged on that
+/// backend's own runs only; `None` for native, which has none.
+fn stats_accepted(variant: &str, stats_runs: &[StatsRun]) -> Option<bool> {
+    (variant != "native").then(|| {
+        stats_runs
+            .iter()
+            .filter(|(backend, ..)| backend == variant)
+            .all(|(.., verdict)| verdict.is_ok())
+    })
+}
+
 fn variant_argv(hermit: &[String], variant: &str, fixture: &Path, calls: u64) -> Vec<String> {
     let mut argv = Vec::new();
     if variant != "native" {
@@ -678,34 +731,19 @@ fn run(options: &Options) -> Result<bool, String> {
         }
     }
 
-    // One unmeasured run per backend that asks the backend for its own counters.
-    // LiteInst first runs the fixture with zero calls, so that hooks taken at
-    // start-up and exit sites can be subtracted from the measured run's.
+    // One unmeasured run per backend that asks the backend for its own counters,
+    // after LiteInst's zero-call run (see stats_run_counts).
     let stats_calls = *options.counts.iter().max().expect("at least two counts");
-    let mut stats_runs = Vec::new();
+    let mut stats_runs: Vec<StatsRun> = Vec::new();
     for backend in &options.backends {
         let mut baseline = None;
-        let baseline_run = (backend == "liteinst").then_some(0);
-        for calls in baseline_run.into_iter().chain([stats_calls]) {
+        for calls in stats_run_counts(backend, stats_calls) {
             let argv = variant_argv(&hermit, backend, &fixture, calls);
             let (_, status, stdout, stderr) =
                 run_bounded(&argv, &[("RUST_LOG", STATS_FILTER)], options.timeout, &work)?;
             let records = stats_records(&stderr);
             let classified = classify(status, &stdout, &stderr, calls);
-            let verdict = match check_stats_run(backend, &classified, &records) {
-                Err(reason) => Err(reason),
-                Ok(None) => Ok(()),
-                Ok(Some(direct)) if calls == 0 => {
-                    baseline = Some(direct);
-                    Ok(())
-                }
-                Ok(Some(direct)) => match baseline {
-                    Some(baseline) => check_hooked_calls(calls, direct, baseline),
-                    None => Err(
-                        "the zero-call run was rejected, so the getpid site's hooks cannot be told from start-up and exit hooks".to_string(),
-                    ),
-                },
-            };
+            let verdict = stats_verdict(backend, calls, &classified, &records, &mut baseline);
             if let Err(reason) = &verdict {
                 eprintln!("FAILED stats run {backend} calls={calls}: {reason}");
             }
@@ -724,13 +762,8 @@ fn run(options: &Options) -> Result<bool, String> {
     let summaries: Vec<Summary> = variants
         .iter()
         .map(|variant| {
-            let stats_accepted = (variant != "native").then(|| {
-                stats_runs
-                    .iter()
-                    .filter(|(backend, ..)| backend == variant)
-                    .all(|(.., verdict)| verdict.is_ok())
-            });
-            summarize(&samples, variant, &options.counts, stats_accepted)
+            let accepted = stats_accepted(variant, &stats_runs);
+            summarize(&samples, variant, &options.counts, accepted)
         })
         .collect();
     all_ok &= summaries.iter().all(|summary| summary.fit.is_some());
@@ -1245,6 +1278,86 @@ mod tests {
                     .contains("owes no call to direct_hook")
             );
         }
+    }
+
+    #[test]
+    fn stats_run_counts_put_the_liteinst_zero_call_run_first() {
+        assert_eq!(stats_run_counts("liteinst", 100), vec![0u64, 100]);
+        assert_eq!(stats_run_counts("ptrace", 100), vec![100u64]);
+    }
+
+    #[test]
+    fn stats_verdict_checks_the_measured_run_against_the_zero_call_run() {
+        // The zero-call run's 10 hooks reach the measured run's check: 109
+        // less 10 meets the floor of 99, while 108 less 10 does not, although
+        // 108 alone would.
+        let mut baseline = None;
+        let zero = [liteinst_record(10, 0)];
+        assert_eq!(
+            stats_verdict("liteinst", 0, &Outcome::Ok, &zero, &mut baseline),
+            Ok(())
+        );
+        assert_eq!(baseline, Some(10));
+        let enough = [liteinst_record(109, 1)];
+        assert_eq!(
+            stats_verdict("liteinst", 100, &Outcome::Ok, &enough, &mut baseline),
+            Ok(())
+        );
+        let short = [liteinst_record(108, 1)];
+        assert!(
+            stats_verdict("liteinst", 100, &Outcome::Ok, &short, &mut baseline)
+                .unwrap_err()
+                .contains("less the zero-call run's 10")
+        );
+
+        // A zero-call run without a record, or one that failed, sets no
+        // baseline, and the measured run is then refused however many hooks
+        // it shows.
+        let many = [liteinst_record(1000, 0)];
+        for (outcome, records) in [
+            (Outcome::Ok, Vec::new()),
+            (Outcome::Failed("exit 1".into()), zero.to_vec()),
+        ] {
+            let mut baseline = None;
+            assert!(stats_verdict("liteinst", 0, &outcome, &records, &mut baseline).is_err());
+            assert_eq!(baseline, None);
+            assert!(
+                stats_verdict("liteinst", 100, &Outcome::Ok, &many, &mut baseline)
+                    .unwrap_err()
+                    .contains("zero-call run was rejected")
+            );
+        }
+
+        // Other backends have no zero-call run and are judged on their own
+        // record alone.
+        let mut baseline = None;
+        let ptrace = ["x INFO backend run complete backend=ptrace stats=metrics=none".to_string()];
+        assert_eq!(
+            stats_verdict("ptrace", 100, &Outcome::Ok, &ptrace, &mut baseline),
+            Ok(())
+        );
+        assert_eq!(baseline, None);
+    }
+
+    #[test]
+    fn stats_accepted_judges_each_backend_on_its_own_runs() {
+        let run = |backend: &str, verdict: Result<(), String>| -> StatsRun {
+            (
+                backend.to_string(),
+                100,
+                "ok".to_string(),
+                Vec::new(),
+                verdict,
+            )
+        };
+        let runs = [
+            run("liteinst", Ok(())),
+            run("liteinst", Err("below the floor".to_string())),
+            run("ptrace", Ok(())),
+        ];
+        assert_eq!(stats_accepted("liteinst", &runs), Some(false));
+        assert_eq!(stats_accepted("ptrace", &runs), Some(true));
+        assert_eq!(stats_accepted("native", &runs), None);
     }
 
     #[test]
