@@ -2843,6 +2843,89 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
     );
 }
 
+/// LiteInst reports its own counters, under the same DEBUG gate as ptrace.
+///
+/// The guest is Hermit's activation probe: 32 `getpid` calls from one
+/// instruction site, of which the first traps and installs the hook and the
+/// other 31 go through it. So a record that really came from this run counts
+/// at least 31 direct hooks; other sites in the probe's own start-up may add
+/// more. Exactly one record is required because the activation check Hermit
+/// runs first happens before logging is set up.
+///
+/// `process_reports=0` is today's architecture, not a gap: the ptrace host
+/// counts every hook entry itself, so no guest process submits a report.
+/// When Detcore moves into the guest (https://github.com/rrnewton/hermit/issues/3520)
+/// each guest process reports its own counts and this becomes 1.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let hermit = liteinst_runtime::hermit_binary();
+    let hermit_path = hermit.to_str().expect("Hermit test binary path is UTF-8");
+    let run = |log: &[&str]| {
+        let mut args = log.to_vec();
+        args.extend([
+            "--backend",
+            "liteinst",
+            "run",
+            "--strict",
+            "--env=HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE=1",
+            "--",
+            hermit_path,
+        ]);
+        let mut command = Command::new(&hermit);
+        command
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE");
+        append_hermit_args(&mut command, &args);
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run LiteInst Hermit with {args:?}: {error}"));
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "hermit-liteinst-activation calls=32 traps=1 hooks=31\n"
+        );
+        stderr(&output)
+    };
+
+    for log in [&[][..], &["--log", "info"][..]] {
+        let stderr = run(log);
+        assert!(
+            !stderr.contains("backend run complete"),
+            "the record is DEBUG-only, but {log:?} printed it:\n{stderr}"
+        );
+    }
+
+    let stderr = run(&["--log", "debug"]);
+    let records: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("backend run complete"))
+        .collect();
+    let [record] = records[..] else {
+        panic!("expected exactly one backend statistics record, found {records:#?}");
+    };
+    assert!(
+        record.contains(
+            "backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 "
+        ),
+        "{record}"
+    );
+    let direct_hooks: u64 = record
+        .split_once("direct_hook=")
+        .and_then(|(_, rest)| {
+            rest.split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("no direct_hook count in {record}"));
+    assert!(
+        direct_hooks >= 31,
+        "the probe makes 31 hooked calls, but the record counts {direct_hooks}: {record}"
+    );
+}
+
 #[test]
 fn inherited_container_output_does_not_expose_capture_offset() {
     let _guard = HERMIT_RUN_LOCK.lock().unwrap();
