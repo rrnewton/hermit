@@ -1137,6 +1137,7 @@ fn read_dag(path: &Path) -> Result<dagrun::DagConfig, String> {
         .map_err(|error| format!("{}: invalid DAG JSON: {error}", path.display()))
 }
 
+#[cfg(test)]
 fn command_jobs(command: &str) -> Result<Option<i64>, String> {
     let words = command.split_whitespace().collect::<Vec<_>>();
     let mut jobs = None;
@@ -1211,141 +1212,386 @@ fn command_runs_exactly(command: &str, inner: &str) -> bool {
     unique.len() == pairs.len() && quoted_inner == shell_quote_one(&expected)
 }
 
+// Decode only the already supported host or pinned shell envelope, then
+// inspect real argument spellings. Quoting a duplicate selector cannot hide it.
+fn manifest_run_words(command: &str) -> Result<Vec<String>, String> {
+    let inner = if let Some(inner) = command.strip_prefix(PREBUILT_COMMAND_PREFIX) {
+        inner.to_string()
+    } else {
+        let current_separator = format!(
+            " -- bash -c {} bash ",
+            shell_quote_one(PINNED_ROOT_COMMAND_GUARD)
+        );
+        let quoted = command
+            .split_once(&current_separator)
+            .or_else(|| command.split_once(PINNED_COMMAND_SEPARATOR))
+            .map(|(_, quoted)| quoted)
+            .ok_or("manifest command lacks its canonical shell envelope")?;
+        let payload = shell_words::split(quoted).map_err(|error| error.to_string())?;
+        if payload.len() != 1 {
+            return Err("manifest command has multiple pinned payloads".into());
+        }
+        let inner = payload[0]
+            .strip_prefix(PREBUILT_COMMAND_PREFIX)
+            .ok_or("manifest command lacks its prebuilt script prefix")?;
+        // This existing runtime mount option is used by the c-programs owner.
+        // It is not an environment pair; all remaining wrapper checks stay exact.
+        let normalized = command.replacen(
+            &format!("{PINNED_COMMAND_PREFIX}--proc-locks-runtime "),
+            PINNED_COMMAND_PREFIX,
+            1,
+        );
+        if !command_runs_exactly(&normalized, inner) {
+            return Err("manifest command has a noncanonical pinned envelope".into());
+        }
+        inner.to_string()
+    };
+    let words = shell_words::split(&inner).map_err(|error| error.to_string())?;
+    let mut words = words.into_iter();
+    if words.next().as_deref() != Some("./ci/run-with-hermit-e2e-artifact.sh") {
+        return Err("manifest command lacks its literal artifact launcher".into());
+    }
+    let mut executable = words.next();
+    if executable.as_deref() == Some("--require-install") {
+        executable = words.next();
+    }
+    if executable.as_deref() != Some("target/debug/test-harness")
+        || words.next().as_deref() != Some("run")
+    {
+        return Err("manifest command lacks its literal harness run".into());
+    }
+    let words = words.collect::<Vec<_>>();
+    let mut arguments = words.iter();
+    while let Some(flag) = arguments.next() {
+        let (name, assigned) = flag
+            .split_once('=')
+            .map_or((flag.as_str(), false), |(name, _)| (name, true));
+        if name == "--jobs" && assigned {
+            return Err("manifest command requires separate --jobs and value arguments".into());
+        }
+        match name {
+            "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--jobs"
+            | "--parity-reference" | "--results" | "--junit" => {
+                if !assigned && arguments.next().is_none() {
+                    return Err(format!("manifest command has no value for {flag}"));
+                }
+            }
+            "--ci-only" | "--allow-empty" | "--prebuilt" if !assigned => {}
+            _ => return Err(format!("manifest command has unexpected argument {flag:?}")),
+        }
+    }
+    Ok(words)
+}
+
+fn manifest_command_jobs(words: &[String]) -> Result<Option<i64>, String> {
+    let mut jobs = None;
+    let mut index = 0;
+    while index < words.len() {
+        if words[index] == "--jobs" {
+            let value = words
+                .get(index + 1)
+                .ok_or_else(|| "manifest command has --jobs without a value".to_string())?
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "manifest command has invalid --jobs value".to_string())?;
+            if jobs.replace(value).is_some() {
+                return Err("manifest command repeats --jobs".into());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(jobs)
+}
+
+fn audit_manifest_command_population(
+    dag: &dagrun::DagConfig,
+    lane: &str,
+    command: &str,
+    required_tags: &[&str],
+) -> Result<(), String> {
+    let matches = dag
+        .steps
+        .iter()
+        .filter(|step| command_runs_exactly(&step.cmd, command))
+        .map(dagrun::Step::tag)
+        .collect::<Vec<_>>();
+    let actual = matches.iter().cloned().collect::<BTreeSet<_>>();
+    let expected = required_tags
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect::<BTreeSet<_>>();
+    if matches.len() != expected.len() || actual != expected {
+        return Err(format!(
+            "{lane} command population for {command:?} differs: expected={expected:?} actual={matches:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn audit_lane_manifest_correspondence(
+    path: &Path,
+    lane: &str,
+    dag: &dagrun::DagConfig,
+    expected_categories: &BTreeSet<String>,
+    expected_cells: &BTreeSet<PlanCellIdentity>,
+) -> Result<(), String> {
+    if dag
+        .steps
+        .iter()
+        .any(|step| step.cmd.contains("test_harness.sh"))
+    {
+        return Err(format!(
+            "{} still invokes the removed shell harness",
+            path.display()
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for step in &dag.steps {
+        let id = format!("{}.{}", step.group, step.job);
+        if !ids.insert(id.clone()) {
+            return Err(format!("{} contains duplicate node {id}", path.display()));
+        }
+    }
+    for step in &dag.steps {
+        for dependency in &step.deps {
+            if !ids.contains(dependency) {
+                return Err(format!(
+                    "{} node {}.{} names missing dependency {dependency}",
+                    path.display(),
+                    step.group,
+                    step.job
+                ));
+            }
+        }
+    }
+    let (metadata_tags, build_tags): (&[&str], &[&str]) = match lane {
+        "portable" => (
+            &["gate.manifest"],
+            &[
+                "build.manifest_guests",
+                "build.manifest_guests_in_pinned_root",
+            ],
+        ),
+        "privileged" => (
+            &["gate.manifest", "gate.manifest_on_host"],
+            &[
+                "privileged-build.manifest_guests",
+                "privileged-build.manifest_guests_in_pinned_root",
+                "privileged-build.manifest_guests_on_host",
+            ],
+        ),
+        _ => return Err(format!("unknown manifest lane {lane}")),
+    };
+    audit_manifest_command_population(
+        dag,
+        lane,
+        "target/debug/test-harness validate",
+        metadata_tags,
+    )?;
+    audit_manifest_command_population(
+        dag,
+        lane,
+        &format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty"),
+        build_tags,
+    )?;
+    let mut actual = BTreeSet::new();
+    let mut owners = BTreeMap::new();
+    for step in dag.steps.iter().filter(|step| {
+        step.manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.lane == lane)
+    }) {
+        let manifest = step
+            .manifest
+            .as_ref()
+            .ok_or_else(|| format!("{}.{} lacks typed manifest identity", step.group, step.job))?;
+        let dagrun::DagManifest {
+            lane: manifest_lane,
+            category,
+            ..
+        } = manifest;
+        if manifest_lane != lane {
+            return Err(format!(
+                "{}.{} records lane {} in the {lane} DAG",
+                step.group, step.job, manifest_lane
+            ));
+        }
+        // Only the existing HTTP/KVM applications split may filter a bucket.
+        // All other buckets retain their one unfiltered owner, including empty ones.
+        let tag = step.tag();
+        let selected_test = match (lane, category.as_str(), tag.as_str()) {
+            ("privileged", "applications", "privileged-only-e2e.manifest_applications") => {
+                Some("applications/kvm-shell-environment")
+            }
+            ("privileged", "applications", "privileged-e2e.network_http_on_host") => {
+                Some("applications/network-only-curl-http")
+            }
+            ("privileged", "applications", _) => {
+                return Err(format!(
+                    "{tag} is not a required privileged applications owner"
+                ));
+            }
+            _ => None,
+        };
+        if manifest.test.as_deref() != selected_test
+            || manifest.mode.is_some()
+            || manifest.backend.is_some()
+        {
+            return Err(format!("{tag} does not match its closed manifest selector"));
+        }
+        let mut selector =
+            format!("target/debug/test-harness run --lane {lane} --category {category}");
+        if let Some(test) = selected_test {
+            selector.push_str(&format!(" --test {test}"));
+        }
+        selector.push_str(" --ci-only --allow-empty --prebuilt");
+        if !step.cmd.contains(&selector) {
+            return Err(format!(
+                "{tag} does not execute its typed selector literally"
+            ));
+        }
+        let words = manifest_run_words(&step.cmd)?;
+        let expected_arguments = selector.split_whitespace().skip(2).collect::<Vec<_>>();
+        if words.len() < expected_arguments.len()
+            || !words
+                .iter()
+                .take(expected_arguments.len())
+                .map(String::as_str)
+                .eq(expected_arguments)
+        {
+            return Err(format!(
+                "{tag} decoded arguments differ from its typed selector"
+            ));
+        }
+        for (flag, expected_count) in [
+            ("--lane", 1),
+            ("--category", 1),
+            ("--test", usize::from(selected_test.is_some())),
+            ("--mode", 0),
+            ("--backend", 0),
+            ("--ci-only", 1),
+            ("--allow-empty", 1),
+            ("--prebuilt", 1),
+        ] {
+            let actual_count = words
+                .iter()
+                .filter(|word| {
+                    word.as_str() == flag
+                        || word
+                            .strip_prefix(flag)
+                            .is_some_and(|tail| tail.starts_with('='))
+                })
+                .count();
+            if actual_count != expected_count {
+                return Err(format!(
+                    "{tag} has duplicate or unmatched selector flag {flag}"
+                ));
+            }
+        }
+        let selected_cells = expected_cells
+            .iter()
+            .filter(|cell| {
+                cell.category == *category && selected_test.is_none_or(|test| cell.test == test)
+            })
+            .collect::<Vec<_>>();
+        if selected_test.is_some() && selected_cells.is_empty() {
+            return Err(format!(
+                "{tag} filters an empty required manifest population"
+            ));
+        }
+        for cell in selected_cells {
+            if let Some(prior) = owners.insert((*cell).clone(), tag.clone()) {
+                return Err(format!(
+                    "required manifest cell {} has duplicate owners {prior} and {tag}",
+                    cell.display()
+                ));
+            }
+        }
+        if let Some(jobs) = manifest_command_jobs(&words)? {
+            let demand = step
+                .hint
+                .resources
+                .get("manifest_guest")
+                .copied()
+                .unwrap_or(0);
+            let cap = dag
+                .resource_caps
+                .get("manifest_guest")
+                .copied()
+                .unwrap_or(0);
+            if demand != jobs
+                || cap < jobs
+                || step.hint.preferred_inner_jobs != Some(jobs)
+                || step.jobs_flag.as_deref() != Some("")
+            {
+                return Err(format!(
+                    "{}.{} runs --jobs {jobs} but declares manifest_guest={demand}, cap={cap}, preferred_inner_jobs={:?}, jobs_flag={:?}",
+                    step.group, step.job, step.hint.preferred_inner_jobs, step.jobs_flag
+                ));
+            }
+        }
+        if !actual.insert(category.clone()) && !(lane == "privileged" && category == "applications")
+        {
+            return Err(format!(
+                "{} has duplicate manifest bucket {}",
+                path.display(),
+                category
+            ));
+        }
+    }
+    if &actual != expected_categories {
+        return Err(format!(
+            "{} manifest buckets differ: expected={expected_categories:?} actual={actual:?}",
+            path.display()
+        ));
+    }
+    let actual_cells = owners.into_keys().collect::<BTreeSet<_>>();
+    if &actual_cells != expected_cells {
+        let missing = expected_cells
+            .difference(&actual_cells)
+            .map(PlanCellIdentity::display)
+            .collect::<Vec<_>>();
+        let extra = actual_cells
+            .difference(expected_cells)
+            .map(PlanCellIdentity::display)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "{lane} required manifest cells differ: missing={missing:?} extra={extra:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
     let committed_path = root.join("ci/dag/validate.json");
     let committed = read_dag(&committed_path)?;
+    let (_, rows) = required_plan_rows(manifests);
+    let required_cells = rows
+        .iter()
+        .map(PlanCellIdentity::from_json)
+        .collect::<Result<BTreeSet<_>, _>>()?;
     for lane in ["portable", "privileged"] {
-        let path = &committed_path;
-        let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])
-            .map_err(|error| format!("{}: cannot select label {lane}: {error}", path.display()))?;
-        if dag
-            .steps
-            .iter()
-            .any(|step| step.cmd.contains("test_harness.sh"))
-        {
-            return Err(format!(
-                "{} still invokes the removed shell harness",
-                path.display()
-            ));
-        }
-        let mut ids = BTreeSet::new();
-        for step in &dag.steps {
-            let id = format!("{}.{}", step.group, step.job);
-            if !ids.insert(id.clone()) {
-                return Err(format!("{} contains duplicate node {id}", path.display()));
-            }
-        }
-        for step in &dag.steps {
-            for dependency in &step.deps {
-                if !ids.contains(dependency) {
-                    return Err(format!(
-                        "{} node {}.{} names missing dependency {dependency}",
-                        path.display(),
-                        step.group,
-                        step.job
-                    ));
-                }
-            }
-        }
-        if dag
-            .steps
-            .iter()
-            .filter(|step| command_runs_exactly(&step.cmd, "target/debug/test-harness validate"))
-            .count()
-            != 1
-        {
-            return Err(format!(
-                "{} must contain exactly one Rust metadata validation node",
-                path.display()
-            ));
-        }
-        let build =
-            format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
-        if dag
-            .steps
-            .iter()
-            .filter(|step| command_runs_exactly(&step.cmd, &build))
-            .count()
-            != 2
-        {
-            return Err(format!(
-                "{} must contain exactly the host and pinned-root Rust manifest build nodes",
-                path.display()
-            ));
-        }
-        let expected = manifests
+        let dag =
+            dagrun::select_steps_by_labels(&committed, &[lane.to_string()]).map_err(|error| {
+                format!(
+                    "{}: cannot select label {lane}: {error}",
+                    committed_path.display()
+                )
+            })?;
+        let categories = manifests
             .documents
             .iter()
             .filter(|document| document.test.iter().any(|test| test.lane == lane))
             .map(|document| document.bucket.clone())
-            .collect::<BTreeSet<_>>();
-        let mut actual = BTreeSet::new();
-        for step in dag.steps.iter().filter(|step| {
-            step.manifest
-                .as_ref()
-                .is_some_and(|manifest| manifest.lane == lane)
-        }) {
-            let manifest = step.manifest.as_ref().ok_or_else(|| {
-                format!("{}.{} lacks typed manifest identity", step.group, step.job)
-            })?;
-            let dagrun::DagManifest {
-                lane: manifest_lane,
-                category,
-                ..
-            } = manifest;
-            if manifest_lane != lane {
-                return Err(format!(
-                    "{}.{} records lane {} in the {lane} DAG",
-                    step.group, step.job, manifest_lane
-                ));
-            }
-            let selector = format!(
-                "target/debug/test-harness run --lane {lane} --category {} --ci-only --allow-empty --prebuilt",
-                category
-            );
-            if !step.cmd.contains(&selector) {
-                return Err(format!(
-                    "{}.{} does not execute its typed selector literally",
-                    step.group, step.job
-                ));
-            }
-            if let Some(jobs) = command_jobs(&step.cmd)? {
-                let demand = step
-                    .hint
-                    .resources
-                    .get("manifest_guest")
-                    .copied()
-                    .unwrap_or(0);
-                let cap = dag
-                    .resource_caps
-                    .get("manifest_guest")
-                    .copied()
-                    .unwrap_or(0);
-                if demand != jobs
-                    || cap < jobs
-                    || step.hint.preferred_inner_jobs != Some(jobs)
-                    || step.jobs_flag.as_deref() != Some("")
-                {
-                    return Err(format!(
-                        "{}.{} runs --jobs {jobs} but declares manifest_guest={demand}, cap={cap}, preferred_inner_jobs={:?}, jobs_flag={:?}",
-                        step.group, step.job, step.hint.preferred_inner_jobs, step.jobs_flag
-                    ));
-                }
-            }
-            if !actual.insert(category.clone()) {
-                return Err(format!(
-                    "{} has duplicate manifest bucket {}",
-                    path.display(),
-                    category
-                ));
-            }
-        }
-        if actual != expected {
-            return Err(format!(
-                "{} manifest buckets differ: expected={expected:?} actual={actual:?}",
-                path.display()
-            ));
-        }
+            .collect();
+        let cells = required_cells
+            .iter()
+            .filter(|cell| cell.lane == lane)
+            .cloned()
+            .collect();
+        audit_lane_manifest_correspondence(&committed_path, lane, &dag, &categories, &cells)?;
     }
     Ok(())
 }
@@ -2430,7 +2676,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -2448,8 +2696,12 @@ mod tests {
     use super::HostCapabilityVerdict;
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
+    use super::PINNED_ROOT_COMMAND_GUARD;
     use super::PREBUILT_COMMAND_PREFIX;
+    use super::PlanCellIdentity;
     use super::accumulate_cell_cpu_usage;
+    use super::audit_dag_correspondence;
+    use super::audit_lane_manifest_correspondence;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
     use super::audit_validation_levels_policy;
@@ -2461,7 +2713,10 @@ mod tests {
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
+    use super::manifest_command_jobs;
+    use super::manifest_run_words;
     use super::parse;
+    use super::required_plan_rows;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::shell_quote_one;
@@ -3962,6 +4217,467 @@ report.write_bytes((root/'verification.json').read_bytes())
             |_, _, _| false,
         );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    fn correspondence_fixture(
+        lane: &str,
+    ) -> (
+        dagrun::DagConfig,
+        BTreeSet<String>,
+        BTreeSet<PlanCellIdentity>,
+    ) {
+        let manifests = ManifestSet::load(&super::root()).unwrap();
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json")).unwrap();
+        let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()]).unwrap();
+        let categories = manifests
+            .documents
+            .iter()
+            .filter(|document| document.test.iter().any(|test| test.lane == lane))
+            .map(|document| document.bucket.clone())
+            .collect();
+        let (_, rows) = required_plan_rows(&manifests);
+        let cells = rows
+            .iter()
+            .map(PlanCellIdentity::from_json)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|cell| cell.lane == lane)
+            .collect();
+        (dag, categories, cells)
+    }
+
+    fn remove_correspondence_node(dag: &mut dagrun::DagConfig, tag: &str) {
+        let count = dag.steps.len();
+        dag.steps.retain(|step| step.tag() != tag);
+        assert_eq!(dag.steps.len() + 1, count);
+        // Keep the mutant structurally complete so the population guard, rather
+        // than a dangling dependency, is the predicate being exercised.
+        for step in &mut dag.steps {
+            step.deps.retain(|dependency| dependency != tag);
+        }
+    }
+
+    #[test]
+    fn correspondence_audit_accepts_actual_lane_populations_and_partition() {
+        let root = super::root();
+        let manifests = ManifestSet::load(&root).unwrap();
+        audit_dag_correspondence(&root, &manifests).unwrap();
+        let (dag, categories, cells) = correspondence_fixture("privileged");
+        audit_lane_manifest_correspondence(
+            Path::new("fixture"),
+            "privileged",
+            &dag,
+            &categories,
+            &cells,
+        )
+        .unwrap();
+        let application_tests = cells
+            .iter()
+            .filter(|cell| cell.category == "applications")
+            .map(|cell| cell.test.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            application_tests,
+            BTreeSet::from([
+                "applications/kvm-shell-environment",
+                "applications/network-only-curl-http"
+            ])
+        );
+    }
+
+    #[test]
+    fn correspondence_audit_requires_exact_metadata_and_build_tags_and_commands() {
+        for lane in ["portable", "privileged"] {
+            let (dag, categories, cells) = correspondence_fixture(lane);
+            let build =
+                format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
+            let required = dag
+                .steps
+                .iter()
+                .filter(|step| {
+                    command_runs_exactly(&step.cmd, "target/debug/test-harness validate")
+                        || command_runs_exactly(&step.cmd, &build)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(required.len(), if lane == "portable" { 3 } else { 5 });
+            for original in required {
+                let tag = original.tag();
+                let check = |candidate: &dagrun::DagConfig, reason: &str| {
+                    let error = audit_lane_manifest_correspondence(
+                        Path::new("fixture"),
+                        lane,
+                        candidate,
+                        &categories,
+                        &cells,
+                    )
+                    .unwrap_err();
+                    assert!(error.contains(reason), "{lane} {tag}: {error}");
+                };
+                let mut missing = dag.clone();
+                remove_correspondence_node(&mut missing, &tag);
+                check(&missing, "command population");
+
+                let mut wrong_command = dag.clone();
+                wrong_command
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap()
+                    .cmd = "true".into();
+                check(&wrong_command, "command population");
+
+                let mut renamed = dag.clone();
+                let step = renamed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap();
+                step.job.push_str("_unexpected");
+                let replacement = step.tag();
+                for step in &mut renamed.steps {
+                    for dependency in &mut step.deps {
+                        if dependency == &tag {
+                            *dependency = replacement.clone();
+                        }
+                    }
+                }
+                check(&renamed, "command population");
+
+                let mut extra = dag.clone();
+                let mut clone = original.clone();
+                clone.job.push_str("_unexpected");
+                extra.steps.push(clone);
+                check(&extra, "command population");
+
+                let mut duplicate = dag.clone();
+                duplicate.steps.push(original);
+                check(&duplicate, "duplicate node");
+            }
+        }
+    }
+
+    #[test]
+    fn correspondence_audit_refuses_missing_overlapping_or_changed_application_selectors() {
+        let (dag, categories, cells) = correspondence_fixture("privileged");
+        for tag in [
+            "privileged-only-e2e.manifest_applications",
+            "privileged-e2e.network_http_on_host",
+        ] {
+            let check = |candidate: &dagrun::DagConfig, reason: &str| {
+                let error = audit_lane_manifest_correspondence(
+                    Path::new("fixture"),
+                    "privileged",
+                    candidate,
+                    &categories,
+                    &cells,
+                )
+                .unwrap_err();
+                assert!(error.contains(reason), "{tag}: {error}");
+            };
+            let mut missing = dag.clone();
+            remove_correspondence_node(&mut missing, tag);
+            check(&missing, "required manifest cells differ");
+            let original = dag.steps.iter().find(|step| step.tag() == tag).unwrap();
+            let test = original.manifest.as_ref().unwrap().test.as_deref().unwrap();
+            let other_test = if test == "applications/kvm-shell-environment" {
+                "applications/network-only-curl-http"
+            } else {
+                "applications/kvm-shell-environment"
+            };
+            for replacement in [None, Some(other_test), Some("applications/unknown")] {
+                let mut changed = dag.clone();
+                let step = changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap();
+                step.manifest.as_mut().unwrap().test = replacement.map(str::to_string);
+                step.cmd = step.cmd.replace(
+                    &format!(" --test {test}"),
+                    &replacement
+                        .map(|value| format!(" --test {value}"))
+                        .unwrap_or_default(),
+                );
+                check(&changed, "closed manifest selector");
+            }
+            for flag in ["--mode", "--backend"] {
+                let mut changed = dag.clone();
+                let step = changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap();
+                let manifest = step.manifest.as_mut().unwrap();
+                if flag == "--mode" {
+                    manifest.mode = Some("verify".into());
+                } else {
+                    manifest.backend = Some("ptrace".into());
+                }
+                step.cmd = step
+                    .cmd
+                    .replace(" --ci-only", &format!(" {flag} verify --ci-only"));
+                check(&changed, "closed manifest selector");
+            }
+            let mut literal = dag.clone();
+            literal
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .cmd = original
+                .cmd
+                .replace(&format!(" --test {test}"), &format!(" --test {other_test}"));
+            check(&literal, "typed selector literally");
+
+            for extra in [
+                format!(" --test {test}"),
+                format!(" --test={test}"),
+                " --mode verify".into(),
+                " --backend ptrace".into(),
+                " --lane privileged".into(),
+                " --category applications".into(),
+                " --ci-only".into(),
+                " --allow-empty".into(),
+                " --prebuilt".into(),
+            ] {
+                let mut duplicate = dag.clone();
+                let step = duplicate
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap();
+                step.cmd = step
+                    .cmd
+                    .replace(" --prebuilt", &format!(" --prebuilt{extra}"));
+                check(&duplicate, "duplicate or unmatched selector flag");
+            }
+            for flag in ["--test", "--mode", "--backend"] {
+                for quoted_flag in [format!("'{flag}'"), format!("\"{flag}\"")] {
+                    let mut duplicate = dag.clone();
+                    let step = duplicate
+                        .steps
+                        .iter_mut()
+                        .find(|step| step.tag() == tag)
+                        .unwrap();
+                    let extra = format!(" {quoted_flag} verify");
+                    let current_separator = format!(
+                        " -- bash -c {} bash ",
+                        shell_quote_one(PINNED_ROOT_COMMAND_GUARD)
+                    );
+                    if let Some((envelope, payload)) = step.cmd.split_once(&current_separator) {
+                        let decoded = shell_words::split(payload).unwrap();
+                        assert_eq!(decoded.len(), 1);
+                        let changed =
+                            decoded[0].replace(" --prebuilt", &format!(" --prebuilt{extra}"));
+                        step.cmd =
+                            format!("{envelope}{current_separator}{}", shell_quote_one(&changed));
+                    } else {
+                        step.cmd = step
+                            .cmd
+                            .replace(" --prebuilt", &format!(" --prebuilt{extra}"));
+                    }
+                    check(&duplicate, "duplicate or unmatched selector flag");
+                }
+            }
+            let mut false_launcher = dag.clone();
+            let step = false_launcher
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            step.cmd = format!("{PREBUILT_COMMAND_PREFIX}true # {}", original.cmd);
+            check(&false_launcher, "literal artifact launcher");
+            let mut unknown_owner = dag.clone();
+            let mut clone = original.clone();
+            clone.job.push_str("_unexpected");
+            unknown_owner.steps.push(clone);
+            check(
+                &unknown_owner,
+                "not a required privileged applications owner",
+            );
+        }
+    }
+
+    #[test]
+    fn correspondence_audit_binds_decoded_jobs_to_actual_resources() {
+        let (dag, categories, cells) = correspondence_fixture("portable");
+        let tag = "e2e.manifest_system_utils";
+        let original = dag.steps.iter().find(|step| step.tag() == tag).unwrap();
+        assert_eq!(command_jobs(&original.cmd).unwrap(), Some(1));
+        assert_eq!(
+            manifest_command_jobs(&manifest_run_words(&original.cmd).unwrap()).unwrap(),
+            Some(1)
+        );
+        audit_lane_manifest_correspondence(
+            Path::new("fixture"),
+            "portable",
+            &dag,
+            &categories,
+            &cells,
+        )
+        .unwrap();
+        let current_separator = format!(
+            " -- bash -c {} bash ",
+            shell_quote_one(PINNED_ROOT_COMMAND_GUARD)
+        );
+        let (envelope, payload) = original.cmd.split_once(&current_separator).unwrap();
+        let decoded = shell_words::split(payload).unwrap();
+        assert_eq!(decoded.len(), 1);
+        for (replacement, reason) in [
+            ("'--jobs' 2", "runs --jobs 2 but declares"),
+            ("\"--jobs\" 2", "runs --jobs 2 but declares"),
+            ("--jobs=2", "requires separate --jobs"),
+            ("--jobs 1 '--jobs' 1", "repeats --jobs"),
+        ] {
+            let mut candidate = dag.clone();
+            let changed = decoded[0].replace("--jobs 1", replacement);
+            assert_ne!(changed, decoded[0]);
+            candidate
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .cmd = format!("{envelope}{current_separator}{}", shell_quote_one(&changed));
+            let error = audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "portable",
+                &candidate,
+                &categories,
+                &cells,
+            )
+            .unwrap_err();
+            assert!(error.contains(reason), "{replacement}: {error}");
+        }
+    }
+
+    #[test]
+    fn correspondence_audit_keeps_unfiltered_empty_buckets_and_exact_cell_ownership() {
+        let (dag, categories, cells) = correspondence_fixture("portable");
+        let category = "bin-c";
+        let empty_cells = cells
+            .iter()
+            .filter(|cell| cell.category != category)
+            .cloned()
+            .collect();
+        // Controlled manifest premise: the category remains known but currently
+        // has no required cells. Its unfiltered --allow-empty owner remains mandatory.
+        audit_lane_manifest_correspondence(
+            Path::new("fixture"),
+            "portable",
+            &dag,
+            &categories,
+            &empty_cells,
+        )
+        .unwrap();
+        let original = dag
+            .steps
+            .iter()
+            .find(|step| {
+                step.manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.category == category)
+            })
+            .unwrap();
+        let mut missing = dag.clone();
+        remove_correspondence_node(&mut missing, &original.tag());
+        assert!(
+            audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "portable",
+                &missing,
+                &categories,
+                &empty_cells
+            )
+            .unwrap_err()
+            .contains("manifest buckets differ")
+        );
+
+        let mut overlapping = dag.clone();
+        let mut clone = original.clone();
+        clone.job.push_str("_overlap");
+        overlapping.steps.push(clone);
+        assert!(
+            audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "portable",
+                &overlapping,
+                &categories,
+                &cells
+            )
+            .unwrap_err()
+            .contains("duplicate owners")
+        );
+        assert!(
+            audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "portable",
+                &overlapping,
+                &categories,
+                &empty_cells
+            )
+            .unwrap_err()
+            .contains("duplicate manifest bucket")
+        );
+
+        let mut filtered = dag.clone();
+        let step = filtered
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == original.tag())
+            .unwrap();
+        step.manifest.as_mut().unwrap().test = Some("bin-c/unknown".into());
+        step.cmd = step
+            .cmd
+            .replace(" --ci-only", " --test bin-c/unknown --ci-only");
+        assert!(
+            audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "portable",
+                &filtered,
+                &categories,
+                &cells
+            )
+            .unwrap_err()
+            .contains("closed manifest selector")
+        );
+
+        let (privileged, categories, cells) = correspondence_fixture("privileged");
+        let mut future_cells = cells.clone();
+        let mut future = cells
+            .iter()
+            .find(|cell| cell.category == "applications")
+            .unwrap()
+            .clone();
+        future.test = "applications/new-required-test".into();
+        assert!(future_cells.insert(future));
+        assert!(
+            audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "privileged",
+                &privileged,
+                &categories,
+                &future_cells
+            )
+            .unwrap_err()
+            .contains("required manifest cells differ")
+        );
+        let no_http = cells
+            .into_iter()
+            .filter(|cell| cell.test != "applications/network-only-curl-http")
+            .collect();
+        assert!(
+            audit_lane_manifest_correspondence(
+                Path::new("fixture"),
+                "privileged",
+                &privileged,
+                &categories,
+                &no_http
+            )
+            .unwrap_err()
+            .contains("filters an empty required manifest population")
+        );
     }
 
     #[test]
