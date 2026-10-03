@@ -164,5 +164,163 @@ class CleanTransientGlobTest(unittest.TestCase):
         )
 
 
+# The results directories under target/ that clean.sh removes, each with the
+# variable that moves it somewhere else.
+RESULT_OVERRIDES = (
+    ("DEMO07_ARTIFACTS", "target/demos/07-drgn-kernel"),
+    ("DEMO08_ARTIFACTS", "target/demos/08-btrfs-convert-uaf"),
+    ("DEMO_SWEEP_LOG_DIR", "target/demo-sweep"),
+)
+
+
+class CleanMovedResultsTest(unittest.TestCase):
+    """clean.sh keeps a results directory that an override moved, and says so.
+
+    DEMO07_ARTIFACTS, DEMO08_ARTIFACTS and DEMO_SWEEP_LOG_DIR move a demo's
+    results out of target/. Such a path can name any directory, / or $HOME
+    included, and nothing records which entries in it a demo created, so
+    clean.sh does not remove it. It used to say nothing about it either: with
+    DEMO07_ARTIFACTS set, clean.sh reported "clean complete" while every
+    94 MB snapshot copy that demo 7 had left there was still on disk. It now
+    names each such directory as not removed.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="demo-clean-moved-")
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+
+        self.root = self.base / "repo"
+        (self.root / "demos/lib").mkdir(parents=True)
+        self.script = self.root / "demos/clean.sh"
+        shutil.copy2(DEMO_DIR / "clean.sh", self.script)
+        shutil.copy2(DEMO_DIR / "lib/qemu-paths.sh", self.root / "demos/lib/qemu-paths.sh")
+
+        self.assets = self.base / "assets"
+        self.assets.mkdir()
+
+    def _make_default_results(self):
+        for _, default in RESULT_OVERRIDES:
+            run = self.root / default / "run.default"
+            run.mkdir(parents=True, exist_ok=True)
+            (run / "hermit.log").write_text("default\n")
+
+    def _make_moved_results(self, variable):
+        directory = self.base / ("moved-" + variable.lower())
+        (directory / "run.moved").mkdir(parents=True, exist_ok=True)
+        (directory / "run.moved/hermit.log").write_text("moved\n")
+        (directory / "unrelated.txt").write_text("not written by a demo\n")
+        return directory
+
+    def _clean(self, *arguments, **overrides):
+        variables = {variable for variable, _ in RESULT_OVERRIDES}
+        environment = {
+            key: value for key, value in os.environ.items() if key not in variables
+        }
+        environment["QEMU_ASSETS"] = str(self.assets)
+        environment.update(overrides)
+        return subprocess.run(
+            ["bash", str(self.script), *arguments],
+            cwd=self.base,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _not_removed_lines(output):
+        return [line for line in output.splitlines() if line.startswith("  not removed: ")]
+
+    def test_a_moved_results_directory_is_kept_and_named(self):
+        for variable, default in RESULT_OVERRIDES:
+            with self.subTest(variable=variable):
+                self._make_default_results()
+                moved = self._make_moved_results(variable)
+                before = _snapshot(moved)
+                completed = self._clean(**{variable: str(moved)})
+                self.assertEqual(completed.returncode, 0, completed.stdout)
+                self.assertEqual(
+                    self._not_removed_lines(completed.stdout),
+                    [
+                        f"  not removed: {variable}={moved} (clean.sh removes only "
+                        f"{default}; delete that directory yourself when you no "
+                        "longer need it)"
+                    ],
+                    completed.stdout,
+                )
+                self.assertEqual(_snapshot(moved), before, completed.stdout)
+                self.assertFalse((self.root / default).exists(), completed.stdout)
+
+    def test_every_moved_directory_is_named(self):
+        self._make_default_results()
+        moved = {variable: self._make_moved_results(variable) for variable, _ in RESULT_OVERRIDES}
+        completed = self._clean(**{variable: str(path) for variable, path in moved.items()})
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        named = self._not_removed_lines(completed.stdout)
+        self.assertEqual(len(named), len(RESULT_OVERRIDES), completed.stdout)
+        for (variable, _), line in zip(RESULT_OVERRIDES, named):
+            self.assertTrue(line.startswith(f"  not removed: {variable}={moved[variable]} "), line)
+
+    def test_the_dry_run_names_a_moved_directory_and_deletes_nothing(self):
+        self._make_default_results()
+        moved = self._make_moved_results("DEMO07_ARTIFACTS")
+        before = _snapshot(self.base)
+        completed = self._clean("--dry-run", DEMO07_ARTIFACTS=str(moved))
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("  would remove target/demos/07-drgn-kernel\n", completed.stdout)
+        self.assertEqual(
+            self._not_removed_lines(completed.stdout),
+            [
+                f"  not removed: DEMO07_ARTIFACTS={moved} (clean.sh removes only "
+                "target/demos/07-drgn-kernel; delete that directory yourself when "
+                "you no longer need it)"
+            ],
+            completed.stdout,
+        )
+        self.assertEqual(_snapshot(self.base), before, completed.stdout)
+
+    def test_an_override_that_names_the_default_directory_is_not_reported(self):
+        # Positive control: the default directory, however it is spelled, is
+        # removed, and there is nothing left behind to report.
+        link = self.base / "link-to-default"
+        link.symlink_to(self.root / "target/demos/07-drgn-kernel")
+        spellings = (
+            str(self.root / "target/demos/07-drgn-kernel"),
+            str(self.root / "target/demos/07-drgn-kernel") + "//",
+            str(link),
+        )
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                self._make_default_results()
+                completed = self._clean(DEMO07_ARTIFACTS=spelling)
+                self.assertEqual(completed.returncode, 0, completed.stdout)
+                self.assertEqual(self._not_removed_lines(completed.stdout), [], completed.stdout)
+                self.assertIn("  removed target/demos/07-drgn-kernel\n", completed.stdout)
+                self.assertFalse((self.root / "target/demos/07-drgn-kernel").exists())
+
+    def test_an_empty_override_is_not_reported(self):
+        # Positive control: an empty value means the default, as in the demos.
+        self._make_default_results()
+        completed = self._clean(DEMO07_ARTIFACTS="")
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertEqual(self._not_removed_lines(completed.stdout), [], completed.stdout)
+        self.assertFalse((self.root / "target/demos/07-drgn-kernel").exists())
+
+    def test_the_help_says_that_moved_directories_are_not_removed(self):
+        completed = self._clean("--help")
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        help_text = " ".join(completed.stdout.split())
+        self.assertIn(
+            "A results directory moved with DEMO07_ARTIFACTS, DEMO08_ARTIFACTS or "
+            "DEMO_SWEEP_LOG_DIR is not removed",
+            help_text,
+        )
+        # The help is the script's header comment and nothing after it.
+        self.assertTrue(help_text.endswith("so that you can remove it yourself."), help_text)
+        self.assertNotIn("set -euo pipefail", completed.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

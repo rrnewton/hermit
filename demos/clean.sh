@@ -17,6 +17,11 @@
 # checkout-specific /var/tmp directory when the checkout is under /tmp, and
 # honors the same QEMU_ASSETS override the demos use. Only paths the demos
 # create are removed.
+#
+# A results directory moved with DEMO07_ARTIFACTS, DEMO08_ARTIFACTS or
+# DEMO_SWEEP_LOG_DIR is not removed: such a path can name any directory, and
+# nothing records which entries in it a demo created. clean.sh prints its
+# name instead, so that you can remove it yourself.
 
 set -euo pipefail
 
@@ -33,7 +38,7 @@ for arg in "$@"; do
     --distclean) distclean=1 ;;
     --dry-run|-n) dry_run=1 ;;
     -h|--help)
-      sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -98,6 +103,14 @@ target_results=(
   "$ROOT/target/demos/08-btrfs-convert-uaf"
   "$ROOT/target/demo-sweep"
 )
+# The variable that moves each directory above somewhere else, in the same
+# order. A moved directory is never removed, because its path can be anything,
+# / or $HOME included; it is named instead.
+target_result_overrides=(
+  DEMO07_ARTIFACTS
+  DEMO08_ARTIFACTS
+  DEMO_SWEEP_LOG_DIR
+)
 target_provisioned=(
   "$ROOT/target/qemu-busybox"
 )
@@ -137,7 +150,21 @@ else
   printf 'No QEMU asset directory at %s\n' "${ASSETS#"$ROOT"/}"
 fi
 
-for path in "${target_results[@]}"; do
+for index in "${!target_results[@]}"; do
+  path="${target_results[$index]}"
+  variable="${target_result_overrides[$index]}"
+  moved="${!variable:-}"
+  # Drop trailing slashes, so that the default spelled with one is the default.
+  while [ "${#moved}" -gt 1 ] && [ "${moved%/}" != "$moved" ]; do
+    moved="${moved%/}"
+  done
+  # An empty value means the default, as it does in the demos. -ef also
+  # recognizes the default reached through a symbolic link; it must be tested
+  # before the default is removed.
+  if [ -n "$moved" ] && [ "$moved" != "$path" ] && ! [ "$moved" -ef "$path" ]; then
+    printf '  not removed: %s=%s (clean.sh removes only %s; delete that directory yourself when you no longer need it)\n' \
+      "$variable" "$moved" "${path#"$ROOT"/}"
+  fi
   remove_path "$path"
 done
 

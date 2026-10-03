@@ -452,7 +452,7 @@ Controls (environment variables):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DEMO08_DIR` | `ignored/demo08-btrfs` | Directory holding `buggy/`, `fixed/`, `pop-tiny.img`, and `.crash-seed`. Under `/tmp`, give an absolute path that begins with `/tmp/`; see [Run it](#run-it). |
-| `DEMO08_ARTIFACTS` | `target/demos/08-btrfs-convert-uaf` | Scratch images and saved reports. Under `/tmp`, give an absolute path that begins with `/tmp/`; see [Run it](#run-it). |
+| `DEMO08_ARTIFACTS` | `target/demos/08-btrfs-convert-uaf` | Scratch images and saved reports. Under `/tmp`, give an absolute path that begins with `/tmp/`; see [Run it](#run-it). `demos/clean.sh` removes only the default directory and names an override instead. |
 | `DEMO08_CRASH_SEED` | from `.crash-seed`, else `7` | The chaos seed to use. |
 | `DEMO08_TIMEOUT` | `90` | Seconds allowed per run. `prepare-assets.sh` applies the same limit, so it only records a seed that fits. |
 | `DEMO08_REQUIRE_ASSETS` | `0` | Set to `1` to fail (exit 1) instead of skipping when the assets are missing. With `0`, a missing asset is a skip, which exits with `DEMO_SKIP_EXIT_STATUS`. |

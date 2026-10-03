@@ -182,4 +182,7 @@ Controls (environment variables):
 | `QEMU_BIN`, `QEMU_ASSETS` | as in demo 5 | The QEMU binary and asset directory. |
 
 Each pass keeps its working copy of the snapshot, serial transcript, and Hermit
-log under `target/demos/07-drgn-kernel/`; `demos/clean.sh` removes them.
+log under `target/demos/07-drgn-kernel/`, or under `DEMO07_ARTIFACTS` when that
+is set. `demos/clean.sh` removes the default directory. It does not remove a
+`DEMO07_ARTIFACTS` directory, which can be any path; it prints that directory's
+name instead, so that you can delete it yourself.
