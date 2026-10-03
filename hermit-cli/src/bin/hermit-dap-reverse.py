@@ -247,6 +247,10 @@ def _recording():
 # makes a forward run cost the square of the stack depth: one continue past a
 # recursion 1000 deep took 121.79 s with the full chain and 4.77 s with the
 # cap (devbig030, GDB 17.2). With the cap the cost per arrival is bounded.
+# hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7
+# in hermit-cli/tests/cli.rs fails with any smaller value, and
+# hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly
+# fails without a cap.
 _FRAME_IDENTITY_DEPTH = 8
 
 
@@ -265,10 +269,10 @@ def _frame_identity():
     # _FRAME_IDENTITY_DEPTH frames. It cannot tell apart two passes of a loop
     # in one activation, two calls from the same call site at the same depth
     # (a call inside a loop), or two arrivals whose newest frames are all
-    # equal and which differ only further out (the same helper chain more
-    # than _FRAME_IDENTITY_DEPTH frames deep, entered from two call sites in
-    # one caller): their chains are equal. GDB stops unwinding at main by
-    # default, so frames that called main are never part of the chain.
+    # equal and which differ only further out (the same chain of
+    # _FRAME_IDENTITY_DEPTH or more nested helper calls, entered from two call
+    # sites in one caller): their chains are equal. GDB stops unwinding at
+    # main by default, so frames that called main are never part of the chain.
     identity = []
     try:
         frame = gdb.newest_frame()

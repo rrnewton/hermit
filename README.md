@@ -404,9 +404,11 @@ as the calling frame is among the 8. It cannot tell apart two passes through
 the same activation, such as two iterations of a loop, two calls from the
 same call site at the same depth, such as a call inside a loop, or two
 arrivals whose 8 innermost frames are all equal and which differ only further
-out, such as the same chain of helper calls more than 8 frames deep entered
-from two call sites in one caller. Their identities are equal, so a wrong
-count there would land at the wrong pass without an error.
+out, such as the same chain of 8 or more nested helper calls entered from
+two call sites in one caller. Their identities are equal, so a wrong count
+there would land at the wrong pass without an error. A test pins the limit:
+with a chain of 7 helpers, the two activations differ only in the caller's
+return address, frame 7, and a wrong count must be refused.
 
 The identity is limited to 8 frames because the adapter takes it at every
 line arrival while the replay runs forward, and unwinding every frame made

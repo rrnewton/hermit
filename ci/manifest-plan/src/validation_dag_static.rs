@@ -646,7 +646,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly
     // (https://github.com/rrnewton/hermit/pull/3545) retain all 114 prior
     // selected CLI identities.
-    ("test.cli", 117),
+    // hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7
+    // (https://github.com/rrnewton/hermit/pull/3545) retains all 117 prior
+    // selected CLI identities.
+    ("test.cli", 118),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -678,26 +681,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
     // retains all 102.
-    // The same two hermit-dap
-    // end-to-end tests as test.cli; all 103 prior identities retained.
-    // The same two hermit-dap
-    // end-to-end tests as test.cli; all 102 prior identities retained. The
-    // same three hermit-dap replay tests from
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 105 prior
-    // identities retained.
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 104 prior
-    // identities retained. The same two further hermit-dap replay tests from
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 108 prior
-    // identities retained.
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 107 prior
-    // identities retained. The same four further hermit-dap replay tests from
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 110 prior
-    // identities retained.
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 109 prior
-    // identities retained. The same three further hermit-dap replay tests from
-    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 114 prior
-    // identities retained.
-    ("test.cli_on_host", 117),
+    // The same two hermit-dap end-to-end tests from
+    // https://github.com/rrnewton/reverie/pull/885 as test.cli; all 103 prior
+    // identities retained. The same thirteen hermit-dap replay tests from
+    // https://github.com/rrnewton/hermit/pull/3545 as test.cli (added three,
+    // two, four, three and one at a time); all 105, 108, 110, 114 and 117
+    // prior identities retained at each step.
+    ("test.cli_on_host", 118),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),

@@ -7879,6 +7879,129 @@ fn hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointe
     );
 }
 
+/// The guest of the frame-identity depth test below: `main` calls a chain of
+/// seven helpers, `h6` down to `h0`, from two consecutive lines. At line 5 of
+/// `h0` the two activations have 8 frames, and the newest 7 (`h0` to `h6`)
+/// have the same pc and stack pointer in both; only frame 7, `main`'s return
+/// address (line 26 against line 27), differs. Checked with `bt` and
+/// `gdb.Frame.read_register("sp")` in GDB 17.2 on devbig030.
+const DAP_HELPER_CHAIN_SOURCE: &str = r#"#include <stdio.h>
+
+static int h0(int x) {
+  int y = x + 1;
+  return y;
+}
+static int h1(int x) {
+  return h0(x) + 1;
+}
+static int h2(int x) {
+  return h1(x) + 1;
+}
+static int h3(int x) {
+  return h2(x) + 1;
+}
+static int h4(int x) {
+  return h3(x) + 1;
+}
+static int h5(int x) {
+  return h4(x) + 1;
+}
+static int h6(int x) {
+  return h5(x) + 1;
+}
+int main(void) {
+  int a = h6(1);
+  int b = h6(2);
+  printf("s=%d\n", a + b);
+  return 0;
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TEST BELOW ARE THIS LAYOUT: 4 is h0's first
+// statement, 5 `return y;`, 6 h0's closing brace, 8 to 23 the calls in h1 to
+// h6, 26 and 27 the two calls of h6.
+
+/// The frames of a stop at `line` of `h0` called from `main`'s line
+/// `main_line`, newest first.
+fn dap_helper_chain_frames(line: u64, main_line: u64) -> [(&'static str, u64); 8] {
+    [
+        ("h0", line),
+        ("h1", 8),
+        ("h2", 11),
+        ("h3", 14),
+        ("h4", 17),
+        ("h5", 20),
+        ("h6", 23),
+        ("main", main_line),
+    ]
+}
+
+/// A stepBack whose arrival count is short must refuse to land in an
+/// activation that differs from the right one only at frame index 7, which
+/// pins the frame identity at 8 frames.
+///
+/// With a breakpoint on line 4, the client stops in `h0` under the first
+/// call of `h6`, continues to `h0` under the second call, and steps to line 5
+/// and then line 6. The test-only fault injection drops the first arrival the
+/// line breakpoints record at line 5, the first call's, which the client
+/// never saw. stepBack from line 6 goes to line 5 of the second call, and the
+/// count picks the first call's line 5 instead. The newest 7 frames of the
+/// two are equal; only `main`'s return address tells them apart. With an
+/// identity of 7 frames or fewer, the landing check passes and stepBack
+/// reports success. With 8 it must fail, put the replay back at line 6 with
+/// a `stopped` event, and leave a working session.
+#[test]
+fn hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7() {
+    const TEST: &str =
+        "hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "chain", DAP_HELPER_CHAIN_SOURCE, "s=17", Some("5:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    // (request, what, reason, h0 line, main line, (watched expression, value)).
+    let walk = [
+        (
+            "continue",
+            "the stop in h0 under the first call",
+            "breakpoint",
+            4,
+            26,
+            ("x", "1"),
+        ),
+        (
+            "continue",
+            "the stop in h0 under the second call",
+            "breakpoint",
+            4,
+            27,
+            ("x", "2"),
+        ),
+        ("next", "next to line 5", "step", 5, 27, ("y", "3")),
+        ("next", "next to line 6", "step", 6, 27, ("y", "3")),
+    ];
+    for (request, what, reason, line, main_line, watch) in walk {
+        let stop = dap.resume(request, &thread, what, DAP_TIMEOUT);
+        let frames = dap_helper_chain_frames(line, main_line);
+        dap.assert_stop(what, &stop, &thread, reason, &frames, watch);
+    }
+
+    let what = "line 6 after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    let frames = dap_helper_chain_frames(6, 27);
+    dap.assert_stop(what, &stop, &thread, "step", &frames, ("y", "3"));
+    let what = "stepOut to h1 after the refused stepBack";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    let frames = &dap_helper_chain_frames(0, 27)[1..];
+    dap.assert_stop(what, &stop, &thread, "step", frames, ("x", "2"));
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
 /// A refused stepBack from a stop in the middle of a source line must put the
 /// replay back at that stop, not end the session.
 ///
@@ -8189,10 +8312,27 @@ int main(void) {{
 /// How deep the guest of
 /// [`hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly`]
 /// recurses.
-const DAP_DEEP_DEPTH: u32 = 4000;
+const DAP_DEEP_DEPTH: u32 = 1000;
 
-/// The bound on that test's `continue`; see its documentation.
-const DAP_DEEP_CONTINUE_BOUND: Duration = Duration::from_secs(95);
+/// The bound on that test's `continue` before scaling by
+/// [`dap_wall_timeout_multiplier`]; see the test's documentation.
+const DAP_DEEP_CONTINUE_BOUND: Duration = Duration::from_secs(20);
+
+/// The runner's wall-clock timeout multiplier, which also scales its 57 s
+/// per-test wall kill (`.config/nextest.toml`), read the way
+/// `ci/manifest-plan/src/timeouts.rs` reads it: unset is 1, and anything else
+/// must be a finite number greater than zero.
+fn dap_wall_timeout_multiplier() -> f64 {
+    const NAME: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
+    match std::env::var(NAME) {
+        Err(std::env::VarError::NotPresent) => 1.0,
+        Ok(text) => match text.parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 => value,
+            _ => panic!("{NAME} must be a finite number greater than zero, got {text:?}"),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => panic!("{NAME} must be valid UTF-8"),
+    }
+}
 
 /// The stop `stop` must be a `reason` stop of `thread` whose newest frames
 /// are `frames`, each (function, line), and whose newest frame evaluates
@@ -8315,23 +8455,39 @@ fn dap_deep_recursion_session(test: &str, depth: u32, bound: Duration) -> Option
 /// The adapter records a frame identity at every line arrival while the
 /// replay runs forward. Unwinding every frame for it made that cost the square
 /// of the stack depth, so the identity holds only the newest 8 frames. One
-/// `continue` from the attach stop to `bottom` passes about 8000 line
-/// arrivals at stack depths up to 4000. Measured on devbig030 with GDB 17.2
-/// and Reverie 4f125805, it took 9.18 s to 9.47 s in four runs with 8 frames,
-/// and 983 s with every frame. The bound, 95 s, is 10 times the slowest
-/// capped run and a tenth of the uncapped one.
+/// `continue` from the attach stop to `bottom` passes about 2000 line
+/// arrivals at stack depths up to 1000. Measured on devbig030 with GDB 17.2
+/// and Reverie 4f125805, it took 2.51 s to 2.66 s in eight runs with 8
+/// frames, and 63.45 s with every frame. The bound, 20 s (times
+/// `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER` when set), is 7.5 times the slowest
+/// capped run and 3.2 times under the uncapped one.
+///
+/// The validation runner kills a test at 57 s of wall time
+/// (`.config/nextest.toml`, also times the wall multiplier) and at 22
+/// CPU-seconds counted over the test's cgroup, GDB and Hermit included
+/// (`DEFAULT_TEST_CPU_TIMEOUT_SECONDS` in `ci/manifest-plan/src/timeouts.rs`).
+/// The whole test took 6.11 s to 6.29 s of wall time and 4.69 s to 4.75 s of
+/// cgroup CPU in three runs in a systemd unit: 4.6 times under the CPU kill
+/// and 9 times under the wall kill. With every frame, the test failed at its
+/// bound after 20.97 s and 20.3 CPU-seconds in two runs, just under the CPU
+/// kill; in the runner, whichever fires first fails the test.
 ///
 /// Then stepBack must land exactly at the previous two line arrivals: line 8
-/// of `depth(0)` and line 9 of `depth(1)`, more than 4000 frames deep, where
+/// of `depth(0)` and line 9 of `depth(1)`, more than 1000 frames deep, where
 /// every arrival at those lines has the same newest frames except for their
 /// stack pointers.
 #[test]
 fn hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly() {
-    dap_deep_recursion_session(
+    let bound = DAP_DEEP_CONTINUE_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    if let Some(elapsed) = dap_deep_recursion_session(
         "hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly",
         DAP_DEEP_DEPTH,
-        DAP_DEEP_CONTINUE_BOUND,
-    );
+        bound,
+    ) {
+        eprintln!(
+            "the continue through {DAP_DEEP_DEPTH} recursive calls took {elapsed:?} (bound {bound:?})"
+        );
+    }
 }
 
 /// The guest of the one-line-loop stepBack test below: a loop on one source
