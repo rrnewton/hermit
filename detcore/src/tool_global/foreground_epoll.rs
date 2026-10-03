@@ -3,16 +3,23 @@ use reverie::InjectedSyscallEvent as Event;
 
 use super::*;
 
+#[cfg(test)]
+mod terminal_lifecycle;
+
 impl GlobalState {
-    pub(crate) fn revoke_original_foreground<T>(&self, state: &crate::tool_local::ThreadState<T>) {
+    /// The synchronous final hook next closes exact physical task admission in
+    /// settle_no_seq_terminal. Death revokes live memory/root authority without
+    /// rewriting the recorder's retained history as an unsupported exposure.
+    /// https://github.com/rrnewton/hermit/issues/3612
+    pub(crate) fn invalidate_terminal_foreground_memory<T>(
+        &self,
+        state: &crate::tool_local::ThreadState<T>,
+    ) {
         state
             .memory_metadata
             .lock()
             .unwrap()
             .invalidate_original_arena();
-        if let Some(runtime) = &self.network_runtime {
-            runtime.revoke_foreground_lineage();
-        }
     }
     pub(crate) fn observe_original_memory<T>(
         &self,

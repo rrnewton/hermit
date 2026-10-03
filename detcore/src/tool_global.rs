@@ -3640,6 +3640,11 @@ impl GlobalState {
             if tid.as_raw() != owner.thread.as_raw()
                 || runtime.native_birth_creator_terminal(owner).is_err()
             {
+                // A mismatched final observation cannot preserve the root's
+                // historical policy. Keep the former blanket revocation on
+                // this failure path; successful exact retirement only closes
+                // live authority and never clears an earlier history loss.
+                runtime.revoke_foreground_lineage();
                 self.report_backend_failure(reverie::BackendFailure {
                     pid: Tid::from_raw(process.as_raw()),
                     tid,

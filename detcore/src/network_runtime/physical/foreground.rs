@@ -66,6 +66,36 @@ impl ForegroundRoot {
     ) -> policy_tests::SharedBirthFixture {
         policy_tests::SharedBirthFixture::new_after_entry(thread, before).await
     }
+    /// Controlled completed census plus an owned local accepted endpoint. No
+    /// provider command is submitted; terminal retirement must still traverse
+    /// the production accepted-runtime branch, not the guard-only early return.
+    #[cfg(test)]
+    pub(crate) fn controlled_terminal_runtime(
+        thread: i32,
+    ) -> (ControlledRuntimeFixture, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let (mut runtime, root, metadata, memory, claim) = controlled_foreground_runtime(thread);
+        let shared = Arc::get_mut(&mut runtime.shared).unwrap();
+        assert!(shared.endpoint.is_none());
+        shared.endpoint = Some(unsafe { OwnedFd::from_raw_fd(pair[0]) });
+        shared.copy_wire = Some(super::super::ProviderWireFormat::Abi9Copy5);
+        ((runtime, root, metadata, memory, claim), unsafe {
+            OwnedFd::from_raw_fd(pair[1])
+        })
+    }
     pub(in crate::network_runtime) fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
     }

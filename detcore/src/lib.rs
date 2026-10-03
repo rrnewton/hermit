@@ -1187,7 +1187,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         state: &mut Self::ThreadState,
         _status: ExitStatus,
     ) {
-        global.revoke_original_foreground(state);
+        global.invalidate_terminal_foreground_memory(state);
         #[cfg(test)]
         let before =
             tool_global::native_prestart_tests::before_terminal(tid, global, state, _status);

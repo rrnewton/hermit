@@ -2284,6 +2284,19 @@ impl NetworkReplayEngine {
             .unwrap();
         (engine, call, lease, effect)
     }
+    /// Controlled channel premise for the actual Tool terminal lifecycle test.
+    /// The socket is real; this issues no provider receipt or terminal event.
+    pub(crate) fn controlled_terminal_recording(
+        owner: NetworkStreamOwner,
+    ) -> (
+        Self,
+        OpenFileId,
+        std::os::fd::OwnedFd,
+        Option<std::net::TcpStream>,
+    ) {
+        let (engine, _, file, _, socket, peer) = tests::retirement_fixture_for_owner(true, owner);
+        (engine, file, socket, peer)
+    }
     pub(crate) fn native_trace_fixture(&self) -> NetworkTraceV4 {
         let EngineState::Native(native) = &self.mode else {
             panic!("native engine")
