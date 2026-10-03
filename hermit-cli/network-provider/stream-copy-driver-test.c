@@ -15,7 +15,8 @@ struct ap_pending_command {
     struct ap_command_result receipt;
     bool original_collected;
     struct ap_stream_copy_owned stream_copy;
-    struct ap_stream_tx_owned stream_tx;
+    union { struct ap_stream_tx_owned stream_tx;
+        struct ap_stream_tx_blocking_owned stream_tx_blocking; };
     struct ap_fd_call original_receipt;
 };
 struct ring { unsigned long consumer,producer; };

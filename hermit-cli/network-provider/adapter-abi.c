@@ -41,14 +41,15 @@ _Static_assert(sizeof(struct ap_program_id)==8,"identifier ABI");
 #error "Selected copy grammar is not a declared native producer grammar"
 #endif
 #endif
-/* ABI9 adds the explicit112-byte descriptor census event. Older hosts must
- * reject this DSO before resolving an operation that writes the larger event. */
+/* ABI10 adds a distinct632-byte blocking TX capture and72-byte internal
+ * command. Older hosts must reject before resolving any operation. */
 #if AP_NATIVE_COPY_VERSION == 4ULL || AP_NATIVE_COPY_VERSION == 5ULL
-u64 ap_adapter_abi_version(void) { return 0x4150525553540009ULL; }
+u64 ap_adapter_abi_version(void) { return 0x415052555354000aULL; }
 #else
 #error "No authenticated adapter ABI for this copy grammar"
 #endif
 u64 ap_adapter_copy_version(void) { return AP_NATIVE_COPY_VERSION; }
+u64 ap_adapter_task_command_size(void) { return sizeof(struct ap_task_command); }
 #include "fd-enrollment.h"
 _Static_assert(sizeof(struct ap_fd_enrollment)==112,"enrollment ABI");
 _Static_assert(offsetof(struct ap_fd_enrollment,phases)==72,"enrollment phases ABI");
@@ -84,7 +85,7 @@ _Static_assert(sizeof(struct ap_native_birth_terminal)==352,"native birth termin
 _Static_assert(offsetof(struct ap_native_birth,ready)==144,"native birth publication ABI");
 _Static_assert(sizeof(struct ap_fd_call)==424,"existing shared call map ABI");
 
-_Static_assert(sizeof(struct ap_task_command)==64,"ABI7 task command");
+_Static_assert(sizeof(struct ap_task_command)==72,"ABI10 task command");
 _Static_assert(offsetof(struct ap_task_command,original_count)==56,"full Read request count");
 _Static_assert(offsetof(struct ap_command_result,original_count)==128,"full Read result count");
 _Static_assert(offsetof(struct ap_original_selection,original_count)==96,"full Read selection count");
@@ -105,3 +106,12 @@ _Static_assert(offsetof(struct ap_stream_copy_manifest,summary)==56,"Read observ
 _Static_assert(sizeof(struct ap_original_epoll_ctl)==112,"original ctl observation overlay");
 _Static_assert(offsetof(struct ap_original_epoll_ctl,ctl_returned)==96,"immutable ctl selection prefix");
 _Static_assert(sizeof(struct ap_original_epoll_ctl)<=sizeof(((struct ap_original_result *)0)->address),"same original Call union bound");
+
+_Static_assert(offsetof(struct ap_task_command,expected_timeout_ticks)==64,"ABI10 timeout intent");
+_Static_assert(sizeof(struct ap_stream_tx_blocking_summary)==72,"blocking TX summary ABI");
+_Static_assert(sizeof(struct ap_stream_tx_blocking_capture)==632,"blocking TX capture ABI");
+_Static_assert(offsetof(struct ap_stream_tx_blocking_capture,bytes)==120,"blocking TX bytes ABI");
+_Static_assert(sizeof(struct ap_task_command_prefix)==64,"unchanged diagnostic prefix");
+_Static_assert(offsetof(struct ap_setter_rejection,raw)==64,"unchanged diagnostic prefix offset");
+_Static_assert(offsetof(struct ap_setter_rejection,raw_present)==128,"unchanged diagnostic presence offset");
+_Static_assert(offsetof(struct ap_setter_rejection,raw_level)==132,"unchanged diagnostic actual level offset");

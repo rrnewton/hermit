@@ -14,7 +14,8 @@ struct ap_pending_command {
     struct ap_task_command submitted;
     struct ap_command_result receipt;
     struct ap_fd_call original_receipt;
-    struct ap_stream_tx_owned stream_tx;
+    union { struct ap_stream_tx_owned stream_tx;
+        struct ap_stream_tx_blocking_owned stream_tx_blocking; };
     bool original_collected;
 };
 struct ap_session {u64 incarnation;struct ap_pending_command pending[AP_COMMANDS];};
@@ -36,6 +37,26 @@ static void image_controls(void) {
     }
     for(size_t i=0;i<sizeof(suffix);i++) {
         ((u8 *)b)[i]^=1;TX_CHECK(!ap_stream_tx_image_words(a,b));((u8 *)b)[i]^=1;
+    }
+}
+static int blocking_window(unsigned index,const u64 *words) {
+    switch(index) {
+    case 0:return ap_tx_prefix_words(words);
+    case 1:return ap_tx_load_words(words);
+    case 2:return ap_tx_wait_memory_words(words);
+    case 3:return ap_tx_wait_connect_words(words);
+    default:return 0;
+    }
+}
+static void blocking_image_controls(void) {
+    const unsigned offsets[]={AP_TX_PREFIX_OFFSET,AP_TX_LOAD_OFFSET,AP_TX_WAIT_MEMORY_OFFSET,AP_TX_WAIT_CONNECT_OFFSET};
+    const unsigned lengths[]={AP_TX_PREFIX_SIZE,AP_TX_LOAD_SIZE,AP_TX_WAIT_MEMORY_SIZE,AP_TX_WAIT_CONNECT_SIZE};
+    for(unsigned w=0;w<4;w++) {
+        u64 words[29]={0};memcpy(words,ap_tx_image_tcp_sendmsg+offsets[w],lengths[w]);
+        TX_CHECK(blocking_window(w,words));
+        for(unsigned i=0;i<lengths[w];i++) {
+            ((u8 *)words)[i]^=1;TX_CHECK(!blocking_window(w,words));((u8 *)words)[i]^=1;
+        }
     }
 }
 static void interval_controls(void) {
@@ -199,7 +220,35 @@ static void collector_controls(void) {
     memcpy(bad.bytes,&summary,sizeof(summary));
     TX_CHECK(stream_tx_record(p,&bad)<0 && !p->stream_tx.committed); /* no bytes is not capture */
 }
+static void blocking_collector_controls(void) {
+    struct ap_session session={.incarnation=3};struct ap_pending_command *p=&session.pending[1];
+    p->state=AP_SLOT_ACTIVE;p->submitted=command_fixture();
+    p->submitted.operation=AP_ORIGINAL_SENDTO_BLOCKING_CALL;p->submitted.expected_timeout_ticks=5000;
+    struct ap_stream_copy_record data=record_fixture(AP_STREAM_TX_DATA,1,0,3);memcpy(data.bytes,"ABC",3);
+    TX_CHECK(stream_tx_record(p,&data)<0); /* operation selects layout before payload */
+    TX_CHECK(!stream_tx_blocking_record(p,&data));
+    struct ap_stream_tx_blocking_summary summary={.prefix={.version=2,.file=17,.requested=8,.captured=3,
+        .sequence_before=0xfffffffeU,.sequence_after=1,.protocol_returned=3,.protocol_complete=1},
+        .saved_timeout_ticks=5000};
+    struct ap_stream_copy_record commit=record_fixture(AP_STREAM_TX_COMMIT,2,3,sizeof(summary));
+    memcpy(commit.bytes,&summary,sizeof(summary));
+    struct ap_stream_copy_record bad=commit;bad.length=64;
+    TX_CHECK(stream_tx_blocking_record(p,&bad)<0);
+    bad=commit;bad.bytes[0]=1;TX_CHECK(stream_tx_blocking_record(p,&bad)<0);
+    bad=commit;bad.bytes[64]^=1;TX_CHECK(stream_tx_blocking_record(p,&bad)<0);
+    bad=commit;bad.bytes[72]=1;TX_CHECK(stream_tx_blocking_record(p,&bad)<0);
+    p->submitted.expected_timeout_ticks++;TX_CHECK(stream_tx_blocking_record(p,&commit)<0);p->submitted.expected_timeout_ticks--;
+    TX_CHECK(!p->stream_tx_blocking.committed);
+    TX_CHECK(!stream_tx_blocking_record(p,&commit));
+    TX_CHECK(p->stream_tx_blocking.committed && p->stream_tx_blocking.capture.summary.saved_timeout_ticks==5000);
+    TX_CHECK(stream_tx_blocking_record(p,&commit)<0);
+    /* A v2 result cannot leak into old v1 even when its first eight values look
+     * plausible. The separately named API retains the original624-byte type. */
+    struct {u64 pre;struct ap_stream_tx_capture value;u64 post;} old={.pre=0xfeed,.post=0xbeef};
+    TX_CHECK(ap_original_sendto_capture(&session,1,&old.value)<0);
+    TX_CHECK(old.pre==0xfeed && old.post==0xbeef);
+}
 int main(void) {
-    image_controls();interval_controls();storage_controls();single_skb_controls();collector_controls();
+    image_controls();blocking_image_controls();interval_controls();storage_controls();single_skb_controls();collector_controls();blocking_collector_controls();
     printf("stream TX shared decoder/collector checks: %u\n",checks);return 0;
 }

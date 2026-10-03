@@ -48,6 +48,7 @@ static __attribute__((noinline)) struct ap_task_command *raw_command(void) {
     return task_storage(&tasks,current_task(),0,0);
 }
 static __attribute__((noinline)) struct ap_task_command *authenticated_command(struct ap_task_command *c) {
+    if(c && !ap_task_command_extension_valid(c)) {ap_fail(AP_BAD_COMMAND);return 0;}
     return c && c->provider && c->provider==incarnation()?c:0;
 }
 static __attribute__((noinline)) struct ap_task_command *command(void) { return authenticated_command(raw_command()); }
@@ -171,8 +172,8 @@ INLINE void save_setter_rejection(const struct ap_task_command *raw,u64 id,u64 g
     if(!d || __sync_val_compare_and_swap(&d->phase,0,1))return;
     d->task=pid_tgid();d->start_boottime=CORE(current_task()->start_boottime);
     d->incarnation=incarnation();d->object=id;d->generation=generation;
-    d->level=level;d->option=option;d->raw_present=raw!=0;d->raw_level=raw_level;
-    if(raw)d->raw=*raw;
+    d->level=level;d->option=option;d->raw_level=raw_level;
+    ap_setter_diagnostic_raw(d,raw);
     d->mismatch=ap_authorization_mismatch(raw,d->incarnation,id,generation,level,option);
     /* Publish after every payload field. No later failure overwrites the first. */
     __sync_val_compare_and_swap(&d->phase,1,2);

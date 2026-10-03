@@ -62,13 +62,33 @@ enum ap_operation { AP_ENROLL=1, AP_MATCH=2, AP_SETTER=3,
      * syscall. An unknown/different held file is retained as an observation. */
     AP_OBSERVE_SOCKET_FILE=14,
 };
+/* Stable diagnostic prefix. The reserved136-byte diagnostic slot cannot grow
+ * with task-storage commands; every original word retains its original offset.
+ * The ABI10-only timeout is separately rejected by AP_AUTH_TIMEOUT if nonzero
+ * on a setter and remains in the full retained task/pending command. */
+struct ap_task_command_prefix {
+    u64 provider,command,operation,expected_object;
+    u64 generation_before,generation_after;
+    s32 expected_level,expected_option;
+    u64 original_count;
+};
+_Static_assert(sizeof(struct ap_task_command_prefix)==64,"original command diagnostic prefix");
 struct ap_task_command {
     u64 provider, command, operation, expected_object;
     u64 generation_before, generation_after;
     s32 expected_level, expected_option;
     /* ABI7: exact original-I/O count operand; op11 uses bytes, older ops use zero. */
     u64 original_count;
+    /* ABI10: exact finite timeout intent for op25 only; older commands zero it. */
+    u64 expected_timeout_ticks;
 };
+#define AP_ORIGINAL_SENDTO_BLOCKING_CALL 25ULL
+static __attribute__((always_inline)) inline int ap_task_command_extension_valid(
+    const struct ap_task_command *c) {
+    return c && (c->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL?
+        c->expected_timeout_ticks && c->expected_timeout_ticks<=0x7ffffffffffffffeULL:
+        !c->expected_timeout_ticks);
+}
 static __attribute__((always_inline)) inline int ap_socket_file_observation_command(
     const struct ap_task_command *c) {
     return c && c->provider && c->command && c->operation==AP_OBSERVE_SOCKET_FILE &&
@@ -121,7 +141,7 @@ ap_command_ready_payload_empty(const struct ap_command_result *r) {
 struct ap_setter_rejection {
     u64 phase, mismatch, task, start_boottime, incarnation, object, generation;
     s32 level, option;
-    struct ap_task_command raw;
+    struct ap_task_command_prefix raw;
     u32 raw_present;
     s32 raw_level; /* Unused ctx1 retained separately from semantic level. */
 };

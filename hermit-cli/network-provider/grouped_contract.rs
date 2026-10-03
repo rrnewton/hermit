@@ -427,7 +427,7 @@ mod tests {
         let selected = current();
         let parsed = Contract::parse(include_bytes!("accepted-contract.json")).unwrap();
         assert_eq!(parsed.accepted_copy_version().unwrap(), 5);
-        assert_eq!(parsed.abi_version, "4150525553540009");
+        assert_eq!(parsed.abi_version, "415052555354000a");
         assert!(parsed.ftrace_only);
         assert_eq!((parsed.maps, parsed.programs, parsed.links), (24, 49, 49));
         assert_eq!((historical["programs"].as_u64(),historical["links"].as_u64()),(Some(44),Some(44)));
@@ -482,7 +482,9 @@ mod tests {
             ("4150525553540007", Some(5)),
             ("4150525553540009", None),
             ("4150525553540009", Some(4)),
-            ("415052555354000a", Some(5)),
+            ("415052555354000a", None),
+            ("415052555354000a", Some(4)),
+            ("415052555354000b", Some(5)),
             ("4150525553540008", Some(6)),
             ("4150525553540007", Some(4)),
         ] {

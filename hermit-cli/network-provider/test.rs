@@ -381,11 +381,12 @@ const DRIVER_FTRACE_CONTROL_INPUTS: &[&str] = &[
 ];
 const OWNED_DRIVER_CONTROLS: &[&str] = &[
     "owned-inventory", "owned-identity", "owned-fault", "owned-gate",
+    "owned-command-wire", "owned-task-map",
 ];
 
 fn expected_stage_count(accepted: bool) -> usize {
     1 + if accepted {
-        // Preserve all original stages and add the four owned-metadata controls.
+        // Preserve all original stages and require every additive owned control.
         2 * ACCEPTED_CONTROLS.len() + 32 + 26 + OWNED_DRIVER_CONTROLS.len()
     } else {
         2 * UNIX_CONTROLS.len()
@@ -1037,7 +1038,7 @@ mod initial_gate_batch_tests {
         assert_eq!(ACCEPTED_CONTROLS.last(), Some(&"grouped-wire-test.c"));
         assert_eq!(independent.len(), 24);
         assert!(!independent.contains(&"grouped-wire-test.c"));
-        assert_eq!(expected_stage_count(true), 113);
+        assert_eq!(expected_stage_count(true), 115);
         assert!(initial_control_partition(&[]).is_err());
         assert!(initial_control_partition(&ACCEPTED_CONTROLS[1..]).is_err());
         assert!(initial_control_partition(&ACCEPTED_CONTROLS[..24]).is_err());
@@ -1655,8 +1656,9 @@ raise SystemExit(status)
         let source_neighbor = plan.iter().find(|s| s.name == "neighbor:failed-prefix-SOURCE").unwrap();
         assert_eq!(source_neighbor.command.get_program(), "/output/stream-copy-fault-producer-test");
         assert_eq!(source_neighbor.command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>(), ["full"]);
-        // The new TX compile/run pair precedes the unchanged postwire DAG.
-        assert_eq!(expected_stage_count(true), 57 + plan.len());
+        // The TX compile/run pair and the exact command-wire/task-map controls
+        // precede the unchanged 56-node postwire DAG above.
+        assert_eq!(expected_stage_count(true), 59 + plan.len());
     }
 
     #[test]
@@ -1819,8 +1821,9 @@ mod tests {
     fn owned_and_tx_controls_preserve_the_original_population() {
         assert_eq!(super::ACCEPTED_CONTROLS.len(), 25);
         assert_eq!(super::OWNED_DRIVER_CONTROLS,
-            ["owned-inventory", "owned-identity", "owned-fault", "owned-gate"]);
-        assert_eq!(super::expected_stage_count(true), 113);
+            ["owned-inventory", "owned-identity", "owned-fault", "owned-gate",
+             "owned-command-wire", "owned-task-map"]);
+        assert_eq!(super::expected_stage_count(true), 115);
         assert_eq!(super::expected_stage_count(false), 7);
     }
 
@@ -1828,7 +1831,9 @@ mod tests {
     fn exact_stage_completion_refuses_omitted_extra_and_failed_stages() {
         let good = serde_json::json!({"receipt":{"passed":true}});
         let expected = super::expected_stage_count(true);
-        assert!(super::stages_complete(&vec![good.clone(); 113], expected));
+        assert!(super::stages_complete(&vec![good.clone(); 115], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 113], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 116], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 108], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 109], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 110], expected));
@@ -1836,10 +1841,10 @@ mod tests {
         assert!(!super::stages_complete(&vec![good.clone(); 112], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 114], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 105], expected));
-        let mut failed = vec![good; 113];
+        let mut failed = vec![good; 115];
         failed[110]["receipt"]["passed"] = serde_json::json!(false);
         assert!(!super::stages_complete(&failed, expected));
-        for at in [111, 112] {
+        for at in [111, 112, 113, 114] {
             failed[at-1]["receipt"]["passed"] = serde_json::json!(true);
             failed[at]["receipt"]["passed"] = serde_json::json!(false);
             assert!(!super::stages_complete(&failed, expected));

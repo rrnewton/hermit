@@ -304,6 +304,10 @@ static int ownership_info(int fd,void *out,unsigned int *size) {
         assert(ownership_maps[at].fd==fd && *size==sizeof(struct bpf_map_info));
         if(at==ownership_bad_at && ownership_fault==OWN_MAP_IO) {errno=EIO;return -1;}
         struct bpf_map_info *m=out;assert(!m->id);m->id=10000+at;
+        if(at==1) { /* Actual tasks-map FD returned by this load facade. */
+            m->type=BPF_MAP_TYPE_TASK_STORAGE;m->key_size=sizeof(int);
+            m->value_size=sizeof(struct ap_task_command);m->map_flags=BPF_F_NO_PREALLOC;
+        }
         if(at==ownership_bad_at && ownership_fault==OWN_SHORT_MAP)*size=offsetof(struct bpf_map_info,id);
         return 0;
     }
@@ -536,7 +540,7 @@ static void program_ownership_controls(void) {
     OWN_CHECK(ownership_peak==116);
     OWN_CHECK(12+ownership_live_fds()+4<=128);
     OWN_CHECK(12+ownership_live_fds()+4==120);
-    OWN_CHECK(ownership_unloads==40 && ownership_queries==216);
+    OWN_CHECK(ownership_unloads==40 && ownership_queries==216+1 /* exact ABI10 task-map query */);
     for(unsigned i=0;i<AP_PROGRAMS;i++) {
         OWN_CHECK(ownership_programs[i].fd==(i<2 || i>=42?ownership_program_fd(i):-1));
     }
@@ -600,7 +604,7 @@ static void program_ownership_controls(void) {
         OWN_CHECK(ap_open("ownership-fixture",3,&s)==-1 && errno==EIO && s);
         unsigned original=links<AP_PROGRAMS?links:AP_PROGRAMS;
         unsigned released=original>42?40:original>2?original-2:0;
-        OWN_CHECK(ownership_unloads==released && ownership_queries==2*links);
+        OWN_CHECK(ownership_unloads==released && ownership_queries==2*links+1 /* exact ABI10 task-map query */);
         ownership_inventory(s,links);ownership_close(s,links,released);
     }
     /* Every later link/program/map response is fresh. A prior positive binding

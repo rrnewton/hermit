@@ -89,7 +89,8 @@ enum ap_slot_state { AP_SLOT_FREE, AP_SLOT_RESERVED, AP_SLOT_ACTIVE, AP_SLOT_DIS
 
 struct ap_pending_command {
     struct ap_stream_copy_owned stream_copy;
-    struct ap_stream_tx_owned stream_tx;
+    union { struct ap_stream_tx_owned stream_tx;
+        struct ap_stream_tx_blocking_owned stream_tx_blocking; };
     enum ap_slot_state state;
     struct ap_task_command submitted;
     struct ap_command_result receipt;
@@ -522,6 +523,14 @@ int ap_open(const char *path,u64 incarnation,struct ap_session **out) {
     s->events=bpf_object__find_map_fd_by_name(s->object,"events");
     s->status=bpf_object__find_map_fd_by_name(s->object,"status");
     if(config<0 || s->tasks<0 || s->commands<0 || s->events<0 || s->status<0)return unavailable();
+    /* ABI10 extends only the task command. Refuse an older or foreign map
+     * before the first map write or any observer attachment. */
+    struct bpf_map_info task_info={0};u32 task_size=sizeof(task_info);
+    if(bpf_obj_get_info_by_fd(s->tasks,&task_info,&task_size) ||
+       task_size<offsetof(struct bpf_map_info,map_flags)+sizeof(task_info.map_flags) ||
+       !task_info.id || task_info.type!=BPF_MAP_TYPE_TASK_STORAGE ||
+       task_info.key_size!=sizeof(int) || task_info.value_size!=sizeof(struct ap_task_command) ||
+       task_info.max_entries || task_info.map_flags!=BPF_F_NO_PREALLOC)return unavailable();
 #ifdef AP_FTRACE_PROVIDER
     int fault_map=bpf_object__find_map_fd_by_name(s->object,"stream_copy_faults");
     struct bpf_map_info fault_info={0};u32 fault_size=sizeof(fault_info);
@@ -829,7 +838,7 @@ done:
 /* The session owns every reserved ticket even when a map syscall returns an
  * unknown outcome. No cancellation or ordinary error frees that reservation. */
 static int submit(struct ap_session *s,int pidfd,struct ap_task_command *c) {
-    if(pidfd<0)return invalid();
+    if(pidfd<0 || !ap_task_command_extension_valid(c))return invalid();
     struct ap_task_command prior;
     if(bpf_map_lookup_elem(s->tasks,&pidfd,&prior))return -1;
     struct ap_task_command idle={.provider=s->incarnation};

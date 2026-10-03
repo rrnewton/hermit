@@ -6,6 +6,7 @@
  * proposal before executing. Do not link libbpf or bypass that fence. */
 #include "driver-ftrace-facade.h"
 #include "driver-grouped.c"
+#include "auth-diagnostic.h"
 
 #define DF_COUNT(a) (sizeof(a)/sizeof((a)[0]))
 #define DF_PID 4242
@@ -29,7 +30,7 @@ enum df_fault {
     DF_ATTACH_FAIL, DF_LOAD_FAIL, DF_CONFIG_FAIL, DF_RING_FAIL, DF_READ_LINK,
     DF_ANCHOR_FAIL, DF_WRONG_PROGRAM_KIND, DF_LEGACY_PROGRAM,
     DF_FAULT_TARGET, DF_FAULT_MISS, DF_FAULT_SHORT, DF_FAULT_MAP, DF_FAULT_MAP_MISSING,
-    DF_OPEN_FAIL, DF_PROGRAM_MISS, DF_LINK_MISS
+    DF_OPEN_FAIL, DF_PROGRAM_MISS, DF_LINK_MISS, DF_TASK_MAP
 };
 static enum df_fault df_fault;
 static unsigned df_bad_at;
@@ -68,7 +69,10 @@ static unsigned dm_global_id_queries;
 static bool dm_tx_maps;
 static struct ap_task_command dm_tx_task;
 static struct ap_command_result dm_tx_result;
+static bool dm_diagnostic_maps;
+static struct ap_setter_rejection dm_diagnostic;
 static unsigned dm_tx_updates;
+static u64 dm_tx_expected_operation;
 
 /* Explicit metadata inventory transcribed from the active Ftrace object:
  * 38 fentry/fexit + 3 tp_btf + 8 multi/session programs. Names are fixture
@@ -387,13 +391,13 @@ int bpf_map_update_elem(int fd,const void *key,const void *value,unsigned long l
     if(dm_tx_maps && fd==1004) {
         assert(*(const u32 *)key==1 && flags==BPF_EXIST);
         const struct ap_command_result *r=value;
-        assert(r->command==1 && r->operation==AP_ORIGINAL_SENDTO_CALL && r->phase==AP_COMMAND_READY);
+        assert(r->command==1 && r->operation==dm_tx_expected_operation && r->phase==AP_COMMAND_READY);
         dm_tx_result=*r;dm_tx_updates++;return 0;
     }
     if(dm_tx_maps && fd==1008) {
         assert(*(const int *)key==DF_PIDFD && flags==BPF_EXIST);
         const struct ap_task_command *c=value;
-        assert(c->provider==DF_PROVIDER && c->command==1 && c->operation==AP_ORIGINAL_SENDTO_CALL);
+        assert(c->provider==DF_PROVIDER && c->command==1 && c->operation==dm_tx_expected_operation);
         dm_tx_task=*c;dm_tx_updates++;return 0;
     }
     assert(fd==1000 && *(const u32 *)key==0 && flags==BPF_ANY);
@@ -408,6 +412,9 @@ int bpf_map_update_elem(int fd,const void *key,const void *value,unsigned long l
     df_config=*c;return 0;
 }
 int bpf_map_lookup_elem(int fd,const void *key,void *out) {
+    if(dm_diagnostic_maps && fd==1004) {
+        assert(*(const u32 *)key==0);memcpy(out,&dm_diagnostic,sizeof(dm_diagnostic));return 0;
+    }
     if(dm_tx_maps && fd==1008) {
         assert(*(const int *)key==DF_PIDFD);memcpy(out,&dm_tx_task,sizeof(dm_tx_task));return 0;
     }
@@ -444,6 +451,21 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
         struct bpf_map_info *m=out;m->id=df_maps[at].id;m->type=df_maps[at].type;
         memcpy(m->name,df_maps[at].name,strlen(df_maps[at].name)<15?strlen(df_maps[at].name):15);
         if(dm_info_short)*size=0;
+        if(!strcmp(df_maps[at].name,"tasks")) {
+            m->key_size=sizeof(int);m->value_size=sizeof(struct ap_task_command);
+            m->map_flags=BPF_F_NO_PREALLOC;
+            if(df_fault==DF_TASK_MAP)switch(df_bad_at) {
+            case 0:m->value_size=64;break; /* actual pre-ABI10 layout */
+            case 1:m->value_size=80;break;
+            case 2:m->key_size=8;break;
+            case 3:m->type=BPF_MAP_TYPE_HASH;break;
+            case 4:m->max_entries=1;break;
+            case 5:m->map_flags=0;break;
+            case 6:m->id=0;break;
+            case 7:*size=offsetof(struct bpf_map_info,map_flags);break;
+            default:df_unexpected("task-map mutant");
+            }
+        }
         if(!strcmp(df_maps[at].name,"stream_copy_faults")) {
             m->key_size=sizeof(u32);m->value_size=sizeof(struct ap_stream_fault_state);m->max_entries=AP_COMMANDS;
             if(df_fault==DF_FAULT_MAP)m->value_size--;
@@ -511,7 +533,7 @@ static void df_reset(enum df_fault fault,unsigned at) {
     assert(!df_session_alive && !df_object.open && !df_ring.alive && !df_btf.alive && !df_file.alive && !df_owner_alive);
     assert(!df_terminal);df_terminal_unloads=0;
     df_fault=fault;df_bad_at=at;df_destroy_failure=-1;
-    dm_tx_maps=false;dm_tx_updates=0;
+    dm_tx_maps=false;dm_tx_updates=0;dm_tx_expected_operation=AP_ORIGINAL_SENDTO_CALL;
     dm_tx_task=(struct ap_task_command){.provider=DF_PROVIDER};
     dm_tx_result=(struct ap_command_result){0};
     df_attached=df_attach_calls=df_unloads=df_destroyed=df_map_closes=0;
@@ -1042,6 +1064,68 @@ static void dm_gate(void) {
     CHECK(nr_open_observation_result(&v,190,0)==-1 && errno==EPROTO);
     CHECK(nr_open_timely(0,200,2000)==-1);
 }
+static void dm_task_map(void) {
+    for(unsigned mutation=0;mutation<8;mutation++) {
+        df_reset(DF_TASK_MAP,mutation);struct ap_session *session=NULL;
+        CHECK(ap_open("fixture-object-only",DF_PROVIDER,&session)==-1 && errno==ENODATA);
+        CHECK(session && !session->ready && !df_updates && !df_lookups && !df_attach_calls);
+        df_closed(session,0);
+    }
+    struct ap_session *session=NULL;dm_ready(&session);
+    CHECK(session && session->ready);df_closed(session,0);
+}
+static void dm_command_wire(void) {
+    _Static_assert(sizeof(struct ap_task_command)==72,"ABI10 command");
+    _Static_assert(sizeof(struct ap_task_command_prefix)==64,"unchanged prefix");
+    _Static_assert(sizeof(struct ap_setter_rejection)==136,"unchanged diagnostic");
+    struct ap_task_command raw={.provider=3,.command=7,.operation=AP_SETTER,
+        .expected_object=11,.generation_before=13,.generation_after=14,
+        .expected_level=17,.expected_option=19,.original_count=23,.expected_timeout_ticks=5000};
+    struct {u64 pre;struct ap_setter_rejection value;u64 post;} writer={.pre=0xfeed,.post=0xbeef};
+    writer.value.raw_level=123;ap_setter_diagnostic_raw(&writer.value,&raw);
+    CHECK(writer.pre==0xfeed && writer.post==0xbeef && writer.value.raw_present==1 && writer.value.raw_level==123);
+    CHECK(!memcmp(&writer.value.raw,&raw,sizeof(writer.value.raw)));
+    CHECK(ap_authorization_mismatch(&raw,3,11,13,17,19)==AP_AUTH_TIMEOUT);
+    for(u64 op=0;op<25;op++) {
+        raw.operation=op;CHECK(!ap_task_command_extension_valid(&raw));
+        raw.expected_timeout_ticks=0;CHECK(ap_task_command_extension_valid(&raw));
+        raw.expected_timeout_ticks=5000;
+    }
+    raw.operation=AP_ORIGINAL_SENDTO_BLOCKING_CALL;CHECK(ap_task_command_extension_valid(&raw));
+    raw.expected_timeout_ticks=0;CHECK(!ap_task_command_extension_valid(&raw));
+    raw.expected_timeout_ticks=0x7fffffffffffffffULL;CHECK(!ap_task_command_extension_valid(&raw));
+    raw.expected_timeout_ticks=5000;raw.operation=~0ULL;CHECK(!ap_task_command_extension_valid(&raw));
+    struct ap_session *session=NULL;dm_ready(&session);
+    dm_diagnostic=writer.value;dm_diagnostic.phase=2;dm_diagnostic_maps=true;
+    struct {u64 pre;struct ap_setter_rejection value;u64 post;} reader={.pre=0xfeed,.post=0xbeef};
+    CHECK(!ap_read_setter_rejection(session,&reader.value));
+    CHECK(reader.pre==0xfeed && reader.post==0xbeef && !memcmp(&reader.value,&dm_diagnostic,sizeof(dm_diagnostic)));
+    dm_diagnostic.phase=1;CHECK(ap_read_setter_rejection(session,&reader.value)==-1);
+    dm_diagnostic_maps=false;df_closed(session,0);
+    const struct ap_pending_command empty={0};
+    for(unsigned mutation=0;mutation<4;mutation++) {
+        dm_ready(&session);u64 command=0xfeedface;
+        u64 timeout=mutation==0?0:mutation==1?0x7fffffffffffffffULL:5000;
+        int flags=mutation==2?0x4040:0x4000;
+        u64 count=mutation==3?513:8;
+        CHECK(ap_prepare_original_sendto_blocking(session,DF_PIDFD,395,0,5,0x100000,
+            count,flags,timeout,&command)==-1 && errno==EINVAL);
+        CHECK(command==0xfeedface && !session->next_command && !dm_tx_updates);
+        for(unsigned slot=0;slot<AP_COMMANDS;slot++)assert(!memcmp(&session->pending[slot],&empty,sizeof(empty)));
+        df_closed(session,0);
+    }
+    dm_ready(&session);dm_tx_maps=true;dm_tx_expected_operation=AP_ORIGINAL_SENDTO_BLOCKING_CALL;
+    u64 command=0;
+    CHECK(!ap_prepare_original_sendto_blocking(session,DF_PIDFD,395,0,5,0x100000,8,0x4000,5000,&command));
+    const struct ap_task_command expected={.provider=DF_PROVIDER,.command=1,.operation=25,
+        .expected_object=395,.generation_before=0x100000,.generation_after=0,
+        .expected_level=5,.expected_option=0x4000,.original_count=8,.expected_timeout_ticks=5000};
+    CHECK(command==1 && dm_tx_updates==2 && !memcmp(&dm_tx_task,&expected,sizeof(expected)));
+    CHECK(!memcmp(&session->pending[1].submitted,&expected,sizeof(expected)) &&
+        session->pending[1].state==AP_SLOT_ACTIVE && !session->pending[1].original_selected &&
+        !session->pending[1].original_collected && !session->pending[1].stream_tx_blocking.committed);
+    df_closed(session,0);
+}
 int main(int argc,char **argv) {
     if(argc==1 || (argc==2 && !strcmp(argv[1],"all"))) {
         int result=inherited_main(argc,argv);
@@ -1058,6 +1142,8 @@ int main(int argc,char **argv) {
         assert(result>=0); /* unchanged required old inventory lookup success */
         return 0;
     }
+    if(!strcmp(selector,"task-map") || !strcmp(selector,"all"))dm_task_map();
+    if(!strcmp(selector,"command-wire") || !strcmp(selector,"all"))dm_command_wire();
     if(!strcmp(selector,"inventory") || !strcmp(selector,"all"))dm_inventory();
     if(!strcmp(selector,"identity") || !strcmp(selector,"all"))dm_identity();
     if(!strcmp(selector,"fault") || !strcmp(selector,"all"))dm_faults();

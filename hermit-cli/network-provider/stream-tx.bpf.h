@@ -8,10 +8,10 @@ static __attribute__((noinline)) void stream_tx_problem(struct ap_fd_call *call,
 }
 static __attribute__((noinline)) struct ap_fd_call *stream_tx_call(void) {
     struct ap_task_command *c=command();
-    if(!c || c->operation!=AP_ORIGINAL_SENDTO_CALL)return 0;
+    if(!c || !ap_stream_tx_operation(c->operation))return 0;
     struct ap_invocation_key key;struct ap_fd_call *call=fd_actor_call(&key);
     struct ap_command_result *r=result(c->command);
-    if(!ap_stream_tx_command(c) || !call || !r || call->operation!=c->operation ||
+    if(!ap_stream_tx_any_command(c) || !call || !r || call->operation!=c->operation ||
        call->command!=c->command || r->command!=c->command || r->operation!=c->operation ||
        r->phase!=AP_COMMAND_RUNNING || r->identity.provider!=c->provider ||
        r->task!=key.task || r->start_boottime!=key.start || r->original_count!=c->original_count ||
@@ -34,7 +34,7 @@ static __attribute__((noinline)) struct ap_fd_call *stream_tx_call(void) {
  * caller's logical outbound lineage is joined separately to this actual file.
  * Actual kernel flags include O_NONBLOCK's MSG_DONTWAIT, even if Sendto itself
  * supplied only MSG_NOSIGNAL. Repair/fastopen/zerocopy/ancillary paths refuse. */
-static __attribute__((noinline)) int stream_tx_shape(struct sock *sk,struct msghdr *msg,int locked) {
+static __attribute__((noinline)) int stream_tx_shape(struct sock *sk,struct msghdr *msg,int locked,int blocking) {
     /* Kprobe arguments and map-retained kernel addresses are verifier scalars.
      * CO-RE relocates addresses only; every value load uses the bounded reader.
      * Failed reads refuse, rather than turning zero-initialized fields into a
@@ -47,7 +47,7 @@ static __attribute__((noinline)) int stream_tx_shape(struct sock *sk,struct msgh
        fd_read_kernel(&protocol,sizeof(protocol),CORE(&sk->sk_protocol)) || protocol!=6 ||
        fd_read_kernel(&type,sizeof(type),CORE(&sk->sk_type)) || type!=1 ||
        (locked && (fd_read_kernel(&owned,sizeof(owned),CORE(&sk->sk_lock.owned)) || owned!=1)) ||
-       fd_read_kernel(&flags,sizeof(flags),CORE(&msg->msg_flags)) || flags!=AP_STREAM_TX_FLAGS ||
+       fd_read_kernel(&flags,sizeof(flags),CORE(&msg->msg_flags)) || flags!=(blocking?0x4000U:AP_STREAM_TX_FLAGS) ||
        fd_read_kernel(&name,sizeof(name),CORE(&msg->msg_name)) || name ||
        fd_read_kernel(&name_length,sizeof(name_length),CORE(&msg->msg_namelen)) || name_length ||
        fd_read_kernel(&control,sizeof(control),CORE(&msg->msg_control)) || control ||
@@ -59,14 +59,21 @@ static __attribute__((noinline)) int stream_tx_shape(struct sock *sk,struct msgh
           __builtin_preserve_field_info(tcp->repair,0)))return 0;
     repair<<=__builtin_preserve_field_info(tcp->repair,4);
     repair>>=__builtin_preserve_field_info(tcp->repair,5);
-    return !repair;
+    if(repair)return 0;
+    if(blocking) {
+        u64 inet_flags=0;
+        if(fd_read_kernel(&inet_flags,sizeof(inet_flags),CORE(&((struct inet_sock *)sk)->inet_flags)) ||
+           (inet_flags&AP_STREAM_TX_DEFER_CONNECT_MASK))return 0;
+    }
+    return 1;
 }
-static __attribute__((noinline)) struct file *stream_tx_file(struct sock *sk) {
+static __attribute__((noinline)) struct file *stream_tx_file(struct sock *sk,int blocking) {
     struct socket *socket=0;struct file *file=0;struct sock *back=0;u32 flags=0;
     if(!sk || fd_read_kernel(&socket,sizeof(socket),CORE(&sk->sk_socket)) || !socket ||
        fd_read_kernel(&back,sizeof(back),CORE(&socket->sk)) || back!=sk ||
        fd_read_kernel(&file,sizeof(file),CORE(&socket->file)) || !file ||
-       fd_read_kernel(&flags,sizeof(flags),CORE(&file->f_flags)) || !(flags&04000U))return 0;
+       fd_read_kernel(&flags,sizeof(flags),CORE(&file->f_flags)) ||
+       (blocking?!!(flags&04000U):!(flags&04000U)))return 0;
     return file;
 }
 /* Bind the real prologue, lock call and final unlock/result path. Entry nops
@@ -81,22 +88,51 @@ static __attribute__((noinline)) int stream_tx_image(u64 function) {
        fd_read_kernel(b,28,(const void *)(function+0x855)))return 0;
     return ap_stream_tx_image_words(a,b);
 }
+/* Full installed bodies are authenticated by the same loader. These exact
+ * live windows cover the ordinary prefix/store, blocking load and both escaped
+ * pointer calls, avoiding every known legal text-patching site. */
+static __attribute__((noinline)) int stream_tx_blocking_image(u64 function) {
+    u64 w[29]={0};
+    if(function>~0ULL-(AP_TX_LOAD_OFFSET+AP_TX_LOAD_SIZE) ||
+       fd_read_kernel(w,AP_TX_PREFIX_SIZE,(const void *)(function+AP_TX_PREFIX_OFFSET)) ||
+       !ap_tx_prefix_words(w))return 0;
+    w[0]=w[1]=0;
+    if(fd_read_kernel(w,AP_TX_LOAD_SIZE,(const void *)(function+AP_TX_LOAD_OFFSET)) ||
+       !ap_tx_load_words(w))return 0;
+    w[0]=w[1]=0;
+    if(fd_read_kernel(w,AP_TX_WAIT_MEMORY_SIZE,(const void *)(function+AP_TX_WAIT_MEMORY_OFFSET)) ||
+       !ap_tx_wait_memory_words(w))return 0;
+    w[0]=w[1]=0;
+    return !fd_read_kernel(w,AP_TX_WAIT_CONNECT_SIZE,(const void *)(function+AP_TX_WAIT_CONNECT_OFFSET)) &&
+        ap_tx_wait_connect_words(w);
+}
+static __attribute__((always_inline)) inline int stream_tx_summary_complete(
+        const struct ap_task_command *c,const struct ap_stream_tx_state *tx,u64 file,s64 returned) {
+    if(c->operation==AP_ORIGINAL_SENDTO_CALL)
+        return ap_stream_tx_summary_valid(&tx->summary,file,c->original_count,returned) &&
+            !tx->saved_timeout_ticks;
+    return ap_stream_tx_blocking_command(c) && ap_stream_tx_blocking_parts_valid(
+        &tx->summary,tx->saved_timeout_ticks,file,c->original_count,returned,
+        c->expected_timeout_ticks);
+}
 static __attribute__((noinline)) int stream_tx_enter(struct pt_regs *ctx) {
     struct ap_fd_call *call=stream_tx_call();if(!call)return 0;
     struct ap_stream_tx_state *tx=&call->original.stream_tx;
     struct sock *sk=(struct sock *)CORE(ctx->di);
     struct msghdr *msg=(struct msghdr *)CORE(ctx->si);
-    struct file *file=stream_tx_file(sk);u64 count=0;
+    int blocking=call->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL;
+    struct file *file=stream_tx_file(sk,blocking);u64 count=0;
     if(tx->active || tx->summary.version || call->selected_file || call->selection.word ||
-       call->original.selection.ready || !stream_tx_shape(sk,msg,0) || !file ||
+       call->original.selection.ready || !stream_tx_shape(sk,msg,0,blocking) || !file ||
        CORE(ctx->dx)!=call->original.selection.original_count ||
        fd_read_kernel(&count,sizeof(count),CORE(&msg->msg_iter.count)) ||
        count!=call->original.selection.original_count) {
         stream_tx_problem(call,AP_FD_OUTCOME);return 0;
     }
     u64 selected=fd_file(file),function=fd_function_ip(ctx);
-    if(!selected || !function || !stream_tx_image(function)) {stream_tx_problem(call,AP_FD_IDENTITY);return 0;}
-    tx->summary.version=AP_STREAM_TX_VERSION;tx->summary.file=selected;
+    if(!selected || !function || !stream_tx_image(function) ||
+       (blocking && !stream_tx_blocking_image(function))) {stream_tx_problem(call,AP_FD_IDENTITY);return 0;}
+    tx->summary.version=blocking?AP_STREAM_TX_BLOCKING_VERSION:AP_STREAM_TX_VERSION;tx->summary.file=selected;
     tx->summary.requested=call->original.selection.original_count;
     tx->socket=(u64)sk;tx->message=(u64)msg;tx->function=function;tx->stack=CORE(ctx->sp);tx->active=1;
     call->selected_file=selected;call->selection.word=(u64)file;
@@ -121,7 +157,7 @@ static __attribute__((noinline)) int stream_tx_lock(struct pt_regs *ctx,int retu
     }
     struct sock *sk=(struct sock *)tx->socket;
     u32 sequence=0;
-    if(tx->active!=2 || !stream_tx_shape(sk,(struct msghdr *)tx->message,1) ||
+    if(tx->active!=2 || !stream_tx_shape(sk,(struct msghdr *)tx->message,1,call->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL) ||
        call->original.selection.ready ||
        fd_read_kernel(&sequence,sizeof(sequence),CORE(&((struct tcp_sock *)sk)->write_seq))) {
         stream_tx_problem(call,AP_FD_OUTCOME);return 0;
@@ -241,12 +277,27 @@ static __attribute__((noinline)) int stream_tx_unlock(struct pt_regs *ctx,int re
     if(tx->active!=3 || CORE(ctx->di)!=tx->socket ||
        fd_read_kernel(&caller,sizeof(caller),(const void *)stack) ||
        !ap_stream_tx_caller(tx->function,tx->stack,stack,caller,AP_STREAM_TX_UNLOCK_RETURN) ||
-       !stream_tx_shape(sk,msg,1) || call->original.selection.ready!=1 ||
+       !stream_tx_shape(sk,msg,1,call->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL) || call->original.selection.ready!=1 ||
        !call->selected_file || tx->summary.file!=call->selected_file ||
        returned< -4095 || returned>(s64)tx->summary.requested) {
         stream_tx_problem(call,AP_FD_OUTCOME);return 0;
     }
-    struct file *file=stream_tx_file(sk);u32 sequence=0;
+    int blocking=call->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL;
+    /* Positive ordinary-copy path and exact final caller dominate this read.
+     * Never read an uninitialized local for an early zero/error/FastOpen path.
+     * The first inner unlock already poisons the Call even if its RETURN was
+     * omitted; equal timeout values never excuse an observed inner cycle. */
+    if(blocking) {
+        struct ap_task_command *c=command();u64 timeout=0;
+        if(returned<=0 || !c || !ap_stream_tx_blocking_command(c) ||
+           stack>~0ULL-AP_STREAM_TX_TIMEOUT_OFFSET ||
+           fd_read_kernel(&timeout,sizeof(timeout),(const void *)(stack+AP_STREAM_TX_TIMEOUT_OFFSET)) ||
+           timeout!=c->expected_timeout_ticks || !ap_stream_tx_timeout(timeout)) {
+            stream_tx_problem(call,AP_FD_OUTCOME);return 0;
+        }
+        tx->saved_timeout_ticks=timeout;
+    }
+    struct file *file=stream_tx_file(sk,blocking);u32 sequence=0;
     if(!file || (u64)file!=call->selection.word || fd_file(file)!=call->selected_file ||
        fd_read_kernel(&sequence,sizeof(sequence),CORE(&((struct tcp_sock *)sk)->write_seq))) {
         stream_tx_problem(call,AP_FD_IDENTITY);return 0;
@@ -274,8 +325,8 @@ static __attribute__((noinline)) int stream_tx_exit(struct pt_regs *ctx) {
         stream_tx_problem(call,AP_FD_OUTCOME);return 0;
     }
     tx->summary.protocol_complete=1;
-    if(!ap_stream_tx_summary_valid(&tx->summary,call->selected_file,
-          call->original.selection.original_count,returned)) {
+    struct ap_task_command *c=command();
+    if(!c || !stream_tx_summary_complete(c,tx,call->selected_file,returned)) {
         stream_tx_problem(call,AP_FD_OUTCOME);return 0;
     }
     tx->socket=tx->message=tx->function=tx->stack=tx->active=0;return 0;
@@ -297,18 +348,24 @@ static __attribute__((noinline)) int stream_tx_syscall_exit(u64 *ctx,struct ap_t
        fd_read_kernel(&flags,sizeof(flags),CORE(&regs->r10)) ||
        fd_read_kernel(&destination,sizeof(destination),CORE(&regs->r8)) ||
        fd_read_kernel(&address_length,sizeof(address_length),CORE(&regs->r9)) ||
-       !ap_stream_tx_operands(c,nr,fd,address,count,flags,destination,address_length) ||
+       !ap_stream_tx_any_operands(c,nr,fd,address,count,flags,destination,address_length) ||
        !ap_original_selection_matches(c,&call->original.selection) ||
        tx->socket || tx->message || tx->function || tx->stack || tx->active ||
-       !ap_stream_tx_summary_valid(&tx->summary,call->selected_file,c->original_count,returned)) {
+       !stream_tx_summary_complete(c,tx,call->selected_file,returned)) {
         stream_tx_problem(call,AP_FD_OUTCOME);return 0;
     }
     struct ap_stream_copy_record *record=stream_copy_reserve(&stream_copy_records,sizeof(*record),0);
     if(!record) {stream_tx_problem(call,AP_FD_CAPACITY);return 0;}
     __builtin_memset(record,0,sizeof(*record));stream_copy_record_init(record,call);
     record->kind=AP_STREAM_TX_COMMIT;record->attempt=1;record->offset=(u64)returned;
-    record->sequence=tx->records+1;record->length=sizeof(tx->summary);
-    __builtin_memcpy(record->bytes,&tx->summary,sizeof(tx->summary));
+    record->sequence=tx->records+1;
+    if(c->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL) {
+        record->length=sizeof(struct ap_stream_tx_blocking_summary);
+        __builtin_memcpy(record->bytes,tx,sizeof(struct ap_stream_tx_blocking_summary));
+    } else {
+        record->length=sizeof(tx->summary);
+        __builtin_memcpy(record->bytes,&tx->summary,sizeof(tx->summary));
+    }
     stream_copy_submit(record,0);
     tx->records=0;
     call->original.returned=(s32)returned;call->original.complete=1;result_row->returned=(s32)returned;

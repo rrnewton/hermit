@@ -224,7 +224,7 @@ static __attribute__((noinline)) int fd_original_selection_publish_physical(
     struct ap_invocation_key key=fd_actor();
     struct files_struct *files=CORE(current_task()->files);
     u64 table=fd_table(files,(c->operation==AP_AUXILIARY_FILE || ap_original_recv(c->operation) ||
-        c->operation==AP_ORIGINAL_SENDTO_CALL)?AP_TABLE_NORMALIZE:AP_TABLE_ENROLLED_CREATE),provider=incarnation();
+        ap_stream_tx_operation(c->operation))?AP_TABLE_NORMALIZE:AP_TABLE_ENROLLED_CREATE),provider=incarnation();
     fresh->command=c->command;fresh->raw_table=(u64)files;
     fresh->file_entry_ip=entry_ip;
     fresh->original.selection.command=c->command;fresh->original.selection.call=c->expected_object;
@@ -233,8 +233,8 @@ static __attribute__((noinline)) int fd_original_selection_publish_physical(
     fresh->original.selection.table=table;
     __asm__ __volatile__("" : : "r"(fresh), "r"(&key) : "memory");
     if(ap_original_allocator(fresh->operation) || ap_original_recv(fresh->operation) ||
-       fresh->operation==AP_ORIGINAL_SENDTO_CALL) {
-        if(ap_original_recv(fresh->operation) || fresh->operation==AP_ORIGINAL_SENDTO_CALL)
+       ap_stream_tx_operation(fresh->operation)) {
+        if(ap_original_recv(fresh->operation) || ap_stream_tx_operation(fresh->operation))
             fresh->new_file=(u64)CORE(current_task()->mm);
         if(!provider || provider!=c->provider || !table || !key.task || !key.start ||
            fresh->original.selection.requested_fd!=c->expected_level ||
@@ -279,7 +279,7 @@ static __attribute__((noinline)) int fd_original_selection_publish(
         }
 #endif
     } else if(!ap_original_allocator(fresh->operation) && !ap_original_recv(fresh->operation) &&
-              fresh->operation!=AP_ORIGINAL_SENDTO_CALL) {
+              !ap_stream_tx_operation(fresh->operation)) {
         fd_problem(AP_FD_IDENTITY);return 0;
     }
     return fd_original_selection_publish_physical(
@@ -411,7 +411,7 @@ static __attribute__((noinline)) int fd_original_sendto_syscall_entered(
     if((s64)ctx[1]!=AP_SENDTO_SYSCALL)return 0;
     struct pt_regs *regs=(struct pt_regs *)ctx[0];
     if(!regs || CORE(regs->cs)!=0x33 || CORE(regs->orig_ax)!=AP_SENDTO_SYSCALL ||
-       !ap_stream_tx_operands(c,ctx[1],CORE(regs->di),CORE(regs->si),CORE(regs->dx),
+       !ap_stream_tx_any_operands(c,ctx[1],CORE(regs->di),CORE(regs->si),CORE(regs->dx),
            CORE(regs->r10),CORE(regs->r8),CORE(regs->r9))) {
         fd_problem(AP_FD_IDENTITY);return 0;
     }
@@ -1552,7 +1552,7 @@ SEC("tp_btf/sys_exit") int fd_native_syscall_returned(u64 *ctx) {
     if(ap_original_file_operation(c->operation))return fd_original_file_returned(ctx,c);
     if(c->operation==AP_ORIGINAL_READ)return fd_original_read_returned(ctx,c);
     if(ap_original_recv(c->operation))return fd_original_recv_returned(ctx,c);
-    if(c->operation==AP_ORIGINAL_SENDTO_CALL)return stream_tx_syscall_exit(ctx,c);
+    if(ap_stream_tx_operation(c->operation))return stream_tx_syscall_exit(ctx,c);
     if(ap_original_allocator(c->operation))return fd_original_allocator_returned(ctx,c);
     if(c->operation!=AP_NATIVE_BIRTH)return 0;
     struct ap_command_result *r=result(c->command);

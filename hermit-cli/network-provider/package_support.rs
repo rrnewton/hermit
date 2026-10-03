@@ -50,6 +50,44 @@ pub fn read_regular(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+const TX_IMAGE: &str = "/lib/modules/7.1.3-0_fbk0_0_g295ad0959f34/vmlinux-7.1.3-0_fbk0_0_g295ad0959f34";
+const TX_CONFIG_OFFSET: u64 = 0x1608008;
+const TX_CONFIG_BYTES: usize = 43_052;
+const TX_CONFIG_SHA: &str = "7f6c4e6a9262e141d3dc9a45db7b090fd1edceb678c64db620bec47ff3d3f4f3";
+const TX_CONFIG_DECODED_SHA: &str = "d4534e2e23cab1dd4d381bf737e9c49a9957c728a25bb3db27fc5a8b4b528148";
+fn read_tx_config() -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let image = File::options().read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(TX_IMAGE).context("open exact blocking-TX image")?;
+    ensure!(image.metadata()?.is_file(), "blocking-TX image is not regular");
+    let mut compressed = vec![0; TX_CONFIG_BYTES];
+    image.read_exact_at(&mut compressed, TX_CONFIG_OFFSET)?;
+    Ok(compressed)
+}
+fn validate_tx_config(compressed: &[u8]) -> Result<Value> {
+    ensure!(compressed.len() == TX_CONFIG_BYTES && digest(compressed) == TX_CONFIG_SHA,
+        "blocking-TX embedded config differs from the reviewed image");
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(compressed).take(193_922).read_to_end(&mut decoded)?;
+    ensure!(decoded.len() == 193_921 && digest(&decoded) == TX_CONFIG_DECODED_SHA,
+        "blocking-TX decoded config differs");
+    let config = std::str::from_utf8(&decoded)?;
+    for exact in ["CONFIG_HZ=1000", "CONFIG_HZ_1000=y", "CONFIG_DYNAMIC_FTRACE_WITH_ARGS=y",
+        "CONFIG_DYNAMIC_FTRACE_WITH_REGS=y"] {
+        ensure!(config.lines().filter(|line| *line == exact).count() == 1,
+            "blocking-TX config missing exact feature {exact}");
+    }
+    Ok(json!({"image":TX_IMAGE,"offset":TX_CONFIG_OFFSET,"compressed_bytes":TX_CONFIG_BYTES,
+        "compressed_sha256":TX_CONFIG_SHA,"decoded_bytes":193_921,
+        "decoded_sha256":TX_CONFIG_DECODED_SHA,"hz":1000}))
+}
+/// Read only the exact bounded embedded config. Complete TCP/wait/converter
+/// bodies remain independently checked by the native loader's image contract.
+pub fn blocking_tx_config() -> Result<Value> {
+    validate_tx_config(&read_tx_config()?)
+}
+
 fn bytes(raw: &[u8], at: usize, count: usize) -> Result<&[u8]> {
     raw.get(at..at.checked_add(count).context("byte range overflow")?)
         .context("truncated binary input")
@@ -158,6 +196,7 @@ impl Contract {
             ("4150525553540007", None | Some(4)) => Ok(4),
             ("4150525553540008", Some(5)) => Ok(5),
             ("4150525553540009", Some(version @ (4 | 5))) => Ok(version),
+            ("415052555354000a", Some(version @ (4 | 5))) => Ok(version),
             _ => anyhow::bail!("unsupported accepted adapter/copy version pair"),
         }
     }
@@ -886,6 +925,21 @@ mod tests {
     }
 
     #[test]
+    fn blocking_tx_config_binds_actual_image_and_refuses_mutation_or_truncation() {
+        let raw = read_tx_config().unwrap();
+        let proof = validate_tx_config(&raw).unwrap();
+        assert_eq!(proof["hz"], json!(1000));
+        assert_eq!(proof["offset"], json!(0x1608008));
+        for index in [0, 10, raw.len() / 2, raw.len() - 1] {
+            let mut changed = raw.clone();changed[index] ^= 1;
+            assert!(validate_tx_config(&changed).is_err());
+        }
+        assert!(validate_tx_config(&raw[..raw.len() - 1]).is_err());
+        let mut longer = raw.clone();longer.push(0);
+        assert!(validate_tx_config(&longer).is_err());
+    }
+
+    #[test]
     fn read_copy_unit_hook_requires_exact_argument_and_return_contract() {
         let raw = include_bytes!("accepted-classic-v40-contract.json");
         assert!(Contract::parse(raw).is_ok());
@@ -1491,7 +1545,11 @@ mod tests {
             ("4150525553540009", Some(5), Some(5)),
             ("4150525553540009", None, None),
             ("4150525553540009", Some(6), None),
-            ("415052555354000a", Some(5), None),
+            ("415052555354000a", Some(4), Some(4)),
+            ("415052555354000a", Some(5), Some(5)),
+            ("415052555354000a", None, None),
+            ("415052555354000a", Some(6), None),
+            ("415052555354000b", Some(5), None),
         ] {
             raw["abi_version"] = json!(abi);
             match copy { Some(value) => { raw["copy_version"] = json!(value); },

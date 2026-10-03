@@ -104,7 +104,7 @@ static inline int ap_original_operation(u64 operation) {
     return operation==AP_ORIGINAL_CONNECT || operation==AP_ORIGINAL_CLOSE ||
         ap_original_file_operation(operation) || ap_original_receive(operation) ||
         operation==AP_ORIGINAL_EPOLL_CTL || ap_original_allocator(operation) ||
-        operation==AP_ORIGINAL_SENDTO_CALL;
+        ap_stream_tx_operation(operation);
 }
 #define AP_NATIVE_BIRTH 8
 /* Exact x86-64 syscall shape retained from the original Tool invocation. */
@@ -228,7 +228,8 @@ struct ap_original_result {
         struct ap_original_openat_installation opened;
         struct ap_original_epoll_installation epoll;
         struct ap_original_epoll_ctl epoll_ctl;
-        struct ap_stream_copy_state stream_copy; struct ap_stream_tx_state stream_tx; };
+        struct ap_stream_copy_state stream_copy; struct ap_stream_tx_state stream_tx;
+        struct ap_stream_tx_blocking_summary stream_tx_blocking; };
     u64 copy_entered, copy_returned, copy_remaining;
     u64 audit_entered, audit_returned;
     u64 security_entered, security_returned, complete, problem;
@@ -403,7 +404,7 @@ static __attribute__((always_inline)) inline int ap_original_selection_matches(
      * TODO-HUMAN-REVIEW(PR-id): activation remains disabled pending review.
      * Common identity/operand guards are identical for every admitted opcode;
      * operation-specific constraints below remain mandatory. */
-    if(!submitted || !s || !submitted->provider || !submitted->command || !submitted->expected_object ||
+    if(!ap_task_command_extension_valid(submitted) || !s || !submitted->provider || !submitted->command || !submitted->expected_object ||
        s->provider!=submitted->provider || s->command!=submitted->command ||
        s->call!=submitted->expected_object || s->owner_mm!=submitted->generation_after ||
        s->requested_fd!=submitted->expected_level || s->user_address!=submitted->generation_before ||
@@ -414,6 +415,8 @@ static __attribute__((always_inline)) inline int ap_original_selection_matches(
     if(operation==AP_ORIGINAL_READ)return !submitted->expected_option;
     if(operation==AP_ORIGINAL_SENDTO_CALL)
         return ap_stream_tx_command(submitted) && s->file && !s->fdput_flags;
+    if(operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL)
+        return ap_stream_tx_blocking_command(submitted) && s->file && !s->fdput_flags;
     /* Actual protocol-entry selection has no fdget flag/phase issuer. */
     if(ap_original_recv(operation))
         return ap_original_copy_disposition(operation,submitted->expected_option) &&
@@ -654,6 +657,26 @@ static __attribute__((always_inline)) inline int ap_original_result_matches(
            !ap_stream_tx_summary_valid(&original->stream_tx.summary,original->selection.file,
                submitted->original_count,original->returned))return 0;
         for(u32 i=sizeof(struct ap_stream_tx_summary);i<sizeof(original->address);i++)
+            if(original->address[i])return 0;
+        const unsigned char *state=(const unsigned char *)&result->state;
+        for(u32 i=0;i<sizeof(result->state);i++)if(state[i])return 0;
+        return 1;
+    }
+    if(submitted && submitted->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL) {
+        if(!result || !original || !ap_original_selection_matches(submitted,&original->selection) ||
+           result->command!=submitted->command || result->operation!=submitted->operation ||
+           result->phase!=AP_COMMAND_DONE || result->identity.provider!=submitted->provider ||
+           result->identity.object || result->identity.namespace || result->creation || result->cookie ||
+           result->reserved ||
+           result->task!=original->selection.task || result->start_boottime!=original->selection.task_start ||
+           result->original_count!=submitted->original_count || result->returned!=original->returned ||
+           original->complete!=1 || original->problem || original->reserved ||
+           original->copy_entered || original->copy_returned || original->copy_remaining ||
+           original->audit_entered || original->audit_returned || original->audit_result ||
+           original->security_entered || original->security_returned || original->security_result ||
+           !ap_stream_tx_blocking_summary_valid(&original->stream_tx_blocking,original->selection.file,
+               submitted->original_count,original->returned,submitted->expected_timeout_ticks))return 0;
+        for(u32 i=sizeof(struct ap_stream_tx_blocking_summary);i<sizeof(original->address);i++)
             if(original->address[i])return 0;
         const unsigned char *state=(const unsigned char *)&result->state;
         for(u32 i=0;i<sizeof(result->state);i++)if(state[i])return 0;

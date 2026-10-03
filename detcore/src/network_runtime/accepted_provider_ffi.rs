@@ -239,6 +239,41 @@ impl Default for OriginalSendCapture {
     }
 }
 const _: () = assert!(std::mem::size_of::<OriginalSendCapture>() == 624);
+/// Exact ABI10 op25 output; never passed to the historical624-byte writer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginalBlockingSendCapture {
+    pub provider: u64,
+    pub command: u64,
+    pub call: u64,
+    pub task: u64,
+    pub task_start: u64,
+    pub returned: i64,
+    pub summary: [u64; 9],
+    pub bytes: [u8; 512],
+}
+impl Default for OriginalBlockingSendCapture {
+    fn default() -> Self {
+        Self {
+            provider: 0,
+            command: 0,
+            call: 0,
+            task: 0,
+            task_start: 0,
+            returned: 0,
+            summary: [0; 9],
+            bytes: [0; 512],
+        }
+    }
+}
+const _: () = {
+    assert!(std::mem::size_of::<OriginalBlockingSendCapture>() == 632);
+    assert!(std::mem::offset_of!(OriginalBlockingSendCapture, summary) == 48);
+    assert!(std::mem::offset_of!(OriginalBlockingSendCapture, bytes) == 120);
+};
+#[path = "accepted_provider_ffi/blocking_tx.rs"]
+mod blocking_tx;
+
 /// Exact physical cleanup evidence, not an observed syscall result.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -499,6 +534,9 @@ fn authenticate_provider_declarations(
     {
         return Err(LoadError("provider copy grammar version mismatch".into()));
     }
+    if wire.has_blocking_tx() && read(c"ap_adapter_task_command_size")? != 72 {
+        return Err(LoadError("provider task command layout mismatch".into()));
+    }
     topology
         .observe_driver(read(c"ap_provider_topology_version")?)
         .map_err(|error| LoadError(error.to_string()))
@@ -544,6 +582,7 @@ struct GroupedApi {
         unsafe extern "C" fn(*mut SessionPtr, *mut c_void, *mut c_void, u64, u64) -> c_int,
 }
 struct Api {
+    blocking_tx: Option<blocking_tx::Api>,
     grouped: Option<GroupedApi>,
     original_read_copy_ready: unsafe extern "C" fn(SessionPtr, c_int, u64, u32) -> c_int,
     original_copy_poll_fd: unsafe extern "C" fn(SessionPtr) -> c_int,
@@ -795,7 +834,16 @@ impl Library {
         } else {
             None
         };
+        let blocking_tx = if wire_format.has_blocking_tx() {
+            Some(blocking_tx::Api {
+                prepare: symbol!("ap_prepare_original_sendto_blocking", blocking_tx::Prepare),
+                capture: symbol!("ap_original_sendto_blocking_capture", blocking_tx::Capture),
+            })
+        } else {
+            None
+        };
         let api = Api {
+            blocking_tx,
             grouped,
             observe_socket_file: symbol!(
                 "ap_observe_socket_file",
@@ -1777,6 +1825,61 @@ impl Session {
         Ok(raw)
     }
 
+    /// Additive ABI10 primitive. The shared-attempt caller is deliberately not
+    /// selected by the current production policy until separately qualified.
+    #[expect(dead_code, reason = "blocking TX admission is not yet activated")]
+    pub fn prepare_original_sendto_blocking(
+        &mut self,
+        target: BorrowedFd<'_>,
+        call: u64,
+        mm: u64,
+        operands: (i32, u64, u64, i32),
+        expected_timeout_ticks: u64,
+    ) -> io::Result<Observation<u64>> {
+        let api = self
+            .library
+            .api
+            .blocking_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("blocking TX requires authenticated ABI10"))?;
+        let (fd, buffer, count, flags) = operands;
+        let mut raw = 0;
+        let rc = unsafe {
+            (api.prepare)(
+                self.pointer(),
+                target.as_raw_fd(),
+                call,
+                mm,
+                fd,
+                buffer,
+                count,
+                flags,
+                expected_timeout_ticks,
+                &mut raw,
+            )
+        };
+        Ok(Observation {
+            status: CallStatus::capture("ap_prepare_original_sendto_blocking", rc),
+            raw,
+        })
+    }
+
+    #[expect(dead_code, reason = "blocking TX admission is not yet activated")]
+    pub(super) fn original_sendto_blocking_capture(
+        &mut self,
+        command: u64,
+    ) -> io::Result<OriginalBlockingSendCapture> {
+        let api = self
+            .library
+            .api
+            .blocking_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("blocking TX requires authenticated ABI10"))?;
+        blocking_tx::read(self.wire_format(), |raw| unsafe {
+            (api.capture)(self.pointer(), command, raw)
+        })
+    }
+
     pub fn cancel_uninvoked_birth(&mut self, pin: BorrowedFd<'_>, command: u64) -> CallStatus {
         let rc = unsafe {
             (self.library.api.cancel_uninvoked_birth)(self.pointer(), pin.as_raw_fd(), command)
@@ -2186,6 +2289,8 @@ mod topology_tests {
             ProviderWireFormat::Abi8Copy5,
             ProviderWireFormat::Abi9Copy4,
             ProviderWireFormat::Abi9Copy5,
+            ProviderWireFormat::Abi10Copy4,
+            ProviderWireFormat::Abi10Copy5,
         ] {
             for expected in [
                 ProviderTopology::ClassicV40,
@@ -2203,6 +2308,7 @@ mod topology_tests {
                         match name.to_bytes() {
                             b"ap_adapter_abi_version" => Ok(wire.abi_version()),
                             b"ap_adapter_copy_version" => Ok(wire.copy_version()),
+                            b"ap_adapter_task_command_size" => Ok(72),
                             b"ap_provider_topology_version" => {
                                 actual.ok_or_else(|| LoadError("missing topology export".into()))
                             }
@@ -2218,6 +2324,9 @@ mod topology_tests {
                     let mut expected_names = vec![c"ap_adapter_abi_version".to_owned()];
                     if wire != ProviderWireFormat::Abi7Copy4 {
                         expected_names.push(c"ap_adapter_copy_version".to_owned());
+                    }
+                    if wire.has_blocking_tx() {
+                        expected_names.push(c"ap_adapter_task_command_size".to_owned());
                     }
                     expected_names.push(c"ap_provider_topology_version".to_owned());
                     assert_eq!(names, expected_names);

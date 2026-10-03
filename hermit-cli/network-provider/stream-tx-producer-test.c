@@ -22,7 +22,8 @@ struct sock {
     struct {void *next,*prev;u32 qlen;} sk_write_queue;
     struct {struct rb_node *rb_node;} tcp_rtx_queue;
 };
-struct tcp_sock {struct sock sk;u64 repair;u32 write_seq;};
+struct inet_sock {struct sock sk;u64 inet_flags;};
+struct tcp_sock {struct sock sk;u64 inet_flags;u64 repair;u32 write_seq;};
 struct file {u32 f_flags;};
 struct socket {struct sock *sk;struct file *file;};
 struct msghdr {u32 msg_flags;s32 msg_namelen;void *msg_name,*msg_control;u64 msg_controllen;struct {u64 count;} msg_iter;};
@@ -53,6 +54,9 @@ static struct ap_stream_copy_record emitted[8],reserved;
 static unsigned emitted_count,published,checks;
 static u64 problems;
 static bool missing_call,missing_result,ring_full,read_failure,bad_image;
+static unsigned timeout_reads;
+static bool timeout_read_failure;
+static int bad_window;
 static struct ap_task_command *command(void) {return &submitted;}
 static struct ap_command_result *result(u64 command_id) {
     return !missing_result && command_id==submitted.command?&receipt:NULL;
@@ -75,7 +79,17 @@ static int fd_read_kernel(void *out,u32 length,const void *source) {
     const u64 suffix[]={0xfff993d3e8df8948ULL,0x0000a8c48148e889ULL,0x5e415d415c415b00ULL,0xc35d5f41ULL};
     if(address==AP_STREAM_TX_IMAGE+5) {assert(length==35);memcpy(out,prefix,length);}
     else if(address==AP_STREAM_TX_IMAGE+0x855) {assert(length==28);memcpy(out,suffix,length);}
-    else {memcpy(out,source,length);return 0;}
+    else if(address>=AP_STREAM_TX_IMAGE && address<AP_STREAM_TX_IMAGE+sizeof(ap_tx_image_tcp_sendmsg)) {
+        const u64 offset=address-AP_STREAM_TX_IMAGE;
+        assert(offset<=sizeof(ap_tx_image_tcp_sendmsg)-length);
+        memcpy(out,ap_tx_image_tcp_sendmsg+offset,length);
+        if(bad_window && offset==(u64)bad_window)((u8 *)out)[length-1]^=1;
+        return 0;
+    }
+    else {
+        if(source==&stack[28]) {timeout_reads++;if(timeout_read_failure)return -1;}
+        memcpy(out,source,length);return 0;
+    }
     if(bad_image)((u8 *)out)[0]^=1;return 0;
 }
 struct stream_copy_skb_view {u64 head,data;u32 tail,end,size,nonlinear;s32 users;};
@@ -114,7 +128,8 @@ struct ap_pending_command {
     struct ap_task_command submitted;
     struct ap_command_result receipt;
     struct ap_fd_call original_receipt;
-    struct ap_stream_tx_owned stream_tx;
+    union { struct ap_stream_tx_owned stream_tx;
+        struct ap_stream_tx_blocking_owned stream_tx_blocking; };
     bool original_collected;
 };
 struct ap_session {u64 incarnation;struct ap_pending_command pending[AP_COMMANDS];};
@@ -125,7 +140,8 @@ static int stream_copy_drain(struct ap_session *s) {(void)s;return 0;}
 static void reset(void) {
     memset(&active,0,sizeof(active));memset(&tcp,0,sizeof(tcp));memset(&skb,0,sizeof(skb));
     memset(head,0,sizeof(head));memcpy(head,"ABCdefgh",8);
-    emitted_count=published=0;problems=0;
+    emitted_count=published=0;problems=0;timeout_reads=0;timeout_read_failure=false;bad_window=0;
+    memset(stack,0,sizeof(stack));stack[28]=5000;
     missing_call=missing_result=ring_full=read_failure=bad_image=false;
     config=(struct ap_config){.anchor_phase=AP_GROUPED_ANCHOR_ACTIVE,.anchor_ip=AP_GROUPED_CONNECT_IMAGE};
     submitted=(struct ap_task_command){.provider=3,.command=7,.operation=AP_ORIGINAL_SENDTO_CALL,
@@ -196,6 +212,105 @@ static void positive(s64 returned) {
     if(returned>0)assert(returned==3 && !memcmp(out.bytes,"ABC",3));
     checks++;
 }
+static void blocking_reset(void) {
+    reset();submitted.operation=AP_ORIGINAL_SENDTO_BLOCKING_CALL;
+    submitted.expected_timeout_ticks=5000;
+    receipt.operation=active.operation=submitted.operation;
+    selected.f_flags=0;message.msg_flags=0x4000;
+}
+static void positive_blocking(int wrap) {
+    blocking_reset();
+    if(wrap) {
+        tcp.write_seq=0xfffffffeU;
+        *(struct tcp_skb_cb *)skb.cb=(struct tcp_skb_cb){.seq=0xfffffffeU,.end_seq=1};
+    }
+    for(unsigned i=0;i<7;i++) {
+        if(i==3 && wrap) {
+            struct pt_regs ctx={.ip=AP_STREAM_TX_UNLOCK_IMAGE,.sp=(u64)&stack[12],
+                .di=(u64)&tcp.sk,.bp=3};
+            stack[12]=AP_STREAM_TX_IMAGE+AP_STREAM_TX_UNLOCK_RETURN;tcp.write_seq=1;
+            stream_tx_unlock(&ctx,0);
+        } else phase(i,3);
+    }
+    assert(!problems && !active.original.problem && published==1 && timeout_reads==1);
+    assert(ap_original_result_matches(&submitted,&receipt,&active.original));
+    struct ap_session owner={.incarnation=3};struct ap_pending_command *p=&owner.pending[ap_command_slot(7)];
+    p->state=AP_SLOT_ACTIVE;p->submitted=submitted;
+    for(unsigned i=0;i<emitted_count;i++)assert(!stream_tx_blocking_record(p,&emitted[i]));
+    p->receipt=receipt;p->original_receipt=active;p->state=AP_SLOT_COLLECTED;p->original_collected=true;
+    struct {u64 pre;struct ap_stream_tx_blocking_capture out;u64 post;} guarded={.pre=0xfeed,.post=0xbeef};
+    assert(!ap_original_sendto_blocking_capture(&owner,7,&guarded.out));
+    assert(guarded.pre==0xfeed && guarded.post==0xbeef && guarded.out.returned==3 &&
+        guarded.out.summary.prefix.version==2 && guarded.out.summary.saved_timeout_ticks==5000 &&
+        !memcmp(guarded.out.bytes,"ABC",3));
+    struct ap_stream_tx_capture old;
+    assert(ap_original_sendto_capture(&owner,7,&old)==-1);
+    checks++;
+}
+static void blocking_controls(void) {
+    positive_blocking(0);positive_blocking(1);
+    /* Keep every old127 omission case; additionally run every subset on v2. */
+    for(unsigned mask=1;mask<128;mask++) {blocking_reset();run(mask,0,3);no_completion();}
+    for(unsigned which=0;which<4;which++) {
+        blocking_reset();for(unsigned i=0;i<3;i++)phase(i,3);
+        struct pt_regs inner={.ip=AP_STREAM_TX_UNLOCK_IMAGE,.sp=(u64)&stack[12],
+            .di=(u64)&tcp.sk,.bp=3};
+        stack[12]=AP_STREAM_TX_IMAGE+0xb34; /* actual wait-helper call, never final */
+        stream_tx_unlock(&inner,0);
+        if(which&1)stream_tx_unlock(&inner,1);
+        if(which&2) {
+            inner.ip=AP_STREAM_TX_LOCK_IMAGE;inner.si=0;stream_tx_lock(&inner,0);
+            if(which&1)stream_tx_lock(&inner,1);
+        }
+        for(unsigned i=3;i<7;i++)phase(i,3);
+        assert(problems && active.original.problem && timeout_reads==0 && stack[28]==5000);
+        no_completion();
+    }
+    /* A duplicate initial-lock ENTRY is independently fatal even without its
+     * return and without an earlier inner unlock in the modeled sequence. */
+    for(unsigned returned=0;returned<2;returned++) {
+        blocking_reset();for(unsigned i=0;i<3;i++)phase(i,3);
+        phase(1,3);if(returned)phase(2,3);
+        for(unsigned i=3;i<7;i++)phase(i,3);
+        assert(problems && active.original.problem && !timeout_reads);no_completion();
+    }
+    for(unsigned which=0;which<7;which++) {
+        blocking_reset();for(unsigned i=0;i<6;i++)phase(i,3);
+        struct pt_regs ctx={.orig_ax=44,.cs=0x33,.di=5,.si=0x100000,.dx=8,.r10=0x4000};
+        u64 *operands[]={&ctx.cs,&ctx.di,&ctx.si,&ctx.dx,&ctx.r10,&ctx.r8,&ctx.r9};
+        (*operands[which])++;u64 args[]={(u64)&ctx,3};stream_tx_syscall_exit(args,&submitted);
+        assert(problems);no_completion();
+    }
+    blocking_reset();timeout_read_failure=true;run(0,0,3);
+    assert(timeout_reads==1 && problems);no_completion();
+    for(unsigned which=0;which<17;which++) {
+        blocking_reset();
+        switch(which) {
+        case 0:tcp.inet_flags=AP_STREAM_TX_DEFER_CONNECT_MASK;break;
+        case 1:message.msg_flags|=0x20000000;break;
+        case 2:tcp.inet_flags=AP_STREAM_TX_DEFER_CONNECT_MASK;message.msg_flags|=0x20000000;break;
+        case 3:message.msg_flags|=0x4000000;break;
+        case 4:message.msg_flags|=0x8000000;break;
+        case 5:message.msg_control=&task;message.msg_controllen=8;break;
+        case 6:selected.f_flags=04000;break;
+        case 7:submitted.expected_timeout_ticks=0;break;
+        case 8:submitted.expected_timeout_ticks=0x7fffffffffffffffULL;break;
+        case 9:stack[28]=5001;break;
+        case 10:stack[28]=0;break;
+        case 11:tcp.sk.__sk_common.skc_state=3;break;
+        case 12:bad_window=AP_TX_PREFIX_OFFSET;break;
+        case 13:bad_window=AP_TX_LOAD_OFFSET;break;
+        case 14:bad_window=AP_TX_WAIT_MEMORY_OFFSET;break;
+        case 15:bad_window=AP_TX_WAIT_CONNECT_OFFSET;break;
+        case 16:tcp.repair=1;break;
+        }
+        run(0,0,3);assert(problems);no_completion();
+    }
+    for(s64 returned=-14;returned<=0;returned+=14) {
+        blocking_reset();run(0,0,returned);assert(problems && !timeout_reads);no_completion();
+    }
+    blocking_reset();run(0,0,9);assert(problems && !timeout_reads);no_completion();
+}
 int main(void) {
     positive(3);positive(0);positive(-14);
     /* All nonempty omission subsets include paired and multiple missing inner
@@ -237,6 +352,7 @@ int main(void) {
         (*operands[which])++;u64 args[]={(u64)&ctx,3};stream_tx_syscall_exit(args,&submitted);
         assert(problems);no_completion();
     }
+    blocking_controls();
     printf("actual TX callbacks+collector: %u controls, all127 omission subsets and7 duplicate stages; native UNRUN\n",checks);
     return 0;
 }

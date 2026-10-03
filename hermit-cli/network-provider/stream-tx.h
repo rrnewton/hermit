@@ -2,11 +2,14 @@
 #ifndef HERMIT_PROVIDER_STREAM_TX_H
 #define HERMIT_PROVIDER_STREAM_TX_H
 #include "stream-copy.h"
+#include "stream-tx-image.h"
+#include "stream-tx-live-image.h"
 
 /* AUTONOMOUS-BOT-IMPLEMENTED: bounded original Sendto capture, not a guest
  * buffer snapshot. TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464).
  * Receive copy version/units and their authority are deliberately unchanged. */
 #define AP_ORIGINAL_SENDTO_CALL 24ULL
+#define AP_STREAM_TX_BLOCKING_VERSION 2ULL
 #define AP_SENDTO_SYSCALL 44ULL
 #define AP_STREAM_TX_VERSION 1ULL
 #define AP_STREAM_TX_COOKIE 24ULL
@@ -43,8 +46,23 @@ struct ap_stream_tx_summary {
  * original syscall result is published; terminal export clears the union. */
 struct ap_stream_tx_state {
     struct ap_stream_tx_summary summary;
+    /* The first72 bytes are the v2 public summary. This remains inside the
+     * original128-byte union; v1 leaves this word and its public tail zero. */
+    u64 saved_timeout_ticks;
     u64 socket,message,function,stack,records,active;
 };
+struct ap_stream_tx_blocking_summary {
+    struct ap_stream_tx_summary prefix;
+    u64 saved_timeout_ticks;
+};
+struct ap_stream_tx_blocking_capture {
+    u64 provider,command,call,task,task_start;
+    s64 returned;
+    struct ap_stream_tx_blocking_summary summary;
+    u8 bytes[AP_STREAM_COPY_BYTES];
+};
+_Static_assert(sizeof(struct ap_stream_tx_blocking_summary)==72,"blocking TX summary ABI");
+_Static_assert(sizeof(struct ap_stream_tx_blocking_capture)==632,"blocking TX capture ABI");
 struct ap_stream_tx_capture {
     u64 provider,command,call,task,task_start;
     s64 returned;
@@ -78,6 +96,49 @@ static inline int ap_stream_tx_summary_valid(const struct ap_stream_tx_summary *
         s->sequence_before<=0xffffffffULL && s->sequence_after<=0xffffffffULL &&
         (u32)((u32)s->sequence_after-(u32)s->sequence_before)==s->captured &&
         s->protocol_returned==(u64)returned && s->protocol_complete==1;
+}
+/* Separate positive-only blocking grammar. Never weaken v1's predicates or
+ * select a larger public layout from frame-controlled length/version bytes. */
+static inline int ap_stream_tx_operation(u64 operation) {
+    return operation==AP_ORIGINAL_SENDTO_CALL || operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL;
+}
+static inline int ap_stream_tx_timeout(u64 ticks) {
+    return ticks && ticks<=AP_STREAM_TX_TIMEOUT_MAX;
+}
+static inline int ap_stream_tx_blocking_command(const struct ap_task_command *c) {
+    return c && c->operation==AP_ORIGINAL_SENDTO_BLOCKING_CALL && c->provider && c->command &&
+        c->expected_object && c->expected_level>=0 && c->generation_before &&
+        c->original_count && c->original_count<=AP_STREAM_COPY_BYTES &&
+        c->expected_option==0x4000 && ap_stream_tx_timeout(c->expected_timeout_ticks);
+}
+static inline int ap_stream_tx_any_command(const struct ap_task_command *c) {
+    return ap_task_command_extension_valid(c) &&
+        (ap_stream_tx_command(c) || ap_stream_tx_blocking_command(c));
+}
+static __attribute__((always_inline)) inline int ap_stream_tx_any_operands(
+        const struct ap_task_command *c,u64 nr,u64 fd,u64 buffer,u64 count,
+        u64 flags,u64 destination,u64 address_length) {
+    return ap_task_command_extension_valid(c) &&
+        (ap_stream_tx_operands(c,nr,fd,buffer,count,flags,destination,address_length) ||
+        (ap_stream_tx_blocking_command(c) && nr==AP_SENDTO_SYSCALL &&
+         fd==(u64)(u32)c->expected_level && buffer==c->generation_before &&
+         count==c->original_count && flags==0x4000 && !destination && !address_length));
+}
+static __attribute__((always_inline)) inline int ap_stream_tx_blocking_parts_valid(
+        const struct ap_stream_tx_summary *s,u64 saved,u64 file,u64 requested,s64 returned,u64 timeout) {
+    return s && file && requested && requested<=AP_STREAM_COPY_BYTES &&
+        returned>0 && returned<=(s64)requested &&
+        s->version==AP_STREAM_TX_BLOCKING_VERSION && s->file==file && s->requested==requested &&
+        s->captured==(u64)returned &&
+        s->sequence_before<=0xffffffffULL && s->sequence_after<=0xffffffffULL &&
+        (u32)((u32)s->sequence_after-(u32)s->sequence_before)==s->captured &&
+        s->protocol_returned==(u64)returned && s->protocol_complete==1 &&
+        ap_stream_tx_timeout(timeout) && saved==timeout;
+}
+static inline int ap_stream_tx_blocking_summary_valid(const struct ap_stream_tx_blocking_summary *b,
+        u64 file,u64 requested,s64 returned,u64 timeout) {
+    return b && ap_stream_tx_blocking_parts_valid(&b->prefix,b->saved_timeout_ticks,
+        file,requested,returned,timeout);
 }
 /* The real producer currently requires exactly one retained rtx OR unsent SKB.
  * The <=512 interval makes modulo-u32 comparison unambiguous. Intersections
@@ -151,5 +212,12 @@ struct ap_stream_tx_owned {
 };
 int ap_prepare_original_sendto(struct ap_session *,int,u64,u64,int,u64,u64,int,u64 *);
 int ap_original_sendto_capture(struct ap_session *,u64,struct ap_stream_tx_capture *);
+struct ap_stream_tx_blocking_owned {
+    struct ap_stream_tx_blocking_capture capture;
+    u64 records,received;
+    bool committed,read;
+};
+int ap_prepare_original_sendto_blocking(struct ap_session *,int,u64,u64,int,u64,u64,int,u64,u64 *);
+int ap_original_sendto_blocking_capture(struct ap_session *,u64,struct ap_stream_tx_blocking_capture *);
 #endif
 #endif

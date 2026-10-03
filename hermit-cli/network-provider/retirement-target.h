@@ -1448,8 +1448,10 @@ static const unsigned char ap_copy_image_helper_unix_stream_read_generic[]={
     0x06,0xfc,0xff,0xff,0x48,0x8b,0x04,0x24,0x48,0x8b,0x80,0x00,0x01,0x00,0x00,0xf0,
     0x80,0x60,0x20,0xfd,0xe9,0x33,0xfc,0xff,0xff,
 };
+#include "stream-tx-image.h"
 struct ap_copy_image_slice { long offset;const unsigned char *bytes;size_t size; };
 static const struct ap_copy_image_slice ap_copy_image_slices[]={
+
     {0xfd7c50,ap_copy_image_helper___sys_recvmsg,sizeof(ap_copy_image_helper___sys_recvmsg)},
     {0x1269f70,ap_copy_image_helper____sys_recvmsg,sizeof(ap_copy_image_helper____sys_recvmsg)},
     {0x126bd30,ap_copy_image_helper_____sys_recvmsg,sizeof(ap_copy_image_helper_____sys_recvmsg)},
@@ -1472,6 +1474,11 @@ static const struct ap_copy_image_slice ap_copy_image_slices[]={
     {0x11b8970,ap_copy_image___skb_datagram_iter,sizeof(ap_copy_image___skb_datagram_iter)},
     {0xfe2170,ap_copy_image_simple_copy_to_iter,sizeof(ap_copy_image_simple_copy_to_iter)},
     {0x11b8c60,ap_copy_image__copy_to_iter,sizeof(ap_copy_image__copy_to_iter)},
+    {0x11babf0,ap_tx_image_tcp_sendmsg,sizeof(ap_tx_image_tcp_sendmsg)},
+    {0x1330150,ap_tx_image_sk_stream_wait_memory,sizeof(ap_tx_image_sk_stream_wait_memory)},
+    {0x132e8d0,ap_tx_image_sk_stream_wait_connect,sizeof(ap_tx_image_sk_stream_wait_connect)},
+    {0x1498b20,ap_tx_image_sock_set_timeout,sizeof(ap_tx_image_sock_set_timeout)},
+    {0xfd8b60,ap_tx_image_sock_get_timeout,sizeof(ap_tx_image_sock_get_timeout)},
 };
 static int ap_check_copy_image(FILE *input) {
     unsigned char actual[256];

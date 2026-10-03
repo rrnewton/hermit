@@ -308,9 +308,10 @@ fn run() -> Result<()> {
     }
     let contract_name = format!("{}-contract.json", args.component);
     let contract = Contract::parse(&read_regular(&args.source.join(&contract_name), 32768)?)?;
-    ensure!(args.component != "accepted" || contract.abi_version == "4150525553540009",
-        "current accepted producer requires descriptor-event ABI9; historical packages keep their original sources");
+    ensure!(args.component != "accepted" || contract.abi_version == "415052555354000a",
+        "current accepted producer requires blocking-TX ABI10; historical packages keep their original sources");
     let accepted = args.component == "accepted";
+    let tx_config = if accepted { Some(package_support::blocking_tx_config()?) } else { None };
     let grouped_build = contract.grouped_event.is_some();
     let ftrace = contract.ftrace_only;
     let grouped = grouped_build && !ftrace;
@@ -319,7 +320,7 @@ fn run() -> Result<()> {
     let mut names = contract.source_files.clone();
     if accepted {
         names.extend(["owned-metadata.h", "owned-metadata-driver.h",
-            "stream-copy-fault.h"].map(str::to_owned));
+            "stream-copy-fault.h", "stream-tx-image.h", "stream-tx-live-image.h"].map(str::to_owned));
     }
     // Maintained topology contracts move to the current adapter together;
     // decoding historical packages remains a separate compatibility path.
@@ -394,6 +395,7 @@ fn run() -> Result<()> {
                         Some(value) => value.as_u64() == Some(contract.accepted_copy_version()?),
                         None => false,
                     })
+                    && manifest.get("blocking_tx_config") == tx_config.as_ref()
                     && manifest["btf_sha256"] == contract.btf_sha256
                     && manifest["sources"] == serde_json::to_value(&source_digests)?
                     && manifest["maps"] == contract.maps
@@ -628,8 +630,11 @@ fn run() -> Result<()> {
         started.elapsed() <= Duration::from_secs(120),
         "package aggregate deadline exceeded"
     );
+    ensure!(!accepted || tx_config.as_ref() == Some(&package_support::blocking_tx_config()?),
+        "blocking-TX embedded config changed during compile");
     let mut manifest = json!({"schema":1,"kind":kind,"abi_version":contract.abi_version,"object":object_name,"library":library_name,"object_sha256":digest(&object),"library_sha256":digest(&library),"btf_sha256":contract.btf_sha256,"maps":contract.maps,"programs":contract.programs,"links":contract.links,"sources":source_digests,"compile_only":true,"supported_kernel_contract":"Exact reviewed BTF; fresh exact-artifact native qualification required before activation","compile_seconds":started.elapsed().as_secs_f64()});
     if ftrace {manifest["ftrace_only"]=json!(true);}
+    if let Some(tx_config) = tx_config { manifest["blocking_tx_config"] = tx_config; }
     if accepted {
         manifest["copy_version"] = json!(contract.accepted_copy_version()?);
     }
