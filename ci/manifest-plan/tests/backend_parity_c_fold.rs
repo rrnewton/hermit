@@ -1038,5 +1038,7 @@ fn the_privileged_c_programs_description_names_every_selected_cell() {
             assert!(description.contains(backend), "{backend}: {description}");
         }
     }
-    assert_eq!(seen, 3, "privileged c-programs nodes");
+    // 4 with privileged-e2e.manifest_c_programs_buck, the full-buck-e2e import
+    // twin, which runs its counterpart's arguments and leads with its description.
+    assert_eq!(seen, 4, "privileged c-programs nodes");
 }
