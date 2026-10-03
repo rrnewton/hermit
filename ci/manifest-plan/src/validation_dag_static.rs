@@ -474,8 +474,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 770 prior identities.
     // https://github.com/rrnewton/hermit/issues/3537 adds
     // recorder::mmap::tests::{parses_maps_lines,
-    // private_file_ranges_clip_to_the_advised_range,
-    // private_file_ranges_skip_shared_mappings,
+    // refill_ranges_clip_to_the_advised_range,
+    // refill_ranges_cover_shared_files_but_not_shared_anonymous_memory,
     // wipeonfork_prefix_stops_at_the_first_private_file_mapping} and
     // replayer::mmap::tests::{differing_pages_merges_adjacent_changed_pages,
     // differing_pages_treats_unread_bytes_as_changed}, which retain all 777

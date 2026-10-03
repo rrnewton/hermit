@@ -87,12 +87,30 @@ static int check_semantic_advice(
     return 6;
   }
 
-  /* A shared file mapping keeps its contents too; replay needs no refill
-   * for it. */
+  /* A shared file mapping keeps its contents too. */
   unsigned char* shared = mmap(NULL, page_size, PROT_READ, MAP_SHARED, fd, 0);
   if (shared == MAP_FAILED || madvise(shared, page_size, MADV_DONTNEED) != 0 ||
       shared[1] != original || munmap(shared, page_size) != 0) {
     return 13;
+  }
+
+  /* A dropped shared file page reads back what was written through the
+   * descriptor after the mapping was made, which replay's anonymous stand-in
+   * never saw. */
+  int memfd = memfd_create("madvise_determinism", 0);
+  if (memfd < 0 || pwrite(memfd, "A", 1, 0) != 1) {
+    return 14;
+  }
+  unsigned char* coherent =
+      mmap(NULL, page_size, PROT_READ, MAP_SHARED, memfd, 0);
+  if (coherent == MAP_FAILED || pwrite(memfd, "B", 1, 0) != 1 ||
+      madvise(coherent, page_size, MADV_DONTNEED) != 0 || coherent[0] != 'B') {
+    fprintf(stderr, "shared MADV_DONTNEED read %c, not B\n",
+            coherent == MAP_FAILED ? '?' : coherent[0]);
+    return 15;
+  }
+  if (munmap(coherent, page_size) != 0 || close(memfd) != 0) {
+    return 16;
   }
 
   /* Dropping a page of this program's own text, which replay maps from the
