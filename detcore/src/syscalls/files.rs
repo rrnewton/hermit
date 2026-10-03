@@ -449,6 +449,13 @@ fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(guest_cwd).join(path))
 }
 
+/// Writes back the guest bytes that the utimensat lookup buffer covered.
+fn restore_lookup_buffer<M: MemoryAccess>(memory: &mut M, buffer: StatPtr, saved: &[u8]) {
+    if memory.write_exact(buffer.0.cast(), saved).is_err() {
+        info!("Could not restore the guest bytes under the utimensat lookup buffer.");
+    }
+}
+
 /// Whether the utimensat lookup buffer overlaps the guest memory Linux reads
 /// for `call`: the path through its NUL and, with `guest_times`, the two
 /// timespecs. A path that cannot be read counts as overlapping, so that the
@@ -3798,6 +3805,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !guest.config().virtualize_metadata {
             return self.utimensat_without_lookup(guest, call, staged).await;
         }
+        // Without thread sequentialization another guest thread can swap the
+        // target away and back around the call, so that both lookups name a
+        // file the kernel did not update. No lookup can tell the two apart,
+        // so the virtual mtime is left alone.
+        if !guest.config().sequentialize_threads {
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
+        // The scratch stack starts 128 bytes below the stack pointer and its
+        // addresses are computed by subtraction, so a stack pointer too close
+        // to zero to hold the staged times and the lookup buffer would stop
+        // Hermit rather than reach Linux.
+        let scratch = 128
+            + staged.map_or(0, |_| std::mem::size_of::<[Timespec; 2]>())
+            + std::mem::size_of::<libc::stat>();
+        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+            info!(
+                "Guest stack pointer cannot hold the utimensat target lookup; \
+                 leaving the virtual mtime unchanged."
+            );
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
 
         // The staged times and the buffer for the target lookups share one
         // scratch stack, and its guard is held until the last injected syscall
@@ -3820,6 +3848,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             drop(stack);
             return self.utimensat_without_lookup(guest, call, staged).await;
         }
+        // The buffer's address range can still share its pages with guest data
+        // through a second shared mapping, which no address comparison sees.
+        // Its bytes are saved here and put back after the commit and after
+        // each lookup, so the lookups and the call read their inputs unchanged
+        // and the guest keeps its memory.
+        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
+        if guest
+            .memory()
+            .read_exact(statptr.0.cast(), &mut saved)
+            .is_err()
+        {
+            info!(
+                "Guest stack scratch cannot hold the utimensat target lookup; \
+                 leaving the virtual mtime unchanged."
+            );
+            drop(stack);
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
         let _guard = match stack.commit() {
             Ok(guard) => guard,
             // The lookup buffer only serves the virtual update, so a scratch
@@ -3833,6 +3879,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.utimensat_without_lookup(guest, call, staged).await;
             }
         };
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
         let call = staged_call;
 
         // The kernel applies the new times to the real file, but the guest
@@ -3861,26 +3908,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(_) => self.utimensat_target(guest, &call, statptr).await,
             None => None,
         };
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
 
         let res = self.record_or_replay(guest, call).await?;
 
-        // Update only the inode the kernel modified. Without thread
-        // sequentialization another guest thread can rename, unlink or replace
-        // the target, or dup2 over the descriptor, around the call; the target
-        // is resolved before and after it, and the update is skipped unless
-        // both name the same file. Equal lookups alone do not show that the
-        // kernel updated that file: the name may have been swapped away and
-        // back during the call, an inode number reused, or the guest's
-        // `times` buffer rewritten after it was read here. So an explicit
-        // mtime is copied only when the file holds it, truncated to the
-        // filesystem's granularity, and the virtual mtime takes the value the
-        // kernel stored, which is what stat reports on Linux. `UTIME_NOW` has
-        // no such witness. With thread sequentialization, the default and
-        // required by --strict, no other guest thread runs during the call.
+        // Update only the inode the kernel modified. No other guest thread
+        // runs during the call, but a process outside the container can still
+        // rename, unlink or replace the target; the target is resolved before
+        // and after the call, and the update is skipped unless both name the
+        // same file. Equal lookups alone do not show that the kernel updated
+        // that file: the name may have been swapped away and back during the
+        // call, or an inode number reused. So an explicit mtime is copied only
+        // when the file holds it, truncated to the filesystem's granularity,
+        // and the virtual mtime takes the value the kernel stored, which is
+        // what stat reports on Linux. `UTIME_NOW` has no such witness.
         let (Some(mtime), Some(before)) = (mtime, before) else {
             return Ok(res);
         };
-        let Some(after) = self.utimensat_target(guest, &call, statptr).await else {
+        let after = self.utimensat_target(guest, &call, statptr).await;
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+        let Some(after) = after else {
             return Ok(res);
         };
         if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {

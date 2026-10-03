@@ -98,14 +98,19 @@ fn explicit_mtimes_are_reported_by_stat_and_verify_strictly() {
     );
 }
 
-/// Without thread sequentialization, another guest thread can rename a fresh
-/// file over the name a utimensat call targets, between the kernel's update and
-/// Hermit's lookup of the updated inode. The guest reports, for each file that
-/// ever held the name, whether it sees the explicit mtime; that file's real
-/// mtime must then be the explicit one too. Before the update was bound to the
-/// inode resolved before and after the call, and to the mtime the kernel stored
-/// on it, the file that took over the name could get the virtual mtime of a
-/// call that never touched it.
+/// One guest thread renames fresh files over the name that another thread's
+/// utimensat calls target. The guest reports, for each file that ever held the
+/// name, whether it sees the explicit mtime.
+///
+/// With thread sequentialization no rename runs during a call, so every file the
+/// guest sees with the explicit mtime must really have it, and the final call
+/// after the renames end must reach the last file.
+///
+/// Without sequentialization a rename can swap the name away and back during a
+/// call, so that Hermit's lookups name a file the kernel did not update. Hermit
+/// then leaves every virtual mtime alone, and the guest sees none of them.
+/// Before that, the file that took over the name could get the virtual mtime of
+/// a call that never touched it.
 #[test]
 fn a_renamed_over_target_does_not_get_the_explicit_mtime() {
     const EXPLICIT: Duration = Duration::from_secs(1_000_000_000);
@@ -158,22 +163,22 @@ fn a_renamed_over_target_does_not_get_the_explicit_mtime() {
     assert!(native.iter().all(|(_, seen, real)| seen == real));
     assert!(native.last().is_some_and(|(_, seen, _)| *seen));
 
-    let directory = fresh_directory("hermit");
-    let mut run = Command::new("timeout");
-    run.args(["--kill-after", "5s", "90s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--backend=ptrace",
-            "run",
-            "--no-sequentialize-threads",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .arg(&directory);
-    let output = command_output(run, "rename-race guest under hermit run");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let observed = observations(&directory, &output);
+    let run = |name: &str, relaxations: &[&str]| {
+        let directory = fresh_directory(name);
+        let mut run = Command::new("timeout");
+        run.args(["--kill-after", "5s", "90s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["--backend=ptrace", "run"])
+            .args(relaxations)
+            .args(["--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg(&directory);
+        let output = command_output(run, &format!("rename-race guest under hermit run ({name})"));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (observations(&directory, &output), stderr)
+    };
+
+    let (observed, stderr) = run("sequentialized", &[]);
     let misattributed: Vec<&str> = observed
         .iter()
         .filter(|(_, seen, real)| *seen && !*real)
@@ -184,14 +189,36 @@ fn a_renamed_over_target_does_not_get_the_explicit_mtime() {
         "the guest saw the explicit mtime on {} file(s) the kernel never updated: {misattributed:?}\nstderr:\n{stderr}",
         misattributed.len(),
     );
-    // Racing calls may skip the virtual update, but the guest's final call,
-    // made after the renames end, must reach the last file, or the test checked
-    // nothing.
+    // The guest's final call, made after the renames end, must reach the last
+    // file, or the run checked nothing.
     assert!(
         observed
             .last()
             .is_some_and(|(_, seen, real)| *seen && *real),
         "the guest's final, unraced call did not show the explicit mtime on the last file: {:?}\nstderr:\n{stderr}",
         observed.last(),
+    );
+
+    let (observed, stderr) = run("relaxed", &["--no-sequentialize-threads"]);
+    assert!(
+        !observed.is_empty(),
+        "the relaxed guest reported no files\nstderr:\n{stderr}"
+    );
+    // The last file really has the explicit mtime, so a run that saw none
+    // shows that Hermit, not the race, left the virtual mtimes alone.
+    assert!(
+        observed.last().is_some_and(|(_, _, real)| *real),
+        "the relaxed guest's final call did not reach Linux: {:?}\nstderr:\n{stderr}",
+        observed.last(),
+    );
+    let seen: Vec<&str> = observed
+        .iter()
+        .filter(|(_, seen, _)| *seen)
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    assert!(
+        seen.is_empty(),
+        "without sequentialization the guest saw the explicit mtime on {} file(s): {seen:?}\nstderr:\n{stderr}",
+        seen.len(),
     );
 }
