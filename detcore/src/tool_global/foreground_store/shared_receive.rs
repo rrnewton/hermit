@@ -1,5 +1,9 @@
 //! Shared scalar receives keep their original callback, saved policy and Call.
 //! The old sole-root receive path is unchanged.
+mod record;
+mod wait;
+pub(crate) use record::{SharedRecordReceiveEffect, SharedRecordStoreAttempt};
+
 use super::*;
 use crate::network_replay::SharedReplaySource;
 use crate::network_replay::shared_waits::SharedReplayNoStorePlan;

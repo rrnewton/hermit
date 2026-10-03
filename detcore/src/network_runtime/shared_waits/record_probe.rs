@@ -20,6 +20,7 @@ impl JoinedSharedEffect {
     pub(crate) fn observed(&self) -> &Observation {
         &self.observed
     }
+    pub(super) fn validate_runtime(&self, runtime: &Arc<RuntimeShared>) -> std::io::Result<()> { self.joined.validate_runtime(runtime) }
 }
 pub(crate) struct ConfirmedSharedEffect<'a> {
     joined: &'a Arc<JoinedSharedEffect>,
@@ -56,7 +57,7 @@ impl ConfirmedSharedRecordPoll<'_> {
 }
 
 impl RuntimeShared {
-    fn check_shared_probe_workers(
+    pub(super) fn check_shared_probe_workers(
         self: &Arc<Self>,
         origin: &SharedRecordProbe,
         workers: &NativeWorkers,
@@ -97,7 +98,7 @@ impl RuntimeShared {
         Ok(())
     }
 
-    fn check_shared_probe_peers(
+    pub(super) fn check_shared_probe_peers(
         &self,
         origin: &SharedRecordProbe,
         peers: &SharedCallCensus,
@@ -188,6 +189,17 @@ impl NetworkRuntimeResources {
         prepared: PreparedSharedEffect,
     ) -> std::io::Result<Arc<JoinedSharedEffect>> {
         let step = prepared.into_identity();
+        #[cfg(test)]
+        if matches!(
+            step.effect(),
+            crate::network_replay::NetworkStreamPhysicalEffect::Peek { .. }
+        ) {
+            let controlled = self.shared.record_receive_fixture.lock().unwrap().clone();
+            if let Some(controlled) = controlled {
+                controlled.begin_peek()?;
+                return self.controlled_shared_record_effect_identity(step).await;
+            }
+        }
         self.shared.claim_shared_effect(&step)?;
         let owner = step.origin().owner();
         let lease = step.origin().lease();
@@ -398,7 +410,13 @@ impl NetworkRuntimeResources {
         &self,
         prepared: PreparedSharedEffect,
     ) -> std::io::Result<Arc<JoinedSharedEffect>> {
-        let step = prepared.into_identity();
+        self.controlled_shared_record_effect_identity(prepared.into_identity())
+            .await
+    }
+    async fn controlled_shared_record_effect_identity(
+        &self,
+        step: Arc<crate::network_replay::shared_waits::SharedEffectIdentity>,
+    ) -> std::io::Result<Arc<JoinedSharedEffect>> {
         self.shared.claim_shared_effect(&step)?;
         let (permit, entered) = std::sync::mpsc::channel();
         let shared = self.shared.clone();

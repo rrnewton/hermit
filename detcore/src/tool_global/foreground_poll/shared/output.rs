@@ -24,18 +24,6 @@ impl SharedPollStoreAttempt {
         self.interval.lock().unwrap().take();
     }
 
-    /// Supplied outcome only; does not qualify a real backend write or hold.
-    #[cfg(test)]
-    pub(crate) fn controlled(
-        source: Arc<crate::network_replay::shared_waits::SharedPollSource>,
-        outcome: reverie::syscalls::NativeUserStoreOutcome,
-    ) -> Self {
-        Self {
-            source,
-            outcome,
-            interval: Mutex::new(None),
-        }
-    }
     /// Supplied outcome with an actual runtime interval tests ownership only.
     #[cfg(test)]
     pub(crate) fn controlled_with_interval(

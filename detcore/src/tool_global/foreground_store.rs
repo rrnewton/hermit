@@ -3,9 +3,10 @@
 mod scalar_receive;
 mod shared_receive;
 pub(crate) use scalar_receive::ScalarReceive;
-pub(crate) use shared_receive::PreparedSharedReceiveStore;
 pub(crate) use shared_receive::SharedReceiveInvocation;
 pub(crate) use shared_receive::SharedReceivePreparation;
+pub(crate) use shared_receive::SharedRecordReceiveEffect;
+pub(crate) use shared_receive::SharedRecordStoreAttempt;
 
 use super::*;
 use crate::network_replay::ForegroundStore;

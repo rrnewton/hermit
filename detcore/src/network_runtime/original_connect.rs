@@ -25,7 +25,7 @@ impl NativeCaptureRecovery {
     /// Use the same semantic-retirement/port publication boundary as existing
     /// capture recovery. The caller must already own a known no-acquisition or
     /// actual close; engine phase checks reject every unresolved alternative.
-    fn retire_original_lifetime(
+    pub(super) fn retire_original_lifetime(
         &self,
         owner: NetworkStreamOwner,
         admission: &Admission,
@@ -79,7 +79,7 @@ impl RuntimeShared {
     /// Runs only in the same capture worker, before any provider request exists.
     /// Both classification failure and consumed pre-submission cancellation use
     /// the existing ReleaseExecution and exact semantic/port retirement join.
-    fn retire_original_before_submission(
+    pub(super) fn retire_original_before_submission(
         &self,
         owner: NetworkStreamOwner,
         admission: &Admission,
@@ -887,11 +887,7 @@ impl RuntimeShared {
                     .unwrap()
                     .original(owner, call)?
                     .close_queued = true;
-                let _ = self.start_original_retirement_worker(
-                    owner,
-                    call,
-                    state.executor.clone(),
-                    move || {
+                let operation = move || {
                         let result: std::io::Result<()> = (|| {
                             let work = shared
                                 .native_streams
@@ -919,8 +915,12 @@ impl RuntimeShared {
                         }
                         publication.changed.notify_waiters();
                         result
-                    },
-                )?;
+                    };
+                if let Some(origin) = state.shared_send.clone() {
+                    self.start_shared_send_close(origin, state.canceled || state.terminal.is_some() || state.terminating || state.failed_collection.is_some(), state.executor.clone(), operation)?;
+                } else {
+                    let _ = self.start_original_retirement_worker(owner, call, state.executor.clone(), operation)?;
+                }
             }
         }
         Ok(())
@@ -1173,7 +1173,7 @@ impl NetworkRuntimeResources {
             .await
             .map(|_| ())
     }
-    async fn wait_original(
+    pub(super) async fn wait_original(
         &self,
         owner: NetworkStreamOwner,
         admission: &Admission,
@@ -1390,6 +1390,7 @@ mod close_tests {
             native_streams: Mutex::default(),
             native_workers: Mutex::default(),
             native_terminal_failure: Mutex::default(),
+            record_receive_fixture: Mutex::default(),
         });
         shared
             .native_streams
@@ -1445,6 +1446,7 @@ mod close_tests {
             socket: None,
             read_copy: None,
             send: None,
+            blocking_send: None,
             command: ffi::CommandResult {
                 command: 17,
                 operation: 9,

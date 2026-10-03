@@ -24,6 +24,7 @@ pub(crate) enum Kind {
     EpollCreate { legacy: bool },
     EpollCtl,
     Sendto,
+    BlockingSendto { timeout_ticks: u64 },
 }
 /// Operations on the file selected by the original kernel invocation. Numeric
 /// slot operations (F_GETFD/F_SETFD) deliberately do not belong to this class.
@@ -58,6 +59,7 @@ impl Kind {
             Self::EpollCreate { .. } => 19,
             Self::EpollCtl => 20,
             Self::Sendto => 24,
+            Self::BlockingSendto { .. } => 25,
         }
     }
     pub(crate) fn syscall(self) -> reverie::syscalls::Sysno {
@@ -71,7 +73,7 @@ impl Kind {
             Self::EpollCreate { legacy: true } => reverie::syscalls::Sysno::epoll_create,
             Self::EpollCreate { legacy: false } => reverie::syscalls::Sysno::epoll_create1,
             Self::EpollCtl => reverie::syscalls::Sysno::epoll_ctl,
-            Self::Sendto => reverie::syscalls::Sysno::sendto,
+            Self::Sendto | Self::BlockingSendto { .. } => reverie::syscalls::Sysno::sendto,
         }
     }
     pub(crate) fn valid_operands(self, address: u64, length: i32, original_count: u64) -> bool {
@@ -86,6 +88,9 @@ impl Kind {
             Self::Read => length == 0,
             Self::Sendto => address != 0 && (1..=512).contains(&original_count)
                 && matches!(length, libc::MSG_NOSIGNAL | 0x4040),
+            Self::BlockingSendto { timeout_ticks } => address != 0
+                && (1..=512).contains(&original_count) && length == libc::MSG_NOSIGNAL
+                && (1..=i64::MAX as u64 - 1).contains(&timeout_ticks),
             Self::Socket => address <= u64::from(u32::MAX) && original_count == 0,
             Self::EpollCtl => original_count <= u64::from(u32::MAX), // target FD low int bits
             Self::Openat => true, // exact pathname/mode; Linux owns flags, access and uaccess errors
@@ -97,7 +102,7 @@ impl Kind {
     pub(crate) fn valid_counted_result(self, returned: i64, original_count: u64) -> bool {
         self.valid_result(returned)
             && match self {
-                Self::Read | Self::Sendto => returned < 0 || returned as u64 <= original_count,
+                Self::Read | Self::Sendto | Self::BlockingSendto { .. } => returned < 0 || returned as u64 <= original_count,
                 Self::Openat | Self::EpollCtl => true, // mode or target FD, not a byte limit
                 _ => original_count == 0,
             }
@@ -114,7 +119,7 @@ impl Kind {
             // Installed scalar Read clamps positive completion to MAX_RW_COUNT.
             // Actual kernel restart errors remain raw negative results.
             Self::Read => (-4095..=0x7fff_f000).contains(&returned),
-            Self::Sendto => (-4095..=512).contains(&returned),
+            Self::Sendto | Self::BlockingSendto { .. } => (-4095..=512).contains(&returned),
         }
     }
 }
@@ -336,6 +341,7 @@ impl NetworkReplayEngine {
         if !self.fd_table_capability()
             || arguments.kind.allocator()
             || arguments.kind == Kind::EpollCtl
+            || matches!(arguments.kind, Kind::BlockingSendto { .. })
         {
             return Err(protocol(
                 "original connect requires complete descriptor mutation authority",
@@ -459,7 +465,7 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         arguments: &Arguments,
     ) -> Result<(TaskOwner, u64, NetworkStreamCallId), NetworkReplayError> {
-        if matches!(arguments.kind, Kind::Connect | Kind::Sendto) {
+        if matches!(arguments.kind, Kind::Connect | Kind::Sendto | Kind::BlockingSendto { .. }) {
             self.check_native_retirement()?;
         }
         if arguments.kind == Kind::Close && (arguments.address != 0 || arguments.length != 0) {
@@ -574,6 +580,7 @@ impl NetworkReplayEngine {
                     Kind::Connect | Kind::Close => !matches!(source, OriginalResultSource::Native),
                     Kind::File(_)
                     | Kind::Sendto
+                    | Kind::BlockingSendto { .. }
                     | Kind::Socket
                     | Kind::Openat
                     | Kind::EpollCreate { .. }
@@ -707,7 +714,7 @@ impl NetworkReplayEngine {
             StreamCallState {
                 owner,
                 open_file,
-                physical_pin_required: matches!(arguments.kind, Kind::Connect | Kind::Sendto) && open_file.is_some(),
+                physical_pin_required: matches!(arguments.kind, Kind::Connect | Kind::Sendto | Kind::BlockingSendto { .. }) && open_file.is_some(),
                 phase: StreamCallPhase::PinAcquireSubmitted,
                 abandoned: false,
                 final_wait: false,
@@ -1070,7 +1077,8 @@ impl NetworkReplayEngine {
         if local.admission.is_some()
             || local.invoked
             || local.returned.is_some()
-            || !matches!(local.arguments.kind, Kind::Connect | Kind::Close)
+            || !matches!(local.arguments.kind, Kind::Connect | Kind::Close | Kind::BlockingSendto { .. })
+            || (matches!(local.arguments.kind, Kind::BlockingSendto { .. }) && read.external_grant.is_some())
             || read.fd != local.arguments.fd
             || read
                 .external_grant
@@ -1463,6 +1471,9 @@ impl NetworkReplayEngine {
                     domain: libc::AF_INET | libc::AF_INET6,
                     kind: libc::SOCK_STREAM, protocol: libc::IPPROTO_TCP,
                 })) || state.open_file.is_none(),
+                Kind::BlockingSendto { .. } => !matches!(pin, Some(Pin::Socket {
+                    domain: libc::AF_INET, kind: libc::SOCK_STREAM, protocol: libc::IPPROTO_TCP,
+                })) || state.open_file.is_none(),
                 Kind::Close
                 | Kind::File(_)
                 | Kind::Read
@@ -1497,7 +1508,7 @@ impl NetworkReplayEngine {
             || original.arguments != admission.arguments
             || !original.uninvoked
             || original.command.is_none()
-            || (matches!(original.arguments.kind, Kind::Connect | Kind::Sendto) && original.pin.is_none())
+            || (matches!(original.arguments.kind, Kind::Connect | Kind::Sendto | Kind::BlockingSendto { .. }) && original.pin.is_none())
         {
             return Err(protocol(
                 "original invocation lacks its prepared exact admission",
@@ -1806,7 +1817,7 @@ impl NetworkReplayEngine {
                     "epoll control requires its paired historical selection join",
                 ));
             }
-            Kind::Connect | Kind::Sendto => match original.pin {
+            Kind::Connect | Kind::Sendto | Kind::BlockingSendto { .. } => match original.pin {
                 Some(Pin::Empty | Pin::Path) if file == 0 => {}
                 Some(Pin::Other | Pin::Socket { .. }) if file != 0 => {}
                 _ => {
@@ -2853,7 +2864,7 @@ impl NetworkReplayEngine {
                 .require_no_unjoined_receipts(*received)
                 .map_err(|error| protocol(&error.to_string()))?;
         }
-        if original.arguments.kind == Kind::Sendto && !original.consumed
+        if matches!(original.arguments.kind, Kind::Sendto | Kind::BlockingSendto { .. }) && !original.consumed
             && !original.final_wait && !original.cancel_requested && !original.uninvoked
         {
             self.require_native_send_published(owner, admission.call)?;
@@ -5375,5 +5386,32 @@ impl NetworkReplayEngine {
             .open_file
             .map(|file| (file, original.backend_result.unwrap()))
             .ok_or_else(|| protocol("V4 Connect has no exact selected OFD"))
+    }
+}
+
+impl NetworkReplayEngine {
+    pub(in crate::network_replay) fn begin_shared_original_send_from_read(
+        &mut self, owner:NetworkStreamOwner, arguments:Arguments, read:NetworkFdReadAdmission,
+    )->Result<Admission,NetworkReplayError> {
+        if !self.fd_table_capability() || !self.uses_shared_mm_attempts()
+            || self.mode()!=NetworkEngineMode::Record
+            || !matches!(arguments.kind,Kind::BlockingSendto{..}) || read.external_grant.is_some() {
+            return Err(protocol("shared Sendto changed closed original transfer"));
+        }
+        self.begin_original_call_with_read(owner,arguments,OriginalResultSource::Native,Some(read))
+    }
+    pub(in crate::network_replay) fn original_shared_native_sent(
+        &self, owner:NetworkStreamOwner, admission:&Admission,
+    )->Result<i64,NetworkReplayError> {
+        let (state,original)=self.original_connect_state(owner,admission.call)?;
+        if original.arguments!=admission.arguments || !matches!(original.arguments.kind,Kind::BlockingSendto{..})
+            || state.abandoned || state.final_wait || original.final_wait || original.uninvoked
+            || !original.backend_entered || !original.provider_submitted || !original.provider_retired
+            || !original.pin_released || original.selected.is_none() || original.cancel_requested
+            || original.consumed || state.capture_publication.is_some() || state.capture_control.is_some()
+            || original.external_grant.is_some() || admission.arguments.binding.map(|b|b.open_file)!=state.open_file {
+            return Err(protocol("shared Sendto lacks original selection/result/retirement"));
+        }
+        original.backend_result.filter(|v|*v>0).ok_or_else(||protocol("shared Sendto requires positive original return"))
     }
 }

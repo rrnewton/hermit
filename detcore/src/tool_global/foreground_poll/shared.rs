@@ -18,7 +18,8 @@ fn internal(error: impl std::fmt::Display) -> NetworkRpcError {
 pub(crate) struct SharedPollInvocation {
     call: crate::network_replay::NetworkStreamCall,
     captured: CapturedSharedPollInput,
-    intent: Arc<OriginalPollIntent>,
+    // Retain the original intent for the whole invocation, including Call retirement.
+    _intent: Arc<OriginalPollIntent>,
 }
 impl SharedPollInvocation {
     pub(crate) fn call(&self) -> crate::network_replay::NetworkStreamCallId {
@@ -273,7 +274,7 @@ impl GlobalState {
             Ok(SharedPollInvocation {
                 call,
                 captured,
-                intent,
+                _intent: intent,
             })
         }
         .await;

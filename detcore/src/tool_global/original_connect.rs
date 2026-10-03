@@ -490,6 +490,10 @@ impl GlobalState {
         })?;
         match request {
             NetworkRequest::NativeSubmitOriginalConnect { .. } => {
+                if matches!(admission.arguments.kind, crate::network_replay::original_connect::Kind::BlockingSendto { .. }) {
+                    self.validate_shared_send_submission(owner, admission)?;
+                    return Ok(NetworkReply::Unit);
+                }
                 let sched = self.sched.lock().unwrap();
                 if sched.backend_failed()
                     || sched.thread_is_logically_killed(owner.thread)
@@ -662,6 +666,10 @@ impl GlobalState {
                 return Err("original Connect local admission changed");
             }
             if event == reverie::InjectedSyscallEvent::Prepared {
+                if matches!(local.arguments.kind, crate::network_replay::original_connect::Kind::BlockingSendto { .. }) {
+                    self.validate_shared_send_callback(tid, state, admission, raw)
+                        .map_err(|_| "shared Sendto Prepared lost exact original grant/tuple/peer custody")?;
+                }
                 if local.arguments.kind == crate::network_replay::original_connect::Kind::Sendto {
                     let runtime = self.network_runtime.as_ref().ok_or("Sendto runtime absent")?;
                     let root = runtime.foreground_root(owner).map_err(|_| "Sendto root absent")?;

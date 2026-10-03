@@ -10,6 +10,14 @@ use crate::network_replay::shared_waits::SharedCallCensus;
 
 mod poll_input;
 mod record_probe;
+mod record_receive;
+#[cfg(test)]
+mod record_receive_global_fixture;
+#[cfg(test)]
+pub(crate) use record_receive_global_fixture::ControlledRecordReceiveFixture;
+pub(crate) use record_receive::ConfirmedSharedDrain;
+pub(crate) use record_receive::ConfirmedSharedRecordReceive;
+pub(crate) use record_receive::JoinedSharedDrain;
 pub(crate) use record_probe::ConfirmedSharedEffect;
 pub(crate) use record_probe::ConfirmedSharedRecordPending;
 pub(crate) use record_probe::ConfirmedSharedRecordPoll;
@@ -17,6 +25,7 @@ pub(crate) use record_probe::JoinedSharedEffect;
 
 mod capture;
 pub(crate) use capture::ConfirmedSharedCapture;
+#[cfg(test)]
 pub(crate) use capture::JoinedSharedCapture;
 
 #[derive(Debug, Clone)]
@@ -26,6 +35,9 @@ pub(crate) struct JoinedSharedPrefix {
     selected: Option<NetworkStreamCallId>,
 }
 impl JoinedSharedPrefix {
+    pub(in crate::network_runtime) fn native_prefix(&self) -> &JoinedNativePrefix { &self.prefix }
+    pub(in crate::network_runtime) fn peers(&self) -> &SharedCallCensus { &self.census }
+
     pub(crate) fn root(&self) -> &Arc<ForegroundRoot> {
         self.prefix.root()
     }

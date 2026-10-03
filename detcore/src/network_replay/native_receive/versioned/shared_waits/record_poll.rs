@@ -13,6 +13,7 @@ impl SharedRecordPollPublication {
     pub(crate) fn source(&self) -> &Arc<SharedRecordPollSource> {
         &self.source
     }
+    #[cfg(test)]
     pub(crate) fn input_ordinal(&self) -> u64 {
         self.input.ordinal
     }

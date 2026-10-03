@@ -96,6 +96,16 @@ impl NetworkRuntimeResources {
         submission: SharedCaptureSubmission,
         recovery: NativeCaptureRecovery,
     ) -> std::io::Result<JoinedSharedCapture> {
+        #[cfg(test)]
+        {
+            let controlled = self.shared.record_receive_fixture.lock().unwrap().clone();
+            if let Some(controlled) = controlled {
+                let capture = controlled.take_capture()?;
+                return self
+                    .controlled_shared_capture_with(submission, recovery, capture)
+                    .await;
+            }
+        }
         let origin = submission.into_origin();
         let task = {
             let physical = self.shared.physical.lock().unwrap();

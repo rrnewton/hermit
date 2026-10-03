@@ -92,6 +92,7 @@ impl NetworkRuntimeResources {
             socket: None,
             read_copy: None,
             send: None,
+            blocking_send: None,
             command: ffi::CommandResult {
                 command: selection.command,
                 operation: 7,

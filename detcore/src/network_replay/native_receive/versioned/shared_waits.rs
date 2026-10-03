@@ -8,14 +8,22 @@ use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 #[path = "shared_waits/replay_store.rs"]
 mod replay_store;
 pub(crate) use replay_store::SharedNoStoreResult;
-pub(crate) use replay_store::SharedReplayBytesPlan;
 pub(crate) use replay_store::SharedReplayNoStorePlan;
 pub(crate) use replay_store::SharedReplayReceivePlan;
 pub(crate) use replay_store::SharedReplaySource;
 
 #[path = "shared_waits/poll.rs"]
 mod poll;
-pub(crate) use poll::{SharedPollDecision, SharedPollPlan, SharedPollSource, SharedPollStoreRetainer};
+pub(crate) use poll::{SharedPollDecision, SharedPollSource};
+
+#[path = "shared_waits/record_receive.rs"]
+mod record_receive;
+pub(crate) use record_receive::PreparedSharedRecordReceivePublication;
+pub(crate) use record_receive::SharedRecordDrainSubmission;
+pub(crate) use record_receive::SharedRecordNoStorePlan;
+pub(crate) use record_receive::SharedRecordReceivePlan;
+pub(crate) use record_receive::SharedRecordReceiveSource;
+pub(crate) use record_receive::SharedRecordStored;
 
 #[path = "shared_waits/record_probe.rs"]
 mod record_probe;
@@ -23,6 +31,7 @@ pub(crate) use record_probe::PreparedSharedEffect;
 pub(crate) use record_probe::SharedEffectIdentity;
 pub(crate) use record_probe::SharedProbeProgress;
 pub(crate) use record_probe::SharedRecordPollPublication;
+#[cfg(test)]
 pub(crate) use record_probe::SharedRecordPollSource;
 pub(crate) use record_probe::SharedRecordProbe;
 
@@ -71,9 +80,6 @@ impl OriginalPollIntent {
             started,
             deadline,
         })
-    }
-    pub(crate) fn raw(&self) -> (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs) {
-        self.raw
     }
     fn accepts(&self, kind: NetworkWaitKind) -> bool {
         self.rows.iter().any(|(_, events)| match kind {
@@ -149,6 +155,7 @@ pub(in crate::network_replay) struct SharedWait {
     phase: AttemptPhase,
     output: Option<replay_store::SharedOutput>,
     poll_output: Option<poll::SharedPollOutput>,
+    record_receive: Option<record_receive::SharedRecordReceiveOutput>,
     capture: Option<Arc<SharedCaptureOrigin>>,
     record_probe: Option<record_probe::ProbeState>,
     record_history: Vec<Arc<record_probe::RecordHistory>>,
@@ -352,7 +359,7 @@ impl NetworkReplayEngine {
         state: &StreamCallState,
     ) -> Result<(), NetworkReplayError> {
         self.shared_wait_non_output_debts_settled(call, state)?;
-        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(wait)) if wait.output.is_some() || wait.poll_output.is_some())
+        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(wait)) if wait.output.is_some() || wait.poll_output.is_some() || wait.record_receive.is_some())
         {
             return Err(invalid("shared wait retains its exact output attempt"));
         }
@@ -364,7 +371,7 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
         state: &StreamCallState,
     ) -> Result<(), NetworkReplayError> {
-        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(w)) if w.record_probe.is_some())
+        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(w)) if w.record_probe.is_some() || w.record_receive.is_some())
             || state.capture_publication.is_some()
             || state.capture_control.is_some()
             || state.original.is_some()
@@ -411,7 +418,7 @@ impl NetworkReplayEngine {
         exclude: Option<NetworkStreamCallId>,
         delivery: Option<NetworkStreamLeaseId>,
     ) -> Result<SharedCallCensus, NetworkReplayError> {
-        self.shared_call_census_with_record_probe(selected, exclude, delivery, None)
+        self.shared_call_census_with_record_probe(selected, exclude, delivery, None, None)
     }
     fn shared_call_census_with_record_probe(
         &self,
@@ -419,7 +426,22 @@ impl NetworkReplayEngine {
         exclude: Option<NetworkStreamCallId>,
         delivery: Option<NetworkStreamLeaseId>,
         record: Option<&SharedRecordProbe>,
+        record_output: Option<&Arc<SharedRecordReceiveSource>>,
     ) -> Result<SharedCallCensus, NetworkReplayError> {
+        if let Some(source) = record_output {
+            self.check_shared_record_receive_source(source)?;
+            if selected.is_some()
+                || record.is_some()
+                || exclude != Some(source.call())
+                || delivery != Some(source.lease())
+                || self.shadow_deliveries.len() != 1
+                || self.shadow_deliveries.get(&source.lease()).is_none_or(|d| d.call != source.call())
+            {
+                return Err(invalid(
+                    "Record output census changed its sole exact physical Delivery",
+                ));
+            }
+        }
         if !self.uses_shared_mm_attempts() || !self.fd_table_capability() {
             return Err(invalid("shared census lacks declared policy/table"));
         }
@@ -438,7 +460,12 @@ impl NetworkReplayEngine {
                         .get(lease)
                         .is_none_or(|operation| operation.open_file != *file)
             })
-            || !self.shadow_deliveries.is_empty()
+            || match record_output {
+                None => !self.shadow_deliveries.is_empty(),
+                Some(source) => self.shadow_deliveries.iter().any(|(lease, d)| {
+                    *lease != source.lease() || d.call != source.call()
+                }),
+            }
         {
             return Err(invalid(
                 "shared census retains operation/control/delivery debt",
@@ -623,12 +650,13 @@ impl NetworkReplayEngine {
         if let SharedWaitIntent::Receive(p) = &intent {
             state.receive_policy = Some(p.clone());
         }
-        state.shared_attempt = Some(SharedAttempt::Wait(SharedWait {
+        state.shared_attempt = Some(SharedAttempt::Wait(Box::new(SharedWait {
             root: grant.root().clone(),
             binding,
             intent,
             output: None,
             poll_output: None,
+            record_receive: None,
             capture: None,
             record_probe: None,
             record_history: Vec::new(),
@@ -638,7 +666,7 @@ impl NetworkReplayEngine {
                 entry,
                 completion: None,
             },
-        }));
+        })));
         Ok(())
     }
 

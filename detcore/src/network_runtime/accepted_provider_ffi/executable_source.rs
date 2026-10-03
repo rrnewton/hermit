@@ -3,6 +3,7 @@ use std::ffi::c_int;
 use std::io;
 
 use super::CommandResult;
+#[cfg(test)]
 use super::RawState;
 use super::SessionPtr;
 
@@ -101,9 +102,16 @@ pub(super) fn read(
 const _: () = assert!(
     size_of::<Intent>() == 64 && size_of::<Mapping>() == 184 && size_of::<Receipt>() == 472
 );
+// The packaged C collector validates both mappings against its retained image
+// anchor. This exact Rust mirror remains for decoder mutation tests; production
+// transport correlation and ACK checks do not infer an anchor from receipt data.
+#[cfg(test)]
 const IMAGE_ANCHOR: u64 = 0xffffffff8206bf70;
+#[cfg(test)]
 const FOPS: u64 = 0xffffffff82a8bba8;
+#[cfg(test)]
 const VMOPS: u64 = 0xffffffff82a8bb20;
+#[cfg(test)]
 fn range(i: &Intent) -> bool {
     i.address != 0
         && (1..=512).contains(&i.length)
@@ -111,6 +119,7 @@ fn range(i: &Intent) -> bool {
         && i.length <= 0x800000000000 - i.address
         && i.address >> 12 == (i.address + i.length - 1) >> 12
 }
+#[cfg(test)]
 impl Mapping {
     fn valid(&self, i: &Intent, anchor: u64) -> bool {
         let o = self;
@@ -169,6 +178,7 @@ impl Mapping {
         offset <= o.file_size && i.length <= o.file_size - offset
     }
 }
+#[cfg(test)]
 impl Effect {
     /// Authenticate the closed observation against the originally held command,
     /// image anchor and original task identity. No anonymous-backing authority.

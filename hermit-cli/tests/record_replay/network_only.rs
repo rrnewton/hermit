@@ -509,10 +509,52 @@ fn accepted_recovery_argument(evidence: &Path) -> String {
 fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
     super::network_boundary::initialize("tcp");
     let _guard = super::hermit_record_lock();
+    // The CLI still authenticates these roots. This test only transports an
+    // explicit, complete deployment without creating or rotating its state.
+    let deployment = match (
+        std::env::var_os("HERMIT_NETWORK_TCP_GUARD_BPFFS"),
+        std::env::var_os("HERMIT_NETWORK_TCP_GUARD_RECOVERY"),
+        std::env::var_os("HERMIT_NETWORK_TCP_ACCEPTED_RECOVERY"),
+    ) {
+        (None, None, None) => None,
+        (Some(bpffs), Some(guard_recovery), Some(accepted_recovery)) => {
+            let directory = |name: &str, value: std::ffi::OsString| {
+                let value = value
+                    .into_string()
+                    .unwrap_or_else(|_| panic!("{name} must be a UTF-8 directory path"));
+                let path = Path::new(&value);
+                assert!(path.is_absolute(), "{name} must be an absolute directory path");
+                assert!(path.is_dir(), "{name} must name an existing directory");
+                value
+            };
+            Some((
+                directory("HERMIT_NETWORK_TCP_GUARD_BPFFS", bpffs),
+                directory("HERMIT_NETWORK_TCP_GUARD_RECOVERY", guard_recovery),
+                directory("HERMIT_NETWORK_TCP_ACCEPTED_RECOVERY", accepted_recovery),
+            ))
+        }
+        _ => panic!(
+            "HERMIT_NETWORK_TCP_GUARD_BPFFS, HERMIT_NETWORK_TCP_GUARD_RECOVERY, \
+             and HERMIT_NETWORK_TCP_ACCEPTED_RECOVERY must be supplied together"
+        ),
+    };
+    let run_arguments = |seed, max_timeslice| {
+        let mut arguments = common_run_arguments(seed, max_timeslice);
+        if let Some((bpffs, recovery, _)) = &deployment {
+            arguments.extend([
+                format!("--network-guard-bpffs={bpffs}"),
+                format!("--network-guard-recovery={recovery}"),
+            ]);
+        }
+        arguments
+    };
     let fixture = &super::workload("c_network_replay_tcp_bracket").path;
     let (_temporary_evidence, evidence) = acceptance_evidence_directory();
     let trace = evidence.join("network.trace");
-    let accepted_recovery = accepted_recovery_argument(&evidence);
+    let accepted_recovery = deployment.as_ref().map_or_else(
+        || accepted_recovery_argument(&evidence),
+        |(_, _, recovery)| format!("--network-accepted-recovery={recovery}"),
+    );
 
     // Policy 1: deterministic execution without a trace cannot touch even the
     // waiting loopback controller. This also proves that refusal is prompt.
@@ -520,7 +562,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     let closed = safehermit_command(
         &evidence,
         "default-policy-refusal",
-        &common_run_arguments(0, 1_000_000),
+        &run_arguments(0, 1_000_000),
         fixture,
         &["client", &closed_port, "match"],
     );
@@ -536,9 +578,10 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     let record_directory = evidence.join("record-controller");
     fs::create_dir(&record_directory).expect("create record controller directory");
     let (controller, port) = Controller::start(fixture, &record_directory);
-    let mut record_arguments = common_run_arguments(0, 1_000_000);
+    let mut record_arguments = run_arguments(0, 1_000_000);
     record_arguments.push(accepted_recovery.clone());
     record_arguments.push(format!("--record-networking={}", trace.display()));
+    record_arguments.push("--network-record-profile=shared-mm-v1".into());
     let recorded = safehermit_command(
         &evidence,
         "record-networking",
@@ -562,7 +605,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     for (seed, max_timeslice) in REPLAY_CELLS {
         let label = format!("replay-seed-{seed}-timeslice-{max_timeslice}");
         let report = evidence.join(format!("{label}.verify.json"));
-        let mut arguments = common_run_arguments(*seed, *max_timeslice);
+        let mut arguments = run_arguments(*seed, *max_timeslice);
         arguments.extend([
             accepted_recovery.clone(),
             "--verify".into(),
@@ -594,7 +637,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
 
     // A changed outbound byte must terminate replay instead of consulting the
     // network or silently accepting a different request stream.
-    let mut mismatch_arguments = common_run_arguments(0, 1_000_000);
+    let mut mismatch_arguments = run_arguments(0, 1_000_000);
     mismatch_arguments.push(accepted_recovery.clone());
     mismatch_arguments.push(format!("--replay-networking={}", trace.display()));
     let mismatch = safehermit_command(
@@ -613,7 +656,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     // Missing replay input is independently fail-closed and must fail before a
     // guest can attempt the fresh host connection.
     let missing_trace = evidence.join("missing.trace");
-    let mut missing_arguments = common_run_arguments(0, 1_000_000);
+    let mut missing_arguments = run_arguments(0, 1_000_000);
     missing_arguments.push(accepted_recovery);
     missing_arguments.push(format!("--replay-networking={}", missing_trace.display()));
     let missing = safehermit_command(

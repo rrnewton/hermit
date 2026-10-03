@@ -367,7 +367,7 @@ impl Tool for NativeTool {
             "source read adds no scheduler request"
         );
         let error = result.as_ref().err().map(ToString::to_string);
-        let mut engine = q.state.network_engine.as_ref().unwrap().lock().unwrap();
+        let engine = q.state.network_engine.as_ref().unwrap().lock().unwrap();
         let offset = engine.replay_transmit_offset(q.binding.open_file).unwrap();
         assert_eq!(engine.native_trace_fixture(), original_trace);
         if mutant {

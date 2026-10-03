@@ -10,6 +10,8 @@
 
 mod native_poll;
 mod shared_poll;
+mod shared_receive;
+mod shared_sendto;
 
 use std::io::IoSlice;
 use std::time::Duration;
@@ -319,6 +321,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // native submission until the shared engine has an authenticated TX join.
         // Ordinary file/stdout writes and explicit live policy retain dispatch.
         if policy == NetworkPolicy::Record {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464): original shared blocking TX with retained peer gates.
+            if let Syscall::Sendto(send) = call
+                && self.network_open_file(guest, send.fd()).is_some()
+                && guest.local_global_state().is_some_and(|global|global.shared_mm_attempts_active())
+                && guest.thread_state().with_detfd(send.fd(), |fd| !fd.is_nonblocking()).unwrap_or(false)
+            {
+                let result = self.network_shared_original_sendto(guest, send).await;
+                return Some(self.finish_original_invocation(guest, result).await);
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3464): original nonblocking TCP Sendto capture.
             if let Syscall::Sendto(send) = call
@@ -1292,7 +1304,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 length,
                 original_count: match kind {
                     crate::network_replay::original_connect::Kind::Read
-                    | crate::network_replay::original_connect::Kind::Sendto => raw.arg2 as u64,
+                    | crate::network_replay::original_connect::Kind::Sendto
+                    | crate::network_replay::original_connect::Kind::BlockingSendto { .. } => raw.arg2 as u64,
                     crate::network_replay::original_connect::Kind::Openat => raw.arg3 as u64,
                     crate::network_replay::original_connect::Kind::EpollCtl => {
                         u64::from(raw.arg2 as u32)
@@ -2394,6 +2407,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         read: crate::network_replay::NetworkFdReadAdmission,
         metadata: crate::tool_local::NetworkFdReadMetadata,
     ) -> Result<i64, Error> {
+        if self.shared_poll_profile(guest) {
+            return self.network_shared_receive(guest, call, mode, read, metadata).await;
+        }
         // Range precedence belongs to the authenticated, still-stopped
         // original Read/Recvfrom. It grants neither mapped access nor a Store.
         let range =

@@ -9,6 +9,7 @@ mod sendto_entry;
 mod native_source_read;
 mod shared_source;
 mod shared_receive;
+mod shared_record_receive;
 mod shared_poll;
 mod socket_error;
 
@@ -3784,6 +3785,7 @@ struct ScalarForegroundGuest<'a> {
     // Opt-in SO_ERROR ABI tests use real permission-respecting copies.
     socket_error_access: bool,
     shared_store: Option<Arc<shared_receive::ControlledStore>>,
+    shared_record_store: Option<Arc<shared_record_receive::ControlledRecordStore>>,
     // Opt-in supplied original Poll context; actual PVM input/output in tests.
     shared_poll: Option<Arc<shared_poll::ControlledPoll>>,
 }
@@ -3987,9 +3989,15 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
         self.expose_local_global.then_some(self.global)
     }
     fn with_followed_store<R>(&self, original: reverie::syscalls::Syscall, action: impl FnOnce(&mut dyn reverie::syscalls::FollowedStore) -> R) -> Result<R, reverie::syscalls::NativeUserStoreRefusal> {
+        if let Some(writer) = &self.shared_record_store {
+            return writer.with(original, false, action);
+        }
         self.shared_store.as_ref().ok_or(reverie::syscalls::NativeUserStoreRefusal::Evidence(reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend))?.with(original,false,action)
     }
     fn with_restored_followed_store<R>(&self, original: reverie::syscalls::Syscall, action: impl FnOnce(&mut dyn reverie::syscalls::FollowedStore) -> R) -> Result<R, reverie::syscalls::NativeUserStoreRefusal> {
+        if let Some(writer) = &self.shared_record_store {
+            return writer.with(original, true, action);
+        }
         self.shared_store.as_ref().ok_or(reverie::syscalls::NativeUserStoreRefusal::Evidence(reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend))?.with(original,true,action)
     }
     async fn capture_original_followed_poll(
@@ -4162,6 +4170,7 @@ fn scalar_foreground_guest<'a>(
         record_timer_arrival: None,
         socket_error_access: false,
         shared_store: None,
+        shared_record_store: None,
         shared_poll: None,
     }
 }

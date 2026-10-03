@@ -179,6 +179,8 @@ pub(super) struct OriginalEffect {
     pub read_copy: Option<super::original_read_copy::Manifest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send: Option<super::original_send::Capture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_send: Option<super::original_send::BlockingCapture>,
 }
 impl From<ffi::OriginalEffect> for OriginalEffect {
     fn from(raw: ffi::OriginalEffect) -> Self {
@@ -188,6 +190,7 @@ impl From<ffi::OriginalEffect> for OriginalEffect {
             socket: None,
             read_copy: None,
             send: None,
+            blocking_send: None,
         }
     }
 }
@@ -732,7 +735,7 @@ fn retained_identity_refusals(
         }
     } else if !matches!(
         expected_operation,
-        4 | 7 | 8 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 21 | 22 | 23 | 24
+        4 | 7 | 8 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25
     ) {
         if raw.identity.object == 0 {
             refusals.push("identity.object=0".into());
@@ -864,6 +867,10 @@ fn acknowledge_response(
         }
         return serde_json::to_vec(&CommandAcknowledgement::NotCollected).map_err(io::Error::other);
     }
+    if let Reply::OriginalEffect(observed)=&reply
+        && observed.raw.blocking_send.is_some() && expected_operation!=25 {
+        return Err(io::Error::other("blocking capture attached to a different original kind"));
+    }
     if expected_operation == 24 {
         let Reply::OriginalEffect(observed) = &reply else {
             return Err(io::Error::other("Sendto ACK lacks its actual capture"));
@@ -894,6 +901,29 @@ fn acknowledge_response(
                 .as_ref()
                 .ok_or_else(|| io::Error::other("Sendto ACK preceded capture consumption"))?
                 .validate(&observed.raw)?;
+        }
+    }
+    if expected_operation == 25 {
+        let Reply::OriginalEffect(observed) = &reply else {
+            return Err(io::Error::other("blocking Sendto ACK lacks capture"));
+        };
+        if observed.status.returned == 0 && observed.status.errno.is_none() {
+            let Request::CollectOriginalConnect {
+                kind: crate::network_replay::original_connect::Kind::BlockingSendto { timeout_ticks },
+                call, command, ..
+            } = serde_json::from_slice(&envelope.body)? else {
+                return Err(io::Error::other("blocking Sendto ACK changed request"));
+            };
+            let owner = envelope.owner.filter(|_| envelope.accept.is_none())
+                .ok_or_else(|| io::Error::other("blocking Sendto ACK lost original owner"))?;
+            if observed.raw.original.selection.call != call
+                || observed.raw.command.command != command
+                || observed.raw.original.selection.owner_mm != owner.mm.generation() {
+                return Err(io::Error::other("blocking Sendto ACK changed Call/command/MM"));
+            }
+            observed.raw.blocking_send.as_ref()
+                .ok_or_else(|| io::Error::other("blocking Sendto ACK preceded capture"))?
+                .validate(&observed.raw, super::original_send::BlockingTimeout::from_ticks(timeout_ticks)?)?;
         }
     }
     let auxiliary = match &reply {
@@ -939,7 +969,7 @@ fn acknowledge_response(
             }
         }
         Reply::OriginalEffect(observation)
-            if matches!(expected_operation, 7 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 24) =>
+            if matches!(expected_operation, 7 | 9 | 10 | 11 | 12 | 18 | 19 | 20 | 24 | 25) =>
         {
             Observation {
                 status: observation.status,
@@ -1582,6 +1612,25 @@ impl Provider {
                         .into();
                     capture.validate(&observed.raw)?;
                     observed.raw.send = Some(capture);
+                }
+                return serde_json::to_vec(&reply).map_err(io::Error::other);
+            }
+            if let Ok(Request::CollectOriginalConnect {
+                kind: crate::network_replay::original_connect::Kind::BlockingSendto { timeout_ticks }, ..
+            }) = serde_json::from_slice::<Request>(&envelope.body) {
+                let mut reply: Reply = serde_json::from_slice(&bytes)?;
+                let Reply::OriginalEffect(ref mut observed) = reply else {
+                    return Err(io::Error::other("blocking Sendto collection changed response"));
+                };
+                if observed.status.returned == 0 && observed.status.errno.is_none() {
+                    if observed.raw.blocking_send.is_some() {
+                        return Err(io::Error::other("blocking Sendto capture repeated"));
+                    }
+                    let capture: super::original_send::BlockingCapture = session
+                        .original_sendto_blocking_capture(observed.raw.command.command)?.into();
+                    capture.validate(&observed.raw,
+                        super::original_send::BlockingTimeout::from_ticks(timeout_ticks)?)?;
+                    observed.raw.blocking_send = Some(capture);
                 }
                 return serde_json::to_vec(&reply).map_err(io::Error::other);
             }

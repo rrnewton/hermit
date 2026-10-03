@@ -19,16 +19,18 @@ mod original_connect;
 mod original_source_ioctl;
 mod replay_connect;
 mod shared_origin;
+mod shared_send;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
-pub(crate) use foreground_store::PreparedSharedReceiveStore;
 #[cfg(test)]
 pub(crate) use foreground_store::ReceiveRetryFailure;
 pub(crate) use foreground_store::SavedReceivePolicy;
 pub(crate) use foreground_store::ScalarReceive;
 pub(crate) use foreground_store::SharedReceiveInvocation;
 pub(crate) use foreground_store::SharedReceivePreparation;
+pub(crate) use foreground_store::SharedRecordReceiveEffect;
+pub(crate) use foreground_store::SharedRecordStoreAttempt;
 pub(crate) use foreground_store::SharedStoreAttempt;
 mod original_installation;
 mod parked;
@@ -21170,8 +21172,10 @@ mod shared_profile_controls {
 
     #[test]
     fn shared_record_profile_keeps_default_and_rejects_nonrecord_override() {
-        let mut cfg = Config::default();
-        cfg.epoch_explicit = true;
+        let mut cfg = Config {
+            epoch_explicit: true,
+            ..Config::default()
+        };
         cfg.network_trace.policy = NetworkPolicy::Record;
         let old = initialize_network_engine(&cfg).unwrap().unwrap();
         assert!(!old.lock().unwrap().uses_shared_mm_attempts());
@@ -21189,9 +21193,11 @@ mod shared_profile_controls {
         use detcore_model::network_trace::NetworkReleaseModelV4;
         let trace = crate::network_replay::replay_connect::fixture(LogicalTime::ZERO, false)
             .engine.native_trace_fixture();
-        let mut cfg = Config::default();
-        cfg.epoch_explicit = true;
-        cfg.epoch = trace.epoch;
+        let mut cfg = Config {
+            epoch_explicit: true,
+            epoch: trace.epoch,
+            ..Config::default()
+        };
         cfg.network_trace.policy = NetworkPolicy::Replay;
         for shared in [false, true] {
             let mut trace = trace.clone();

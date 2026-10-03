@@ -589,3 +589,6 @@ async fn shared_record_probe_changed_original_cut_or_policy_owner_refuses_before
 
 #[path = "record_poll_tests.rs"]
 mod record_poll_tests;
+
+#[path = "record_receive_tests.rs"]
+mod record_receive_tests;

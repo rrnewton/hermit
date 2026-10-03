@@ -33,6 +33,7 @@ mod accepted_service;
 mod accepted_transport;
 pub mod capability_unit;
 pub(crate) mod executable_capture;
+pub(crate) mod shared_send;
 mod fd_journal;
 mod grouped_broker;
 pub mod guard;
@@ -151,6 +152,8 @@ struct RuntimeShared {
     native_streams: Mutex<native_peer::Calls>,
     native_workers: Mutex<NativeWorkers>,
     native_terminal_failure: Mutex<Option<String>>,
+    #[cfg(test)]
+    record_receive_fixture: Mutex<Option<std::sync::Arc<shared_waits::ControlledRecordReceiveFixture>>>,
 }
 
 // Execution handles, not semantic call/lease authority. Each native operation
@@ -1135,6 +1138,8 @@ impl NetworkRuntimeResources {
                 native_streams: Mutex::default(),
                 native_workers: Mutex::default(),
                 native_terminal_failure: Mutex::default(),
+                #[cfg(test)]
+                record_receive_fixture: Mutex::default(),
             }),
             drops: None,
             controlled_private_drain: Mutex::default(),
@@ -1186,6 +1191,8 @@ impl NetworkRuntimeResources {
             native_streams: Mutex::default(),
             native_workers: Mutex::default(),
             native_terminal_failure: Mutex::default(),
+            #[cfg(test)]
+            record_receive_fixture: Mutex::default(),
         });
         (
             NetworkRuntimeOwner {
@@ -1234,6 +1241,8 @@ impl NetworkRuntimeResources {
             native_streams: Mutex::default(),
             native_workers: Mutex::default(),
             native_terminal_failure: Mutex::default(),
+            #[cfg(test)]
+            record_receive_fixture: Mutex::default(),
         });
         (
             NetworkRuntimeOwner {
@@ -2850,6 +2859,8 @@ mod tests {
                     native_streams: Mutex::default(),
                     native_workers: Mutex::default(),
                     native_terminal_failure: Mutex::default(),
+                    #[cfg(test)]
+                    record_receive_fixture: Mutex::default(),
                 }),
                 drops: Some(drops.clone()),
                 controlled_private_drain: Mutex::default(),

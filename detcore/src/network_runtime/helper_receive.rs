@@ -832,7 +832,7 @@ impl RuntimeShared {
         lease: NetworkStreamLeaseId,
         effect: Effect,
     ) -> io::Result<NativeObservation> {
-        self.execute_helper_receive_inner(owner, lease, effect, None, None)
+        self.execute_helper_receive_inner(owner, lease, effect, None, None, None)
             .await
     }
 
@@ -849,6 +849,7 @@ impl RuntimeShared {
             },
             Some(full),
             None,
+            None,
         )
         .await
     }
@@ -864,8 +865,17 @@ impl RuntimeShared {
             step.effect().clone(),
             None,
             Some(step),
+            None,
         )
         .await
+    }
+
+    pub(super) async fn execute_shared_record_receive_drain(
+        self: &Arc<Self>,
+        submission: Arc<crate::network_replay::shared_waits::SharedRecordDrainSubmission>,
+    ) -> io::Result<NativeObservation> {
+        let source = submission.source();
+        self.execute_helper_receive_inner(source.owner(), source.lease(), Effect::Drain { maximum: source.len() }, None, None, Some(submission)).await
     }
 
     async fn execute_helper_receive_inner(
@@ -875,7 +885,11 @@ impl RuntimeShared {
         effect: Effect,
         full: Option<crate::network_replay::FullStoreCompletion>,
         shared_probe: Option<Arc<crate::network_replay::shared_waits::SharedEffectIdentity>>,
+        shared_drain: Option<Arc<crate::network_replay::shared_waits::SharedRecordDrainSubmission>>,
     ) -> io::Result<NativeObservation> {
+        if usize::from(full.is_some()) + usize::from(shared_probe.is_some()) + usize::from(shared_drain.is_some()) > 1 {
+            return Err(io::Error::other("helper source origins cannot be combined"));
+        }
         let controller = self
             .controller
             .lock()
@@ -890,13 +904,14 @@ impl RuntimeShared {
         let worker_quarantine = quarantine.clone();
         let worker_effect = effect.clone();
         let owner_task = self.physical.lock().unwrap().get(owner)?.try_clone()?;
-        let (shared_permit, shared_entered) = if shared_probe.is_some() {
+        let (shared_permit, shared_entered) = if shared_probe.is_some() || shared_drain.is_some() {
             let (tx, rx) = std::sync::mpsc::channel();
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
         let worker_probe = shared_probe.clone();
+        let worker_drain = shared_drain.clone();
         let (worker, receive) = self.start_native_worker_with_quarantine(
             executor,
             None,
@@ -909,12 +924,13 @@ impl RuntimeShared {
                         .map_err(|_| io::Error::other("shared Peek was never armed"))?;
                 }
                 let effect = worker_effect;
-                let work = shared.native_streams.lock().unwrap().prepare_with_store(
-                    owner,
-                    lease,
-                    effect.clone(),
-                    full.as_ref(),
-                )?;
+                let work = if let Some(submission) = &worker_drain {
+                    shared.native_streams.lock().unwrap().prepare_shared_record_drain(submission)?
+                } else {
+                    shared.native_streams.lock().unwrap().prepare_with_store(
+                        owner, lease, effect.clone(), full.as_ref(),
+                    )?
+                };
                 let held = work
                     .helper
                     .clone()
@@ -927,7 +943,9 @@ impl RuntimeShared {
                         io::Error::other("helper lacks captured shared-engine owner")
                     })?;
                     let mut engine = publication.engine().lock().unwrap();
-                    if let Some(full) = &full {
+                    if let Some(submission) = &worker_drain {
+                        engine.bind_shared_record_drain_helper(submission, held.binding()).map_err(io::Error::other)?;
+                    } else if let Some(full) = &full {
                         engine
                             .bind_private_drain_helper(full, held.binding())
                             .map_err(io::Error::other)?;
@@ -969,11 +987,15 @@ impl RuntimeShared {
                 result
             },
         )?;
-        if let (Some(step), Some(permit)) = (&shared_probe, shared_permit) {
-            self.arm_shared_effect(step, &worker)?;
-            permit
-                .send(())
-                .map_err(|_| io::Error::other("shared Peek lost gated worker"))?;
+        if let Some(permit) = shared_permit {
+            if let Some(step) = &shared_probe {
+                self.arm_shared_effect(step, &worker)?;
+            } else if let Some(submission) = &shared_drain {
+                self.arm_shared_record_drain(submission, &worker)?;
+            } else {
+                unreachable!("only a typed shared origin creates a gated worker");
+            }
+            permit.send(()).map_err(|_| io::Error::other("shared receive lost gated worker"))?;
         }
         let result = receive.await.map_err(io::Error::other)?;
         // Failure was delivered before the same worker parks. Awaiting that
@@ -1047,7 +1069,7 @@ impl Held {
     ) -> io::Result<NativeObservation> {
         self.controlled_observation_at(observed, version, 0, 0)
     }
-    fn controlled_observation_at(
+    pub(super) fn controlled_observation_at(
         &self,
         mut observed: NativeObservation,
         version: u64,

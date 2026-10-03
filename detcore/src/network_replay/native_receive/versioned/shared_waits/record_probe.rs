@@ -424,7 +424,7 @@ impl NetworkReplayEngine {
         if self.shadow_probes.len() != 1 || self.socket_controls.len() != 1 {
             return Err(invalid("shared Record probe has another control owner"));
         }
-        self.shared_call_census_with_record_probe(None, Some(origin.call), None, Some(origin))
+        self.shared_call_census_with_record_probe(None, Some(origin.call), None, Some(origin), None)
     }
 
     pub(crate) fn shared_record_probe_progress(
@@ -942,5 +942,94 @@ impl NetworkReplayEngine {
         origin: &Arc<SharedRecordProbe>,
     ) -> Result<&[Arc<JoinedSharedEffect>], NetworkReplayError> {
         Ok(&self.record_probe(origin)?.1.effects)
+    }
+}
+impl ProbeState {
+    pub(super) fn receive_effects(&self) -> &[Arc<JoinedSharedEffect>] {
+        &self.effects
+    }
+    pub(super) fn receive_history(&self, now: LogicalTime) -> Arc<RecordHistory> {
+        Arc::new(RecordHistory {
+            origin: self.origin.clone(),
+            effects: self.effects.clone(),
+            source: self.source.clone(),
+            observed_at: now,
+            published_poll: self.published_poll.clone(),
+        })
+    }
+}
+impl NetworkReplayEngine {
+    /// Separate source view for the output consumer. The existing probe and
+    /// Pending issuer keep all their original predicates.
+    pub(super) fn shared_record_receive_snapshot(
+        &self,
+        origin: &Arc<SharedRecordProbe>,
+        grant: &SharedMmForegroundObservation<'_>,
+        now: LogicalTime,
+    ) -> Result<super::record_receive::RecordReceiveSnapshot, NetworkReplayError> {
+        self.shared_active(origin.call, grant)?;
+        if self.shared_record_probe_progress(origin, now)? != SharedProbeProgress::EligibleSource {
+            return Err(invalid(
+                "Record receive output requires its actual eligible source",
+            ));
+        }
+        let (wait, record, probe) = self.record_probe(origin)?;
+        let SharedWaitIntent::Receive(policy) = &wait.intent else {
+            return Err(invalid("Record byte source is not original Receive"));
+        };
+        if wait.record_receive.is_some()
+            || wait.poll_output.is_some()
+            || record.pending.is_some()
+            || record.published_poll.is_some()
+            || probe.pending.is_some()
+            || !probe.cursor_restored()
+            || record
+                .effects
+                .last()
+                .is_none_or(|e| e.step().effect() != &NetworkStreamPhysicalEffect::PollState)
+            || record.confirmed_at.is_none_or(|at| at > now)
+        {
+            return Err(invalid(
+                "Record receive source retains unfinished cursor/worker/output history",
+            ));
+        }
+        let source = match record
+            .source
+            .as_ref()
+            .ok_or_else(|| invalid("Record receive has no canonical helper source"))?
+        {
+            Source::Bytes(s) => super::record_receive::ReceiveSource::Bytes(s.clone()),
+            Source::Empty(s) => super::record_receive::ReceiveSource::Empty(s.clone()),
+        };
+        Ok(super::record_receive::RecordReceiveSnapshot {
+            origin: origin.clone(),
+            binding: origin.binding,
+            policy: policy.clone(),
+            physical: origin.physical,
+            consumed: origin.consumed,
+            ordinal: origin.ordinal,
+            epoch: origin.epoch,
+            entry: origin.entry.clone(),
+            control: origin.control,
+            low_water: origin.low_water,
+            record: record.clone(),
+            probe: probe.clone(),
+            source,
+            at: now,
+        })
+    }
+}
+
+impl NetworkReplayEngine {
+    pub(super) fn shared_record_history_receipt_covered(
+        &self,
+        wait: &SharedWait,
+        receipt: &crate::network_runtime::original_read_copy::NativeAttempt,
+    ) -> bool {
+        wait.record_history.iter().any(|h| {
+            h.source
+                .as_ref()
+                .is_some_and(|s| s.completion().attempts().iter().any(|r| r.same(receipt)))
+        })
     }
 }

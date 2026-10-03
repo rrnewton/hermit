@@ -373,6 +373,7 @@ impl NetworkReplayEngine {
 
 #[path = "native_receive/versioned.rs"]
 mod versioned;
+pub(crate) use versioned::shared_send;
 pub(super) use versioned::NativeEntry;
 pub(super) use versioned::NativeEntryMarker;
 pub(super) use versioned::NativeState;

@@ -79,6 +79,7 @@ impl Capture {
         let count = usize::try_from(captured).map_err(io::Error::other)?;
         if effect.socket.is_some()
             || effect.read_copy.is_some()
+            || effect.blocking_send.is_some()
             || version != 1
             || complete != 1
             || !(1..=512).contains(&requested)
@@ -171,6 +172,12 @@ impl Capture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlockingTimeout(u64);
 impl BlockingTimeout {
+    pub(crate) fn from_ticks(ticks: u64) -> io::Result<Self> {
+        if !(1..=i64::MAX as u64 - 1).contains(&ticks) {
+            return Err(io::Error::other("blocking send timeout is not finite"));
+        }
+        Ok(Self(ticks))
+    }
     fn from_timeval(value: libc::timeval) -> io::Result<Self> {
         // The exact supported image authenticates HZ1000 and both timeout
         // converters. SO_SNDTIMEO readback must be in whole1000-usec ticks.
@@ -187,7 +194,6 @@ impl BlockingTimeout {
             .ok_or_else(|| io::Error::other("blocking send timeout is not finite"))?;
         Ok(Self(ticks))
     }
-    #[expect(dead_code, reason = "blocking TX admission is not yet activated")]
     pub(crate) fn ticks(self) -> u64 {
         self.0
     }
@@ -195,10 +201,6 @@ impl BlockingTimeout {
 
 /// Read-only classification of the actual retained file. This observes intent,
 /// not a native-operation completion or protection from concurrent alias edits.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "blocking TX admission is not yet activated")
-)]
 pub(super) fn classify_blocking(pin: &std::os::fd::OwnedFd) -> io::Result<BlockingTimeout> {
     use std::os::fd::AsRawFd;
 
@@ -246,7 +248,7 @@ pub(super) fn classify_blocking(pin: &std::os::fd::OwnedFd) -> io::Result<Blocki
 }
 
 /// Version2 positive accepted prefix, obtained only through its632-byte API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BlockingCapture {
     provider: u64,
     command: u64,
@@ -271,10 +273,6 @@ impl From<accepted_provider_ffi::OriginalBlockingSendCapture> for BlockingCaptur
         }
     }
 }
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "blocking TX admission is not yet activated")
-)]
 impl BlockingCapture {
     pub(super) fn validate(
         &self,

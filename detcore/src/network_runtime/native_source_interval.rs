@@ -17,6 +17,9 @@ pub(super) struct Interval {
 }
 #[derive(Debug)]
 enum SourceAdmission {
+    SharedRecordReceive {
+        _source: Arc<crate::network_replay::shared_waits::SharedRecordReceiveSource>,
+    },
     SharedPoll { _source: Arc<crate::network_replay::shared_waits::SharedPollSource> },
     Settled,
     SharedPollInput(crate::network_replay::shared_waits::SharedCallCensus),
@@ -320,6 +323,44 @@ impl RuntimeShared {
         }
         let interval = Arc::new(Interval { runtime: Arc::downgrade(self), root: source.root().clone(), generation,
             admission: SourceAdmission::SharedPoll { _source: source } });
+        owned.source_read = Arc::downgrade(&interval);
+        Ok(NativeSourceInterval { interval })
+    }
+}
+impl RuntimeShared {
+    pub(super) fn reserve_shared_record_receive_interval(
+        self: &Arc<Self>,
+        owned: &mut NativeWorkers,
+        generation: u64,
+        source: Arc<crate::network_replay::shared_waits::SharedRecordReceiveSource>,
+        engine: &crate::network_replay::NetworkReplayEngine,
+        calls: &native_peer::Calls,
+    ) -> std::io::Result<NativeSourceInterval> {
+        if owned.closed
+            || owned.copy_exclusion.is_some()
+            || owned.source_read_active()
+            || !owned.tasks.is_empty()
+            || owned.submission_generation != generation
+            || !source.root().is_current(source.owner())
+            || !source.root().has_shared_mm_history()
+        {
+            return Err(std::io::Error::other(
+                "Record output changed exact stopped worker prefix",
+            ));
+        }
+        if let Some(error) = self.native_terminal_failure.lock().unwrap().as_ref() {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        let peers = engine
+            .shared_record_receive_peers(&source)
+            .map_err(std::io::Error::other)?;
+        calls.require_shared_record_delivery(&peers, &source)?;
+        let interval = Arc::new(Interval {
+            runtime: Arc::downgrade(self),
+            root: source.root().clone(),
+            generation,
+            admission: SourceAdmission::SharedRecordReceive { _source: source },
+        });
         owned.source_read = Arc::downgrade(&interval);
         Ok(NativeSourceInterval { interval })
     }

@@ -56,6 +56,7 @@ pub(crate) struct SharedReplayBytesPlan {
     bytes: Vec<u8>,
 }
 impl SharedReplayBytesPlan {
+    #[cfg(test)]
     pub(crate) fn length(&self) -> usize {
         self.bytes.len()
     }
@@ -89,9 +90,6 @@ impl SharedReplaySource {
     pub(crate) fn call(&self) -> NetworkStreamCallId {
         self.selected.call
     }
-    pub(crate) fn open_file(&self) -> OpenFileId {
-        self.selected.file
-    }
     pub(crate) fn root(&self) -> &Arc<crate::network_runtime::ForegroundRoot> {
         &self.selected.root
     }
@@ -101,6 +99,7 @@ impl SharedReplaySource {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    #[cfg(test)]
     pub(crate) fn lease(&self) -> NetworkStreamLeaseId {
         self.lease
     }

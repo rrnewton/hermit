@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 #[path = "versioned/shared_origin.rs"]
 mod shared_origin;
+#[path = "versioned/shared_send.rs"]
+pub(crate) mod shared_send;
 
 #[path = "versioned/raw_poll.rs"]
 mod raw_poll;
@@ -225,6 +227,7 @@ pub(in crate::network_replay) struct NativeEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
+    SharedSend { epoch: u64, operation: crate::resources::ExternalOpId },
     SharedInitialConnect {
         operation: crate::resources::ExternalOpId,
     },

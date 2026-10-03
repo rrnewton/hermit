@@ -102,6 +102,7 @@ type OriginalPin = crate::network_replay::original_connect::Pin;
 #[derive(Clone)]
 pub(super) struct OriginalConnect {
     pub admission: OriginalAdmission,
+    pub shared_send: Option<std::sync::Arc<crate::network_replay::shared_send::SharedRecordSend>>,
     pub pin: Option<OriginalPin>,
     // Supplied only by the backend's synchronous Prepared observation, never
     // deserialized from the RPC or discovered through a numeric task registry.
@@ -175,6 +176,7 @@ impl OriginalConnect {
             socket: None,
             read_copy: None,
             send: None,
+            blocking_send: None,
         })
     }
 }
@@ -289,7 +291,8 @@ impl Calls {
     ) -> io::Result<()> {
         let call = admission.call;
         if !matches!(admission.arguments.kind, crate::network_replay::original_connect::Kind::Connect
-            | crate::network_replay::original_connect::Kind::Sendto)
+            | crate::network_replay::original_connect::Kind::Sendto
+            | crate::network_replay::original_connect::Kind::BlockingSendto { .. })
             && pin.is_some()
         {
             return Err(io::Error::other(
@@ -316,6 +319,7 @@ impl Calls {
                 release: None,
                 invocation: Some(OriginalConnect {
                     admission,
+                    shared_send: None,
                     pin: None,
                     close_metadata: None,
                     installation_owner: None,
@@ -404,7 +408,8 @@ impl Calls {
     ) -> io::Result<()> {
         let state = self.original(owner, call)?;
         if !matches!(state.admission.arguments.kind, crate::network_replay::original_connect::Kind::Connect
-            | crate::network_replay::original_connect::Kind::Sendto)
+            | crate::network_replay::original_connect::Kind::Sendto
+            | crate::network_replay::original_connect::Kind::BlockingSendto { .. })
             || state.pin.is_some()
             || state.admission.arguments.binding.is_none() != (pin == OriginalPin::Empty)
         {
@@ -607,6 +612,9 @@ impl Calls {
             // absent/O_PATH from readable descriptions before publication.
             // This transport layer never invents a selected file from a slot.
             (crate::network_replay::original_connect::Kind::Read, None) => {}
+            (crate::network_replay::original_connect::Kind::BlockingSendto { .. },
+                Some(OriginalPin::Socket { domain:libc::AF_INET,kind:libc::SOCK_STREAM,protocol:libc::IPPROTO_TCP }))
+                if admission.arguments.binding.is_some() && selection.file!=0 && state.shared_send.is_some() => {},
             (crate::network_replay::original_connect::Kind::Sendto,
                 Some(OriginalPin::Socket { kind: libc::SOCK_STREAM, protocol: libc::IPPROTO_TCP, .. }))
                 if admission.arguments.binding.is_some() && selection.file != 0 => {}
@@ -692,7 +700,19 @@ impl Calls {
                 "original native completion does not match exact backend/selection",
             ));
         }
+        if effect.blocking_send.is_some()
+            && !matches!(admission.arguments.kind,crate::network_replay::original_connect::Kind::BlockingSendto{..}) {
+            return Err(io::Error::other("foreign blocking TX capture payload"));
+        }
         let path = match admission.arguments.kind {
+            crate::network_replay::original_connect::Kind::BlockingSendto{timeout_ticks} => {
+                effect.blocking_send.as_ref().ok_or_else(||io::Error::other("blocking TX capture absent"))?
+                    .validate(&effect,super::original_send::BlockingTimeout::from_ticks(timeout_ticks)?)?;
+                let origin=state.shared_send.as_ref().ok_or_else(||io::Error::other("blocking TX origin absent"))?;
+                origin.admission()==admission && origin.timeout()==timeout_ticks && raw>0
+                    && matches!(state.pin,Some(OriginalPin::Socket{domain:libc::AF_INET,kind:libc::SOCK_STREAM,protocol:libc::IPPROTO_TCP}))
+            }
+
             crate::network_replay::original_connect::Kind::Sendto => {
                 effect.send.as_ref()
                     .ok_or_else(|| io::Error::other("Sendto completion lacks captured skb bytes"))?

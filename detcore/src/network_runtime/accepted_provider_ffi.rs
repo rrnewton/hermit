@@ -1892,9 +1892,8 @@ impl Session {
         Ok(raw)
     }
 
-    /// Additive ABI10 primitive. The shared-attempt caller is deliberately not
-    /// selected by the current production policy until separately qualified.
-    #[expect(dead_code, reason = "blocking TX admission is not yet activated")]
+    /// Additive ABI10 primitive for the explicitly selected closed shared profile.
+    /// Dispatch does not itself establish native qualification.
     pub fn prepare_original_sendto_blocking(
         &mut self,
         target: BorrowedFd<'_>,
@@ -1931,7 +1930,6 @@ impl Session {
         })
     }
 
-    #[expect(dead_code, reason = "blocking TX admission is not yet activated")]
     pub(super) fn original_sendto_blocking_capture(
         &mut self,
         command: u64,

@@ -25,14 +25,15 @@ pub(in crate::network_replay) struct TransmitAttempt {
 
 #[derive(Debug, Clone)]
 pub(in crate::network_replay) enum SharedAttempt {
+    RecordTransmit(Arc<super::shared_send::SharedRecordSend>),
     Transmit(TransmitAttempt),
-    Wait(super::shared_waits::SharedWait),
+    Wait(Box<super::shared_waits::SharedWait>),
 }
 impl SharedAttempt {
     fn transmit(&self) -> Option<&TransmitAttempt> {
         match self {
             Self::Transmit(attempt) => Some(attempt),
-            Self::Wait(_) => None,
+            Self::Wait(_) | Self::RecordTransmit(_) => None,
         }
     }
 }

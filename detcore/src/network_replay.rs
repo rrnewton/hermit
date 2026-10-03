@@ -30,6 +30,7 @@ mod helper_copy;
 pub(crate) mod lifetime;
 mod native_receive;
 pub(crate) use native_receive::shared_waits;
+pub(crate) use native_receive::shared_send;
 pub(crate) use native_receive::shared_waits::SharedReplaySource;
 pub(crate) mod original_connect;
 pub(crate) mod replay_connect;
@@ -820,7 +821,11 @@ impl NetworkReplayEngine {
         &self, owner: NetworkStreamOwner, call: NetworkStreamCallId,
     ) -> Result<&StreamCallState, NetworkReplayError> {
         if self.stream_calls.get(&call).is_some_and(|s| s.shared_attempt.is_some()) {
-            self.check_shared_poll_release(owner, call)?;
+            if self.has_shared_record_receive_output(call) {
+                self.check_shared_record_receive_release(owner, call)?;
+            } else {
+                self.check_shared_poll_release(owner, call)?;
+            }
             Ok(&self.stream_calls[&call])
         } else {
             self.owned_stream_call(owner, call)
