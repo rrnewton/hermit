@@ -181,13 +181,20 @@ make -C demos all
 
 This is the same as `demos/run-all.sh --all`. It writes one log per demo and a
 `summary.tsv` to `target/demo-sweep/`. Demo 8 is skipped, which counts as
-neither a pass nor a failure, until you have run its `prepare-assets.sh`. The
-script exits 1 if any demo fails. Otherwise it exits 4 if it could not create,
-write, or read its log directory, a demo's log, or `summary.tsv`, because it
-reads each log to tell a skip from a pass, and 3 if at least one demo was
-skipped, because a skipped demo produced no result. `make` reports any of
-these as its own exit status 2. A caller that accepts skipped demos can check
-for exit status 3 itself; `demos/run-all.sh --help` lists every exit status.
+neither a pass nor a failure, until you have run its `prepare-assets.sh`.
+Demos 5 and 6 compare each run with a reference run that their first run
+saves. The script sets `QEMU_BOOT_REPEAT=1` and `QEMU_RESUME_REPEAT=1` for the
+demos it runs, whatever your environment says, so a demo with no reference run
+yet saves one and then runs again to compare. A demo whose last result line
+still says `FIRST RUN SAVED` compared nothing; it is recorded as `UNCOMPARED`,
+which also counts as neither a pass nor a failure. The script exits 1 if any
+demo fails. Otherwise it exits 4 if it could not create, write, or read its log
+directory, a demo's log, or `summary.tsv`, because it reads each log to tell a
+skip or an uncompared run from a pass, and 3 if at least one demo was skipped
+or compared nothing, because such a demo produced no result. `make` reports
+any of these as its own exit status 2. A caller that accepts skipped or
+uncompared demos can check for exit status 3 itself; `demos/run-all.sh --help`
+lists every exit status.
 
 Smaller selections:
 

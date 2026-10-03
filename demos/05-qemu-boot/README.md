@@ -57,7 +57,10 @@ The first run downloads a pinned Linux kernel from the Hermit GitHub releases,
 checks its SHA-256, and builds a BusyBox initramfs; later runs reuse both. On a
 machine that has never run the demo, one invocation boots twice: the first boot
 is saved as the reference run and the second is compared with it. Set
-`QEMU_BOOT_REPEAT=0` to boot only once.
+`QEMU_BOOT_REPEAT=0` to boot only once; that invocation then compares nothing,
+ends with `FIRST RUN SAVED`, and still exits 0. `demos/run-all.sh`, which
+`make -C demos all` and the group targets use, sets `QEMU_BOOT_REPEAT=1`, so it
+always boots a second time to compare.
 
 How long a boot takes depends on host load. On a shared 316-CPU host
 (2026-09-30, Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2), three first invocations,
@@ -310,7 +313,7 @@ Controls (environment variables):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `QEMU_BOOT_REPEAT` | `1` | Set to `0` to skip the second boot of a first invocation. |
+| `QEMU_BOOT_REPEAT` | `1` | Set to `0` to skip the second boot of a first invocation, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
 | `QEMU_TIMEOUT` | `600` | Seconds before the boot is stopped. |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where the kernel, initramfs, snapshot, and run history are kept. A checkout under `/tmp` uses a directory under `/var/tmp` instead. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. |

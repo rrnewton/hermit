@@ -3,7 +3,8 @@
 # Exits 1 if any selected demo fails. Otherwise it exits 4 if it could not
 # create, write, or read its log directory, a demo's log, or its summary, since
 # a result is then unknown or unrecorded, and 3 if at least one demo was
-# skipped (and so produced no result). `--help` lists the exit statuses.
+# skipped or only saved its first run (and so produced no result). `--help`
+# lists the exit statuses.
 
 set -uo pipefail
 
@@ -26,21 +27,27 @@ With no option, run the quick demos 1-3.
                     3  demos 5, 6, 7        (QEMU snapshot, resume, drgn)
 
 A demo that cannot run on this host prints a SKIPPED line and is recorded as
-SKIP; demo 8 does this until its prepare-assets.sh has been run. A skipped
-demo produced no result, so it never counts as a pass. The sweep tells a skip
-from a pass by reading the demo's log, so a demo whose log could not be
-written or read is recorded as ERROR: its result is unknown.
+SKIP; demo 8 does this until its prepare-assets.sh has been run. Demos 5 and 6
+compare each run with a reference run that their first run saves. The sweep
+sets QEMU_BOOT_REPEAT=1 and QEMU_RESUME_REPEAT=1, so a demo that has no
+reference run yet saves one and then runs again to compare. A demo whose last
+result line still says FIRST RUN SAVED compared nothing and is recorded as
+UNCOMPARED. Neither a skipped nor an uncompared demo produced a result, so
+neither counts as a pass. The sweep tells them from a pass by reading the
+demo's log, so a demo whose log could not be written or read is recorded as
+ERROR: its result is unknown.
 
 Exit status:
   0  every selected demo passed
   1  at least one selected demo failed
   2  usage error
   3  no selected demo failed, but at least one was skipped
+     or saved its first run and compared nothing
   4  no selected demo failed, but the sweep could not create, write, or read
      its log directory, a demo's log, or summary.tsv, so a result is unknown
      or unrecorded (with an unusable log directory, no demo is run)
 When more than one applies, 1 comes before 4, and 4 before 3. A caller that
-accepts skipped demos can check for exit status 3 itself.
+accepts skipped or uncompared demos can check for exit status 3 itself.
 
 Logs and summary.tsv go to target/demo-sweep/ (override: DEMO_SWEEP_LOG_DIR).
 EOF
@@ -108,10 +115,20 @@ printf 'demo\tstatus\texit\tduration_seconds\tlog\n' >"$SUMMARY" ||
 # Demos 1-4 share one scratch directory and one build of their guest programs.
 export DEMO_TMP="${DEMO_TMP:-$(mktemp -d -t hermit-demo.XXXXXX)}"
 
+# Demos 5 and 6 compare a run with a saved reference run. With no reference
+# run yet, a run saves itself as the reference and compares nothing; the demo
+# then runs a second time to compare unless QEMU_BOOT_REPEAT (demo 5) or
+# QEMU_RESUME_REPEAT (demo 6) is 0. The sweep exists to measure, so it always
+# asks for the second run, whatever the caller's environment says.
+export QEMU_BOOT_REPEAT=1 QEMU_RESUME_REPEAT=1
+
 failures=0
 passes=0
 skips=0
 skipped=()
+# Demos whose last result line says FIRST RUN SAVED: they compared nothing.
+uncompared=0
+uncompared_demos=()
 errored=()
 # One line for each log or summary that could not be written or read. Any
 # entry makes the sweep exit 4 unless a demo failed.
@@ -144,36 +161,57 @@ for demo in "${demos[@]}"; do
         "$demo" "$rc" "$duration" "$log"
     fi
   else
-    # A demo that cannot run exits 0 and prints a SKIPPED line (demo 8 does
-    # this when its prepared assets are absent), so only its log separates a
-    # skip from a pass. grep exits 0 for a SKIPPED line, 1 for none, and 2 or
-    # more when it cannot read the log; a log that tee could not write
-    # completely is not read at all.
+    # A demo exits 0 in three cases that only its log separates. It passed.
+    # Or it cannot run here and printed a SKIPPED line (demo 8 does this when
+    # its prepared assets are absent). Or it saved its first run as its
+    # reference run and compared nothing: its last result line,
+    # `=== Demo N: <title>: <result> ===`, says FIRST RUN SAVED. A demo that
+    # then ran again and compared prints a later SUCCESS or PARTIAL line, so
+    # only the last result line counts. grep exits 0 when a line matches, 1
+    # when none does, and 2 or more when it cannot read the log; -a makes it
+    # print the matching lines even when the log holds binary bytes, such as
+    # a guest's serial output. A log that tee could not write completely is
+    # not read at all.
+    status=PASS
     if [ -n "$log_error" ]; then
-      grep_rc=2
+      status=ERROR
     else
       grep -qE '^=== Demo [0-9]+: SKIPPED' "$log"
       grep_rc=$?
+      if [ "$grep_rc" -eq 0 ]; then
+        status=SKIP
+      elif [ "$grep_rc" -eq 1 ]; then
+        result_lines="$(grep -aE '^=== Demo [0-9]+: .+: (FIRST RUN SAVED|SUCCESS|PARTIAL) ===$' "$log")"
+        grep_rc=$?
+        if [ "$grep_rc" -le 1 ] &&
+          [[ "${result_lines##*$'\n'}" == *": FIRST RUN SAVED ===" ]]; then
+          status=UNCOMPARED
+        fi
+      fi
       if [ "$grep_rc" -gt 1 ]; then
+        status=ERROR
         log_error="grep could not read the log $log (exit $grep_rc)"
       fi
     fi
-    case "$grep_rc" in
-      0)
-        status=SKIP
+    case "$status" in
+      SKIP)
         skips=$((skips + 1))
         skipped+=("$demo")
         printf '=== %s: SKIP (%ss; log %s) ===\n' "$demo" "$duration" "$log"
         ;;
-      1)
-        status=PASS
+      UNCOMPARED)
+        uncompared=$((uncompared + 1))
+        uncompared_demos+=("$demo")
+        printf '=== %s: UNCOMPARED (%ss; it saved its first run and compared nothing; log %s) ===\n' \
+          "$demo" "$duration" "$log"
+        ;;
+      PASS)
         passes=$((passes + 1))
         printf '=== %s: PASS (%ss) ===\n' "$demo" "$duration"
         ;;
       *)
-        status=ERROR
         errored+=("$demo")
-        printf '=== %s: ERROR (exit 0, %ss; %s, so a pass cannot be told from a skip) ===\n' \
+        printf '=== %s: ERROR (exit 0, %ss; %s, so a pass cannot be told from a skip or an uncompared run) ===\n' \
           "$demo" "$duration" "$log_error" >&2
         if [ "${GITHUB_ACTIONS:-}" = true ]; then
           printf '::error title=%s result unknown::%s\n' "$demo" "$log_error"
@@ -198,7 +236,7 @@ done
 printf '\n=== Demo sweep summary ===\n'
 for row in "${rows[@]}"; do
   IFS=$'\t' read -r demo status rc duration log <<<"$row"
-  printf '%-8s %-5s exit=%-3s duration=%4ss log=%s\n' \
+  printf '%-8s %-10s exit=%-3s duration=%4ss log=%s\n' \
     "$demo" "$status" "$rc" "$duration" "$log"
 done
 
@@ -228,12 +266,23 @@ report_record_errors() {
   printf 'Make these paths writable and readable, or set DEMO_SWEEP_LOG_DIR to another directory, and run the sweep again.\n' >&2
 }
 
+# Added to the closing line only when some demo compared nothing.
+uncompared_note=""
+if [ "$uncompared" -ne 0 ]; then
+  uncompared_note=", $uncompared saved a first run and compared nothing"
+fi
+report_uncompared() {
+  [ "$uncompared" -ne 0 ] || return 0
+  printf 'Saved a first run and compared nothing: %s\n' "${uncompared_demos[*]}" >&2
+}
+
 if [ "$failures" -ne 0 ]; then
-  printf '\n=== Demo suite: FAILURE — %s demo(s) failed, %s passed, %s skipped ===\n' \
-    "$failures" "$passes" "$skips" >&2
+  printf '\n=== Demo suite: FAILURE — %s demo(s) failed, %s passed, %s skipped%s ===\n' \
+    "$failures" "$passes" "$skips" "$uncompared_note" >&2
   if [ "$skips" -ne 0 ]; then
     printf 'Skipped, with no result: %s\n' "${skipped[*]}" >&2
   fi
+  report_uncompared
   if [ "${#errored[@]}" -ne 0 ]; then
     printf 'Unknown, because the log could not be read: %s\n' "${errored[*]}" >&2
   fi
@@ -245,25 +294,30 @@ fi
 # summary.tsv leaves the record incomplete, so neither may end as SUCCESS or
 # as INCOMPLETE.
 if [ "${#record_errors[@]}" -ne 0 ]; then
-  printf '\n=== Demo suite: ERROR — %s of %s requested demos passed, %s skipped, %s unknown; the sweep could not write or read its records ===\n' \
-    "$passes" "${#demos[@]}" "$skips" "${#errored[@]}" >&2
+  printf '\n=== Demo suite: ERROR — %s of %s requested demos passed, %s skipped, %s unknown%s; the sweep could not write or read its records ===\n' \
+    "$passes" "${#demos[@]}" "$skips" "${#errored[@]}" "$uncompared_note" >&2
   if [ "${#errored[@]}" -ne 0 ]; then
     printf 'Unknown, because the log could not be read: %s\n' "${errored[*]}" >&2
   fi
   if [ "$skips" -ne 0 ]; then
     printf 'Skipped, with no result: %s\n' "${skipped[*]}" >&2
   fi
+  report_uncompared
   report_record_errors
   exit 4
 fi
 
-# A skipped demo produced no result, so never report it as passed, and give the
-# sweep its own nonzero status so that a caller that reads only the exit status
-# does not take it for a success.
-if [ "$skips" -ne 0 ]; then
-  printf '\n=== Demo suite: INCOMPLETE — %s of %s requested demos passed, %s skipped and unmeasured ===\n' \
-    "$passes" "${#demos[@]}" "$skips" >&2
-  printf 'Skipped, with no result: %s\n' "${skipped[*]}" >&2
+# A skipped demo, and a demo that saved its first run and compared nothing,
+# produced no result, so never report either as passed, and give the sweep its
+# own nonzero status so that a caller that reads only the exit status does not
+# take it for a success.
+if [ "$skips" -ne 0 ] || [ "$uncompared" -ne 0 ]; then
+  printf '\n=== Demo suite: INCOMPLETE — %s of %s requested demos passed, %s skipped and unmeasured%s ===\n' \
+    "$passes" "${#demos[@]}" "$skips" "$uncompared_note" >&2
+  if [ "$skips" -ne 0 ]; then
+    printf 'Skipped, with no result: %s\n' "${skipped[*]}" >&2
+  fi
+  report_uncompared
   exit 3
 fi
 

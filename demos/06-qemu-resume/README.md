@@ -50,7 +50,10 @@ directly, because Make would otherwise hand the `|` to your own shell.
 Each distinct command has its own reference run. On the first run of a command,
 one invocation resumes twice: the first resume is saved as that command's
 reference and the second is compared with it. Set `QEMU_RESUME_REPEAT=0` to
-resume only once.
+resume only once; that invocation then compares nothing, ends with
+`FIRST RUN SAVED`, and still exits 0. `demos/run-all.sh`, which
+`make -C demos all` and the group targets use, sets `QEMU_RESUME_REPEAT=1`, so
+it always resumes a second time to compare.
 
 ## What you will see
 
@@ -280,7 +283,7 @@ Controls (environment variables):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `QEMU_RESUME_REPEAT` | `1` | Set to `0` to skip the second resume of a new command. |
+| `QEMU_RESUME_REPEAT` | `1` | Set to `0` to skip the second resume of a new command, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
 | `QEMU_TIMEOUT` | `120` | Seconds before the resume is stopped. |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where demo 5's snapshot and this demo's results are kept. |
 | `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. |
