@@ -478,7 +478,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // --profile ci` over this node's whole selection measured the -1 when the
     // change was written, not on this base; no other selected crate gains or
     // loses a test).
-    ("test.regular_crates", 813),
+    // The import-mode change of https://github.com/rrnewton/hermit/pull/3542
+    // adds six tests and retains all 813 prior identities: test-harness's
+    // import_mode_republishes_rows_and_a_missing_cell_is_an_error,
+    // import_mode_host_inapplicable_claim_needs_this_machines_confirmation and
+    // import_mode_marks_the_rows_of_a_dirty_checkout_dirty, and runner's
+    // a_source_sha_is_refused_where_git_tracks_the_files,
+    // a_source_sha_is_accepted_outside_any_checkout and
+    // a_source_sha_is_refused_through_a_symlink_to_tracked_files.
+    // `cargo nextest list --profile ci` over this node's selection measured
+    // 819 at 9e7dd6e33cf6fc76f3b9a744f50441120b32f0d6.
+    ("test.regular_crates", 819),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -818,7 +828,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The selection includes the S12 parity tests above: 31 identities
     // added and one removed, whose test S12 rewrote under a new name, so 783
     // of its 784 prior identities are retained.
-    ("test.regular_crates_on_host", 813),
+    // The six import-mode tests of https://github.com/rrnewton/hermit/pull/3542
+    // retain all 813 prior identities (measured 819, as above).
+    ("test.regular_crates_on_host", 819),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
