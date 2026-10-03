@@ -3821,12 +3821,18 @@ report.write_bytes((root/'verification.json').read_bytes())
         outcome: &str,
     ) -> CellResult {
         use hermit_manifest_plan::runner::ObservedResult;
+        use hermit_manifest_plan::runner::host_inapplicable_result;
         use hermit_manifest_plan::runner::infrastructure_error_result;
 
         let mut context = producer.with_attempt(1);
         context.run_id = run_id;
         let mut row = infrastructure_error_result(&context, cell, String::new());
         match outcome {
+            // A producer never writes one: it reports host inapplicability
+            // only in summary.json.
+            "HOST-INAPPLICABLE" => {
+                row = host_inapplicable_result(&context, cell, "producer: no kvm".into());
+            }
             "PASS" => {
                 row.outcome = "PASS".into();
                 row.error_kind = None;
@@ -3855,6 +3861,14 @@ report.write_bytes((root/'verification.json').read_bytes())
         serde_json::json!({"test": "imported/control", "mode": mode, "backend": backend})
     }
 
+    /// The `evidence_complete_executions` entry of the execution that wrote
+    /// `row`.
+    fn import_execution(row: &CellResult) -> serde_json::Value {
+        serde_json::json!({
+            "test": row.test, "mode": row.mode, "backend": row.backend, "run_id": row.run_id
+        })
+    }
+
     /// `E2E_IMPORT_RESULTS` executes no cell: it re-publishes the rows a Buck
     /// run left under `<root>/<lane>/manifest_<category>/`. A complete import
     /// passes with every attempt rebound to this run. Each way an imported
@@ -3862,9 +3876,12 @@ report.write_bytes((root/'verification.json').read_bytes())
     /// worse instead: a selected cell with no row (the executed-equals-plan
     /// gate); rows of another commit, a dirty tree, another stamped binary,
     /// other test source, other timeouts or CPU evidence bound elsewhere; a
-    /// producer retry this run would not have made; a host-inapplicable claim
-    /// this machine does not confirm, or one alongside rows; and a PASS without
-    /// the producer's evidence-complete record.
+    /// history no producer writes (an attempt after a PASS, a repeated or
+    /// out-of-order attempt, a HOST-INAPPLICABLE row); a producer retry this
+    /// run would not have made, after an infrastructure ERROR or under
+    /// `--no-retry`; a host-inapplicable claim this machine does not confirm,
+    /// or one alongside rows; and a PASS whose own execution has no
+    /// evidence-complete record.
     #[test]
     fn import_mode_republishes_rows_and_a_missing_cell_is_an_error() {
         use std::path::PathBuf;
@@ -3876,6 +3893,7 @@ report.write_bytes((root/'verification.json').read_bytes())
         use serde_json::json;
 
         const CHILD: &str = "HERMIT_IMPORT_MODE_FIXTURE";
+        const NO_RETRY: &str = "HERMIT_IMPORT_MODE_FIXTURE_NO_RETRY";
         const TEST: &str = "tests::import_mode_republishes_rows_and_a_missing_cell_is_an_error";
         const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
         const STALE: &str = "fedcba9876543210fedcba9876543210fedcba98";
@@ -3885,7 +3903,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             .unwrap();
         if let Some(fixture) = std::env::var_os(CHILD) {
             let fixture = PathBuf::from(fixture);
-            let values = vec![
+            let mut values = vec![
                 "--category".into(),
                 "imported".into(),
                 "--ci-only".into(),
@@ -3899,6 +3917,9 @@ report.write_bytes((root/'verification.json').read_bytes())
                 "--junit".into(),
                 fixture.join("out/junit.xml").display().to_string(),
             ];
+            if std::env::var_os(NO_RETRY).is_some() {
+                values.push("--no-retry".into());
+            }
             let args = parse(values.into_iter());
             validate_args("run", &args);
             let manifests = ManifestSet::load(&fixture).unwrap();
@@ -3916,9 +3937,18 @@ report.write_bytes((root/'verification.json').read_bytes())
             "timeouts",
             "binding",
             "untrusted-retry",
+            "no-retry",
+            "pass-then-fail",
+            "pass-then-error",
+            "pass-then-pass",
+            "duplicate-attempt",
+            "file-order",
+            "host-inapplicable-then-fail",
+            "host-inapplicable-row",
             "unconfirmed",
             "conflict",
             "evidence",
+            "evidence-elsewhere",
         ] {
             let fixture = std::env::temp_dir().join(format!(
                 "hermit-harness-import-{}-{:?}-{scenario}",
@@ -3931,7 +3961,8 @@ report.write_bytes((root/'verification.json').read_bytes())
 
             // The rows a Buck run would have left: each cell ran in its own
             // harness process with its own run id; custom@kvm failed its first
-            // execution and passed its Tpx retry.
+            // execution and passed its Tpx retry. Every execution recorded
+            // complete evidence unless the scenario withholds it.
             let manifests = ManifestSet::load(path).unwrap();
             let selection = parse(
                 ["--category", "imported", "--ci-only"]
@@ -3942,18 +3973,29 @@ report.write_bytes((root/'verification.json').read_bytes())
             assert_eq!(cells.len(), 3, "verify@ptrace, verify@kvm, custom@kvm");
             let producer = RunContext::for_import(root.clone(), Some(SHA)).unwrap();
             let mut rows = Vec::new();
+            let mut evidence = Vec::new();
             for (index, cell) in cells.iter().enumerate() {
                 let ptrace = cell.id.backend.as_deref() == Some("ptrace");
                 let verify_kvm = cell.id.mode == "verify" && !ptrace;
                 if verify_kvm && matches!(scenario, "missing" | "unconfirmed") {
                     continue;
                 }
-                let attempts: &[&str] = match (cell.id.mode.as_str(), scenario) {
-                    ("custom", "untrusted-retry") => &["ERROR", "PASS"],
-                    ("custom", _) => &["FAIL", "PASS"],
-                    _ => &["PASS"],
+                // (attempt, outcome), in file order.
+                let attempts: &[(u64, &str)] = match (cell.id.mode.as_str(), scenario) {
+                    ("custom", "untrusted-retry") => &[(1, "ERROR"), (2, "PASS")],
+                    ("custom", "pass-then-fail") => &[(1, "PASS"), (2, "FAIL")],
+                    ("custom", "pass-then-error") => &[(1, "PASS"), (2, "ERROR")],
+                    ("custom", "pass-then-pass") => &[(1, "PASS"), (2, "PASS")],
+                    ("custom", "duplicate-attempt") => &[(1, "PASS"), (1, "FAIL")],
+                    ("custom", "file-order") => &[(2, "FAIL"), (1, "PASS")],
+                    ("custom", "host-inapplicable-then-fail") => {
+                        &[(1, "HOST-INAPPLICABLE"), (2, "FAIL")]
+                    }
+                    ("custom", _) => &[(1, "FAIL"), (2, "PASS")],
+                    (_, "host-inapplicable-row") if verify_kvm => &[(1, "HOST-INAPPLICABLE")],
+                    _ => &[(1, "PASS")],
                 };
-                for (number, outcome) in attempts.iter().enumerate() {
+                for (number, &(attempt, outcome)) in attempts.iter().enumerate() {
                     let mut producer = producer.clone();
                     if ptrace && scenario == "stale" {
                         producer.source_sha = STALE.into();
@@ -3962,7 +4004,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                         &producer,
                         cell,
                         format!("buck-producer-{index}-{number}"),
-                        number as u64 + 1,
+                        attempt,
                         outcome,
                     );
                     // A binary stamped with this commit's short sha is this
@@ -3983,6 +4025,15 @@ report.write_bytes((root/'verification.json').read_bytes())
                             _ => {}
                         }
                     }
+                    let withheld = match scenario {
+                        "evidence" => verify_kvm,
+                        // Only custom@kvm's failed first execution has it.
+                        "evidence-elsewhere" => cell.id.mode == "custom" && outcome == "PASS",
+                        _ => false,
+                    };
+                    if !withheld {
+                        evidence.push(import_execution(&row));
+                    }
                     rows.push(serde_json::to_string(&row).unwrap());
                 }
             }
@@ -4001,23 +4052,18 @@ report.write_bytes((root/'verification.json').read_bytes())
                 cell
             })
             .collect::<Vec<_>>();
-            let evidence_complete_cells =
-                [("verify", "ptrace"), ("verify", "kvm"), ("custom", "kvm")]
-                    .into_iter()
-                    .filter(|cell| !(scenario == "evidence" && *cell == ("verify", "kvm")))
-                    .map(|(mode, backend)| import_summary_cell(mode, backend))
-                    .collect::<Vec<_>>();
             fs::write(
                 bucket.join("summary.json"),
                 serde_json::to_vec(&json!({
                     "host_inapplicable_cells": host_inapplicable_cells,
-                    "evidence_complete_cells": evidence_complete_cells,
+                    "evidence_complete_executions": evidence,
                 }))
                 .unwrap(),
             )
             .unwrap();
 
-            let result = Command::new("timeout")
+            let mut command = Command::new("timeout");
+            command
                 .args(["--kill-after=2s", "30s"])
                 .arg(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
@@ -4033,9 +4079,11 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .env("E2E_RUN_ID", "import-consumer")
                 .env("E2E_MACHINE_SHORTNAME", "import-control")
                 .env("E2E_KERNEL_VERSION", "import-control")
-                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
-                .output()
-                .unwrap();
+                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"));
+            if scenario == "no-retry" {
+                command.env(NO_RETRY, "1");
+            }
+            let result = command.output().unwrap();
             let context = format!(
                 "{scenario}: {}\n{}",
                 String::from_utf8_lossy(&result.stdout),
@@ -4081,6 +4129,17 @@ report.write_bytes((root/'verification.json').read_bytes())
                     Some(("verify", Some("ptrace"), Some("import-stale")))
                 }
                 "untrusted-retry" => Some(("custom", Some("kvm"), Some("infrastructure"))),
+                // Its FAIL is the verdict, and a FAIL is not an ERROR.
+                "no-retry" => None,
+                "pass-then-fail"
+                | "pass-then-error"
+                | "pass-then-pass"
+                | "duplicate-attempt"
+                | "file-order"
+                | "host-inapplicable-then-fail" => {
+                    Some(("custom", Some("kvm"), Some("import-history")))
+                }
+                "host-inapplicable-row" => Some(("verify", Some("kvm"), Some("import-history"))),
                 "unconfirmed" => Some((
                     "verify",
                     Some("kvm"),
@@ -4088,6 +4147,9 @@ report.write_bytes((root/'verification.json').read_bytes())
                 )),
                 "conflict" => Some(("verify", Some("ptrace"), Some("import-conflict"))),
                 "evidence" => Some(("verify", Some("kvm"), Some("import-evidence-incomplete"))),
+                "evidence-elsewhere" => {
+                    Some(("custom", Some("kvm"), Some("import-evidence-incomplete")))
+                }
                 _ => unreachable!(),
             };
             assert_eq!(errors, Vec::from_iter(expected_error), "{context}");
@@ -4096,6 +4158,30 @@ report.write_bytes((root/'verification.json').read_bytes())
                 u64::from(expected_error.is_some()),
                 "{context}"
             );
+            // Each history no producer writes is refused for its own reason.
+            let history_reason = match scenario {
+                "pass-then-fail" | "pass-then-error" | "pass-then-pass" => {
+                    Some("attempt 2 follows terminal outcome PASS")
+                }
+                "duplicate-attempt" => {
+                    Some("attempt 1 does not follow the preceding attempts; expected 2")
+                }
+                "file-order" => {
+                    Some("attempt 2 does not follow the preceding attempts; expected 1")
+                }
+                "host-inapplicable-then-fail" | "host-inapplicable-row" => {
+                    Some("imported attempt 1 is a HOST-INAPPLICABLE row")
+                }
+                _ => None,
+            };
+            if let Some(expected) = history_reason {
+                let reason = published
+                    .iter()
+                    .find(|row| row.error_kind.as_deref() == Some("import-history"))
+                    .and_then(|row| row.reason.as_deref())
+                    .unwrap_or_default();
+                assert!(reason.contains(expected), "{reason}\n{context}");
+            }
             assert_eq!(
                 summary["imported"]["missing_cells"],
                 u64::from(scenario == "missing"),
@@ -4103,16 +4189,28 @@ report.write_bytes((root/'verification.json').read_bytes())
             );
             assert_eq!(
                 summary["imported"]["dropped_retries"],
-                u64::from(scenario == "untrusted-retry"),
+                u64::from(matches!(scenario, "untrusted-retry" | "no-retry")),
                 "{context}"
             );
-            if scenario == "untrusted-retry" {
+            match scenario {
                 // The producer's retry after an infrastructure ERROR is not
                 // one this run would have made: the ERROR is the verdict.
-                assert_eq!(custom, vec![(1, "ERROR")], "{context}");
-            } else {
+                // Under --no-retry, no retry is: the first FAIL is.
+                "untrusted-retry" => assert_eq!(custom, vec![(1, "ERROR")], "{context}"),
+                "no-retry" => {
+                    assert_eq!(custom, vec![(1, "FAIL")], "{context}");
+                    assert_eq!(summary["failed"], 1, "{context}");
+                }
+                // One import ERROR replaces custom@kvm's rows.
+                "pass-then-fail"
+                | "pass-then-error"
+                | "pass-then-pass"
+                | "duplicate-attempt"
+                | "file-order"
+                | "host-inapplicable-then-fail"
+                | "evidence-elsewhere" => assert_eq!(custom, vec![(1, "ERROR")], "{context}"),
                 // Both custom@kvm attempts are published, in order.
-                assert_eq!(custom, vec![(1, "FAIL"), (2, "PASS")], "{context}");
+                _ => assert_eq!(custom, vec![(1, "FAIL"), (2, "PASS")], "{context}"),
             }
             if scenario == "complete" {
                 assert_eq!(published.len(), 4, "{context}");
@@ -4167,21 +4265,21 @@ report.write_bytes((root/'verification.json').read_bytes())
         let import = fixture.join("import");
         let bucket = bucket_dir(&import, "portable", "imported");
         fs::create_dir_all(&bucket).unwrap();
-        let rows = cells
+        let (rows, evidence): (Vec<_>, Vec<_>) = cells
             .iter()
             .enumerate()
             .filter(|(_, cell)| cell.id.backend.as_deref() == Some("ptrace"))
             .map(|(index, cell)| {
-                serde_json::to_string(&import_producer_row(
+                let row = import_producer_row(
                     &context,
                     cell,
                     format!("buck-producer-{index}"),
                     1,
                     "PASS",
-                ))
-                .unwrap()
+                );
+                (serde_json::to_string(&row).unwrap(), import_execution(&row))
             })
-            .collect::<Vec<_>>();
+            .unzip();
         fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
         let claims = [("verify", "kvm"), ("custom", "kvm")]
             .into_iter()
@@ -4195,7 +4293,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             bucket.join("summary.json"),
             serde_json::to_vec(&json!({
                 "host_inapplicable_cells": claims,
-                "evidence_complete_cells": [import_summary_cell("verify", "ptrace")],
+                "evidence_complete_executions": evidence,
             }))
             .unwrap(),
         )
@@ -4257,6 +4355,89 @@ report.write_bytes((root/'verification.json').read_bytes())
             ])
         );
         assert_eq!(imported.missing, 0);
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// An imported row records whether this checkout is dirty, as an executed
+    /// row does: clean producer rows do not make a dirty checkout's run look
+    /// clean. (`run` takes `--source-sha` in the fixture above, which counts as
+    /// clean, so this drives `imported_results::load` directly.)
+    #[test]
+    fn import_mode_marks_the_rows_of_a_dirty_checkout_dirty() {
+        use std::path::PathBuf;
+
+        use hermit_manifest_plan::imported_results;
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::RunContext;
+        use serde_json::json;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-import-dirty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        write_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let selection = parse(
+            ["--category", "imported", "--ci-only"]
+                .into_iter()
+                .map(String::from),
+        );
+        let cells = run_cells(&manifests, &selection).unwrap();
+        let clean = RunContext::for_import(root, Some(SHA)).unwrap();
+        let import = fixture.join("import");
+        let bucket = bucket_dir(&import, "portable", "imported");
+        fs::create_dir_all(&bucket).unwrap();
+        let (rows, evidence): (Vec<_>, Vec<_>) = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let row =
+                    import_producer_row(&clean, cell, format!("buck-producer-{index}"), 1, "PASS");
+                (serde_json::to_string(&row).unwrap(), import_execution(&row))
+            })
+            .unzip();
+        fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+        fs::write(
+            bucket.join("summary.json"),
+            serde_json::to_vec(&json!({"evidence_complete_executions": evidence})).unwrap(),
+        )
+        .unwrap();
+        let earns_retry = |_: &SelectedCell, _: &CellResult| false;
+        let host_inapplicable = |_: &SelectedCell| None::<String>;
+        let policy = imported_results::ImportPolicy {
+            earns_retry: &earns_retry,
+            host_inapplicable: &host_inapplicable,
+        };
+        for dirty in [false, true] {
+            let mut context = clean.clone();
+            context.source_dirty = dirty;
+            let imported = imported_results::load(
+                &import,
+                &cells,
+                &context,
+                &fixture.join("out/results.jsonl"),
+                &policy,
+            )
+            .unwrap();
+            let published = imported
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.rows)
+                .map(|row| (row.outcome.as_str(), row.source_tree_dirty))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                published,
+                vec![("PASS", dirty); 3],
+                "dirty checkout: {dirty}"
+            );
+        }
         fs::remove_dir_all(&fixture).unwrap();
     }
 
