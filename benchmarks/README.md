@@ -120,10 +120,16 @@ The guest is `fixtures/getpid_loop.c`, which makes exactly N raw `getpid`
 calls and prints `calls=N`. Hermit virtualizes the guest's clocks, so the
 harness times each whole run from outside. For each variant it takes the
 median wall time at several N (default 0, 25,000, 50,000 and 100,000) and fits
-a least-squares line through those medians. The slope is the cost of one call;
-the intercept is the fixed cost of a run, including Hermit start-up and any
-wrapper. The `extra us/call` column is a backend's slope minus the native
-slope.
+a least-squares line through the medians at positive N. The slope is the cost
+of one call; the intercept is the fixed cost of a run, including Hermit
+start-up and any wrapper. The `extra us/call` column is a backend's slope
+minus the native slope. A run with N = 0 never reaches the fixture's `getpid`
+site, so it also skips that site's one-time cost: LiteInst traps and patches
+the site at its first call, and every sample is a fresh process, so warmups
+cannot remove that step. Fitting the zero-call median would add part of the
+step to the slope (half of it at `--counts 0,2`), so the harness reports it
+but leaves it out of the fit, and `--counts` needs at least two positive
+values.
 
 Build Hermit and stage the LiteInst runtime beside it first (the top-level
 `README.md` describes the staging script), then run from the repository root:
@@ -134,7 +140,7 @@ Build Hermit and stage the LiteInst runtime beside it first (the top-level
   "$PWD/target/liteinst-runtime-build"
 cargo build --locked --release -p hermit --features liteinst --bin hermit
 ./benchmarks/getpid_cost.rs
-./benchmarks/getpid_cost.rs --backends ptrace --counts 0,100000 --iterations 3
+./benchmarks/getpid_cost.rs --backends ptrace --counts 50000,100000 --iterations 3
 ./benchmarks/getpid_cost.rs --hermit "/path/to/wrapper target/release/hermit"
 ```
 
@@ -165,9 +171,9 @@ writes them to the JSON as `dispatch_paths`, and refuses the LiteInst result
 the same way unless that difference is at least N - 1, the one allowance being
 a first call that traps before its site is patched. Below that floor the
 fixture's `getpid` site was not patched, so the LiteInst slope would be the
-cost of a trap, not of a hooked call. A largest N below 2 owes the hook no call
-at all, so it cannot show one and is refused the same way. Two limits apply to
-those counts:
+cost of a trap, not of a hooked call. A largest N below 2 would owe the hook
+no call at all; two positive counts rule it out, and the check refuses it
+anyway. Two limits apply to those counts:
 
 - A call at a site that never had a patch attempt is in no path counter.
   LiteInst never attempts the task-creating calls (`clone`, `clone3`, `fork`,
