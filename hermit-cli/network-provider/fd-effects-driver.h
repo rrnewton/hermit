@@ -110,7 +110,13 @@ int ap_prepare_original_sendto(struct ap_session *s,int pidfd,u64 call,u64 mm,
         .expected_option=flags,.original_count=count};
     int rc=stream_copy_observer_ready(s);
     const char *stage="stream-copy";
-    if(!rc) {stage="selected-file";rc=fd_accept_observer_ready(s);}
+    /* Startup still requires clean global counters. After attachment the
+     * shared fdget/tcp_sendmsg/lock/release observer may have historical misses
+     * from unrelated tasks. As in selection/collection, bind its exact live
+     * link shape here; only this original Call's complete TX phases, accepted
+     * bytes, protocol return and syscall return can authorize completion.
+     * Stream-copy/fault readiness above remains strict. */
+    if(!rc) {stage="selected-file";rc=fd_accept_observer_ready_runtime(s);}
     if(!rc) {stage="submit";rc=submit(s,pidfd,&c);}
     if(rc) {
         int saved=errno;

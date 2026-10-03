@@ -65,6 +65,10 @@ static struct ap_stream_fault_state dm_fault;
 static unsigned dm_fault_reads;
 static bool dm_unstable,dm_info_short,dm_info_error;
 static unsigned dm_global_id_queries;
+static bool dm_tx_maps;
+static struct ap_task_command dm_tx_task;
+static struct ap_command_result dm_tx_result;
+static unsigned dm_tx_updates;
 
 /* Explicit metadata inventory transcribed from the active Ftrace object:
  * 38 fentry/fexit + 3 tp_btf + 8 multi/session programs. Names are fixture
@@ -380,6 +384,18 @@ int bpf_link__destroy(struct bpf_link *l) {
     return 0;
 }
 int bpf_map_update_elem(int fd,const void *key,const void *value,unsigned long long flags) {
+    if(dm_tx_maps && fd==1004) {
+        assert(*(const u32 *)key==1 && flags==BPF_EXIST);
+        const struct ap_command_result *r=value;
+        assert(r->command==1 && r->operation==AP_ORIGINAL_SENDTO_CALL && r->phase==AP_COMMAND_READY);
+        dm_tx_result=*r;dm_tx_updates++;return 0;
+    }
+    if(dm_tx_maps && fd==1008) {
+        assert(*(const int *)key==DF_PIDFD && flags==BPF_EXIST);
+        const struct ap_task_command *c=value;
+        assert(c->provider==DF_PROVIDER && c->command==1 && c->operation==AP_ORIGINAL_SENDTO_CALL);
+        dm_tx_task=*c;dm_tx_updates++;return 0;
+    }
     assert(fd==1000 && *(const u32 *)key==0 && flags==BPF_ANY);
     const struct ap_config *c=value;assert(c->provider==DF_PROVIDER);
     df_updates++;
@@ -392,6 +408,12 @@ int bpf_map_update_elem(int fd,const void *key,const void *value,unsigned long l
     df_config=*c;return 0;
 }
 int bpf_map_lookup_elem(int fd,const void *key,void *out) {
+    if(dm_tx_maps && fd==1008) {
+        assert(*(const int *)key==DF_PIDFD);memcpy(out,&dm_tx_task,sizeof(dm_tx_task));return 0;
+    }
+    if(dm_tx_maps && fd==1004) {
+        assert(*(const u32 *)key==1);memcpy(out,&dm_tx_result,sizeof(dm_tx_result));return 0;
+    }
     if(fd==1023) {
         assert(*(const u32 *)key==1);
         memcpy(out,&dm_fault,sizeof(dm_fault));dm_fault_reads++;
@@ -489,6 +511,9 @@ static void df_reset(enum df_fault fault,unsigned at) {
     assert(!df_session_alive && !df_object.open && !df_ring.alive && !df_btf.alive && !df_file.alive && !df_owner_alive);
     assert(!df_terminal);df_terminal_unloads=0;
     df_fault=fault;df_bad_at=at;df_destroy_failure=-1;
+    dm_tx_maps=false;dm_tx_updates=0;
+    dm_tx_task=(struct ap_task_command){.provider=DF_PROVIDER};
+    dm_tx_result=(struct ap_command_result){0};
     df_attached=df_attach_calls=df_unloads=df_destroyed=df_map_closes=0;
     df_program_closes=df_object_closes=df_ring_closes=df_updates=df_lookups=0;
     df_file_opens=df_file_closes=df_image_opens=df_page_queries=df_btf_queries=0;
@@ -686,8 +711,8 @@ static void df_export_inventory(void) {
 /* Exercise actual Sendto preparation before submit, using the existing full
  * driver/load model. Each fresh-query refusal retains the original errno and
  * leaves every pending slot, command counter and kernel-shaped map untouched.
- * These host premises identify the reachable native diagnostic branches; they
- * do not identify which one failed in a particular kernel run. */
+ * Shared historical counters are now exercised through actual submit as well;
+ * they never grant selection or completion. No native execution is claimed. */
 static void df_sendto_readiness(void) {
     static const struct {const char *program;enum df_fault fault;} cases[]={
         {"fd_original_read_entered",DF_PROGRAM_MISS},
@@ -699,10 +724,14 @@ static void df_sendto_readiness(void) {
         {"fd_si",DF_LINK_MISS},
         {"fd_s20e",DF_PROGRAM_MISS},
         {"fd_s20x",DF_LINK_MISS},
+        {"fd_s20x",DF_PROGRAM_MISS},
+        {"fd_s20e",DF_LINK_MISS},
         {"fd_s20e",DF_ADDRESS},
         {"fd_s20x",DF_SHORT_INFO}
     };
     const struct ap_pending_command empty={0};
+    for(unsigned i=7;i<=10;i++)
+        df_refusal(cases[i].fault,df_index(cases[i].program),ENODATA);
     for(unsigned i=0;i<DF_COUNT(cases);i++) {
         df_reset(DF_OK,0);struct ap_session *s=NULL;
         assert(!ap_open("fixture-object-only",DF_PROVIDER,&s) && s->ready);
@@ -710,18 +739,31 @@ static void df_sendto_readiness(void) {
         const u64 next=s->next_command;const unsigned updates=df_updates;
         df_bad_at=df_index(cases[i].program);df_fault=cases[i].fault;
         u64 command=UINT64_C(0xfeedface);errno=0;
-        assert(ap_prepare_original_sendto(s,DF_PIDFD,395,1,5,0x5555555b1ca0,79,0x4000,&command)==-1);
-        assert(errno==ENODATA && command==UINT64_C(0xfeedface));
-        assert(s->next_command==next && df_updates==updates);
-        for(unsigned slot=0;slot<AP_COMMANDS;slot++)
-            assert(!memcmp(&s->pending[slot],&empty,sizeof(empty)));
-        /* Distinguish the preexisting policies without changing either one.
-         * Shared global counters are not task-scoped completion evidence. */
-        if(i==7 || i==8) {
+        if(i>=7 && i<=10) {
             assert(fd_accept_observer_ready(s)==-1 && errno==ENODATA);
             assert(!fd_accept_observer_ready_runtime(s));
+            dm_tx_maps=true;
+            assert(!ap_prepare_original_sendto(s,DF_PIDFD,395,1,5,0x5555555b1ca0,79,0x4000,&command));
+            assert(command==1 && s->next_command==next+1 && dm_tx_updates==2 && df_updates==updates);
+            const struct ap_task_command expected={.provider=DF_PROVIDER,.command=1,.operation=AP_ORIGINAL_SENDTO_CALL,
+                .expected_object=395,.generation_before=0x5555555b1ca0,.generation_after=1,
+                .expected_level=5,.expected_option=0x4000,.original_count=79};
+            assert(!memcmp(&dm_tx_task,&expected,sizeof(expected)));
+            assert(s->pending[1].state==AP_SLOT_ACTIVE && !s->pending[1].original_selected &&
+                !s->pending[1].original_collected && !s->pending[1].stream_tx.committed);
+            struct ap_original_selection selected={0};
+            assert(ap_read_original_selection(s,DF_PIDFD,command,&selected)==-1 && errno==ENODATA);
+            assert(dm_tx_result.phase==AP_COMMAND_READY && !s->pending[1].original_selected);
+            for(unsigned slot=0;slot<AP_COMMANDS;slot++)if(slot!=1)
+                assert(!memcmp(&s->pending[slot],&empty,sizeof(empty)));
+        } else {
+            assert(ap_prepare_original_sendto(s,DF_PIDFD,395,1,5,0x5555555b1ca0,79,0x4000,&command)==-1);
+            assert(errno==ENODATA && command==UINT64_C(0xfeedface));
+            assert(s->next_command==next && df_updates==updates && !dm_tx_updates);
+            for(unsigned slot=0;slot<AP_COMMANDS;slot++)
+                assert(!memcmp(&s->pending[slot],&empty,sizeof(empty)));
         }
-        if(i>=9)assert(fd_accept_observer_ready_runtime(s)==-1 && errno==ENODATA);
+        if(i>=11)assert(fd_accept_observer_ready_runtime(s)==-1 && errno==ENODATA);
         df_fault=DF_OK;
         assert(!stream_copy_observer_ready(s) && !fd_accept_observer_ready(s));
         /* Preparation released its serialization flag even on refusal. */
