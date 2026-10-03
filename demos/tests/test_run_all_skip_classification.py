@@ -12,11 +12,19 @@ status 3 itself.
 Because the SKIPPED line is read from the demo's log, a log directory, log, or
 summary that cannot be created, written, or read makes the sweep exit 4. An
 unread log must never let a skip count as a pass.
+
+Demos 5 and 6 also exit 0 after a run that only saved itself as their
+reference run and compared nothing; their last result line then says FIRST RUN
+SAVED. The sweep records such a demo as UNCOMPARED, exits 3 as for a skip, and
+never reports it as passed. It also sets QEMU_BOOT_REPEAT=1 and
+QEMU_RESUME_REPEAT=1, so that a demo with no reference run runs a second time
+and compares.
 """
 
 import collections
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -87,6 +95,91 @@ rm -f -- "$summary"
 mkdir -- "$summary" || exit 99
 echo "=== Demo 3: Chaos Concurrency Testing: SUCCESS ==="
 exit 0
+"""
+
+# Saves its run as the reference run and stops, so it compared nothing. Demo 5
+# prints these lines when it has no reference run and QEMU_BOOT_REPEAT=0.
+FIRST_RUN_ONLY_DEMO = """#!/usr/bin/env bash
+echo
+echo "=== Automatic repeat verification ==="
+echo "Saved this run as the reference run at ignored/qemu-linux/boot-anchor"
+echo
+echo "=== Demo 5: QEMU Linux Snapshot: FIRST RUN SAVED ==="
+exit 0
+"""
+
+# The same, after guest serial output that holds a NUL byte. grep takes such a
+# log for binary and, without -a, prints none of its matching lines.
+FIRST_RUN_ONLY_DEMO_WITH_BINARY_OUTPUT = """#!/usr/bin/env bash
+printf 'serial: \\000\\001\\n'
+echo "=== Demo 5: QEMU Linux Snapshot: FIRST RUN SAVED ==="
+exit 0
+"""
+
+# Saves its run as the reference run, runs again, and compares the second run
+# with it, as demo 5 does by default when it has no reference run.
+FIRST_RUN_THEN_COMPARED_DEMO = """#!/usr/bin/env bash
+echo
+echo "=== Automatic repeat verification ==="
+echo "Saved this run as the reference run at ignored/qemu-linux/boot-anchor"
+echo
+echo "=== Demo 5: QEMU Linux Snapshot: FIRST RUN SAVED ==="
+echo
+echo "=== Boot again and compare with the reference run just saved ==="
+echo "Comparing with the reference run."
+echo
+echo "=== Demo 5: QEMU Linux Snapshot: SUCCESS ==="
+exit 0
+"""
+
+# Chooses by the make target: demo 5 saves its first run and compares nothing,
+# demo 6 saves its first run and then compares, demo 8 skips, demo 3 fails,
+# and any other demo passes.
+MIXED_DEMOS_WITH_FIRST_RUNS = """#!/usr/bin/env bash
+case "${@: -1}" in
+  demo5)
+    echo "=== Demo 5: QEMU Linux Snapshot: FIRST RUN SAVED ==="
+    exit 0
+    ;;
+  demo6)
+    echo "=== Demo 6: QEMU Snapshot Resume: FIRST RUN SAVED ==="
+    echo "=== Demo 6: QEMU Snapshot Resume: SUCCESS ==="
+    exit 0
+    ;;
+  demo8)
+    echo "=== Demo 8: SKIPPED -- missing asset: /nonexistent/btrfs-convert ==="
+    exit 0
+    ;;
+  demo3)
+    echo "=== Demo 3: Chaos Concurrency Testing: FAILURE (exit 1) -- see errors above ==="
+    exit 1
+    ;;
+esac
+echo "=== Demo 1: Deterministic Execution: SUCCESS ==="
+exit 0
+"""
+
+# Prints the repeat variables it was started with, then passes.
+DEMO_THAT_PRINTS_ITS_REPEAT_VARIABLES = """#!/usr/bin/env bash
+echo "QEMU_BOOT_REPEAT=${QEMU_BOOT_REPEAT-unset}"
+echo "QEMU_RESUME_REPEAT=${QEMU_RESUME_REPEAT-unset}"
+echo "=== Demo 5: QEMU Linux Snapshot: SUCCESS ==="
+exit 0
+"""
+
+# Stands in for grep on PATH. It fails as grep does when it cannot read a file,
+# but only when searching for result lines (the pattern names FIRST RUN SAVED);
+# every other call goes to the real grep, whose path replaces REAL_GREP.
+GREP_THAT_CANNOT_READ_RESULT_LINES = """#!/usr/bin/env bash
+for argument in "$@"; do
+  case "$argument" in
+    *"FIRST RUN SAVED"*)
+      echo "grep: simulated read error" >&2
+      exit 2
+      ;;
+  esac
+done
+exec REAL_GREP "$@"
 """
 
 Sweep = collections.namedtuple("Sweep", "result summary calls")
@@ -325,6 +418,148 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertEqual(self._statuses(sweep.summary), ["PASS"])
         self.assertIn("could not write the GitHub step summary", sweep.result.stdout)
         self.assertNotIn("Demo suite: SUCCESS", sweep.result.stdout)
+
+    def test_a_demo_that_only_saved_its_first_run_is_not_a_pass(self):
+        sweep = self._run(FIRST_RUN_ONLY_DEMO, target="demo5")
+        self.assertEqual(sweep.calls, ["demo5"])
+        self.assertIsNotNone(sweep.summary, sweep.result.stdout)
+        self.assertEqual(self._statuses(sweep.summary), ["UNCOMPARED"])
+        # It compared nothing, so the sweep is incomplete and exits 3, as it
+        # does for a skip.
+        self.assertEqual(sweep.result.returncode, 3, sweep.result.stdout)
+        self.assertIn(
+            "Demo suite: INCOMPLETE — 0 of 1 requested demos passed, "
+            "0 skipped and unmeasured, 1 saved a first run and compared nothing ===",
+            sweep.result.stdout,
+        )
+        self.assertIn(
+            "Saved a first run and compared nothing: demo5\n", sweep.result.stdout
+        )
+        self.assertNeverAPassOrSuccess(sweep)
+
+    def test_a_first_run_after_binary_output_is_still_found(self):
+        sweep = self._run(FIRST_RUN_ONLY_DEMO_WITH_BINARY_OUTPUT, target="demo5")
+        self.assertIsNotNone(sweep.summary, sweep.result.stdout)
+        self.assertEqual(self._statuses(sweep.summary), ["UNCOMPARED"])
+        self.assertEqual(sweep.result.returncode, 3, sweep.result.stdout)
+        self.assertNeverAPassOrSuccess(sweep)
+
+    def test_a_first_run_followed_by_a_comparison_is_a_pass(self):
+        """Positive control: only the last result line counts."""
+        result, summary = self._sweep(FIRST_RUN_THEN_COMPARED_DEMO, target="demo5")
+        self.assertEqual(self._statuses(summary), ["PASS"])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Demo suite: SUCCESS — all 1 requested demos passed", result.stdout)
+        self.assertNotIn("INCOMPLETE", result.stdout)
+
+    def test_skips_and_first_runs_are_counted_and_named(self):
+        result, summary = self._sweep(
+            MIXED_DEMOS_WITH_FIRST_RUNS, target="demo1 demo5 demo6 demo8"
+        )
+        self.assertEqual(
+            self._statuses(summary), ["PASS", "UNCOMPARED", "PASS", "SKIP"]
+        )
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn(
+            "Demo suite: INCOMPLETE — 2 of 4 requested demos passed, "
+            "1 skipped and unmeasured, 1 saved a first run and compared nothing ===",
+            result.stdout,
+        )
+        self.assertIn("Skipped, with no result: demo8\n", result.stdout)
+        self.assertIn("Saved a first run and compared nothing: demo5\n", result.stdout)
+        self.assertNotIn("Demo suite: SUCCESS", result.stdout)
+
+    def test_a_failure_still_outranks_a_first_run(self):
+        result, summary = self._sweep(
+            MIXED_DEMOS_WITH_FIRST_RUNS, target="demo3 demo5"
+        )
+        self.assertEqual(self._statuses(summary), ["FAIL", "UNCOMPARED"])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "Demo suite: FAILURE — 1 demo(s) failed, 0 passed, 0 skipped, "
+            "1 saved a first run and compared nothing ===",
+            result.stdout,
+        )
+        self.assertIn("Saved a first run and compared nothing: demo5\n", result.stdout)
+
+    def _put_grep_that_cannot_read_result_lines_on_path(self, scratch, environment):
+        real_grep = shutil.which("grep", path=environment["PATH"])
+        self.assertIsNotNone(real_grep, "no grep on PATH")
+        bin_dir = scratch / "bin"
+        bin_dir.mkdir()
+        fake_grep = bin_dir / "grep"
+        fake_grep.write_text(
+            GREP_THAT_CANNOT_READ_RESULT_LINES.replace(
+                "REAL_GREP", shlex.quote(real_grep)
+            )
+        )
+        fake_grep.chmod(0o755)
+        environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
+
+    def test_a_log_whose_result_lines_cannot_be_read_is_an_error(self):
+        sweep = self._run(
+            FIRST_RUN_ONLY_DEMO,
+            target="demo5",
+            prepare=self._put_grep_that_cannot_read_result_lines_on_path,
+        )
+        self.assertEqual(sweep.calls, ["demo5"])
+        self.assertEqual(sweep.result.returncode, 4, sweep.result.stdout)
+        self.assertEqual(self._statuses(sweep.summary), ["ERROR"])
+        self.assertIn("grep could not read the log", sweep.result.stdout)
+        self.assertIn(
+            "Unknown, because the log could not be read: demo5\n",
+            sweep.result.stdout,
+        )
+        self.assertNeverAPassOrSuccess(sweep)
+        self.assertNotIn("INCOMPLETE", sweep.result.stdout)
+
+    def test_the_failing_grep_leaves_the_skipped_search_alone(self):
+        """Positive control for the test above: the stand-in grep fails only
+        the search for result lines. The search for a SKIPPED line still
+        works, so the error in that test comes from the later search."""
+        sweep = self._run(
+            SKIPPING_DEMO, prepare=self._put_grep_that_cannot_read_result_lines_on_path
+        )
+        self.assertEqual(sweep.result.returncode, 3, sweep.result.stdout)
+        self.assertEqual(self._statuses(sweep.summary), ["SKIP"])
+
+    def test_demos_are_always_asked_to_compare_a_first_run(self):
+        def caller_turned_the_repeat_off(scratch, environment):
+            environment["QEMU_BOOT_REPEAT"] = "0"
+            environment["QEMU_RESUME_REPEAT"] = "0"
+
+        sweep = self._run(
+            DEMO_THAT_PRINTS_ITS_REPEAT_VARIABLES,
+            target="demo5",
+            prepare=caller_turned_the_repeat_off,
+        )
+        self.assertIn("\nQEMU_BOOT_REPEAT=1\n", sweep.result.stdout)
+        self.assertIn("\nQEMU_RESUME_REPEAT=1\n", sweep.result.stdout)
+        self.assertEqual(sweep.result.returncode, 0, sweep.result.stdout)
+
+    def test_the_usage_documents_a_demo_that_compared_nothing(self):
+        result = subprocess.run(
+            [str(RUN_ALL), "--help"],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "\n  3  no selected demo failed, but at least one was skipped\n"
+            "     or saved its first run and compared nothing\n",
+            result.stdout,
+        )
+        prose = " ".join(result.stdout.split())
+        for phrase in (
+            "sets QEMU_BOOT_REPEAT=1 and QEMU_RESUME_REPEAT=1",
+            "A demo whose last result line still says FIRST RUN SAVED compared "
+            "nothing and is recorded as UNCOMPARED.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prose)
 
     def test_the_usage_documents_the_exit_statuses(self):
         result = subprocess.run(
