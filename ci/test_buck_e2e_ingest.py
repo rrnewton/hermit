@@ -95,6 +95,37 @@ def write_artifacts(directory, uploaded):
     return sorted(path.name for path in directory.iterdir())
 
 
+def write_test_runs(fake, runs):
+    """Lay out RUNS ({test run id: [execution, ...]}) in directory FAKE as FAKE_TESTX
+    serves them: each run's listing, and each uploaded execution's artifact files."""
+    fake.mkdir()
+    test_id = 0
+    for run_id, executions in runs.items():
+        listed = []
+        for uploaded in executions:
+            test_id += 1
+            address = f"{run_id}.{test_id}.{uploaded['end']}"
+            names = write_artifacts(fake / "art" / address, uploaded) if uploaded["uploaded"] else []
+            name = f"//ci/buck-e2e:cell - {uploaded['cell']}"
+            listed.append(
+                {
+                    "test_details": {"name": name, "id": test_id},
+                    "end_time": uploaded["end"],
+                    "artifacts": [{"name": n} for n in names],
+                }
+            )
+            # Tpx also lists an "unmanaged" twin of every execution.
+            listed.append(
+                {
+                    "test_details": {"name": f"{name} - unmanaged", "id": test_id + 1000},
+                    "end_time": uploaded["end"],
+                    "artifacts": [],
+                }
+            )
+        listing = {"results": {"test_results": listed}}
+        (fake / f"list-{run_id}.json").write_text(json.dumps(listing))
+
+
 Y_PASSES = execution(Y, 150, "PASS", "ry1")
 HOST_INAPPLICABLE_X = {"schema": 1, "host_inapplicable_cells": [claim(X)]}
 
@@ -114,32 +145,7 @@ class IngestTest(unittest.TestCase):
         execution in LOCAL copied into its own buck-out artifacts directory."""
         work = Path(tempfile.mkdtemp(dir=self.root))
         fake = work / "fake"
-        fake.mkdir()
-        test_id = 0
-        for run_id, executions in runs.items():
-            listed = []
-            for uploaded in executions:
-                test_id += 1
-                address = f"{run_id}.{test_id}.{uploaded['end']}"
-                names = write_artifacts(fake / "art" / address, uploaded) if uploaded["uploaded"] else []
-                name = f"//ci/buck-e2e:cell - {uploaded['cell']}"
-                listed.append(
-                    {
-                        "test_details": {"name": name, "id": test_id},
-                        "end_time": uploaded["end"],
-                        "artifacts": [{"name": n} for n in names],
-                    }
-                )
-                # Tpx also lists an "unmanaged" twin of every execution.
-                listed.append(
-                    {
-                        "test_details": {"name": f"{name} - unmanaged", "id": test_id + 1000},
-                        "end_time": uploaded["end"],
-                        "artifacts": [],
-                    }
-                )
-            listing = {"results": {"test_results": listed}}
-            (fake / f"list-{run_id}.json").write_text(json.dumps(listing))
+        write_test_runs(fake, runs)
         command = [
             sys.executable,
             str(INGEST),
