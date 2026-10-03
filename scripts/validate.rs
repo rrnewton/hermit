@@ -14732,7 +14732,9 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         ("e2e.manifest_determinism_stress", 2, 8),
         ("e2e.manifest_determinism_stress_c", 2, 14),
         ("e2e.manifest_language_runtimes", 14, 33),
-        ("e2e.manifest_system_utils", 25, 74),
+        // 74 + 1: https://github.com/rrnewton/hermit/pull/3219 re-selects the
+        // ptrace verify cell of system-utils/procfs-sanitized-paths.
+        ("e2e.manifest_system_utils", 25, 75),
     ];
     let privileged_partial: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_c_programs", 1, 4),
@@ -15035,7 +15037,9 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         ("e2e.manifest_determinism_stress", 2, 8),
         ("e2e.manifest_determinism_stress_c", 2, 14),
         ("e2e.manifest_language_runtimes", 14, 33),
-        ("e2e.manifest_system_utils", 25, 74),
+        // 74 + 1: https://github.com/rrnewton/hermit/pull/3219 re-selects the
+        // ptrace verify cell of system-utils/procfs-sanitized-paths.
+        ("e2e.manifest_system_utils", 25, 75),
     ];
     let full_privileged: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_applications", 1, 1),
@@ -17011,7 +17015,10 @@ mod nextest_timeout_tests {
                 // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
                 + 1
                 // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
-                + 1,
+                + 1
+                // The procfs ptrace verify re-selection of
+                // https://github.com/rrnewton/hermit/pull/3219.
+                + hermit_manifest_plan::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {

@@ -674,7 +674,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_exact_canonical_host_mtimes_are_kept and
     // first_seen_mtime_is_resolved_by_the_first_stat) retain all 874 prior
     // identities: 874 + 2 = 876.
-    ("test.detcore_unit", 876),
+    // Four procfs seed-mount tests (procfs::tests::
+    // ephemeral_host_seed_mount_class_is_precise,
+    // seed_churn_does_not_change_guest_mountinfo_membership,
+    // mounts_format_seed_rows_are_excluded_legitimate_rows_kept and
+    // retained_row_with_seed_parent_still_snapshots;
+    // https://github.com/rrnewton/hermit/pull/3219) retain all 876 prior
+    // identities: 876 + 4 = 880.
+    ("test.detcore_unit", 880),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -862,7 +869,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // The host node carries the identical library/binary selection.
     ("test.detcore_time_on_host", 31),
-    ("test.detcore_unit_on_host", 876),
+    // The host twin selects the same four procfs seed-mount tests
+    // (https://github.com/rrnewton/hermit/pull/3219): 876 + 4 = 880.
+    ("test.detcore_unit_on_host", 880),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4439,7 +4448,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"quick"########,
         job: r########"e2e_verify"########,
         desc: r########"Portable ptrace E2E verification"########,
-        description: r########"In the pinned root, with the shared /proc-locks runtime directory mounted, runs `target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat`: every CI-selected portable-lane E2E cell, on the ptrace backend, in verify mode, except the compat category (358 result manifests in ci/dag/validate.json, across applications, C programs, system utilities and the other portable categories). It is the quick profile's end-to-end determinism coverage, run once from quick.build's tree before a full validation. A guest whose two runs differ in output or scheduler log, or that exits nonzero, records a failing row for that cell and turns the node red. The compat category is left to portablecompat.manifest_compat."########,
+        description: r########"In the pinned root, with the shared /proc-locks runtime directory mounted, runs `target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat`: every CI-selected portable-lane E2E cell, on the ptrace backend, in verify mode, except the compat category (359 result manifests in ci/dag/validate.json, across applications, C programs, system utilities and the other portable categories). It is the quick profile's end-to-end determinism coverage, run once from quick.build's tree before a full validation. A guest whose two runs differ in output or scheduler log, or that exits nonzero, records a failing row for that cell and turns the node red. The compat category is left to portablecompat.manifest_compat."########,
         labels: &[r########"quick"########],
         cmd: r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat'"########,
         cmdtype: CmdType::Unknown,

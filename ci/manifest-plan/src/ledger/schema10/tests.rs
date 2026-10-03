@@ -962,7 +962,11 @@ fn generated_plan_populations_preserve_command_policy() {
     // Three more socket KVM verify selections: https://github.com/rrnewton/reverie/issues/891.
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
     // One epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
-    let total = 900 + compat + select + 6 + 3 + 1 + 1;
+    // https://github.com/rrnewton/hermit/pull/3219 re-selects one portable
+    // ptrace verify cell, system-utils/procfs-sanitized-paths, once the guest
+    // mount table excludes ephemeral host seed mounts.
+    let procfs = crate::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT;
+    let total = 900 + compat + select + 6 + 3 + 1 + 1 + procfs;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1006,7 +1010,8 @@ fn generated_plan_populations_preserve_command_policy() {
     assert_eq!(
         hosted_cells.len(),
         // The new KVM row is also excluded from hosted runs: https://github.com/rrnewton/reverie/issues/905.
-        893 + compat + select + 6 + 3 + 1 + 1 - (241 + 6 + 3 + 1 + 1)
+        // The re-selected procfs cell is a ptrace cell, so hosted runs keep it.
+        893 + compat + select + 6 + 3 + 1 + 1 + procfs - (241 + 6 + 3 + 1 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1055,7 +1060,7 @@ fn generated_plan_populations_preserve_command_policy() {
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
             // This pre-exclusion shape also owns the new KVM row: https://github.com/rrnewton/reverie/issues/905.
-            893 + compat + select + 6 + 3 + 1 + 1,
+            893 + compat + select + 6 + 3 + 1 + 1 + procfs,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
