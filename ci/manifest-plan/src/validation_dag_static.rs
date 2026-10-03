@@ -472,7 +472,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replayer::network::tests::{replay_select_restores_sets_and_exact_timeout,
     // replay_select_restores_only_the_recorded_prefix_before_efault}, which
     // retain all 770 prior identities.
-    ("test.hermit_unit", 777),
+    // https://github.com/rrnewton/hermit/pull/3564 adds
+    // backend_stats::tests::liteinst_report_without_requested_stats_does_not_snapshot
+    // and
+    // backend_stats::tests::liteinst_source_is_rejected_for_another_backend_without_stats
+    // (both need the `liteinst` feature, which `third-party-backends` enables),
+    // which retain all 777 prior identities.
+    ("test.hermit_unit", 779),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -636,7 +642,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511).
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3580 tests.
-    ("test.hermit_unit_on_host", 777),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3564 tests.
+    ("test.hermit_unit_on_host", 779),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
