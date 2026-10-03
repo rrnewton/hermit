@@ -17973,9 +17973,11 @@ mod pressure_sample_tests {
         // empty or truncated selection. It was 100 while the
         // portable-strict-compat-only run type emitted 189 generated pinned-root
         // probes; one host-run manifest bucket replaced them (fold 2 of
-        // https://github.com/rrnewton/hermit/issues/3448), which leaves 72.
+        // https://github.com/rrnewton/hermit/issues/3448), which left 72.
+        // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 deleted
+        // check.backend_parity_suites, one of those 72, which leaves 71.
         assert!(
-            headers.len() >= 72,
+            headers.len() >= 71,
             "{} pinned-root commands",
             headers.len()
         );

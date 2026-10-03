@@ -22,7 +22,7 @@
         "validate_run": "validate-parity-green-e454d6c2819d-1790748383455345665-3717701-f74c6b91",
         "validate_unit": "dagrun-1995593.scope",
         "target": "e454d6c2819d383842b94e7141957b3cd1fc1ef1",
-        "log": "dev-hermit ignored/validate/validate-full-e454d6c2819d-validate-parity-green-e454d6c2819d-1790748383455345665-3717701-f74c6b91.log, the run's durable log (1462 lines), on the same host; its step logs are under dev-hermit ignored/validate/artifacts/validate-parity-green-e454d6c2819d-1790748383455345665-3717701-f74c6b91/safe-ci-dag-runner/. Quoted with the dev-hermit root written as <dev-hermit>.",
+        "log": "dev-hermit ignored/validate/validate-full-e454d6c2819d-validate-parity-green-e454d6c2819d-1790748383455345665-3717701-f74c6b91.log, the run's durable log (1462 lines), on the same host; its step logs are in the DAG runner's step-log subdirectory of dev-hermit ignored/validate/artifacts/validate-parity-green-e454d6c2819d-1790748383455345665-3717701-f74c6b91/. Quoted with the dev-hermit root written as <dev-hermit>.",
         "log_quotes": [
           "line 4: Commit: e454d6c2819d383842b94e7141957b3cd1fc1ef1 (clean tree at admission; commit anchoring finalizes after the run)",
           "line 9: ... (promised unit dagrun-1995593.scope)",
