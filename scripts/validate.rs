@@ -909,9 +909,6 @@ const E2E_RUNNER_ENV: &str = "HERMIT_VALIDATE_E2E_RUNNER";
 const E2E_BUCK2_ENV: &str = "HERMIT_VALIDATE_BUCK2";
 const E2E_RUNNER_CARGO: &str = "cargo";
 const E2E_RUNNERS: [&str; 3] = [E2E_RUNNER_CARGO, "buck-local", "buck-hybrid"];
-/// Where `ci/buck-e2e/stage --from-cargo` (run by `e2e.buck_cells`) builds the
-/// validate-profile hermit a Buck E2E runner's cells execute.
-const BUCK_E2E_STAGED_PAYLOAD: &str = "target/buck-e2e-stage/validate/hermit";
 
 /// The binary every E2E cell of a run executes, as `build.e2e_artifact`
 /// publishes it for each builder.
@@ -935,15 +932,6 @@ fn e2e_payload_identity(release_builder: &str) -> serde_json::Value {
             "overflow_checks": true,
         })
     }
-}
-
-/// [`e2e_payload_identity`], with the path a Buck E2E runner's cells ran.
-fn ledger_e2e_payload(release_builder: &str, e2e_runner: &str) -> serde_json::Value {
-    let mut payload = e2e_payload_identity(release_builder);
-    if e2e_runner != E2E_RUNNER_CARGO {
-        payload["path"] = BUCK_E2E_STAGED_PAYLOAD.into();
-    }
-    payload
 }
 
 /// The identity above is a constant per builder. These checks tie it to the
@@ -6263,20 +6251,22 @@ mod e2e_runner_tests {
         assert!(validate_plan::undeclared_nodes(&buck.cfg).is_empty());
     }
 
+    /// A Buck runner's cells execute the Cargo identity's own binary:
+    /// `ci/buck-e2e/stage --from-cargo` builds the validate profile in the
+    /// checkout's target/ and stages target/validate/hermit. The row therefore
+    /// records the Cargo identity unchanged, and `e2e_runner` says who ran it.
     #[test]
-    fn the_ledger_names_the_runner_and_the_payload_it_ran() {
-        assert_eq!(
-            ledger_e2e_payload(RELEASE_BUILDER_CARGO, E2E_RUNNER_CARGO),
-            e2e_payload_identity(RELEASE_BUILDER_CARGO)
-        );
-        let buck = ledger_e2e_payload(RELEASE_BUILDER_CARGO, "buck-hybrid");
-        assert_eq!(buck["path"], BUCK_E2E_STAGED_PAYLOAD);
-        assert_eq!(buck["profile"], "validate");
+    fn a_buck_runner_stages_the_cargo_payload_identity_it_records() {
+        let cargo = e2e_payload_identity(RELEASE_BUILDER_CARGO);
+        assert_eq!(cargo["path"], "target/validate/hermit");
         let stage = std::fs::read_to_string(test_source_root().join("ci/buck-e2e/stage")).unwrap();
+        assert!(stage.contains("target_dir=$root/target\n"));
+        assert!(stage.contains("--profile validate -p hermit --bin hermit"));
         assert!(stage.contains("install -m 755 \"$target_dir/validate/hermit\""));
         let node =
             std::fs::read_to_string(test_source_root().join("ci/buck-e2e/validate-node")).unwrap();
-        assert!(node.contains("--from-cargo --target-dir target/buck-e2e-stage"));
+        assert!(node.contains("\n\"${proxy[@]}\" ./ci/buck-e2e/stage --from-cargo\n"));
+        assert!(!node.contains("--target-dir"));
         assert!(node.contains("-c hermit_e2e.hermit=staged"));
     }
 }
@@ -20265,8 +20255,8 @@ struct LedgerCtx {
     /// overflow checks, so its row is neither a Cargo cache hit nor a receipt.
     release_builder: &'static str,
     /// `cargo`, `buck-local` or `buck-hybrid`: who ran the E2E cells. A Buck
-    /// runner's cells execute the same validate profile, built by
-    /// `ci/buck-e2e/stage` at [`BUCK_E2E_STAGED_PAYLOAD`].
+    /// runner's cells execute the same validate-profile target/validate/hermit,
+    /// built on the host by `ci/buck-e2e/stage --from-cargo`.
     e2e_runner: &'static str,
     cache_state: String,
     commit: String,
@@ -23723,7 +23713,7 @@ fn write_ledger_with_snapshot(
         "selection_mode": ctx.selection_mode,
         "release_builder": ctx.release_builder,
         "e2e_runner": ctx.e2e_runner,
-        "e2e_payload": ledger_e2e_payload(ctx.release_builder, ctx.e2e_runner),
+        "e2e_payload": e2e_payload_identity(ctx.release_builder),
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
         "tree": ctx.tree,

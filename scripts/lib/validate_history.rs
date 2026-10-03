@@ -293,6 +293,17 @@ fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// A Buck runner's row records the Cargo payload identity, because its cells
+/// run that binary, so the builder alone cannot keep it from answering a cargo
+/// request. `e2e_runner` does: a row that names any runner but `cargo` is never
+/// a cache hit. A row from before the field existed ran its cells under Cargo.
+fn row_cells_ran_under_cargo(row: &serde_json::Value) -> bool {
+    match row.get("e2e_runner") {
+        None => true,
+        Some(runner) => runner.as_str() == Some(crate::E2E_RUNNER_CARGO),
+    }
+}
+
 /// The gate-coverage half of the predicate, shared by both producers.
 fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     match (i(row, "gates_expected"), i(row, "gates_run")) {
@@ -526,7 +537,9 @@ pub fn cache_lookup(
             continue;
         }
         if want_result == "pass"
-            && (row_release_builder(row) != Some(key.release_builder) || !pass_row_qualifies(row))
+            && (row_release_builder(row) != Some(key.release_builder)
+                || !row_cells_ran_under_cargo(row)
+                || !pass_row_qualifies(row))
         {
             continue;
         }
@@ -939,6 +952,27 @@ pub fn self_test() -> Result<String, String> {
         if cache_lookup(std::slice::from_ref(row), "pass", &buck_key).is_some() {
             return Err(format!(
                 "cache: a {why} Cargo green answered a Buck request"
+            ));
+        }
+        refused += 1;
+    }
+    // A Buck runner records the Cargo identity; its runner keeps it out.
+    let mut cargo_runner = cargo_named.clone();
+    cargo_runner["e2e_runner"] = serde_json::json!("cargo");
+    if cache_lookup(std::slice::from_ref(&cargo_runner), "pass", &key).is_none() {
+        return Err("cache: a row whose cells ran under cargo must be a Cargo HIT".into());
+    }
+    accepted += 1;
+    for runner in [
+        serde_json::json!("buck-local"),
+        serde_json::json!("buck-hybrid"),
+        serde_json::json!(null),
+    ] {
+        let mut row = cargo_named.clone();
+        row["e2e_runner"] = runner.clone();
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_some() {
+            return Err(format!(
+                "cache: a row with e2e_runner {runner} answered a cargo request"
             ));
         }
         refused += 1;
