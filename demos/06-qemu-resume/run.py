@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 
 DEMO_DIR = Path(__file__).resolve().parent
@@ -25,6 +26,7 @@ from demo_common import (  # noqa: E402
     copy_file,
     default_qemu_assets,
     display_path,
+    drain_output,
     extract_info_tail,
     hash_file,
     hermit_binary,
@@ -40,6 +42,7 @@ from demo_common import (  # noqa: E402
     save_metadata,
     stage_guest_controller,
     stop_process,
+    stop_process_group,
     wait_for_process,
 )
 from qemu_controller import (  # noqa: E402
@@ -122,6 +125,9 @@ def guest_environment_args() -> list:
 
 
 # Seconds to wait, after Hermit exits, for its last output to reach the log.
+# Processes Hermit left running can hold its output open meanwhile;
+# drain_output keeps QEMU_MAX_LOG_BYTES in force and stops them when this
+# runs out.
 OUTPUT_DRAIN_TIMEOUT = 60
 
 
@@ -214,8 +220,13 @@ def failed_run_message(return_code: int, serial_log: Path) -> str:
     return message
 
 
-def guest_command_progress(serial_log: Path) -> str:
-    """Say how far the guest's command had got, from the serial log."""
+def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str:
+    """Say how far the guest's command had got, from the serial log.
+
+    ``hermit_exited`` says Hermit had exited (processes it left running were
+    stopped later), so a finished command is not reported as one whose Hermit
+    had not exited.
+    """
     try:
         transcript = serial_log.read_bytes()
     except OSError:
@@ -226,6 +237,10 @@ def guest_command_progress(serial_log: Path) -> str:
     except StaleGuestInitError as error:
         return str(error)
     if result is not None:
+        if hermit_exited:
+            return "the guest command had finished with exit status {}".format(
+                result.exit_status
+            )
         return (
             "the guest command had finished with exit status {}, but Hermit/QEMU "
             "had not exited".format(result.exit_status)
@@ -248,8 +263,24 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
     INFO log cap is reached first: on 2026-10-03 Hermit wrote 18.5 to 19.2 MB
     of INFO log per second of resume, so the 512 MiB cap stopped a
     `sleep 1000000` after about 29 seconds, well before the 120-second
-    QEMU_TIMEOUT. Neither bound can end in SUCCESS.
+    QEMU_TIMEOUT. Neither bound can end in SUCCESS. The cap also holds after
+    Hermit exits, while processes it left running still write to its output
+    (see drain_output); LogCapExceeded then carries Hermit's exit status.
     """
+    if isinstance(error, LogCapExceeded) and error.exit_status is not None:
+        cause = (
+            "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
+            "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, after Hermit had "
+            "exited with status {}: processes it left running still wrote to its "
+            "output, and were stopped".format(
+                error.log_path,
+                error.log_size,
+                error.max_log_bytes,
+                error.elapsed,
+                error.exit_status,
+            )
+        )
+        return "{}; {}".format(cause, guest_command_progress(serial_log, hermit_exited=True))
     if isinstance(error, LogCapExceeded):
         cause = (
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
@@ -417,6 +448,7 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
                 # process it started, not only the first one.
                 start_new_session=True,
             )
+            launched = time.monotonic()
             copier = start_output_copier(process, log)
             try:
                 return_code = wait_for_process(
@@ -426,17 +458,27 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
                     log_path=info_log,
                     max_log_bytes=MAX_LOG_BYTES,
                 )
+                drain_output(
+                    copier,
+                    process,
+                    OUTPUT_DRAIN_TIMEOUT,
+                    log_path=info_log,
+                    max_log_bytes=MAX_LOG_BYTES,
+                    started=launched,
+                    label="Hermit",
+                )
             except (LogCapExceeded, TimeoutError) as error:
                 print(flush=True)
                 raise RuntimeError(stopped_run_message(error, serial_log)) from error
             finally:
-                copier.join(OUTPUT_DRAIN_TIMEOUT)
-            if copier.is_alive():
-                raise RuntimeError(
-                    "Hermit's output was still open {}s after it exited".format(
-                        OUTPUT_DRAIN_TIMEOUT
-                    )
-                )
+                # Whatever ended the wait, stop everything left in Hermit's
+                # process group, so nothing it started keeps writing the log.
+                # The pipe's last bytes then arrive at once. A copier still
+                # running after 10 seconds is reading from a process outside
+                # the group; closing the log at the end of this block stops it
+                # at its next write.
+                stop_process_group(process)
+                copier.join(10)
         # Check the exit status before reading any artifact: a run stopped early
         # may not have written the serial log yet.
         if return_code != 0:
