@@ -28,6 +28,10 @@ use crate::network_provider_package::read_regular;
 use crate::network_provider_package::sealed_file;
 use crate::network_provider_package::validate_elf;
 
+#[cfg(test)]
+#[path = "unix_guard_package/recovery_journal_tests.rs"]
+mod recovery_journal_tests;
+
 const CONTRACT: &str = include_str!("../network-provider/unix-guard-contract.json");
 const OBJECT: &str = "unix-guard.bpf.o";
 const HELPER: &str = "hermit-unix-keeper";
@@ -340,7 +344,7 @@ fn guard_receipt_file(directory: BorrowedFd<'_>, name: &str, uid: u32) -> io::Re
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if raw < 0 {
@@ -363,6 +367,7 @@ fn guard_terminal_complete(
     name: &str,
     incarnation: u64,
     uid: u32,
+    journal: Option<&KeeperJournal>,
 ) -> io::Result<bool> {
     let file = guard_receipt_file(directory, name, uid)?;
     let mut text = String::new();
@@ -371,28 +376,168 @@ fn guard_terminal_complete(
         return Ok(false);
     }
     let mut terminal = 0;
-    let mut last = false;
+    let mut last = None;
     for line in text.lines() {
-        let matches = serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .is_some_and(|row| {
-                row.get("schema").and_then(|v| v.as_u64()) == Some(1)
-                    && row.get("stage").and_then(|v| v.as_str()) == Some("terminal")
-                    && row.pointer("/guard/incarnation").and_then(|v| v.as_u64())
-                        == Some(incarnation)
-            });
+        let row = serde_json::from_str::<serde_json::Value>(line).ok();
+        let matches = row.as_ref().is_some_and(|row| {
+            row.get("schema").and_then(|v| v.as_u64()) == Some(1)
+                && row.get("stage").and_then(|v| v.as_str()) == Some("terminal")
+                && row.pointer("/guard/incarnation").and_then(|v| v.as_u64()) == Some(incarnation)
+        });
         if matches {
             terminal += 1;
         }
-        last = matches;
+        last = row.filter(|_| matches);
     }
-    Ok(terminal == 1 && last)
+    Ok(terminal == 1
+        && last.is_some_and(|row| journal.is_none_or(|journal| journal.matches_terminal(&row))))
 }
-#[derive(Eq, PartialEq)]
+
+/// The native keeper writes this separate binary journal before its first BPF
+/// load. Its filename has no CLI log role. Recognizing it never proves cleanup:
+/// only an exact complete suffix joined to the existing terminal receipt may
+/// discharge its unresolved incarnation. The producer is keeper-session.c.
+/// https://github.com/rrnewton/hermit/issues/3617
+#[derive(Debug, Eq, PartialEq)]
+struct KeeperJournal {
+    // Bind the two admission censuses to the actual held file and all bytes,
+    // including an uncertain partial final append.
+    snapshot: JournalFileSnapshot,
+    digest: [u8; 32],
+    close: Option<(u64, u64, u64, u64)>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct JournalFileSnapshot {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    links: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl KeeperJournal {
+    fn matches_terminal(&self, row: &serde_json::Value) -> bool {
+        let Some((ordinal, sequence, closed, deadline)) = self.close else {
+            return false;
+        };
+        [
+            ("/guard/terminal/record_ordinal", ordinal),
+            ("/guard/terminal/proof_sequence", sequence),
+            ("/guard/readback/closed_ns", closed),
+            ("/guard/readback/deadline_ns", deadline),
+        ]
+        .into_iter()
+        .all(|(path, expected)| {
+            row.pointer(path).and_then(|value| value.as_u64()) == Some(expected)
+        })
+    }
+}
+
+fn guard_keeper_journal(
+    recovery: BorrowedFd<'_>,
+    name: &str,
+    incarnation: u64,
+    uid: u32,
+) -> io::Result<KeeperJournal> {
+    // Native C recovery_record: six u64s, six 32-bit words, then char[32].
+    // Decode the native-endian disk ABI without alignment-dependent casts.
+    const ROW: usize = 104;
+    let abi = serde_json::from_str::<Contract>(CONTRACT)?
+        .abi_version
+        .parse::<u32>()
+        .map_err(io::Error::other)?;
+    let mut file = guard_receipt_file(recovery, name, uid)?;
+    let snapshot = |meta: std::fs::Metadata| JournalFileSnapshot {
+        device: meta.dev(),
+        inode: meta.ino(),
+        mode: meta.mode(),
+        uid: meta.uid(),
+        links: meta.nlink(),
+        length: meta.len(),
+        modified: (meta.mtime(), meta.mtime_nsec()),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+    };
+    let before = snapshot(file.metadata()?);
+    let mut bytes = Vec::new();
+    (&mut file).take(65_537).read_to_end(&mut bytes)?;
+    if bytes.len() > 65_536
+        || snapshot(file.metadata()?) != before
+        || bytes.len() as u64 != before.length
+    {
+        return Err(io::Error::other(
+            "Unix guard keeper journal changed during census",
+        ));
+    }
+    let word64 =
+        |row: &[u8], offset: usize| u64::from_ne_bytes(row[offset..offset + 8].try_into().unwrap());
+    let word32 =
+        |row: &[u8], offset: usize| u32::from_ne_bytes(row[offset..offset + 4].try_into().unwrap());
+    let mut directory = None;
+    for (index, row) in bytes.as_chunks::<ROW>().0.iter().enumerate() {
+        let actual_directory = (word64(row, 32), word64(row, 40));
+        let phase = word32(row, 52);
+        if word64(row, 0) != 0x5547_5049_4e30_3031
+            || word64(row, 8) != incarnation
+            || word64(row, 16) != index as u64 + 1
+            || word32(row, 48) != abi
+            || !(1..=22).contains(&phase)
+            || (phase == 1) != (index == 0)
+            || word32(row, 68) != 0
+            || actual_directory.1 == 0
+            || directory.is_some_and(|known| known != actual_directory)
+        {
+            return Err(io::Error::other(
+                "Unix guard keeper journal identity or framing differs",
+            ));
+        }
+        directory = Some(actual_directory);
+    }
+    let mut close = None;
+    if bytes.len().is_multiple_of(ROW) && bytes.len() >= 3 * ROW {
+        let suffix = &bytes[bytes.len() - 3 * ROW..];
+        let ready = &suffix[..ROW];
+        let closed = &suffix[ROW..2 * ROW];
+        let deadline = &suffix[2 * ROW..];
+        let stamp = |row: &[u8]| {
+            let text = std::str::from_utf8(&row[72..88]).ok()?;
+            (exact_hex(text, 8) && row[88..].iter().all(|byte| *byte == 0))
+                .then(|| u64::from_str_radix(text, 16).ok())
+                .flatten()
+        };
+        if word32(ready, 52) == 20
+            && word32(closed, 52) == 21
+            && word32(deadline, 52) == 22
+            && word64(ready, 24) != 0
+            && word64(closed, 24) > word64(ready, 24)
+            && word64(closed, 24) == word64(deadline, 24)
+            && [ready, closed, deadline]
+                .into_iter()
+                .all(|row| row[56..72].iter().all(|byte| *byte == 0))
+            && ready[72..].iter().all(|byte| *byte == 0)
+            && let (Some(closed), Some(deadline)) = (stamp(closed), stamp(deadline))
+            && deadline
+                .checked_sub(closed)
+                .is_some_and(|span| (1..=1_000_000_000).contains(&span))
+        {
+            close = Some((word64(ready, 16), word64(ready, 24), closed, deadline));
+        }
+    }
+    Ok(KeeperJournal {
+        snapshot: before,
+        digest: *Digest::new(&bytes),
+        close,
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
 struct GuardAdmissionCensus {
     pins: BTreeSet<String>,
     receipts: BTreeSet<String>,
     unresolved: BTreeSet<String>,
+    journals: BTreeMap<String, KeeperJournal>,
 }
 fn guard_admission_census(
     bpffs: BorrowedFd<'_>,
@@ -438,7 +583,19 @@ fn guard_admission_census(
         }
     }
     let mut receipts = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut journals = BTreeMap::new();
     for name in &receipt_names {
+        if let Some(identity) = name.strip_prefix(GUARD_BOUNDED_PIN_PREFIX) {
+            if !exact_hex(identity, 8) {
+                return Err(io::Error::other("Unix guard keeper journal filename differs"));
+            }
+            let incarnation = u64::from_str_radix(identity, 16).map_err(io::Error::other)?;
+            journals.insert(
+                identity.to_owned(),
+                guard_keeper_journal(recovery, name, incarnation, uid)?,
+            );
+            continue;
+        }
         let (raw_identity, role) = name
             .split_once('.')
             .ok_or_else(|| io::Error::other("Unix guard recovery filename lacks role"))?;
@@ -466,8 +623,14 @@ fn guard_admission_census(
             return Err(io::Error::other("Unix guard recovery role repeated"));
         }
     }
+    let mut journal_receipts = BTreeSet::new();
     for (identity, roles) in receipts {
         let prefix = &identity[..16];
+        if journals.contains_key(prefix) && !journal_receipts.insert(prefix.to_owned()) {
+            return Err(io::Error::other(
+                "Unix guard keeper journal has ambiguous CLI identities",
+            ));
+        }
         let incarnation = u64::from_str_radix(prefix, 16).map_err(io::Error::other)?;
         let terminal = format!("{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.terminal.jsonl");
         let complete_roles = roles.len() == 3
@@ -485,7 +648,7 @@ fn guard_admission_census(
                 &format!("{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.stderr.log"),
                 uid,
             )?;
-            guard_terminal_complete(recovery, &terminal, incarnation, uid)?
+            guard_terminal_complete(recovery, &terminal, incarnation, uid, journals.get(prefix))?
         } else {
             false
         };
@@ -493,10 +656,16 @@ fn guard_admission_census(
             unresolved.insert(prefix.to_owned());
         }
     }
+    for identity in journals.keys() {
+        if !journal_receipts.contains(identity) {
+            unresolved.insert(identity.clone());
+        }
+    }
     Ok(GuardAdmissionCensus {
         pins,
         receipts: receipt_names,
         unresolved,
+        journals,
     })
 }
 
