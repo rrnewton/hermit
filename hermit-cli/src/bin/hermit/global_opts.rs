@@ -29,6 +29,11 @@ use super::tracing::init_stderr_tracing;
 use super::tracing::init_stderr_tracing_with_evidence;
 use super::tracing::log_max_bytes;
 
+/// The target named by controller diagnostics written to `--log-file`. It is
+/// not a tracing target: these lines are written directly, before tracing
+/// starts, so `--log`/`RUST_LOG` filtering does not apply to them.
+const CONTROLLER_TARGET: &str = "hermit::controller";
+
 /// Hermit provides a sandbox for deterministic and reproducible execution.
 /// Arbitrary programs run inside (guests) become deterministic
 /// functions of their inputs. Configuration flags control the initial
@@ -125,12 +130,35 @@ impl GlobalOpts {
 
     /// Report controller context before tracing starts, using the selected host
     /// destination without reopening its path or creating a tracing thread.
+    ///
+    /// In `--log-file` the line is written in the shape of a DEBUG tracing
+    /// event (wall-clock timestamp, level, target), because that file is a
+    /// record stream: `hermit log-diff` splits it on timestamps and refuses any
+    /// record without a level tag, so a bare line made every comparison of two
+    /// such files stop at line 0
+    /// (<https://github.com/rrnewton/hermit/issues/3410>).
+    ///
+    /// DEBUG, not INFO, on purpose. The INFO stream and the DETLOG/COMMIT
+    /// subset are the guest and Detcore evidence that comparisons count toward
+    /// "nonzero compared messages"; a harness line written into every log must
+    /// not satisfy that, or two logs holding nothing but this line would be
+    /// reported as a match. Plain stderr keeps the bare line.
     pub(crate) fn write_controller_diagnostic(
         &self,
         message: std::fmt::Arguments<'_>,
     ) -> Result<(), Error> {
         if let Some(handle) = &self.log_file_handle {
-            writeln!(&**handle, "{message}").context("cannot write to the host log file")?;
+            use tracing_subscriber::fmt::format::Writer;
+            use tracing_subscriber::fmt::time::FormatTime;
+            let mut timestamp = String::new();
+            tracing_subscriber::fmt::time::SystemTime
+                .format_time(&mut Writer::new(&mut timestamp))
+                .map_err(|_| anyhow::anyhow!("cannot format the controller diagnostic time"))?;
+            writeln!(
+                &**handle,
+                "{timestamp} DEBUG {CONTROLLER_TARGET}: {message}"
+            )
+            .context("cannot write to the host log file")?;
         } else {
             // A stopped stderr reader must not replace the command's primary
             // exit status. This shares the existing invocation-wide deadline
@@ -256,6 +284,129 @@ mod tests {
         }
     }
 
+    fn emitted_epoch_notice(epoch: &str, source: &str) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("epoch.log");
+        let mut options = log_options(path.clone());
+        options.open_log_file().unwrap();
+        options
+            .write_controller_diagnostic(format_args!(
+                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
+            ))
+            .unwrap();
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    fn compare_epoch_info(left: &str, right: &str) -> detcore::logdiff::LogDiffSummary {
+        detcore::logdiff::try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            left.as_bytes(),
+            right.as_bytes(),
+            detcore::logdiff::ComparisonSideLabels::new("record", "replay"),
+            detcore::logdiff::BitwiseInfoV1Diagnostics::default(),
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .0
+    }
+
+    // A separate structured execution fixture, never emitted by the controller
+    // notice. Its virtual time must remain in the fixed INFO comparison.
+    fn execution_record(nanoseconds: u64) -> String {
+        format!(
+            "2026-10-03T11:16:10.123456Z INFO detcore: DETLOG clock_gettime result_ns={nanoseconds}{}\n",
+            detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::SyscallResult {
+                finished_syscall_number: 1,
+            })
+        )
+    }
+
+    #[test]
+    fn epoch_notice_preserves_provenance_without_becoming_execution_evidence() {
+        let epoch = "2026-01-01T00:00:00.123456789+00:00";
+        let record = emitted_epoch_notice(epoch, "explicit");
+        let replay = emitted_epoch_notice(epoch, "network-trace");
+        for (text, source) in [(&record, "explicit"), (&replay, "network-trace")] {
+            assert_eq!(text.lines().count(), 1);
+            assert_eq!(detcore::logdiff::record_count(text), 1);
+            assert!(text.contains(&format!(
+                " DEBUG hermit::controller: hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}\n"
+            )));
+        }
+        let empty = compare_epoch_info(&record, &replay);
+        assert!(!empty.matched_with_evidence(), "{empty:?}");
+        assert_eq!((empty.compared_left, empty.compared_right), (0, 0));
+
+        let execution = execution_record(1_767_225_600_123_456_789);
+        let record = record + &execution;
+        let replay = replay + &execution;
+        let summary = compare_epoch_info(&record, &replay);
+        assert!(summary.matched_with_evidence(), "{summary:?}");
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+
+        let options = detcore::logdiff::LogDiffOpts {
+            comparison: detcore::logdiff::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            ..Default::default()
+        };
+        let full = detcore::logdiff::log_diff_summary_from_strs_with_filter(
+            &record,
+            &replay,
+            &options,
+            &mut Vec::new(),
+            |_| true,
+        )
+        .unwrap();
+        assert!(full.diff_found && full.refusal_reason.is_none(), "{full:?}");
+        assert_eq!((full.compared_left, full.compared_right), (2, 2));
+    }
+
+    #[test]
+    fn epoch_notice_does_not_mask_one_nanosecond_of_execution_time_change() {
+        let record = emitted_epoch_notice("2026-01-01T00:00:00.123456789+00:00", "explicit")
+            + &execution_record(1_767_225_600_123_456_789);
+        let replay = emitted_epoch_notice("2026-01-01T00:00:00.123456790+00:00", "network-trace")
+            + &execution_record(1_767_225_600_123_456_790);
+        let summary = compare_epoch_info(&record, &replay);
+        assert!(
+            summary.diff_found && summary.refusal_reason.is_none(),
+            "{summary:?}"
+        );
+        assert!(!summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+    }
+
+    #[test]
+    fn epoch_notice_malformed_control_streams_cannot_establish_a_match() {
+        let epoch = "2026-01-01T00:00:00.123456789+00:00";
+        let notice = emitted_epoch_notice(epoch, "explicit");
+        let execution = execution_record(1_767_225_600_123_456_789);
+        let good = notice.clone() + &execution;
+        let old = format!(
+            "hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}\n{execution}"
+        );
+        let error = detcore::logdiff::try_compare_bitwise_info_v1_bytes_with_records(
+            old.as_bytes(),
+            good.as_bytes(),
+            detcore::logdiff::ComparisonSideLabels::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has no ERROR/WARN/INFO/DEBUG/TRACE tag")
+        );
+
+        // Without the execution record's timestamp, it merges into DEBUG.
+        // Existing parsing does not error; absence of execution evidence must
+        // still prevent a match even when both malformed inputs are identical.
+        let (_, untimestamped) = execution.split_once(' ').unwrap();
+        let missing_boundary = notice + untimestamped;
+        assert_eq!(detcore::logdiff::record_count(&missing_boundary), 1);
+        let summary = compare_epoch_info(&missing_boundary, &missing_boundary);
+        assert!(!summary.matched_with_evidence(), "{summary:?}");
+        assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+    }
+
     #[test]
     fn host_log_open_refuses_a_symlink_without_changing_its_target() {
         let directory = tempfile::tempdir().unwrap();
@@ -299,9 +450,17 @@ mod tests {
         held.write_all(b"written through the held descriptor")
             .unwrap();
 
+        let written = String::from_utf8(std::fs::read(opened_path).unwrap()).unwrap();
+        let (timestamp, rest) = written.split_once(" DEBUG ").unwrap();
+        assert!(
+            regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z$")
+                .unwrap()
+                .is_match(timestamp),
+            "{written:?}"
+        );
         assert_eq!(
-            std::fs::read(opened_path).unwrap(),
-            b"controller context\nwritten through the held descriptor"
+            rest,
+            "hermit::controller: controller context\nwritten through the held descriptor"
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),
