@@ -566,7 +566,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runner::tests::a_retained_verify_pass_is_redecided_from_its_own_evidence,
     // added when a pressure-test history's skid-recovered PASS became
     // re-decided from its retained evidence (the same issue), retains all 839.
-    ("test.regular_crates", 840),
+    // validation_dag::tests::committed_buck_e2e_selection_replaces_22_nodes_with_18,
+    // added with the full-buck-e2e label (Buck as the E2E runner), retains all
+    // 840 prior identities.
+    ("test.regular_crates", 841),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1021,7 +1024,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // there retain all 834. The home-path DAG text test listed there retains
     // all 838, and the retained-PASS re-decision test listed there retains
     // all 839.
-    ("test.regular_crates_on_host", 840),
+    // committed_buck_e2e_selection_replaces_22_nodes_with_18 retains all 840.
+    ("test.regular_crates_on_host", 841),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
