@@ -5099,7 +5099,8 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 2252);
+        // Four new c-programs tests add four cells each; see the census below.
+        assert_eq!(parsed.cells.len(), 2252 + 16);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -5134,9 +5135,22 @@ mod tests {
         // Six earlier and three socket KVM verify enables add applicable, selectable and selected cells;
         // the full matrix still has the same 2252 candidate identities.
         // https://github.com/rrnewton/reverie/issues/891
+        // https://github.com/rrnewton/hermit/pull/3224 adds three c-programs
+        // tests (external-io-signal-interrupt, sigsuspend-alarm-wake and
+        // sigsuspend-sibling-signal-wake) and
+        // https://github.com/rrnewton/hermit/pull/3229 adds
+        // c-programs/timerfd-semantics. Each declares only its ptrace verify
+        // cell, so each adds one not-applicable cell per backend here: 16
+        // cells (4 per backend) and no applicable, selectable or selected one.
         assert_eq!(
             row(&counts.all),
-            (2252, 628 + 6 + 3, 527 + 6 + 3, 194 + 6 + 3, 177 + 6 + 3)
+            (
+                2252 + 16,
+                628 + 6 + 3,
+                527 + 6 + 3,
+                194 + 6 + 3,
+                177 + 6 + 3
+            )
         );
         let by_backend: Vec<_> = counts
             .by_backend
@@ -5146,13 +5160,13 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (563, 85, 26, 16, 2)),
+                ("dbt", (563 + 4, 85, 26, 16, 2)),
                 (
                     "kvm",
-                    (563, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
+                    (563 + 4, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
                 ),
-                ("liteinst", (563, 149, 146, 99, 98)),
-                ("sabre", (563, 144, 112, 2, 1)),
+                ("liteinst", (563 + 4, 149, 146, 99, 98)),
+                ("sabre", (563 + 4, 144, 112, 2, 1)),
             ]
         );
     }
