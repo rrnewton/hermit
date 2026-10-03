@@ -12285,7 +12285,8 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
         if backend == "liteinst" {
             assert!(
                 stderr.contains(
-                    "hermit: [liteinst in-guest] Detcore Tool hosted by the guest preload"
+                    "hermit: [liteinst in-guest] selected: the guest preload is to host the \
+                     Detcore Tool"
                 ),
                 "stderr:\n{stderr}"
             );
