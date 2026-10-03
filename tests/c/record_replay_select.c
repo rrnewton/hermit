@@ -25,9 +25,10 @@
  *                writes the read set, faults on the write set, returns EFAULT
  *   einval       raw select and pselect6 with a negative nfds
  *   poll         poll and ppoll on a ready pipe, an already-recorded control
- *   thread-wake  raw select with a NULL timeout on an empty pipe that a second
- *                thread fills: the call can block, so it records as blocking
- *                external I/O, and replay must not wait on the live pipe
+ *   thread-wake  a second thread blocks in raw select with a NULL timeout on an
+ *                empty pipe that the main thread then fills: the call records
+ *                as blocking external I/O, and replay must not wait on the
+ *                live pipe
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -39,6 +40,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -378,19 +380,34 @@ static int poll_control(void) {
   return 0;
 }
 
-static void* fill_pipe(void* arg) {
-  int fd = *(const int*)arg;
-  if (write(fd, "x", 1) != 1) {
-    perror("fill pipe");
-  }
+struct select_wait {
+  int fd;
+  long result;
+  int result_errno;
+  int read_ready;
+};
+
+static void* select_without_timeout(void* arg) {
+  struct select_wait* wait = arg;
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(wait->fd, &read_set);
+  errno = 0;
+  wait->result = syscall(SYS_select, wait->fd + 1, &read_set, NULL, NULL, NULL);
+  wait->result_errno = errno;
+  wait->read_ready = FD_ISSET(wait->fd, &read_set) ? 1 : 0;
   return NULL;
 }
 
 /*
- * A peer thread wakes a select that has no timeout. Only the no-delay wake is
- * covered: a writer that first sleeps hangs the recording, because a pending
- * blocking external call keeps the record scheduler from releasing timed
- * waiters (https://github.com/rrnewton/hermit/issues/3576).
+ * A peer thread blocks in a select that has no timeout, and the main thread
+ * wakes it by writing the pipe. Hermit runs the new thread up to its select
+ * request first; the yield then lets the scheduler background that select on
+ * the empty pipe before the write, so the select really blocks in the kernel
+ * and only the write can finish it. Only the no-delay wake is covered: a writer
+ * that first sleeps hangs the recording, because a pending blocking external
+ * call keeps the record scheduler from releasing timed waiters
+ * (https://github.com/rrnewton/hermit/issues/3576).
  */
 static int thread_wake(void) {
   int pipe_fds[2];
@@ -398,20 +415,18 @@ static int thread_wake(void) {
     perror("pipe");
     return 1;
   }
-  pthread_t writer;
-  if (pthread_create(&writer, NULL, fill_pipe, &pipe_fds[1]) != 0) {
+  struct select_wait wait = {.fd = pipe_fds[0]};
+  pthread_t waiter;
+  if (pthread_create(&waiter, NULL, select_without_timeout, &wait) != 0) {
     perror("pthread_create");
     return 1;
   }
-  fd_set read_set;
-  FD_ZERO(&read_set);
-  FD_SET(pipe_fds[0], &read_set);
-  errno = 0;
-  long result =
-      syscall(SYS_select, pipe_fds[0] + 1, &read_set, NULL, NULL, NULL);
-  int result_errno = errno;
-  int read_ready = FD_ISSET(pipe_fds[0], &read_set) ? 1 : 0;
-  if (pthread_join(writer, NULL) != 0) {
+  sched_yield();
+  if (write(pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+    return 1;
+  }
+  if (pthread_join(waiter, NULL) != 0) {
     perror("pthread_join");
     return 1;
   }
@@ -421,11 +436,11 @@ static int thread_wake(void) {
   printf(
       "%-24s result=%011ld errno=%011d read_ready=%01d\n",
       "thread-wake",
-      result,
-      result_errno,
-      read_ready);
+      wait.result,
+      wait.result_errno,
+      wait.read_ready);
 
-  if (result != 1 || read_ready != 1) {
+  if (wait.result != 1 || wait.read_ready != 1) {
     fprintf(stderr, "thread-wake mismatch\n");
     return 1;
   }

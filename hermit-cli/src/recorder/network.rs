@@ -206,10 +206,17 @@ fn fd_table_size(tid: reverie::Pid) -> Result<usize, Errno> {
 ///
 /// Linux clamps `nfds` to the caller's fd-table size, which can be smaller than
 /// a userspace `nfds` such as `FD_SETSIZE`. Reading the table size after the
-/// call gives an upper bound when another thread grew the table concurrently;
-/// any extra bytes are then the unchanged guest bytes, so replay restoring them
-/// is a no-op. If the table size cannot be read, the unclamped length is the
-/// same kind of upper bound; the capture stops at the first unreadable byte.
+/// call gives an upper bound when another thread grew the table concurrently,
+/// and the unclamped length is the fallback when the table size cannot be read;
+/// the capture stops at the first unreadable byte. Under-capturing would drop
+/// bytes Linux wrote, so both cases over-capture instead.
+///
+/// The extra bytes are guest memory Linux did not write. Replay restores them,
+/// which is not always a no-op: if they are on a page that cannot be written,
+/// replay fails where Linux succeeded, and on the blocking path another thread
+/// may change them before they are read here. Only a program whose `nfds`
+/// exceeds its fd_set objects can reach either case
+/// (https://github.com/rrnewton/hermit/issues/3582).
 /// A negative `nfds` fails with EINVAL before any copy-out.
 fn select_copyout_len(nfds: i32, fd_table_size: impl FnOnce() -> Result<usize, Errno>) -> usize {
     let Ok(nfds) = usize::try_from(nfds) else {
