@@ -27,6 +27,15 @@ fn shared_constructor_never_upgrades_a_legacy_trace_or_issuer() {
 
 #[tokio::test]
 async fn shared_source_claim_transfers_reader_and_excludes_generic_consumers_until_exact_finish() {
+    shared_source_claim_case(false).await;
+}
+
+#[tokio::test]
+async fn shared_source_missing_lifetime_refuses_before_transmit_frontier_mutation() {
+    shared_source_claim_case(true).await;
+}
+
+async fn shared_source_claim_case(missing_lifetime: bool) {
     // Provider/census and immutable bytes are controlled premises. The test
     // executes real FD publication/ACK, current Normal selection, runtime
     // interval reservation and existing Call lifetime; it does not read guest
@@ -161,6 +170,32 @@ async fn shared_source_claim_transfers_reader_and_excludes_generic_consumers_unt
     assert!(engine.transmit_stream(binding.open_file, b"abc").is_err());
     assert!(engine.begin_stream_call_release(owner, call.id).is_err());
     assert!(engine.check_stream_operations_finished().is_err());
+    if missing_lifetime {
+        // Premature acknowledgement adversary: semantic completion must fail
+        // before the accepted output frontier or progress ledger can change.
+        engine
+            .release_stream_call_lifetime(owner, call.id, binding.open_file)
+            .unwrap();
+        let trace = engine.native_trace_fixture();
+        runtime
+            .with_shared_foreground_lineage(owner, |lineage| {
+                let grant = scheduler.shared_mm_foreground_observation(owner, lineage)?;
+                runtime.with_shared_source_interval(&interval, engine, call.id, |engine| {
+                    assert!(
+                        engine
+                            .complete_shared_replay_transmit(call.id, &grant, &prefix, b"abc")
+                            .is_err()
+                    );
+                    assert_eq!(engine.replay_transmit_offset(binding.open_file).unwrap(), 0);
+                    assert_eq!(engine.native_trace_fixture(), trace);
+                    assert!(engine.stream_calls.contains_key(&call.id));
+                    assert!(engine.finish().is_err());
+                    Ok(())
+                })
+            })
+            .unwrap();
+        return;
+    }
     runtime
         .with_shared_foreground_lineage(owner, |lineage| {
             let grant = scheduler.shared_mm_foreground_observation(owner, lineage)?;

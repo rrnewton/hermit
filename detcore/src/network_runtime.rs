@@ -2247,53 +2247,7 @@ impl NetworkRuntimeResources {
     ) -> std::io::Result<crate::network_replay::NetworkStreamPinOutcome> {
         let shared = self.shared.clone();
         self.run_native_worker(move || {
-            let result = (|| {
-                let pin = match capture() {
-                    Ok(pin) => pin,
-                    Err(error) => {
-                        // The production closure is exactly pidfd_getfd. An
-                        // internal failure without Linux errno is UNKNOWN.
-                        let errno = error.raw_os_error().ok_or(error)?;
-                        shared
-                            .native_streams
-                            .lock()
-                            .unwrap()
-                            .capture_failed(owner, call, errno)?;
-                        return Ok(crate::network_replay::NetworkStreamPinOutcome::Failed(
-                            errno,
-                        ));
-                    }
-                };
-                let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFD) };
-                let error = (flags < 0).then(std::io::Error::last_os_error);
-                {
-                    let mut calls = shared.native_streams.lock().unwrap();
-                    match identity {
-                        Some(identity) => {
-                            calls.capture_authenticated(owner, call, pin, identity)?
-                        }
-                        None => calls.capture(owner, call, pin)?,
-                    }
-                    calls.retain_capture_publication(owner, call, recovery.clone())?;
-                }
-                if let Some(error) = error {
-                    return Err(error);
-                }
-                if flags & libc::FD_CLOEXEC == 0 {
-                    return Err(std::io::Error::other("native stream capture lacks CLOEXEC"));
-                }
-                Ok(crate::network_replay::NetworkStreamPinOutcome::Acquired)
-            })();
-            // This executes even when the RPC receiver has been canceled. A
-            // known acquisition is still distinct from a known physical close.
-            let retired = recovery.retire_known(&shared, owner, call);
-            match (result, retired) {
-                (Ok(value), Ok(_)) => Ok(value),
-                (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
-                (Err(primary), Err(cleanup)) => Err(std::io::Error::other(format!(
-                    "{primary}; capture retirement: {cleanup}"
-                ))),
-            }
+            shared.perform_native_stream_capture(owner, call, capture, identity, recovery)
         })
         .await
     }

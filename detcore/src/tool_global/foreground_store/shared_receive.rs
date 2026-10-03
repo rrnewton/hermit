@@ -146,6 +146,292 @@ impl GlobalState {
         }
     }
 
+    /// Attach the shared Record entry before the first native acquisition. Its
+    /// original Call owns all submission, actual capture and cleanup debt.
+    pub(crate) async fn begin_shared_record_receive<
+        T: crate::RecordOrReplay,
+        G: reverie::Guest<crate::Detcore<T>>,
+    >(
+        &self,
+        guest: &G,
+        original: ScalarReceive,
+        read: crate::network_replay::NetworkFdReadAdmission,
+        expected: crate::tool_local::NetworkFdReadMetadata,
+    ) -> Result<SharedReceiveInvocation, Box<ReceiveAdmissionFailure>> {
+        let state = guest.thread_state();
+        let owner = NetworkStreamOwner {
+            thread: state.dettid,
+            mm: state.mm_id,
+        };
+        let mut custody = ReceiveAdmissionCustody::ReturnedRead(read.clone());
+        let result = async {
+            let runtime = self
+                .network_runtime
+                .as_ref()
+                .ok_or_else(|| internal("shared Record receive lost runtime"))?;
+            let engine = self
+                .network_engine
+                .as_ref()
+                .ok_or_else(|| internal("shared Record receive lost engine"))?;
+            let recovery = self
+                .native_capture_recovery()
+                .ok_or_else(|| internal("shared Record receive lost recovery owner"))?;
+            if self.cfg.network_trace.policy != NetworkPolicy::Record
+                || !(1..=512).contains(&original.capacity())
+            {
+                return Err(internal(
+                    "shared Record receive requires bounded original capacity",
+                ));
+            }
+            let inspect = || -> Result<(), NetworkRpcError> {
+                if original
+                    .inspect_original_range::<crate::Detcore<T>, G>(guest)
+                    .map_err(internal)?
+                    != reverie::OriginalReadRangeVerdict::Allowed
+                {
+                    return Err(internal(
+                        "shared Record original receive range was not admitted",
+                    ));
+                }
+                Ok(())
+            };
+            inspect()?;
+            let (root, epoch) = {
+                let scheduler = self.sched.lock().unwrap();
+                runtime
+                    .with_shared_foreground_lineage(owner, |lineage| {
+                        let grant = scheduler.shared_mm_foreground_observation(owner, lineage)?;
+                        self.check_native_source_task(guest.tid(), state, grant.root())
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        Ok((grant.root().clone(), grant.epoch()))
+                    })
+                    .map_err(internal)?
+            };
+            let prefix = runtime
+                .join_shared_foreground_prefix(root.clone(), engine, None)
+                .await
+                .map_err(internal)?;
+            let (invocation, submission) = {
+                let scheduler = self.sched.lock().unwrap();
+                runtime
+                    .with_shared_foreground_lineage(owner, |lineage| {
+                        Ok((|| {
+                            let grant = scheduler
+                                .shared_mm_foreground_observation(owner, lineage)
+                                .map_err(internal)?;
+                            self.check_native_source_task(guest.tid(), state, grant.root())?;
+                            if !Arc::ptr_eq(grant.root(), &root) || grant.epoch() != epoch {
+                                return Err(internal(
+                                    "shared Record receive crossed original entry grant",
+                                ));
+                            }
+                            inspect()?;
+                            let _memory = state.memory_metadata.lock().unwrap();
+                            let mut metadata = state.file_metadata.lock().unwrap();
+                            let actual = metadata.observe_fd_read(&read).map_err(internal)?;
+                            let binding = read
+                                .binding
+                                .ok_or_else(|| internal("shared Record receive lost binding"))?;
+                            let nonblocking = actual
+                                .nonblocking
+                                .ok_or_else(|| internal("shared Record receive lost flags"))?;
+                            if actual != expected
+                                || original.fd() != read.fd
+                                || actual.binding != read.binding
+                                || actual.socket != Some(binding.open_file)
+                                || read.publication.permit.files != root.files()
+                            {
+                                return Err(internal(
+                                    "shared Record receive changed original FD/OFD/options",
+                                ));
+                            }
+                            let mut engine = engine.lock().unwrap();
+                            if !engine.uses_shared_mm_attempts()
+                                || engine.mode() != crate::network_replay::NetworkEngineMode::Record
+                            {
+                                return Err(internal(
+                                    "shared Record receive changed closed policy",
+                                ));
+                            }
+                            let identity = engine
+                                .native_stream_capture_identity(
+                                    owner,
+                                    &read,
+                                    &state.file_metadata,
+                                    &metadata,
+                                )
+                                .map_err(internal)?
+                                .ok_or_else(|| {
+                                    internal(
+                                        "shared Record receive lost authenticated original file",
+                                    )
+                                })?;
+                            runtime
+                                .with_shared_attempt_prefix(
+                                    &prefix,
+                                    &mut engine,
+                                    |engine, admission| {
+                                        engine
+                                            .preflight_shared_wait_begin(&read, &grant, admission)
+                                            .map_err(std::io::Error::other)?;
+                                        let socket = engine
+                                            .stream_socket_state(binding.open_file)
+                                            .map_err(std::io::Error::other)?
+                                            .ok_or_else(|| {
+                                                std::io::Error::other(
+                                                    "shared Record receive lost socket profile",
+                                                )
+                                            })?;
+                                        let started = self.global_time.lock().unwrap().as_nanos();
+                                        let deadline = socket
+                                            .options
+                                            .receive_timeout
+                                            .duration(socket.normalization.hz)
+                                            .map(|duration| {
+                                                let nanos = u64::try_from(duration.as_nanos())
+                                                    .map_err(std::io::Error::other)?;
+                                                started
+                                                    .as_nanos()
+                                                    .checked_add(nanos)
+                                                    .filter(|end| {
+                                                        *end != LogicalTime::INDEFINITE.as_nanos()
+                                                    })
+                                                    .map(LogicalTime::from_nanos)
+                                                    .ok_or_else(|| {
+                                                        std::io::Error::other(
+                                                            "shared Record deadline overflow",
+                                                        )
+                                                    })
+                                            })
+                                            .transpose()?;
+                                        let target = original.capacity().min(
+                                            usize::try_from(
+                                                socket.options.receive_low_water.max(1),
+                                            )
+                                            .map_err(std::io::Error::other)?,
+                                        );
+                                        let call = engine
+                                            .begin_native_stream_call_from_read(owner, read.clone())
+                                            .map_err(std::io::Error::other)?;
+                                        custody = ReceiveAdmissionCustody::RetainedCall(
+                                            RetainedReceiveAdmission {
+                                                call: call.id,
+                                                stage: ReceiveAdmissionStage::Capture,
+                                            },
+                                        );
+                                        let policy = Arc::new(SavedReceivePolicy {
+                                            origin: ReceivePolicyOrigin::SharedFollowed,
+                                            target,
+                                            owner,
+                                            call: call.id,
+                                            open_file: call.open_file,
+                                            root: root.clone(),
+                                            raw: original.into_parts(),
+                                            nonblocking,
+                                            started,
+                                            deadline,
+                                        });
+                                        // This attachment owns the Record cut before pidfd_getfd.
+                                        // The original publication/control remain held until
+                                        // the typed actual-capture completion commits below.
+                                        engine
+                                            .attach_shared_wait_call(
+                                                call.id,
+                                                binding,
+                                                SharedWaitIntent::Receive(policy.clone()),
+                                                &grant,
+                                                admission,
+                                                started,
+                                            )
+                                            .map_err(std::io::Error::other)?;
+                                        let submission = engine
+                                            .prepare_shared_record_capture(
+                                                call.id, identity, &grant, admission,
+                                            )
+                                            .map_err(std::io::Error::other)?;
+                                        Ok((SharedReceiveInvocation { call, policy }, submission))
+                                    },
+                                )
+                                .map_err(internal)
+                        })())
+                    })
+                    .map_err(internal)??
+            };
+            let joined = runtime
+                .capture_shared_wait(submission, recovery)
+                .await
+                .map_err(internal)?;
+            if joined.outcome() != crate::network_replay::NetworkStreamPinOutcome::Acquired {
+                return Err(internal(format!(
+                    "shared Record capture failed: {:?}",
+                    joined.outcome()
+                )));
+            }
+            {
+                let scheduler = self.sched.lock().unwrap();
+                runtime
+                    .with_shared_foreground_lineage(owner, |lineage| {
+                        Ok((|| {
+                            let grant = scheduler
+                                .shared_mm_foreground_observation(owner, lineage)
+                                .map_err(internal)?;
+                            self.check_native_source_task(guest.tid(), state, grant.root())?;
+                            if !Arc::ptr_eq(grant.root(), &root) || grant.epoch() != epoch {
+                                return Err(internal(
+                                    "shared Record capture crossed original Normal grant",
+                                ));
+                            }
+                            inspect()?;
+                            let _memory = state.memory_metadata.lock().unwrap();
+                            let metadata = state.file_metadata.lock().unwrap();
+                            let mut engine = engine.lock().unwrap();
+                            engine
+                                .validate_fd_metadata(
+                                    owner,
+                                    root.files(),
+                                    &state.file_metadata,
+                                    &metadata,
+                                )
+                                .map_err(internal)?;
+                            runtime
+                                .with_shared_capture_completion(
+                                    &joined,
+                                    &mut engine,
+                                    |engine, confirmed| {
+                                        let actual = engine
+                                            .complete_shared_record_capture(confirmed, &grant)
+                                            .map_err(std::io::Error::other)?;
+                                        assert_eq!(
+                                            actual.id, invocation.call.id,
+                                            "typed completion retained its original Call"
+                                        );
+                                        Ok(())
+                                    },
+                                )
+                                .map_err(internal)
+                        })())
+                    })
+                    .map_err(internal)??;
+            }
+            Ok(invocation)
+        }
+        .await;
+        match result {
+            Ok(invocation) => {
+                self.finish_local_receive_release();
+                Ok(invocation)
+            }
+            Err(primary) => {
+                let failure = self.receive_admission_failure(owner, primary, custody);
+                if matches!(failure.custody, ReceiveAdmissionCustody::RetainedCall(_)) {
+                    Err(self.cleanup_receive_admission_failure(failure).await)
+                } else {
+                    Err(failure)
+                }
+            }
+        }
+    }
+
     fn with_shared_receive_context<T, R>(
         &self,
         tid: Tid,
@@ -334,6 +620,60 @@ impl GlobalState {
         }
         .map_err(|e| internal(format!("shared held store refused before callback: {e:?}")))?;
         drop(prepared);
+        if result.is_ok() {
+            self.finish_local_receive_release();
+        }
+        result
+    }
+    /// Consumes an exact empty result only while the original/restored backend
+    /// context is freshly validated inside the same H commit transaction.
+    pub(crate) fn complete_shared_replay_receive_no_store<
+        T: crate::RecordOrReplay,
+        G: reverie::Guest<crate::Detcore<T>>,
+    >(
+        &self,
+        guest: &G,
+        invocation: &SharedReceiveInvocation,
+        prepared: PreparedSharedReceiveNoStore,
+        restored: bool,
+    ) -> Result<crate::network_replay::shared_waits::SharedNoStoreResult, NetworkRpcError> {
+        let runtime = self
+            .network_runtime
+            .as_ref()
+            .ok_or_else(|| internal("shared no-store lost runtime"))?;
+        let original =
+            reverie::syscalls::Syscall::from_raw(invocation.policy.raw.0, invocation.policy.raw.1);
+        let PreparedSharedReceiveNoStore { plan, prefix } = prepared;
+        let action = |context: &mut dyn reverie::syscalls::FollowedStore| {
+            self.with_shared_receive_context(
+                guest.tid(),
+                guest.thread_state(),
+                invocation,
+                |engine, grant, _| {
+                    runtime
+                        .with_shared_attempt_prefix(&prefix, engine, |engine, admission| {
+                            // No guest payload read/write and no original one-use claim.
+                            // This is the actual held backend check, never a supplied bool.
+                            context.validate_context().map_err(|error| {
+                                std::io::Error::other(format!(
+                                    "shared no-store original context: {error:?}"
+                                ))
+                            })?;
+                            let now = self.global_time.lock().unwrap().as_nanos();
+                            engine
+                                .complete_shared_replay_no_store(plan, grant, admission, now)
+                                .map_err(std::io::Error::other)
+                        })
+                        .map_err(internal)
+                },
+            )
+        };
+        let result = if restored {
+            guest.with_restored_followed_store(original, action)
+        } else {
+            guest.with_followed_store(original, action)
+        }
+        .map_err(|error| internal(format!("shared no-store callback refused: {error:?}")))?;
         if result.is_ok() {
             self.finish_local_receive_release();
         }

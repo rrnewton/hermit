@@ -13,6 +13,11 @@ pub(crate) use replay_store::SharedReplayNoStorePlan;
 pub(crate) use replay_store::SharedReplayReceivePlan;
 pub(crate) use replay_store::SharedReplaySource;
 
+#[path = "shared_waits/capture.rs"]
+mod capture;
+pub(crate) use capture::SharedCaptureOrigin;
+pub(crate) use capture::SharedCaptureSubmission;
+
 #[derive(Debug, Clone)]
 pub(crate) struct OriginalPollIntent {
     raw: (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs),
@@ -130,6 +135,7 @@ pub(in crate::network_replay) struct SharedWait {
     intent: SharedWaitIntent,
     phase: AttemptPhase,
     output: Option<replay_store::SharedOutput>,
+    capture: Option<Arc<SharedCaptureOrigin>>,
 }
 #[derive(Debug, Clone)]
 enum AttemptPhase {
@@ -229,7 +235,7 @@ pub(crate) struct CallWaitBinding {
 }
 
 impl NetworkReplayEngine {
-    pub(in crate::network_replay) fn shared_wait_pin_confirmation_state(
+    fn shared_wait_capture_pending_state(
         &self,
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
@@ -593,6 +599,7 @@ impl NetworkReplayEngine {
             binding,
             intent,
             output: None,
+            capture: None,
             phase: AttemptPhase::Active {
                 ordinal: 0,
                 epoch: grant.epoch(),

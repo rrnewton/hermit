@@ -40,6 +40,15 @@ async fn fixture_with_receive_inputs(
     eof: bool,
     split: bool,
 ) -> Fixture {
+    fixture_engine_kind(with_child, ready_poll, eof, split, false).await
+}
+async fn fixture_engine_kind(
+    with_child: bool,
+    ready_poll: bool,
+    eof: bool,
+    split: bool,
+    record: bool,
+) -> Fixture {
     let mut trace = NetworkReplayEngine::controlled_replay_two_row_trace();
     let now = trace.epoch_global_time().unwrap();
     // Real validated immutable trace: bytes are unavailable at this first
@@ -142,7 +151,12 @@ async fn fixture_with_receive_inputs(
     }
     trace.validate().unwrap();
     let key = trace.fresh_stream_profiles[0].key;
-    let mut engine = NetworkReplayEngine::replay_shared_mm_attempts(trace).unwrap();
+    let record_profile = trace.fresh_stream_profiles[0].clone();
+    let mut engine = if record {
+        NetworkReplayEngine::record_shared_mm_attempts(trace.epoch)
+    } else {
+        NetworkReplayEngine::replay_shared_mm_attempts(trace).unwrap()
+    };
     let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
     let mut scheduler = Scheduler::new(&crate::config::Config::default());
     engine.fd_table_fixture_enable();
@@ -246,25 +260,57 @@ async fn fixture_with_receive_inputs(
         .unwrap()
         .publication_server_acknowledge(&batch)
         .unwrap();
-    engine
-        .register_stream_socket(
-            binding.open_file,
-            key,
-            NetworkStreamNamespace {
-                device: 1,
-                inode: 1,
-            },
-            None,
-        )
-        .unwrap();
-    engine.bind(binding.open_file, NetworkChannelId(1)).unwrap();
-    engine.release_eligible(now).unwrap();
-    assert!(
+    if record {
+        // Explicit original-installation premise for capture ownership only.
+        // No provider or native Socket/Connect publication is claimed.
         engine
-            .take_connection_outcome(binding.open_file)
+            .register_stream_socket_profile(
+                binding.open_file,
+                key,
+                NetworkStreamNamespace {
+                    device: 1,
+                    inode: 1,
+                },
+                Some(record_profile),
+            )
+            .unwrap();
+        engine
+            .shadow
+            .as_mut()
             .unwrap()
-            .is_some()
-    );
+            .sockets
+            .get_mut(&binding.open_file)
+            .unwrap()
+            .native = Some(crate::network_replay::native_receive::NativeReceive {
+            identity:
+                crate::network_runtime::original_installation::FileIdentity::controlled_fixture(
+                    7, 19,
+                ),
+            binding,
+            birth: NetworkStreamCallId::controlled_fixture(9999),
+            physical_observed: crate::network_replay::native_receive::Cut::ZERO,
+        });
+    } else {
+        engine
+            .register_stream_socket(
+                binding.open_file,
+                key,
+                NetworkStreamNamespace {
+                    device: 1,
+                    inode: 1,
+                },
+                None,
+            )
+            .unwrap();
+        engine.bind(binding.open_file, NetworkChannelId(1)).unwrap();
+        engine.release_eligible(now).unwrap();
+        assert!(
+            engine
+                .take_connection_outcome(binding.open_file)
+                .unwrap()
+                .is_some()
+        );
+    }
     Fixture {
         runtime,
         root,
@@ -1617,3 +1663,6 @@ async fn shared_wait_unrecorded_terminal_flag_cannot_issue_eof() {
         })
         .unwrap();
 }
+
+#[path = "capture_tests.rs"]
+mod capture_tests;

@@ -255,6 +255,7 @@ impl NetworkReplayEngine {
                 "shared source changed original Call/grant/prefix or retains other custody",
             ));
         }
+        self.validate_stream_call_lifetime(owner, call, attempt.binding.open_file)?;
         Ok(attempt.binding.open_file)
     }
 
@@ -281,7 +282,8 @@ impl NetworkReplayEngine {
             return Err(invalid("shared source changed exact selected length"));
         }
         let result = self.transmit_stream_inner(file, bytes)?;
-        self.release_stream_call_lifetime(grant.owner(), call, file)?;
+        self.release_stream_call_lifetime(grant.owner(), call, file)
+            .expect("same-lock shared transmit validated exact lifetime lease before consumption");
         self.stream_calls.remove(&call);
         self.complete_deferred_retirement(file);
         self.check_native_retirement()?;

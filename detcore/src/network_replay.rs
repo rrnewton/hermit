@@ -973,7 +973,7 @@ impl NetworkReplayEngine {
                 Some(native_receive::SharedAttempt::Wait(_))
             )
         }) {
-            self.shared_wait_pin_confirmation_state(owner, call)?
+            self.shared_wait_pin_confirmation_state(owner, call, outcome)?
         } else {
             self.owned_stream_call(owner, call)?
         };

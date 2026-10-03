@@ -8,6 +8,7 @@ mod raw_poll;
 mod sendto_entry;
 mod native_source_read;
 mod shared_source;
+mod shared_receive;
 mod socket_error;
 
 use std::cell::Cell;
@@ -3781,6 +3782,7 @@ struct ScalarForegroundGuest<'a> {
     record_timer_arrival: Option<(std::os::unix::net::UnixStream, bool)>,
     // Opt-in SO_ERROR ABI tests use real permission-respecting copies.
     socket_error_access: bool,
+    shared_store: Option<Arc<shared_receive::ControlledStore>>,
 }
 impl ScalarForegroundGuest<'_> {
     fn enable_record_timer(&mut self) {
@@ -3981,6 +3983,12 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
     fn local_global_state(&self) -> Option<&GlobalState> {
         self.expose_local_global.then_some(self.global)
     }
+    fn with_followed_store<R>(&self, original: reverie::syscalls::Syscall, action: impl FnOnce(&mut dyn reverie::syscalls::FollowedStore) -> R) -> Result<R, reverie::syscalls::NativeUserStoreRefusal> {
+        self.shared_store.as_ref().ok_or(reverie::syscalls::NativeUserStoreRefusal::Evidence(reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend))?.with(original,false,action)
+    }
+    fn with_restored_followed_store<R>(&self, original: reverie::syscalls::Syscall, action: impl FnOnce(&mut dyn reverie::syscalls::FollowedStore) -> R) -> Result<R, reverie::syscalls::NativeUserStoreRefusal> {
+        self.shared_store.as_ref().ok_or(reverie::syscalls::NativeUserStoreRefusal::Evidence(reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend))?.with(original,true,action)
+    }
     fn inspect_original_read_range(
         &self,
         read: reverie::syscalls::Read,
@@ -4117,6 +4125,7 @@ fn scalar_foreground_guest<'a>(
         controlled_retry_call: None,
         record_timer_arrival: None,
         socket_error_access: false,
+        shared_store: None,
     }
 }
 

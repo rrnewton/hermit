@@ -8,6 +8,10 @@ use crate::network_replay::NetworkReplayError;
 use crate::network_replay::NetworkStreamCallId;
 use crate::network_replay::shared_waits::SharedCallCensus;
 
+mod capture;
+pub(crate) use capture::ConfirmedSharedCapture;
+pub(crate) use capture::JoinedSharedCapture;
+
 #[derive(Debug, Clone)]
 pub(crate) struct JoinedSharedPrefix {
     prefix: JoinedNativePrefix,
@@ -40,6 +44,10 @@ pub(crate) struct SharedAttemptAdmission<'a> {
     _calls: &'a native_peer::Calls,
 }
 impl SharedAttemptAdmission<'_> {
+    pub(crate) fn retained_capture_prefix(&self) -> JoinedSharedPrefix {
+        self.prefix.clone()
+    }
+
     pub(crate) fn root(&self) -> &Arc<ForegroundRoot> {
         self.prefix.prefix.root()
     }

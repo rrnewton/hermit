@@ -7,13 +7,13 @@ use super::*;
 use crate::network_runtime::ForegroundRoot;
 use crate::tool_global::native_source_read::PreparedNativeSource;
 
-struct SharedFixture {
-    f: ReplayIssuerFixture,
+pub(super) struct SharedFixture {
+    pub(super) f: ReplayIssuerFixture,
     // The retained typed birth and controlled responder outlive every attempt.
     _birth: Box<dyn std::any::Any>,
 }
 
-async fn selected() -> SharedFixture {
+pub(super) async fn selected() -> SharedFixture {
     let mut legacy = NetworkReplayEngine::controlled_replay_two_row_trace();
     let channel = legacy.channels[0].id;
     legacy.outputs.push(NetworkOutputEventV2 {
