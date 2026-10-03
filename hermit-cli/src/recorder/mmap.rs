@@ -39,6 +39,10 @@ struct Mapping {
     /// file mappings as anonymous memory, so these are the ranges whose
     /// contents can differ after advice that drops pages.
     file_backed: bool,
+    /// Whether this is shared anonymous memory (`MAP_SHARED|MAP_ANONYMOUS`,
+    /// which Linux backs with a deleted `/dev/zero` inode, or System V
+    /// shared memory). Replay maps these live, so they need no refill.
+    anonymous_shmem: bool,
 }
 
 fn parse_maps(text: &str) -> Vec<Mapping> {
@@ -50,6 +54,7 @@ fn parse_maps(text: &str) -> Vec<Mapping> {
             let _offset = fields.next()?;
             let _device = fields.next()?;
             let inode = fields.next()?;
+            let path = fields.collect::<Vec<_>>().join(" ");
             if perms.len() < 4 {
                 return None;
             }
@@ -69,6 +74,7 @@ fn parse_maps(text: &str) -> Vec<Mapping> {
                 prot,
                 private: perms[3] == b'p',
                 file_backed: inode != "0",
+                anonymous_shmem: path == "/dev/zero (deleted)" || path.starts_with("/SYSV"),
             })
         })
         .collect()
@@ -82,16 +88,19 @@ fn read_mappings(path: &str) -> Vec<Mapping> {
     parse_maps(&String::from_utf8_lossy(&maps))
 }
 
-/// The parts of `[start, end)` covered by private file-backed mappings, each
-/// with the protection of its mapping.
+/// The parts of `[start, end)` covered by mappings that replay represents
+/// with an anonymous stand-in, each with the protection of its mapping.
 ///
-/// Only these read back differently in replay after their pages are dropped.
-/// A shared file mapping keeps its contents in the page cache, and replay's
-/// shared anonymous stand-in keeps them in shmem, so neither needs a refill.
-fn private_file_ranges(mappings: &[Mapping], start: usize, end: usize) -> Vec<(usize, usize, i32)> {
+/// After their pages are dropped these can read back differently in replay:
+/// a private file mapping refaults from the file here but reads zeros there,
+/// and a shared file mapping refaults from the page cache here, including
+/// writes made through a descriptor since it was mapped, which replay's
+/// stand-in never saw. Shared anonymous memory is mapped live in replay and
+/// keeps its contents in both.
+fn refill_ranges(mappings: &[Mapping], start: usize, end: usize) -> Vec<(usize, usize, i32)> {
     mappings
         .iter()
-        .filter(|mapping| mapping.file_backed && mapping.private)
+        .filter(|mapping| mapping.file_backed && !mapping.anonymous_shmem)
         .filter_map(|mapping| {
             let lo = mapping.start.max(start);
             let hi = mapping.end.min(end);
@@ -248,7 +257,7 @@ impl Recorder {
         let mut refills = Vec::new();
         if drops_pages {
             let mappings = read_mappings(&maps_path);
-            let ranges = private_file_ranges(&mappings, start, end);
+            let ranges = refill_ranges(&mappings, start, end);
             if !ranges.is_empty() {
                 let mem_path = format!("/proc/{}/mem", guest.tid().as_raw());
                 // The advice has already taken effect, so failing the guest
@@ -285,13 +294,14 @@ mod tests {
 7f0000000000-7f0000002000 rw-p 00000000 00:00 0
 7f0000002000-7f0000003000 rw-p 00001000 08:01 1234 /usr/bin/guest
 7f0000003000-7f0000004000 ---s 00000000 00:05 77 /dev/zero (deleted)
+7f0000004000-7f0000005000 rw-s 00000000 00:01 88 /memfd:shared state (deleted)
 7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
 ";
 
     #[test]
     fn parses_maps_lines() {
         let mappings = parse_maps(MAPS);
-        assert_eq!(mappings.len(), 5);
+        assert_eq!(mappings.len(), 6);
         assert_eq!(
             mappings[0],
             Mapping {
@@ -300,32 +310,42 @@ mod tests {
                 prot: libc::PROT_READ | libc::PROT_EXEC,
                 private: true,
                 file_backed: true,
+                anonymous_shmem: false,
             }
         );
         assert!(!mappings[1].file_backed);
         assert_eq!(mappings[3].prot, libc::PROT_NONE);
         assert!(!mappings[3].private);
         assert!(mappings[3].file_backed);
+        assert!(mappings[3].anonymous_shmem);
+        assert!(!mappings[4].anonymous_shmem);
     }
 
     #[test]
-    fn private_file_ranges_clip_to_the_advised_range() {
+    fn refill_ranges_clip_to_the_advised_range() {
         let mappings = parse_maps(MAPS);
         assert_eq!(
-            private_file_ranges(&mappings, 0x7f0000001000, 0x7f0000004000),
+            refill_ranges(&mappings, 0x7f0000001000, 0x7f0000004000),
             vec![(
                 0x7f0000002000,
                 0x7f0000003000,
                 libc::PROT_READ | libc::PROT_WRITE
             )]
         );
-        assert!(private_file_ranges(&mappings, 0x7f0000000000, 0x7f0000002000).is_empty());
+        assert!(refill_ranges(&mappings, 0x7f0000000000, 0x7f0000002000).is_empty());
     }
 
     #[test]
-    fn private_file_ranges_skip_shared_mappings() {
+    fn refill_ranges_cover_shared_files_but_not_shared_anonymous_memory() {
         let mappings = parse_maps(MAPS);
-        assert!(private_file_ranges(&mappings, 0x7f0000003000, 0x7f0000004000).is_empty());
+        assert_eq!(
+            refill_ranges(&mappings, 0x7f0000003000, 0x7f0000005000),
+            vec![(
+                0x7f0000004000,
+                0x7f0000005000,
+                libc::PROT_READ | libc::PROT_WRITE
+            )]
+        );
     }
 
     #[test]
