@@ -1495,6 +1495,12 @@
       "why": "tests/c/record_replay_poll_partial_copyout.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks partial poll copyout behavior at multiple controlled record/replay boundaries."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_select.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_select.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that select and pselect6 replay the recorded result, fd sets, and remaining timeout for ready pipes, timeouts, partial copy-out, and invalid nfds."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_replay_setsockopt.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
