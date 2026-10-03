@@ -156,15 +156,24 @@ and keeps the backend's own `backend run complete` record. That run must pass
 the same `calls=N` check and print exactly one record naming its backend, or
 the harness exits 1. For LiteInst the record counts each dispatch path:
 `direct_hook` for calls through a patched site, the trap paths for calls that
-were not. Two limits apply to those counts:
+were not. The harness prints the nonzero path counts beside the fits, writes
+them to the JSON as `dispatch_paths`, and refuses the LiteInst result (exit 1)
+unless `direct_hook` is at least N - 1, the one allowance being a first call
+that traps before its site is patched. Below that floor the fixture's `getpid`
+site was not patched, so the LiteInst slope would be the cost of a trap, not of
+a hooked call. Two limits apply to those counts:
 
-- A call that never reaches a patch attempt is in no path counter. That covers
-  task-creating calls (`clone`, `fork`, `vfork`, `execve`), which LiteInst
-  never patches, and every call once the guest has a second task. The fixture
-  makes neither, so its counts are complete.
+- A call at a site that never had a patch attempt is in no path counter.
+  LiteInst never attempts the task-creating calls (`clone`, `clone3`, `fork`,
+  `vfork`), and once the guest has a second task it attempts no new site.
+  After that point, calls through sites patched earlier still count as
+  `direct_hook`, and calls at sites that had already fallen back still count
+  as fallbacks; calls at sites first reached afterwards count nowhere. The
+  fixture creates no task, so its counts are complete.
 - Hermit prints the record only when the backend returns normally, including
   after a forced shutdown. A backend error or a timeout loses it, exactly as it
-  does for `ptrace`.
+  does for `ptrace`; https://github.com/rrnewton/hermit/issues/3585
+  tracks reporting the counters on those paths too.
 
 Each wall time comes from polling the run every 500 microseconds, so a sample
 can read up to one poll interval, plus the host's timer slack, longer than the
