@@ -5616,8 +5616,9 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/hermit/issues/3448).
         // +1 direct for portablecompat.manifest_compat, the corpus-only run
         // type's bucket, which also runs on the host, and +1 for
-        // sabrecompat.manifest_compat, the SaBRe run type's host bucket.
-        assert_eq!((pinned, direct), (19, 19));
+        // sabrecompat.manifest_compat, the SaBRe run type's host bucket, and
+        // +1 for strictcompat.manifest_compat, the strict run type's.
+        assert_eq!((pinned, direct), (19, 20));
     }
 
     /// With the committed parity selection, the full profile's harness
