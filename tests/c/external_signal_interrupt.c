@@ -10,7 +10,7 @@
  *
  * usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid>
  *            <external|process|thread|timer|exit> [restart] [timed] [warm]
- *            [ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|
+ *            [ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|
  *             chldkill|chldthrexit|chldpend|stealgrp|stealkill|stealthrexit|
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2]
  *
@@ -47,6 +47,17 @@
  * SIGWINCH, which is ignored by default (`winch`). The call then has a 300 ms
  * timeout, the sender does not wake the futex, and an ELAPSED line reports the
  * CLOCK_MONOTONIC time the call took, so the wait must run to its deadline.
+ *
+ * `tstp` is a fourth such option, with one exception. The guest first forks,
+ * and the child runs the whole test after setsid(), which makes it the only
+ * member of a new session and process group. That group is orphaned: no
+ * member has a parent in another group of the same session. The sender then
+ * sends SIGTSTP, left at SIG_DFL. Linux discards a SIG_DFL SIGTSTP, SIGTTIN or
+ * SIGTTOU in an orphaned process group instead of stopping the process, and
+ * restarts a call the signal interrupted. poll, select, a timed futex and
+ * sem_timedwait restart with their original deadline, so they too return at
+ * 300 ms; epoll_wait is the exception and returns EINTR when the signal
+ * arrives. The parent prints nothing and exits with the child's status.
  *
  * The next seven options change a disposition, or queue a signal, while the
  * waiter is already parked; they need the `thread` sender. The sibling thread blocks SIGUSR1 and
@@ -455,7 +466,7 @@ int main(int argc, char **argv) {
   if (argc < 3) {
     say("usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid> "
         "<external|process|thread|timer|exit> [restart] [timed] [warm] "
-        "[ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
+        "[ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2]\n");
     return 2;
@@ -464,7 +475,7 @@ int main(int argc, char **argv) {
   main_thread = pthread_self();
   const char *call = argv[1];
   const char *sender = argv[2];
-  int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, options = 0;
+  int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   static const struct {
     const char *name;
     enum role role;
@@ -495,6 +506,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "winch")) {
       sent_signal = SIGWINCH;
       quiet = 1;
+    } else if (!strcmp(argv[i], "tstp")) {
+      sent_signal = SIGTSTP;
+      tstp = quiet = 1;
     } else if (!strcmp(argv[i], "ign2caught")) flip = IGN2CAUGHT;
     else if (!strcmp(argv[i], "caught2ign")) flip = CAUGHT2IGN;
     else if (!strcmp(argv[i], "chldlate")) flip = CHLDLATE;
@@ -505,7 +519,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "usr2")) usr2 = 1;
     else return 2;
   }
-  if (ignored + blocked + (sent_signal == SIGWINCH) + (flip != FLIP_NONE) + options + usr2 > 1)
+  if (ignored + blocked + (sent_signal == SIGWINCH) + tstp + (flip != FLIP_NONE) + options + usr2 >
+      1)
     return 2;
   flip_timed = timed;
   int is_futex = !strcmp(call, "futex");
@@ -538,6 +553,20 @@ int main(int argc, char **argv) {
   int report_elapsed =
       quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm || (is_wait && restart);
   stamp_handler = is_wait && restart;
+  if (tstp) {
+    /* Run the test in a child that is alone in an orphaned process group (see
+     * the usage comment). The forking thread's pthread_t is also the child's
+     * main thread, so main_thread stays valid. */
+    pid_t runner = fork();
+    if (runner < 0) return 3;
+    if (runner > 0) {
+      int st;
+      while (waitpid(runner, &st, 0) < 0)
+        if (errno != EINTR) return 3;
+      return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+    }
+    if (setsid() < 0) return 3;
+  }
 
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);

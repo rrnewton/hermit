@@ -630,10 +630,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Without a temporary mask, on a backend whose kernel reports the guest's
         // signal state, only a signal that would end the wait natively does; the mask
         // cell lets the wait block signals under the one scratch-stack guard
-        // (https://github.com/rrnewton/hermit/issues/3146).
+        // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
+        // the remaining time written back below, so a default stop ends the wait
+        // as on Linux.
         let mut signals = (sigmask.is_none()
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
-            .then(|| KernelSignalWait::new(guest, 0));
+            .then(|| KernelSignalWait::new(guest, 0, false));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
@@ -883,11 +885,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // On a backend whose kernel reports the guest's signal state, only a signal
         // that would end the wait natively does; the mask cell lets the wait block
         // signals under the one scratch-stack guard
-        // (https://github.com/rrnewton/hermit/issues/3146).
+        // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
+        // the remaining time written back below, so a default stop ends the wait
+        // as on Linux.
         let mut signals = self
             .cfg
             .backend_supports_blocked_wait_signal_interruption
-            .then(|| KernelSignalWait::new(guest, 0));
+            .then(|| KernelSignalWait::new(guest, 0, false));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call

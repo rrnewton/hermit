@@ -243,6 +243,11 @@ pub struct FutexSignalWatch {
     /// Kernel sigset of the signals the waiter's mask leaves unblocked, without
     /// the backend's own preemption signal.
     pub unblocked: u64,
+    /// Whether a default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU` leaves the wait parked:
+    /// set for a timed `FUTEX_WAIT`, whose restart would start its relative timeout
+    /// again (`KernelSignalState::interrupting_wait`). Fixed by the call, so it
+    /// cannot change while the waiter is parked.
+    pub defers_default_stops: bool,
     /// The waiter's process, as the backend names it for `/proc`.
     pub pid: i32,
     /// The waiter's thread, as the backend names it for `/proc`.
@@ -3610,7 +3615,9 @@ impl Scheduler {
                         // Blocked, ignored, or default-ignored for this waiter now:
                         // the kernel discards an ignored signal or keeps a blocked
                         // one pending, and the wait stays registered with its
-                        // original absolute deadline.
+                        // original absolute deadline. So does a default job-control
+                        // stop that the wait defers (`FutexSignalWatch`), which the
+                        // kernel delivers or discards when the call returns.
                         debug!(
                             "[dtid {}] signal {} does not interrupt its futex wait; leaving it parked.",
                             dettid, signal
@@ -3797,13 +3804,15 @@ impl Scheduler {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
-            return Some(state.interrupting(!watch.unblocked));
+            return Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops));
         }
         match read_kernel_signal_state(
             reverie::Pid::from_raw(watch.pid),
             reverie::Pid::from_raw(watch.tid),
         ) {
-            Ok(state) => Some(state.interrupting(!watch.unblocked)),
+            Ok(state) => {
+                Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops))
+            }
             Err(errno) => {
                 debug!(
                     "[dtid {}] cannot read the signal state of parked futex waiter {}/{} ({}); \
@@ -8576,6 +8585,7 @@ mod test {
     fn signal_watch(unblocked: u64) -> FutexSignalWatch {
         FutexSignalWatch {
             unblocked,
+            defers_default_stops: false,
             pid: i32::MAX,
             tid: i32::MAX,
         }
@@ -8653,6 +8663,81 @@ mod test {
             scheduler.inbound_signals(target),
             vec![SigWrapper::from(Signal::SIGUSR1)]
         );
+    }
+
+    /// A timed `FUTEX_WAIT`, whose restart would start its relative timeout again,
+    /// stays parked with its original deadline when a default `SIGTSTP` arrives:
+    /// Linux discards that stop in an orphaned process group and the wait goes on.
+    /// `SIGSTOP` and a caught `SIGTSTP` still end it, and a wait that does not
+    /// defer default stops is ended by the default `SIGTSTP` too (review of
+    /// https://github.com/rrnewton/hermit/pull/3361 at `cbb36408`, finding 4).
+    #[test]
+    fn a_default_job_control_stop_leaves_a_rearming_futex_wait_parked() {
+        let stops = kernel_signal_bit(libc::SIGTSTP)
+            | kernel_signal_bit(libc::SIGTTIN)
+            | kernel_signal_bit(libc::SIGTTOU);
+        let deadline = LogicalTime::from_nanos(300_000_000);
+        let park = |scheduler: &mut Scheduler, defers_default_stops: bool, caught: u64| {
+            let (target, futex) = parked_futex_target(scheduler);
+            scheduler.sleep_futex_waiter(
+                &target,
+                futex,
+                Some(deadline),
+                u32::MAX,
+                Some(FutexSignalWatch {
+                    defers_default_stops,
+                    ..signal_watch(stops | kernel_signal_bit(libc::SIGSTOP))
+                }),
+            );
+            scheduler
+                .test_kernel_signal_states
+                .insert(target, signal_state(caught, 0));
+            target
+        };
+        let assert_parked = |scheduler: &Scheduler, target: DetTid| {
+            assert!(scheduler.is_parked_futex_waiter(target));
+            assert!(!scheduler.run_queue.contains_tid(target));
+            assert!(scheduler.inbound_signals(target).is_empty());
+            assert_eq!(
+                scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                vec![(deadline, TimedEvent::ThreadEvt(target))]
+            );
+        };
+        let assert_woken = |scheduler: &Scheduler, target: DetTid, signal: Signal| {
+            assert!(!scheduler.is_parked_futex_waiter(target));
+            assert!(scheduler.run_queue.contains_tid(target));
+            assert!(scheduler.blocked.timed_waiters.is_empty());
+            assert_eq!(
+                scheduler.inbound_signals(target),
+                vec![SigWrapper::from(signal)]
+            );
+        };
+
+        // Through the drain of cross-task signals and through scheduler sends.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = park(&mut scheduler, true, 0);
+        for signal in [Signal::SIGTSTP, Signal::SIGTTIN, Signal::SIGTTOU] {
+            scheduler.notify_signal_pending(target, SigWrapper::from(signal));
+        }
+        scheduler.drain_pending_cross_task_signals();
+        scheduler.wake_signaled_guest(target, Signal::SIGTSTP);
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert_parked(&scheduler, target);
+        // SIGSTOP always stops the process, so it still ends the wait.
+        scheduler.wake_signaled_guest(target, Signal::SIGSTOP);
+        assert_woken(&scheduler, target, Signal::SIGSTOP);
+
+        // A handler makes SIGTSTP an ordinary caught signal.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = park(&mut scheduler, true, kernel_signal_bit(libc::SIGTSTP));
+        scheduler.wake_signaled_guest(target, Signal::SIGTSTP);
+        assert_woken(&scheduler, target, Signal::SIGTSTP);
+
+        // A wait whose restart keeps its deadline takes the default stop at once.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = park(&mut scheduler, false, 0);
+        scheduler.wake_signaled_guest(target, Signal::SIGTSTP);
+        assert_woken(&scheduler, target, Signal::SIGTSTP);
     }
 
     /// A precise-mode futex waiter is admitted on its mask alone. The dispositions
