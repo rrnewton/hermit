@@ -17,9 +17,22 @@ sleep 1000000`, was then taken as finished: the controller saved the snapshot
 and quit while the command was still running, and demo 6 cut the command's
 output at the marker.
 
+Frame format 2 prefixed the command's output, but the command still inherited
+/init's standard input, which in the guest is the console opened for reading
+and writing, so `echo '__HERMIT_COMMAND_END__ status=0' >&0` printed a whole
+END line, and so could a command that opened /dev/console itself. Frame format
+3 runs the command as an unprivileged user (`chpst -u 1000:1000`) with its
+standard input from /dev/null, so it holds no descriptor for the console and
+cannot open one; puts byte 0x01 between the END marker and "status="; and
+removes every 0x01 byte from the command's output, so not even the tail of an
+output line that a kernel message splits off can be an END line.
+
 The guest-side tests run /init's frame lines, taken from qemu-assets.sh, under
 the guest's BusyBox shell when it is installed (qemu-assets.sh copies the
-host's BusyBox into the initramfs) and under the host's sh. The controller
+host's BusyBox into the initramfs) and under the host's sh, with a stand-in
+for chpst that records its arguments and runs the command as the current user:
+a test cannot change user, so the user change itself is shown by a demo 6 run
+that prints `id`, not here. The controller
 tests run run_controller on a thread with QEMU and its control socket replaced
 and feed it a transcript. The demo 6 tests run resume_once with Hermit
 replaced by a stand-in that leaves a transcript behind.
@@ -31,6 +44,7 @@ import hashlib
 import io
 import os
 import runpy
+import shlex
 import shutil
 import signal
 import subprocess
@@ -52,7 +66,10 @@ import qemu_controller as qc  # noqa: E402
 
 # The frame lines, written out here so that a test states the format rather
 # than reading it back from the code under test.
-FRAME_BEGIN = b"__HERMIT_COMMAND_BEGIN__ format=2"
+FRAME_BEGIN = b"__HERMIT_COMMAND_BEGIN__ format=3"
+# qemu-assets.sh writes /init with this placeholder and replaces it with byte
+# 0x01, the END line's separator.
+FRAME_SEP_PLACEHOLDER = "@HERMIT_FRAME_SEP@"
 # The file /init sends the command's output to; the tests use a scratch path.
 GUEST_OUTPUT_FILE = "/tmp/.hermit-command-output"
 # Seconds a shell running /init's frame lines may take; every test command
@@ -70,8 +87,18 @@ IMPERSONATION_COMMAND = "echo __HERMIT_COMMAND_END__; echo FINISHED; exit 3"
 IMPERSONATION_OUTPUT = b"__HERMIT_COMMAND_END__\nFINISHED\n"
 
 
+def _end(status: int) -> bytes:
+    """/init's END line for ``status``: the marker, byte 0x01, "status=N"."""
+    return b"__HERMIT_COMMAND_END__\x01status=" + str(status).encode()
+
+
+def _shells() -> List[str]:
+    """The shells the guest-side tests run /init's frame lines under."""
+    return ["busybox", "sh"] if _guest_busybox() else ["sh"]
+
+
 def _init_frame_lines() -> List[str]:
-    """/init's lines from the BEGIN echo through the END echo."""
+    """/init's lines from the BEGIN echo through the line that prints END."""
     lines = (LIB_DIR / "qemu-assets.sh").read_text().splitlines()
     starts = [
         index
@@ -81,11 +108,13 @@ def _init_frame_lines() -> List[str]:
     ends = [
         index
         for index, line in enumerate(lines)
-        if line.startswith('echo "__HERMIT_COMMAND_END__')
+        if line.startswith(
+            ('echo "__HERMIT_COMMAND_END__', "printf '__HERMIT_COMMAND_END__")
+        )
     ]
     if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
         raise AssertionError(
-            "expected one BEGIN echo and, after it, one END echo in "
+            "expected one BEGIN echo and, after it, one line printing END in "
             "qemu-assets.sh; found BEGIN at {} and END at {}".format(starts, ends)
         )
     return lines[starts[0] : ends[0] + 1]
@@ -103,38 +132,64 @@ def _preferred_shell() -> str:
     return "busybox" if _guest_busybox() else "sh"
 
 
-def _run_frame(directory: Path, command: str, shell: str) -> bytes:
+def _write_stub_chpst(path: Path, record: Path) -> None:
+    """A stand-in for BusyBox's chpst: record the arguments, run the command.
+
+    The real `chpst -u 1000:1000` needs root to change user. The stand-in runs
+    the command as the current user, which is enough to check what /init
+    passes to chpst and what reaches the transcript; it refuses any other
+    user.
+    """
+    path.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" >{}\n'
+        '[ "$1" = -u ] && [ "$2" = 1000:1000 ] || exit 111\n'
+        "shift 2\n"
+        'exec "$@"\n'.format(shlex.quote(str(record)))
+    )
+    path.chmod(0o755)
+
+
+def _run_frame(
+    directory: Path, command: str, shell: str, console_stdin: bool = False
+) -> bytes:
     """Run /init's frame lines with CMD set to ``command``; return the transcript.
 
     ``shell`` is "busybox" (BusyBox ash, with `sh` on PATH also BusyBox, as in
-    the guest) or "sh" (the host's). The transcript is what the guest's serial
-    console would carry: everything /init writes, stdout and stderr together,
-    with each LF turned into CR LF as the console's line discipline does.
-    Background jobs the command leaves behind are killed afterwards.
+    the guest) or "sh" (the host's). `chpst` on PATH is the stand-in from
+    _write_stub_chpst, which records its arguments in "chpst-arguments". The
+    transcript is what the guest's serial console would carry: everything
+    /init writes, stdout and stderr together, with each LF turned into CR LF as
+    the console's line discipline does. With ``console_stdin`` the shell's
+    standard input is the transcript too, opened for reading and writing, as
+    /init's standard input is the console in the guest; otherwise it is
+    /dev/null. Background jobs the command leaves behind are killed afterwards.
     """
     output_file = directory / "hermit-command-output"
     script = "\n".join(_init_frame_lines()).replace(GUEST_OUTPUT_FILE, str(output_file))
+    script = script.replace(FRAME_SEP_PLACEHOLDER, "\x01")
     script = 'CMD="$1"\n{}\n'.format(script)
     environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"}
+    bin_dir = directory / "{}-bin".format(shell)
+    bin_dir.mkdir(exist_ok=True)
+    _write_stub_chpst(bin_dir / "chpst", directory / "chpst-arguments")
+    environment["PATH"] = "{}:{}".format(bin_dir, environment["PATH"])
     if shell == "busybox":
         busybox = _guest_busybox()
         if busybox is None:
             raise AssertionError("BusyBox is not installed")
-        bin_dir = directory / "busybox-bin"
-        bin_dir.mkdir(exist_ok=True)
         if not (bin_dir / "sh").exists():
             (bin_dir / "sh").symlink_to(busybox)
-        environment["PATH"] = "{}:{}".format(bin_dir, environment["PATH"])
         argv = [busybox, "ash", "-c", script, "init", command]
     elif shell == "sh":
         argv = ["sh", "-c", script, "init", command]
     else:
         raise ValueError(shell)
     transcript_path = directory / "transcript"
-    with transcript_path.open("wb") as transcript:
+    with transcript_path.open("w+b" if console_stdin else "wb") as transcript:
         process = subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,
+            stdin=transcript if console_stdin else subprocess.DEVNULL,
             stdout=transcript,
             stderr=subprocess.STDOUT,
             env=environment,
@@ -154,13 +209,17 @@ def _run_frame(directory: Path, command: str, shell: str) -> bytes:
 class GuestInitFrameTest(unittest.TestCase):
     """What the guest's /init prints around a command, run by a real shell."""
 
-    # Prints the bare END marker, a whole END line, and the BEGIN line, then an
-    # empty line, a line with leading and trailing spaces, a backslash, a line
-    # on stderr, and a last line without a newline, and exits 3.
+    # Prints the bare END marker, a whole END line of frame format 2, an END
+    # line of format 3 without its 0x01 byte, and the BEGIN lines of formats 2
+    # and 3, then an empty line, a line with leading and trailing spaces, a
+    # backslash, a line on stderr, and a last line without a newline, and
+    # exits 3.
     COMMAND = (
         "echo __HERMIT_COMMAND_END__; "
         "echo '__HERMIT_COMMAND_END__ status=0'; "
+        "echo '__HERMIT_COMMAND_END__status=0'; "
         "echo '__HERMIT_COMMAND_BEGIN__ format=2'; "
+        "echo '__HERMIT_COMMAND_BEGIN__ format=3'; "
         "echo; "
         "echo '  lead and trail  '; "
         r"printf '%s\n' 'back\slash'; "
@@ -172,18 +231,23 @@ class GuestInitFrameTest(unittest.TestCase):
         FRAME_BEGIN + b"\r\n"
         b"| __HERMIT_COMMAND_END__\r\n"
         b"| __HERMIT_COMMAND_END__ status=0\r\n"
+        b"| __HERMIT_COMMAND_END__status=0\r\n"
         b"| __HERMIT_COMMAND_BEGIN__ format=2\r\n"
+        b"| __HERMIT_COMMAND_BEGIN__ format=3\r\n"
         b"| \r\n"
         b"|   lead and trail  \r\n"
         b"| back\\slash\r\n"
         b"| to-stderr\r\n"
         b"| no-newline-at-the-end\r\n"
-        b"__HERMIT_COMMAND_END__ status=3\r\n"
+        + _end(3)
+        + b"\r\n"
     )
     OUTPUT = (
         b"__HERMIT_COMMAND_END__\n"
         b"__HERMIT_COMMAND_END__ status=0\n"
+        b"__HERMIT_COMMAND_END__status=0\n"
         b"__HERMIT_COMMAND_BEGIN__ format=2\n"
+        b"__HERMIT_COMMAND_BEGIN__ format=3\n"
         b"\n"
         b"  lead and trail  \n"
         b"back\\slash\n"
@@ -220,10 +284,99 @@ class GuestInitFrameTest(unittest.TestCase):
             self.directory, "sleep 60 & echo started", _preferred_shell()
         )
         self.assertLess(time.monotonic() - started, SHELL_TIMEOUT)
-        self.assertEqual(
-            transcript,
-            FRAME_BEGIN + b"\r\n| started\r\n__HERMIT_COMMAND_END__ status=0\r\n",
+        self.assertEqual(transcript, FRAME_BEGIN + b"\r\n| started\r\n" + _end(0) + b"\r\n")
+
+    def test_the_command_runs_through_chpst_as_user_1000(self):
+        for shell in _shells():
+            with self.subTest(shell=shell):
+                directory = self.directory / shell
+                directory.mkdir()
+                transcript = _run_frame(directory, "echo ran", shell)
+                record = directory / "chpst-arguments"
+                self.assertTrue(
+                    record.exists(), "/init ran the command without chpst"
+                )
+                self.assertEqual(
+                    record.read_text().splitlines(),
+                    ["-u", "1000:1000", "sh", "-c", "echo ran"],
+                )
+                self.assertEqual(
+                    transcript, FRAME_BEGIN + b"\r\n| ran\r\n" + _end(0) + b"\r\n"
+                )
+
+    # Writes END lines of frame formats 2 and 3 to its standard input, which in
+    # the guest was the console before format 3, and the format 3 one to its
+    # standard output too, then exits 7. A write to standard input that fails
+    # prints a line saying so.
+    STDIN_COMMAND = (
+        "echo '__HERMIT_COMMAND_END__ status=0' >&0 2>/dev/null "
+        "|| echo old-end-refused; "
+        r"printf '__HERMIT_COMMAND_END__\001status=0\n' >&0 2>/dev/null "
+        "|| echo new-end-refused; "
+        r"printf '__HERMIT_COMMAND_END__\001status=0\n'; "
+        "exit 7"
+    )
+
+    def test_a_command_cannot_write_to_the_console_through_its_standard_input(self):
+        # In the guest, /init's standard input is the console, opened for
+        # reading and writing. Here it is the transcript, opened the same way.
+        for shell in _shells():
+            with self.subTest(shell=shell):
+                directory = self.directory / shell
+                directory.mkdir()
+                transcript = _run_frame(
+                    directory, self.STDIN_COMMAND, shell, console_stdin=True
+                )
+                lines = transcript.split(b"\r\n")
+                # Between /init's BEGIN line and its END line (the last line,
+                # before the empty string after the final CR LF), every line
+                # must have come through /init's loop.
+                straight = [line for line in lines[1:-2] if not line.startswith(b"| ")]
+                self.assertEqual(
+                    straight,
+                    [],
+                    "the command wrote these lines straight to the console: "
+                    "{!r}".format(transcript),
+                )
+                self.assertEqual(
+                    transcript,
+                    FRAME_BEGIN + b"\r\n"
+                    b"| old-end-refused\r\n"
+                    b"| new-end-refused\r\n"
+                    b"| __HERMIT_COMMAND_END__status=0\r\n" + _end(7) + b"\r\n",
+                )
+                self.assertEqual(
+                    qc.parse_command_transcript(transcript),
+                    qc.CommandResult(
+                        b"old-end-refused\nnew-end-refused\n"
+                        b"__HERMIT_COMMAND_END__status=0\n",
+                        7,
+                        (),
+                    ),
+                )
+
+    def test_byte_0x01_is_removed_from_the_output(self):
+        # Lines with one, two, and adjacent 0x01 bytes, a line that is only
+        # 0x01, and an END line with its 0x01 byte as the last line, without a
+        # newline.
+        command = (
+            r"printf 'a\001b\001\001c\n\001\n"
+            r"__HERMIT_COMMAND_END__\001status=0'"
         )
+        for shell in _shells():
+            with self.subTest(shell=shell):
+                directory = self.directory / shell
+                directory.mkdir()
+                transcript = _run_frame(directory, command, shell)
+                before_end = transcript[: transcript.rindex(b"__HERMIT_COMMAND_END__\x01")]
+                self.assertNotIn(b"\x01", before_end)
+                self.assertEqual(
+                    transcript,
+                    FRAME_BEGIN + b"\r\n"
+                    b"| abc\r\n"
+                    b"| \r\n"
+                    b"| __HERMIT_COMMAND_END__status=0\r\n" + _end(0) + b"\r\n",
+                )
 
 
 class _FakeQemu:
@@ -341,21 +494,27 @@ class ControllerWaitTest(unittest.TestCase):
         self.assertEqual(run.calls, expected_calls)
 
     def test_a_printed_end_marker_does_not_end_the_wait(self):
+        # Printed markers, and unprefixed END lines without the 0x01 byte: an
+        # END line of frame format 2, and the tail of a split output line.
         before_end = (
             FRAME_BEGIN + b"\r\n"
             b"| __HERMIT_COMMAND_END__\r\n"
             b"| __HERMIT_COMMAND_END__ status=0\r\n"
+            b"| __HERMIT_COMMAND_END__status=0\r\n"
+            b"__HERMIT_COMMAND_END__ status=0\r\n"
+            b"__HERMIT_COMMAND_END__status=0\r\n"
         )
         rest = (
             b"| FINISHED\r\n"
-            b"__HERMIT_COMMAND_END__ status=0\r\n"
+            + _end(0)
+            + b"\r\n"
             b"Interactive busybox shell. Type 'poweroff -f' to exit.\r\n"
         )
         self._check_waits_then_ends(before_end, rest, False, SAVE_AND_QUIT)
 
     def test_without_a_snapshot_it_quits_only_after_the_end_line(self):
         before_end = FRAME_BEGIN + b"\r\n| __HERMIT_COMMAND_END__\r\n"
-        rest = b"__HERMIT_COMMAND_END__ status=1\r\n"
+        rest = _end(1) + b"\r\n"
         self._check_waits_then_ends(before_end, rest, True, [("quit",)])
 
     def test_the_guest_init_transcript_ends_the_wait_only_after_the_command(self):
@@ -370,18 +529,24 @@ class ControllerWaitTest(unittest.TestCase):
         )
 
     def test_a_stale_guest_init_stops_the_controller(self):
-        # What the /init of an older boot snapshot prints for `uname -a`.
-        self.serial_log.write_bytes(
+        # What the /init of an older boot snapshot prints for `uname -a`: before
+        # frame format 2, and in format 2.
+        for transcript in (
             b"__HERMIT_COMMAND_BEGIN__\r\n"
             b"Linux (none) 6.17.13 #1 SMP x86_64 GNU/Linux\r\n"
-            b"__HERMIT_COMMAND_END__\r\n"
-        )
-        run = _ControllerRun(self, self.serial_log)
-        run.wait_until_idle_or_ended()
-        run.join()
-        self.assertFalse(run.thread.is_alive(), "the controller is still waiting")
-        self.assertIsInstance(run.outcome.get("error"), qc.StaleGuestInitError)
-        self.assertEqual(run.calls, [])
+            b"__HERMIT_COMMAND_END__\r\n",
+            b"__HERMIT_COMMAND_BEGIN__ format=2\r\n"
+            b"| Linux (none) 6.17.13 #1 SMP x86_64 GNU/Linux\r\n"
+            b"__HERMIT_COMMAND_END__ status=0\r\n",
+        ):
+            with self.subTest(transcript=transcript):
+                self.serial_log.write_bytes(transcript)
+                run = _ControllerRun(self, self.serial_log)
+                run.wait_until_idle_or_ended()
+                run.join()
+                self.assertFalse(run.thread.is_alive(), "the controller is still waiting")
+                self.assertIsInstance(run.outcome.get("error"), qc.StaleGuestInitError)
+                self.assertEqual(run.calls, [])
 
 
 class TranscriptParserTest(unittest.TestCase):
@@ -390,19 +555,39 @@ class TranscriptParserTest(unittest.TestCase):
     def test_the_frame_constants_match_this_test(self):
         self.assertEqual(qc.BEGIN_LINE, FRAME_BEGIN)
         self.assertEqual(qc.OUTPUT_PREFIX, b"| ")
+        self.assertEqual(qc.end_line_status(_end(0)), 0)
+        # Every line the guest kernel prints starts with its timestamp, so no
+        # kernel line can be an END line.
+        self.assertIn("printk.time=1", qc.KERNEL_COMMAND_LINE.split())
+
+    def test_both_launchers_use_the_kernel_command_line(self):
+        command = qc.build_qemu_command(
+            "qemu-system-x86_64",
+            Path("qmp.sock"),
+            Path("serial.sock"),
+            Path("disk.qcow2"),
+            Path("bzImage"),
+            Path("initramfs.cpio.gz"),
+        )
+        self.assertEqual(command[command.index("-append") + 1], qc.KERNEL_COMMAND_LINE)
+        # Demo 7 restores the same boot snapshot with its own QEMU command line.
+        drgn_source = (LIB_DIR / "drgn_hermit.py").read_text()
+        self.assertIn('"-append", KERNEL_COMMAND_LINE,', drgn_source)
+        self.assertNotIn("reboot=t", drgn_source)
 
     def test_printed_markers_are_output(self):
         transcript = (
             FRAME_BEGIN + b"\r\n"
             b"| __HERMIT_COMMAND_END__\r\n"
             b"| __HERMIT_COMMAND_END__ status=0\r\n"
-            b"| FINISHED\r\n"
-            b"__HERMIT_COMMAND_END__ status=3\r\n"
+            b"| __HERMIT_COMMAND_END__status=0\r\n"
+            b"| FINISHED\r\n" + _end(3) + b"\r\n"
         )
         self.assertEqual(
             qc.parse_command_transcript(transcript),
             qc.CommandResult(
-                b"__HERMIT_COMMAND_END__\n__HERMIT_COMMAND_END__ status=0\nFINISHED\n",
+                b"__HERMIT_COMMAND_END__\n__HERMIT_COMMAND_END__ status=0\n"
+                b"__HERMIT_COMMAND_END__status=0\nFINISHED\n",
                 3,
                 (),
             ),
@@ -415,9 +600,13 @@ class TranscriptParserTest(unittest.TestCase):
             FRAME_BEGIN,
             FRAME_BEGIN + b"\r\n",
             FRAME_BEGIN + b"\r\n| __HERMIT_COMMAND_END__\r\n",
-            FRAME_BEGIN + b"\r\n__HERMIT_COMMAND_END__ status=1",
-            FRAME_BEGIN + b"\r\n__HERMIT_COMMAND_END__ status=1\r",
-            b"__HERMIT_COMMAND_END__ status=0\r\n",
+            FRAME_BEGIN + b"\r\n" + _end(1),
+            FRAME_BEGIN + b"\r\n" + _end(1) + b"\r",
+            _end(0) + b"\r\n",
+            # END lines without the 0x01 byte: frame format 2's, and the tail of
+            # an output line that a kernel message split.
+            FRAME_BEGIN + b"\r\n__HERMIT_COMMAND_END__ status=1\r\n",
+            FRAME_BEGIN + b"\r\n__HERMIT_COMMAND_END__status=1\r\n",
         ):
             with self.subTest(transcript=transcript):
                 self.assertIsNone(qc.parse_command_transcript(transcript))
@@ -425,25 +614,36 @@ class TranscriptParserTest(unittest.TestCase):
     def test_exit_status_values(self):
         for status in (0, 1, 2, 127, 128, 255):
             with self.subTest(status=status):
-                line = "__HERMIT_COMMAND_END__ status={}".format(status).encode()
+                line = _end(status)
                 self.assertEqual(qc.end_line_status(line), status)
                 result = qc.parse_command_transcript(FRAME_BEGIN + b"\r\n" + line + b"\r\n")
                 self.assertEqual(result, qc.CommandResult(b"", status, ()))
         for line in (
             b"__HERMIT_COMMAND_END__",
+            b"__HERMIT_COMMAND_END__\x01",
+            b"__HERMIT_COMMAND_END__\x01status=",
+            b"__HERMIT_COMMAND_END__\x01status=256",
+            b"__HERMIT_COMMAND_END__\x01status=1000",
+            b"__HERMIT_COMMAND_END__\x01status=007",
+            b"__HERMIT_COMMAND_END__\x01status=00",
+            b"__HERMIT_COMMAND_END__\x01status=-1",
+            b"__HERMIT_COMMAND_END__\x01status=+3",
+            b"__HERMIT_COMMAND_END__\x01status=3 ",
+            b"__HERMIT_COMMAND_END__\x01status=3x",
+            b"__HERMIT_COMMAND_END__\x01\x01status=3",
+            b"__HERMIT_COMMAND_END__ \x01status=3",
+            b"__HERMIT_COMMAND_END__\x01 status=3",
+            b" __HERMIT_COMMAND_END__\x01status=3",
+            b"| __HERMIT_COMMAND_END__\x01status=3",
+            b"__HERMIT_COMMAND_END__\x01status=3\r",
+            # Without the 0x01 byte: frame format 2's END line and its variants,
+            # and the same line with the 0x01 byte removed.
             b"__HERMIT_COMMAND_END__ status=",
+            b"__HERMIT_COMMAND_END__ status=0",
+            b"__HERMIT_COMMAND_END__ status=3",
             b"__HERMIT_COMMAND_END__ status=256",
-            b"__HERMIT_COMMAND_END__ status=1000",
-            b"__HERMIT_COMMAND_END__ status=007",
-            b"__HERMIT_COMMAND_END__ status=00",
-            b"__HERMIT_COMMAND_END__ status=-1",
-            b"__HERMIT_COMMAND_END__ status=+3",
-            b"__HERMIT_COMMAND_END__ status=3 ",
-            b"__HERMIT_COMMAND_END__ status=3x",
             b"__HERMIT_COMMAND_END__  status=3",
-            b" __HERMIT_COMMAND_END__ status=3",
-            b"| __HERMIT_COMMAND_END__ status=3",
-            b"__HERMIT_COMMAND_END__ status=3\r",
+            b"__HERMIT_COMMAND_END__status=3",
         ):
             with self.subTest(line=line):
                 self.assertIsNone(qc.end_line_status(line))
@@ -453,36 +653,72 @@ class TranscriptParserTest(unittest.TestCase):
             FRAME_BEGIN + b"\r\n"
             b"| one\r\n"
             b"[   12.345678] random: crng init done\r\n"
-            b"__HERMIT_COMMAND_END__ status=256\r\n"
-            b"__HERMIT_COMMAND_END__\r\n"
-            b"| two\r\n"
+            + _end(256)
+            + b"\r\n"
             b"__HERMIT_COMMAND_END__ status=0\r\n"
+            b"__HERMIT_COMMAND_END__\r\n"
+            b"| two\r\n" + _end(0) + b"\r\n"
         )
         self.assertEqual(
             qc.parse_command_transcript(transcript),
             qc.CommandResult(
                 b"one\n"
                 b"[console] [   12.345678] random: crng init done\n"
-                b"[console] __HERMIT_COMMAND_END__ status=256\n"
+                b"[console] " + _end(256) + b"\n"
+                b"[console] __HERMIT_COMMAND_END__ status=0\n"
                 b"[console] __HERMIT_COMMAND_END__\n"
                 b"two\n",
                 0,
                 (
                     b"[   12.345678] random: crng init done",
-                    b"__HERMIT_COMMAND_END__ status=256",
+                    _end(256),
+                    b"__HERMIT_COMMAND_END__ status=0",
                     b"__HERMIT_COMMAND_END__",
                 ),
             ),
         )
 
+    def test_the_tail_of_a_split_output_line_is_not_an_end_line(self):
+        # A kernel message printed while an output line is being sent splits
+        # the line: its tail arrives as a line of its own. /init removes byte
+        # 0x01 from the command's output, so whatever the command printed, the
+        # tail is kept as a console line and the frame goes on.
+        transcript = (
+            FRAME_BEGIN + b"\r\n"
+            b"| padding[   12.345678] traps: sh[71] general protection\r\n"
+            b"__HERMIT_COMMAND_END__status=0\r\n"
+            b"| padding[   12.456789] traps: sh[72] general protection\r\n"
+            b"__HERMIT_COMMAND_END__ status=0\r\n"
+            b"| still running\r\n" + _end(4) + b"\r\n"
+        )
+        self.assertEqual(
+            qc.parse_command_transcript(transcript),
+            qc.CommandResult(
+                b"padding[   12.345678] traps: sh[71] general protection\n"
+                b"[console] __HERMIT_COMMAND_END__status=0\n"
+                b"padding[   12.456789] traps: sh[72] general protection\n"
+                b"[console] __HERMIT_COMMAND_END__ status=0\n"
+                b"still running\n",
+                4,
+                (b"__HERMIT_COMMAND_END__status=0", b"__HERMIT_COMMAND_END__ status=0"),
+            ),
+        )
+
     def test_lines_before_the_frame_are_ignored(self):
         transcript = (
+            _end(0)
+            + b"\r\n"
             b"__HERMIT_COMMAND_END__ status=0\r\n"
             b"| not the command's\r\n"
             + FRAME_BEGIN
             + b" \r\n"
+            # A kernel message printed onto the end of a BEGIN line of another
+            # format is not a whole BEGIN line, so it is ignored too.
+            b"__HERMIT_COMMAND_BEGIN__ format=2[   12.345678] random: crng init done\r\n"
             + FRAME_BEGIN
-            + b"\r\n| inside\r\n__HERMIT_COMMAND_END__ status=5\r\n"
+            + b"\r\n| inside\r\n"
+            + _end(5)
+            + b"\r\n"
         )
         self.assertEqual(
             qc.parse_command_transcript(transcript),
@@ -490,28 +726,42 @@ class TranscriptParserTest(unittest.TestCase):
         )
 
     def test_a_stale_guest_init_is_named(self):
-        with self.assertRaises(qc.StaleGuestInitError) as caught:
-            qc.parse_command_transcript(
-                b"[   12.000000] boot noise\r\n"
-                b"__HERMIT_COMMAND_BEGIN__\r\n"
-                b"Linux (none) 6.17.13 #1 SMP x86_64 GNU/Linux\r\n"
-                b"__HERMIT_COMMAND_END__\r\n"
-            )
-        self.assertEqual(str(caught.exception), qc.STALE_GUEST_INIT_MESSAGE)
-        self.assertIn("demos/clean.sh", qc.STALE_GUEST_INIT_MESSAGE)
-        self.assertIn("demo 5", qc.STALE_GUEST_INIT_MESSAGE)
-        # Inside a current frame the bare BEGIN line is output, not a stale init.
+        # The BEGIN lines of /init before frame format 2, of format 2, and of a
+        # format this code does not know.
+        for begin in (
+            b"__HERMIT_COMMAND_BEGIN__",
+            b"__HERMIT_COMMAND_BEGIN__ format=2",
+            b"__HERMIT_COMMAND_BEGIN__ format=30",
+        ):
+            with self.subTest(begin=begin):
+                with self.assertRaises(qc.StaleGuestInitError) as caught:
+                    qc.parse_command_transcript(
+                        b"[   12.000000] boot noise\r\n"
+                        + begin
+                        + b"\r\n"
+                        b"Linux (none) 6.17.13 #1 SMP x86_64 GNU/Linux\r\n"
+                        b"__HERMIT_COMMAND_END__\r\n"
+                    )
+                message = str(caught.exception)
+                self.assertEqual(message, qc.stale_guest_init_message(begin))
+                self.assertIn('"{}"'.format(begin.decode()), message)
+                self.assertIn('"{}"'.format(FRAME_BEGIN.decode()), message)
+                self.assertIn("demos/clean.sh", message)
+                self.assertIn("demo 5", message)
+        # Inside a current frame the old BEGIN lines are output or console
+        # lines, not a stale init.
         self.assertEqual(
             qc.parse_command_transcript(
                 FRAME_BEGIN + b"\r\n"
                 b"| __HERMIT_COMMAND_BEGIN__\r\n"
                 b"__HERMIT_COMMAND_BEGIN__\r\n"
-                b"__HERMIT_COMMAND_END__ status=0\r\n"
+                b"__HERMIT_COMMAND_BEGIN__ format=2\r\n" + _end(0) + b"\r\n"
             ),
             qc.CommandResult(
-                b"__HERMIT_COMMAND_BEGIN__\n[console] __HERMIT_COMMAND_BEGIN__\n",
+                b"__HERMIT_COMMAND_BEGIN__\n[console] __HERMIT_COMMAND_BEGIN__\n"
+                b"[console] __HERMIT_COMMAND_BEGIN__ format=2\n",
                 0,
-                (b"__HERMIT_COMMAND_BEGIN__",),
+                (b"__HERMIT_COMMAND_BEGIN__", b"__HERMIT_COMMAND_BEGIN__ format=2"),
             ),
         )
 
@@ -519,8 +769,7 @@ class TranscriptParserTest(unittest.TestCase):
         transcript = (
             FRAME_BEGIN + b"\r\n"
             b"| a\r\n"
-            b"| b\r\n"
-            b"__HERMIT_COMMAND_END__ status=7\r\n"
+            b"| b\r\n" + _end(7) + b"\r\n"
             b"Interactive busybox shell. Type 'poweroff -f' to exit.\r\n"
         )
         whole = qc.parse_command_transcript(transcript)
@@ -543,8 +792,7 @@ class TranscriptParserTest(unittest.TestCase):
         transcript = (
             FRAME_BEGIN + b"\r\n"
             b"| a\rb\r\r\n"
-            b"| plain\n"
-            b"__HERMIT_COMMAND_END__ status=0\r\n"
+            b"| plain\n" + _end(0) + b"\r\n"
         )
         self.assertEqual(
             qc.parse_command_transcript(transcript),
@@ -651,11 +899,14 @@ class Demo6ResumeTest(unittest.TestCase):
         self.assertEqual(
             failed_run_message(124, serial_log), "Hermit/QEMU exited with status 124"
         )
-        serial_log.write_bytes(b"__HERMIT_COMMAND_BEGIN__\r\nLinux (none)\r\n")
-        self.assertEqual(
-            failed_run_message(1, serial_log),
-            "Hermit/QEMU exited with status 1: " + qc.STALE_GUEST_INIT_MESSAGE,
-        )
+        for begin in (b"__HERMIT_COMMAND_BEGIN__", b"__HERMIT_COMMAND_BEGIN__ format=2"):
+            with self.subTest(begin=begin):
+                serial_log.write_bytes(begin + b"\r\nLinux (none)\r\n")
+                self.assertEqual(
+                    failed_run_message(1, serial_log),
+                    "Hermit/QEMU exited with status 1: "
+                    + qc.stale_guest_init_message(begin),
+                )
 
 
 if __name__ == "__main__":

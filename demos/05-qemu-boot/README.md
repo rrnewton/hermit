@@ -88,7 +88,7 @@ the next verified run.
 Hermit boots QEMU/Linux, streams the serial console, saves a live snapshot,
 and compares every repeat run with the first run.
 Dependency check passed: hermit 0.2.0 (...) (...)
-QEMU dependency check passed: qemu-system-x86_64 qemu-img python3 static-busybox file cpio gzip sha256sum touch kernel-source
+QEMU dependency check passed: qemu-system-x86_64 qemu-img python3 static-busybox file cpio gzip sed sha256sum touch kernel-source
 
 ================================================================================
 

@@ -225,16 +225,41 @@ instead of `WAIT`, and runs it. The command is on disk before the guest runs,
 so nothing depends on when the host sends it.
 
 `/init` frames the command's output so that nothing the command prints can be
-taken for the frame. It prints `__HERMIT_COMMAND_BEGIN__ format=2`, runs the
-command with its standard output and standard error going to a file, prints
-that file with `| ` in front of every line, and then prints
-`__HERMIT_COMMAND_END__ status=N`, where `N` is the command's exit status. The
+taken for the frame. It prints `__HERMIT_COMMAND_BEGIN__ format=3`, then runs
+the command as user and group 1000 (BusyBox `chpst -u 1000:1000`), with its
+standard input from `/dev/null` and its standard output and standard error
+going to a file. It prints that file with `| ` in front of every line and every
+byte 0x01 (ASCII SOH) removed, and then prints `__HERMIT_COMMAND_END__`, one
+0x01 byte, and `status=N`, where `N` is the command's exit status. The
 controller ([`lib/qemu_controller.py`](../lib/qemu_controller.py)) reads the
 transcript line by line and accepts only these exact whole lines as the frame.
 A command that prints the end marker itself, for example
 `echo __HERMIT_COMMAND_END__; sleep 1000000`, produces the line
 `| __HERMIT_COMMAND_END__`, which neither ends the wait nor cuts the output
-short. When the real END line arrives, the controller asks QEMU to save a
+short.
+
+The command cannot print a frame line by another route either:
+
+- It cannot write to the serial port. `/dev/console` and `/dev/ttyS0` belong to
+  root with mode 0600, and the command is not root. Its standard input is
+  `/dev/null`, so it holds no console file descriptor: before this change the
+  command inherited `/init`'s standard input, the console opened for reading
+  and writing, and `echo ... >&0` put a forged END line straight on the serial
+  port.
+- It cannot make the kernel print one. `/dev/kmsg` has mode 0644, so user 1000
+  cannot write to it, and the kernel command line holds `printk.time=1`, so
+  every line the kernel prints starts with a `[` timestamp.
+- It cannot change what `/init` prints. No output line holds a 0x01 byte, so
+  neither an output line nor the tail of one that a kernel message split in
+  two is an END line. User 1000 cannot signal or trace `/init`, and because
+  `/tmp` is sticky (mode 1777) it cannot remove or rename the output file,
+  which `/init` creates as root; writing into that file only changes its own
+  output.
+
+This rests on the guest kernel. A kernel bug or privilege escalation that
+gives user 1000 root, or a kernel or initramfs other than demo 5's with
+different device modes, would reopen these routes; the demo does not defend
+against the guest kernel. When the real END line arrives, the controller asks QEMU to save a
 snapshot named `command-<first 16 hex digits of the command's SHA-256>`. The
 demo removes the `| ` prefixes to get the guest output. Any other line inside
 the frame, such as a kernel message, is kept in the guest output with
@@ -248,20 +273,29 @@ The framing has these consequences and limits:
   one name per line instead of columns), and C programs buffer their standard
   output, so its lines can come out in a different order relative to standard
   error than they would at a terminal.
-- A command that writes to `/dev/console` directly bypasses the file and can
-  still print any line, including an END line.
+- The command runs as user and group 1000, not root, and reads `/dev/null` as
+  its standard input. A command that needs root, such as `mount`, reading
+  `/dev/vda`, or writing under `/proc/sys`, fails with a permission error. It
+  can still create files in `/tmp`.
 - The file is `/tmp/.hermit-command-output` in the guest's memory. A command
   that reads or writes it interferes with its own output.
-- A last line without a newline is printed with one, and NUL bytes are not
-  preserved. Output that a background job writes after the command has exited
-  is not shown.
+- A last line without a newline is printed with one, and NUL bytes and 0x01
+  bytes are not preserved. Output that a background job writes after the
+  command has exited is not shown.
 - A kernel message printed in the middle of the END line hides that line, so
   the controller keeps waiting and the run fails at its timeout; it never ends
   with a cut-off output.
-- A boot snapshot saved before this change still runs the old `/init`, which
-  prints a bare `__HERMIT_COMMAND_BEGIN__` line. The controller stops as soon
-  as it sees that line, and the demo says to run `demos/clean.sh` and then
-  demo 5 again.
+- A boot snapshot saved before this change still runs an old `/init`, which
+  prints a bare `__HERMIT_COMMAND_BEGIN__` line or one ending in `format=2`.
+  The controller stops as soon as it sees such a line, names it, and the demo
+  says to run `demos/clean.sh` and then demo 5 again. `demos/lib/qemu-assets.sh`
+  rebuilds the initramfs by itself (its `.initramfs-version` is now 9), but
+  only demo 5 saves a new boot snapshot.
+- A reference run saved before this change was started with another kernel
+  command line, without `printk.time=1`, so its comparison reports
+  `WARN: QEMU argv differs from first run` and the run ends `PARTIAL`, never
+  `SUCCESS`. This holds for demo 5's saved first boot too. `demos/clean.sh`
+  removes both.
 
 The resume runs under `hermit run --strict --epoch 2026-01-01T00:00:00Z
 --no-rcb-time --target-timeslice 100000 --max-timeslice disabled`. It switches
