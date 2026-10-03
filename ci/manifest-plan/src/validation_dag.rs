@@ -1276,8 +1276,10 @@ pub const FULL_BUCK_E2E_LABEL: &str = "full-buck-e2e";
 /// The host node that runs every E2E cell under Buck/Tpx.
 pub const BUCK_CELLS_TAG: &str = "e2e.buck_cells";
 const BUCK_TWIN_SUFFIX: &str = "_buck";
-/// Where e2e.buck_cells leaves the Buck rows and the twins import them from.
-const BUCK_IMPORT_ROOT: &str = "$VALIDATE_RUN_STATE/buck-e2e/results";
+/// The assignment that puts a twin's `target/debug/test-harness run` in import mode,
+/// naming where e2e.buck_cells leaves the Buck rows.
+pub const BUCK_IMPORT_ASSIGNMENT: &str =
+    "E2E_IMPORT_RESULTS=\"$VALIDATE_RUN_STATE/buck-e2e/results\" ";
 const BUCK_CELLS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node"#;
 /// The scorecard that judges the cargo buckets' result files, and its twin.
 const FULL_SCORECARD_TAG: &str = "full-scorecard.compatibility";
@@ -1401,7 +1403,10 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         let cargo = bucket.tag();
         // A twin executes no cell, so it runs on the host (runs_in_pinned_root
         // excludes it): keep only the payload of an authored pinned-root wrapper.
-        let payload = if bucket.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        let payload = if bucket
+            .cmd
+            .starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+        {
             let argv = shell_words::split(&bucket.cmd)
                 .map_err(|error| format!("{cargo}: invalid pinned-root quoting: {error}"))?;
             let boundary = argv
@@ -1440,7 +1445,7 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         twin.labels = vec![FULL_BUCK_E2E_LABEL.into()];
         twin.cmd = payload.replace(
             launcher,
-            &format!("E2E_IMPORT_RESULTS=\"{BUCK_IMPORT_ROOT}\" target/debug/test-harness run "),
+            &format!("{BUCK_IMPORT_ASSIGNMENT}target/debug/test-harness run "),
         );
         twin.deps = deps.iter().map(|dep| (*dep).to_string()).collect();
         twin.env.clear();
@@ -2318,7 +2323,11 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     let selected = buck_e2e_selection(cfg)?;
     let full = select_steps_by_labels(cfg, &["full".to_string()])?;
     let full_tags = full.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-    let selected_tags = selected.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let selected_tags = selected
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     // The selection is the full profile minus the replaced nodes plus exactly
     // the full-buck-e2e nodes (on the committed DAG: 87 - 22 + 18 = 83, pinned
     // by committed_buck_e2e_selection_has_83_steps).
@@ -2349,14 +2358,12 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     for step in &selected.steps {
         if step.labels == [FULL_BUCK_E2E_LABEL]
             && step.tag() != BUCK_CELLS_TAG
-            && !step.deps.iter().any(|dep| {
-                dep == BUCK_CELLS_TAG || dep.ends_with(BUCK_TWIN_SUFFIX)
-            })
+            && !step
+                .deps
+                .iter()
+                .any(|dep| dep == BUCK_CELLS_TAG || dep.ends_with(BUCK_TWIN_SUFFIX))
         {
-            return Err(format!(
-                "{} does not wait for the Buck rows",
-                step.tag()
-            ));
+            return Err(format!("{} does not wait for the Buck rows", step.tag()));
         }
         // A twin reads rows it is handed on the host; inside the pinned root
         // $VALIDATE_RUN_STATE would not name the rows e2e.buck_cells wrote.

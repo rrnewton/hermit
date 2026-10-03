@@ -7431,6 +7431,19 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
                 ));
             }
             String::new()
+        } else if step
+            .labels
+            .iter()
+            .map(String::as_str)
+            .eq([hermit_manifest_plan::validation_dag::FULL_BUCK_E2E_LABEL])
+        {
+            // The third: a full-buck-e2e twin runs no Hermit. It publishes its
+            // bucket's cells from the rows e2e.buck_cells wrote, by putting the
+            // same harness selection in import mode.
+            if hermit_bin.is_some() {
+                return Err(format!("{tag} imports rows but sets HERMIT_BIN"));
+            }
+            hermit_manifest_plan::validation_dag::BUCK_IMPORT_ASSIGNMENT.to_string()
         } else {
             if hermit_bin.is_some() {
                 return Err(format!("{tag} overrides the e2e artifact's HERMIT_BIN"));
@@ -16927,11 +16940,26 @@ fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
     let source = source
         .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
         .unwrap_or(&source);
+    // A full-buck-e2e twin runs the same harness selection in import mode.
+    let source = source
+        .strip_prefix(hermit_manifest_plan::validation_dag::BUCK_IMPORT_ASSIGNMENT)
+        .unwrap_or(source);
     let source = source
         .strip_prefix("./ci/run-with-hermit-e2e-artifact.sh ")
         .map(|inner| inner.strip_prefix("--require-install ").unwrap_or(inner))
         .unwrap_or(source);
     Ok(source.to_owned())
+}
+
+// Whether a manifest node only imports rows another node executed (a
+// full-buck-e2e twin): it runs no cell, so no cell attempt needs to fit its
+// timeout.
+fn manifest_command_imports(tag: &str, command: &str) -> Result<bool, String> {
+    let source = guarded_command_source(tag, command)?;
+    let source = source
+        .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+        .unwrap_or(&source);
+    Ok(source.starts_with(hermit_manifest_plan::validation_dag::BUCK_IMPORT_ASSIGNMENT))
 }
 
 fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool), String> {
@@ -17614,6 +17642,13 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
+            // Exactly the twins import; every other node executes its cells.
+            assert_eq!(
+                manifest_command_imports(&step.tag(), &step.cmd).unwrap(),
+                step.labels == [hermit_manifest_plan::validation_dag::FULL_BUCK_E2E_LABEL],
+                "{}",
+                step.tag()
+            );
             let selected = manifests
                 .select(&selection)
                 .unwrap()
@@ -18420,6 +18455,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .filter(|step| step.cmd.contains("target/debug/test-harness run "))
     {
         let (selection, prebuilt) = manifest_step_policy(step)?;
+        if manifest_command_imports(&step.tag(), &step.cmd)? {
+            continue;
+        }
         let effective_multipliers = step_timeout_multipliers(step, timeout_multipliers)?;
         if let Some(headroom_s) = require_manifest_selection_headroom(
             &manifests,
@@ -31700,6 +31738,15 @@ mod raw_census_publication_tests {
         assert_eq!(publishers.len(), 56);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
+            // Only the full-buck-e2e label admits the import launcher.
+            if step.labels == [hermit_manifest_plan::validation_dag::FULL_BUCK_E2E_LABEL] {
+                let mut relabelled = step.clone();
+                relabelled.labels = vec!["full".into()];
+                assert_eq!(
+                    normal_raw_result_path(&relabelled, "fixture-run").unwrap_err(),
+                    format!("{} is not the exact normal harness publisher", step.tag())
+                );
+            }
             let expects_proc_locks_runtime = matches!(
                 step.tag().as_str(),
                 "e2e.manifest_c_programs" | "quick.e2e_verify"
