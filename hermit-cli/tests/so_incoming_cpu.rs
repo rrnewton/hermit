@@ -68,5 +68,31 @@ fn incoming_cpu_is_the_virtual_cpu_under_strict_verify() {
             stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
             "{transport} omitted Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+
+        // The TCP guests are servers that bind, listen and accept4 on a socket
+        // connected to themselves. Replay used to run those calls live and hang
+        // in accept: https://github.com/rrnewton/hermit/issues/3550
+        let mut record = Command::new("timeout");
+        record
+            .args(["--kill-after", "5s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--backend=ptrace",
+                "record",
+                "start",
+                "--base-env=minimal",
+                "--strict",
+                "--verify",
+                "--",
+            ])
+            .arg(&guest);
+        let output = command_output(record, &format!("{transport} record and replay"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("Success: replay matched recording.")
+                || stderr.contains("Success: replay matched recording."),
+            "{transport} replay did not match its recording\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 }

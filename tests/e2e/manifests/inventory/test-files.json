@@ -1495,6 +1495,12 @@
       "why": "tests/c/record_replay_setsockopt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_socket_calls.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_socket_calls.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite records and replays this guest to cover the socket setup and batched message calls from https://github.com/rrnewton/hermit/issues/3550."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/recvmsg_scm_rights_mmap.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

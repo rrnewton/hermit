@@ -446,6 +446,14 @@ impl Tool for Recorder {
             Sysno::connect,
             Sysno::sendto,
             Sysno::sendmsg,
+            Sysno::sendmmsg,
+            Sysno::recvmmsg,
+            Sysno::bind,
+            Sysno::listen,
+            Sysno::accept,
+            Sysno::accept4,
+            Sysno::shutdown,
+            Sysno::socketpair,
             Sysno::poll,
             Sysno::ppoll,
             Sysno::select,
@@ -583,6 +591,19 @@ impl Tool for Recorder {
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579):
+            // record the results replay needs: bind and listen run again live
+            // and must match, except on accepted or connected sockets, where
+            // replay returns these results; accept and shutdown always do.
+            Syscall::Bind(_) | Syscall::Listen(_) | Syscall::Shutdown(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            Syscall::Accept(call) => self.handle_accept(guest, syscall, call.into()).await,
+            Syscall::Accept4(call) => self.handle_accept(guest, syscall, call).await,
+            Syscall::Socketpair(call) => self.handle_socketpair(guest, call).await,
+            Syscall::Recvmmsg(call) => self.handle_recvmmsg(guest, call).await,
+            Syscall::Sendmmsg(call) => self.handle_sendmmsg(guest, call).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
             Syscall::Select(syscall) => self.handle_select(guest, syscall).await,

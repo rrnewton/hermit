@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Accept4;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
@@ -16,14 +17,19 @@ use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
+use reverie::syscalls::Recvmmsg;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Select;
+use reverie::syscalls::Sendmmsg;
+use reverie::syscalls::Socketpair;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
+use crate::event::RecvmsgEvent;
 use crate::event::SelectEvent;
 use crate::event::fd_set_bytes;
 
@@ -143,6 +149,80 @@ fn write_bytes<M: MemoryAccess>(
     }
     let address = AddrMut::<u8>::from_raw(pointer as usize).ok_or(Errno::EFAULT)?;
     memory.write_exact(address.cast(), bytes)
+}
+
+/// Write a recorded receive back through the guest `msghdr` at
+/// `message_address`. Shared by `recvmsg` and every message of `recvmmsg`.
+fn restore_recvmsg<M: MemoryAccess>(
+    memory: &mut M,
+    message_address: AddrMut<'_, libc::msghdr>,
+    event: &RecvmsgEvent,
+) -> Result<(), Errno> {
+    let message: libc::msghdr = memory.read_value(message_address)?;
+    let iovecs = crate::read_iovecs(memory, &message)?;
+    assert_eq!(iovecs.len(), event.iovs.len());
+
+    for (iovec, bytes) in iovecs.into_iter().zip(&event.iovs) {
+        assert!(bytes.len() <= iovec.iov_len);
+        write_bytes(memory, iovec.iov_base, bytes)?;
+    }
+
+    assert!(event.name.len() <= message.msg_namelen as usize);
+    assert!(event.control.len() <= message.msg_controllen);
+    write_bytes(memory, message.msg_name, &event.name)?;
+    write_bytes(memory, message.msg_control, &event.control)?;
+
+    // Linux writes back only these fields, and msg_namelen only with a name
+    // buffer; the rest of the header may be on a page the guest cannot write.
+    let header = message_address.as_raw();
+    if !message.msg_name.is_null() {
+        write_field(
+            memory,
+            header + std::mem::offset_of!(libc::msghdr, msg_namelen),
+            &event.name_len,
+        )?;
+    }
+    write_field(
+        memory,
+        header + std::mem::offset_of!(libc::msghdr, msg_controllen),
+        &event.control_len,
+    )?;
+    write_field(
+        memory,
+        header + std::mem::offset_of!(libc::msghdr, msg_flags),
+        &event.flags,
+    )
+}
+
+fn write_field<M: MemoryAccess, T: Copy>(
+    memory: &mut M,
+    address: usize,
+    value: &T,
+) -> Result<(), Errno> {
+    let address = AddrMut::<T>::from_raw(address).ok_or(Errno::EFAULT)?;
+    memory.write_value(address, value)
+}
+
+/// The address of `mmsghdr` entry `index` of the array at `base`.
+fn mmsghdr_address<'a>(base: usize, index: usize) -> Result<AddrMut<'a, libc::mmsghdr>, Errno> {
+    index
+        .checked_mul(std::mem::size_of::<libc::mmsghdr>())
+        .and_then(|offset| base.checked_add(offset))
+        .and_then(AddrMut::from_raw)
+        .ok_or(Errno::EFAULT)
+}
+
+/// Write `length` to the `msg_len` field of `mmsghdr` entry `index`.
+fn write_mmsg_len<M: MemoryAccess>(
+    memory: &mut M,
+    base: usize,
+    index: usize,
+    length: u32,
+) -> Result<(), Errno> {
+    let entry = mmsghdr_address(base, index)?.as_raw();
+    let field = AddrMut::<u32>::from_raw(entry + std::mem::offset_of!(libc::mmsghdr, msg_len))
+        .ok_or(Errno::EFAULT)?;
+    memory.write_value(field, &length)
 }
 
 fn replay_select_event<M: MemoryAccess>(
@@ -368,26 +448,144 @@ impl Replayer {
         }
 
         let message_address = syscall.msg().ok_or(Errno::EFAULT)?;
-        let mut message: libc::msghdr = guest.memory().read_value(message_address)?;
-        let iovecs = crate::read_iovecs(&guest.memory(), &message)?;
-        assert_eq!(iovecs.len(), event.iovs.len());
-
-        for (iovec, bytes) in iovecs.into_iter().zip(&event.iovs) {
-            assert!(bytes.len() <= iovec.iov_len);
-            write_bytes(&mut guest.memory(), iovec.iov_base, bytes)?;
-        }
-
-        assert!(event.name.len() <= message.msg_namelen as usize);
-        assert!(event.control.len() <= message.msg_controllen);
-        write_bytes(&mut guest.memory(), message.msg_name, &event.name)?;
-        write_bytes(&mut guest.memory(), message.msg_control, &event.control)?;
-
-        message.msg_namelen = event.name_len;
-        message.msg_controllen = event.control_len;
-        message.msg_flags = event.flags;
-        guest.memory().write_value(message_address, &message)?;
+        restore_recvmsg(&mut guest.memory(), message_address, &event)?;
 
         Ok(event.result)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
+    /// Restore every recorded message of a `recvmmsg` without receiving live.
+    pub(super) async fn handle_recvmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Recvmmsg,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Recvmmsg)?;
+        assert!(event.messages.len() <= syscall.vlen() as usize);
+        let cloexec = syscall.flags() as i32 & libc::MSG_CMSG_CLOEXEC != 0;
+        let base = syscall.mmsg().ok_or(Errno::EFAULT)?.as_raw();
+
+        for (index, message) in event.messages.iter().enumerate() {
+            // Linux installs each message's SCM_RIGHTS fds in message order.
+            for fd in scm_rights_fds(&message.control) {
+                self.reserve_replay_fd(guest, fd, cloexec).await;
+            }
+            // msg_hdr is the first field of mmsghdr.
+            let header = mmsghdr_address(base, index)?.cast::<libc::msghdr>();
+            restore_recvmsg(&mut guest.memory(), header, message)?;
+            let length = u32::try_from(message.result).expect("recorded msg_len fits in u32");
+            write_mmsg_len(&mut guest.memory(), base, index, length)?;
+        }
+
+        if let Some(prefix) = &event.timeout_fault {
+            // Linux received these messages, then copied only `prefix` of the
+            // remaining timeout back before faulting.
+            assert!(event.timeout.is_none() && !event.messages.is_empty());
+            let address = syscall
+                .timeout()
+                .expect("a timeout fault needs a timeout")
+                .as_raw();
+            let address = AddrMut::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(address, prefix)?;
+            return Err(Errno::EFAULT);
+        }
+        // Linux writes the remaining timeout back exactly when it was given
+        // one and received something.
+        assert_eq!(
+            event.timeout.is_some(),
+            syscall.timeout().is_some() && !event.messages.is_empty()
+        );
+        if let Some(timeout) = event.timeout {
+            let address = AddrMut::<Timespec>::from_raw(syscall.timeout().unwrap().as_raw())
+                .ok_or(Errno::EFAULT)?;
+            guest.memory().write_value(address, &timeout)?;
+        }
+
+        Ok(event.messages.len() as i64)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
+    /// Restore the recorded `msg_len` of every message a `sendmmsg` sent.
+    pub(super) async fn handle_sendmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Sendmmsg,
+    ) -> Result<i64, Errno> {
+        let lengths = next_event!(guest, Sendmmsg)?;
+        assert!(lengths.len() <= syscall.vlen() as usize);
+        let base = syscall.msgvec().ok_or(Errno::EFAULT)?.as_raw();
+        for (index, length) in lengths.iter().enumerate() {
+            write_mmsg_len(&mut guest.memory(), base, index, *length)?;
+        }
+        Ok(lengths.len() as i64)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
+    /// Restore a recorded `accept`/`accept4` without accepting live: the
+    /// recorded peer never connects during replay, so a live accept would hang.
+    pub(super) async fn handle_accept<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        _syscall: Syscall,
+        call: Accept4,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Accept)?;
+
+        if let Some(addr_len) = event.addr_len {
+            let addr = call
+                .sockaddr()
+                .expect("recorded peer address requires a buffer");
+            let addr_len_address = call
+                .addrlen()
+                .expect("recorded peer address requires a length")
+                .cast::<libc::socklen_t>();
+            let capacity: libc::socklen_t = guest.memory().read_value(addr_len_address)?;
+            assert!(event.addr.len() <= capacity as usize);
+            write_bytes(
+                &mut guest.memory(),
+                addr.as_raw() as *mut libc::c_void,
+                &event.addr,
+            )?;
+            guest.memory().write_value(addr_len_address, &addr_len)?;
+        } else {
+            assert!(
+                call.sockaddr().is_none(),
+                "accept peer address shape diverged during replay"
+            );
+        }
+
+        let shape = event.shape.unwrap_or_else(|| {
+            panic!(
+                "recorded accept of fd {} lacks the socket shape replay needs to reserve it",
+                event.fd
+            )
+        });
+        self.reserve_replay_socket(guest, event.fd, shape, call.flags())
+            .await;
+        Ok(i64::from(event.fd))
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3579)
+    /// Recreate a recorded `socketpair` live. It touches no network, and the
+    /// resulting connected pair keeps later live fd operations valid; assert
+    /// the kernel chose the recorded fds.
+    pub(super) async fn handle_socketpair<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Socketpair,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Socketpair)?;
+        let actual = guest.inject_with_retry(syscall).await;
+        assert_eq!(actual, Ok(0), "socketpair side effects diverged");
+        let fds: [i32; 2] = guest
+            .memory()
+            .read_value(syscall.usockvec().ok_or(Errno::EFAULT)?)?;
+        assert_eq!(fds, recorded, "socketpair fd allocation diverged");
+        Ok(0)
     }
 
     pub(super) async fn handle_recvfrom<G: Guest<Self>>(
@@ -414,6 +612,70 @@ mod tests {
     use reverie::syscalls::PollFlags;
 
     use super::*;
+
+    #[test]
+    fn restore_recvmsg_writes_payload_name_and_header() {
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 4];
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        let mut name = [0u8; 2];
+        // SAFETY: an all-zero msghdr is valid; the fields used are set below.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = iovecs.as_mut_ptr();
+        message.msg_iovlen = iovecs.len();
+        message.msg_name = name.as_mut_ptr().cast();
+        message.msg_namelen = name.len() as libc::socklen_t;
+        let event = RecvmsgEvent {
+            result: 6,
+            iovs: vec![b"abcd".to_vec(), b"ef".to_vec()],
+            name: b"NA".to_vec(),
+            name_len: 16,
+            control: Vec::new(),
+            control_len: 0,
+            flags: libc::MSG_TRUNC,
+        };
+
+        restore_recvmsg(
+            &mut LocalMemory::new(),
+            AddrMut::from_raw((&mut message as *mut libc::msghdr) as usize).unwrap(),
+            &event,
+        )
+        .unwrap();
+
+        assert_eq!(&first, b"abcd");
+        assert_eq!(&second, b"ef\0\0");
+        assert_eq!(&name, b"NA");
+        assert_eq!(message.msg_namelen, 16);
+        assert_eq!(message.msg_controllen, 0);
+        assert_eq!(message.msg_flags, libc::MSG_TRUNC);
+    }
+
+    /// sendmmsg/recvmmsg replay writes each message's msg_len into its own
+    /// mmsghdr entry and leaves the header beside it untouched.
+    #[test]
+    fn write_mmsg_len_targets_each_entry() {
+        // SAFETY: an all-zero mmsghdr is valid.
+        let mut entries: [libc::mmsghdr; 3] = unsafe { std::mem::zeroed() };
+        entries[1].msg_hdr.msg_flags = 0x55;
+        let base = entries.as_mut_ptr() as usize;
+
+        write_mmsg_len(&mut LocalMemory::new(), base, 0, 7).unwrap();
+        write_mmsg_len(&mut LocalMemory::new(), base, 1, 9).unwrap();
+
+        assert_eq!(entries[0].msg_len, 7);
+        assert_eq!(entries[1].msg_len, 9);
+        assert_eq!(entries[2].msg_len, 0);
+        assert_eq!(entries[1].msg_hdr.msg_flags, 0x55);
+    }
 
     #[test]
     fn replay_poll_restores_outputs_before_returning_efault() {
