@@ -3784,9 +3784,9 @@ fn run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues() {
         .to_str()
         .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--",
         program,
@@ -3808,9 +3808,9 @@ fn run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error() {
         .to_str()
         .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
     let args = [
-        "run",
         "--backend",
         "kvm",
+        "run",
         "--strict",
         "--",
         program,
