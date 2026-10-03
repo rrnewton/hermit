@@ -284,7 +284,16 @@ impl SeriesPressureAttempt {
     /// Validate one retained invocation without changing its framework outcome.
     /// Callers that have original report bytes must additionally validate their
     /// digest and report semantics before constructing these compact facts.
-    pub fn validate_for_mode(&self, mode: &str) -> Result<(), String> {
+    ///
+    /// `declared` is the cell's `expected_guest_exit`, if it has one. A matched
+    /// verify invocation may then also end with exactly that disposition as
+    /// Hermit reports it ([`ExpectedGuestExit::hermit_status_matches`]). A
+    /// declaration the runner itself would refuse accepts nothing more.
+    pub fn validate_for_mode(
+        &self,
+        mode: &str,
+        declared: Option<&ExpectedGuestExit>,
+    ) -> Result<(), String> {
         let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
         if !matches!(self.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
             return Err("pressure_evidence has an unsupported inner outcome".into());
@@ -352,11 +361,16 @@ impl SeriesPressureAttempt {
         }
         let valid = match comparison.verdict {
             Verdict::Matched => {
-                completed_pass
-                    && self.signal.is_none()
+                let ordinary_exit = self.signal.is_none()
                     && self
                         .status
-                        .is_some_and(|status| mode == "chaos" || status == 0)
+                        .is_some_and(|status| mode == "chaos" || status == 0);
+                let declared_exit = declared.is_some_and(|declared| {
+                    validate_expected_guest_exit("declared_guest_exit", mode, Some(declared))
+                        .is_ok()
+                        && declared.hermit_status_matches(self.status, self.signal)
+                });
+                completed_pass && (ordinary_exit || declared_exit)
             }
             Verdict::Diverged => {
                 self.outcome == "FAIL"
@@ -854,12 +868,21 @@ impl SeriesRow {
             return Err("pressure_evidence.attempts must retain a nonempty inner history".into());
         }
         let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let declared = self
+            .series
+            .declared_guest_exit
+            .as_ref()
+            .map(|declared| ExpectedGuestExit {
+                code: declared.code,
+                signal: declared.signal,
+                reason: declared.reason.clone(),
+            });
         let mut indices = std::collections::BTreeSet::new();
         for attempt in &evidence.attempts {
             if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
                 return Err("pressure_evidence attempt indices must be nonempty and unique".into());
             }
-            attempt.validate_for_mode(mode)?;
+            attempt.validate_for_mode(mode, declared.as_ref())?;
         }
         if let Some(other) = &self.series.no_verdict_evidence {
             for disposition in &other.attempts {
@@ -2682,6 +2705,131 @@ mod tests {
         let mut raw = serde_json::to_value(&good).unwrap();
         raw["series"]["pressure_evidence"]["attempts"][0]["timed_out"] = serde_json::json!("false");
         assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
+    }
+
+    /// `pressure_row` for a cell that declares exit `code` or `signal`, whose
+    /// one inner invocation Hermit ended with `status` or `observed_signal`.
+    /// The declaration's own audit shows the declared disposition, so the
+    /// inner invocation is the only thing that varies.
+    fn declared_pressure_row(
+        code: Option<i32>,
+        signal: Option<i32>,
+        status: Option<i32>,
+        observed_signal: Option<i32>,
+    ) -> SeriesRow {
+        let mut value = pressure_row();
+        value.series.declared_guest_exit = declared_exit_row(code, signal, code, signal)
+            .series
+            .declared_guest_exit;
+        let inner = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.status = status;
+        inner.signal = observed_signal;
+        value
+    }
+
+    #[test]
+    fn pressure_history_admits_a_nonzero_match_only_as_declared() {
+        for (label, value) in [
+            ("status 0 without a declaration", pressure_row()),
+            (
+                "status 0 with a declaration",
+                declared_pressure_row(Some(23), None, Some(0), None),
+            ),
+            (
+                "the declared code",
+                declared_pressure_row(Some(23), None, Some(23), None),
+            ),
+            (
+                "the declared signal",
+                declared_pressure_row(None, Some(11), None, Some(11)),
+            ),
+            (
+                "the declared signal as 128 + 11",
+                declared_pressure_row(None, Some(11), Some(139), None),
+            ),
+        ] {
+            value
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        let mut undeclared = declared_pressure_row(Some(23), None, Some(23), None);
+        undeclared.series.declared_guest_exit = None;
+        let mut blank_reason = declared_pressure_row(Some(23), None, Some(23), None);
+        declared(&mut blank_reason).reason = " ".into();
+        let mut replay = declared_pressure_row(Some(23), None, Some(23), None);
+        replay.series.cell = "fixture/test/replay/ptrace".into();
+        let mut failed = declared_pressure_row(Some(23), None, Some(23), None);
+        let inner = &mut failed.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.outcome = "FAIL".into();
+        for (label, value) in [
+            ("status 23 without a declaration", undeclared),
+            (
+                "another code",
+                declared_pressure_row(Some(23), None, Some(22), None),
+            ),
+            (
+                "a signal for a declared code",
+                declared_pressure_row(Some(23), None, None, Some(23)),
+            ),
+            (
+                "128 + the declared code",
+                declared_pressure_row(Some(23), None, Some(151), None),
+            ),
+            (
+                "the declared signal's number as a code",
+                declared_pressure_row(None, Some(11), Some(11), None),
+            ),
+            (
+                "another signal",
+                declared_pressure_row(None, Some(11), None, Some(9)),
+            ),
+            (
+                "128 + another signal",
+                declared_pressure_row(None, Some(11), Some(137), None),
+            ),
+            // A declaration the runner itself refuses accepts nothing more.
+            ("a blank reason", blank_reason),
+            (
+                "a code out of range",
+                declared_pressure_row(Some(300), None, Some(300), None),
+            ),
+            (
+                "both a code and a signal",
+                declared_pressure_row(Some(23), Some(23), Some(23), None),
+            ),
+            ("a replay cell", replay),
+            ("an invocation that did not pass", failed),
+        ] {
+            let error = value.validate_for_read().unwrap_err();
+            assert!(
+                error.contains(
+                    "pressure_evidence matched report contradicts its inner process disposition"
+                ),
+                "{label}: {error}"
+            );
+        }
+        // The declaration admits an exit, never a verdict: every other verdict
+        // keeps its own rule for an invocation that ended as declared.
+        for verdict in [
+            Verdict::Diverged,
+            Verdict::InfrastructureError,
+            Verdict::NoResult,
+        ] {
+            let mut value = declared_pressure_row(Some(23), None, Some(23), None);
+            let comparison = value.series.pressure_evidence.as_mut().unwrap().attempts[0]
+                .comparison
+                .as_mut()
+                .unwrap();
+            comparison.verdict = verdict;
+            comparison.canonical = verdict == Verdict::Diverged;
+            let error = value.validate_for_read().unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "pressure_evidence {verdict} report contradicts its inner process disposition"
+                )),
+                "{verdict}: {error}"
+            );
+        }
     }
 
     #[test]
