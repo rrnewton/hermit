@@ -137,7 +137,13 @@ jobs:
         set -euo pipefail
         swapfile=/mnt/compatibility-rebuild.swap
         free -g
-        df -h /mnt
+        df -h /mnt "$RUNNER_TEMP"
+        # The swapfile is never removed, so it must not take space from the
+        # rebuild's scratch and target directories under $RUNNER_TEMP.
+        if [[ $(stat -c %d /mnt) == $(stat -c %d "$RUNNER_TEMP") ]]; then
+          echo "::error::/mnt and \$RUNNER_TEMP are on the same filesystem; refusing to put a 16 GiB swapfile there"
+          exit 1
+        fi
         sudo fallocate -l 16G "$swapfile"
         sudo chmod 600 "$swapfile"
         sudo mkswap "$swapfile"
@@ -185,6 +191,20 @@ jobs:
           jq -r '"Cell ledger: `" + .ledger_commit + "`", "Built identity: `" + .identity + "`", "Canonical validation history: `" + .validation_history_commit + "`"' "$RUNNER_TEMP/compatibility-rebuild.json"
           echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
         } >> "$GITHUB_STEP_SUMMARY"
+    - name: Record swap use by the compatibility rebuild
+      if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
+      # The rebuild's resource receipt does not count swapped-out pages, so its
+      # memory peaks stop near physical RAM once swap is on. Log the swap the
+      # rebuild actually used (https://github.com/rrnewton/dev-hermit/issues/515).
+      run: |
+        set -uo pipefail
+        swapon --show --bytes || true
+        grep -E '^Swap(Total|Free):' /proc/meminfo || true
+        cgroup=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+        for name in memory.peak memory.swap.peak memory.swap.current; do
+          printf '%s %s %s\n' "$cgroup" "$name" "$(cat "$cgroup/$name" 2>/dev/null || echo unavailable)"
+        done
+        free -g
     - name: Build documentation
       id: rustdoc
       # A documentation lint must not throw away a finished website rebuild.
