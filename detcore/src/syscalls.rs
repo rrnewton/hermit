@@ -25,6 +25,13 @@ mod sysinfo;
 mod threads;
 pub(crate) mod time;
 
+use std::path::PathBuf;
+
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
+use reverie::syscalls::ReadAddr;
+
 use crate::consts::DET_SPECIAL_INODE_OFFSET;
 use crate::resources::Device;
 use crate::resources::ResourceID;
@@ -55,6 +62,33 @@ pub(crate) fn deterministic_stdio_inode_for_resource(
         )) => deterministic_stdio_inode(fd),
         _ => None,
     }
+}
+
+/// Read a guest path argument.
+///
+/// With std, Reverie reads a path as a `PathBuf`. Without std Reverie has no
+/// `PathBuf` and returns the `CString` it read, so the Narf kernel build makes
+/// the `PathBuf` from those bytes, as Reverie's std build does.
+#[cfg(not(target_os = "none"))]
+pub(crate) fn read_guest_path<M: MemoryAccess>(
+    path: PathPtr<'_>,
+    memory: &M,
+) -> Result<PathBuf, Errno> {
+    path.read(memory)
+}
+
+/// Read a guest path argument; see the host version.
+#[cfg(target_os = "none")]
+pub(crate) fn read_guest_path<M: MemoryAccess>(
+    path: PathPtr<'_>,
+    memory: &M,
+) -> Result<PathBuf, Errno> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(PathBuf::from(OsString::from_vec(
+        path.read(memory)?.into_bytes(),
+    )))
 }
 
 #[cfg(test)]

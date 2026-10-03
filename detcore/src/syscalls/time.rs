@@ -9,9 +9,9 @@
 //! System calls for dealing with threads and concurrency.
 use std::time::Duration;
 
-use nix::sys::signal::Signal;
 use reverie::Error;
 use reverie::Guest;
+use reverie::Signal;
 use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::ClockId;

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-use nix::fcntl::OFlag;
+use reverie::syscalls::OFlag;
 use serde::Deserialize;
 use serde::Serialize;
 

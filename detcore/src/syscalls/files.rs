@@ -12,12 +12,11 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+#[cfg(not(target_os = "none"))]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-use nix::fcntl::AtFlags;
-use nix::fcntl::OFlag;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
@@ -25,10 +24,12 @@ use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::AtFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::ProtFlags;
 use reverie::syscalls::ReadAddr;
@@ -403,10 +404,18 @@ const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 ///
 /// `None` when the link cannot be read (the descriptor is gone, or procfs is
 /// unavailable), in which case the lexical result stands unchanged.
+#[cfg(not(target_os = "none"))]
 fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
     let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     // A deleted or anonymous target is not a stable object name.
     link.is_absolute().then_some(link)
+}
+
+/// Without std the supervisor has no `/proc` of its own: `None`, as when the
+/// host's procfs is unavailable, so the lexical result stands.
+#[cfg(target_os = "none")]
+fn resolved_open_path(_pid: i32, _fd: RawFd) -> Option<PathBuf> {
+    None
 }
 
 /// Resolve an `AT_FDCWD`-relative spelling in the guest's filesystem view.
@@ -415,12 +424,52 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
 /// root. Stripping `/proc/<pid>/root` produces the same guest-absolute path in
 /// record and replay without depending on the opened descriptor (which is an
 /// eventfd placeholder during replay).
+#[cfg(not(target_os = "none"))]
 fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     debug_assert!(!path.is_absolute());
     let root = std::fs::read_link(format!("/proc/{pid}/root")).ok()?;
     let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     let guest_cwd = cwd.strip_prefix(root).ok()?;
     Some(Path::new("/").join(guest_cwd).join(path))
+}
+
+/// Without std the supervisor has no `/proc` of its own: `None`, as when the
+/// host's procfs is unavailable, so the caller keeps the relative spelling.
+#[cfg(target_os = "none")]
+fn resolved_at_fdcwd_path(_pid: i32, path: &Path) -> Option<PathBuf> {
+    debug_assert!(!path.is_absolute());
+    None
+}
+
+/// The device and inode numbers of `path` in the supervisor's own view of
+/// `/proc`, or `None` when it cannot be read.
+#[cfg(not(target_os = "none"))]
+fn host_proc_identity(path: &str) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// Without std the supervisor has no `/proc` of its own: `None`, as when the
+/// host's cannot be read.
+#[cfg(target_os = "none")]
+fn host_proc_identity(_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
+/// The contents of `path` in the supervisor's own view of `/proc`.
+#[cfg(not(target_os = "none"))]
+fn read_host_proc(path: &str) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+/// Without std the supervisor has no `/proc` of its own, so the read fails and
+/// the caller reports that.
+#[cfg(target_os = "none")]
+fn read_host_proc(_path: &str) -> std::io::Result<Vec<u8>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the Narf kernel build of Detcore has no file system",
+    ))
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -465,9 +514,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the guest-path result above as their sole authority.
         if identity.is_none()
             && guest.config().recordreplay_modes
-            && let Ok(metadata) = std::fs::metadata(path)
+            && let Some(host_identity) = host_proc_identity(&path)
         {
-            identity = Some((metadata.dev(), metadata.ino()));
+            identity = Some(host_identity);
         }
         Ok(identity)
     }
@@ -936,7 +985,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Openat,
     ) -> Result<i64, Error> {
         let path = call.path().ok_or(Errno::EFAULT)?;
-        let path: PathBuf = path.read(&guest.memory())?;
+        let path: PathBuf = crate::syscalls::read_guest_path(path, &guest.memory())?;
         // A relative spelling is not the object. `chdir("/sys/module/kvm");
         // open("refcnt")` and an absolute open name the SAME kernel object, so
         // classifying the unresolved lexical pathname lets one spelling bypass
@@ -1464,7 +1513,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Mount/unshare/setns are refused once Detcore starts, so a
                 // tracer-side snapshot of this task's namespace is immutable.
                 let mountinfo_path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
-                let mountinfo_contents = std::fs::read(&mountinfo_path).map_err(|error| {
+                let mountinfo_contents = read_host_proc(&mountinfo_path).map_err(|error| {
                     Error::Tool(anyhow::anyhow!(
                         "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
                     ))
@@ -3965,7 +4014,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let port = match resp.1 {
                 GlobalResponse::RequestPort(port) => port,
                 GlobalResponse::PortFull => {
-                    return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                    return Err(reverie::Error::from(Errno::EADDRINUSE));
                 }
                 _ => unreachable!(),
             };
@@ -4004,7 +4053,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return Ok(self.record_or_replay(guest, deterministic_bind).await?);
                     }
                     GlobalResponse::PortFull => {
-                        return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                        return Err(reverie::Error::from(Errno::EADDRINUSE));
                     }
                     _ => unreachable!(),
                 }
@@ -4046,7 +4095,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .write_value(addr.cast::<libc::sockaddr_in>(), &sockaddr_in)?;
                     }
                     GlobalResponse::PortFull => {
-                        return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                        return Err(reverie::Error::from(Errno::EADDRINUSE));
                     }
                     _ => unreachable!(),
                 }
@@ -4086,7 +4135,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         trace!("Port assigned {}", port_assigned)
                     }
                     GlobalResponse::PortFull => {
-                        return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                        return Err(reverie::Error::from(Errno::EADDRINUSE));
                     }
                     _ => unreachable!(),
                 }

@@ -15,7 +15,6 @@ use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
-use nix::fcntl::OFlag;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
@@ -25,6 +24,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;

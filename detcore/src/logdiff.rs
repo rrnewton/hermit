@@ -26,6 +26,7 @@ use tempfile::NamedTempFile;
 
 use crate::detlog::DetLogEvent;
 use crate::detlog::DetLogRecord;
+pub use crate::detlog::host_addr;
 
 /// The in-band line a bounded log writer emits when a run's log file reaches
 /// its configured size bound.
@@ -424,21 +425,6 @@ pub fn strip_log_entry(log: &str) -> String {
     let log = RE1.replace_all(&log, "<NUM>");
     let log = RE2.replace_all(&log, "/tmp/<somewhere>\"");
     String::from(log)
-}
-
-/// Wrap a host memory address so `canonicalize_addresses_in_line` will
-/// canonicalize it. Producers that print a genuinely host-specific pointer
-/// (one that varies run-to-run, e.g. a supervisor-side allocation) should emit
-/// it via this helper -- `<hostaddr 0x7fcfb7e7d450>` -- instead of a bare
-/// `0x...` literal. Only marked addresses are canonicalized, so reproducible hex
-/// (syscall arguments, guest memory ranges, digests) is compared exactly.
-///
-/// Command bootstrap logs use this marker for proven launcher-image pointers
-/// before the first successful exec. Guest pointers, syscall scalars, and
-/// addresses without that provenance remain exact. Marking an address preserves
-/// its identity and aliasing through the per-run ordinal mapping below.
-pub fn host_addr(addr: usize) -> String {
-    format!("<hostaddr {addr:#x}>")
 }
 
 /// Rewrite each MARKED host memory address (`<hostaddr 0x...>`, see

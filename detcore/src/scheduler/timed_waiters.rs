@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use nix::sys::signal::Signal;
+use reverie::Signal;
 
 use crate::types::DetPid;
 use crate::types::DetTid;

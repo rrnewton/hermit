@@ -8,8 +8,11 @@
 
 //! Widely useful small utilities.
 
+#[cfg(not(target_os = "none"))]
 use std::sync::OnceLock;
+#[cfg(not(target_os = "none"))]
 use std::sync::atomic::AtomicU64;
+#[cfg(not(target_os = "none"))]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -18,6 +21,7 @@ use crate::types::NANOS_PER_RCB;
 #[allow(dead_code)]
 /// A simple debugging helper function that makes it easy to printf-debug through
 /// layers of stdout/stderr caputure, such as when running under buck test/tpx.
+#[cfg(not(target_os = "none"))]
 pub fn punch_out_print(msg: &str) {
     use std::io::Write;
     // TODO: if we want this to be more performant, we can have a lazy static
@@ -32,6 +36,14 @@ pub fn punch_out_print(msg: &str) {
         // If devtty doesn't exist, we just use stderr.
         eprintln!("{}", msg);
     }
+}
+
+/// Without std there is no `/dev/tty`: the message goes to the kernel's
+/// `eprintln!` sink.
+#[allow(dead_code)]
+#[cfg(target_os = "none")]
+pub fn punch_out_print(msg: &str) {
+    eprintln!("{}", msg);
 }
 /// A helper function to convert a number of Retired Conditional Branches (RCBS) into
 /// a `std::time::Duration` via the `NANOS_PER_RCB` defined in ` types.rs`.
@@ -180,6 +192,7 @@ pub struct RetryingStderr;
 /// On expiry the write returns `WouldBlock`, `writeln!` gives up, the caller's
 /// `let _ =` drops that line, and hermit exits — the pre-existing contract for a
 /// diagnostic that cannot be delivered.
+#[cfg(not(target_os = "none"))]
 pub const STDERR_DIAGNOSTIC_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// When this process first found stderr unwritable, shared by every
@@ -188,6 +201,7 @@ pub const STDERR_DIAGNOSTIC_DEADLINE: std::time::Duration = std::time::Duration:
 /// blocks again has still spent that earlier time on its exit path.
 ///
 /// Fallback only: used when the invocation-wide origin below is unavailable.
+#[cfg(not(target_os = "none"))]
 static STDERR_BLOCKED_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// The same instant, shared by every hermit process of ONE INVOCATION.
@@ -230,6 +244,7 @@ static STDERR_BLOCKED_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync
 /// another process, while `CLOCK_MONOTONIC` is system-wide on Linux, so the same
 /// nanosecond count is directly comparable between parent and child. 0 means
 /// unset; the first blocked write in ANY process installs the origin.
+#[cfg(not(target_os = "none"))]
 static STDERR_ORIGIN_ADDR: OnceLock<usize> = OnceLock::new();
 
 /// Create the origin cell every hermit process of this invocation shares.
@@ -239,6 +254,7 @@ static STDERR_ORIGIN_ADDR: OnceLock<usize> = OnceLock::new();
 /// so a late call would silently give each process its own origin -- the exact
 /// failure this removes. `main` dominates every `with_container` and
 /// `run_guarded_at` site in run.rs, replay.rs and record_start.rs.
+#[cfg(not(target_os = "none"))]
 pub fn init_shared_stderr_deadline_origin() {
     STDERR_ORIGIN_ADDR.get_or_init(|| {
         // SAFETY: an anonymous shared mapping of one page, no fd, no fixed
@@ -265,6 +281,7 @@ pub fn init_shared_stderr_deadline_origin() {
     });
 }
 
+#[cfg(not(target_os = "none"))]
 fn shared_origin_cell() -> Option<&'static AtomicU64> {
     match STDERR_ORIGIN_ADDR.get() {
         None | Some(0) => None,
@@ -275,6 +292,7 @@ fn shared_origin_cell() -> Option<&'static AtomicU64> {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 fn monotonic_nanos() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -291,12 +309,14 @@ fn monotonic_nanos() -> u64 {
 /// something forks before `init_shared_stderr_deadline_origin`, the bound
 /// degrades to per-process and is multiplied by however many processes write.
 #[doc(hidden)]
+#[cfg(not(target_os = "none"))]
 pub fn stderr_deadline_is_shared() -> bool {
     shared_origin_cell().is_some()
 }
 
 /// How long this invocation has been blocked on stderr, from the shared origin
 /// when there is one and from this process's own first block otherwise.
+#[cfg(not(target_os = "none"))]
 fn stderr_blocked_for() -> std::time::Duration {
     match shared_origin_cell() {
         Some(cell) => {
@@ -318,12 +338,14 @@ fn stderr_blocked_for() -> std::time::Duration {
 /// Reset the shared origin. Test-only: brackets that measure the deadline need
 /// each case to start from zero, and nothing in a real run wants this.
 #[doc(hidden)]
+#[cfg(not(target_os = "none"))]
 pub fn reset_stderr_deadline_origin_for_test() {
     if let Some(cell) = shared_origin_cell() {
         cell.store(0, Ordering::Release);
     }
 }
 
+#[cfg(not(target_os = "none"))]
 impl std::io::Write for RetryingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
@@ -378,6 +400,21 @@ impl std::io::Write for RetryingStderr {
                 _ => return Err(err),
             }
         }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Without std, the supervisor's diagnostics go to the kernel's `eprintln!`
+/// sink, which the kernel provides and which does not share a descriptor with
+/// the guest.
+#[cfg(target_os = "none")]
+impl std::io::Write for RetryingStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        eprint!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

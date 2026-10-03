@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
-use nix::fcntl::OFlag;
+#[cfg(not(target_os = "none"))]
 use nix::sys::stat;
+#[cfg(not(target_os = "none"))]
 use nix::unistd::Pid;
 use rand::Rng as _;
 use rand::RngExt as _;
@@ -32,7 +33,11 @@ use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
+// Without std, reverie-process's look-alike of nix's type, as in detcore-model.
+#[cfg(target_os = "none")]
+use reverie::Pid;
 use reverie::syscalls::CloneFlags;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
