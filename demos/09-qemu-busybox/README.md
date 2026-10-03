@@ -70,10 +70,11 @@ inside the private `/tmp`: the directory that holds `boot_qemu.sh`, the
 kernel, and the initramfs. For a checkout outside `/tmp` it adds nothing, so
 its command line is unchanged. The launcher is bound through its directory
 because Hermit cannot start a program whose path is itself a `--bind` target:
-it reports that the program does not exist. `--tmp=/tmp` would also work, but
-it would show QEMU everything in the host's `/tmp` and make all of it an input
-to the run. By hand, from a checkout under `/tmp`, give absolute paths and the
-same three options:
+it reports that the program does not exist
+(<https://github.com/rrnewton/hermit/issues/3626>). `--tmp=/tmp` would also
+work, but it would show QEMU everything in the host's `/tmp` and make all of it
+an input to the run. By hand, from a checkout under `/tmp`, give absolute
+paths and the same three options:
 
 ```bash
 hermit run --strict --epoch=2026-01-01T00:00:00Z \

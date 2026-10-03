@@ -19,8 +19,9 @@
 # after the bind's target (mapped_path in hermit-cli/src/bin/hermit/run.rs).
 # When the program is the target, the rest is empty, the join leaves the path
 # with a trailing slash, and a file path with a trailing slash is not found
-# (ENOTDIR), so Hermit reports that the program does not exist. Binding the
-# directory also shows the program the directory's other entries, which in the
+# (ENOTDIR), so Hermit reports that the program does not exist
+# (https://github.com/rrnewton/hermit/issues/3626). Binding the directory also
+# shows the program the directory's other entries, which in the
 # demos are the program alone or files tracked in the repository. A symbolic
 # link inside a bound directory is resolved in the program's view, where the
 # rest of the host's /tmp is hidden.
