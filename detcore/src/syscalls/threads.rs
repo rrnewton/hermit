@@ -726,9 +726,56 @@ impl KernelSignalState {
             & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32)
     }
 
-    /// Pending signals that would end a blocking wait under the guest's `mask`.
-    pub(crate) fn pending_interrupting(&self, mask: KernelSigset) -> KernelSigset {
-        self.pending & self.interrupting(mask)
+    /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
+    /// disposition is still `SIG_DFL`.
+    ///
+    /// Linux does not stop a process for one of these when its process group is
+    /// orphaned: `get_signal` discards the signal (`is_current_pgrp_orphaned`),
+    /// and a wait it reached restarts as if no signal had arrived. Whether a
+    /// group is orphaned depends on the parents and sessions of every process in
+    /// it, which Detcore does not track.
+    pub(crate) fn default_job_control_stops(&self) -> KernelSigset {
+        [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU]
+            .into_iter()
+            .fold(0, |set, signal| set | kernel_sigset_bit(signal))
+            & !(self.ignored | self.caught)
+    }
+
+    /// The signals that end a blocking wait under the guest's `mask`: those
+    /// [`interrupting`](Self::interrupting) names, without the default job-control
+    /// stops ([`default_job_control_stops`](Self::default_job_control_stops)) when
+    /// `defers_default_stops` is set.
+    ///
+    /// A wait sets it when Detcore's restart of the call would start a relative
+    /// timeout again (`NonblockableSyscall::restart_rearms_timeout`): a `poll` with
+    /// a timeout, and a timed `FUTEX_WAIT`. Ending such a wait for a stop that
+    /// Linux discards in an orphaned process group would restart it with a fresh
+    /// timeout, so it would return late. Left alone, the wait keeps its deadline,
+    /// as on hermit main, and a stop that Linux does not discard takes effect when
+    /// the call returns rather than when the signal arrives
+    /// (https://github.com/rrnewton/hermit/issues/3358). `SIGSTOP`, a caught
+    /// stop signal, and a fatal one still end the wait.
+    pub(crate) fn interrupting_wait(
+        &self,
+        mask: KernelSigset,
+        defers_default_stops: bool,
+    ) -> KernelSigset {
+        let interrupting = self.interrupting(mask);
+        if defers_default_stops {
+            interrupting & !self.default_job_control_stops()
+        } else {
+            interrupting
+        }
+    }
+
+    /// Pending signals that would end a blocking wait under the guest's `mask`
+    /// (see [`interrupting_wait`](Self::interrupting_wait)).
+    pub(crate) fn pending_interrupting(
+        &self,
+        mask: KernelSigset,
+        defers_default_stops: bool,
+    ) -> KernelSigset {
+        self.pending & self.interrupting_wait(mask, defers_default_stops)
     }
 }
 
@@ -1568,10 +1615,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 Ok(state) => state,
                                 Err(errno) => break Err(Error::Errno(errno)),
                             };
-                            let interrupting = state.interrupting(state.blocked);
+                            // A timed `FUTEX_WAIT` lets a default job-control stop
+                            // wait for its deadline (`KernelSignalState::interrupting_wait`).
+                            let defers_default_stops = call.restart_rearms_timeout();
+                            let interrupting =
+                                state.interrupting_wait(state.blocked, defers_default_stops);
                             let pending = eligible_pending_signals(
                                 guest,
-                                state.pending_interrupting(state.blocked),
+                                state.pending_interrupting(state.blocked, defers_default_stops),
                                 interrupting,
                             )
                             .await;
@@ -1586,6 +1637,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             Some(FutexSignalWatch {
                                 unblocked: !state.blocked
                                     & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                                defers_default_stops,
                                 pid: guest.pid().as_raw(),
                                 tid: guest.tid().as_raw(),
                             })
@@ -3168,12 +3220,12 @@ mod tests {
         // Caught and unblocked (SIGUSR1, SIGWINCH) and default-fatal (SIGTERM) end the
         // wait; blocked (SIGUSR2), ignored (SIGPIPE), and default-ignored ones do not.
         assert_eq!(
-            state.pending_interrupting(state.blocked),
+            state.pending_interrupting(state.blocked, false),
             bits(&[libc::SIGUSR1, libc::SIGWINCH, libc::SIGTERM])
         );
         // The mask the guest had when the wait began decides, not the current one.
         assert_eq!(
-            state.pending_interrupting(0),
+            state.pending_interrupting(0, false),
             bits(&[libc::SIGUSR1, libc::SIGUSR2, libc::SIGWINCH, libc::SIGTERM])
         );
         let interrupting = state.interrupting(state.blocked);
@@ -3185,6 +3237,47 @@ mod tests {
         );
         assert_eq!(kernel_sigset_bit(0), 0);
         assert_eq!(kernel_sigset_bit(65), 0);
+    }
+
+    /// A wait whose restart starts its relative timeout again does not end for a
+    /// default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU`, which Linux discards in an
+    /// orphaned process group; every other wait still does. `SIGSTOP`, a caught
+    /// stop signal, and a fatal signal end both kinds, and an ignored stop signal
+    /// ends neither (review of https://github.com/rrnewton/hermit/pull/3361 at
+    /// `cbb36408`, finding 4).
+    #[test]
+    fn a_rearming_wait_is_not_ended_by_a_default_job_control_stop() {
+        let stops = bits(&[libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU]);
+        let state = KernelSignalState {
+            pending: stops | bits(&[libc::SIGSTOP, libc::SIGTERM]),
+            ..Default::default()
+        };
+        assert_eq!(state.default_job_control_stops(), stops);
+        assert_eq!(state.pending_interrupting(0, false), state.pending);
+        assert_eq!(
+            state.pending_interrupting(0, true),
+            bits(&[libc::SIGSTOP, libc::SIGTERM])
+        );
+        let rearming = state.interrupting_wait(0, true);
+        assert_eq!(rearming & stops, 0);
+        assert_eq!(rearming, state.interrupting(0) & !stops);
+
+        // A handler makes SIGTSTP an ordinary caught signal, and SIG_IGN takes
+        // SIGTTIN out of every wait; SIGTTOU keeps its default action.
+        let state = KernelSignalState {
+            pending: stops,
+            caught: bits(&[libc::SIGTSTP]),
+            ignored: bits(&[libc::SIGTTIN]),
+            ..Default::default()
+        };
+        assert_eq!(state.default_job_control_stops(), bits(&[libc::SIGTTOU]));
+        assert_eq!(state.pending_interrupting(0, true), bits(&[libc::SIGTSTP]));
+        assert_eq!(
+            state.pending_interrupting(0, false),
+            bits(&[libc::SIGTSTP, libc::SIGTTOU])
+        );
+        // The mask still decides first.
+        assert_eq!(state.pending_interrupting(bits(&[libc::SIGTSTP]), true), 0);
     }
 
     #[test]

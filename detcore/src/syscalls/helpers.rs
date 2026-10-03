@@ -968,6 +968,15 @@ pub trait NonblockableSyscall: SyscallInfo {
         self.signal_interrupt_errno()
     }
 
+    /// Whether restarting this call after [`kernel_restart_errno`](Self::kernel_restart_errno)
+    /// starts a relative timeout again, where Linux's restart would keep the original
+    /// deadline. Such a wait is not ended by a default job-control stop signal
+    /// (`KernelSignalState::interrupting_wait`), so that a stop Linux discards in an
+    /// orphaned process group does not make the call return late.
+    fn restart_rearms_timeout(&self) -> bool {
+        false
+    }
+
     /// Signals the wait itself accepts rather than being interrupted by, read from
     /// guest memory. Only `rt_sigtimedwait` has any.
     fn signals_consumed_by_wait<M: MemoryAccess>(&self, _memory: &M) -> KernelSigset {
@@ -1033,10 +1042,18 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     /// kernel's restart block for a wait it emulates, so it returns `ERESTARTNOHAND`.
     /// The kernel then re-runs `poll` with its original arguments, at a ptrace stop
     /// and, through Reverie's restart, at a LiteInst patched site, so a restart after
-    /// a stop signal starts the relative timeout again. A timed futex wait has the
+    /// `SIGSTOP` or a caught-and-restarted stop starts the relative timeout again. A
+    /// default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU` does not end the wait at all
+    /// ([`restart_rearms_timeout`](NonblockableSyscall::restart_rearms_timeout)), so
+    /// the deadline holds when Linux discards that stop. A timed futex wait has the
     /// same deviation (https://github.com/rrnewton/hermit/issues/3358).
     fn kernel_restart_errno(&self) -> Errno {
         Errno::ERESTARTNOHAND
+    }
+
+    /// A zero timeout never blocks, and a negative one never expires.
+    fn restart_rearms_timeout(&self) -> bool {
+        self.timeout() > 0
     }
 }
 
@@ -1179,8 +1196,10 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
     /// Linux restarts an untimed `FUTEX_WAIT` under `SA_RESTART` (`-ERESTARTSYS`), but a
     /// timed wait returns `-ERESTART_RESTARTBLOCK`, which a handler always turns into
     /// `EINTR`. `ERESTARTNOHAND` gives a timed wait that outcome for a caught signal and a
-    /// transparent restart otherwise. A restart after a stop signal starts a relative
-    /// timeout again, where Linux's restart block would resume the original deadline
+    /// transparent restart otherwise. A restart after `SIGSTOP` or a caught-and-restarted
+    /// stop starts a relative `FUTEX_WAIT` timeout again, where Linux's restart block
+    /// would resume the original deadline; a default job-control stop does not end that
+    /// wait ([`restart_rearms_timeout`](NonblockableSyscall::restart_rearms_timeout))
     /// (https://github.com/rrnewton/hermit/issues/3146; listed with `poll`'s in
     /// https://github.com/rrnewton/hermit/issues/3358).
     fn kernel_restart_errno(&self) -> Errno {
@@ -1189,6 +1208,12 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
         } else {
             Errno::ERESTARTSYS
         }
+    }
+
+    /// Only `FUTEX_WAIT` takes a relative timeout. `FUTEX_WAIT_BITSET`'s is an
+    /// absolute deadline, which a restart with the original arguments keeps.
+    fn restart_rearms_timeout(&self) -> bool {
+        (self.futex_op() & libc::FUTEX_CMD_MASK) == libc::FUTEX_WAIT && self.timeout().is_some()
     }
 }
 
@@ -1618,7 +1643,9 @@ where
 /// does not block and that is caught, or whose default action terminates or stops
 /// the process. Ignored, blocked, and default-ignored signals leave the wait
 /// running to its original deadline
-/// (https://github.com/rrnewton/hermit/issues/3146).
+/// (https://github.com/rrnewton/hermit/issues/3146). So does a default job-control
+/// stop when the call's restart would start a relative timeout again
+/// (`NonblockableSyscall::restart_rearms_timeout`).
 ///
 /// The first probe runs under the guest's own mask. If it would block, every
 /// blockable signal is blocked for the rest of the wait, so later probes cannot be
@@ -1638,7 +1665,11 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let mut signals = KernelSignalWait::new(guest, call0.signals_consumed_by_wait(&guest.memory()));
+    let mut signals = KernelSignalWait::new(
+        guest,
+        call0.signals_consumed_by_wait(&guest.memory()),
+        call0.restart_rearms_timeout(),
+    );
     let mut rsrc = rsrc.clone();
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
 
@@ -1733,7 +1764,8 @@ where
 /// does not block and that is caught, or whose default action terminates or stops
 /// the process. Ignored, blocked, and default-ignored signals leave the wait
 /// running to its original deadline
-/// (https://github.com/rrnewton/hermit/issues/3146).
+/// (https://github.com/rrnewton/hermit/issues/3146). So does a default job-control
+/// stop when `defers_default_stops` is set (`KernelSignalState::interrupting_wait`).
 ///
 /// The first probe runs under the guest's own mask. If it would block, `block`
 /// blocks every blockable signal for the rest of the wait, so later probes cannot
@@ -1759,12 +1791,16 @@ pub(crate) struct KernelSignalWait {
     /// Signals the wait itself consumes (rt_sigtimedwait's set), which never
     /// interrupt it.
     consumed: KernelSigset,
+    /// Whether a default job-control stop leaves the wait running, because the
+    /// call's restart would start a relative timeout again
+    /// (`NonblockableSyscall::restart_rearms_timeout`).
+    defers_default_stops: bool,
     /// The guest's own mask while the wait runs with every signal blocked.
     saved_mask: Option<KernelSigset>,
 }
 
 impl KernelSignalWait {
-    pub(crate) fn new<T, G>(guest: &G, consumed: KernelSigset) -> Self
+    pub(crate) fn new<T, G>(guest: &G, consumed: KernelSigset, defers_default_stops: bool) -> Self
     where
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
@@ -1773,6 +1809,7 @@ impl KernelSignalWait {
             pid: guest.pid(),
             tid: guest.tid(),
             consumed,
+            defers_default_stops,
             saved_mask: None,
         }
     }
@@ -1797,7 +1834,8 @@ impl KernelSignalWait {
     {
         let state = read_kernel_signal_state(self.pid, self.tid)?;
         let guest_mask = self.saved_mask.unwrap_or(state.blocked);
-        let could_interrupt = state.interrupting(guest_mask) & !self.consumed;
+        let could_interrupt =
+            state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed;
         let interrupting =
             eligible_pending_signals(guest, state.pending & could_interrupt, could_interrupt).await;
         if interrupting != 0 {
