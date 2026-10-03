@@ -5503,11 +5503,14 @@ fn dirent_stores(
 /// bytes through another mapping of the same memory. The part written first
 /// is the one whose bytes Detcore can read to put back: the part in the
 /// second page, unless only the part in the first page can be read. Where
-/// neither can be read, the part in the second page is written first, so that
-/// a write-only buffer ending at a page the guest cannot touch is left as
-/// Linux leaves it. While no other thread writes the buffer, only a store
-/// from a page the guest can neither read nor write into a write-only page
-/// leaves bytes Linux does not write: up to 7, in the write-only page.
+/// neither can be read with a vectored copy, the part in the second page is
+/// written first, so that a write-only buffer ending at a page the guest
+/// cannot touch is left as Linux leaves it, and its bytes are read to put
+/// back with Reverie's `read`, which for at most 8 bytes is `PTRACE_PEEKDATA`
+/// on the ptrace backend and reads a write-only page. While no other thread
+/// writes the buffer, only a store from a page the guest can neither read nor
+/// write into a write-only page that this read cannot reach either leaves
+/// bytes Linux does not write: up to 7, in the write-only page.
 fn copy_records(
     memory: &mut impl MemoryAccess,
     buf: AddrMut<u8>,
@@ -5574,10 +5577,18 @@ fn copy_records(
             break;
         }
         let (at, bytes) = pieces[stop];
+        let addr = unsafe { buf.add(at) };
         let mut before = vec![0; bytes.len()];
-        saved = (readable
-            && read_guest_prefix(memory, unsafe { buf.add(at) }, &mut before) == before.len())
-        .then_some((stop, before));
+        let read = if readable {
+            read_guest_prefix(memory, addr, &mut before) == before.len()
+        } else {
+            // The part in the second page, at its start, which no vectored copy
+            // can read. Reverie's `read` of at most 8 bytes can on the ptrace
+            // backend, through `PTRACE_PEEKDATA`, and a read changes nothing
+            // the guest sees.
+            memory.read_exact(addr, &mut before).is_ok()
+        };
+        saved = read.then_some((stop, before));
         next = stop;
     }
     let Some(failed) = failed else {
