@@ -311,6 +311,11 @@ class VerdictTest(unittest.TestCase):
                     "verdict:   | first line\nverdict:   | last line\n",
                 )
 
+    def test_a_host_inapplicable_cell_counts_toward_the_bucket(self):
+        report = {"rc": 0, "summary": summary(2, passed=1, host_inapplicable=1), "junit": []}
+        process, _ = self.verdict({"portable/compat": report})
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+
     def test_an_error_on_an_excused_diagnostic_cell_is_still_listed(self):
         erroring = {"rc": 1, "summary": summary(2, errors=1, failed=1, passed=0, diagnostic=[(E, "exit status 3")]),
                     "junit": [[D, "error", "import-stale: the row's test digest differs"],
@@ -507,11 +512,14 @@ class RunTest(unittest.TestCase):
              f"{self.head} as a clean source tree; commit them and re-stage, or revert them"),
             ("git cannot read the index", lambda: (self.root / "checkout" / ".git" / "index").write_bytes(b"junk"),
              "ci/buck-e2e/run: git cannot read the checkout "),
+            ("HEAD names no commit", lambda: (self.root / "checkout" / ".git" / "HEAD").write_text(
+                "ref: refs/heads/unborn\n"), "ci/buck-e2e/run: git cannot read the checkout "),
         ]
         for name, change, message in cases:
             with self.subTest(name):
                 restore = {path: path.read_bytes()
-                           for path in (staged, self.tracked, self.root / "checkout" / ".git" / "index")}
+                           for path in (staged, self.tracked, self.root / "checkout" / ".git" / "index",
+                                        self.root / "checkout" / ".git" / "HEAD")}
                 change()
                 process = self.run_buck_e2e("local", passing_runs)
                 for path, data in restore.items():
@@ -552,14 +560,26 @@ class RunTest(unittest.TestCase):
 
     def test_an_inherited_git_location_does_not_redirect_the_source_checks(self):
         runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
-        process = self.run_buck_e2e("local", runs, GIT_DIR=str(self.root / "nowhere"),
-                                    GIT_WORK_TREE=str(self.root / "nowhere"))
+        nowhere = str(self.root / "nowhere")
+        process = self.run_buck_e2e("local", runs, **{name: nowhere for name in (
+            "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")})
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
 
     def test_no_verdict_stops_after_ingesting_whatever_the_cells_did(self):
+        # A judged, passing run leaves its verdict in --work ...
+        passing_runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("local", passing_runs)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertTrue((self.root / "work" / "verdict").exists())
+        self.calls.unlink()
+        shutil.rmtree(self.root / "import")
+        # ... which the next run removes, even unjudged, so it cannot stand for that run's rows.
         runs = {"all": [ingest_test.execution(ingest_test.X, 100, "FAIL", "rx1"), ingest_test.Y_PASSES]}
         process = self.run_buck_e2e("local", runs, "--no-verdict")
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertIn(f"ci/buck-e2e/run: --no-verdict: the rows in {self.root / 'import'} are unjudged; "
+                      "this run has no verdict", process.stderr)
         self.assertEqual(self.imported_rows(), ["portable/manifest_cat/results.jsonl"])
         self.assertEqual(calls_in(self.calls), [])
         self.assertFalse((self.root / "work" / "verdict").exists())

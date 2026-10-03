@@ -168,12 +168,17 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
 /// snapshot extracted inside a checkout but not tracked by it
 /// (ci/buck-e2e/staged/src). Inside a checkout, a git that cannot answer
 /// (a corrupt index, an unusable `.git`, no git to run) is refused: the files
-/// might be tracked.
+/// might be tracked. The search for `.git` starts from the resolved root, so
+/// a symlink to tracked files is looked up where the files are.
 pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
     validate_source_sha(sha)?;
-    let absolute = std::path::absolute(root)
-        .map_err(|error| format!("cannot resolve --repo-root {}: {error}", root.display()))?;
-    if !absolute
+    let resolved = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "cannot resolve --repo-root {}: {error}; pass an existing directory",
+            root.display()
+        )
+    })?;
+    if !resolved
         .ancestors()
         .any(|dir| dir.join(".git").symlink_metadata().is_ok())
     {
@@ -6543,8 +6548,12 @@ mod tests {
     fn a_source_sha_is_accepted_outside_any_checkout() {
         let archive = std::env::temp_dir().join(format!("runner-archive-{}", std::process::id()));
         fs::create_dir_all(archive.join("src")).unwrap();
+        // `..` out of a checkout is resolved before looking for `.git`.
+        let checkout = archive.join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
         let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
         let outside = source_identity(&archive.join("src"), Some(sha));
+        let climbed = source_identity(&checkout.join("../src"), Some(sha));
         fs::remove_dir_all(&archive).unwrap();
         assert!(
             !std::env::temp_dir()
@@ -6553,6 +6562,41 @@ mod tests {
             "this test needs a temporary directory outside any checkout"
         );
         assert_eq!(outside, Ok((sha.to_string(), false)));
+        assert_eq!(climbed, Ok((sha.to_string(), false)));
+    }
+
+    /// A symlink outside any checkout that points at tracked files names
+    /// those files, so it is refused as they are.
+    #[test]
+    fn a_source_sha_is_refused_through_a_symlink_to_tracked_files() {
+        let base = std::env::temp_dir().join(format!("runner-symlink-{}", std::process::id()));
+        let checkout = base.join("checkout");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "").unwrap();
+        let git = |args: &[&str]| {
+            crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let tracking = git(&["init", "-q"]) && git(&["add", "src/lib.rs"]);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(checkout.join("src"), &link).unwrap();
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let linked = source_identity(&link, Some(sha));
+        fs::remove_dir_all(&base).unwrap();
+        assert!(
+            !std::env::temp_dir()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists()),
+            "this test needs a temporary directory outside any checkout"
+        );
+        assert!(tracking);
+        let error = linked.unwrap_err();
+        assert!(error.contains("Git tracks files under"), "{error}");
     }
 
     /// The four outcomes of the verification-spelling probe.

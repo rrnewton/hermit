@@ -448,6 +448,18 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
             &head,
         ],
     );
+    // Nor can it say so when there is no git to run.
+    let gitless = located_by_directory(harness)
+        .args([
+            "expected-plan",
+            "--repo-root",
+            snapshot_root,
+            "--source-sha",
+            &head,
+        ])
+        .env("PATH", "")
+        .output()
+        .expect("run the harness without git on PATH");
     // A real `git archive` has no `.git` at all.
     std::fs::remove_file(snapshot.join(".git")).expect("remove the boundary .git");
     let planned = run(
@@ -468,6 +480,11 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
         String::from_utf8_lossy(&unusable.stderr)
             .contains("whether Git tracks its files is unknown"),
         "{unusable:?}"
+    );
+    assert_eq!(gitless.status.code(), Some(2), "{gitless:?}");
+    assert!(
+        String::from_utf8_lossy(&gitless.stderr).contains("git cannot run"),
+        "{gitless:?}"
     );
     assert!(planned.status.success(), "{planned:?}");
     assert!(String::from_utf8_lossy(&planned.stdout).contains("\"cells\""));
