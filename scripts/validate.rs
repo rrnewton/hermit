@@ -2321,6 +2321,14 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("VALIDATE_RUN_STATE")
             .env_remove(RUN_STATE_SCOPE_REEXEC_ENV)
             .env_remove(OWN_SCOPE_DEADLINE_ENV)
+            // The enclosing validation's run identity names its durable log,
+            // and both cases run in this one checkout: an inherited
+            // E2E_RUN_ID gives the second case the first case's log name and
+            // its reservation fails with EEXIST. A new top-level run mints
+            // its own identity and result and build roots.
+            .env_remove("E2E_RUN_ID")
+            .env_remove("E2E_RESULT_ROOT")
+            .env_remove("E2E_BUILD_ROOT")
             .env_remove(PARENT_ENV)
             .env_remove(TOOL_ROOT_ENV)
             .env_remove(TOOL_AUTHORITY_ENV)
