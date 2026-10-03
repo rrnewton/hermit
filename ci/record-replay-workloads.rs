@@ -25,7 +25,7 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 26] = [
+pub const C_SOURCES: [(&str, &str); 27] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
@@ -49,6 +49,7 @@ pub const C_SOURCES: [(&str, &str); 26] = [
         "c_record_replay_poll_partial_copyout",
         "tests/c/record_replay_poll_partial_copyout.c",
     ),
+    ("c_record_replay_select", "tests/c/record_replay_select.c"),
     (
         "c_record_replay_execveat_paths",
         "tests/c/record_replay_execveat_paths.c",
@@ -86,7 +87,7 @@ pub const C_SOURCES: [(&str, &str); 26] = [
 
 // Alias, Cargo target, repository-relative source. The clock now uses the
 // declared Cargo dev profile, rather than the former manual debuginfo=1 build.
-pub const RUST_SOURCES: [(&str, &str, &str); 16] = [
+pub const RUST_SOURCES: [(&str, &str, &str); 17] = [
     (
         "rs_clock_gettime",
         "rustbin_clock_gettime",
@@ -149,6 +150,7 @@ pub const RUST_SOURCES: [(&str, &str, &str); 16] = [
         "tests/rust/poll_spin.rs",
     ),
     ("rustbin_rdtsc", "rustbin_rdtsc", "tests/rust/rdtsc.rs"),
+    ("rustbin_select", "rustbin_select", "tests/rust/select.rs"),
     (
         "rustbin_stack_ptr",
         "rustbin_stack_ptr",

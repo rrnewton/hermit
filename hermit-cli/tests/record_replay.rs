@@ -2162,6 +2162,49 @@ fn record_poll_invalid_nfds_preserves_einval() {
     );
 }
 
+/// select and pselect6 must replay the recorded result, fd sets, and remaining
+/// timeout. Replay does not refill pipes, so before
+/// https://github.com/rrnewton/hermit/issues/3569 a pipe that held data while
+/// recording was reported ready at record time and not ready at replay.
+fn record_select_mode(mode: &str) {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        &format!("select {mode}"),
+        &workload("c_record_replay_select").path,
+        &[OsStr::new(mode)],
+    );
+}
+
+#[test]
+fn record_raw_select_ready_pipe() {
+    record_select_mode("raw");
+}
+
+#[test]
+fn record_glibc_select_ready_pipe() {
+    record_select_mode("glibc");
+}
+
+#[test]
+fn record_pselect_with_signal_mask_ready_pipe() {
+    record_select_mode("pselect-mask");
+}
+
+#[test]
+fn record_select_partial_fd_set_copyout() {
+    record_select_mode("efault");
+}
+
+#[test]
+fn record_select_negative_nfds_preserves_einval() {
+    record_select_mode("einval");
+}
+
+#[test]
+fn record_poll_and_ppoll_ready_pipe() {
+    record_select_mode("poll");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
@@ -2209,6 +2252,7 @@ record_replay_tests! {
     record_rs_poll => "rustbin_poll",
     record_rs_poll_spin => "rustbin_poll_spin",
     record_rs_rdtsc => "rustbin_rdtsc",
+    record_rs_select => "rustbin_select",
     record_rs_stack_ptr => "rustbin_stack_ptr",
     record_rs_thread_random => "rustbin_thread_random",
 }

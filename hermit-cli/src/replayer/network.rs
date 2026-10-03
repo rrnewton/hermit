@@ -14,14 +14,19 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
+use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+use reverie::syscalls::Select;
 use reverie::syscalls::Timespec;
+use reverie::syscalls::Timeval;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
+use crate::event::SelectEvent;
+use crate::recorder::select_fd_set_bytes;
 
 fn replay_pollfds<M: MemoryAccess>(
     memory: &mut M,
@@ -123,6 +128,80 @@ fn replay_ppoll_event<M: MemoryAccess>(
         // recorded result with a replay-only memory error.
         if let Err(error) = memory.write_value(address, &timeout) {
             tracing::trace!(?error, "ppoll timeout replay write returned an error");
+        }
+    }
+
+    result
+}
+
+/// Restore the recorded fd sets and timeout of `select` or `pselect6`, in the
+/// kernel's copy-out order, then return the recorded result.
+fn replay_select_event<M: MemoryAccess, T>(
+    memory: &mut M,
+    fd_set_addresses: [Option<AddrMut<'_, libc::fd_set>>; 3],
+    timeout_address: Option<AddrMut<'_, T>>,
+    nfds: i32,
+    event: SelectEvent<T>,
+) -> Result<i64, Errno> {
+    let SelectEvent {
+        result,
+        fd_set_pointers_present,
+        fd_sets,
+        timeout_pointer_present,
+        timeout,
+    } = event;
+
+    assert_eq!(
+        fd_set_addresses.map(|address| address.is_some()),
+        fd_set_pointers_present,
+        "recorded select fd-set pointer shape diverged during replay"
+    );
+    let fd_sets_written = matches!(result, Ok(_) | Err(Errno::EFAULT));
+    let max_len = usize::try_from(nfds).map_or(0, select_fd_set_bytes);
+    for (address, bytes) in fd_set_addresses.into_iter().zip(fd_sets) {
+        let Some(bytes) = bytes else {
+            assert!(
+                !(fd_sets_written && address.is_some()),
+                "recorded select result {result:?} is missing a written fd set"
+            );
+            continue;
+        };
+        assert!(
+            fd_sets_written,
+            "recorded select result {result:?} wrote no fd set"
+        );
+        assert!(bytes.len() <= max_len);
+        if bytes.is_empty() {
+            continue;
+        }
+        let address = address.expect("recorded fd-set output requires a pointer");
+        let write_result = memory.write_exact(address.cast::<u8>(), &bytes);
+        if matches!(result, Err(Errno::EFAULT)) {
+            // The page boundary that made Linux return EFAULT can make this
+            // write fault after restoring an earlier prefix. Keep going so the
+            // timeout is restored too, then return the recorded errno.
+            if let Err(error) = write_result {
+                tracing::trace!(
+                    ?error,
+                    "partial select fd-set replay write returned an error"
+                );
+            }
+        } else {
+            write_result?;
+        }
+    }
+
+    assert_eq!(
+        timeout_address.is_some(),
+        timeout_pointer_present,
+        "recorded select timeout pointer shape diverged during replay"
+    );
+    if let Some(timeout) = timeout {
+        let address = timeout_address.expect("recorded select timeout requires a pointer");
+        // Linux preserves the result when the remaining-time copy-out faults,
+        // so never replace the recorded result with a replay-only memory error.
+        if let Err(error) = memory.write_value(address, &timeout) {
+            tracing::trace!(?error, "select timeout replay write returned an error");
         }
     }
 
@@ -250,6 +329,36 @@ impl Replayer {
             syscall.fds(),
             syscall.timeout(),
             syscall.nfds() as usize,
+            event,
+        )
+    }
+
+    pub(super) async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Select,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Select)?;
+        replay_select_event(
+            &mut guest.memory(),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall.timeout().map(|address| address.cast::<Timeval>()),
+            syscall.nfds(),
+            event,
+        )
+    }
+
+    pub(super) async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Pselect6,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Pselect6)?;
+        replay_select_event(
+            &mut guest.memory(),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall.timeout(),
+            syscall.nfds(),
             event,
         )
     }
@@ -430,6 +539,135 @@ mod tests {
 
         assert_eq!(result, Err(Errno::EINTR));
         assert_eq!(output.revents, 0);
+    }
+
+    #[test]
+    fn replay_select_restores_recorded_prefix_and_timeout() {
+        let mut readfds = [0xffu8; 16];
+        let mut timeout = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let recorded_timeout = Timespec {
+            tv_sec: 4,
+            tv_nsec: 999_999_001,
+        };
+        let event = SelectEvent {
+            result: Ok(1),
+            fd_set_pointers_present: [true, false, false],
+            fd_sets: [Some(vec![0b1000, 0, 0, 0, 0, 0, 0, 0]), None, None],
+            timeout_pointer_present: true,
+            timeout: Some(recorded_timeout),
+        };
+        let result = replay_select_event(
+            &mut LocalMemory::new(),
+            [AddrMut::from_raw(readfds.as_mut_ptr() as usize), None, None],
+            AddrMut::from_raw((&mut timeout as *mut Timespec) as usize),
+            8,
+            event,
+        );
+
+        assert_eq!(result, Ok(1));
+        assert_eq!(readfds[..8], [0b1000, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(readfds[8..], [0xff; 8]);
+        assert_eq!(timeout, recorded_timeout);
+    }
+
+    #[test]
+    fn replay_select_efault_keeps_errno_after_a_faulting_write() {
+        let mut readfds = [0u8; 8];
+        let mut timeout = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let recorded_timeout = Timespec {
+            tv_sec: 4,
+            tv_nsec: 1,
+        };
+        let event = SelectEvent {
+            result: Err(Errno::EFAULT),
+            fd_set_pointers_present: [true, true, false],
+            fd_sets: [Some(vec![1; 8]), Some(vec![2; 8]), None],
+            timeout_pointer_present: true,
+            timeout: Some(recorded_timeout),
+        };
+        let result = replay_select_event(
+            &mut LocalMemory::new(),
+            [
+                AddrMut::from_raw(readfds.as_mut_ptr() as usize),
+                AddrMut::from_raw(1),
+                None,
+            ],
+            AddrMut::from_raw((&mut timeout as *mut Timespec) as usize),
+            64,
+            event,
+        );
+
+        assert_eq!(result, Err(Errno::EFAULT));
+        assert_eq!(readfds, [1; 8]);
+        assert_eq!(timeout, recorded_timeout);
+    }
+
+    #[test]
+    fn replay_select_einval_writes_only_the_timeout() {
+        let mut timeout = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let recorded_timeout = Timespec {
+            tv_sec: 4,
+            tv_nsec: 2,
+        };
+        let event = SelectEvent {
+            result: Err(Errno::EINVAL),
+            fd_set_pointers_present: [true, false, false],
+            fd_sets: [None, None, None],
+            timeout_pointer_present: true,
+            timeout: Some(recorded_timeout),
+        };
+        let result = replay_select_event(
+            &mut LocalMemory::new(),
+            [AddrMut::from_raw(1), None, None],
+            AddrMut::from_raw((&mut timeout as *mut Timespec) as usize),
+            -1,
+            event,
+        );
+
+        assert_eq!(result, Err(Errno::EINVAL));
+        assert_eq!(timeout, recorded_timeout);
+    }
+
+    #[test]
+    #[should_panic(expected = "fd-set pointer shape diverged")]
+    fn replay_select_refuses_a_different_pointer_shape() {
+        let event = SelectEvent::<Timespec> {
+            result: Ok(0),
+            fd_set_pointers_present: [true, false, false],
+            fd_sets: [Some(vec![0; 8]), None, None],
+            timeout_pointer_present: false,
+            timeout: None,
+        };
+        let _ = replay_select_event(&mut LocalMemory::new(), [None, None, None], None, 8, event);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing a written fd set")]
+    fn replay_select_refuses_a_success_without_its_fd_set() {
+        let mut readfds = [0u8; 8];
+        let event = SelectEvent::<Timespec> {
+            result: Ok(0),
+            fd_set_pointers_present: [true, false, false],
+            fd_sets: [None, None, None],
+            timeout_pointer_present: false,
+            timeout: None,
+        };
+        let _ = replay_select_event(
+            &mut LocalMemory::new(),
+            [AddrMut::from_raw(readfds.as_mut_ptr() as usize), None, None],
+            None,
+            8,
+            event,
+        );
     }
 
     #[test]

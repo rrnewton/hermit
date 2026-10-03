@@ -157,7 +157,12 @@ impl RecordVersion {
 // them. Streams now carry Timespec and Timeofday events for clock_gettime,
 // gettimeofday and time, and clock_getres gains a recorder event (Timespec, or
 // Return for a NULL `res`). An older reader would desynchronize on these events.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
+// 0x11d -> 0x11e: select and pselect6 are recorded as Select and Pselect6
+// events (result, fd sets, remaining timeout) instead of being injected live
+// on both sides, which lost the readiness of a pipe that held data while
+// recording (https://github.com/rrnewton/hermit/issues/3569). An older reader
+// would desynchronize on these events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -182,7 +187,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

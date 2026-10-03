@@ -17,10 +17,13 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
+use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+use reverie::syscalls::Select;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
+use reverie::syscalls::Timeval;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
@@ -28,6 +31,7 @@ use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
+use crate::event::SelectEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
 
@@ -176,6 +180,113 @@ fn capture_ppoll_event<M: MemoryAccess>(
         timeout_pointer_present: timeout_address.is_some(),
         timeout,
     })
+}
+
+/// The smallest fd table Linux gives a process (`NR_OPEN_DEFAULT`, one word of
+/// descriptors). An `nfds` at or below this needs no fd-table lookup.
+const MIN_FD_TABLE_SIZE: usize = libc::c_ulong::BITS as usize;
+
+/// Linux `FDS_BYTES`: the whole `unsigned long` words covering `nfds` bits.
+pub(crate) fn select_fd_set_bytes(nfds: usize) -> usize {
+    nfds.div_ceil(libc::c_ulong::BITS as usize) * std::mem::size_of::<libc::c_ulong>()
+}
+
+/// The `FDSize` of `tid`'s fd table, which Linux uses to clamp select's `nfds`.
+fn fd_table_size(tid: reverie::Pid) -> Result<usize, Errno> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw()))
+        .map_err(|error| Errno::new(error.raw_os_error().unwrap_or(libc::EIO)))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("FDSize:"))
+        .and_then(|size| size.trim().parse().ok())
+        .ok_or(Errno::EIO)
+}
+
+/// The number of bytes Linux copies out to each select fd set for `nfds`.
+///
+/// Linux clamps `nfds` to the caller's fd-table size, which can be smaller than
+/// a userspace `nfds` such as `FD_SETSIZE`. Reading the table size after the
+/// call gives an upper bound when another thread grew the table concurrently;
+/// any extra bytes are then the unchanged guest bytes, so replay restoring them
+/// is a no-op. A negative `nfds` fails with EINVAL before any copy-out.
+fn select_copyout_len(
+    nfds: i32,
+    fd_table_size: impl FnOnce() -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    let Ok(nfds) = usize::try_from(nfds) else {
+        return Ok(0);
+    };
+    let nfds = if nfds <= MIN_FD_TABLE_SIZE {
+        nfds
+    } else {
+        nfds.min(fd_table_size()?)
+    };
+    Ok(select_fd_set_bytes(nfds))
+}
+
+/// Read the readable prefix of `length` bytes in bounded chunks, so an
+/// unmapped tail neither fails the capture nor forces a large allocation.
+fn read_byte_prefix<M: MemoryAccess>(
+    memory: &M,
+    address: AddrMut<'_, u8>,
+    length: usize,
+) -> Vec<u8> {
+    const BYTES_PER_READ: usize = 4096;
+
+    let mut bytes = Vec::new();
+    while bytes.len() < length {
+        let Some(chunk_address) = address
+            .as_raw()
+            .checked_add(bytes.len())
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            break;
+        };
+        let mut chunk = vec![0; (length - bytes.len()).min(BYTES_PER_READ)];
+        let bytes_read = match memory.read(chunk_address, &mut chunk) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
+        };
+        bytes.extend_from_slice(&chunk[..bytes_read]);
+        if bytes_read < chunk.len() {
+            break;
+        }
+    }
+    bytes
+}
+
+/// Capture the post-kernel outputs of `select` or `pselect6`.
+///
+/// `fd_set_len` is the per-set copy-out length from [`select_copyout_len`]; it
+/// is consulted only for results after which Linux may have written the sets.
+fn capture_select_event<M: MemoryAccess, T>(
+    memory: &M,
+    fd_sets: [Option<AddrMut<'_, libc::fd_set>>; 3],
+    timeout_address: Option<AddrMut<'_, T>>,
+    fd_set_len: usize,
+    result: Result<i64, Errno>,
+) -> SelectEvent<T> {
+    // Linux writes the sets on success, including a zero count, and may have
+    // written a prefix before a copy-out fault turned the result into EFAULT.
+    // An EFAULT from unreadable input leaves the guest bytes unchanged, which
+    // replay then restores as a no-op. Every other error, notably EINVAL for an
+    // invalid nfds or timeout, precedes the copy-out, so nothing is read.
+    let fd_sets_written = matches!(result, Ok(_) | Err(Errno::EFAULT));
+    SelectEvent {
+        result,
+        fd_set_pointers_present: fd_sets.map(|address| address.is_some()),
+        fd_sets: fd_sets.map(|address| {
+            address
+                .filter(|_| fd_sets_written)
+                .map(|address| read_byte_prefix(memory, address.cast(), fd_set_len))
+        }),
+        timeout_pointer_present: timeout_address.is_some(),
+        // Linux writes the remaining time back after any result once it has
+        // accepted the timeout input, and ignores a fault doing so. Read it
+        // best effort for every result: where Linux did not write it, the value
+        // is the unchanged input and restoring it on replay is a no-op.
+        timeout: timeout_address.and_then(|address| memory.read_value(address).ok()),
+    }
 }
 
 impl Recorder {
@@ -367,7 +478,43 @@ impl Recorder {
         result
     }
 
-    // TODO: Add support for select here.
+    pub(super) async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Select,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let event = select_copyout_len(syscall.nfds(), || fd_table_size(guest.tid())).map(|len| {
+            SyscallEvent::Select(capture_select_event(
+                &guest.memory(),
+                [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+                syscall.timeout().map(|address| address.cast::<Timeval>()),
+                len,
+                result,
+            ))
+        });
+        self.record_event(guest, event);
+        result
+    }
+
+    pub(super) async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Pselect6,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let event = select_copyout_len(syscall.nfds(), || fd_table_size(guest.tid())).map(|len| {
+            SyscallEvent::Pselect6(capture_select_event(
+                &guest.memory(),
+                [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+                syscall.timeout(),
+                len,
+                result,
+            ))
+        });
+        self.record_event(guest, event);
+        result
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +523,127 @@ mod tests {
     use reverie::syscalls::PollFlags;
 
     use super::*;
+
+    fn fd_set_with(fds: &[i32]) -> libc::fd_set {
+        // SAFETY: fd_set is plain old data and FD_ZERO/FD_SET only touch it.
+        unsafe {
+            let mut set = std::mem::zeroed::<libc::fd_set>();
+            libc::FD_ZERO(&mut set);
+            for &fd in fds {
+                libc::FD_SET(fd, &mut set);
+            }
+            set
+        }
+    }
+
+    fn fd_set_address(set: &libc::fd_set) -> Option<AddrMut<'_, libc::fd_set>> {
+        AddrMut::from_raw((set as *const libc::fd_set) as usize)
+    }
+
+    #[test]
+    fn select_copyout_len_clamps_to_the_fd_table() {
+        assert_eq!(select_copyout_len(-1, || panic!("no copy-out")), Ok(0));
+        assert_eq!(select_copyout_len(0, || panic!("no table read")), Ok(0));
+        assert_eq!(select_copyout_len(3, || panic!("no table read")), Ok(8));
+        assert_eq!(select_copyout_len(64, || panic!("no table read")), Ok(8));
+        assert_eq!(select_copyout_len(1024, || Ok(64)), Ok(8));
+        assert_eq!(select_copyout_len(1024, || Ok(256)), Ok(32));
+        assert_eq!(select_copyout_len(100, || Ok(4096)), Ok(16));
+        assert_eq!(
+            select_copyout_len(1024, || Err(Errno::ENOENT)),
+            Err(Errno::ENOENT)
+        );
+    }
+
+    #[test]
+    fn fd_table_size_reads_this_process() {
+        let size = fd_table_size(reverie::Pid::this()).unwrap();
+        assert!(size >= MIN_FD_TABLE_SIZE, "FDSize {size}");
+    }
+
+    #[test]
+    fn capture_select_keeps_sets_and_timeout_on_success() {
+        let readfds = fd_set_with(&[3]);
+        let exceptfds = fd_set_with(&[]);
+        let timeout = Timespec {
+            tv_sec: 4,
+            tv_nsec: 999_000_123,
+        };
+        let event = capture_select_event(
+            &LocalMemory::new(),
+            [fd_set_address(&readfds), None, fd_set_address(&exceptfds)],
+            AddrMut::from_raw((&timeout as *const Timespec) as usize),
+            8,
+            Ok(1),
+        );
+
+        assert_eq!(event.result, Ok(1));
+        assert_eq!(event.fd_set_pointers_present, [true, false, true]);
+        assert_eq!(
+            event.fd_sets[0].as_deref(),
+            Some(&[0b1000, 0, 0, 0, 0, 0, 0, 0][..])
+        );
+        assert!(event.fd_sets[1].is_none());
+        assert_eq!(event.fd_sets[2].as_deref(), Some(&[0; 8][..]));
+        assert!(event.timeout_pointer_present);
+        assert_eq!(event.timeout, Some(timeout));
+    }
+
+    #[test]
+    fn capture_select_keeps_sets_on_zero_and_efault() {
+        let readfds = fd_set_with(&[9]);
+        for result in [Ok(0), Err(Errno::EFAULT)] {
+            let event = capture_select_event::<_, Timespec>(
+                &LocalMemory::new(),
+                [fd_set_address(&readfds), None, None],
+                None,
+                16,
+                result,
+            );
+            assert_eq!(
+                event.fd_sets[0].as_ref().map(Vec::len),
+                Some(16),
+                "{result:?}"
+            );
+            assert!(!event.timeout_pointer_present);
+            assert!(event.timeout.is_none());
+        }
+    }
+
+    #[test]
+    fn capture_select_reads_no_sets_on_einval_or_eintr_but_keeps_timeout() {
+        let timeout = Timespec {
+            tv_sec: 1,
+            tv_nsec: 2,
+        };
+        for result in [Err(Errno::EINVAL), Err(Errno::EINTR), Err(Errno::ENOMEM)] {
+            // An unreadable set address proves nothing is read.
+            let event = capture_select_event(
+                &LocalMemory::new(),
+                [AddrMut::from_raw(1), AddrMut::from_raw(1), None],
+                AddrMut::from_raw((&timeout as *const Timespec) as usize),
+                usize::MAX,
+                result,
+            );
+            assert_eq!(event.fd_set_pointers_present, [true, true, false]);
+            assert!(event.fd_sets.iter().all(Option::is_none), "{result:?}");
+            assert_eq!(event.timeout, Some(timeout));
+        }
+    }
+
+    #[test]
+    fn capture_select_stops_at_an_unreadable_prefix() {
+        let event = capture_select_event::<_, Timespec>(
+            &LocalMemory::new(),
+            [AddrMut::from_raw(1), None, None],
+            AddrMut::from_raw(1),
+            8,
+            Err(Errno::EFAULT),
+        );
+        assert_eq!(event.fd_sets[0].as_deref(), Some(&[][..]));
+        assert!(event.timeout_pointer_present);
+        assert!(event.timeout.is_none());
+    }
 
     #[test]
     fn capture_poll_keeps_outputs_on_efault() {

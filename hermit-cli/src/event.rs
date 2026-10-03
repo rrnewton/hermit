@@ -104,6 +104,10 @@ pub enum SyscallEvent {
     Exec(ExecEvent),
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
+    /// The result and mutable output fields of a raw `select` call.
+    Select(SelectEvent<Timeval>),
+    /// The result and mutable output fields of a raw `pselect6` call.
+    Pselect6(SelectEvent<Timespec>),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -371,6 +375,41 @@ pub struct PpollEvent {
     /// this continuously; replay must restore the captured value without
     /// rounding, freezing, or synthesizing it.
     pub timeout: Option<Timespec>,
+}
+
+/// Records every guest-visible output of a raw `select` or `pselect6` call.
+///
+/// Linux writes the read, write, and except fd sets back in that order on
+/// success, including a zero count. Each copy-out is `FDS_BYTES(min(nfds,
+/// max_fds))` bytes, where `max_fds` is the size of the caller's fd table. The
+/// first copy-out that faults stops the sequence and turns the result into
+/// EFAULT, leaving earlier sets and a prefix of the faulting set written. Other
+/// errors leave the sets untouched. The remaining-time copy-out follows any
+/// result once the timeout input was accepted, except for an initially zero
+/// timeout, and a fault there preserves the result. `T` is the timeout type:
+/// [`Timeval`] for `select` and [`Timespec`] for `pselect6`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SelectEvent<T> {
+    /// The exact return value or errno observed while recording.
+    pub result: Result<i64, Errno>,
+
+    /// Whether the guest supplied non-null read, write, and except fd sets.
+    pub fd_set_pointers_present: [bool; 3],
+
+    /// The post-kernel bytes of the read, write, and except fd sets. Present on
+    /// success and on EFAULT, where it holds the readable prefix of the bytes
+    /// Linux may have written. Absent for a null pointer and for other errors.
+    pub fd_sets: [Option<Vec<u8>>; 3],
+
+    /// Whether the guest supplied a non-null timeout pointer.
+    pub timeout_pointer_present: bool,
+
+    /// The timeout bytes as they stood after the kernel call, when readable.
+    /// Linux mutates this continuously with the time not slept, so replay
+    /// restores the captured value without rounding or synthesizing it. When
+    /// Linux did not write the timeout, this is the unchanged input, so
+    /// restoring it is a no-op.
+    pub timeout: Option<T>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
