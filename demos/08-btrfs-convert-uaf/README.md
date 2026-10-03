@@ -63,9 +63,10 @@ have not been prepared. The preparation clones btrfs-progs v7.1
 <https://github.com/kdave/btrfs-progs>), builds a `buggy` and a `fixed` variant
 with AddressSanitizer, writes a 256 MiB ext4 image holding 100 small files, and
 then tries chaos seeds until it finds one that crashes the buggy build,
-crashes it again identically, and leaves the fixed build clean. It records that
-seed in `ignored/demo08-btrfs/.crash-seed`. Running it again only rechecks the
-recorded seed.
+crashes it again with the same complete AddressSanitizer report, and leaves
+the fixed build clean. It records that seed in
+`ignored/demo08-btrfs/.crash-seed`. Running it again only rechecks the
+recorded seed, with those same checks.
 
 A run that Hermit refuses with exit status 122 (the overshoot refusal described
 under [What to notice](#what-to-notice)) did not test its seed, so the seed
@@ -111,13 +112,19 @@ that way for the recorded seed to apply:
 - Keep the same absolute paths. The paths are the program's arguments, and a
   different argument length shifts the program's memory layout. With seed 7 on
   the reference build, image paths of 75, 85 (the path above), and 104
-  characters each crashed three times out of three with the same
-  AddressSanitizer report. With the image at paths of 36 to 40 characters
-  under `/var/tmp`, seed 7 still crashed, but at heap address
-  `0x6060000002d0` instead of `0x606000000210`. A path change can also change
-  whether a seed reaches the use-after-free at all: seed 1 printed the start of
-  a report with the image at the path above, and no report with it under
-  `/var/tmp`.
+  characters each crashed three times out of three with the same heap
+  address, program counter, program frames, and `SUMMARY:` line, the lines
+  that step 2 prints. With the image at paths of 36 to 40 characters under
+  `/var/tmp`, seed 7 still crashed, but at heap address `0x6060000002d0`
+  instead of `0x606000000210`. The rest of the report can depend on the path
+  even when those lines do not. Of the seed-7 runs under `/var/tmp` whose
+  output is still on the reference host, the 9 with a 38-character image path
+  all printed one complete report, the 21 with a 39-character path all printed
+  a second, and the one with a 40-character path printed a third; the three
+  differ only in one row of the shadow memory map that ends the report. A path
+  change can also change whether a seed reaches the use-after-free at all:
+  seed 1 printed the start of a report with the image at the path above, and
+  no report with it under `/var/tmp`.
 - Keep `--base-env=minimal`. Without it the program inherits your shell's
   whole environment, which also shifts its memory layout: with the path above
   and seed 7, three runs that inherited the environment all exited 0 without a
@@ -153,8 +160,15 @@ memory map), and the host wall-clock timestamps that begin Hermit's two
 `ERROR` lines. Those two lines are Hermit's own log, printed as it sees each
 thread end, and their order is not fixed: in the 13 saved outputs of seed 7 at
 this path, `tid=3`'s line came first in 10 and `tid=5`'s in 3. The demo
-compares the AddressSanitizer report, which was the same in every one of those
-runs.
+leaves Hermit's log lines out and compares everything else from the report's
+`ERROR:` line through `==3==ABORTING`, byte for byte: the complete
+AddressSanitizer report, 63 lines here, including the parts elided above.
+Five outputs of seed 7 at this path are still on the reference host, from
+2026-09-30 and 2026-10-01, and all five contain the same complete report;
+two of them are a run of `run.sh` and its repeat, and two are a recheck by
+`prepare-assets.sh` and its repeat. A run and its repeat by `run.sh` in
+another checkout, with a 109-character image path, printed that same report
+too.
 
 ## What you will see
 
@@ -209,6 +223,19 @@ the fix closed the window, and the crash reproduced exactly.
 Steps 2 to 4 printed the same lines in all 11 runs of `run.sh`, including
 one whose environment carried 3,000 extra bytes.
 
+The runs above used the earlier `run.sh`, which compared only the four report
+lines that step 2 prints. This version compares the complete report, and two
+of its lines read differently: step 2 ends with the first line below instead
+of `chaos buggy: reproduced the use-after-free`, and step 4 prints the second
+instead of `replay: ASAN report byte-identical (same heap address, PC, and
+frames)`. Both lines are written here from the script and from the 63-line
+reports in the saved outputs, not copied from a run:
+
+```text
+chaos buggy: reproduced the use-after-free; the complete 63-line ASAN report is in .../target/demos/08-btrfs-convert-uaf/asan-report.txt
+replay: ASAN report byte-identical: all 63 lines from the ERROR line through ABORTING, including the heap address, PC, every stack, and the shadow memory
+```
+
 ## What to notice
 
 - The native run cannot choose its interleaving. In 40 native runs of the
@@ -227,8 +254,16 @@ one whose environment carried 3,000 extra bytes.
   the two builds is the fix, so its clean exit shows the crash came from the bug
   and not from the scheduler.
 - Step 4 compares the saved reports, `asan-report.txt` and
-  `asan-report-replay.txt` under `target/demos/08-btrfs-convert-uaf/`: same
-  faulting address, same program counter, same frames.
+  `asan-report-replay.txt` under `target/demos/08-btrfs-convert-uaf/`, byte
+  for byte. Each holds the complete AddressSanitizer report from its `ERROR:`
+  line through `==3==ABORTING`: the faulting address and program counter, the
+  stacks of the faulting read, of the free, of the allocation, and of the
+  thread's creation, and the shadow memory map. Only Hermit's own log lines,
+  which begin with a wall-clock timestamp, are left out. Nothing inside the
+  report is changed or skipped, and a run whose report stops before
+  `==3==ABORTING` fails the demo. `prepare-assets.sh` compares a seed's first
+  run and its repeat the same way before it records the seed, and stops if
+  the two reports differ.
 - The crashing seed is a property of the build and of the exact command line.
   A different compiler or Hermit version can move the crash to other seeds,
   which is why `prepare-assets.sh` searches for one and ties it to the buggy
@@ -346,7 +381,8 @@ memory is the original bug.
 Each run gets a fresh copy of the image, because btrfs-convert converts it in
 place. Step 4 reuses the image path of step 2: the path is part of the
 program's arguments, and a different argument length shifts the initial heap
-layout, which would produce a different (but equally repeatable) heap address.
+layout, which can produce a different (but equally repeatable) heap address or
+shadow memory map; the measurements are under [Run it](#run-it).
 
 Controls (environment variables):
 

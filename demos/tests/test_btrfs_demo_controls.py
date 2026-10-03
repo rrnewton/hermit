@@ -3,17 +3,22 @@
 
 Both scripts decide PASS or FAIL from what `hermit run --chaos` returns: the
 exit status (134 is the ASAN abort, 124 the timeout, 125 a wrapper failure,
-122 Hermit's refusal after a late performance-counter interrupt) and
-whether the output holds a complete AddressSanitizer report. Each test puts a
-stub `hermit` first on PATH that returns one scripted outcome, runs the real
-script, and checks that the script accepts or refuses it for the stated reason.
-No real Hermit and no btrfs-convert build are involved.
+122 Hermit's refusal after a late performance-counter interrupt), whether the
+output holds a complete AddressSanitizer report, and whether two runs of one
+seed print the same complete report. Each test puts a stub `hermit` first on
+PATH that returns one scripted outcome, runs the real script, and checks that
+the script accepts or refuses it for the stated reason. No real Hermit and no
+btrfs-convert build are involved.
 
-The calibration tests also build a tiny C program with a real heap
+CalibrationControlsTest also builds a tiny C program with a real heap
 use-after-free under AddressSanitizer, so the "a crash was found" path is fed
-a genuine ASAN abort rather than hand-written text. They fail, rather than
-skip, when the host cannot build it: without that program the tests could not
-show that calibration ever accepts a seed.
+a genuine ASAN abort rather than hand-written text. It fails, rather than
+skips, when the host cannot build it: without that program the tests could not
+show that calibration ever accepts a seed. The stub runs that program on a
+seed's first crash and prints the same output again on the seed's replay, as
+two Hermit runs of one seed do; run natively, the program prints a different
+PID and different addresses every time. CalibrationReportComparisonTest needs
+no compiler: its planted program prints a saved report.
 """
 
 import hashlib
@@ -38,14 +43,141 @@ FIXTURES = DEMO8 / "fixtures"
 PREP_VERSION = 2
 BTRFS_COMMIT = "4ab0e80be9e3bb1db2e6038e6d4316d35fb7ba8b"
 
-UAF_REPORT = """\
-==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210
-    #0 0x4e69f6 in task_period_wait common/task-utils.c:154
-    #1 0x4e7100 in print_copied_inodes convert/main.c:169
+# ASAN's complete report from a crashing chaos run of the reference build's
+# buggy btrfs-convert, every line from the ERROR line through the closing
+# ABORTING line. Both scripts compare exactly this between two runs of a seed.
+FULL_REPORT = """\
+==3==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210 at pc 0x0000004e68e1 bp 0x7ffff3ffeaf0 sp 0x7ffff3ffeae0
+READ of size 8 at 0x606000000210 thread T1
+    #0 0x4e68e0 in task_period_wait common/task-utils.c:154
+    #1 0x41215a in print_copied_inodes convert/main.c:169
+    #2 0x7ffff708b568 in start_thread (/lib64/libc.so.6+0x8b568)
+    #3 0x7ffff7110a7f in clone3 (/lib64/libc.so.6+0x110a7f)
+
+0x606000000210 is located 16 bytes inside of 56-byte region [0x606000000200,0x606000000238)
+freed by thread T0 here:
+    #0 0x7ffff74b46b7 in free (/lib64/libasan.so.6+0xb46b7)
+    #1 0x4e65a6 in task_deinit common/task-utils.c:100
+    #2 0x418691 in do_convert convert/main.c:1354
+    #3 0x418691 in main convert/main.c:2116
+    #4 0x7ffff702a60f in __libc_start_call_main (/lib64/libc.so.6+0x2a60f)
+
+previously allocated by thread T0 here:
+    #0 0x7ffff74b4bd7 in calloc (/lib64/libasan.so.6+0xb4bd7)
+    #1 0x4e621a in task_init common/task-utils.c:29
+    #2 0x4185b1 in do_convert convert/main.c:1343
+    #3 0x4185b1 in main convert/main.c:2116
+    #4 0x7ffff702a60f in __libc_start_call_main (/lib64/libc.so.6+0x2a60f)
+
+Thread T1 created by T0 here:
+    #0 0x7ffff74587d5 in pthread_create (/lib64/libasan.so.6+0x587d5)
+    #1 0x4e6346 in task_start common/task-utils.c:56
+    #2 0x4185e5 in do_convert convert/main.c:1345
+    #3 0x4185e5 in main convert/main.c:2116
+    #4 0x7ffff702a60f in __libc_start_call_main (/lib64/libc.so.6+0x2a60f)
+
 SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_period_wait
+Shadow bytes around the buggy address:
+  0x0c0c7fff7ff0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c0c7fff8000: fa fa fa fa fd fd fd fd fd fd fd fa fa fa fa fa
+  0x0c0c7fff8010: 00 00 00 00 00 00 06 fa fa fa fa fa 00 00 00 00
+  0x0c0c7fff8020: 00 00 00 00 fa fa fa fa 00 00 00 00 00 00 00 00
+  0x0c0c7fff8030: fa fa fa fa 00 00 00 00 00 00 00 00 fa fa fa fa
+=>0x0c0c7fff8040: fd fd[fd]fd fd fd fd fa fa fa fa fa 00 00 00 00
+  0x0c0c7fff8050: 00 00 00 00 fa fa fa fa fd fd fd fd fd fd fd fa
+  0x0c0c7fff8060: fa fa fa fa fd fd fd fd fd fd fd fa fa fa fa fa
+  0x0c0c7fff8070: fd fd fd fd fd fd fd fa fa fa fa fa fd fd fd fd
+  0x0c0c7fff8080: fd fd fd fa fa fa fa fa fd fd fd fd fd fd fd fa
+  0x0c0c7fff8090: fa fa fa fa fd fd fd fd fd fd fd fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07\x20
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+  Shadow gap:              cc
+==3==ABORTING
 """
 
-# The report cut off before ASAN's closing SUMMARY line.
+# What the guest printed before the report, ending with ASAN's separator line.
+REPORT_PREAMBLE = """\
+btrfs-convert from btrfs-progs v7.1
+Create btrfs metadata
+Copy inodes [o] [         0/       111]\r
+=================================================================
+"""
+
+# Hermit's two log events after the abort. Their order is not fixed.
+EXIT_EVENTS = (
+    "2026-10-01T21:20:16.078060Z ERROR reverie_ptrace::lifecycle: guest terminated "
+    "by signal tid=5 pid=3 signal=SIGABRT core_dumped=true\n"
+    "2026-10-01T21:20:16.081167Z ERROR reverie_ptrace::lifecycle: guest terminated "
+    "by signal tid=3 pid=3 signal=SIGABRT core_dumped=true\n"
+)
+
+# A crashing chaos run's whole output.
+UAF_REPORT = REPORT_PREAMBLE + FULL_REPORT + EXIT_EVENTS
+
+# Another run of the same seed whose report is the same but whose other lines are
+# not: a Hermit log line inside the report, the exit events in the other order
+# with other timestamps, and the per-run summary bin/safehermit appends when a
+# run goes through it. None of these lines is part of the guest's report.
+SAME_REPORT_OTHER_LOGS = (
+    REPORT_PREAMBLE
+    + FULL_REPORT.replace(
+        "freed by thread T0 here:\n",
+        "freed by thread T0 here:\n"
+        "2026-10-01T21:22:03.517204Z ERROR detcore::tool_global: example event\n",
+    )
+    + "2026-10-01T21:22:04.045954Z ERROR reverie_ptrace::lifecycle: guest terminated "
+    "by signal tid=3 pid=3 signal=SIGABRT core_dumped=true\n"
+    "2026-10-01T21:22:04.046018Z ERROR reverie_ptrace::lifecycle: guest terminated "
+    "by signal tid=5 pid=3 signal=SIGABRT core_dumped=true\n"
+    "safehermit: elapsed_secs=2\n"
+    "safehermit: exec_main_pid=3954865\n"
+    "safehermit: exit_code=134\n"
+)
+
+
+def _vary(text, old, new):
+    """`text` with the one line `old` replaced by `new`; refuses a no-op edit."""
+    if text.count(old) != 1:
+        raise AssertionError("expected exactly one {!r} in the fixture".format(old))
+    return text.replace(old, new)
+
+
+# The same run with one line of the shadow-memory map changed, as a different
+# image path length changed it in README.md's measurements.
+SHADOW_DIFFERENT = _vary(
+    UAF_REPORT,
+    "  0x0c0c7fff8020: 00 00 00 00 fa fa fa fa 00 00 00 00 00 00 00 00\n",
+    "  0x0c0c7fff8020: 00 00 00 01 fa fa fa fa 00 00 00 00 00 00 00 01\n",
+)
+
+# The same run with a different frame in the stack that freed the memory.
+FREE_STACK_DIFFERENT = _vary(
+    UAF_REPORT,
+    "    #2 0x418691 in do_convert convert/main.c:1354\n",
+    "    #2 0x418702 in do_convert convert/main.c:1360\n",
+)
+
+# The same run without ASAN's closing ABORTING line. It still has the SUMMARY.
+NO_CLOSING_LINE = _vary(UAF_REPORT, "==3==ABORTING\n", "")
+
+# The report cut off before its SUMMARY line.
 PARTIAL_REPORT = """\
 ==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210
     #0 0x4e69f6 in task_period_wait common/task-utils.c:154
@@ -89,7 +221,7 @@ case "$conv" in
       partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
       truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
       skid-refusal) skid_refusal ;;
-      replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different|replay-skid-refusal)
+      replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different|replay-skid-refusal|replay-custom)
         if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
         case "$DEMO08_TEST_BUGGY_MODE" in
           replay-partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
@@ -97,6 +229,8 @@ case "$conv" in
           replay-truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
           replay-different) cat "$DEMO08_TEST_OTHER_FILE"; exit 134 ;;
           replay-skid-refusal) skid_refusal ;;
+          # The ASAN abort with whatever output the test wrote to the file.
+          replay-custom) cat "$DEMO08_TEST_REPLAY_FILE"; exit 134 ;;
         esac ;;
       *) echo "stub: unknown DEMO08_TEST_BUGGY_MODE" >&2; exit 9 ;;
     esac ;;
@@ -148,8 +282,20 @@ count=1
 printf '%s\n' "$count" >"$counter"
 
 engage() { printf 'Copy inodes [o] [         0/         1]\r\n'; }
+# Run the planted program on this (variant, seed) pair's first crash, and print
+# that crash's output again, with its exit status, on every later one. Under
+# Hermit two runs of one seed print the same report: the guest's PID is
+# virtual and its addresses do not move. Run natively, the planted program
+# prints a different PID and different addresses every time.
 abort_with_uaf() {
-  ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "${DEMO08_TEST_UAF_BIN:?}"
+  local saved="$DEMO08_TEST_COUNT_DIR/uaf-$variant-$seed" rc=0
+  if [ ! -e "$saved.rc" ]; then
+    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 "${DEMO08_TEST_UAF_BIN:?}" \
+      >"$saved.out" 2>&1 || rc=$?
+    printf '%s\n' "$rc" >"$saved.rc"
+  fi
+  cat "$saved.out"
+  return "$(cat "$saved.rc")"
 }
 partial_report() {
   echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
@@ -208,6 +354,14 @@ case "${DEMO08_TEST_MODE:?}" in
     engage
     if [ "$variant" = buggy ] && [ "$count" -eq 1 ]; then abort_with_uaf; fi
     echo 'Conversion complete' ;;
+  replay-report)
+    # A seed's first buggy run crashes with the planted program's report; every
+    # later buggy run prints DEMO08_TEST_REPLAY_REPORT and aborts. The fixed
+    # variant is clean.
+    engage
+    if [ "$variant" = fixed ]; then echo 'Conversion complete'; exit 0; fi
+    if [ "$count" -eq 1 ]; then abort_with_uaf; fi
+    cat "${DEMO08_TEST_REPLAY_REPORT:?}"; exit 134 ;;
   fixed-timeout)
     engage
     if [ "$variant" = buggy ]; then abort_with_uaf; fi
@@ -337,6 +491,7 @@ class DemoRunControlsTest(unittest.TestCase):
                 "DEMO08_TEST_UAF_FILE": str(self.tmp / "uaf.txt"),
                 "DEMO08_TEST_PARTIAL_FILE": str(self.tmp / "partial.txt"),
                 "DEMO08_TEST_OTHER_FILE": str(self.tmp / "other.txt"),
+                "DEMO08_TEST_REPLAY_FILE": str(self.tmp / "replay.txt"),
             }
         )
         for key, value in overrides.items():
@@ -365,11 +520,22 @@ class DemoRunControlsTest(unittest.TestCase):
         self.assertIn(
             "=== Demo 8: btrfs-convert Use-After-Free: SUCCESS ===", result.stdout
         )
-        self.assertIn("replay: ASAN report byte-identical", result.stdout)
-        # Step 2 saves the guest-produced core of the report, nothing else.
-        self.assertEqual(
-            (self.artifacts / "asan-report.txt").read_text(), UAF_REPORT
+        lines = len(FULL_REPORT.splitlines())
+        self.assertEqual(lines, 63)
+        self.assertIn(
+            "replay: ASAN report byte-identical: all {} lines from the ERROR line "
+            "through ABORTING".format(lines),
+            result.stdout,
         )
+        self.assertIn(
+            "chaos buggy: reproduced the use-after-free; the complete {}-line "
+            "ASAN report is in".format(lines),
+            result.stdout,
+        )
+        # Steps 2 and 4 each save the complete report and nothing else: not the
+        # program's output before it, and not Hermit's exit events after it.
+        for name in ("asan-report.txt", "asan-report-replay.txt"):
+            self.assertEqual((self.artifacts / name).read_text(), FULL_REPORT, name)
         # Every chaos run uses the documented command line and the same seed.
         invocations = (self.tmp / "hermit-args").read_text().splitlines()
         self.assertEqual(len(invocations), 3)
@@ -508,6 +674,63 @@ class DemoRunControlsTest(unittest.TestCase):
             self._run(buggy_mode="replay-different"),
             "replay: ASAN reports differ between runs",
         )
+
+    def _replay_prints(self, text):
+        """Make the second buggy run print `text` and exit 134."""
+        (self.tmp / "replay.txt").write_text(text)
+        return self._run(buggy_mode="replay-custom")
+
+    def test_a_second_run_with_a_different_shadow_memory_map_is_refused(self):
+        """Same address, PC, and stacks; one shadow-memory line differs."""
+        result = self._replay_prints(SHADOW_DIFFERENT)
+        self._assert_refused(result, "replay: ASAN reports differ between runs")
+        # diff shows the replay's line.
+        self.assertIn(
+            ">   0x0c0c7fff8020: 00 00 00 01 fa fa fa fa 00 00 00 00 00 00 00 01\n",
+            result.stdout,
+        )
+
+    def test_a_second_run_with_a_different_free_stack_is_refused(self):
+        """Same address, PC, and program frames; the freeing stack differs."""
+        result = self._replay_prints(FREE_STACK_DIFFERENT)
+        self._assert_refused(result, "replay: ASAN reports differ between runs")
+        self.assertIn(
+            ">     #2 0x418702 in do_convert convert/main.c:1360\n", result.stdout
+        )
+
+    def test_a_second_run_without_the_closing_line_is_refused(self):
+        """A report that has its SUMMARY but not ABORTING cannot be compared."""
+        self._assert_refused(
+            self._replay_prints(NO_CLOSING_LINE),
+            "replay exited 134, but its ASAN report stops before ASAN's closing "
+            "==PID==ABORTING line, so the complete report cannot be compared",
+        )
+
+    def test_a_first_run_without_the_closing_line_is_refused(self):
+        (self.tmp / "no-closing.txt").write_text(NO_CLOSING_LINE)
+        result = self._run(DEMO08_TEST_UAF_FILE=str(self.tmp / "no-closing.txt"))
+        self._assert_refused(
+            result,
+            "chaos buggy seed 7 exited 134, but its ASAN report stops before "
+            "ASAN's closing ==PID==ABORTING line, so the complete report cannot "
+            "be compared",
+        )
+        # Refused in Step 2: neither the fixed control nor the replay ran.
+        invocations = (self.tmp / "hermit-args").read_text().splitlines()
+        self.assertEqual(len(invocations), 1, invocations)
+
+    def test_lines_from_hermit_and_its_wrapper_are_not_part_of_the_report(self):
+        """Positive control: only the guest's report is compared.
+
+        The second run differs from the first only outside the report: a Hermit
+        log line inside it, Hermit's exit events in the other order with other
+        timestamps, and bin/safehermit's summary after it.
+        """
+        result = self._replay_prints(SAME_REPORT_OTHER_LOGS)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("replay: ASAN report byte-identical: all 63 lines", result.stdout)
+        for name in ("asan-report.txt", "asan-report-replay.txt"):
+            self.assertEqual((self.artifacts / name).read_text(), FULL_REPORT, name)
 
     def test_missing_assets_skip_by_default(self):
         shutil.rmtree(self.assets / "buggy")
@@ -941,6 +1164,154 @@ class CalibrationControlsTest(unittest.TestCase):
         result = self._prepare("fixed-refused-uaf", 1)
         self._assert_refused(result, "fixed variant reported a use-after-free on seed 0")
         self.assertEqual(self._count_rows(r"\tfixed\t"), 1)
+
+
+class CalibrationReportComparisonTest(unittest.TestCase):
+    """prepare-assets.sh must record a seed only if its two reports are the same.
+
+    run.sh's Step 4 compares the complete ASAN report of two runs of the seed,
+    so calibration must make the same comparison. The planted program here is a
+    shell script that prints a saved run's output and exits 134, so these tests
+    need no compiler; CalibrationControlsTest feeds calibration a real ASAN abort.
+    """
+
+    CALIBRATION_TIMEOUT = 5
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.stub_dir = self.tmp / "bin"
+        self.stub_dir.mkdir()
+        _write_executable(self.stub_dir / "hermit", CALIBRATION_STUB)
+        self.assets = self.tmp / "assets"
+        _make_assets(self.assets)
+        # The cache stamp prepare-assets.sh expects, so it skips the build and
+        # goes straight to calibration.
+        (self.assets / ".nightly-prep-version").write_text(
+            "prep={} btrfs={} fixture-src={}\n".format(
+                PREP_VERSION, BTRFS_COMMIT, fixture_source_digest()
+            )
+        )
+        self.artifacts = self.tmp / "artifacts"
+        self.fixture = _sha256_hex(self.assets / "buggy" / "btrfs-convert")
+        self.first = self.tmp / "first-run.txt"
+        self.first.write_text(UAF_REPORT)
+        self.guest = self.tmp / "planted-uaf"
+        _write_executable(
+            self.guest, "#!/usr/bin/env bash\ncat '{}'\nexit 134\n".format(self.first)
+        )
+
+    def _prepare(self, mode, replay_text=None, **overrides):
+        environment = _base_environment(self.stub_dir)
+        environment.update(
+            {
+                "DEMO08_DIR": str(self.assets),
+                "DEMO08_BUILD_ROOT": str(self.tmp / "build-unused"),
+                "DEMO08_BTRFS_REPO": str(self.tmp / "no-such-repository"),
+                "DEMO08_ARTIFACTS": str(self.artifacts),
+                "DEMO08_CALIBRATION_SEEDS": "1",
+                "DEMO08_CALIBRATION_TIMEOUT": str(self.CALIBRATION_TIMEOUT),
+                "DEMO08_TEST_COUNT_DIR": str(self.tmp / "counts"),
+                "DEMO08_TEST_MODE": mode,
+                "DEMO08_TEST_UAF_BIN": str(self.guest),
+                "DEMO08_TEST_UAF_SEED": "0",
+            }
+        )
+        if replay_text is not None:
+            replay = self.tmp / "replay-run.txt"
+            replay.write_text(replay_text)
+            environment["DEMO08_TEST_REPLAY_REPORT"] = str(replay)
+        environment.update(overrides)
+        result = subprocess.run(
+            [str(PREPARE)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+        )
+        self.assertIn("Searching for a crashing seed", result.stdout)
+        return result
+
+    def _rows(self):
+        return (self.artifacts / "calibration.tsv").read_text().splitlines()
+
+    def _assert_stopped(self, result, *reasons):
+        self.assertEqual(result.returncode, 1, result.stdout)
+        for reason in reasons:
+            self.assertIn(reason, result.stdout)
+        self.assertFalse((self.assets / ".crash-seed").exists())
+        self.assertNotIn("Demo 8 crash seed calibrated", result.stdout)
+
+    def test_the_same_report_is_confirmed_whatever_hermit_logs_around_it(self):
+        """Positive control: only the guest's report is compared.
+
+        The replay differs from the first run only outside the report: a Hermit
+        log line inside it, Hermit's exit events in the other order with other
+        timestamps, and bin/safehermit's summary after it.
+        """
+        result = self._prepare("replay-report", SAME_REPORT_OTHER_LOGS)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Demo 8 crash seed calibrated: 0", result.stdout)
+        self.assertIn(
+            "seed=0 replay printed the same complete ASAN report as the first run "
+            "(63 lines:",
+            result.stdout,
+        )
+        self.assertEqual(
+            (self.assets / ".crash-seed").read_text(), "0 {}\n".format(self.fixture)
+        )
+        for name in (
+            "calibration-cold-seed-0.asan.txt",
+            "calibration-confirm-replay-seed-0.asan.txt",
+        ):
+            self.assertEqual((self.artifacts / name).read_text(), FULL_REPORT, name)
+        # The first run, its replay, and the fixed control, after the header.
+        self.assertEqual(len(self._rows()), 4)
+
+    def test_a_replay_with_a_different_shadow_memory_map_stops_the_calibration(self):
+        result = self._prepare("replay-report", SHADOW_DIFFERENT)
+        self._assert_stopped(
+            result,
+            "demo 8 seed 0 crashed on its first run and on its replay, but the two "
+            "ASAN reports differ",
+            ">   0x0c0c7fff8020: 00 00 00 01 fa fa fa fa 00 00 00 00 00 00 00 01\n",
+        )
+        # Stopped before the fixed control: the first run and the replay only.
+        self.assertEqual(len(self._rows()), 3)
+
+    def test_a_replay_with_a_different_free_stack_stops_the_calibration(self):
+        result = self._prepare("replay-report", FREE_STACK_DIFFERENT)
+        self._assert_stopped(
+            result,
+            "the two ASAN reports differ",
+            ">     #2 0x418702 in do_convert convert/main.c:1360\n",
+        )
+        self.assertEqual(len(self._rows()), 3)
+
+    def test_a_replay_without_the_closing_line_stops_the_calibration(self):
+        result = self._prepare("replay-report", NO_CLOSING_LINE)
+        self._assert_stopped(
+            result,
+            "demo 8 seed 0: the replay run exited 134 with the report's SUMMARY "
+            "line, but no complete ASAN report could be saved from",
+        )
+        self.assertEqual(len(self._rows()), 3)
+
+    def test_a_first_run_without_the_closing_line_stops_before_the_replay(self):
+        self.first.write_text(NO_CLOSING_LINE)
+        result = self._prepare("planted-uaf")
+        self._assert_stopped(
+            result,
+            "demo 8 seed 0: the first run exited 134 with the report's SUMMARY "
+            "line, but no complete ASAN report could be saved from",
+        )
+        # The header and the first run; the replay never ran.
+        self.assertEqual(len(self._rows()), 2)
+        self.assertFalse(
+            (self.artifacts / "calibration-confirm-replay-seed-0.out").exists()
+        )
 
 
 if __name__ == "__main__":
