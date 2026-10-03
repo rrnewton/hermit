@@ -379,6 +379,16 @@ impl TimedEvents {
         self.map.is_empty()
     }
 
+    /// Inspect actual queued events, including child-exit signals which do
+    /// not appear in the separate recurring-timer bookkeeping.
+    pub(super) fn has_signal_event(&self) -> bool {
+        self.map.values().any(|events| {
+            events
+                .iter()
+                .any(|event| matches!(event, TimedEvent::SignalEvt(..)))
+        })
+    }
+
     /// Remove a specific thread from the set of those waiting on time to elapse.
     pub fn remove(&mut self, dettid: DetTid) {
         let mut to_remove: Option<LogicalTime> = None;
@@ -425,6 +435,35 @@ mod test {
     }
     fn at(ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(ns)
+    }
+
+    #[test]
+    fn native_poll_signal_events_inspects_child_exit_without_timer_bookkeeping() {
+        let mut events = TimedEvents::default();
+        events.insert(at(10), tid(100));
+        assert!(!events.has_signal_event());
+        events.insert_child_exit(at(20), pid(200), pid(100), tid(100));
+        assert!(events.signal_timers.is_empty());
+        let before = events.iter().collect::<Vec<_>>();
+        assert!(events.has_signal_event());
+        assert_eq!(events.iter().collect::<Vec<_>>(), before);
+        assert_eq!(events.pop(), Some((at(10), TimedEvent::ThreadEvt(tid(100)))));
+        assert!(events.has_signal_event());
+        assert_eq!(
+            events.pop(),
+            Some((
+                at(20),
+                TimedEvent::SignalEvt(
+                    SignalTimerId::ChildExit {
+                        child: pid(200),
+                        parent: pid(100),
+                    },
+                    tid(100),
+                    Signal::SIGCHLD,
+                ),
+            ))
+        );
+        assert!(!events.has_signal_event());
     }
 
     /// `next_deadline` must report the earliest pending deadline without

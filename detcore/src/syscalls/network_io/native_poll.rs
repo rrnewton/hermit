@@ -1,4 +1,4 @@
-//! Bounded V4 poll: one foreground scan, no blocking-wait implementation.
+//! Bounded V4 poll: raw scans and a finite, sole-root retained-OFD wait.
 use detcore_model::network_trace::tcp_poll_row_mask;
 
 use super::*;
@@ -58,6 +58,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 *row = self.probe_shadow_local_pair(guest, *row).await?;
             }
         }
+        // The actual local probes are over before TCP admission. Retain exact
+        // bindings, not only a copied local marker, and never inject a guest
+        // probe during the following host-only wait.
+        let local_bindings: Vec<_> = output
+            .iter()
+            .zip(&local)
+            .filter(|(_, local)| **local)
+            .map(|(row, _)| {
+                guest
+                    .thread_state()
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .descriptor_binding(row.fd)
+                    .map(|binding| (row.fd, binding))
+            })
+            .collect::<Result<_, _>>()?;
         let mut classified = std::collections::BTreeMap::new();
         let mut tcp = None;
         for (row, is_local) in output.iter().zip(&local) {
@@ -70,9 +87,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             classified.insert(row.fd, file);
         }
-        let raw = match tcp {
-            Some((fd, file)) => Some(self.native_poll_snapshot(guest, fd, file, policy).await?),
-            None => None,
+        let other_ready = output.iter().zip(&local).any(|(row, local)| {
+            (*local && row.revents != 0)
+                || (!*local && row.fd >= 0 && classified[&row.fd].is_none())
+        });
+        let events = output
+            .iter()
+            .zip(&local)
+            .filter(|(row, local)| !**local && row.fd >= 0 && classified[&row.fd].is_some())
+            .fold(0, |events, (row, _)| events | row.events);
+        let wait = if other_ready || state.timeout == Some(Duration::ZERO) {
+            None
+        } else {
+            deadline.map(|deadline| (events, deadline))
+        };
+        let (raw, waited) = match tcp {
+            Some((fd, file)) => {
+                let (raw, waited) = self
+                    .native_poll_snapshot(guest, fd, file, policy, wait, &local_bindings)
+                    .await?;
+                (Some(raw), waited)
+            }
+            None => (None, false),
         };
         {
             for (row, is_local) in output.iter_mut().zip(&local) {
@@ -88,7 +124,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Call/pin closure is complete before any guest result-buffer write.
         // A zero snapshot is not permission to report a future timeout.
-        let count = single_scan_result(&output, state.timeout == Some(Duration::ZERO))?;
+        let count = single_scan_result(&output, waited || state.timeout == Some(Duration::ZERO))?;
         write_pollfds(guest, address, &output)?;
         let now = thread_observe_time(guest).await;
         write_remaining_timeout(guest, state.remaining_address, deadline, now)?;
@@ -144,7 +180,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         fd: i32,
         expected: OpenFileId,
         policy: NetworkPolicy,
-    ) -> Result<i16, Error> {
+        wait: Option<(i16, LogicalTime)>,
+        locals: &[(i32, crate::types::FdSlotBinding)],
+    ) -> Result<(i16, bool), Error> {
         if !self.network_fd_tracking_active(guest)
             || (policy == NetworkPolicy::Record && !guest.config().backend_supports_host_socket_pin)
         {
@@ -219,8 +257,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             native: call.physical_pin_required,
             nonblocking,
         };
+        let mut waited = false;
+        let mut record_lease = None;
         let operation = async {
-            let lease = if policy == NetworkPolicy::Record {
+            let (lease, initial) = if policy == NetworkPolicy::Record {
                 let probe = match network_request(
                     guest,
                     NetworkRequest::BeginShadowProbe { call: call.id },
@@ -235,27 +275,84 @@ impl<T: RecordOrReplay> Detcore<T> {
                         )));
                     }
                 };
-                self.native_stream_effect(
-                    guest,
-                    probe.lease,
-                    NetworkStreamPhysicalEffect::PollState,
-                )
-                .await?;
-                Some(probe.lease)
+                record_lease = Some(probe.lease);
+                let observed = self
+                    .native_stream_effect(
+                        guest,
+                        probe.lease,
+                        NetworkStreamPhysicalEffect::PollState,
+                    )
+                    .await?;
+                let NetworkStreamPhysicalResult::PollState { revents } = observed.confirmation
+                else {
+                    return Err(engine_error(
+                        "initial native poll did not complete a raw scan",
+                    ));
+                };
+                (Some(probe.lease), revents)
             } else {
-                None
+                (
+                    None,
+                    guest
+                        .local_global_state()
+                        .ok_or_else(|| engine_error("V4 poll lost local global state"))?
+                        .finish_foreground_poll(guest.tid(), guest.thread_state(), call.id, None)
+                        .map_err(engine_rpc_error)?,
+                )
             };
-            guest
+            let global = guest
                 .local_global_state()
-                .ok_or_else(|| engine_error("V4 poll lost local global state"))?
-                .finish_foreground_poll(guest.tid(), guest.thread_state(), call.id, lease)
-                .map(i64::from)
-                .map_err(engine_rpc_error)
+                .ok_or_else(|| engine_error("V4 poll lost local global state"))?;
+            if let Some(wait) = wait
+                && tcp_poll_row_mask(initial, wait.0) == 0
+            {
+                let raw = global
+                    .wait_foreground_poll(
+                        guest.tid(),
+                        guest.thread_state(),
+                        call.id,
+                        lease,
+                        wait,
+                        locals,
+                    )
+                    .await
+                    .map_err(engine_rpc_error)?;
+                waited = true;
+                Ok(i64::from(raw))
+            } else if lease.is_some() {
+                global
+                    .finish_foreground_poll(guest.tid(), guest.thread_state(), call.id, lease)
+                    .map(i64::from)
+                    .map_err(engine_rpc_error)
+            } else {
+                Ok(i64::from(initial))
+            }
         }
         .await;
+        let operation = match (operation, record_lease) {
+            (Err(primary), Some(lease)) => {
+                let cleanup = guest
+                    .local_global_state()
+                    .ok_or_else(|| engine_error("V4 poll cleanup lost local global state"))
+                    .and_then(|global| {
+                        global
+                            .abort_foreground_poll(
+                                crate::network_replay::NetworkStreamOwner {
+                                    thread: guest.thread_state().dettid,
+                                    mm: guest.thread_state().mm_id,
+                                },
+                                call.id,
+                                lease,
+                            )
+                            .map_err(engine_rpc_error)
+                    });
+                finish_shadow_operation(Err(primary), cleanup)
+            }
+            (operation, _) => operation,
+        };
         self.finish_host_stream_call(guest, pin, operation)
             .await
-            .map(|raw| raw as i16)
+            .map(|raw| (raw as i16, waited))
     }
 }
 

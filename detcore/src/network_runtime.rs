@@ -2041,6 +2041,32 @@ impl NetworkRuntimeResources {
         result.map_err(std::io::Error::other)?
     }
 
+    /// A bounded caller has expired, not completed its outstanding workers.
+    /// Preserve their actual handles and late results for terminal join; close
+    /// further admission and retain RED even if the physical work later ends.
+    pub(crate) fn refuse_native_poll_deadline(&self) -> std::io::Error {
+        let message = "native poll exceeded its original one-second helper deadline; custody retained";
+        let mut owned = self.shared.native_workers.lock().unwrap();
+        owned.closed = true;
+        for worker in &owned.tasks {
+            worker.deadline_failure.lock().unwrap().get_or_insert_with(|| message.to_owned());
+        }
+        self.shared.native_terminal_failure.lock().unwrap().get_or_insert_with(|| message.to_owned());
+        std::io::Error::other(message)
+    }
+
+    /// Test-only physical capture premise: the real TCP object is already
+    /// owned, but no provider or pidfd selection is claimed by this fixture.
+    #[cfg(test)]
+    pub(crate) fn controlled_capture_poll_pin(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        pin: OwnedFd,
+    ) -> std::io::Result<()> {
+        self.shared.native_streams.lock().unwrap().capture(owner, call, pin)
+    }
+
     async fn run_native_release_worker<T: Send + 'static>(
         &self,
         operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
@@ -2320,6 +2346,19 @@ impl NetworkRuntimeResources {
             .lock()
             .unwrap()
             .finish_lease(owner, lease)
+    }
+
+    pub(crate) fn abort_native_poll_lease(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        lease: crate::network_replay::NetworkStreamLeaseId,
+    ) -> std::io::Result<()> {
+        self.shared
+            .native_streams
+            .lock()
+            .unwrap()
+            .abort_poll_lease(owner, call, lease)
     }
 
     pub(crate) async fn release_native_stream(
@@ -3649,6 +3688,41 @@ mod tests {
                 .tasks
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn native_poll_deadline_closes_admission_and_retains_late_worker() {
+        let (runtime, _) = fixture(75);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let mut pending = Box::pin(runtime.run_native_worker(move || {
+            let _ = entered.send(());
+            proceed.recv_timeout(std::time::Duration::from_secs(1))
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        }));
+        let was_pending = futures::poll!(pending.as_mut()).is_pending();
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(1), started).await;
+        let worker = runtime.shared.native_workers.lock().unwrap().tasks[0].clone();
+        drop(pending);
+        let refusal = runtime.refuse_native_poll_deadline();
+        let next = runtime.start_native_worker(|| Ok(()));
+        let released = release.send(());
+        let joined = runtime.shared.join_native_worker(&worker).await;
+        // Semantic assertions follow the actual join, including if an earlier
+        // premise failed. Late physical completion cannot turn the cap green.
+        assert!(was_pending);
+        assert!(matches!(entered, Ok(Ok(()))));
+        assert!(released.is_ok());
+        assert!(refusal.to_string().contains("original one-second helper deadline"));
+        assert!(next.is_err());
+        assert!(joined.is_err());
+        let completion = worker.completion.lock().await;
+        assert!(completion.task.is_none());
+        assert_eq!(completion.terminal, Some(Ok(())));
+        assert!(worker.deadline_failure.lock().unwrap().is_some());
+        assert_eq!(runtime.shared.native_workers.lock().unwrap().tasks.len(), 1);
+        assert!(runtime.shared.native_terminal_failure.lock().unwrap().is_some());
     }
 
     #[tokio::test]

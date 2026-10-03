@@ -2,8 +2,9 @@
 //!
 //! No descriptor number in this module authenticates a guest FD. Admission and
 //! the call/lease join come from the shared engine. Every kernel operation is
-//! synchronous, uses owned scratch and MSG_DONTWAIT, and retains its raw result
-//! before the caller can await an RPC. This does not supply replay topology or
+//! synchronous, uses owned scratch and bounded nonconsuming waits or
+//! MSG_DONTWAIT, and retains its raw result before the caller can await an RPC.
+//! This does not supply replay topology or
 //! prove completion of native epoll callbacks after a peer send.
 
 use std::collections::BTreeMap;
@@ -1104,6 +1105,9 @@ impl Calls {
         if matches!(effect, Effect::PollState) {
             raw_poll::validate(observed)?;
         }
+        if let Effect::PollWait { events, .. } = effect {
+            raw_poll::validate_wait(observed, *events)?;
+        }
         Ok(())
     }
 
@@ -1151,6 +1155,63 @@ impl Calls {
                 "shadow publication differs from retained native PEEK",
             ));
         }
+        Ok(())
+    }
+
+    /// Retire only a completed initial raw scan, before any wait was prepared.
+    /// The engine checks that semantic phase under its guard; this registry
+    /// independently requires the exact captured Call and confirmed result.
+    pub(super) fn abort_poll_lease(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        lease: NetworkStreamLeaseId,
+    ) -> io::Result<()> {
+        let state = self
+            .calls
+            .get_mut(&call)
+            .ok_or_else(|| io::Error::other("poll abort has no captured call"))?;
+        if state.id != call
+            || state.owner != owner
+            || state.acquisition.is_err()
+            || state.releasing
+            || state.release.is_some()
+            || state.invocation.is_some()
+            || state
+                .original
+                .as_ref()
+                .is_none_or(|pin| std::sync::Arc::strong_count(pin) != 1)
+        {
+            return Err(io::Error::other("poll abort changed active captured call"));
+        }
+        let record = state
+            .leases
+            .get(&lease)
+            .ok_or_else(|| io::Error::other("poll abort has no captured lease"))?;
+        let pending = record
+            .pending
+            .as_ref()
+            .ok_or_else(|| io::Error::other("poll abort has no completed scan"))?;
+        if pending.effect != Effect::PollState
+            || !pending.confirmed
+            || pending.helper.is_some()
+            || record.peek.is_some()
+            || record.no_store_join.is_some()
+            || record.private_predecessor.is_some()
+        {
+            return Err(io::Error::other(
+                "poll abort is not its confirmed initial scan",
+            ));
+        }
+        let observed = pending
+            .result
+            .as_ref()
+            .ok_or_else(|| io::Error::other("poll abort lacks retained raw result"))?;
+        if !matches!(observed.confirmation, ResultValue::PollState { .. }) {
+            return Err(io::Error::other("poll abort did not complete a raw scan"));
+        }
+        raw_poll::validate(observed)?;
+        state.leases.remove(&lease);
         Ok(())
     }
 
@@ -1573,6 +1634,9 @@ fn validate(effect: &Effect) -> io::Result<()> {
     let valid = match effect {
         Effect::Peek { maximum } => (PUBLICATION_UNIT..=MAX_RW_COUNT).contains(maximum),
         Effect::Drain { maximum } => (1..=DRAIN_VIEW).contains(maximum),
+        Effect::PollWait { events, timeout_ns } => {
+            raw_poll::valid_wait_request(*events, *timeout_ns)
+        }
         Effect::ReadPeekOffset
         | Effect::SetPeekOffset { .. }
         | Effect::PollState
@@ -1713,6 +1777,7 @@ fn execute(fd: BorrowedFd<'_>, effect: &Effect) -> Observation {
         Effect::PollState => {
             raw_poll::observe(fd)
         }
+        Effect::PollWait { events, timeout_ns } => raw_poll::wait(fd, *events, *timeout_ns),
         Effect::QueuedBytes => {
             let mut count = 0i32;
             let raw = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &raw mut count) };

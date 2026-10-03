@@ -2135,6 +2135,14 @@ pub enum NetworkStreamPhysicalEffect {
     },
     /// Actual poll0 after this receipt's PEEK.
     PollState,
+    /// One finite requested-mask wait on the same retained original socket.
+    /// This is distinct from a full readiness snapshot and never guest EINTR.
+    PollWait {
+        /// Union of the caller's admitted TCP row interests.
+        events: i16,
+        /// Remaining finite kernel wait, strictly below the helper's one second.
+        timeout_ns: u64,
+    },
     /// Actual FIONREAD after this receipt's poll0.
     QueuedBytes,
     /// Exact successful-copy selection drain, at most 512 bytes per view.
@@ -2458,6 +2466,11 @@ pub enum NetworkStreamPhysicalResult {
         /// Actual kernel poll result bits.
         revents: i16,
     },
+    /// Actual requested-mask wait result, not a full-state observation.
+    PollWait {
+        /// Actual kernel result for the exact requested interests.
+        revents: i16,
+    },
     /// Actual kernel queue length from the ordered FIONREAD.
     QueuedBytes {
         /// Actual successful physical syscall byte count.
@@ -2489,8 +2502,18 @@ struct ShadowProbeState {
     current_cursor: Option<i32>,
     peek: Option<Result<usize, i32>>,
     poll: Option<i16>,
+    poll_wait: Option<NativePollWaitState>,
     queued: Option<usize>,
     pending: Option<NetworkStreamPhysicalEffect>,
+}
+
+#[derive(Debug, Clone)]
+struct NativePollWaitState {
+    initial: i16,
+    observed_at: LogicalTime,
+    events: i16,
+    timeout_ns: u64,
+    returned: Option<i16>,
 }
 
 impl ShadowProbeState {
@@ -2543,6 +2566,7 @@ impl NetworkReplayEngine {
                 current_cursor: options.options.peek_offset,
                 peek: None,
                 poll: None,
+                poll_wait: None,
                 queued: None,
                 pending: None,
             },
@@ -2617,6 +2641,12 @@ impl NetworkReplayEngine {
                             && probe.peek.is_none()
                             && !probe.cursor_observed
                             && probe.current_cursor == probe.original_cursor))
+            }
+            NetworkStreamPhysicalEffect::PollWait { events, timeout_ns } => {
+                native_poll && probe.poll_wait.as_ref().is_some_and(|wait| {
+                    wait.events == events && wait.timeout_ns == timeout_ns
+                        && wait.returned.is_none() && probe.poll == Some(wait.initial)
+                })
             }
             NetworkStreamPhysicalEffect::QueuedBytes => {
                 probe.poll.is_some() && probe.queued.is_none()
@@ -2694,6 +2724,20 @@ impl NetworkReplayEngine {
                 NetworkStreamPhysicalEffect::PollState,
                 NetworkStreamPhysicalResult::PollState { revents },
             ) if revents & libc::POLLNVAL == 0 => next.poll = Some(revents),
+            (
+                NetworkStreamPhysicalEffect::PollWait { events, timeout_ns },
+                NetworkStreamPhysicalResult::PollWait { revents },
+            ) if detcore_model::network_trace::valid_tcp_poll_mask(revents)
+                && detcore_model::network_trace::tcp_poll_row_mask(revents, events) == revents => {
+                let wait = next.poll_wait.as_mut()
+                    .ok_or(NetworkReplayError::UnresolvedStreamOperation(lease))?;
+                if wait.events != events || wait.timeout_ns != timeout_ns || wait.returned.is_some() {
+                    return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
+                }
+                wait.returned = Some(revents);
+                // A distinct final full-mask observation must now follow the wait.
+                next.poll = None;
+            }
             (
                 NetworkStreamPhysicalEffect::QueuedBytes,
                 NetworkStreamPhysicalResult::QueuedBytes { count },

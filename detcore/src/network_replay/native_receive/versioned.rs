@@ -1500,7 +1500,13 @@ impl NetworkReplayEngine {
         for n in selected {
             let input = &native.trace.inputs[n];
             if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, revents } = input.event {
-                replay.poll.apply(input.ordinal, input.channel, consumed_prefix, revents);
+                replay.poll.apply(
+                    input.ordinal,
+                    input.channel,
+                    consumed_prefix,
+                    input.release.not_before_global_time,
+                    revents,
+                );
             } else if input.event == NetworkInputKindV2::ConnectEstablished {
                 // Apply the separately observed state, not a second syscall
                 // result. Completion of its producer still requires delivery

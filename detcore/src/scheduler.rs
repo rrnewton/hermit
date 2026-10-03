@@ -676,6 +676,12 @@ pub struct Scheduler {
     /// run-queue mutation is safe.
     pending_cross_task_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
 
+    /// Conservative run-wide history for the sole-initial-root native Poll
+    /// wait profile. A successful modeled publication can outlive its timer
+    /// entry and remain pending in Linux. Never reset on cancellation, exec or
+    /// signal delivery; this is refusal state, not signal/disposition authority.
+    native_poll_signal_published: bool,
+
     /// Selected only at construction from the immutable run configuration.
     clear_tid_owner: ClearTidOwner,
 
@@ -3185,6 +3191,7 @@ impl Scheduler {
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
+            native_poll_signal_published: false,
             clear_tid_owner: ClearTidOwner::from_config(cfg),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
@@ -4042,6 +4049,34 @@ impl Scheduler {
 
     pub(crate) fn backend_failed(&self) -> bool {
         self.backend_failure.is_some()
+    }
+
+    /// Check only the conservative modeled-signal profile of a native Poll
+    /// wait. The caller must separately retain its real foreground grant,
+    /// sole initial root/MM, Call and files, and exclude diagnostic signals.
+    /// This does not assert that Linux has no externally pending signal.
+    pub(crate) fn validate_native_poll_wait_profile(&self) -> std::io::Result<()> {
+        if self.backend_failed() || self.terminal_deadlock.is_some() {
+            return Err(std::io::Error::other(
+                "native Poll wait after scheduler terminal failure",
+            ));
+        }
+        if self.native_poll_signal_published {
+            return Err(std::io::Error::other(
+                "native Poll wait after modeled signal publication",
+            ));
+        }
+        if self.blocked.timed_waiters.has_signal_event() {
+            return Err(std::io::Error::other(
+                "native Poll wait with armed modeled signal",
+            ));
+        }
+        if !self.pending_cross_task_signals.is_empty() {
+            return Err(std::io::Error::other(
+                "native Poll wait with pending cross-task signals",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn backend_failure_waiter(&self) -> Shared<oneshot::Receiver<()>> {
@@ -5038,6 +5073,7 @@ impl Scheduler {
             }
             Err(errno) => panic!("signal::kill to go through, got {errno}"),
         }
+        self.native_poll_signal_published = true;
         self.wake_signaled_guest(dettid, signal);
     }
 
@@ -9525,6 +9561,212 @@ mod test {
             Some(&operation)
         );
         operation
+    }
+
+    #[test]
+    fn native_poll_wait_profile_allows_cancellation_before_publication() {
+        for interval in [LogicalTime::ZERO, LogicalTime::from_nanos(5)] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let tid = DetTid::from_raw(101);
+            assert!(scheduler.validate_native_poll_wait_profile().is_ok());
+            scheduler.register_alarm(
+                tid,
+                tid,
+                LogicalTime::ZERO,
+                LogicalTime::from_nanos(10),
+                interval,
+                Signal::SIGALRM,
+            );
+            let before = scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>();
+            assert_eq!(
+                scheduler
+                    .validate_native_poll_wait_profile()
+                    .unwrap_err()
+                    .to_string(),
+                "native Poll wait with armed modeled signal"
+            );
+            assert_eq!(
+                scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                before
+            );
+            assert!(!scheduler.native_poll_signal_published);
+            assert_eq!(
+                scheduler.register_alarm(
+                    tid,
+                    tid,
+                    LogicalTime::ZERO,
+                    LogicalTime::ZERO,
+                    LogicalTime::ZERO,
+                    Signal::SIGALRM,
+                ),
+                (LogicalTime::from_nanos(10), interval)
+            );
+            assert!(scheduler.validate_native_poll_wait_profile().is_ok());
+        }
+    }
+
+    #[test]
+    fn native_poll_wait_profile_keeps_published_alarm_after_removal_and_signal_grant() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(101);
+        scheduler.thread_tree.add_child(tid, tid, true);
+        start_test_network_capture(&mut scheduler, tid);
+        // Physical success is the existing controlled unit-test premise. Timer
+        // removal, the production publication branch and signal grant are real.
+        scheduler.enable_controlled_signal_delivery();
+        scheduler.register_alarm(
+            tid,
+            tid,
+            LogicalTime::ZERO,
+            LogicalTime::from_nanos(10),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+        scheduler.committed_time = LogicalTime::from_nanos(10);
+        assert!(scheduler.step2b_process_timed());
+        assert_eq!(scheduler.host_signal_attempts, 1);
+        assert!(scheduler.native_poll_signal_published);
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+        assert_eq!(
+            scheduler.register_alarm(
+                tid,
+                tid,
+                scheduler.committed_time,
+                LogicalTime::ZERO,
+                LogicalTime::ZERO,
+                Signal::SIGALRM,
+            ),
+            (LogicalTime::ZERO, LogicalTime::ZERO)
+        );
+        assert_eq!(
+            scheduler
+                .validate_native_poll_wait_profile()
+                .unwrap_err()
+                .to_string(),
+            "native Poll wait after modeled signal publication"
+        );
+
+        let mut request = Resources::new(tid);
+        request.insert(
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGALRM)),
+            Permission::RW,
+        );
+        let next = scheduler.next_turns.get(&tid).unwrap();
+        let response = next.resp.clone();
+        next.req.put(Ok(request));
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.network_capture_blockers.is_empty());
+        let (selected, _, _) = scheduler.step3_peek().unwrap();
+        assert_eq!(selected, tid);
+        scheduler.unblock_guest(tid, &response).unwrap();
+        assert!(matches!(
+            response.try_read(),
+            Some(SchedResponse::Signaled(Some(signals)))
+                if signals == vec![SigWrapper::from(Signal::SIGALRM)]
+        ));
+        assert!(scheduler.inbound_signals(tid).is_empty());
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+        assert_eq!(
+            scheduler
+                .validate_native_poll_wait_profile()
+                .unwrap_err()
+                .to_string(),
+            "native Poll wait after modeled signal publication"
+        );
+    }
+
+    #[test]
+    fn native_poll_wait_profile_refuses_pending_cross_task_publication() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, tid);
+        let mut request = Resources::new(tid);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.fyi("waitid");
+        scheduler.next_turns.get(&tid).unwrap().req.put(Ok(request));
+        assert!(scheduler.validate_native_poll_wait_profile().is_ok());
+        scheduler.notify_signal_pending(tid, SigWrapper::from(Signal::SIGUSR1));
+        let before = scheduler.pending_cross_task_signals.clone();
+        assert_eq!(before[&tid], vec![SigWrapper::from(Signal::SIGUSR1)]);
+        assert_eq!(
+            scheduler
+                .validate_native_poll_wait_profile()
+                .unwrap_err()
+                .to_string(),
+            "native Poll wait with pending cross-task signals"
+        );
+        assert_eq!(scheduler.pending_cross_task_signals, before);
+        assert!(!scheduler.native_poll_signal_published);
+    }
+
+    #[test]
+    fn native_poll_wait_profile_refuses_existing_terminal_states() {
+        for backend_failure in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            if backend_failure {
+                let _ = scheduler.report_backend_failure_location(BackendFailureLocation {
+                    pid: reverie::Pid::from_raw(101),
+                    tid: Some(reverie::Pid::from_raw(101)),
+                    phase: "native Poll profile control",
+                });
+            } else {
+                scheduler.terminal_deadlock = Some("terminal profile control".to_owned());
+            }
+            assert_eq!(
+                scheduler
+                    .validate_native_poll_wait_profile()
+                    .unwrap_err()
+                    .to_string(),
+                "native Poll wait after scheduler terminal failure"
+            );
+            assert!(!scheduler.native_poll_signal_published);
+        }
+    }
+
+    #[test]
+    fn native_poll_wait_profile_does_not_publish_after_actual_pidfd_esrch() {
+        let (started, tid_ready) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel::<()>(0);
+        let thread = std::thread::spawn(move || {
+            started
+                .send(unsafe { libc::syscall(libc::SYS_gettid) as i32 })
+                .unwrap();
+            let _ = released.recv();
+        });
+        let physical_tid = tid_ready.recv().unwrap();
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(101);
+        let mm = MmId::initial(tid);
+        let registered = scheduler.register_physical_thread(
+            tid,
+            mm,
+            std::process::id() as i32,
+            physical_tid,
+        );
+        // Join can return after clear_child_tid but before the kernel unhashes
+        // the task. POLLIN can also precede that unhash; the retained thread
+        // pidfd reports POLLHUP only once its PIDTYPE_PID task is gone.
+        drop(release);
+        thread.join().unwrap();
+        registered.unwrap();
+        let mut death = libc::pollfd {
+            fd: scheduler.physical_thread_pidfds[&tid].3.as_raw_fd(),
+            events: libc::POLLHUP,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut death, 1, 1000) };
+        if ready != 1 || death.revents != libc::POLLHUP {
+            scheduler.remove_physical_thread(&tid, mm);
+        }
+        assert_eq!(ready, 1, "original thread pidfd did not reach kernel death");
+        assert_eq!(death.revents, libc::POLLHUP);
+        scheduler.signal_guest(tid, Signal::SIGUSR1);
+        scheduler.remove_physical_thread(&tid, mm);
+        assert!(scheduler.physical_thread_pidfds.is_empty());
+        assert!(!scheduler.native_poll_signal_published);
+        assert!(scheduler.validate_native_poll_wait_profile().is_ok());
     }
 
     #[test]
