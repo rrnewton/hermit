@@ -16,6 +16,7 @@ use reverie::Guest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Ftruncate;
+use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -823,6 +824,29 @@ impl Recorder {
         &self,
         guest: &mut G,
         syscall: Readlink,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|length| {
+                let mut buf = vec![0; length as usize];
+                let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
+                guest.memory().read_exact(addr, &mut buf)?;
+                Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#3590)
+    /// Records the path `getcwd` copied out. The raw syscall returns the
+    /// length including the terminating NUL, so the recorded bytes include it.
+    pub(super) async fn handle_getcwd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Getcwd,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 

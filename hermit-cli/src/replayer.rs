@@ -439,7 +439,11 @@ impl Tool for Replayer {
             Syscall::Pwritev2(syscall) => {
                 Ok(self.handle_write_family(guest, syscall.into()).await?)
             }
-            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3590)
+            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Lseek(_) => self.handle_optional_fd_position(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -459,7 +463,11 @@ impl Tool for Replayer {
             }
             Syscall::Openat2(call) => self.handle_openat2(guest, call).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3590)
+            Syscall::Chdir(_) => self.handle_chdir(guest, syscall).await,
             Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
+            Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#2373)
@@ -544,6 +552,16 @@ impl Tool for Replayer {
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
             | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Rmdir(_) => self.handle_optional_path_removal(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1588,6 +1606,15 @@ impl Replayer {
             Syscall::Mknodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchownat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchmodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            // TODO-HUMAN-REVIEW(#3590): the legacy forms resolve relative
+            // paths against the working directory, like AT_FDCWD.
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_) => true,
             Syscall::Utimensat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Symlinkat(call) => self.dirfd_is_confined(pid, call.newdirfd()),
             Syscall::Linkat(call) => {
@@ -1650,6 +1677,37 @@ impl Replayer {
                 Err(error) => {
                     panic!(
                         "replayed path mutation {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
+        }
+        recorded
+    }
+
+    // TODO-HUMAN-REVIEW(#3590)
+    /// Replay `chdir(2)` from its recorded result, and move the replay
+    /// process's working directory along with it when the target exists in the
+    /// replay chroot, so later `AT_FDCWD`-relative replay mutations land in the
+    /// same place. Most recorded directories are never materialized there; the
+    /// guest still observes the recorded result, and `getcwd` is replayed.
+    async fn handle_chdir<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed chdir returned a different result"
+                ),
+                Err(error @ (Errno::ENOENT | Errno::ENOTDIR)) => {
+                    tracing::debug!(?syscall, %error, "replay chdir target not materialized");
+                }
+                Err(error) => {
+                    panic!(
+                        "replayed chdir {syscall:?} failed after recording returned {expected}: {error}"
                     );
                 }
             }

@@ -2163,6 +2163,20 @@ fn record_poll_invalid_nfds_preserves_einval() {
     );
 }
 
+/// faccessat/faccessat2, chdir/getcwd and the legacy path mutations (rename,
+/// link, symlink, chmod, chown, lchown, mknod, rmdir) must replay from the
+/// recording. The replay chroot lacks /etc/passwd and /usr/lib, so a live
+/// query there answers differently and the guest's output diverges.
+#[test]
+fn record_path_queries_and_legacy_mutations() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "path queries and legacy path mutations",
+        &workload("c_record_replay_path_queries").path,
+        &[],
+    );
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

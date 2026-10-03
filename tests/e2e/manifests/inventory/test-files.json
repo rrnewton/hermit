@@ -1484,6 +1484,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_path_queries.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_path_queries.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that faccessat/faccessat2, chdir/getcwd and legacy path mutations replay from the recording rather than from the replay chroot."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_poll_partial_copyout.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_poll_partial_copyout.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks partial poll copyout behavior at multiple controlled record/replay boundaries."

@@ -21,6 +21,7 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Ftruncate;
+use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Getuid;
@@ -1168,6 +1169,25 @@ impl Replayer {
         guest
             .memory()
             .write_exact(syscall.buf().unwrap().cast::<u8>(), &buf)?;
+        Ok(buf.len() as i64)
+    }
+
+    // TODO-HUMAN-REVIEW(#3590)
+    /// Writes back the recorded working directory, including its NUL, without
+    /// asking the replay process, whose working directory lives in the replay
+    /// chroot rather than the recording's namespace.
+    pub(super) async fn handle_getcwd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Getcwd,
+    ) -> Result<i64, Errno> {
+        let buf = next_event!(guest, Bytes)?;
+
+        debug_assert!(buf.len() <= syscall.size());
+
+        guest
+            .memory()
+            .write_exact(syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>(), &buf)?;
         Ok(buf.len() as i64)
     }
 
