@@ -18,16 +18,17 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1091 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1097 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
 //!    added (895 portable and 5 privileged), the 189 portable cells of the
-//!    compatibility-corpus fold and the 2 portable select replay cells, after
-//!    applying the later lane moves listed in `LATER_LANE_MOVES` (now 1084
-//!    portable and 7 privileged).
+//!    compatibility-corpus fold, the 2 portable select replay cells and the 6
+//!    portable KVM verify selections, after applying the later lane moves listed
+//!    in `LATER_LANE_MOVES` (now 1090 portable and 7 privileged).
 //! 3. The committed compatibility cell table has 9008 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
-//!    compatibility-corpus fold.
+//!    compatibility-corpus fold, plus the 2 select replay and 6 KVM verify
+//!    selection changes that keep the row total unchanged.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -149,6 +150,17 @@ const SELECT_REPLAY_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
         "not-applicable",
         -(SELECT_REPLAY_TESTS as isize),
     ),
+];
+
+/// <https://github.com/rrnewton/reverie/issues/891> qualified six existing
+/// portable KVM verify cells. Their selection adds six plan cells; the catalogue
+/// moves six existing rows from not applicable to selected (green), without
+/// adding rows or changing any guest assertion or bound.
+const KVM_2026_10_03_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 6)];
+const KVM_2026_10_03_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 6),
+    ("kvm", "verify", "not-applicable", -6),
 ];
 
 /// Cells that later changes moved between lanes after the fold, as
@@ -478,15 +490,15 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS,
-            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS - moved_out("portable")
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 - moved_out("portable")
                 + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS, 7),
+        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6, 7),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -526,6 +538,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .iter()
         .chain(COMPAT_FOLD_PLAN_ADDITIONS)
         .chain(SELECT_REPLAY_PLAN_ADDITIONS)
+        .chain(KVM_2026_10_03_PLAN_ADDITIONS)
     {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
@@ -545,7 +558,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // The folded cells now belong to c-programs: 437 portable c-programs cells
     // and 276 portable plus 3 privileged backend-parity-c cells before the fold,
     // plus the 29 portable and 1 privileged c-programs cells S13 added and the
-    // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS`.
+    // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS` and
+    // six portable KVM verify cells of `KVM_2026_10_03_PLAN_ADDITIONS`.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -566,7 +580,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         BTreeMap::from([
             (
                 ("portable".into(), "c-programs".into()),
-                437 + 276 + 29 + SELECT_REPLAY_TESTS
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6
             ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
@@ -601,6 +615,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .copied()
         .chain(compat_fold_cell_deltas())
         .chain(SELECT_REPLAY_CELL_DELTAS.iter().copied())
+        .chain(KVM_2026_10_03_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
