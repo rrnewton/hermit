@@ -449,6 +449,32 @@ fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(guest_cwd).join(path))
 }
 
+/// Whether the utimensat lookup buffer overlaps the guest memory Linux reads
+/// for `call`: the path through its NUL and, with `guest_times`, the two
+/// timespecs. A path that cannot be read counts as overlapping, so that the
+/// kernel, not a lookup, reports the fault.
+fn utimensat_input_overlaps<M: MemoryAccess>(
+    memory: &M,
+    call: &syscalls::Utimensat,
+    guest_times: bool,
+    buffer: StatPtr,
+) -> bool {
+    use reverie::syscalls::FromToRaw;
+
+    let start = buffer.0.as_raw();
+    let end = start + std::mem::size_of::<libc::stat>();
+    let overlaps = |addr: usize, len: usize| addr < end && start < addr.saturating_add(len);
+    let path = call.path().is_some_and(|path| match path.read(memory) {
+        Ok(path) => overlaps(call.path().into_raw(), path.as_os_str().len() + 1),
+        Err(_) => true,
+    });
+    let times = guest_times
+        && call
+            .times()
+            .is_some_and(|times| overlaps(times.as_raw(), std::mem::size_of::<[Timespec; 2]>()));
+    path || times
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
@@ -3783,6 +3809,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => call,
         };
         let statptr: StatPtr = StatPtr(stack.reserve());
+        // The scratch stack lies below the guest's red zone, where a raw
+        // syscall may keep its own path or times. Writing the lookup buffer
+        // over either would change the call before Linux reads it.
+        if utimensat_input_overlaps(&guest.memory(), &call, staged.is_none(), statptr) {
+            info!(
+                "utimensat inputs overlap the target lookup buffer; \
+                 leaving the virtual mtime unchanged."
+            );
+            drop(stack);
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
         let _guard = match stack.commit() {
             Ok(guard) => guard,
             // The lookup buffer only serves the virtual update, so a scratch

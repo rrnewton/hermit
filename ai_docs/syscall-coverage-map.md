@@ -468,7 +468,7 @@ header.
 | 277 | `sync_file_range` | MISSING | none | none | No Detcore-specific release coverage. |
 | 278 | `vmsplice` | MISSING | none | none | Pipe I/O bypasses resource ordering and blocking handling. |
 | 279 | `move_pages` | MISSING | none | none | No Detcore-specific release coverage. |
-| 280 | `utimensat` | DETERMINIZED | always | partial | Host call, then the mtime the kernel stored (the requested one truncated to the filesystem's granularity), or logical now for `UTIME_NOW`, becomes the target inode's virtual mtime; skipped if the target changes identity around the call or does not hold the requested mtime. |
+| 280 | `utimensat` | DETERMINIZED | always | partial | Host call, then the mtime the kernel stored (the requested one truncated to the filesystem's granularity), or logical now for `UTIME_NOW`, becomes the target inode's virtual mtime; skipped if the target changes identity around the call or does not hold the requested mtime, and when the guest's scratch stack cannot hold the lookup buffer or the buffer would overlap the call's path or times. |
 | 281 | `epoll_pwait` | PASSTHROUGH | always | none | Empty scheduler checkpoint, then host call; blocking, timeout, and signal-mask behavior are not determinized. |
 | 282 | `signalfd` | DETERMINIZED | always | partial | Tracks descriptor type/flags only; most subsequent object operations remain missing or host-backed. |
 | 283 | `timerfd_create` | DETERMINIZED | always | partial | Tracks descriptor type/flags only; most subsequent object operations remain missing or host-backed. |

@@ -13,6 +13,7 @@
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,20 +72,9 @@ static void set_mtime(const char* path, long sec, long nsec) {
   }
 }
 
-// Makes a raw syscall with the stack pointer 192 bytes above an unmapped page
-// and returns its result. Below the 128-byte red zone that leaves Hermit 64
-// bytes of scratch space: enough to stage the 32-byte times of raw utime and
-// utimes(NULL), as before the virtual mtime update existed, but not enough for
-// the update's stat buffer. The kernel itself does not touch the stack.
-static long syscall_on_short_stack(long nr, long a1, long a2, long a3, long a4) {
-  long page = sysconf(_SC_PAGESIZE);
-  char* map =
-      mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (map == MAP_FAILED || munmap(map, page) != 0) {
-    perror("short stack");
-    exit(2);
-  }
-  char* sp = map + page + 192;
+// Makes a raw syscall with the stack pointer at `sp` and returns its result.
+// The kernel itself does not touch the stack.
+static long syscall_at(char* sp, long nr, long a1, long a2, long a3, long a4) {
   register long r10 __asm__("r10") = a4;
   long ret;
   __asm__ volatile(
@@ -100,6 +90,29 @@ static long syscall_on_short_stack(long nr, long a1, long a2, long a3, long a4) 
         "r"(r10),
         [sp] "r"(sp)
       : "rcx", "r11", "r12", "memory");
+  return ret;
+}
+
+// Maps a two-page stack whose lower page is unmapped when `guard` is set.
+static char* map_stack(long page, int guard) {
+  char* map =
+      mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (map == MAP_FAILED || (guard && munmap(map, page) != 0)) {
+    perror("stack");
+    exit(2);
+  }
+  return map;
+}
+
+// Makes a raw syscall with the stack pointer 192 bytes above an unmapped page.
+// Below the 128-byte red zone that leaves Hermit 64 bytes of scratch space:
+// enough to stage the 32-byte times of raw utime and utimes(NULL), as before
+// the virtual mtime update existed, but not enough for the update's stat
+// buffer.
+static long syscall_on_short_stack(long nr, long a1, long a2, long a3, long a4) {
+  long page = sysconf(_SC_PAGESIZE);
+  char* map = map_stack(page, 1);
+  long ret = syscall_at(map + page + 192, nr, a1, a2, a3, a4);
   munmap(map + page, page);
   return ret;
 }
@@ -203,6 +216,32 @@ int main(void) {
     fprintf(stderr, "raw utimes(NULL) on a short stack returned %ld\n", ret);
     failures++;
   }
+
+  // A raw syscall may keep its arguments below its stack pointer, in the
+  // bytes from 128 to 272 below it where Hermit places its stat buffer.
+  // Hermit must not overwrite them before Linux reads them. The path case
+  // fails with ENOENT if Hermit clears the path. The times case has an
+  // invalid atime and an omitted mtime, which ends just inside the red zone;
+  // it must fail with EINVAL rather than succeed with a cleared atime.
+  long page = sysconf(_SC_PAGESIZE);
+  char* stack = map_stack(page, 0);
+  char* sp = stack + page;
+  strcpy(sp - 256, "a");
+  struct timespec atime_only[2] = {{EARLY, 0}, {0, UTIME_OMIT}};
+  ret = syscall_at(sp, SYS_utimensat, AT_FDCWD, (long)(sp - 256), (long)atime_only, 0);
+  if (ret != 0) {
+    fprintf(stderr, "utimensat with its path below the stack returned %ld\n", ret);
+    failures++;
+  }
+  struct timespec* invalid = (struct timespec*)(sp - 152);
+  invalid[0] = (struct timespec){EARLY, 1000000000};
+  invalid[1] = (struct timespec){0, UTIME_OMIT};
+  ret = syscall_at(sp, SYS_utimensat, AT_FDCWD, (long)"b", (long)invalid, 0);
+  if (ret != -EINVAL) {
+    fprintf(stderr, "invalid utimensat times below the stack returned %ld\n", ret);
+    failures++;
+  }
+  munmap(stack, 2 * page);
 
   // A later write still moves the mtime off the explicitly set value.
   set_mtime("a", EARLY + 5, 11);
