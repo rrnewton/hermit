@@ -18,13 +18,17 @@ so the ledger, coverage and verdict consumers read a Buck run exactly as a cargo
 summary.json aggregates each cell's final execution: counts are summed and cell lists
 joined, which is what one harness process over the bucket writes. A host-inapplicable
 cell has no row, only its entry in summary.json's host_inapplicable_cells.
-summary.json's evidence_complete_cells lists each cell whose final execution's
-result.json (written by cell.sh) records complete evidence; `test-harness run` in
-import mode (E2E_IMPORT_RESULTS) refuses a PASS for any cell not listed.
+summary.json's evidence_complete_executions lists each execution whose result.json
+(written by cell.sh) records complete evidence, by the run id its rows carry;
+`test-harness run` in import mode (E2E_IMPORT_RESULTS) refuses a PASS whose own
+execution is not listed. An execution's rows must carry its result.json's run id, and
+no two executions may share one.
 Tpx owns retries (cells run the harness with --no-retry): a cell's executions, in Tpx
 order, become attempts 1, 2, ..., so "passed only on rerun" stays visible as a failed
-attempt 1 followed by a passing attempt 2. Every plan cell must have a row; a cell with
-none, or an unexpected cell, is an error. Prints one JSON summary line.
+attempt 1 followed by a passing attempt 2. Executions of one cell that end in the same
+second are refused: their order is unknown, and testx addresses an artifact as
+RUN.TEST.END. Every plan cell must have a row; a cell with none, or an unexpected cell,
+is an error. Prints one JSON summary line.
 
 --local-artifacts: Buck materializes each test's artifact directory locally
 (buck-out/v2/test/execution/<cell>/<target hash>/<config hash>/default/artifacts_directory),
@@ -73,6 +77,11 @@ def main():
             # Each target also reports an "unmanaged" twin of the same execution.
             if " - " in name and not name.endswith(" - unmanaged"):
                 executions.append((name.split(" - ", 1)[1], (int(t["end_time"]), t["test_details"]["id"]), rid, t))
+    ends = collections.Counter((cell, key[0]) for cell, key, rid, t in executions)
+    ties = sorted(f"{cell} at {end}" for (cell, end), n in ends.items() if n > 1)
+    if ties:
+        sys.exit(f"ingest: executions of one cell ended in the same second, so their order is unknown "
+                 f"and testx (RUN.TEST.END) cannot tell their artifacts apart: {ties[:20]} ({len(ties)})")
 
     # The newest local artifact directory per cell, if this run wrote it.
     local = {}
@@ -126,11 +135,21 @@ def main():
         fetched = list(ex.map(fetch, executions))
     per_cell = collections.defaultdict(list)
     final_summary = {}
-    final_result = {}
+    complete_runs = collections.defaultdict(list)  # cell -> run ids of evidence-complete executions
+    run_cells = {}
     for cell, end, rows, summary, result in sorted(fetched, key=lambda x: (x[0], x[1])):
+        if result is not None:
+            run_id = result.get("run_id")
+            if result.get("cell") != cell or any(row.get("run_id") != run_id for row in rows):
+                sys.exit(f"ingest: the execution of {cell} that ended at {end} has a result.json for "
+                         f"{result.get('cell')} run {run_id}, and rows of runs {sorted({str(row.get('run_id')) for row in rows})}")
+            if run_id in run_cells:
+                sys.exit(f"ingest: run {run_id} names two executions: {run_cells[run_id]} and {cell} ended at {end}")
+            run_cells[run_id] = f"{cell} ended at {end}"
+            if result.get("evidence_complete") is True:
+                complete_runs[cell].append(run_id)
         per_cell[cell].append(rows)
         final_summary[cell] = summary
-        final_result[cell] = result
     def host_inapplicable(cell):
         return any("{}/{}@{}".format(h["test"], h["mode"], h.get("backend") or "native") == cell
                    for h in (final_summary.get(cell) or {}).get("host_inapplicable_cells", []))
@@ -147,11 +166,11 @@ def main():
         lane, category = want[cell]["lane"], want[cell]["category"]
         if final_summary.get(cell):
             summaries[(lane, category)].append(final_summary[cell])
-        result = final_result.get(cell) or {}
-        if result.get("cell") == cell and result.get("evidence_complete") is True:
-            c = want[cell]
+        c = want[cell]
+        for run_id in complete_runs[cell]:
             evidence_complete[(lane, category)].append(
-                {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"]})
+                {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"],
+                 "run_id": run_id})
         attempt = 0
         for rows in runs:
             for row in rows:
@@ -175,13 +194,14 @@ def main():
                     total.setdefault(k, []).extend(v)
                 elif isinstance(v, (int, float)):
                     total[k] = total.get(k, 0) + v
-        total["evidence_complete_cells"] = sorted(evidence_complete[key], key=lambda c: (c["test"], c["mode"], c["backend"] or ""))
+        total["evidence_complete_executions"] = sorted(
+            evidence_complete[key], key=lambda c: (c["test"], c["mode"], c["backend"] or "", c["run_id"]))
         with open(os.path.join(d, "summary.json"), "w") as f:
             json.dump(total, f, indent=2, sort_keys=True)
             f.write("\n")
     print(json.dumps({"sources": dict(used_local), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final),
-                      "evidence_complete_cells": sum(len(v) for v in evidence_complete.values())}))
+                      "evidence_complete_executions": sum(len(v) for v in evidence_complete.values())}))
 
 if __name__ == "__main__":
     main()
