@@ -2251,11 +2251,12 @@ const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
 
 /// Exercise the real bootstrap boundary around the first DAG node.
 ///
-/// With agent-utils populated, the Rust driver can start and a missing rr
-/// checkout must become a schema-4 FAILED result from `pre.submodules`, even
-/// though cgroup setup replaces the process first. With agent-utils absent,
-/// rust-script cannot build the driver; that remains a pre-driver bootstrap
-/// failure and must not manufacture a typed result.
+/// The driver's dagrun dependency is a pinned git revision, so rust-script
+/// builds it from a clone with no submodules at all. A missing rr checkout must
+/// then become a schema-4 FAILED result from `pre.submodules`, even though
+/// cgroup setup replaces the process first: once compiled from the copied
+/// sources with every submodule absent, and once from the original root's
+/// prepared scripts with only agent-utils populated.
 fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, String> {
     fn run_fixture(
         checkout: &Path,
@@ -2332,7 +2333,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
         if prepared_source_root.is_none() {
-            // Only the missing-agent-utils case tests copied-source compilation.
+            // Only the no-submodules case tests copied-source compilation.
             // It must reach real rust-script, not a prepared executable.
             command
                 .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
@@ -2435,25 +2436,46 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         )?;
     }
 
+    // `.gitmodules` lists third-party/rr first, so both cases fail on it.
+    fn expect_missing_rr_result(
+        case: &str,
+        output: &std::process::Output,
+        result_path: &Path,
+    ) -> Result<(), String> {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = ValidationServiceResult::from_json_slice(
+            &std::fs::read(result_path).map_err(|error| {
+                format!(
+                    "submodule service result ({case}): pre.submodules failure wrote no typed \
+                     result: {error}; status={:?} output={rendered}",
+                    output.status.code()
+                )
+            })?,
+        )?;
+        if output.status.code() != Some(1)
+            || result.final_validate_status != FinalValidateStatus::Failed
+            || result.exit_code != 1
+            || result.executed_nodes != 1
+            || !rendered.contains("pre.submodules")
+            || !rendered.contains("third-party/rr")
+            || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
+        {
+            return Err(format!(
+                "submodule service result ({case}): missing rr was not attributed to the real \
+                 first DAG node: status={:?} result={result:?} output={rendered}",
+                output.status.code()
+            ));
+        }
+        Ok(())
+    }
+
     let bootstrap_result = fixture.path().join("bootstrap-result.json");
     let bootstrap = run_fixture(&checkout, None, &bootstrap_result, ledger.path())?;
-    let bootstrap_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&bootstrap.stdout),
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
-    if bootstrap.status.success()
-        || bootstrap_result.exists()
-        || String::from_utf8_lossy(&bootstrap.stdout).contains(FINAL_VALIDATE_STATUS_PREFIX)
-        || !bootstrap_output.contains("agent-utils")
-    {
-        return Err(format!(
-            "submodule service result: missing agent-utils did not remain a diagnosed bootstrap failure: \
-             status={:?} result_exists={} output={bootstrap_output}",
-            bootstrap.status.code(),
-            bootstrap_result.exists()
-        ));
-    }
+    expect_missing_rr_result("no submodules", &bootstrap, &bootstrap_result)?;
 
     checked_command(
         scratch_git()
@@ -2493,36 +2515,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 
     let result_path = fixture.path().join("service-result.json");
     let output = run_fixture(&checkout, Some(root), &result_path, ledger.path())?;
-    let rendered = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result = ValidationServiceResult::from_json_slice(&std::fs::read(&result_path).map_err(
-        |error| {
-            format!(
-                "submodule service result: pre.submodules failure wrote no typed result: {error}; \
-                 status={:?} output={rendered}",
-                output.status.code()
-            )
-        },
-    )?)?;
-    if output.status.code() != Some(1)
-        || result.final_validate_status != FinalValidateStatus::Failed
-        || result.exit_code != 1
-        || result.executed_nodes != 1
-        || !rendered.contains("pre.submodules")
-        || !rendered.contains("third-party/rr")
-        || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
-    {
-        return Err(format!(
-            "submodule service result: missing rr was not attributed to the real first DAG node: \
-             status={:?} result={result:?} output={rendered}",
-            output.status.code()
-        ));
-    }
+    expect_missing_rr_result("agent-utils present", &output, &result_path)?;
 
-    Ok("missing agent-utils stays a bootstrap failure; with agent-utils present, missing rr is a typed pre.submodules failure across scope re-exec".into())
+    Ok("with no submodules the driver builds from copied sources and missing rr is a typed pre.submodules failure; with agent-utils present it stays one across scope re-exec".into())
 }
 
 /// Pin the measured resource policy for the shard-coverage guard.
