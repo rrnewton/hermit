@@ -87,6 +87,14 @@ static int check_semantic_advice(
     return 6;
   }
 
+  /* A shared file mapping keeps its contents too; replay needs no refill
+   * for it. */
+  unsigned char* shared = mmap(NULL, page_size, PROT_READ, MAP_SHARED, fd, 0);
+  if (shared == MAP_FAILED || madvise(shared, page_size, MADV_DONTNEED) != 0 ||
+      shared[1] != original || munmap(shared, page_size) != 0) {
+    return 13;
+  }
+
   /* Dropping a page of this program's own text, which replay maps from the
    * real executable, leaves it intact. */
   unsigned char* text = (unsigned char*)((uintptr_t)&check_semantic_advice &

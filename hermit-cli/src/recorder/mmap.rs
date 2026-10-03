@@ -82,12 +82,16 @@ fn read_mappings(path: &str) -> Vec<Mapping> {
     parse_maps(&String::from_utf8_lossy(&maps))
 }
 
-/// The parts of `[start, end)` covered by file-backed mappings, each with
-/// the protection of its mapping.
-fn file_backed_ranges(mappings: &[Mapping], start: usize, end: usize) -> Vec<(usize, usize, i32)> {
+/// The parts of `[start, end)` covered by private file-backed mappings, each
+/// with the protection of its mapping.
+///
+/// Only these read back differently in replay after their pages are dropped.
+/// A shared file mapping keeps its contents in the page cache, and replay's
+/// shared anonymous stand-in keeps them in shmem, so neither needs a refill.
+fn private_file_ranges(mappings: &[Mapping], start: usize, end: usize) -> Vec<(usize, usize, i32)> {
     mappings
         .iter()
-        .filter(|mapping| mapping.file_backed)
+        .filter(|mapping| mapping.file_backed && mapping.private)
         .filter_map(|mapping| {
             let lo = mapping.start.max(start);
             let hi = mapping.end.min(end);
@@ -218,7 +222,9 @@ impl Recorder {
             advice,
             libc::MADV_DONTNEED | libc::MADV_DONTNEED_LOCKED | MADV_GUARD_REMOVE
         );
-        let maps_path = format!("/proc/{}/maps", guest.pid().as_raw());
+        // The thread's own maps: the thread-group leader's is empty once it has
+        // exited.
+        let maps_path = format!("/proc/{}/maps", guest.tid().as_raw());
 
         let wipeonfork_prefix = if advice == libc::MADV_WIPEONFORK {
             let mappings = read_mappings(&maps_path);
@@ -242,7 +248,7 @@ impl Recorder {
         let mut refills = Vec::new();
         if drops_pages {
             let mappings = read_mappings(&maps_path);
-            let ranges = file_backed_ranges(&mappings, start, end);
+            let ranges = private_file_ranges(&mappings, start, end);
             if !ranges.is_empty() {
                 let mem_path = format!("/proc/{}/mem", guest.tid().as_raw());
                 // The advice has already taken effect, so failing the guest
@@ -303,20 +309,23 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_ranges_clip_to_the_advised_range() {
+    fn private_file_ranges_clip_to_the_advised_range() {
         let mappings = parse_maps(MAPS);
         assert_eq!(
-            file_backed_ranges(&mappings, 0x7f0000001000, 0x7f0000004000),
-            vec![
-                (
-                    0x7f0000002000,
-                    0x7f0000003000,
-                    libc::PROT_READ | libc::PROT_WRITE
-                ),
-                (0x7f0000003000, 0x7f0000004000, libc::PROT_NONE),
-            ]
+            private_file_ranges(&mappings, 0x7f0000001000, 0x7f0000004000),
+            vec![(
+                0x7f0000002000,
+                0x7f0000003000,
+                libc::PROT_READ | libc::PROT_WRITE
+            )]
         );
-        assert!(file_backed_ranges(&mappings, 0x7f0000000000, 0x7f0000002000).is_empty());
+        assert!(private_file_ranges(&mappings, 0x7f0000000000, 0x7f0000002000).is_empty());
+    }
+
+    #[test]
+    fn private_file_ranges_skip_shared_mappings() {
+        let mappings = parse_maps(MAPS);
+        assert!(private_file_ranges(&mappings, 0x7f0000003000, 0x7f0000004000).is_empty());
     }
 
     #[test]
