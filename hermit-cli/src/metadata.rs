@@ -476,7 +476,8 @@ pub fn record_or_replay_config(
             }
         },
         network_trace_input: None,
-        network_trace_output_fd: None,
+        network_record_profile: None,
+    network_trace_output_fd: None,
         epoch_explicit: true,
         recordreplay_modes: true,
         record_preemptions: false,

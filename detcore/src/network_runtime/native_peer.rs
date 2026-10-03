@@ -7,6 +7,8 @@
 //! This does not supply replay topology or
 //! prove completion of native epoll callbacks after a peer send.
 
+mod shared_origin;
+
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::AsFd;

@@ -196,3 +196,84 @@ impl NetworkReplayEngine {
         }
     }
 }
+
+impl NetworkReplayEngine {
+    pub(in crate::network_replay) fn check_shared_record_poll_output_publication(
+        &self,
+        receipt: &Arc<SharedRecordPollPublication>,
+        grant: &SharedMmForegroundObservation<'_>,
+        now: LogicalTime,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_shared_record_poll_source(receipt.source(), grant, now)?;
+        let (wait, record, probe) = self.record_probe(receipt.source().origin())?;
+        if !matches!(wait.intent, SharedWaitIntent::Poll(_))
+            || record
+                .published_poll
+                .as_ref()
+                .is_none_or(|p| !Arc::ptr_eq(p, receipt))
+            || !self.shared_record_poll_row_matches(receipt)
+            || record.pending.is_some()
+            || probe.pending.is_some()
+            || record.source.is_some()
+            || !self
+                .shared_record_history_covers(&self.stream_calls[&receipt.source().origin().call()])
+        {
+            return Err(invalid(
+                "Poll output lacks its exact published actual full scan",
+            ));
+        }
+        Ok(())
+    }
+
+    /// This is output settlement, not Pending. Runtime independently retains
+    /// and preflights the exact confirmed native lease through this transaction.
+    pub(in crate::network_replay) fn settle_shared_record_poll_output(
+        &mut self,
+        receipt: &Arc<SharedRecordPollPublication>,
+        grant: &SharedMmForegroundObservation<'_>,
+        now: LogicalTime,
+    ) -> Result<(), NetworkReplayError> {
+        self.check_shared_record_poll_output_publication(receipt, grant, now)?;
+        let origin = receipt.source().origin();
+        let (_, record, _) = self.record_probe(origin)?;
+        let history = Arc::new(RecordHistory {
+            origin: origin.clone(),
+            effects: record.effects.clone(),
+            source: None,
+            observed_at: now,
+            published_poll: Some(receipt.clone()),
+        });
+        // All source, lifetime, history and unchanged-control checks precede
+        // mutation. No byte delivery, cursor movement or time advance occurs.
+        self.shadow_probes
+            .remove(&origin.lease)
+            .expect("checked actual Poll probe");
+        self.finish_socket_control(
+            origin.owner,
+            origin.lease,
+            NetworkSocketControlFinish::Unchanged,
+        )
+        .expect("exact unchanged Poll control preflighted under same engine lock");
+        let state = self.stream_calls.get_mut(&origin.call).unwrap();
+        let Some(SharedAttempt::Wait(wait)) = &mut state.shared_attempt else {
+            unreachable!()
+        };
+        wait.record_probe = None;
+        wait.record_history.push(history);
+        Ok(())
+    }
+    pub(in crate::network_replay) fn shared_record_poll_output_history_matches(
+        &self,
+        wait: &SharedWait,
+        receipt: &Arc<SharedRecordPollPublication>,
+    ) -> bool {
+        wait.record_probe.is_none()
+            && wait.record_history.last().is_some_and(|history| {
+                history
+                    .published_poll
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(p, receipt))
+                    && self.shared_record_poll_history_matches(history)
+            })
+    }
+}

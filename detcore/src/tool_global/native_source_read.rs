@@ -4,6 +4,7 @@ use super::*;
 use crate::network_runtime::ForegroundRoot;
 use crate::network_runtime::NativeSourceInterval;
 
+mod executable_source;
 mod shared_source;
 use shared_source::SharedNativeSource;
 
@@ -44,8 +45,24 @@ impl PreparedNativeSource {
     pub(crate) fn retention(&self) -> Box<dyn Send + Sync> {
         match self {
             Self::Legacy(source) => source.interval.keepalive(),
-            Self::Shared(source) => source.interval.keepalive(),
+            Self::Shared(source) => {
+                Box::new((source.interval.keepalive(), source.executable.clone()))
+            }
         }
+    }
+    pub(crate) fn source_finished(
+        &self,
+        result: &Result<Vec<u8>, reverie::syscalls::NativeUserReadError>,
+    ) -> Result<(), NetworkRpcError> {
+        if let Self::Shared(source) = self
+            && let Some(capture) = &source.executable
+        {
+            match result {
+                Ok(bytes) => capture.joined(bytes.len()).map_err(internal)?,
+                Err(error) => capture.source_failed(error),
+            }
+        }
+        Ok(())
     }
     /// A successful shared preparation transferred the selected reader into
     /// its Call. The old FinishFdRead path must never release it afterward.

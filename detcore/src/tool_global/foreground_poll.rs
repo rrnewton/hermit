@@ -6,6 +6,9 @@ use super::foreground_store::ReceiveAdmissionStage;
 use super::foreground_store::RetainedReceiveAdmission;
 use super::*;
 
+mod shared;
+pub(crate) use shared::{SharedPollInvocation, SharedPollStoreAttempt};
+
 impl GlobalState {
     /// Refusal after a known initial scan, before preparing a wait. Unknown or
     /// post-wait effects remain owned by the ordinary terminal cleanup path.

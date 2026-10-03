@@ -845,6 +845,76 @@ impl AcceptedProviderService {
             self.run_replies.push(sequence);
             return Ok(());
         }
+        if let Request::CollectExecutableSource {
+            call,
+            command,
+            prepared_request,
+        } = &request
+        {
+            if envelope.operation != Operation::CollectExecutableSource
+                || !rights.is_empty()
+                || envelope.owner.is_none()
+                || envelope.accept.is_some()
+                || sequence <= *prepared_request
+            {
+                return Err(io::Error::other("executable collection envelope mismatch"));
+            }
+            let (prior, pins, body) = session.retained_request(*prepared_request)?;
+            if prior.operation != Operation::PrepareExecutableSource
+                || prior.owner != envelope.owner
+                || prior.accept.is_some()
+                || pins.len() != 1
+                || !matches!(serde_json::from_slice::<Request>(&prior.body),
+                    Ok(Request::PrepareExecutableSource { intent }) if intent.valid_unarmed()
+                        && intent.call == *call && intent.owner_mm == envelope.owner.unwrap().mm.generation())
+                || !matches!(serde_json::from_slice::<Reply>(body.ok_or_else(|| io::Error::other("executable preparation unresolved"))?),
+                    Ok(Reply::Prepared(ref p)) if p.status.operation == "ap_prepare_executable_source"
+                        && p.status.returned == 0 && p.status.errno.is_none() && p.raw == *command && *command != 0)
+            {
+                return Err(io::Error::other(
+                    "executable collection changed retained preparation",
+                ));
+            }
+            let pins = pins.iter().map(duplicate).collect::<io::Result<Vec<_>>>()?;
+            let provider = &mut self.provider;
+            session.dispatch(sequence, |envelope, rights| {
+                provider.dispatch(envelope, rights, Some(&pins))
+            })?;
+            // The full raw collection is delivered and retained before a distinct
+            // exact ACK request. No generic automatic command ACK handles op26.
+            self.run_replies.push(sequence);
+            return Ok(());
+        }
+        if let Request::RetireExecutableSource {
+            call,
+            prepared,
+            completed,
+        } = &request
+        {
+            if envelope.operation != Operation::RetireExecutableSource
+                || !rights.is_empty()
+                || envelope.owner.is_none()
+                || envelope.accept.is_some()
+                || sequence <= *completed
+            {
+                return Err(io::Error::other("executable retirement envelope mismatch"));
+            }
+            let owner = envelope.owner.unwrap();
+            session.check_incoming_executable_source(owner, *call, *prepared, *completed)?;
+            let (_, pins, _) = session.retained_request(*prepared)?;
+            let pins = pins.iter().map(duplicate).collect::<io::Result<Vec<_>>>()?;
+            let provider = &mut self.provider;
+            session.dispatch(sequence, |envelope, rights| {
+                provider.dispatch(envelope, rights, Some(&pins))
+            })?;
+            session.retire_incoming_executable_source(
+                owner,
+                *call,
+                [*prepared, *completed, sequence],
+            )?;
+            self.run_replies.push(sequence);
+            return Ok(());
+        }
         if let Request::RetireNativeBirth {
             call,
             prepared,

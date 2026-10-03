@@ -14,6 +14,12 @@ pub(super) struct SharedFixture {
 }
 
 pub(super) async fn selected() -> SharedFixture {
+    selected_with_transform(|_| {}).await
+}
+
+pub(super) async fn selected_with_transform(
+    transform: impl FnOnce(&mut NetworkTraceV4),
+) -> SharedFixture {
     let mut legacy = NetworkReplayEngine::controlled_replay_two_row_trace();
     let channel = legacy.channels[0].id;
     legacy.outputs.push(NetworkOutputEventV2 {
@@ -42,6 +48,7 @@ pub(super) async fn selected() -> SharedFixture {
     trace.release_model = NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 {
         nodes: legacy.release_model.nodes().to_vec(),
     };
+    transform(&mut trace);
     trace.validate().unwrap();
     let mut bytes = Vec::new();
     NetworkTrace::V4(legacy).write_framed(&mut bytes).unwrap();

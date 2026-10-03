@@ -36,6 +36,9 @@ type NativeBirthTestGroup = (
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Operation {
+    PrepareExecutableSource,
+    CollectExecutableSource,
+    RetireExecutableSource,
     PrepareNativeBirth,
     ObserveNativeBirth,
     CollectNativeBirth,
@@ -71,6 +74,14 @@ pub(super) enum Operation {
 }
 
 impl Operation {
+    fn executable(self) -> bool {
+        matches!(
+            self,
+            Self::PrepareExecutableSource
+                | Self::CollectExecutableSource
+                | Self::RetireExecutableSource
+        )
+    }
     fn rights(self) -> usize {
         match self {
             Self::Bootstrap => 2, // actual controller pidfd + private controller endpoint
@@ -79,13 +90,16 @@ impl Operation {
             | Self::PrepareSetter
             | Self::MatchAccepted
             | Self::PrepareAccept => 2, // socket + task pidfd
-            Self::ObserveTerminalSocket
+            Self::PrepareExecutableSource
+            | Self::ObserveTerminalSocket
             | Self::PrepareTableEnrollment
             | Self::PrepareOriginalConnect
             | Self::PrepareOriginalFileObservation
             | Self::PrepareNativeBirth
             | Self::ObserveNativeBirth => 1, // exact held target PIDFD_THREAD
-            Self::RetireTerminalSocketObservation
+            Self::CollectExecutableSource
+            | Self::RetireExecutableSource
+            | Self::RetireTerminalSocketObservation
             | Self::CollectOriginalFileObservation
             | Self::RetireOriginalFileObservation
             | Self::CollectNativeBirth
@@ -179,6 +193,37 @@ fn receipt(envelope: &Envelope, body: &[u8]) -> ObservationReceipt {
     }
 }
 
+fn validate_executable_retirement(
+    owner: NetworkStreamOwner,
+    call: u64,
+    sequences: [u64; 3],
+    envelope: &Envelope,
+    body: &[u8],
+    rights: usize,
+) -> io::Result<()> {
+    use super::accepted_provider::Reply;
+    use super::accepted_provider::Request;
+    let [prepared, completed, retired] = sequences;
+    if retired <= completed
+        || envelope.sequence != retired
+        || envelope.owner != Some(owner)
+        || envelope.accept.is_some()
+        || rights != 0
+        || envelope.operation != Operation::RetireExecutableSource
+        || !matches!(serde_json::from_slice::<Request>(&envelope.body),
+            Ok(Request::RetireExecutableSource { call: c, prepared: p, completed: d })
+                if (c,p,d) == (call,prepared,completed))
+        || !matches!(serde_json::from_slice::<Reply>(body),
+            Ok(Reply::ExecutableSourceRetired(status)) if status.operation == "ap_ack_command"
+                && status.returned == 0 && status.errno.is_none())
+    {
+        return Err(protocol(
+            "executable retirement changed exact group or actual ACK",
+        ));
+    }
+    Ok(())
+}
+
 fn protocol(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
@@ -245,6 +290,7 @@ impl<T> Outbox<T> {
     ) -> Result<u64, (io::Error, Vec<T>)> {
         // Failure returns ownership rather than letting temporary arguments drop.
         if envelope.operation == Operation::Reply
+            || envelope.operation.executable() && !self.wire_format.has_executable_source()
             || envelope.expected_rights() != Some(rights.len())
         {
             return Err((protocol("accepted request rights shape mismatch"), rights));
@@ -1655,7 +1701,8 @@ impl<T> Inbox<T> {
             .ok_or_else(|| protocol("sent original ACK missing"))?;
         if !matches!(
             entry.envelope.operation,
-            Operation::RetireOriginalConnect
+            Operation::RetireExecutableSource
+                | Operation::RetireOriginalConnect
                 | Operation::RetireNativeBirth
                 | Operation::RetireOriginalFileObservation
                 | Operation::RetireTerminalSocketObservation
@@ -1674,6 +1721,12 @@ impl<T> Inbox<T> {
                     && status.returned == 0
                     && status.errno.is_none()
                     && status.operation == "ap_retire_auxiliary_task"
+            }
+            super::accepted_provider::Reply::ExecutableSourceRetired(status) => {
+                entry.envelope.operation == Operation::RetireExecutableSource
+                    && status.returned == 0
+                    && status.errno.is_none()
+                    && status.operation == "ap_ack_command"
             }
             _ => false,
         };
@@ -1966,6 +2019,90 @@ impl AcceptedSession {
         }
         self.outgoing.entries.remove(&observed);
         self.outgoing.entries.remove(&retired);
+        Ok(())
+    }
+
+    pub(super) fn check_incoming_executable_source(
+        &self,
+        owner: NetworkStreamOwner,
+        call: u64,
+        prepared: u64,
+        completed: u64,
+    ) -> io::Result<()> {
+        let mut views = Vec::new();
+        for sequence in [prepared, completed] {
+            let entry = self
+                .incoming
+                .entries
+                .get(&sequence)
+                .ok_or_else(|| protocol("executable incoming frame missing"))?;
+            let IncomingState::Completed(body) = &entry.state else {
+                return Err(protocol("executable incoming frame unresolved"));
+            };
+            views.push((&entry.envelope, body.as_slice(), entry.rights.len()));
+        }
+        super::accepted_provider::executable_source::validate_group(
+            owner, call, prepared, completed, &views,
+        )
+    }
+    pub(super) fn retire_incoming_executable_source(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: u64,
+        sequences: [u64; 3],
+    ) -> io::Result<()> {
+        let [prepared, completed, retired] = sequences;
+        self.check_incoming_executable_source(owner, call, prepared, completed)?;
+        let entry = self
+            .incoming
+            .entries
+            .get(&retired)
+            .ok_or_else(|| protocol("executable ACK frame missing"))?;
+        let IncomingState::Completed(body) = &entry.state else {
+            return Err(protocol("executable ACK remains unresolved"));
+        };
+        validate_executable_retirement(
+            owner,
+            call,
+            sequences,
+            &entry.envelope,
+            body,
+            entry.rights.len(),
+        )?;
+        self.incoming.entries.remove(&prepared);
+        self.incoming.entries.remove(&completed);
+        Ok(())
+    }
+    pub(super) fn retire_outgoing_executable_source(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: u64,
+        sequences: [u64; 3],
+    ) -> io::Result<()> {
+        let [prepared, completed, retired] = sequences;
+        let views = self.outgoing.acknowledged_group(&[prepared, completed])?;
+        super::accepted_provider::executable_source::validate_group(
+            owner, call, prepared, completed, &views,
+        )?;
+        let entry = self
+            .outgoing
+            .entries
+            .get(&retired)
+            .ok_or_else(|| protocol("executable outgoing ACK missing"))?;
+        let SendState::Acknowledged(body) = &entry.state else {
+            return Err(protocol("executable outgoing ACK unresolved"));
+        };
+        validate_executable_retirement(
+            owner,
+            call,
+            sequences,
+            &entry.envelope,
+            body,
+            entry.rights.len(),
+        )?;
+        for sequence in sequences {
+            self.outgoing.entries.remove(&sequence);
+        }
         Ok(())
     }
 
@@ -2410,10 +2547,11 @@ impl AcceptedSession {
             raw.flags,
             raw.rights.len()
         );
-        let valid = parsed
-            .as_ref()
-            .is_ok_and(|e| e.run == self.run && e.expected_rights() == Some(raw.rights.len()))
-            && raw.control_valid
+        let valid = parsed.as_ref().is_ok_and(|e| {
+            e.run == self.run
+                && e.expected_rights() == Some(raw.rights.len())
+                && (!e.operation.executable() || self.incoming.wire_format.has_executable_source())
+        }) && raw.control_valid
             && raw.flags == libc::MSG_CMSG_CLOEXEC;
         if !valid {
             self.quarantine.push(raw);
@@ -6594,6 +6732,42 @@ mod helper_receive_transport_tests {
                 effect.raw.original.selection = selection.raw.clone();
                 wrong[1].1 = serde_json::to_vec(&reply).unwrap();
                 assert!(check(&wrong).is_err(), "helper identity mutation {case}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod executable_wire_tests {
+    use super::*;
+    #[test]
+    fn executable_commands_require_abi11_without_losing_rejected_rights() {
+        for wire in [
+            super::super::ProviderWireFormat::Abi7Copy4,
+            super::super::ProviderWireFormat::Abi8Copy5,
+            super::super::ProviderWireFormat::Abi9Copy5,
+            super::super::ProviderWireFormat::Abi10Copy5,
+        ] {
+            for (operation, rights) in [
+                (Operation::PrepareExecutableSource, vec![41]),
+                (Operation::CollectExecutableSource, vec![]),
+                (Operation::RetireExecutableSource, vec![]),
+            ] {
+                let mut outbox = Outbox {
+                    wire_format: wire,
+                    ..Outbox::default()
+                };
+                let envelope = Envelope {
+                    run: [7; 16],
+                    sequence: 0,
+                    owner: None,
+                    accept: None,
+                    operation,
+                    body: b"controlled rejected predecode".to_vec(),
+                };
+                let (_, retained) = outbox.prepare(envelope, rights.clone()).unwrap_err();
+                assert_eq!(retained, rights);
+                assert!(outbox.entries.is_empty());
             }
         }
     }

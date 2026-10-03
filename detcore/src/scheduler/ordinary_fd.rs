@@ -8,6 +8,8 @@
 //! Borrowed authority for an FD observation inside an already granted turn.
 //! No resource, response, turn, queue entry or physical completion is created.
 
+pub(crate) mod shared_initial;
+
 use super::SchedRequest;
 use super::SchedResponse;
 use super::Scheduler;
@@ -812,5 +814,87 @@ impl Scheduler {
         );
         assert_eq!(self.turn, parked_turn);
         assert_eq!(self.committed_time, time);
+    }
+}
+
+
+#[cfg(test)]
+impl Scheduler {
+    /// Controlled original-census fixture, actual request/park/timer/Normal path.
+    /// The caller supplies GlobalTime at before/equal/after the original deadline;
+    /// this helper never assigns committed_time or fabricates a grant/response.
+    pub(crate) fn controlled_shared_poll_deadline_continuation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        deadline: crate::types::LogicalTime,
+        engine: std::sync::Arc<std::sync::Mutex<crate::network_replay::NetworkReplayEngine>>,
+        global_time: &std::sync::Arc<std::sync::Mutex<crate::types::GlobalTime>>,
+    ) -> (bool, u64) {
+        use super::parked::{ControlCapability, ResourceOrigin, RpcOrigin};
+        let original_epoch = self.ordinary_fd_observation(owner).unwrap().epoch();
+        let now = global_time.lock().unwrap().as_nanos();
+        let interests = vec![(call, crate::resources::NetworkWaitKind::PollReadable)];
+        assert_eq!(engine.lock().unwrap().call_wait_binding(
+            owner, call, crate::resources::NetworkWaitKind::PollReadable, Some(deadline)
+        ).unwrap().observed_ready, Some(false));
+        // Global initialization already installed this exact engine. Preserve
+        // that identity and the production one-use installation assertion.
+        assert!(std::sync::Arc::ptr_eq(
+            self.network_engine.as_ref().expect("Global installed the engine"),
+            &engine,
+        ));
+        self.install_resource_origin(owner.thread, ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources, mm: owner.mm, control: ControlCapability::None,
+        }).unwrap();
+        let mut request = crate::resources::Resources::new(owner.thread);
+        request.insert(crate::resources::ResourceID::NetworkCallWaitSet {
+            interests: interests.clone(), deadline: Some(deadline), zero_wait: None,
+        }, crate::resources::Permission::R);
+        let req = self.next_turns[&owner.thread].req.clone();
+        self.request_put(&req, request, global_time);
+        self.bump_global_time(global_time, &Err(super::SkipTurn));
+        assert_eq!(self.committed_time, now);
+        let turn = self.turn;
+        let (tid, request, response) = self.step3_peek().unwrap();
+        assert_eq!(tid, owner.thread);
+        let request = request.try_read().unwrap().unwrap();
+        let parked = self.step4_resource_block(tid, &request, &response).is_err();
+        assert_eq!(parked, now < deadline);
+        if parked {
+            assert_eq!(self.turn, turn + 1);
+            assert!(response.try_read().is_none());
+            assert_eq!(self.blocked.network_call_waiters.get(&tid), Some(&(owner, interests)));
+            assert_eq!(self.blocked.timed_waiters.thread_deadline(tid), Some(deadline));
+            assert!(!self.step2b_process_timed());
+            self.step2_network_replay_ready().unwrap();
+            assert!(self.blocked.network_call_waiters.contains_key(&tid));
+            assert!(response.try_read().is_none());
+            assert!(self.step2d_handle_empty_queue(global_time).is_err());
+            assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+            self.bump_global_time(global_time, &Err(super::SkipTurn));
+            assert_eq!(self.committed_time, deadline);
+            assert!(!self.blocked.network_call_waiters.contains_key(&tid));
+            assert_eq!(self.blocked.timed_waiters.thread_deadline(tid), None);
+            let (next, new_request, new_response) = self.step3_peek().unwrap();
+            assert_eq!(next, tid);
+            assert_eq!(new_response, response);
+            assert_eq!(new_request.try_read().unwrap().unwrap(), request);
+            self.step4_resource_block(tid, &request, &response).unwrap();
+        } else {
+            assert_eq!(self.turn, turn);
+            assert_eq!(global_time.lock().unwrap().as_nanos(), now);
+            assert!(!self.blocked.network_call_waiters.contains_key(&tid));
+            assert_eq!(self.blocked.timed_waiters.thread_deadline(tid), None);
+        }
+        self.step5_guest_unblock(tid, &request, &response).unwrap();
+        self.step6_reenquue(tid, false);
+        assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+        assert!(self.terminal_deadlock.is_none());
+        assert_eq!(self.turn, turn + if parked { 2 } else { 1 });
+        let grant = self.ordinary_fd_observation(owner).unwrap();
+        assert_eq!(grant.resume(), OrdinaryFdResume::Normal);
+        assert_eq!(grant.epoch(), original_epoch + 1);
+        (parked, grant.epoch())
     }
 }

@@ -523,6 +523,10 @@ impl NetworkReplayEngine {
         effect: NetworkStreamPhysicalEffect,
         now: LogicalTime,
     ) -> Result<PreparedSharedEffect, NetworkReplayError> {
+
+        if matches!(&self.stream_calls.get(&origin.call).and_then(|s| s.shared_attempt.as_ref()), Some(SharedAttempt::Wait(w)) if w.poll_output.is_some()) {
+            return Err(invalid("shared native transition retains Poll output custody"));
+        }
         self.shared_active(origin.call, grant)?;
         if self.shared_record_probe_progress(origin, now)?
             != SharedProbeProgress::Need(effect.clone())
@@ -748,6 +752,10 @@ impl NetworkReplayEngine {
         now: LogicalTime,
     ) -> Result<CompletedSharedAttempt, NetworkReplayError> {
         let origin = proof.origin();
+        if matches!(&self.stream_calls.get(&origin.call).and_then(|s| s.shared_attempt.as_ref()), Some(SharedAttempt::Wait(w)) if w.poll_output.is_some()) {
+            return Err(invalid("shared native transition retains Poll output custody"));
+        }
+
         self.shared_active(origin.call, grant)?;
         if self.shared_record_probe_progress(origin, now)? != SharedProbeProgress::PendingCandidate
         {

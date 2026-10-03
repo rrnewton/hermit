@@ -512,6 +512,11 @@ pub struct RunOpts {
     )]
     network_trace: Option<PathBuf>,
 
+    /// Record a serialized shared-memory network trace. Replay reads the profile
+    /// from the trace and rejects this Record-only option.
+    #[clap(long, value_enum, value_name = "shared-mm-v1")]
+    network_record_profile: Option<detcore_model::config::NetworkRecordProfile>,
+
     /// Administrator-provisioned private bpffs directory for the default Unix
     /// network guard. Must be supplied together with --network-guard-recovery.
     #[clap(long, value_name = "DIRECTORY", requires = "network_guard_recovery")]
@@ -1264,6 +1269,13 @@ impl fmt::Display for RunOpts {
                 " --record-networking={}",
                 shell_words::quote(&path.to_string_lossy())
             )?;
+        }
+        if let Some(profile) = self.network_record_profile {
+            match profile {
+                detcore_model::config::NetworkRecordProfile::SharedMmV1 => {
+                    write!(f, " --network-record-profile=shared-mm-v1")?;
+                }
+            }
         }
         if let Some(path) = replay_networking {
             write!(
@@ -4200,6 +4212,13 @@ impl RunOpts {
             ))
         })?;
 
+        if self.network_record_profile.is_some()
+            && network_trace.policy != detcore_model::network_trace::NetworkPolicy::Record
+        {
+            return Err(network_policy_refusal(
+                "--network-record-profile requires Record; Replay obtains its profile from the trace",
+            ));
+        }
         if self.namespace_only && network_trace.uses_trace() {
             return Err(network_policy_refusal(
                 "--namespace-only does not load Detcore and therefore cannot record or replay a \
@@ -4315,6 +4334,7 @@ impl RunOpts {
         let epoch_source_explicit = self.epoch_source_explicit();
         let config = &mut self.det_opts.det_config;
         config.network_trace = network_trace;
+        config.network_record_profile = self.network_record_profile;
         let replay_epoch = if let Some(path) = &self.replay_networking {
             let bytes = detcore::network_replay::open_bounded_network_trace(path)
                 .map_err(|error| {
@@ -7083,4 +7103,48 @@ mod tests {
         );
         assert_eq!(config.epoch, wrong);
     }
+}
+
+
+#[test]
+fn network_record_profile_is_explicit_record_only_and_round_trips() {
+    use detcore_model::config::NetworkRecordProfile;
+    let mut default = RunOpts::parse_from([
+        "fakehermit", "--strict", "--network=record", "--network-trace=network.trace", "fakeprog",
+    ]);
+    use_fixed_test_epoch(&mut default);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(default.det_opts.det_config.network_record_profile, None);
+    assert!(!default.to_string().contains("network-record-profile"));
+    for flag in ["--network=record", "--record-networking=network.trace"] {
+        let mut args = vec!["fakehermit", "--strict", flag, "--network-record-profile=shared-mm-v1"];
+        if flag == "--network=record" { args.push("--network-trace=network.trace"); }
+        args.push("fakeprog");
+        let mut opts = RunOpts::parse_from(args);
+        use_fixed_test_epoch(&mut opts);
+        // Display requires resolved DetConfig defaults. Validate once before
+        // formatting, then prove validation and canonical display are idempotent.
+        opts.validate_args_with_perf_support(true).unwrap();
+        let display = opts.to_string();
+        opts.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(opts.network, NetworkingMode::UnsafeHost);
+        assert_eq!(opts.det_opts.det_config.network_record_profile, Some(NetworkRecordProfile::SharedMmV1));
+        assert_eq!(display, opts.to_string());
+        let mut argv = vec!["fakehermit".to_owned()];
+        argv.extend(shell_words::split(&display).unwrap());
+        let mut restored = RunOpts::parse_from(argv);
+        restored.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(restored.det_opts.det_config.network_record_profile, opts.det_opts.det_config.network_record_profile);
+        assert_eq!(restored.to_string(), display);
+    }
+    for mode in ["none", "local", "host", "replay"] {
+        let mode = format!("--network={mode}");
+        let mut args = vec!["fakehermit", "--strict", mode.as_str(), "--network-record-profile=shared-mm-v1"];
+        if mode == "--network=replay" { args.push("--network-trace=does-not-exist"); }
+        args.push("fakeprog");
+        let mut opts = RunOpts::parse_from(args);
+        let failure = opts.validate_args_with_perf_support(true).unwrap_err().to_string();
+        assert!(failure.contains("--network-record-profile requires Record"), "{failure}");
+    }
+    assert!(RunOpts::try_parse_from(["fakehermit", "--network-record-profile=unknown", "fakeprog"]).is_err());
 }

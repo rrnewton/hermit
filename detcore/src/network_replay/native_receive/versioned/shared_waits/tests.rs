@@ -1668,3 +1668,6 @@ async fn shared_wait_unrecorded_terminal_flag_cannot_issue_eof() {
 
 #[path = "capture_tests.rs"]
 mod capture_tests;
+
+#[path = "poll_tests.rs"]
+mod poll_tests;

@@ -9,6 +9,7 @@
 //! Single guest-memory adapter for engine-owned network syscalls.
 
 mod native_poll;
+mod shared_poll;
 
 use std::io::IoSlice;
 use std::time::Duration;
@@ -156,6 +157,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !matches!(guest.config().network_trace.policy, NetworkPolicy::Record | NetworkPolicy::Replay) {
             return Ok(());
         }
+        // Shared Poll input is authenticated by its backend capture before
+        // FD admission. Its closed consumer rejects capability-only and other
+        // nonconnected descriptors; this early classifier never reads its row.
+        if matches!(call, Syscall::Poll(_)) && self.shared_poll_profile(guest) {
+            return Ok(());
+        }
         let forbidden_local = match call {
             Syscall::Connect(c) => Some(c.fd()),
             Syscall::Bind(c) => Some(c.fd()),
@@ -248,6 +255,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Recvmmsg(call) => self.network_open_file(guest, call.fd()).is_some(),
             Syscall::Sendmmsg(call) => self.network_open_file(guest, call.sockfd()).is_some(),
             Syscall::Shutdown(call) => self.network_open_file(guest, call.fd()).is_some(),
+            Syscall::Poll(_) if self.shared_poll_profile(guest) => true,
             Syscall::Poll(call) => self.poll_array_has_network_fd(
                 guest,
                 call.fds().map(|address| address.cast()),
@@ -293,6 +301,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let policy = guest.config().network_trace.policy;
         if !matches!(policy, NetworkPolicy::Record | NetworkPolicy::Replay) {
             return None;
+        }
+
+        if let Syscall::Poll(poll) = call
+            && self.shared_poll_profile(guest)
+        {
+            return Some(self.network_shared_poll(guest, poll).await);
         }
 
         if let Err(error) = self.check_network_capability_probe_use(guest, call) {
@@ -1082,6 +1096,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         open_file: OpenFileId,
     ) -> Result<i64, Error> {
         self.network_replay_connect(guest, call, open_file).await
+    }
+
+    /// Test-only entry after the existing connected transport classification.
+    /// Executes the production Sendto caller; native fallback remains forbidden.
+    #[cfg(test)]
+    pub(crate) async fn executable_source_fixture_dispatch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendto,
+    ) -> Result<i64, Error> {
+        self.network_sendto(guest, call, NetworkPolicy::Replay).await
     }
 
     /// Replay pays the same external start/continuation as original Connect.
@@ -3251,13 +3276,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Only the selected recorded prefix is read, never the
                     // requested tail. Record's original native Sendto path is
                     // separate and supplies its bytes from the real producer.
-                    let prepared = guest.local_global_state().unwrap()
+                    if shared_attempt {
+                        // Join only actual typed peer timers through native
+                        // return/restoration. This does not wait for a peer's
+                        // Normal grant or replace the original Sendto tuple.
+                        guest.join_followed_observation_timers(call.into()).await?;
+                    }
+                    let mut prepared = guest.local_global_state().unwrap()
                         .prepare_replay_transmit_source(
                             guest.tid(), guest.thread_state(), &read,
                             (call.buf().ok_or(Errno::EFAULT)?.as_raw(), maximum, call.flags()),
                         ).await.map_err(engine_rpc_error)?;
                     read_transferred = prepared.transferred_read();
-                    let source = if read_transferred {
+                    // All subsequent failures retain the already-transferred
+                    // Call; no late error may trigger a second FinishFdRead.
+                    let executable = guest.local_global_state().unwrap()
+                        .prepare_replay_executable_source(guest.tid(), guest.thread_state(), &mut prepared)
+                        .map_err(engine_rpc_error)?;
+                    let source = if let Some(armer) = executable {
+                        guest.stage_followed_executable_source(
+                            prepared.address(), prepared.length(), prepared.retention(), armer,
+                        ).await
+                    } else if read_transferred {
                         guest.stage_followed_source(
                             prepared.address(), prepared.length(), prepared.retention(),
                         ).await
@@ -3266,6 +3306,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             prepared.address(), prepared.length(), prepared.retention(),
                         ).await
                     };
+                    prepared.source_finished(&source).map_err(engine_rpc_error)?;
                     let bytes = source.map_err(|error| {
                         // Preserve the existing explicit unsupported-backend
                         // refusal; no unsafe memory() fallback or guest errno.

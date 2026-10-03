@@ -32,6 +32,7 @@ mod accepted_provider_ffi;
 mod accepted_service;
 mod accepted_transport;
 pub mod capability_unit;
+pub(crate) mod executable_capture;
 mod fd_journal;
 mod grouped_broker;
 pub mod guard;

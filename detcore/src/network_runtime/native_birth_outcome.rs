@@ -1,6 +1,8 @@
 //! Private common construction facts retained by the original birth reservation.
 //! Neither serde nor a numeric PID lookup can issue this object. Birth-time
 //! parent identity deliberately does not claim a current reparent relationship.
+mod shared_initial;
+
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -66,6 +68,8 @@ impl Eq for NativeTaskProjection {}
 
 #[derive(Debug)]
 struct NativeTaskFinalWait {
+    // Only the initial final-wait issuer fills this complete historical set.
+    initial_history: Option<Vec<Arc<NativeTaskProjection>>>,
     owner: NetworkStreamOwner,
     root: Arc<super::ForegroundRoot>,
     observations_complete: AtomicBool,
@@ -130,6 +134,7 @@ impl NativeTaskProjection {
             ));
         }
         let fact = self.final_wait.get_or_init(|| NativeTaskFinalWait {
+            initial_history: None,
             owner,
             root: root.clone(),
             observations_complete: AtomicBool::new(false),

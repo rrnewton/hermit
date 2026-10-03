@@ -11,12 +11,14 @@
 
 mod foreground_epoll;
 mod foreground_poll;
+pub(crate) use foreground_poll::{SharedPollInvocation, SharedPollStoreAttempt};
 mod foreground_store;
 mod guard_probe;
 mod native_source_read;
 mod original_connect;
 mod original_source_ioctl;
 mod replay_connect;
+mod shared_origin;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
@@ -494,6 +496,9 @@ impl DevicePool {
 fn initialize_network_engine(
     cfg: &Config,
 ) -> Result<Option<Arc<Mutex<NetworkReplayEngine>>>, String> {
+    if cfg.network_record_profile.is_some() && cfg.network_trace.policy != NetworkPolicy::Record {
+        return Err("network Record profile cannot override a non-Record policy".to_owned());
+    }
     let engine = match cfg.network_trace.policy {
         NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => return Ok(None),
         NetworkPolicy::Record => {
@@ -505,7 +510,12 @@ fn initialize_network_engine(
             // Production Record uses the V4 native-receive journal. The V3
             // recorder stays constructible, and its host-stream capture stays
             // refused: it has no current-layout or copy authority.
-            NetworkReplayEngine::record_native_receive(cfg.epoch)
+            match cfg.network_record_profile {
+                None => NetworkReplayEngine::record_native_receive(cfg.epoch),
+                Some(crate::config::NetworkRecordProfile::SharedMmV1) => {
+                    NetworkReplayEngine::record_shared_mm_attempts(cfg.epoch)
+                }
+            }
         }
         NetworkPolicy::Replay => {
             if !cfg.epoch_explicit {
@@ -3682,6 +3692,7 @@ impl GlobalState {
                     if let Some(projection) = sched.shared_terminal_projection(owner, process)? {
                         return runtime.native_shared_child_terminal(owner, projection);
                     }
+                    return self.settle_shared_initial_terminal(&sched, runtime, owner, process);
                 }
                 runtime.native_birth_creator_terminal(owner)
             })();
@@ -6209,6 +6220,8 @@ impl GlobalState {
                 let sched = self.sched.lock().unwrap();
                 if let Some(projection) = sched.shared_terminal_projection(owner, process)? {
                     runtime.finish_shared_terminal_observations(owner, &projection)?;
+                } else {
+                    self.finish_shared_initial_observers(&sched, runtime, owner, process)?;
                 }
                 Ok(())
             })();
@@ -9337,6 +9350,7 @@ pub(crate) fn exit_owned_controller(status: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
+    mod shared_initial_origin;
     #[test]
     fn schedule_event_host_markers_require_command_bootstrap_provenance() {
         let event = SchedEvent::branches(DetTid::from_raw(3), 223)
@@ -9517,6 +9531,8 @@ mod tests {
     mod foreground_store;
     mod native_connected;
     mod replay_connect;
+    #[cfg(target_arch = "x86_64")]
+    mod executable_source_native;
     mod shared_terminal;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
@@ -21146,3 +21162,50 @@ pub(crate) mod native_prestart_tests;
 
 #[cfg(test)]
 pub(crate) mod native_clear_tid_tests;
+
+
+#[cfg(test)]
+mod shared_profile_controls {
+    use super::*;
+
+    #[test]
+    fn shared_record_profile_keeps_default_and_rejects_nonrecord_override() {
+        let mut cfg = Config::default();
+        cfg.epoch_explicit = true;
+        cfg.network_trace.policy = NetworkPolicy::Record;
+        let old = initialize_network_engine(&cfg).unwrap().unwrap();
+        assert!(!old.lock().unwrap().uses_shared_mm_attempts());
+        cfg.network_record_profile = Some(crate::config::NetworkRecordProfile::SharedMmV1);
+        let shared = initialize_network_engine(&cfg).unwrap().unwrap();
+        assert!(shared.lock().unwrap().uses_shared_mm_attempts());
+        for policy in [NetworkPolicy::Deny, NetworkPolicy::UnsafeLive, NetworkPolicy::Replay] {
+            cfg.network_trace.policy = policy;
+            assert!(initialize_network_engine(&cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_record_profile_replay_dispatches_only_from_validated_trace() {
+        use detcore_model::network_trace::NetworkReleaseModelV4;
+        let trace = crate::network_replay::replay_connect::fixture(LogicalTime::ZERO, false)
+            .engine.native_trace_fixture();
+        let mut cfg = Config::default();
+        cfg.epoch_explicit = true;
+        cfg.epoch = trace.epoch;
+        cfg.network_trace.policy = NetworkPolicy::Replay;
+        for shared in [false, true] {
+            let mut trace = trace.clone();
+            if shared {
+                trace.release_model = NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 {
+                    nodes: trace.release_model.nodes().to_vec(),
+                };
+            }
+            trace.validate().unwrap();
+            let mut bytes = Vec::new();
+            trace.write_framed(&mut bytes).unwrap();
+            cfg.network_trace_input = Some(bytes);
+            let engine = initialize_network_engine(&cfg).unwrap().unwrap();
+            assert_eq!(engine.lock().unwrap().uses_shared_mm_attempts(), shared);
+        }
+    }
+}

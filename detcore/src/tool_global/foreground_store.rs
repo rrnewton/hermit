@@ -1767,6 +1767,9 @@ impl GlobalState {
             engine
                 .validate_fd_metadata(owner, arguments.files, &actual, &metadata)
                 .map_err(|e| fail(&e))?;
+            let shared_initial = if engine.uses_shared_mm_attempts() {
+                Some(scheduler.shared_initial_projection(&root).map_err(|e| fail(&e))?)
+            } else { None };
             let admission = runtime
                 .with_foreground_prefix(&joined, |prefix| {
                     let admission = engine
@@ -1776,16 +1779,21 @@ impl GlobalState {
                         call: admission.call,
                         stage: ReceiveAdmissionStage::Unsubmitted(joined.clone()),
                     });
-                    let mut attempt = engine
-                        .begin_native_entry_stamp(owner, admission.call)
-                        .map_err(std::io::Error::other)?;
+                    let mut attempt = if shared_initial.is_some() {
+                        engine.begin_shared_initial_entry_stamp(owner, admission.call)
+                    } else {
+                        engine.begin_native_entry_stamp(owner, admission.call)
+                    }.map_err(std::io::Error::other)?;
                     let retained = attempt
                         .retain_unsubmitted_recovery(&joined)
                         .map_err(std::io::Error::other)?;
                     let now = self.global_time.lock().unwrap().as_nanos();
-                    if let Err(primary) =
+                    let stamped = if let Some(initial) = &shared_initial {
+                        engine.stamp_shared_initial_connect_entry(attempt, prefix, &grant, initial.clone(), now)
+                    } else {
                         engine.stamp_native_connect_entry(attempt, prefix, &grant, now)
-                    {
+                    };
+                    if let Err(primary) = stamped {
                         match engine.cancel_unsubmitted_native_entry(&retained, prefix) {
                             Ok(()) => custody = ReceiveAdmissionCustody::Released,
                             Err(secondary) => cleanup_diagnostic = Some(fail(&secondary)),
@@ -2168,6 +2176,10 @@ impl GlobalState {
             .ok_or_else(|| NetworkRpcError::internal("Connect engine absent"))?
             .lock()
             .unwrap();
+        if engine.uses_shared_mm_attempts() {
+            return runtime.publish_shared_initial_connected(&mut engine, owner, admission, &root,
+                self.global_time.lock().unwrap().as_nanos()).map_err(|e| fail(&e));
+        }
         runtime
             .publish_native_connected(
                 &mut engine,

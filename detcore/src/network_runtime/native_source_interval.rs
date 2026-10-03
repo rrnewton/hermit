@@ -6,6 +6,8 @@ use std::sync::Weak;
 
 use super::*;
 
+mod poll_input;
+
 #[derive(Debug)]
 pub(super) struct Interval {
     runtime: Weak<RuntimeShared>,
@@ -15,7 +17,9 @@ pub(super) struct Interval {
 }
 #[derive(Debug)]
 enum SourceAdmission {
+    SharedPoll { _source: Arc<crate::network_replay::shared_waits::SharedPollSource> },
     Settled,
+    SharedPollInput(crate::network_replay::shared_waits::SharedCallCensus),
     Shared(crate::network_replay::shared_waits::SharedCallCensus),
     SharedOutput {
         peers: crate::network_replay::shared_waits::SharedCallCensus,
@@ -288,5 +292,35 @@ impl NetworkRuntimeResources {
         drop(calls);
         drop(owned);
         result
+    }
+}
+
+impl RuntimeShared {
+    /// Called only inside the exact Poll output borrower after reservation.
+    /// The private source carries actual Replay snapshot or Record publication;
+    /// Record's confirmed lease is rechecked, never treated as generic settled.
+    pub(super) fn reserve_shared_poll_interval(
+        self: &Arc<Self>, owned: &mut NativeWorkers, generation: u64,
+        source: Arc<crate::network_replay::shared_waits::SharedPollSource>,
+        engine: &crate::network_replay::NetworkReplayEngine, calls: &native_peer::Calls,
+    ) -> std::io::Result<NativeSourceInterval> {
+        if owned.closed || owned.copy_exclusion.is_some() || owned.source_read_active()
+            || !owned.tasks.is_empty() || owned.submission_generation != generation
+            || !source.root().is_current(source.owner()) || !source.root().has_shared_mm_history() {
+            return Err(std::io::Error::other("Poll output interval changed original native admission"));
+        }
+        if let Some(error) = self.native_terminal_failure.lock().unwrap().as_ref() { return Err(std::io::Error::other(error.clone())); }
+        let peers = engine.shared_poll_peer_census(&source).map_err(std::io::Error::other)?;
+        if let Some(publication) = source.record_publication() {
+            let origin = publication.source().origin();
+            calls.require_shared_probe(&peers, origin, true)?;
+            calls.preflight_shared_probe_retirement(origin, engine.shared_record_probe_effects(origin).map_err(std::io::Error::other)?)?;
+        } else {
+            calls.require_shared_quiescence(&peers)?;
+        }
+        let interval = Arc::new(Interval { runtime: Arc::downgrade(self), root: source.root().clone(), generation,
+            admission: SourceAdmission::SharedPoll { _source: source } });
+        owned.source_read = Arc::downgrade(&interval);
+        Ok(NativeSourceInterval { interval })
     }
 }

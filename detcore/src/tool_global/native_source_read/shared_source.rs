@@ -7,13 +7,15 @@ use crate::network_runtime::shared_waits::JoinedSharedPrefix;
 use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 
 pub(crate) struct SharedNativeSource {
-    root: Arc<ForegroundRoot>,
-    epoch: u64,
-    call: crate::network_replay::NetworkStreamCallId,
-    prefix: JoinedSharedPrefix,
+    pub(super) root: Arc<ForegroundRoot>,
+    pub(super) epoch: u64,
+    pub(super) call: crate::network_replay::NetworkStreamCallId,
+    pub(super) prefix: JoinedSharedPrefix,
     pub(super) address: usize,
     pub(super) length: usize,
     pub(super) interval: NativeSourceInterval,
+    pub(super) executable:
+        Option<Arc<crate::network_runtime::executable_capture::ExecutableCapture>>,
 }
 
 impl GlobalState {
@@ -176,6 +178,7 @@ impl GlobalState {
             address,
             length,
             interval,
+            executable: None,
         }))
     }
 

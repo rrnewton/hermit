@@ -3,6 +3,7 @@
 mod foreground;
 mod source_ioctl;
 mod terminal;
+mod shared_initial;
 use std::collections::BTreeMap;
 
 pub(crate) use foreground::ForegroundRoot;

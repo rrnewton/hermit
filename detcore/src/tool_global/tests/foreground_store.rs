@@ -9,6 +9,7 @@ mod sendto_entry;
 mod native_source_read;
 mod shared_source;
 mod shared_receive;
+mod shared_poll;
 mod socket_error;
 
 use std::cell::Cell;
@@ -3783,6 +3784,8 @@ struct ScalarForegroundGuest<'a> {
     // Opt-in SO_ERROR ABI tests use real permission-respecting copies.
     socket_error_access: bool,
     shared_store: Option<Arc<shared_receive::ControlledStore>>,
+    // Opt-in supplied original Poll context; actual PVM input/output in tests.
+    shared_poll: Option<Arc<shared_poll::ControlledPoll>>,
 }
 impl ScalarForegroundGuest<'_> {
     fn enable_record_timer(&mut self) {
@@ -3989,6 +3992,39 @@ impl Guest<Detcore> for ScalarForegroundGuest<'_> {
     fn with_restored_followed_store<R>(&self, original: reverie::syscalls::Syscall, action: impl FnOnce(&mut dyn reverie::syscalls::FollowedStore) -> R) -> Result<R, reverie::syscalls::NativeUserStoreRefusal> {
         self.shared_store.as_ref().ok_or(reverie::syscalls::NativeUserStoreRefusal::Evidence(reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend))?.with(original,true,action)
     }
+    async fn capture_original_followed_poll(
+        &mut self,
+        original: reverie::syscalls::Syscall,
+        retention: Box<dyn Send + Sync>,
+    ) -> Result<reverie::syscalls::OriginalPollInput, reverie::syscalls::NativeUserReadError> {
+        self.shared_poll
+            .as_ref()
+            .ok_or(reverie::syscalls::NativeUserReadError::Refused(
+                reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend,
+            ))?
+            .capture(original, retention)
+    }
+    async fn join_followed_observation_timers(
+        &mut self,
+        original: reverie::syscalls::Syscall,
+    ) -> Result<(), reverie::Error> {
+        self.shared_poll
+            .as_ref()
+            .ok_or_else(|| reverie::Error::Tool(anyhow::anyhow!("backend has no peer timer join")))?
+            .join(original)
+    }
+    fn with_followed_poll_store<R>(
+        &self,
+        original: reverie::syscalls::Syscall,
+        action: impl FnOnce(&mut dyn reverie::syscalls::FollowedPollStore) -> R,
+    ) -> Result<R, reverie::syscalls::NativeUserStoreRefusal> {
+        self.shared_poll
+            .as_ref()
+            .ok_or(reverie::syscalls::NativeUserStoreRefusal::Evidence(
+                reverie::syscalls::NativeUserReadRefusal::UnsupportedBackend,
+            ))?
+            .with(original, action)
+    }
     fn inspect_original_read_range(
         &self,
         read: reverie::syscalls::Read,
@@ -4126,6 +4162,7 @@ fn scalar_foreground_guest<'a>(
         record_timer_arrival: None,
         socket_error_access: false,
         shared_store: None,
+        shared_poll: None,
     }
 }
 

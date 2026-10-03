@@ -10,7 +10,16 @@ fn shared_constructor_never_upgrades_a_legacy_trace_or_issuer() {
     let shared = NetworkReplayEngine::record_shared_mm_attempts(epoch);
     assert!(shared.uses_shared_mm_attempts());
     assert!(shared.require_sole_initial_release_policy().is_err());
-    let shared = shared.into_native_recorded_trace().unwrap();
+    // Constructor/profile separation inspects an immutable controlled trace;
+    // it does not certify a completed run or invent an initial origin.
+    let shared_trace = shared.native_trace_fixture();
+    let error = shared.into_native_recorded_trace().unwrap_err();
+    assert!(
+        matches!(&error, NetworkReplayError::FdPublicationProtocol(message)
+            if message == "shared trace lacks actual initial origin"),
+        "empty shared recording must retain the real initial-origin gate: {error:?}"
+    );
+    let shared = shared_trace;
     assert!(NetworkReplayEngine::replay_native_receive(shared.clone()).is_err());
     assert!(NetworkReplayEngine::replay_shared_mm_attempts(legacy.clone()).is_err());
     assert!(

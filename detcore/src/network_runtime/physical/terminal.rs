@@ -21,8 +21,7 @@ impl<T> CustodyTasks<T> {
             return Ok(());
         };
         if !root.is_shared_child() {
-            self.forget(owner);
-            return Ok(());
+            return self.forget_shared_initial(owner);
         }
         root.revoke();
         task.retired = true;
@@ -114,6 +113,9 @@ impl<T> CustodyTasks<T> {
         owner: NetworkStreamOwner,
         projection: &Arc<NativeTaskProjection>,
     ) -> std::io::Result<()> {
+        if projection.is_initial() {
+            return self.finish_shared_initial_observations(owner, projection);
+        }
         let root = projection.final_wait_root(owner)?;
         if let Some(task) = self.tasks.get(&owner.thread)
             && (task.mm != owner.mm
@@ -135,7 +137,7 @@ impl<T> CustodyTasks<T> {
         self.retire_completed_shared_child(owner)
     }
 
-    fn retire_completed_shared_child(&mut self, owner: NetworkStreamOwner) -> std::io::Result<()> {
+    pub(super) fn retire_completed_shared_child(&mut self, owner: NetworkStreamOwner) -> std::io::Result<()> {
         let Some(task) = self.tasks.get(&owner.thread) else {
             return Ok(());
         };

@@ -8,6 +8,10 @@ use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 #[path = "shared_attempt/tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "shared_attempt/executable_tests.rs"]
+mod executable_tests;
+
 #[derive(Debug, Clone)]
 pub(in crate::network_replay) struct TransmitAttempt {
     root: Arc<crate::network_runtime::ForegroundRoot>,
@@ -16,6 +20,7 @@ pub(in crate::network_replay) struct TransmitAttempt {
     binding: crate::types::FdSlotBinding,
     transmitted: u64,
     length: usize,
+    executable: Option<Arc<crate::network_runtime::executable_capture::ExecutableCapture>>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,13 +38,6 @@ impl SharedAttempt {
 }
 
 impl NetworkReplayEngine {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "unactivated M2 policy: separately named constructor remains opt-in until paired native qualification"
-        )
-    )]
     pub(crate) fn record_shared_mm_attempts(epoch: DateTime<Utc>) -> Self {
         let mut engine = Self::record_native_receive(epoch);
         let EngineState::Native(native) = &mut engine.mode else {
@@ -51,13 +49,6 @@ impl NetworkReplayEngine {
         engine
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "unactivated M2 policy: separately named constructor remains opt-in until paired native qualification"
-        )
-    )]
     pub(crate) fn replay_shared_mm_attempts(
         trace: NetworkTraceV4,
     ) -> Result<Self, NetworkReplayError> {
@@ -176,6 +167,7 @@ impl NetworkReplayEngine {
             binding,
             transmitted,
             length,
+            executable: None,
         };
         let call = self.begin_native_stream_call_from_read(owner, read)?;
         assert!(!call.physical_pin_required);
@@ -259,6 +251,31 @@ impl NetworkReplayEngine {
         Ok(attempt.binding.open_file)
     }
 
+    pub(crate) fn attach_shared_executable_capture(
+        &mut self,
+        call: NetworkStreamCallId,
+        grant: &SharedMmForegroundObservation<'_>,
+        prefix: &crate::network_runtime::shared_waits::JoinedSharedPrefix,
+        address: usize,
+        capture: Arc<crate::network_runtime::executable_capture::ExecutableCapture>,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_shared_replay_transmit(call, grant, prefix)?;
+        let Some(SharedAttempt::Transmit(attempt)) = self
+            .stream_calls
+            .get_mut(&call)
+            .and_then(|state| state.shared_attempt.as_mut())
+        else {
+            unreachable!()
+        };
+        if attempt.executable.is_some()
+            || !capture.matches(&attempt.root, call, address, attempt.length)
+        {
+            return Err(invalid("executable capture changed original source Call"));
+        }
+        attempt.executable = Some(capture);
+        Ok(())
+    }
+
     /// Only the actual Global source consumer calls this inside the original
     /// with_source_interval transaction after the backend's true worker join.
     /// On mismatch/error the claim stays retained; no generic cancellation may
@@ -280,6 +297,16 @@ impl NetworkReplayEngine {
                 .length
         {
             return Err(invalid("shared source changed exact selected length"));
+        }
+        if let Some(capture) = self.stream_calls[&call]
+            .shared_attempt
+            .as_ref()
+            .and_then(SharedAttempt::transmit)
+            .and_then(|a| a.executable.as_ref())
+        {
+            capture
+                .require_joined()
+                .map_err(|error| invalid(&error.to_string()))?;
         }
         let result = self.transmit_stream_inner(file, bytes)?;
         self.release_stream_call_lifetime(grant.owner(), call, file)

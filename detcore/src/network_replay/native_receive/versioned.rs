@@ -3,6 +3,9 @@
 //! owner. No V2 release gate or V3 immutable copy unit is manufactured here.
 use std::sync::Arc;
 
+#[path = "versioned/shared_origin.rs"]
+mod shared_origin;
+
 #[path = "versioned/raw_poll.rs"]
 mod raw_poll;
 
@@ -45,6 +48,7 @@ pub(in crate::network_replay) struct NativeState {
     // Retained only by an actual pre-effect entry issuer. This is lifetime
     // provenance for terminal progress, never a substitute for a fresh grant.
     policy_root: Option<Arc<crate::network_runtime::ForegroundRoot>>,
+    shared_origin: Option<shared_origin::SharedInitialOrigin>,
     policy_failure: bool,
     // Exact original Close admissions, never Connect entries or journal nodes.
     close_policy: BTreeMap<NetworkStreamCallId, NativeClosePolicy>,
@@ -88,6 +92,7 @@ impl NativeState {
             && self.poll_witnesses.is_empty()
             && self.retirement_failure.is_none()
             && self.policy_root.is_none()
+            && self.shared_origin.is_none()
             && !self.policy_failure
             && self.close_policy.is_empty()
             && t.channels.is_empty()
@@ -118,6 +123,9 @@ impl NativeState {
     }
     fn check_retirement(&self) -> Result<(), NetworkReplayError> {
         self.check_retirement_failure()?;
+        if matches!(self.trace.release_model, NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. }) {
+            return self.check_shared_origin_history();
+        }
         if self.policy_failure
             || (self.replay.is_none()
                 && self
@@ -217,6 +225,9 @@ pub(in crate::network_replay) struct NativeEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
+    SharedInitialConnect {
+        operation: crate::resources::ExternalOpId,
+    },
     Foreground {
         epoch: u64,
     },
@@ -482,6 +493,7 @@ impl NetworkReplayEngine {
             poll_witnesses: Vec::new(),
             retirement_failure: None,
             policy_root: None,
+            shared_origin: None,
             policy_failure: false,
             close_policy: BTreeMap::new(),
         }));
@@ -574,6 +586,7 @@ impl NetworkReplayEngine {
             poll_witnesses: Vec::new(),
             retirement_failure: None,
             policy_root: None,
+            shared_origin: None,
             policy_failure: false,
             close_policy: BTreeMap::new(),
         }));
@@ -589,7 +602,9 @@ impl NetworkReplayEngine {
             return Err(NetworkReplayError::WrongMode);
         }
         native.check_retirement()?;
-        if !native.trace.release_model.nodes().is_empty() && native.policy_root.is_none() {
+        if matches!(native.trace.release_model, NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. }) {
+            native.check_shared_origin_finalization()?;
+        } else if !native.trace.release_model.nodes().is_empty() && native.policy_root.is_none() {
             return Err(invalid("V4 trace lacks an actual sole-root entry issuer"));
         }
         if !native.poll_witnesses.is_empty() {
@@ -910,6 +925,9 @@ impl NetworkReplayEngine {
         &mut self,
         channel: NetworkChannelId,
     ) -> Result<(), NetworkReplayError> {
+        if self.uses_shared_mm_attempts() {
+            return self.retain_shared_retirement(channel);
+        }
         let EngineState::Native(native) = &mut self.mode else {
             return Ok(());
         };

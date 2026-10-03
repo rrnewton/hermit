@@ -1640,3 +1640,20 @@ mod tests {
 #[cfg(test)]
 #[path = "raw_poll/shared_provenance_tests.rs"]
 mod shared_provenance_tests;
+
+impl NetworkReplayEngine {
+    /// The full immutable shared observation, including its original control
+    /// provenance. A missing current cut is not a synthetic zero mask.
+    pub(super) fn shared_poll_snapshot(
+        &self, file: OpenFileId,
+    ) -> Result<Option<SharedPollSnapshot>, NetworkReplayError> {
+        let channel = self.bound_channel(file)?;
+        let EngineState::Native(native) = &self.mode else { return Err(NetworkReplayError::WrongMode); };
+        let replay = native.replay.as_ref().ok_or(NetworkReplayError::WrongMode)?;
+        let queue = &self.channels[&channel];
+        let low_water = self.shadow.as_ref().and_then(|s| s.sockets.get(&file))
+            .ok_or(NetworkReplayError::UnregisteredStreamSocket(file))?.options.receive_low_water;
+        replay.poll.shared_observation_at(channel, queue.inbound_consumed,
+            queue.local_control_generation, low_water)
+    }
+}

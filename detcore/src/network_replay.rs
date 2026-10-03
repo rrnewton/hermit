@@ -73,6 +73,7 @@ pub use chrono::DateTime;
 pub use chrono::Utc;
 use detcore_model::fd::FilesId;
 use detcore_model::fd::OpenFileId;
+use detcore_model::network_trace::NetworkReleaseModelV4;
 use detcore_model::network_trace::ChannelSocketClassV3;
 use detcore_model::network_trace::FreshStreamSocketProfileV3;
 use detcore_model::network_trace::LinuxReceiveNormalizationV3;
@@ -815,6 +816,17 @@ impl NetworkReplayEngine {
         Ok(state)
     }
 
+    fn owned_stream_call_for_release(
+        &self, owner: NetworkStreamOwner, call: NetworkStreamCallId,
+    ) -> Result<&StreamCallState, NetworkReplayError> {
+        if self.stream_calls.get(&call).is_some_and(|s| s.shared_attempt.is_some()) {
+            self.check_shared_poll_release(owner, call)?;
+            Ok(&self.stream_calls[&call])
+        } else {
+            self.owned_stream_call(owner, call)
+        }
+    }
+
     /// The caller holds the short OFD control and has revalidated fd->OFD.
     /// Record latches possible host handle acquisition before pidfd_getfd.
     /// The actual backend, not a caller-supplied PID, authenticates that pin.
@@ -1281,7 +1293,7 @@ impl NetworkReplayEngine {
     ) -> Result<(), NetworkReplayError> {
         self.require_no_helper_copy(call)?;
         self.check_accept_call_release(call)?;
-        let state = self.owned_stream_call(owner, call)?;
+        let state = self.owned_stream_call_for_release(owner, call)?;
         if state.phase != StreamCallPhase::Active {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
@@ -1336,7 +1348,7 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
     ) -> Result<CompletedStreamCallRelease, NetworkReplayError> {
         self.require_no_helper_copy(call)?;
-        let state = self.owned_stream_call(owner, call)?;
+        let state = self.owned_stream_call_for_release(owner, call)?;
         if state.phase != StreamCallPhase::PinReleaseSubmitted {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
@@ -4320,7 +4332,10 @@ impl NetworkReplayEngine {
             NetworkTrace::V1(trace) => Self::replay(upgrade_v1_trace(trace)?),
             NetworkTrace::V2(trace) => Self::replay(trace),
             NetworkTrace::V3(trace) => Self::replay_shadow(trace),
-            NetworkTrace::V4(trace) => Self::replay_native_receive(trace),
+            NetworkTrace::V4(trace) => match trace.release_model {
+                NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { .. } => Self::replay_native_receive(trace),
+                NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. } => Self::replay_shared_mm_attempts(trace),
+            },
         }
     }
 
@@ -6634,7 +6649,8 @@ impl NetworkReplayEngine {
         // Policy loss cannot hide an actual unresolved Call/control. Once all
         // custody is resolved it still forbids successful trace finalization.
         // New effects retain their full pre-effect policy checks elsewhere.
-        self.check_native_retirement()
+        self.check_native_retirement()?;
+        self.check_shared_initial_finalization()
     }
 }
 

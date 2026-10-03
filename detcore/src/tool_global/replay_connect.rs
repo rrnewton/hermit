@@ -68,6 +68,13 @@ impl GlobalState {
                 &metadata,
             )
             .map_err(|e| fail(&e))?;
+        if engine.uses_shared_mm_attempts() {
+            let initial = scheduler.shared_initial_projection(&root).map_err(|e| fail(&e))?;
+            let grant = scheduler.native_capture_entry_observation(owner, operation, &root)
+                .map_err(|e| fail(&e))?;
+            engine.bind_shared_initial_replay_origin(root.clone(), initial, &grant)
+                .map_err(|e| fail(&e))?;
+        }
         let call = engine
             .begin_replay_connect(owner, operation, read, open_file)
             .map_err(|e| fail(&e))?;

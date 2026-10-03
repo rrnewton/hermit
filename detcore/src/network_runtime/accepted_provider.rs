@@ -87,6 +87,8 @@ macro_rules! wire {
         }
     }
 }
+pub(super) mod executable_source;
+
 wire!(Identity,ffi::Identity,{provider:u64,object:u64,namespace:u64});
 impl From<Identity> for ffi::Identity {
     fn from(value: Identity) -> Self {
@@ -365,6 +367,19 @@ impl AuxiliaryRole {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum Request {
+    PrepareExecutableSource {
+        intent: executable_source::Intent,
+    },
+    CollectExecutableSource {
+        call: u64,
+        command: u64,
+        prepared_request: u64,
+    },
+    RetireExecutableSource {
+        call: u64,
+        prepared: u64,
+        completed: u64,
+    },
     PrepareNativeBirth {
         call: u64,
         mm: u64,
@@ -536,6 +551,8 @@ pub(super) enum Request {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) enum Reply {
+    ExecutableSource(Observation<executable_source::Effect>),
+    ExecutableSourceRetired(CallStatus),
     NativeBirth(Observation<NativeBirth>),
     NativeBirthEffect(Observation<NativeBirthEffect>),
     NativeBirthTerminated(Observation<NativeBirthTerminal>),
@@ -1460,7 +1477,10 @@ impl Provider {
             .ok_or_else(|| io::Error::other("accepted provider session is not ready"))?;
         if matches!(
             envelope.operation,
-            Operation::PrepareOriginalFileObservation
+            Operation::PrepareExecutableSource
+                | Operation::CollectExecutableSource
+                | Operation::RetireExecutableSource
+                | Operation::PrepareOriginalFileObservation
                 | Operation::CollectOriginalFileObservation
                 | Operation::RetireOriginalFileObservation
                 | Operation::PrepareNativeBirth

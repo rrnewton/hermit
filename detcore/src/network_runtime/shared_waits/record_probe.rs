@@ -466,3 +466,163 @@ impl NetworkRuntimeResources {
         }))
     }
 }
+
+impl NetworkRuntimeResources {
+    /// The complete original Replay prefix is held continuously from reserve
+    /// through actual store/retention/commit. The interval outlives this borrow
+    /// only when retained actual failure custody requires it.
+    pub(crate) fn with_shared_replay_poll_output<T>(
+        &self,
+        prefix: &JoinedSharedPrefix,
+        lineage: &SharedForegroundLineage<'_>,
+        engine: &mut NetworkReplayEngine,
+        call: NetworkStreamCallId,
+        reserve: impl FnOnce(
+            &mut NetworkReplayEngine,
+            &SharedAttemptAdmission<'_>,
+        ) -> std::io::Result<
+            Arc<crate::network_replay::shared_waits::SharedPollSource>,
+        >,
+        store: impl FnOnce(
+            &mut NetworkReplayEngine,
+            &Arc<crate::network_replay::shared_waits::SharedPollSource>,
+            &Arc<NativeSourceInterval>,
+        ) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        if prefix.selected != Some(call)
+            || !Arc::ptr_eq(lineage.root(), prefix.root())
+            || prefix.census.rows.iter().any(|row| {
+                !lineage
+                    .members()
+                    .any(|actual| Arc::ptr_eq(actual, &row.root))
+            })
+            || prefix
+                .census
+                .rows
+                .iter()
+                .find(|r| r.call == call)
+                .is_none_or(|r| r.native.is_some() || r.owner != prefix.root().owner())
+            || engine.mode() != crate::network_replay::NetworkEngineMode::Replay
+        {
+            return Err(std::io::Error::other(
+                "Poll output changed selected original Replay lineage",
+            ));
+        }
+        self.with_shared_prefix_locks(prefix, engine, |engine, workers, calls| {
+            let source = reserve(
+                engine,
+                &SharedAttemptAdmission {
+                    prefix,
+                    _workers: workers,
+                    _calls: calls,
+                },
+            )?;
+            if source.call() != call
+                || !Arc::ptr_eq(source.root(), prefix.root())
+                || source.record_publication().is_some()
+            {
+                return Err(std::io::Error::other(
+                    "Poll reservation changed original Replay source",
+                ));
+            }
+            let interval = Arc::new(self.shared.reserve_shared_poll_interval(
+                workers,
+                prefix.prefix.generation,
+                source.clone(),
+                engine,
+                calls,
+            )?);
+            store(engine, &source, &interval)
+        })
+    }
+
+    /// A ready Record scan legitimately still owns its confirmed PollState
+    /// lease. This exact borrower admits only that lease, never empty-map or
+    /// generic settled permission. Failed actual stores retain lease+interval.
+    pub(crate) fn with_shared_record_poll_output<T>(
+        &self,
+        publication: &Arc<crate::network_replay::shared_waits::SharedRecordPollPublication>,
+        engine: &mut NetworkReplayEngine,
+        reserve: impl FnOnce(
+            &mut NetworkReplayEngine,
+            &ConfirmedSharedRecordPoll<'_>,
+        ) -> std::io::Result<
+            Arc<crate::network_replay::shared_waits::SharedPollSource>,
+        >,
+        store: impl FnOnce(
+            &mut NetworkReplayEngine,
+            &ConfirmedSharedRecordPoll<'_>,
+            &Arc<crate::network_replay::shared_waits::SharedPollSource>,
+            &Arc<NativeSourceInterval>,
+        ) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let origin = publication.source().origin();
+        let peers = engine
+            .shared_record_probe_peers(origin)
+            .map_err(std::io::Error::other)?;
+        self.shared.check_shared_probe_peers(origin, &peers)?;
+        let effects = engine
+            .shared_record_probe_effects(origin)
+            .map_err(std::io::Error::other)?;
+        for (at, effect) in effects.iter().enumerate() {
+            if !Arc::ptr_eq(effect.step().origin(), origin)
+                || effect.step().number() != at as u64 + 1
+            {
+                return Err(std::io::Error::other(
+                    "Poll output changed append-only worker history",
+                ));
+            }
+            effect.joined.validate_runtime(&self.shared)?;
+        }
+        let count = effects.len() as u64;
+        let mut workers = self.shared.native_workers.lock().unwrap();
+        self.shared
+            .check_shared_probe_workers(origin, &workers, count, None)?;
+        let mut calls = self.shared.native_streams.lock().unwrap();
+        calls.require_shared_probe(&peers, origin, true)?;
+        calls.preflight_shared_probe_retirement(origin, effects)?;
+        let source = reserve(
+            engine,
+            &ConfirmedSharedRecordPoll {
+                origin,
+                _workers: &workers,
+                _calls: &calls,
+            },
+        )?;
+        if source
+            .record_publication()
+            .is_none_or(|p| !Arc::ptr_eq(p, publication))
+        {
+            return Err(std::io::Error::other(
+                "Poll output changed actual publication",
+            ));
+        }
+        let generation = workers.submission_generation;
+        let interval = Arc::new(self.shared.reserve_shared_poll_interval(
+            &mut workers,
+            generation,
+            source.clone(),
+            engine,
+            &calls,
+        )?);
+        let value = store(
+            engine,
+            &ConfirmedSharedRecordPoll {
+                origin,
+                _workers: &workers,
+                _calls: &calls,
+            },
+            &source,
+            &interval,
+        )?;
+        if !engine.shared_record_poll_output_committed(&source) {
+            return Err(std::io::Error::other(
+                "Poll output closure lacks exact full semantic commit",
+            ));
+        }
+        calls
+            .finish_lease(origin.owner(), origin.lease())
+            .expect("actual Poll lease retirement preflight held across exact full store");
+        Ok(value)
+    }
+}

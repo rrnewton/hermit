@@ -72,6 +72,15 @@ pub struct MountInfoRootRewrite {
     pub deterministic_mountpoint_prefix: Option<Vec<u8>>,
 }
 
+/// Explicit Record-only policy. Replay obtains its policy from the trace.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, clap::ValueEnum, Eq, PartialEq)]
+pub enum NetworkRecordProfile {
+    /// Serialize each shared-memory network attempt under its selected turn.
+    #[value(name = "shared-mm-v1")]
+    #[serde(rename = "shared-mm-v1")]
+    SharedMmV1,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -577,6 +586,11 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub network_trace: NetworkTraceConfig,
+
+    /// Explicit run-level Record profile; never overrides Replay trace policy.
+    #[serde(default)]
+    #[clap(skip)]
+    pub network_record_profile: Option<NetworkRecordProfile>,
 
     /// Exact trace bytes opened and verified in the host namespace before the
     /// container is entered. Record/replay policies must not reopen a path.

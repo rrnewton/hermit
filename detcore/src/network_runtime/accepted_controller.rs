@@ -26,6 +26,9 @@ use crate::types::OpenFileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Effect {
+    PrepareExecutableSource(crate::network_replay::NetworkStreamCallId),
+    CollectExecutableSource(crate::network_replay::NetworkStreamCallId),
+    RetireExecutableSource(crate::network_replay::NetworkStreamCallId),
     PrepareNativeBirth(NetworkStreamLeaseId),
     ObserveNativeBirth(NetworkStreamLeaseId),
     CollectNativeBirth(NetworkStreamLeaseId),
@@ -268,6 +271,7 @@ pub(super) struct Controller {
     wire_format: Option<super::ProviderWireFormat>,
     copy_authority_owner: std::sync::Arc<()>,
     changed: tokio::sync::Notify,
+    executable_changed: std::sync::Condvar,
 }
 impl Controller {
     #[cfg(test)]
@@ -305,6 +309,7 @@ impl Controller {
             }
             Ok(!state.pending_send.is_empty())
         })();
+        self.executable_changed.notify_all();
         // Preserve known replies and failures even if transport progress failed.
         // The state mutex has been released; publication may acquire it again.
         retain()?;
@@ -420,6 +425,7 @@ impl Controller {
             .failure
             .get_or_insert_with(|| error.to_string());
         self.changed.notify_waiters();
+        self.executable_changed.notify_all();
     }
 
     pub(super) fn quiescent(&self) -> io::Result<bool> {
@@ -430,12 +436,12 @@ impl Controller {
         if !state.pending_send.is_empty() {
             return Ok(false);
         }
-        if state
-            .requests
-            .0
-            .keys()
-            .any(|key| matches!(key, Effect::PrepareNativeBirth(_)))
-        {
+        if state.requests.0.keys().any(|key| {
+            matches!(
+                key,
+                Effect::PrepareNativeBirth(_) | Effect::PrepareExecutableSource(_)
+            )
+        }) {
             return Ok(false);
         }
         for request in state.requests.0.values() {
@@ -521,6 +527,7 @@ impl Controller {
             wire_format,
             copy_authority_owner: std::sync::Arc::new(()),
             changed: tokio::sync::Notify::new(),
+            executable_changed: std::sync::Condvar::new(),
         })
     }
 
@@ -543,6 +550,9 @@ impl Controller {
             | Request::ReadCreation { .. }
             | Request::AwaitCreation { .. }
             | Request::RetireObservation { .. } => Operation::DrainCreations,
+            Request::PrepareExecutableSource { .. } => Operation::PrepareExecutableSource,
+            Request::CollectExecutableSource { .. } => Operation::CollectExecutableSource,
+            Request::RetireExecutableSource { .. } => Operation::RetireExecutableSource,
             Request::PrepareSetter { .. } => Operation::PrepareSetter,
             Request::FinishSetter { .. } => Operation::FinishSetter,
             Request::PrepareNativeBirth { .. } => Operation::PrepareNativeBirth,
@@ -1461,6 +1471,74 @@ impl Controller {
         let receipt = state.session.retire_outgoing_observation(sequence, body)?;
         state.requests.retire_observation(key, sequence)?;
         Ok(receipt)
+    }
+
+    /// One op26 housekeeping budget covers ARM, collection and ACK. Expiry
+    /// poisons this original controller even when a late raw reply is retained.
+    pub(super) fn executable_response_blocking(
+        &self,
+        sequence: u64,
+        deadline: std::time::Instant,
+    ) -> io::Result<Reply> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(error) = &state.failure {
+                return Err(io::Error::other(error.clone()));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let message = "executable source exceeded original one-second housekeeping budget";
+                state.failure.get_or_insert_with(|| message.into());
+                drop(state);
+                self.changed.notify_waiters();
+                self.executable_changed.notify_all();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, message));
+            }
+            if let Some(bytes) = state.session.response(sequence)? {
+                return serde_json::from_slice(bytes).map_err(io::Error::other);
+            }
+            state = self
+                .executable_changed
+                .wait_timeout(state, deadline - now)
+                .unwrap()
+                .0;
+        }
+    }
+
+    pub(super) fn retire_executable_source(
+        &self,
+        owner: NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+        sequences: [u64; 3],
+    ) -> io::Result<()> {
+        let keys = [
+            Effect::PrepareExecutableSource(call),
+            Effect::CollectExecutableSource(call),
+            Effect::RetireExecutableSource(call),
+        ];
+        let mut state = self.state.lock().unwrap();
+        for (key, sequence) in keys.into_iter().zip(sequences) {
+            if state
+                .requests
+                .0
+                .get(&key)
+                .is_none_or(|r| r.owner != owner || r.sequence != Some(sequence))
+                || state.pending_send.contains(&sequence)
+            {
+                return Err(io::Error::other(
+                    "executable source retirement changed retained requests",
+                ));
+            }
+        }
+        state.session.retire_outgoing_executable_source(
+            owner,
+            call.native_command_call(),
+            sequences,
+        )?;
+        for key in keys {
+            state.requests.0.remove(&key);
+        }
+        Ok(())
     }
 
     /// Transport waits do not publish guest time or select a guest wakeup.
@@ -2501,5 +2579,272 @@ mod tests {
                 .is_err()
         );
         assert_eq!(requests.0.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::super::accepted_provider::CallStatus;
+    use super::super::accepted_provider::Observation;
+    use super::super::accepted_provider::executable_source::Intent;
+    use super::super::accepted_provider::executable_source::controlled_collection;
+    use super::*;
+    fn owner() -> NetworkStreamOwner {
+        let thread = crate::types::DetTid::from_raw(41);
+        NetworkStreamOwner {
+            thread,
+            mm: crate::types::MmId::initial(thread),
+        }
+    }
+    fn pair() -> (Arc<Controller>, AcceptedSession) {
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let wire = super::super::ProviderWireFormat::Abi11Copy5;
+        (
+            Arc::new(
+                Controller::from_startup(unsafe { OwnedFd::from_raw_fd(pair[0]) }, [7; 16], wire)
+                    .unwrap(),
+            ),
+            AcceptedSession::from_wire(unsafe { OwnedFd::from_raw_fd(pair[1]) }, [7; 16], wire)
+                .unwrap(),
+        )
+    }
+    fn intent() -> Intent {
+        Intent {
+            command: 0,
+            registration: 11,
+            owner_mm: owner().mm.generation(),
+            call: 13,
+            address: 0x401020,
+            length: 5,
+            iovec: 0x700000,
+            registers: 0x700100,
+        }
+    }
+    fn status(operation: &str) -> CallStatus {
+        CallStatus {
+            operation: operation.into(),
+            returned: 0,
+            errno: None,
+        }
+    }
+    #[test]
+    fn executable_blocking_transport_has_no_tokio_dependency_and_requires_exact_ack() {
+        let (controller, mut provider) = pair();
+        let call = crate::network_replay::NetworkStreamCallId::controlled_fixture(13);
+        let pin = std::fs::File::open("/dev/null").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let driver = controller.clone();
+        // Actual private socket/retained Inbox traffic on an independent native
+        // thread. Provider C semantics below are an explicitly controlled premise.
+        let worker = std::thread::spawn(move || {
+            let mut phase = 0;
+            while phase < 3 {
+                assert!(Instant::now() < deadline, "bounded controlled service");
+                driver
+                    .drive_once_retained_with_poll(|| Ok(()), |_| 0)
+                    .unwrap();
+                if let Some(Received::Request(sequence)) = provider.try_receive().unwrap() {
+                    let (envelope, rights, _) = provider.retained_request(sequence).unwrap();
+                    let reply = match (
+                        phase,
+                        serde_json::from_slice::<Request>(&envelope.body).unwrap(),
+                    ) {
+                        (0, Request::PrepareExecutableSource { intent: requested }) => {
+                            assert_eq!(requested, intent());
+                            assert_eq!(rights.len(), 1);
+                            Reply::Prepared(Observation {
+                                status: status("ap_prepare_executable_source"),
+                                raw: 7,
+                            })
+                        }
+                        (
+                            1,
+                            Request::CollectExecutableSource {
+                                call: 13,
+                                command: 7,
+                                prepared_request: 1,
+                            },
+                        ) => {
+                            assert!(rights.is_empty());
+                            let mut expected = intent();
+                            expected.command = 7;
+                            Reply::ExecutableSource(controlled_collection(expected))
+                        }
+                        (
+                            2,
+                            Request::RetireExecutableSource {
+                                call: 13,
+                                prepared: 1,
+                                completed: 2,
+                            },
+                        ) => {
+                            assert!(rights.is_empty());
+                            provider
+                                .check_incoming_executable_source(owner(), 13, 1, 2)
+                                .unwrap();
+                            Reply::ExecutableSourceRetired(status("ap_ack_command"))
+                        }
+                        _ => panic!("changed exact controlled wire sequence"),
+                    };
+                    provider
+                        .dispatch(sequence, |_, _| Ok(serde_json::to_vec(&reply).unwrap()))
+                        .unwrap();
+                    if phase == 2 {
+                        provider
+                            .retire_incoming_executable_source(owner(), 13, [1, 2, 3])
+                            .unwrap();
+                    }
+                    assert!(provider.try_reply(sequence).unwrap());
+                    driver
+                        .drive_once_retained_with_poll(|| Ok(()), |_| 0)
+                        .unwrap();
+                    phase += 1;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let prepared = controller
+            .prepare(
+                Effect::PrepareExecutableSource(call),
+                owner(),
+                &Request::PrepareExecutableSource { intent: intent() },
+                || Ok(vec![pin.as_fd().try_clone_to_owned()?]),
+            )
+            .unwrap();
+        assert_eq!(prepared, 1);
+        assert!(matches!(
+            controller
+                .executable_response_blocking(prepared, deadline)
+                .unwrap(),
+            Reply::Prepared(_)
+        ));
+        assert!(
+            !controller.quiescent().unwrap(),
+            "positive ARM is still native debt"
+        );
+        let collected = controller
+            .prepare(
+                Effect::CollectExecutableSource(call),
+                owner(),
+                &Request::CollectExecutableSource {
+                    call: 13,
+                    command: 7,
+                    prepared_request: prepared,
+                },
+                || Ok(vec![]),
+            )
+            .unwrap();
+        assert!(matches!(
+            controller
+                .executable_response_blocking(collected, deadline)
+                .unwrap(),
+            Reply::ExecutableSource(_)
+        ));
+        assert!(
+            !controller.quiescent().unwrap(),
+            "positive collection is still ACK debt"
+        );
+        assert!(
+            controller
+                .retire_executable_source(owner(), call, [prepared, collected, 3])
+                .is_err()
+        );
+        let retired = controller
+            .prepare(
+                Effect::RetireExecutableSource(call),
+                owner(),
+                &Request::RetireExecutableSource {
+                    call: 13,
+                    prepared,
+                    completed: collected,
+                },
+                || Ok(vec![]),
+            )
+            .unwrap();
+        assert!(matches!(
+            controller
+                .executable_response_blocking(retired, deadline)
+                .unwrap(),
+            Reply::ExecutableSourceRetired(_)
+        ));
+        controller
+            .retire_executable_source(owner(), call, [prepared, collected, retired])
+            .unwrap();
+        assert!(controller.quiescent().unwrap());
+        worker.join().unwrap();
+    }
+    #[test]
+    fn executable_expiry_is_sticky_before_late_positive_reply() {
+        let (controller, mut provider) = pair();
+        let call = crate::network_replay::NetworkStreamCallId::controlled_fixture(13);
+        let pin = std::fs::File::open("/dev/null").unwrap();
+        let seq = controller
+            .prepare(
+                Effect::PrepareExecutableSource(call),
+                owner(),
+                &Request::PrepareExecutableSource { intent: intent() },
+                || Ok(vec![pin.as_fd().try_clone_to_owned()?]),
+            )
+            .unwrap();
+        controller
+            .drive_once_retained_with_poll(|| Ok(()), |_| 0)
+            .unwrap();
+        assert!(matches!(provider.try_receive().unwrap(), Some(Received::Request(s)) if s == seq));
+        assert_eq!(
+            controller
+                .executable_response_blocking(seq, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        // The original controller keeps both its request and sticky failure.
+        // A retained known reply does not renew the original attempt's budget.
+        let bytes = serde_json::to_vec(&Reply::Prepared(Observation {
+            status: status("ap_prepare_executable_source"),
+            raw: 7,
+        }))
+        .unwrap();
+        provider.dispatch(seq, |_, _| Ok(bytes)).unwrap();
+        assert!(provider.try_reply(seq).unwrap());
+        {
+            let mut state = controller.state.lock().unwrap();
+            assert!(
+                matches!(state.session.try_receive().unwrap(), Some(Received::Acknowledged(s)) if s == seq)
+            );
+        }
+        assert!(matches!(
+            controller.retained_response(seq).unwrap(),
+            Some(Reply::Prepared(_))
+        ));
+        assert!(
+            controller
+                .executable_response_blocking(seq, Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(controller.quiescent().is_err());
+        assert!(
+            controller
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .0
+                .contains_key(&Effect::PrepareExecutableSource(call))
+        );
     }
 }

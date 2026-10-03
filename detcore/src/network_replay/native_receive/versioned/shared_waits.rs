@@ -13,6 +13,10 @@ pub(crate) use replay_store::SharedReplayNoStorePlan;
 pub(crate) use replay_store::SharedReplayReceivePlan;
 pub(crate) use replay_store::SharedReplaySource;
 
+#[path = "shared_waits/poll.rs"]
+mod poll;
+pub(crate) use poll::{SharedPollDecision, SharedPollPlan, SharedPollSource, SharedPollStoreRetainer};
+
 #[path = "shared_waits/record_probe.rs"]
 mod record_probe;
 pub(crate) use record_probe::PreparedSharedEffect;
@@ -144,6 +148,7 @@ pub(in crate::network_replay) struct SharedWait {
     intent: SharedWaitIntent,
     phase: AttemptPhase,
     output: Option<replay_store::SharedOutput>,
+    poll_output: Option<poll::SharedPollOutput>,
     capture: Option<Arc<SharedCaptureOrigin>>,
     record_probe: Option<record_probe::ProbeState>,
     record_history: Vec<Arc<record_probe::RecordHistory>>,
@@ -347,7 +352,7 @@ impl NetworkReplayEngine {
         state: &StreamCallState,
     ) -> Result<(), NetworkReplayError> {
         self.shared_wait_non_output_debts_settled(call, state)?;
-        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(wait)) if wait.output.is_some())
+        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(wait)) if wait.output.is_some() || wait.poll_output.is_some())
         {
             return Err(invalid("shared wait retains its exact output attempt"));
         }
@@ -623,6 +628,7 @@ impl NetworkReplayEngine {
             binding,
             intent,
             output: None,
+            poll_output: None,
             capture: None,
             record_probe: None,
             record_history: Vec::new(),

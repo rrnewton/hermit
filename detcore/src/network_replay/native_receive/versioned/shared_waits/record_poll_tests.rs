@@ -463,3 +463,6 @@ async fn shared_record_poll_invalid_duplicate_candidate_retains_trace_and_native
         .unwrap();
     assert!(e.stream_calls[&call.id].physical_pin_required);
 }
+
+#[path = "poll_record_output_tests.rs"]
+mod poll_record_output_tests;
