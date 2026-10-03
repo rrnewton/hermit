@@ -124,8 +124,9 @@ its step 2, and it must stay that way for the recorded seed to apply:
   For a checkout outside `/tmp` the scripts add nothing, so their command line
   and the seeds recorded with it are unchanged. The converter is bound through
   its directory because Hermit cannot start a program whose path is itself a
-  `--bind` target: it reports that the program does not exist. `--tmp=/tmp`
-  would also work, but it would show the converter everything in the host's
+  `--bind` target: it reports that the program does not exist
+  (<https://github.com/rrnewton/hermit/issues/3626>). `--tmp=/tmp` would also
+  work, but it would show the converter everything in the host's
   `/tmp` and make all of it an input to the run. The binds add entries to the
   guest's mount table and the directories leading to them inside the private
   `/tmp`. The patched build reads no mount table (see
@@ -406,7 +407,7 @@ The two variants carry a small harness, applied identically to both, in
   the unpatched build opened `/proc/self/mounts` once and
   `/sys/block/loop*/loop/backing_file` 14 times. Giving the program a mount
   table that does not depend on the host's mounts is tracked in
-  MOUNT-TABLE-ISSUE-URL.
+  <https://github.com/rrnewton/hermit/issues/3627>.
   <https://github.com/rrnewton/hermit/issues/1820> is a narrower, related
   issue: a short-lived host mount changed `findmnt` output between the two
   runs of a Hermit `--verify`.
