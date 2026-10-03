@@ -18,20 +18,20 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1103 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1104 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
 //!    added (895 portable and 5 privileged), the 189 portable cells of the
 //!    compatibility-corpus fold, the 2 portable select replay cells and the 6
 //!    portable KVM verify selections, the three socket selections, and one
-//!    poll-readiness, one epoll-pwait2 and one fsync-durability selection,
+//!    poll-readiness, one epoll-pwait2, one fsync-durability and one fcntl-owner selection,
 //!    after applying the later lane moves listed
-//!    in `LATER_LANE_MOVES` (now 1096 portable and 7 privileged).
+//!    in `LATER_LANE_MOVES` (now 1097 portable and 7 privileged).
 //! 3. The committed compatibility cell table has 14800 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
 //!    compatibility-corpus fold, plus the 2 select replay and 6 KVM verify
-//!    selection changes, plus three socket, one poll-readiness, one epoll-pwait2
-//!    and one fsync-durability selection,
+//!    selection changes, plus three socket, one poll-readiness, one epoll-pwait2,
+//!    one fsync-durability and one fcntl-owner selection,
 //!    that keep the row total unchanged, plus the later SaBRe, strict and rr
 //!    compatibility folds described below.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
@@ -284,6 +284,17 @@ const KVM_EPOLL_PWAIT2_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
 /// original bounds retained. Replay stays disabled.
 const KVM_FSYNC_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[("portable", "kvm", "verify", 1)];
 const KVM_FSYNC_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
+
+/// <https://github.com/rrnewton/reverie/pull/910> supplies the proven pipe
+/// owner/signal configuration used by the unchanged fcntl-owner fixture.
+/// One required KVM verify cell, all six checks and original bounds retained;
+/// this selection does not claim asynchronous signal delivery. Replay stays disabled.
+const KVM_FCNTL_OWNER_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 1)];
+const KVM_FCNTL_OWNER_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
     ("kvm", "verify", "green", 1),
     ("kvm", "verify", "not-applicable", -1),
 ];
@@ -615,11 +626,12 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
     // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1,
-            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1
                 - moved_out("portable")
                 + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
@@ -628,7 +640,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         (lane("portable"), lane("privileged")),
         (
-            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1,
+            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1,
             7
         ),
         "the lane moves above are the only ones since the fold"
@@ -675,6 +687,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .chain(KVM_PSELECT_PLAN_ADDITIONS)
         .chain(KVM_EPOLL_PWAIT2_PLAN_ADDITIONS)
         .chain(KVM_FSYNC_PLAN_ADDITIONS)
+        .chain(KVM_FCNTL_OWNER_PLAN_ADDITIONS)
     {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
@@ -699,7 +712,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // three socket KVM verify cells of `KVM_SOCKET_PLAN_ADDITIONS`, plus the one
     // poll-readiness cell of `KVM_PSELECT_PLAN_ADDITIONS` and one epoll-pwait2
     // cell of `KVM_EPOLL_PWAIT2_PLAN_ADDITIONS`, plus one fsync-durability
-    // cell of `KVM_FSYNC_PLAN_ADDITIONS` above.
+    // cell of `KVM_FSYNC_PLAN_ADDITIONS` and one fcntl-owner cell
+    // of `KVM_FCNTL_OWNER_PLAN_ADDITIONS` above.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -720,7 +734,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         BTreeMap::from([
             (
                 ("portable".into(), "c-programs".into()),
-                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1
             ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
@@ -770,6 +784,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(rr_fold_cell_deltas())
         .chain(KVM_EPOLL_PWAIT2_CELL_DELTAS.iter().copied())
         .chain(KVM_FSYNC_CELL_DELTAS.iter().copied())
+        .chain(KVM_FCNTL_OWNER_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
