@@ -16,7 +16,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.2.0",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "9b6c101a796623cda8c3bb50195f82eca76df6bb",
+    "HERMIT_REVERIE_PIN": "950a52f1ebaa6ed3aaa631cd4c257534de3cc1f3",
 }
 
 fb_native.cxx_library(

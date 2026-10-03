@@ -467,7 +467,12 @@ fi
 # 76e4e74 and this pin resolve that entire tree to
 # a62d15302ee5e907667d1c02f6e629177ad87f61. Build settings and measured limits
 # remain unchanged. This carries source identity, not a new timing result.
-expected_pin=9b6c101a796623cda8c3bb50195f82eca76df6bb
+# CARRY TO 950a52f1ebaa6ed3aaa631cd4c257534de3cc1f3 (2026-10-03): original Poll capture/timer/output
+# and executable-source bridge preserve the entire reverie-dbt tree
+# a62d15302ee5e907667d1c02f6e629177ad87f61 and all recipe/toolchain inputs.
+# Compiler/generator choice and measured limits are unchanged. This is
+# source-identity carry, not a new timing sample or DBT qualification.
+expected_pin=950a52f1ebaa6ed3aaa631cd4c257534de3cc1f3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
