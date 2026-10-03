@@ -19,6 +19,13 @@
 //! wait: `poll`, `epoll_wait`, `select`, and a timed futex wait then run to
 //! their 300 ms deadline.
 //!
+//! Nor does a SIGTSTP, SIGTTIN, or SIGTTOU left at its default action end a
+//! `poll` with a timeout or a timed `FUTEX_WAIT`, because Detcore restarts those
+//! two calls with their relative timeout re-armed. In an orphaned process group
+//! Linux discards such a signal and restarts the call with its original
+//! deadline, so these calls still return at 300 ms, and the other waits restart
+//! with their deadline kept or, for `epoll_wait`, return EINTR.
+//!
 //! Signal dispositions belong to the whole process, so a sibling can change
 //! one while a waiter is parked. The disposition that counts is the one in
 //! force when the signal arrives, not the one when the wait began: a signal
@@ -76,6 +83,10 @@
 //!   middle of the patched bytes (https://github.com/rrnewton/reverie/issues/812).
 //!   Only `sem exit warm` is asserted.
 //! - `warm` on ptrace, which patches no call site.
+//! - A default SIGTSTP, SIGTTIN, or SIGTTOU in a process group that is not
+//!   orphaned. Linux stops the process when the signal arrives; Detcore lets a
+//!   `poll` with a timeout or a timed `FUTEX_WAIT` run to its end first, and the
+//!   process stops when the call returns, as on hermit main.
 
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
@@ -131,7 +142,11 @@ const WAKE_SLACK_MS: u64 = 100;
 /// start stamp. Under Hermit each of those syscalls advances virtual time, so
 /// the wake reads about 1 ms short of `SIGNAL_DELAY_MS` (99 ms measured on
 /// 2026-09-29 for `epoll` on both backends). 90 ms still separates a wake by the
-/// exit from an immediate return, and the upper bound is unchanged.
+/// exit from an immediate return, and the upper bound is unchanged. The `tstp`
+/// cells use the same floor: their test runs in a forked child, and there the
+/// sibling sender starts its 100 ms sleep before the main thread prints `READY`,
+/// creates and arms its epoll set and takes its start stamp (99 ms measured on
+/// 2026-10-03 for `epoll` on both backends).
 const EXIT_WAKE_FLOOR_MS: u64 = 90;
 /// Strict-verified repetitions of each child-exit SIGCHLD cell. The kernel also
 /// posts its own SIGCHLD for the exit at a host-timed moment, so a single
@@ -660,7 +675,7 @@ fn assert_woken_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &s
         "{backend} {mode:?} {args:?}: expected `{expected}`\n{}",
         run.describe()
     );
-    let floor = if args.contains(&"exit") {
+    let floor = if args.contains(&"exit") || args.contains(&"tstp") {
         EXIT_WAKE_FLOOR_MS
     } else {
         SIGNAL_DELAY_MS
@@ -928,6 +943,109 @@ fn ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
 #[test]
 fn liteinst_timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
     assert_timed_futex_wait_is_not_ended("liteinst");
+}
+
+/// The waits whose restart re-arms a relative timeout keep their deadline when
+/// a SIGTSTP left at SIG_DFL arrives in an orphaned process group (the guest's
+/// `tstp` option). Linux discards that signal: the process does not stop, no
+/// handler runs, and the kernel restarts the interrupted call with the end time
+/// it saved, so `poll` and a timed `FUTEX_WAIT` return their timeout result at
+/// 300 ms. Detcore restarts these two calls with their relative timeout
+/// re-armed, so it leaves them waiting through a default SIGTSTP, SIGTTIN or
+/// SIGTTOU, as hermit main does, instead of ending them. Ending them returned
+/// near 400 ms (review of https://github.com/rrnewton/hermit/pull/3361 at
+/// `cbb36408`, finding 4). LiteInst also runs the futex wait at a patched call
+/// site, in both futex modes.
+fn assert_discarded_default_stop_leaves_rearming_waits(backend: &str) {
+    for sender in ["thread", "process"] {
+        for mode in [FutexMode::Precise, FutexMode::Polling] {
+            assert_quiet_cell(
+                backend,
+                mode,
+                &["futex", sender, "tstp"],
+                "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
+            );
+        }
+        assert_quiet_cell(
+            backend,
+            FutexMode::Precise,
+            &["poll", sender, "tstp"],
+            "RESULT call=poll ret=0 errno=none handler=0",
+        );
+    }
+    if backend == "liteinst" {
+        for mode in [FutexMode::Precise, FutexMode::Polling] {
+            assert_quiet_cell(
+                backend,
+                mode,
+                &["futex", "thread", "tstp", "warm"],
+                "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
+            );
+        }
+    }
+}
+
+#[test]
+fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop() {
+    assert_discarded_default_stop_leaves_rearming_waits("ptrace");
+}
+
+#[test]
+fn liteinst_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop() {
+    assert_discarded_default_stop_leaves_rearming_waits("liteinst");
+}
+
+/// Control for the test above: the same discarded SIGTSTP still ends, or
+/// restarts, every other wait as Linux does. glibc `select`, the `select`
+/// system call, and `sem_timedwait` restart with their deadline kept (Detcore
+/// writes the time left back for both selects, and `sem_timedwait` passes an
+/// absolute deadline), so they return their timeout result at 300 ms.
+/// `epoll_wait` is not restarted: Linux returns EINTR when the signal arrives,
+/// although no handler runs. LiteInst also runs the `select` system call at a
+/// patched call site; `sem thread warm` crashes for an unrelated reason (see
+/// the module comment).
+fn assert_discarded_default_stop_is_handled_as_on_linux(backend: &str) {
+    for (call, expected) in [
+        ("select", "RESULT call=select ret=0 errno=none handler=0"),
+        (
+            "rawselect",
+            "RESULT call=rawselect ret=0 errno=none handler=0",
+        ),
+        ("sem", "RESULT call=sem ret=-1 errno=ETIMEDOUT handler=0"),
+    ] {
+        assert_quiet_cell(
+            backend,
+            FutexMode::Precise,
+            &[call, "thread", "tstp"],
+            expected,
+        );
+    }
+    for sender in ["thread", "process"] {
+        assert_woken_cell(
+            backend,
+            FutexMode::Precise,
+            &["epoll", sender, "tstp"],
+            "RESULT call=epoll ret=-1 errno=EINTR handler=0",
+        );
+    }
+    if backend == "liteinst" {
+        assert_quiet_cell(
+            backend,
+            FutexMode::Precise,
+            &["rawselect", "thread", "tstp", "warm"],
+            "RESULT call=rawselect ret=0 errno=none handler=0",
+        );
+    }
+}
+
+#[test]
+fn ptrace_other_waits_take_a_discarded_default_stop_as_on_linux() {
+    assert_discarded_default_stop_is_handled_as_on_linux("ptrace");
+}
+
+#[test]
+fn liteinst_other_waits_take_a_discarded_default_stop_as_on_linux() {
+    assert_discarded_default_stop_is_handled_as_on_linux("liteinst");
 }
 
 /// Positive control: `select` already observed an external signal before the
