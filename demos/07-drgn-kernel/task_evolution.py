@@ -163,7 +163,7 @@ def main() -> int:
         all_metrics.extend((before_metrics, after_metrics))
         print(
             "evolution {}: before_tasks={} after_tasks={} removed={} added={} "
-            "read_states={}/{},{}/{} serial_delta=0/0".format(
+            "read_states={}/{},{}/{} serial_delta={}/{}".format(
                 run,
                 len(before),
                 len(after),
@@ -173,6 +173,8 @@ def main() -> int:
                 before_metrics.tracer_state,
                 after_metrics.qemu_state,
                 after_metrics.tracer_state,
+                before_metrics.serial_bytes_delta,
+                after_metrics.serial_bytes_delta,
             ),
             flush=True,
         )
