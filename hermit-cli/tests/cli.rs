@@ -3243,8 +3243,9 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
                 "expected a {side} capture, found {log:?}"
             );
         }
-        // Hermit creates run 2's log before run 1 starts, so a poll sees it
-        // whatever the verdict, and a missed capture fails here.
+        // The helper links run 2's log while the command runs, and once more
+        // after it exits, which finds the log a divergence retains. A missing
+        // capture fails here whatever the verdict.
         let run2_log = run2_log.expect("run 2's log was not captured while the command ran");
         // After a match Hermit deletes run 2's log, so the link made while the
         // command ran is checked in its place. The match compares only INFO
@@ -9024,9 +9025,11 @@ fn retained_captures(log_dir: &Path, prefix: &str) -> Vec<PathBuf> {
 /// Runs a `hermit run --verify --keep-logs` command whose `--verify-log-dir` is
 /// `logs`, as [`Command::output`] does, and also returns run 2's log, which
 /// Hermit deletes after a match. The log survives as a hard link at `capture`,
-/// made while the command runs; the `run2_log` module explains why that link
-/// holds run 2's complete log. The caller checks it like a retained log and
-/// then removes it. `None` means no poll saw a run 2 log.
+/// made by a poll while the command runs, or after it exits if Hermit retained
+/// the log; the `run2_log` module explains why that link holds run 2's complete
+/// log. The caller checks it like a retained log and
+/// then removes it. `None` means no poll saw a run 2 log and Hermit did not
+/// retain one.
 fn output_capturing_run2_log(
     command: &mut Command,
     logs: &Path,
@@ -9050,6 +9053,11 @@ fn output_capturing_run2_log(
         .join()
         .expect("the verify command's waiter panicked")
         .expect("failed to wait for the verify command");
+    // The polls can miss the whole run. A run 2 log that Hermit retained, as
+    // it does after a divergence, is still there to link.
+    if !captured {
+        captured = run2_log::link_run2_log(logs, capture);
+    }
     (output, captured.then(|| capture.to_owned()))
 }
 
