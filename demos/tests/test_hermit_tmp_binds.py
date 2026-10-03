@@ -75,6 +75,13 @@ REFUSAL = (
     "and the demo cannot make this path visible there: {}. "
 )
 
+# The advice demo 9 prints after REFUSAL.
+DEMO9_TMP_HINT = (
+    "Run demo 9 from a checkout outside /tmp or through a path that begins with "
+    "/tmp/, or set OUTPUT_DIR, KERNEL_IMAGE, and INITRAMFS_IMAGE to paths outside "
+    "/tmp or to absolute paths that begin with /tmp/."
+)
+
 
 def _write_executable(path, text):
     path.write_text(text)
@@ -259,13 +266,160 @@ class HelperTest(unittest.TestCase):
         program = self.outside / "bin" / "prog"
         relative = os.path.relpath(self.inside / "a.img", self.outside)
         self.assertIn("..", relative.split("/"))
+        # The lookup climbs to / and steps into tmp, where the program sees
+        # its private /tmp.
         self._assert_refused(
             [program, relative],
             relative,
-            "it resolves to {}, under /tmp, through a '..' component".format(
+            "it resolves to {}, under /tmp, through /tmp itself, where the program "
+            "sees its private /tmp".format(self.inside / "a.img"),
+            cwd=self.outside,
+        )
+
+    def test_a_relative_file_whose_dot_dot_stays_below_tmp_is_left_alone(self):
+        # The program looks these up from the working directory it inherits,
+        # and none of them leaves the host's files below /tmp.
+        program = self.outside / "bin" / "prog"
+        (self.inside / "sub" / "deeper").mkdir(parents=True)
+        (self.inside / "w").mkdir()
+        (self.inside / "a.img").write_bytes(b"image\n")
+        for cwd, relative in (
+            (self.inside, "sub/../a.img"),
+            (self.inside, "sub/deeper/../../a.img"),
+            (self.inside, "./sub/./../a.img"),
+            (self.inside / "w", "../a.img"),
+            (self.inside / "w", "../w/../a.img"),
+        ):
+            with self.subTest(cwd=cwd, relative=relative):
+                self._assert_accepted(program, relative, cwd=cwd)
+                self.assertEqual(self._binds(program, relative, cwd=cwd), [])
+
+    def test_a_relative_file_whose_lookup_passes_through_tmp_itself_is_refused(self):
+        program = self.outside / "bin" / "prog"
+        below_tmp = os.path.relpath(self.inside, "/tmp")
+        problem = (
+            "it resolves to {}, under /tmp, through /tmp itself, where the program "
+            "sees its private /tmp".format(self.inside / "a.img")
+        )
+        # Climbing to /tmp from below it, and stepping into tmp from /.
+        climb = "../" * len(Path(below_tmp).parts) + below_tmp + "/a.img"
+        for cwd, relative in (
+            (self.inside, climb),
+            ("/", "tmp/{}/a.img".format(below_tmp)),
+        ):
+            with self.subTest(cwd=cwd, relative=relative):
+                self._assert_refused(
+                    [program, relative], relative, problem, cwd=cwd
+                )
+
+    def test_a_relative_file_through_a_symbolic_link_and_dot_dot_is_refused(self):
+        # The program resolves the absolute link in its own view, where it
+        # points into the private /tmp, before the `..` that follows it.
+        program = self.outside / "bin" / "prog"
+        (self.inside / "real").mkdir()
+        (self.inside / "link").symlink_to(self.inside / "real")
+        self._assert_refused(
+            [program, "link/../a.img"],
+            "link/../a.img",
+            "it resolves to {}, under /tmp, through a symbolic link".format(
                 self.inside / "a.img"
             ),
-            cwd=self.outside,
+            cwd=self.inside,
+        )
+
+    def test_a_file_inside_the_program_directory_through_a_link_is_refused(self):
+        directory = self.inside / "d"
+        directory.mkdir()
+        (self.inside / "kernels").mkdir()
+        kernel = self.inside / "kernels" / "bzImage"
+        kernel.write_bytes(b"kernel\n")
+        (directory / "kernel").symlink_to(kernel)
+        (directory / "relative-kernel").symlink_to("../kernels/bzImage")
+        (directory / "sub").symlink_to(self.inside / "kernels")
+        for path, link in (
+            (directory / "kernel", directory / "kernel"),
+            (directory / "relative-kernel", directory / "relative-kernel"),
+            (directory / "sub" / "bzImage", directory / "sub"),
+        ):
+            with self.subTest(path=path):
+                self._assert_refused(
+                    [directory / "prog", path],
+                    path,
+                    "it is inside the program's directory, {}, which is bound as a "
+                    "whole, and {} is a symbolic link, which the program would "
+                    "follow in its own view, where the rest of the host's /tmp is "
+                    "hidden; give the path it resolves to, {}, instead".format(
+                        directory, link, kernel
+                    ),
+                    binds=["--bind", str(directory)],
+                )
+
+    def test_a_link_inside_the_program_directory_is_refused_even_if_it_works(self):
+        # A link out of /tmp, or to another file in the directory, would
+        # resolve in the program's view too; the helper refuses every link
+        # below the directory rather than follow each one.
+        directory = self.inside / "d"
+        directory.mkdir()
+        (directory / "data").write_bytes(b"data\n")
+        (self.outside / "bzImage").write_bytes(b"kernel\n")
+        (directory / "out").symlink_to(self.outside / "bzImage")
+        (directory / "alias").symlink_to("data")
+        for link, target in (
+            (directory / "out", self.outside / "bzImage"),
+            (directory / "alias", directory / "data"),
+        ):
+            with self.subTest(link=link):
+                self._assert_refused(
+                    [directory / "prog", link],
+                    link,
+                    "it is inside the program's directory, {}, which is bound as a "
+                    "whole, and {} is a symbolic link, which the program would "
+                    "follow in its own view, where the rest of the host's /tmp is "
+                    "hidden; give the path it resolves to, {}, instead".format(
+                        directory, link, target
+                    ),
+                    binds=["--bind", str(directory)],
+                )
+                # The path it resolves to is accepted.
+                self._assert_accepted(directory / "prog", target)
+
+    def test_a_program_that_is_a_symbolic_link_is_refused(self):
+        directory = self.inside / "d"
+        directory.mkdir()
+        (self.inside / "elsewhere").mkdir()
+        target = self.inside / "elsewhere" / "prog"
+        _write_executable(target, "#!/bin/sh\n")
+        (directory / "prog").symlink_to(target)
+        self._assert_refused(
+            [directory / "prog"],
+            directory / "prog",
+            "it is a symbolic link, which Hermit would follow in the program's "
+            "view, where the rest of the host's /tmp is hidden; give the path it "
+            "resolves to, {}, instead".format(target),
+        )
+
+    def test_real_files_inside_the_program_directory_are_accepted(self):
+        """Positive control: regular files and directories, bound once."""
+        directory = self.inside / "d"
+        (directory / "sub").mkdir(parents=True)
+        _write_executable(directory / "prog", "#!/bin/sh\n")
+        (directory / "data").write_bytes(b"data\n")
+        (directory / "sub" / "x").write_bytes(b"x\n")
+        paths = (directory / "prog", directory / "data", directory / "sub" / "x")
+        self._assert_accepted(*paths)
+        self.assertEqual(self._binds(*paths), ["--bind", str(directory)])
+
+    def test_a_link_above_the_program_directory_is_accepted(self):
+        """Positive control: Hermit resolves it on the host when it binds."""
+        (self.inside / "real" / "d").mkdir(parents=True)
+        (self.inside / "alias").symlink_to(self.inside / "real")
+        directory = self.inside / "alias" / "d"
+        _write_executable(directory / "prog", "#!/bin/sh\n")
+        (directory / "data").write_bytes(b"data\n")
+        self._assert_accepted(directory / "prog", directory / "data")
+        self.assertEqual(
+            self._binds(directory / "prog", directory / "data"),
+            ["--bind", str(directory)],
         )
 
     def test_a_relative_file_that_reaches_tmp_through_a_symbolic_link_is_refused(self):
@@ -339,7 +493,7 @@ class Demo9TmpBindTest(unittest.TestCase):
         (output / "initramfs-busybox.cpio.gz").write_bytes(b"stand-in initramfs\n")
         return root
 
-    def _run(self, root, **settings):
+    def _run(self, root, cwd=None, **settings):
         environment = {
             key: value
             for key, value in os.environ.items()
@@ -366,6 +520,7 @@ class Demo9TmpBindTest(unittest.TestCase):
                 environment[key] = value
         return subprocess.run(
             [str(root / "demos" / "09-qemu-busybox" / "run.sh")],
+            cwd=cwd,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -374,15 +529,18 @@ class Demo9TmpBindTest(unittest.TestCase):
             timeout=120,
         )
 
-    def _expected(self, root, binds):
+    def _expected(self, root, binds, kernel=None):
         output = root / "target" / "qemu-busybox"
         launcher = root / "demos" / "09-qemu-busybox"
-        kernel = output / "bzImage"
         initramfs = output / "initramfs-busybox.cpio.gz"
+        if kernel is None:
+            kernel = output / "bzImage"
+            bound = (launcher, kernel, initramfs)
+        else:
+            # A relative kernel is reached through the working directory.
+            bound = (launcher, initramfs)
         bind_args = (
-            "--bind {} --bind {} --bind {} ".format(launcher, kernel, initramfs)
-            if binds
-            else ""
+            "".join("--bind {} ".format(path) for path in bound) if binds else ""
         )
         return [
             "--log info --log-file {}/hermit-info.log run --strict "
@@ -446,6 +604,35 @@ class Demo9TmpBindTest(unittest.TestCase):
         )
         # Nor is the output directory created.
         self.assertFalse(output.exists())
+
+    def test_a_kernel_linked_from_the_launcher_directory_is_refused(self):
+        # The launcher's directory is bound as a whole, so the program would
+        # follow this link in its own view, where the kernel is hidden.
+        root = self._checkout(under_tmp=True)
+        launcher = root / "demos" / "09-qemu-busybox"
+        kernel = root / "target" / "qemu-busybox" / "bzImage"
+        link = launcher / "kernel"
+        link.symlink_to(kernel)
+        self._assert_stopped(
+            self._run(root, KERNEL_IMAGE=str(link)),
+            REFUSAL.format(
+                link,
+                "it is inside the program's directory, {}, which is bound as a "
+                "whole, and {} is a symbolic link, which the program would follow "
+                "in its own view, where the rest of the host's /tmp is hidden; give "
+                "the path it resolves to, {}, instead".format(launcher, link, kernel),
+            )
+            + DEMO9_TMP_HINT,
+        )
+
+    def test_a_relative_kernel_with_dot_dot_under_tmp_is_used_in_place(self):
+        root = self._checkout(under_tmp=True)
+        (root / "target" / "qemu-busybox" / "sub").mkdir()
+        relative = "target/qemu-busybox/sub/../bzImage"
+        self._assert_passed_with(
+            self._run(root, cwd=root, KERNEL_IMAGE=relative),
+            self._expected(root, binds=True, kernel=relative),
+        )
 
 
 if __name__ == "__main__":
