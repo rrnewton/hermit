@@ -25,6 +25,9 @@
  *                writes the read set, faults on the write set, returns EFAULT
  *   einval       raw select and pselect6 with a negative nfds
  *   poll         poll and ppoll on a ready pipe, an already-recorded control
+ *   thread-wake  raw select with a NULL timeout on an empty pipe that a second
+ *                thread fills: the call can block, so it records as blocking
+ *                external I/O, and replay must not wait on the live pipe
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -35,6 +38,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -374,11 +378,65 @@ static int poll_control(void) {
   return 0;
 }
 
+static void* fill_pipe(void* arg) {
+  int fd = *(const int*)arg;
+  if (write(fd, "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+/*
+ * A peer thread wakes a select that has no timeout. Only the no-delay wake is
+ * covered: a writer that first sleeps hangs the recording, because a pending
+ * blocking external call keeps the record scheduler from releasing timed
+ * waiters (https://github.com/rrnewton/hermit/issues/3576).
+ */
+static int thread_wake(void) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, fill_pipe, &pipe_fds[1]) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(pipe_fds[0], &read_set);
+  errno = 0;
+  long result =
+      syscall(SYS_select, pipe_fds[0] + 1, &read_set, NULL, NULL, NULL);
+  int result_errno = errno;
+  int read_ready = FD_ISSET(pipe_fds[0], &read_set) ? 1 : 0;
+  if (pthread_join(writer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+
+  printf(
+      "%-24s result=%011ld errno=%011d read_ready=%01d\n",
+      "thread-wake",
+      result,
+      result_errno,
+      read_ready);
+
+  if (result != 1 || read_ready != 1) {
+    fprintf(stderr, "thread-wake mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
         stderr,
-        "usage: %s [raw|glibc|pselect-mask|efault|einval|poll]\n",
+        "usage: %s [raw|glibc|pselect-mask|efault|einval|poll|thread-wake]\n",
         argv[0]);
     return 2;
   }
@@ -399,6 +457,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "poll") == 0) {
     return poll_control();
+  }
+  if (strcmp(argv[1], "thread-wake") == 0) {
+    return thread_wake();
   }
   fprintf(stderr, "unknown mode: %s\n", argv[1]);
   return 2;

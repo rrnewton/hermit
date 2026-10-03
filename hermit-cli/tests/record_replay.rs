@@ -2205,6 +2205,11 @@ fn record_poll_and_ppoll_ready_pipe() {
     record_select_mode("poll");
 }
 
+#[test]
+fn record_select_null_timeout_woken_by_thread() {
+    record_select_mode("thread-wake");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
