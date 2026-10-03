@@ -2170,10 +2170,17 @@ fn record_poll_invalid_nfds_preserves_einval() {
 #[test]
 fn record_path_queries_and_legacy_mutations() {
     let _guard = hermit_record_lock();
+    // Host directories absent from the replay chroot: a replayed chdir that
+    // stayed put would make the second round's link collide with the first.
+    let host_dirs = tempfile::tempdir().expect("failed to create host directories");
+    let first = host_dirs.path().join("first");
+    let second = host_dirs.path().join("second");
+    std::fs::create_dir(&first).expect("failed to create first host directory");
+    std::fs::create_dir(&second).expect("failed to create second host directory");
     canonical_record_replay_command(
         "path queries and legacy path mutations",
         &workload("c_record_replay_path_queries").path,
-        &[],
+        &[first.as_os_str(), second.as_os_str()],
     );
 }
 

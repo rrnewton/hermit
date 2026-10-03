@@ -467,6 +467,7 @@ impl Tool for Replayer {
             // TODO-HUMAN-REVIEW(#3598)
             Syscall::Chdir(_) => self.handle_chdir(guest, syscall).await,
             Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -561,6 +562,7 @@ impl Tool for Replayer {
             | Syscall::Lchown(_)
             | Syscall::Mknod(_) => self.handle_confined_path_mutation(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): rmdir shares unlink's optional removal.
             Syscall::Rmdir(_) => self.handle_optional_path_removal(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
@@ -1685,11 +1687,12 @@ impl Replayer {
     }
 
     // TODO-HUMAN-REVIEW(#3598)
-    /// Replay `chdir(2)` from its recorded result, and move the replay
-    /// process's working directory along with it when the target exists in the
-    /// replay chroot, so later `AT_FDCWD`-relative replay mutations land in the
-    /// same place. Most recorded directories are never materialized there; the
-    /// guest still observes the recorded result, and `getcwd` is replayed.
+    /// Replay `chdir(2)` from its recorded result and move the replay
+    /// process's working directory with it. The recorded target is first
+    /// created inside the replay root, as for a recorded `O_DIRECTORY` open, so
+    /// the re-issued chdir cannot leave the process in its previous directory:
+    /// every later `AT_FDCWD`-relative or legacy relative-path replay mutation
+    /// trusts `/proc/<pid>/cwd`, and a stale one would land them elsewhere.
     async fn handle_chdir<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1697,14 +1700,31 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(expected) = recorded {
+            let Syscall::Chdir(call) = syscall else {
+                unreachable!("chdir replay requested for {syscall:?}")
+            };
+            let path = call
+                .path()
+                .ok_or(Errno::EFAULT)
+                .and_then(|path| path.read(&guest.memory()))
+                .unwrap_or_else(|error| {
+                    panic!("could not decode successful recorded chdir: {error}")
+                });
+            self.materialize_recorded_directory(
+                guest,
+                syscall,
+                libc::AT_FDCWD,
+                &path,
+                OFlag::empty(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("failed to materialize recorded chdir target {path:?}: {error}")
+            });
             match guest.inject_with_retry(syscall).await {
                 Ok(actual) => assert_eq!(
                     actual, expected,
                     "replayed chdir returned a different result"
                 ),
-                Err(error @ (Errno::ENOENT | Errno::ENOTDIR)) => {
-                    tracing::debug!(?syscall, %error, "replay chdir target not materialized");
-                }
                 Err(error) => {
                     panic!(
                         "replayed chdir {syscall:?} failed after recording returned {expected}: {error}"

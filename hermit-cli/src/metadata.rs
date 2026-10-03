@@ -599,9 +599,17 @@ mod tests {
                 delivered.contains(&Sysno::syslog),
                 "{phase} must deliver syslog to its deterministic Detcore handler"
             );
+            // chdir is PassThrough for Detcore but its result depends on the
+            // replay chroot, so record/replay subscribes it (hermit#3598);
+            // umask, from the same PassThrough group, stays the sentinel that
+            // record/replay does not subscribe everything.
             assert!(
-                !delivered.contains(&Sysno::chdir),
-                "{phase} must leave unlisted PassThrough chdir unsubscribed"
+                delivered.contains(&Sysno::chdir) && delivered.contains(&Sysno::getcwd),
+                "{phase} must deliver chdir and getcwd so replay uses recorded results"
+            );
+            assert!(
+                !delivered.contains(&Sysno::umask),
+                "{phase} must leave unlisted PassThrough umask unsubscribed"
             );
         }
     }

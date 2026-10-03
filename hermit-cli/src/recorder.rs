@@ -588,6 +588,7 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598)
             Syscall::Chdir(_) | Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Getcwd(syscall) => self.handle_getcwd(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
