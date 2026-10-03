@@ -8,9 +8,13 @@ and 6 compare. See signal_33.settle_signal_33_disposition for the mechanism.
 
 The child script below starts two children the way demos 5 and 6 start
 `hermit` (subprocess.Popen, then an output-copier thread), and reports whether
-each child inherited signal 33 as ignored. It is started with os.posix_spawn,
-which in glibc leaves signal 33 ignored in the new process, the same starting
-state that GNU make gives a recipe.
+each child inherited signal 33 as ignored. Before anything else, the child sets
+its own signal 33 disposition to the starting state a test asks for: ignored,
+the state GNU make gives a recipe, or default, the state a shell gives a
+command. glibc's sigaction(), and with it Python's signal.signal(), refuses to
+change signal 33, so the child makes the rt_sigaction system call directly. The
+tests then check that the starting state took effect, so they do not depend on
+how the child itself was started.
 """
 
 import ast
@@ -23,9 +27,10 @@ from pathlib import Path
 
 LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
 
-# Bit n of SigIgn stands for signal n + 1, so signal 33 is bit 32.
 CHILD_SCRIPT = r"""
+import ctypes
 import json
+import platform
 import subprocess
 import sys
 import threading
@@ -33,12 +38,59 @@ import threading
 sys.path.insert(0, sys.argv[1])
 import signal_33
 
+SIG_DFL = 0
+SIG_IGN = 1
+# The rt_sigaction system call numbers.
+SYS_RT_SIGACTION = {"x86_64": 13, "aarch64": 134}
 
-def signal_33_ignored(status_text):
+
+class KernelSigaction(ctypes.Structure):
+    # The kernel's struct sigaction: handler, flags, restorer, and a 64-bit
+    # signal mask. Only the handler is nonzero here, so a kernel whose
+    # structure has no restorer field reads the same request.
+    _fields_ = [
+        ("handler", ctypes.c_ulong),
+        ("flags", ctypes.c_ulong),
+        ("restorer", ctypes.c_ulong),
+        ("mask", ctypes.c_ulong),
+    ]
+
+
+def set_signal_33(handler):
+    machine = platform.machine()
+    if machine not in SYS_RT_SIGACTION:
+        raise RuntimeError("no rt_sigaction system call number for " + machine)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    action = KernelSigaction(handler, 0, 0, 0)
+    # The last argument is the kernel's signal set size: 8 bytes, 64 signals.
+    result = libc.syscall(
+        ctypes.c_long(SYS_RT_SIGACTION[machine]),
+        ctypes.c_long(33),
+        ctypes.byref(action),
+        None,
+        ctypes.c_long(8),
+    )
+    if result != 0:
+        raise OSError(ctypes.get_errno(), "rt_sigaction for signal 33 failed")
+
+
+def signal_33_state(status_text):
+    # Returns (ignored, caught). Bit n of SigIgn and SigCgt stands for signal
+    # n + 1, so signal 33 is bit 32.
+    masks = {}
     for line in status_text.splitlines():
-        if line.startswith("SigIgn:"):
-            return bool(int(line.split()[1], 16) & (1 << 32))
-    raise RuntimeError("no SigIgn line")
+        name, _, value = line.partition(":")
+        if name in ("SigIgn", "SigCgt"):
+            masks[name] = int(value.split()[0], 16)
+    if len(masks) != 2:
+        raise RuntimeError("no SigIgn or SigCgt line")
+    return bool(masks["SigIgn"] & (1 << 32)), bool(masks["SigCgt"] & (1 << 32))
+
+
+def own_signal_33_state():
+    with open("/proc/self/status") as status:
+        return signal_33_state(status.read())
 
 
 def launch():
@@ -55,20 +107,25 @@ def launch():
     copier.start()
     process.wait()
     copier.join()
-    return signal_33_ignored(output[0].decode())
+    return signal_33_state(output[0].decode())[0]
 
 
-with open("/proc/self/status") as status:
-    started_ignored = signal_33_ignored(status.read())
-if sys.argv[2] == "settle":
-    signal_33.settle_signal_33_disposition()
-first = launch()
-second = launch()
-print(json.dumps({"started_ignored": started_ignored, "first": first, "second": second}))
+start, mode = sys.argv[2], sys.argv[3]
+report = {"caught_at_entry": own_signal_33_state()[1]}
+# Setting a disposition over a handler the C library already installed would
+# make a state that no real launch is in, so do nothing in that case.
+if not report["caught_at_entry"]:
+    set_signal_33({"ignored": SIG_IGN, "default": SIG_DFL}[start])
+    report["started_ignored"], report["started_caught"] = own_signal_33_state()
+    if mode == "settle":
+        signal_33.settle_signal_33_disposition()
+    report["first"] = launch()
+    report["second"] = launch()
+print(json.dumps(report))
 """
 
 
-def _spawn_child(mode):
+def _spawn_child(start, mode):
     """Run CHILD_SCRIPT through os.posix_spawn and return its JSON report."""
     with tempfile.TemporaryDirectory() as scratch:
         script = Path(scratch) / "child.py"
@@ -77,7 +134,7 @@ def _spawn_child(mode):
         try:
             pid = os.posix_spawn(
                 sys.executable,
-                [sys.executable, str(script), str(LIB_DIR), mode],
+                [sys.executable, str(script), str(LIB_DIR), start, mode],
                 dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
                 file_actions=[(os.POSIX_SPAWN_DUP2, write_end, 1)],
             )
@@ -92,14 +149,29 @@ def _spawn_child(mode):
 
 
 class Signal33DispositionTest(unittest.TestCase):
+    def _report(self, start, mode):
+        """Run the child from `start` and check that the starting state took."""
+        report = _spawn_child(start, mode)
+        if report["caught_at_entry"]:
+            # Decided before the child changes anything or calls the code under
+            # test. Here no `hermit` can inherit signal 33 ignored, so there is
+            # no difference between launches to remove.
+            self.skipTest(
+                "the C library installed its own signal 33 handler before the "
+                "child's first line ran (glibc before 2.34 does this as "
+                "libpthread starts), so no launch can inherit signal 33 "
+                "ignored: {}".format(report)
+            )
+        self.assertEqual(
+            (report["started_ignored"], report["started_caught"]),
+            (start == "ignored", False),
+            "rt_sigaction did not leave signal 33 {}: {}".format(start, report),
+        )
+        return report
+
     def test_without_settling_the_second_launch_differs(self):
         """Control: the flip that settle_signal_33_disposition removes exists here."""
-        report = _spawn_child("control")
-        if not report["started_ignored"]:
-            self.skipTest(
-                "this C library does not leave signal 33 ignored in a "
-                "posix_spawn child, so the starting state cannot be set up"
-            )
+        report = self._report("ignored", "control")
         self.assertEqual(
             (report["first"], report["second"]),
             (True, False),
@@ -114,17 +186,34 @@ class Signal33DispositionTest(unittest.TestCase):
         changes that, so a launch through make and a launch from a shell can
         still differ in signal 32 (see the demo 5 and 6 READMEs).
         """
-        report = _spawn_child("settle")
-        if not report["started_ignored"]:
-            self.skipTest(
-                "this C library does not leave signal 33 ignored in a "
-                "posix_spawn child, so the starting state cannot be set up"
-            )
+        report = self._report("ignored", "settle")
         self.assertEqual(
             (report["first"], report["second"]),
             (False, False),
             "every launch after settle_signal_33_disposition should run with "
             "signal 33 at its default disposition: {}".format(report),
+        )
+
+    def test_a_shell_start_settles_to_the_same_disposition(self):
+        """Reset first, as a shell leaves signal 33: the result must not change.
+
+        Demos 5 and 6 can be started through make (signal 33 ignored) or from
+        a shell (signal 33 at its default disposition). After settling, every
+        launch must see the same disposition whichever way the script started.
+        """
+        from_shell = self._report("default", "settle")
+        from_make = self._report("ignored", "settle")
+        self.assertEqual(
+            (from_shell["first"], from_shell["second"]),
+            (False, False),
+            "every launch after settle_signal_33_disposition should run with "
+            "signal 33 at its default disposition: {}".format(from_shell),
+        )
+        self.assertEqual(
+            (from_shell["first"], from_shell["second"]),
+            (from_make["first"], from_make["second"]),
+            "a shell start and a make start should settle to the same "
+            "disposition: {} and {}".format(from_shell, from_make),
         )
 
     def test_qemu_demos_settle_before_anything_else(self):
