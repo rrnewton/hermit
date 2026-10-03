@@ -90,10 +90,12 @@ celldir = os.path.join(host(os.environ["E2E_RESULT_ROOT"]), "runs", os.environ["
 os.makedirs(os.path.join(celldir, "verify-logs"), exist_ok=True)
 # Like hermit --keep-logs: a matched verify keeps only run 1's (golden) log, anything else
 # keeps both. FAKE_VERDICT overrides the verdict, FAKE_DETLOGS ("1", "2", "12" or "")
-# which logs survive.
+# which logs survive, FAKE_VERIFY_JSON=missing|garbage the verdict file itself.
 verdict = os.environ.get("FAKE_VERDICT", "matched")
-with open(os.path.join(celldir, "verify-1.json"), "w") as f:
-    f.write(json.dumps({"verdict": verdict}) + "\n")
+verify_json = os.environ.get("FAKE_VERIFY_JSON", "")
+if verify_json != "missing":
+    with open(os.path.join(celldir, "verify-1.json"), "w") as f:
+        f.write("not json\n" if verify_json == "garbage" else json.dumps({"verdict": verdict}) + "\n")
 for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
     with open(os.path.join(celldir, "verify-logs", "run%s_log_detlog" % n), "w") as f:
         f.write("detlog\n")
@@ -374,7 +376,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(result["empty_workdir"], "")
 
 
-    def assert_evidence(self, complete: bool, **env: str) -> None:
+    def assert_evidence(self, complete: bool, missing: str = "detlogs", **env: str) -> None:
         done, result = self.run_cell(**env)
         details = json.loads(done["details"])
         if complete:
@@ -383,8 +385,9 @@ class CellTest(unittest.TestCase):
         else:
             self.assertEqual(done["status"], "failed", done)
             self.assertEqual(details["outcome"], "ERROR")
-            self.assertIn("detlogs", details["reason"])
+            self.assertIn(missing, details["reason"])
             self.assertFalse(result["evidence_complete"], result)
+            self.assertIn(missing, result["missing"])
 
     def test_matched_verify_with_only_the_golden_log_is_complete(self) -> None:
         self.assert_evidence(True)
@@ -401,6 +404,14 @@ class CellTest(unittest.TestCase):
     def test_unmatched_passing_verify_needs_both_logs(self) -> None:
         self.assert_evidence(True, FAKE_VERDICT="diverged", FAKE_DETLOGS="12")
         self.assert_evidence(False, FAKE_VERDICT="diverged", FAKE_DETLOGS="1")
+
+    def test_passing_verify_without_a_readable_verdict_file_is_an_error(self) -> None:
+        # Both logs present, so only the verdict file itself can make these incomplete.
+        for verify_json in ("missing", "garbage"):
+            with self.subTest(verify_json=verify_json):
+                self.assert_evidence(False, "verify-1.json", FAKE_VERIFY_JSON=verify_json,
+                                     FAKE_DETLOGS="12")
+        self.assert_evidence(False, "verify-1.json", FAKE_VERDICT="", FAKE_DETLOGS="12")
 
 class _Anything:
     """Stand-in for Buck builtins defs.bzl names at load time but these tests never call."""

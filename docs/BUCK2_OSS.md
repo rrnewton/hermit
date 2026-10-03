@@ -412,6 +412,14 @@ builds the inputs Buck does not build yet with Cargo
 same `test-harness run` verdict as the Cargo bucket, reading them through
 `E2E_IMPORT_RESULTS`.
 
+One ordering difference follows. In the Cargo plan, eight nodes run before the
+E2E buckets, directly or through `compatprep.fixtures`: `check.dbt_runtime_abi`,
+`doc.doctests`, `doc.rustdoc`, `lint.clippy`, `test.detcore_unit`,
+`test.hermit_unit`, `test.regular_crates` and `test.rr_suite_contract`. In the
+Buck plan nothing waits for them. They still run, and a failure still fails the
+validation, but the Buck cells no longer wait on them, so a failure among them
+no longer stops the cells early.
+
 The cells therefore test the Cargo-built validate-profile `hermit` staged at
 `target/buck-e2e-stage/validate/hermit`, with the same debug assertions and
 overflow checks as a Cargo-runner run. The ledger row records `release_builder:
