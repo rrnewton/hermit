@@ -71,6 +71,7 @@ use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
+use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
@@ -6754,13 +6755,17 @@ fn repetition_passed_cleanly(terminal_result: &str, result_rows: &[CellResult]) 
 /// Qualifying a sample is stricter than the retained legacy clean-pass count.
 /// One framework attempt may contain several declared seeds or subruns; every
 /// one must pass, and none may be an error or a timed-out observation.
-fn qualifying_subruns(mode: &str, attempts: &[AttemptResult]) -> bool {
+fn qualifying_subruns(
+    mode: &str,
+    declared: Option<&ExpectedGuestExit>,
+    attempts: &[AttemptResult],
+) -> bool {
     let mut indices = BTreeSet::new();
     !attempts.is_empty()
         && attempts.iter().all(|attempt| {
             !attempt.index.trim().is_empty()
                 && indices.insert(attempt.index.as_str())
-                && retained_pressure_attempt(mode, attempt).is_ok_and(|retained| {
+                && retained_pressure_attempt(mode, declared, attempt).is_ok_and(|retained| {
                     retained.outcome == "PASS"
                         && retained.error_kind.is_none()
                         && !retained.timed_out
@@ -6800,6 +6805,7 @@ fn canonical_pressure_comparison(mode: &str, report: &VerificationReport) -> boo
 
 fn retained_pressure_attempt(
     mode: &str,
+    declared: Option<&ExpectedGuestExit>,
     attempt: &AttemptResult,
 ) -> Result<SeriesPressureAttempt, String> {
     // The runner reads comparison reports only for these modes. Its generic
@@ -6937,7 +6943,7 @@ fn retained_pressure_attempt(
         timed_out: attempt.timed_out,
         comparison,
     };
-    retained.validate_for_mode(mode)?;
+    retained.validate_for_mode(mode, declared)?;
     Ok(retained)
 }
 
@@ -6951,7 +6957,9 @@ fn retained_typed_no_comparison(cell: &CellId, artifact_dir: &Path, rows: &[Cell
     let Some(attempt) = row.attempts.first() else {
         return false;
     };
-    let Ok(retained) = retained_pressure_attempt(&cell.mode, attempt) else {
+    let Ok(retained) =
+        retained_pressure_attempt(&cell.mode, row.expected_guest_exit.as_ref(), attempt)
+    else {
         return false;
     };
     if !retained
@@ -7038,7 +7046,8 @@ fn inner_pressure_history(
                     row.attempt
                 ));
             }
-            let retained = retained_pressure_attempt(&row.mode, attempt)?;
+            let retained =
+                retained_pressure_attempt(&row.mode, row.expected_guest_exit.as_ref(), attempt)?;
             if let Some(category) = inner_pressure_category(&retained) {
                 categories.insert(category);
             }
@@ -7071,7 +7080,11 @@ fn repetition_qualifies_for_promotion(terminal_result: &str, rows: &[CellResult]
         && rows[0].result == Some(ObservedResult::Pass)
         && rows[0].failure_class.is_none()
         && !rows[0].source_tree_dirty
-        && qualifying_subruns(&rows[0].mode, &rows[0].attempts)
+        && qualifying_subruns(
+            &rows[0].mode,
+            rows[0].expected_guest_exit.as_ref(),
+            &rows[0].attempts,
+        )
 }
 
 fn repeated_run_has_unacceptable_product_result(
@@ -16365,24 +16378,29 @@ mod pressure_sample_tests {
         second.index = "2".into();
         assert!(qualifying_subruns(
             "naked",
+            None,
             &[first.clone(), second.clone()]
         ));
-        assert!(!qualifying_subruns("naked", &[]));
+        assert!(!qualifying_subruns("naked", None, &[]));
         for outcome in ["FAIL", "ERROR", "HOST-INAPPLICABLE", "UNKNOWN"] {
             let mut failed = first.clone();
             failed.outcome = outcome.into();
             assert!(
-                !qualifying_subruns("naked", &[failed, second.clone()]),
+                !qualifying_subruns("naked", None, &[failed, second.clone()]),
                 "{outcome}"
             );
         }
         let mut timed_out = first.clone();
         timed_out.timed_out = true;
-        assert!(!qualifying_subruns("naked", &[timed_out, second.clone()]));
+        assert!(!qualifying_subruns(
+            "naked",
+            None,
+            &[timed_out, second.clone()]
+        ));
         let mut error = first.clone();
         error.error_kind = Some("infrastructure".into());
-        assert!(!qualifying_subruns("naked", &[error, second]));
-        assert!(!qualifying_subruns("naked", &[first.clone(), first]));
+        assert!(!qualifying_subruns("naked", None, &[error, second]));
+        assert!(!qualifying_subruns("naked", None, &[first.clone(), first]));
         for mode in ["naked", "custom"] {
             let mut expected_nonzero = no_result_attempt("not_run", Some("cpu-timeout"));
             expected_nonzero.outcome = "PASS".into();
@@ -16391,10 +16409,11 @@ mod pressure_sample_tests {
             let before = serde_json::to_value(&expected_nonzero).unwrap();
             assert!(qualifying_subruns(
                 mode,
+                None,
                 std::slice::from_ref(&expected_nonzero)
             ));
             assert!(
-                retained_pressure_attempt(mode, &expected_nonzero)
+                retained_pressure_attempt(mode, None, &expected_nonzero)
                     .unwrap()
                     .comparison
                     .is_none()
@@ -16402,15 +16421,15 @@ mod pressure_sample_tests {
             assert_eq!(serde_json::to_value(&expected_nonzero).unwrap(), before);
             expected_nonzero.status = None;
             expected_nonzero.signal = Some(11);
-            assert!(qualifying_subruns(mode, &[expected_nonzero]));
+            assert!(qualifying_subruns(mode, None, &[expected_nonzero]));
             let mut timeout = no_result_attempt("not_run", Some("cpu-timeout"));
             timeout.timed_out = true;
             timeout.status = None;
             assert_eq!(
-                inner_pressure_category(&retained_pressure_attempt(mode, &timeout).unwrap()),
+                inner_pressure_category(&retained_pressure_attempt(mode, None, &timeout).unwrap()),
                 Some(RepetitionClassification::NoResult)
             );
-            assert!(!qualifying_subruns(mode, &[timeout]));
+            assert!(!qualifying_subruns(mode, None, &[timeout]));
         }
     }
 
@@ -16519,25 +16538,25 @@ mod pressure_sample_tests {
             let mut second = first.clone();
             second.index = "2".into();
             assert!(
-                qualifying_subruns(mode, &[first.clone(), second.clone()]),
+                qualifying_subruns(mode, None, &[first.clone(), second.clone()]),
                 "{mode}"
             );
             let mut absent = first.clone();
             absent.verification_report = None;
             assert!(
-                !qualifying_subruns(mode, &[absent, second.clone()]),
+                !qualifying_subruns(mode, None, &[absent, second.clone()]),
                 "{mode}: missing first report"
             );
             let mut wrong = first.clone();
             wrong.verification_report_sha256 = Some("0".repeat(64));
             assert!(
-                !qualifying_subruns(mode, &[wrong, second.clone()]),
+                !qualifying_subruns(mode, None, &[wrong, second.clone()]),
                 "{mode}: wrong first digest"
             );
             let mut signal = first.clone();
             signal.signal = Some(9);
             assert!(
-                !qualifying_subruns(mode, &[signal, second.clone()]),
+                !qualifying_subruns(mode, None, &[signal, second.clone()]),
                 "{mode}: contradictory process"
             );
             for (field, value) in [
@@ -16552,10 +16571,10 @@ mod pressure_sample_tests {
                 report[field] = value;
                 replace_report(&mut changed, report);
                 assert!(
-                    retained_pressure_attempt(mode, &changed).is_err(),
+                    retained_pressure_attempt(mode, None, &changed).is_err(),
                     "{mode}: {field}"
                 );
-                assert!(!qualifying_subruns(mode, &[changed, second.clone()]));
+                assert!(!qualifying_subruns(mode, None, &[changed, second.clone()]));
             }
             for (field, value) in [
                 ("strictness", json!("stripped")),
@@ -16575,7 +16594,7 @@ mod pressure_sample_tests {
                 report["comparison"][field] = value;
                 replace_report(&mut changed, report);
                 assert!(
-                    !qualifying_subruns(mode, &[changed, second.clone()]),
+                    !qualifying_subruns(mode, None, &[changed, second.clone()]),
                     "{mode}: {field}"
                 );
             }
@@ -16586,7 +16605,7 @@ mod pressure_sample_tests {
                 report["compared_log_messages"] = counts;
                 replace_report(&mut changed, report);
                 assert!(
-                    !qualifying_subruns(mode, &[changed, second.clone()]),
+                    !qualifying_subruns(mode, None, &[changed, second.clone()]),
                     "{mode}: invalid message counts"
                 );
             }
@@ -16598,10 +16617,167 @@ mod pressure_sample_tests {
                 .unwrap()
                 .remove("exact_remainder");
             replace_report(&mut missing_field, report);
-            assert!(!qualifying_subruns(mode, &[missing_field, second]));
+            assert!(!qualifying_subruns(mode, None, &[missing_field, second]));
         }
         let nonzero_verify = comparison_attempt("verify", 17);
-        assert!(!qualifying_subruns("verify", &[nonzero_verify]));
+        assert!(!qualifying_subruns("verify", None, &[nonzero_verify]));
+    }
+
+    #[test]
+    fn matched_subruns_end_nonzero_only_as_the_cell_declares() {
+        let declare = |code: Option<i32>, signal: Option<i32>| ExpectedGuestExit {
+            code,
+            signal,
+            reason: "the fixture guest fails on purpose".into(),
+        };
+        let code_23 = declare(Some(23), None);
+        let signal_11 = declare(None, Some(11));
+        let exits_0 = comparison_attempt("verify", 0);
+        let exits_23 = comparison_attempt("verify", 23);
+        // A guest killed by signal 11, as the report and both compared outputs
+        // say. Hermit ends with that signal, or with status 128 + 11 when it
+        // cannot re-raise it.
+        let mut killed = comparison_attempt("verify", 0);
+        let mut report: JsonValue =
+            serde_json::from_str(killed.verification_report.as_ref().unwrap()).unwrap();
+        report["guest_exit_code"] = JsonValue::Null;
+        report["guest_signal"] = json!(11);
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["exit_code"] = JsonValue::Null;
+            report["compared_outputs"][side]["signal"] = json!(11);
+        }
+        replace_report(&mut killed, report);
+        killed.status = None;
+        killed.signal = Some(11);
+        let mut killed_139 = killed.clone();
+        killed_139.status = Some(139);
+        killed_139.signal = None;
+        for (label, declared, attempt) in [
+            ("status 0 without a declaration", None, &exits_0),
+            ("status 0 with a declaration", Some(&code_23), &exits_0),
+            ("the declared code", Some(&code_23), &exits_23),
+            ("the declared signal", Some(&signal_11), &killed),
+            (
+                "the declared signal as 128 + 11",
+                Some(&signal_11),
+                &killed_139,
+            ),
+        ] {
+            let retained = retained_pressure_attempt("verify", declared, attempt)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(inner_pressure_category(&retained), None, "{label}");
+            assert!(
+                qualifying_subruns("verify", declared, std::slice::from_ref(attempt)),
+                "{label}"
+            );
+        }
+        let mut killed_137 = killed_139.clone();
+        killed_137.status = Some(137);
+        let mut blank_reason = code_23.clone();
+        blank_reason.reason = " ".into();
+        let code_11 = declare(Some(11), None);
+        let signal_23 = declare(None, Some(23));
+        let both = declare(Some(23), Some(23));
+        let exits_22 = comparison_attempt("verify", 22);
+        let exits_151 = comparison_attempt("verify", 151);
+        let replay_23 = comparison_attempt("replay", 23);
+        let mut failed_23 = exits_23.clone();
+        failed_23.outcome = "FAIL".into();
+        for (label, mode, declared, attempt) in [
+            ("status 23 without a declaration", "verify", None, &exits_23),
+            ("another code", "verify", Some(&code_23), &exits_22),
+            (
+                "128 + the declared code",
+                "verify",
+                Some(&code_23),
+                &exits_151,
+            ),
+            (
+                "a signal for a declared code",
+                "verify",
+                Some(&code_11),
+                &killed,
+            ),
+            (
+                "the declared signal's number as a status",
+                "verify",
+                Some(&signal_23),
+                &exits_23,
+            ),
+            (
+                "128 + another signal",
+                "verify",
+                Some(&signal_11),
+                &killed_137,
+            ),
+            // A declaration the runner itself refuses accepts nothing more.
+            ("a blank reason", "verify", Some(&blank_reason), &exits_23),
+            ("both a code and a signal", "verify", Some(&both), &exits_23),
+            ("a replay cell", "replay", Some(&code_23), &replay_23),
+            (
+                "an invocation that did not pass",
+                "verify",
+                Some(&code_23),
+                &failed_23,
+            ),
+        ] {
+            let error = retained_pressure_attempt(mode, declared, attempt).unwrap_err();
+            assert!(
+                error.contains("matched report contradicts its inner process disposition"),
+                "{label}: {error}"
+            );
+            assert!(
+                !qualifying_subruns(mode, declared, std::slice::from_ref(attempt)),
+                "{label}"
+            );
+        }
+        // The declaration reaches the history and the promotion check through
+        // the cell's own CellResult.
+        let mut row = history_row("verify", "PASS", 1, vec![exits_23.clone()]);
+        let error = inner_pressure_history(std::slice::from_ref(&row)).unwrap_err();
+        assert!(
+            error.contains("matched report contradicts its inner process disposition"),
+            "{error}"
+        );
+        assert!(!repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
+        ));
+        row.expected_guest_exit = Some(code_23.clone());
+        assert!(
+            inner_pressure_history(std::slice::from_ref(&row))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
+        ));
+        // The declaration admits an exit, never a verdict. A diverged report
+        // whose guest ended as declared is still a divergence.
+        let mut diverged = exits_23.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(diverged.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        replace_report(&mut diverged, report);
+        let error = retained_pressure_attempt("verify", Some(&code_23), &diverged).unwrap_err();
+        assert!(
+            error.contains("diverged report contradicts its inner process disposition"),
+            "{error}"
+        );
+        diverged.outcome = "FAIL".into();
+        let retained = retained_pressure_attempt("verify", Some(&code_23), &diverged).unwrap();
+        assert_eq!(
+            inner_pressure_category(&retained),
+            Some(RepetitionClassification::ProductFailure)
+        );
+        assert!(!qualifying_subruns(
+            "verify",
+            Some(&code_23),
+            std::slice::from_ref(&diverged)
+        ));
     }
 
     fn history_row(
@@ -16742,7 +16918,7 @@ mod pressure_sample_tests {
         report["no_result_reason"] = JsonValue::Null;
         report["infrastructure_error"] = json!({"kind":"skid_overshoot","count":1});
         replace_report(&mut infrastructure, report.clone());
-        let retained = retained_pressure_attempt("verify", &infrastructure).unwrap();
+        let retained = retained_pressure_attempt("verify", None, &infrastructure).unwrap();
         assert_eq!(
             inner_pressure_category(&retained),
             Some(RepetitionClassification::InfrastructureFailure)
@@ -16760,7 +16936,7 @@ mod pressure_sample_tests {
             changed[field] = value;
             replace_report(&mut bad, changed);
             assert!(
-                retained_pressure_attempt("verify", &bad).is_err(),
+                retained_pressure_attempt("verify", None, &bad).is_err(),
                 "{field}"
             );
         }
@@ -16769,13 +16945,13 @@ mod pressure_sample_tests {
         missing_timeout.error_kind = Some("wall-timeout".into());
         assert_eq!(
             inner_pressure_category(
-                &retained_pressure_attempt("verify", &missing_timeout).unwrap()
+                &retained_pressure_attempt("verify", None, &missing_timeout).unwrap()
             ),
             Some(RepetitionClassification::NoResult)
         );
         let mut bad_timeout = missing_timeout.clone();
         bad_timeout.error_kind = None;
-        assert!(retained_pressure_attempt("verify", &bad_timeout).is_err());
+        assert!(retained_pressure_attempt("verify", None, &bad_timeout).is_err());
         for cause in [
             "cpu-timeout",
             "wall-timeout",
@@ -16785,14 +16961,16 @@ mod pressure_sample_tests {
             prelaunch.timed_out = true;
             prelaunch.status = None;
             assert_eq!(
-                inner_pressure_category(&retained_pressure_attempt("verify", &prelaunch).unwrap()),
+                inner_pressure_category(
+                    &retained_pressure_attempt("verify", None, &prelaunch).unwrap()
+                ),
                 Some(RepetitionClassification::NoResult),
                 "{cause}"
             );
             let mut contradiction = prelaunch.clone();
             contradiction.timed_out = false;
             assert!(
-                retained_pressure_attempt("verify", &contradiction).is_err(),
+                retained_pressure_attempt("verify", None, &contradiction).is_err(),
                 "{cause}"
             );
         }
@@ -16809,7 +16987,7 @@ mod pressure_sample_tests {
             report["no_result_reason"][field] = value;
             replace_report(&mut bad, report);
             assert!(
-                retained_pressure_attempt("verify", &bad).is_err(),
+                retained_pressure_attempt("verify", None, &bad).is_err(),
                 "{field}"
             );
         }
@@ -16822,7 +17000,7 @@ mod pressure_sample_tests {
             let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
             report["no_result_reason"] = json!({"kind":"container_failed","run":run,"disposition":{"kind":"signaled","signal":14,"core_dumped":false}});
             replace_report(&mut attempt, report.clone());
-            let retained = retained_pressure_attempt("verify", &attempt).unwrap();
+            let retained = retained_pressure_attempt("verify", None, &attempt).unwrap();
             let comparison = retained.comparison.as_ref().unwrap();
             assert_eq!(comparison.verdict, Verdict::NoResult);
             assert!(!comparison.canonical);
@@ -16836,6 +17014,7 @@ mod pressure_sample_tests {
             );
             assert!(!qualifying_subruns(
                 "verify",
+                None,
                 std::slice::from_ref(&attempt)
             ));
             let row = history_row("verify", "FAIL", 1, vec![attempt.clone()]);
@@ -16874,7 +17053,7 @@ mod pressure_sample_tests {
                 }
                 replace_report(&mut bad, bad_report);
                 assert!(
-                    retained_pressure_attempt("verify", &bad).is_err(),
+                    retained_pressure_attempt("verify", None, &bad).is_err(),
                     "{mutation}"
                 );
             }
@@ -16909,12 +17088,12 @@ mod pressure_sample_tests {
                         Some(format!("{:x}", sha2::Sha256::digest(duplicated.as_bytes())));
                     bad.verification_report = Some(duplicated);
                     assert!(
-                        retained_pressure_attempt(mode, &bad)
+                        retained_pressure_attempt(mode, None, &bad)
                             .unwrap_err()
                             .contains("duplicate field")
                     );
                 }
-                let retained = retained_pressure_attempt(mode, &attempt).unwrap();
+                let retained = retained_pressure_attempt(mode, None, &attempt).unwrap();
                 let comparison = retained.comparison.as_ref().unwrap();
                 assert_eq!(comparison.verdict, Verdict::NoResult);
                 assert!(!comparison.canonical);
@@ -16927,7 +17106,11 @@ mod pressure_sample_tests {
                     inner_pressure_category(&retained),
                     Some(RepetitionClassification::NoResult)
                 );
-                assert!(!qualifying_subruns(mode, std::slice::from_ref(&attempt)));
+                assert!(!qualifying_subruns(
+                    mode,
+                    None,
+                    std::slice::from_ref(&attempt)
+                ));
                 assert_eq!(serde_json::to_value(&attempt).unwrap(), original);
                 let row = history_row(mode, "ERROR", 1, vec![attempt.clone()]);
                 let history = inner_pressure_history(&[row]).unwrap();
@@ -16943,7 +17126,7 @@ mod pressure_sample_tests {
                 let mut signaled = attempt.clone();
                 signaled.status = None;
                 signaled.signal = Some(11);
-                retained_pressure_attempt(mode, &signaled).unwrap();
+                retained_pressure_attempt(mode, None, &signaled).unwrap();
                 for edit in [
                     (|a: &mut AttemptResult| a.outcome = "PASS".into()) as fn(&mut AttemptResult),
                     |a| a.outcome = "FAIL".into(),
@@ -16957,7 +17140,7 @@ mod pressure_sample_tests {
                     let mut bad = attempt.clone();
                     edit(&mut bad);
                     assert!(
-                        retained_pressure_attempt(mode, &bad).is_err(),
+                        retained_pressure_attempt(mode, None, &bad).is_err(),
                         "{kind:?} {mode}"
                     );
                 }
@@ -16977,7 +17160,7 @@ mod pressure_sample_tests {
                     changed[field] = contradiction;
                     replace_report(&mut bad, changed);
                     assert!(
-                        retained_pressure_attempt(mode, &bad).is_err(),
+                        retained_pressure_attempt(mode, None, &bad).is_err(),
                         "{kind:?} {mode} {field}"
                     );
                 }
@@ -16986,7 +17169,7 @@ mod pressure_sample_tests {
                 omitted.as_object_mut().unwrap().remove("no_result_reason");
                 replace_report(&mut missing, omitted);
                 assert!(
-                    retained_pressure_attempt(mode, &missing)
+                    retained_pressure_attempt(mode, None, &missing)
                         .unwrap_err()
                         .contains("no_result_reason")
                 );
@@ -16994,9 +17177,9 @@ mod pressure_sample_tests {
                 let mut different_error = attempt;
                 different_error.error_kind = Some("cli-error".into());
                 if kind == SeriesNoVerdictKind::Unspecified {
-                    retained_pressure_attempt(mode, &different_error).unwrap();
+                    retained_pressure_attempt(mode, None, &different_error).unwrap();
                 } else {
-                    assert!(retained_pressure_attempt(mode, &different_error).is_err());
+                    assert!(retained_pressure_attempt(mode, None, &different_error).is_err());
                 }
             }
         }
