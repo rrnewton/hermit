@@ -9,11 +9,13 @@
 //! Detcore configuration and widely used types.
 
 use std::collections::BTreeSet;
+#[cfg(not(target_os = "none"))]
 use std::ffi::OsString;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+#[cfg(not(target_os = "none"))]
 use std::time::SystemTime;
 
 use chrono::DateTime;
@@ -719,6 +721,9 @@ pub struct Config {
     pub happens_before: Option<HappensBeforeProgram>,
 }
 
+// clap's value parsers for the options above, for the host build only, as
+// clap is.
+#[cfg(not(target_os = "none"))]
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {
     if let Some((thread_id_str, time_str)) = from_str.split_once(':') {
         Ok((
@@ -735,6 +740,7 @@ fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)>
     }
 }
 
+#[cfg(not(target_os = "none"))]
 fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
     <bytesize::ByteSize as FromStr>::from_str(from_str)
         .map(|res| res.as_u64())
@@ -751,6 +757,7 @@ impl Config {
     /// by the outer `hermit run` invocation. The caller owns the single
     /// host-clock read boundary; all guest clock and metadata observations
     /// consume the resulting concrete epoch.
+    #[cfg(not(target_os = "none"))]
     pub fn capture_epoch_from_host_time(&mut self, now: SystemTime) {
         self.epoch = epoch_from_host_time(now);
     }
@@ -1227,6 +1234,8 @@ pub type MaybeTimeslice = Option<NonZeroU64>;
 #[deprecated(note = "use MaybeTimeslice")]
 pub type MaybePreemptionTimeout = MaybeTimeslice;
 
+// clap's value parsers for `Config`, for the host build only, as clap is.
+#[cfg(not(target_os = "none"))]
 fn parse_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
     if let Ok(n) = src.parse::<u64>() {
         if n != 0 && n < NANOS_PER_RCB as u64 {
@@ -1246,6 +1255,7 @@ fn parse_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 fn parse_index_with_path(src: &str) -> Result<(u64, Option<PathBuf>), String> {
     let convert = |e| format!("Failed to parse int index before comma: {e}");
     if let Some((index_str, path)) = src.split_once(',') {
@@ -1258,17 +1268,20 @@ fn parse_index_with_path(src: &str) -> Result<(u64, Option<PathBuf>), String> {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 #[derive(Debug)]
 struct ParseTimesliceError {
     details: String,
 }
 
+#[cfg(not(target_os = "none"))]
 impl fmt::Display for ParseTimesliceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.details)
     }
 }
 
+#[cfg(not(target_os = "none"))]
 impl ParseTimesliceError {
     fn new(msg: &str) -> ParseTimesliceError {
         ParseTimesliceError {
@@ -1277,6 +1290,7 @@ impl ParseTimesliceError {
     }
 }
 
+#[cfg(not(target_os = "none"))]
 impl std::error::Error for ParseTimesliceError {
     fn description(&self) -> &str {
         &self.details
@@ -1292,12 +1306,14 @@ pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 /// Convert one invocation's captured host instant without losing subsecond
 /// precision. CLI and comparison orchestration share this input conversion;
 /// guest clock progression never reads the host clock through it.
+#[cfg(not(target_os = "none"))]
 pub fn epoch_from_host_time(now: SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(now)
 }
 
 impl Config {
     /// Construct the config using environment variables only, not CLI args.
+    #[cfg(not(target_os = "none"))]
     pub fn from_env() -> Self {
         let args: [OsString; 2] = [
             OsString::from("CMD"), // Silly/unused.
@@ -1334,6 +1350,7 @@ impl Config {
 /// two travel together and a reader finds them in one place.
 pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
 
+#[cfg(not(target_os = "none"))]
 const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
     include_bytes!("config.rs"),
     include_bytes!("happens_before.rs"),
@@ -1377,6 +1394,7 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 /// strictly requires. A documentation-only edit in one of these files can
 /// require rebuilding the plugin; missing a wire-incompatible hidden variant
 /// can make it decode the handshake or a subsequent request at the wrong offsets.
+#[cfg(not(target_os = "none"))]
 fn config_wire_default() -> Config {
     // `Config::default()` is intentionally environment-aware through Clap.
     // A coordinator may therefore inherit HERMIT_EPOCH/HERMIT_PRNG or
@@ -1396,6 +1414,7 @@ fn config_wire_default() -> Config {
     config
 }
 
+#[cfg(not(target_os = "none"))]
 pub fn config_wire_fingerprint() -> String {
     let config = config_wire_default();
     let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
@@ -1409,6 +1428,7 @@ pub fn config_wire_fingerprint() -> String {
 /// This is a mismatch detector, not a security boundary. Length-prefixing each
 /// domain prevents two different source-file boundaries from hashing the same
 /// concatenation.
+#[cfg(not(target_os = "none"))]
 fn fingerprint_of_config_material(
     wire: &[u8],
     named_shape: &str,
@@ -1432,6 +1452,9 @@ fn fingerprint_of_config_material(
     format!("{hash:016x}")
 }
 
+// Built from clap's defaults, so for the host build only: without std, the
+// host passes the `Config` in.
+#[cfg(not(target_os = "none"))]
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];

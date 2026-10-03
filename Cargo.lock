@@ -510,6 +510,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "detcore-clap"
+version = "0.2.0"
+
+[[package]]
 name = "detcore-dbt"
 version = "0.2.0"
 dependencies = [

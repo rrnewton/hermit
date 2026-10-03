@@ -1,0 +1,11 @@
+[package]
+name = "detcore-clap"
+description = "The clap derive that detcore-model sees when it is built without std for the Narf kernel target."
+version = "0.2.0"
+edition = "2024"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+proc-macro = true

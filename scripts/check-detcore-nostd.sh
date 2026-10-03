@@ -11,8 +11,9 @@
 # (x86_64-unknown-none), and count the compile errors per crate.
 #
 # On `target_os = "none"`, Detcore and detcore-model are `#![no_std]`: they
-# bind detcore-std as `std` and detcore-libc as `libc`, and leave out what
-# needs an operating system. This script type-checks that configuration. The
+# bind detcore-std as `std` and detcore-libc as `libc` (and detcore-model
+# binds detcore-clap as `clap`), and leave out what needs an operating
+# system. This script type-checks that configuration. The
 # port is not finished, so it is a progress measure, not a CI gate.
 #
 # usage: scripts/check-detcore-nostd.sh --reverie PATH [--toolchain NAME]
@@ -31,9 +32,10 @@
 # writes a workspace under target/detcore-nostd with its own manifests for the
 # two packages, built from their real sources: the dependencies of the
 # generated manifests that work without std, with their default features off,
-# plus detcore-std, detcore-libc and (for detcore-model's `Pid` and `Signal`)
-# reverie-process. KEEP THEM IN STEP with the generated manifests: same
-# versions, and no dependency the generated ones lack other than those three.
+# plus detcore-std, detcore-libc, detcore-clap and (for detcore-model's `Pid`
+# and `Signal`) reverie-process. KEEP THEM IN STEP with the generated
+# manifests: same versions, and no dependency the generated ones lack other
+# than those four.
 # It patches Detcore's Reverie git dependencies to PATH, seeds the lockfile
 # from Cargo.lock, and runs `cargo check` offline for x86_64-unknown-none with
 # -Zbuild-std=core,alloc and --keep-going. Run `cargo fetch` first if the
@@ -206,6 +208,7 @@ bincode = { version = "2", features = ["alloc", "serde"], default-features = fal
 bitvec = { version = "1.1.1", features = ["alloc", "atomic", "serde"], default-features = false }
 bytesize = { version = "2.4.2", default-features = false }
 chrono = { version = "0.4.45", features = ["alloc", "serde"], default-features = false }
+detcore-clap = { version = "0.2.0", path = "$REPO_ROOT/detcore-clap" }
 detcore-libc = { version = "0.2.0", path = "$REPO_ROOT/detcore-libc" }
 detcore-std = { version = "0.2.0", path = "$REPO_ROOT/detcore-std" }
 reverie-process = { version = "0.2.0", $reverie_git, default-features = false }
@@ -225,7 +228,7 @@ cp "$REPO_ROOT/Cargo.lock" "$WS/Cargo.lock"
 
 log="$WS/check.log"
 env -C "$WS" -u RUSTFLAGS -u CARGO_BUILD_TARGET CARGO_TARGET_DIR="$WS/target" \
-    cargo "+$toolchain" check --lib --offline --keep-going \
+    cargo "+$toolchain" check --lib --offline --keep-going --verbose \
     --target x86_64-unknown-none -Zbuild-std=core,alloc \
     --message-format=short >"$log" 2>&1
 rc=$?
@@ -233,15 +236,16 @@ rc=$?
 echo "toolchain: $(rustc "+$toolchain" --version 2>/dev/null || echo "$toolchain")"
 echo "reverie:   $reverie ($(git -C "$reverie" rev-parse --short=12 HEAD 2>/dev/null || echo "not a git checkout"))"
 total=0
-for crate in detcore-std detcore-libc detcore-model hermit-detcore; do
+for crate in detcore-std detcore-libc detcore-clap detcore-model hermit-detcore; do
     failed="$(sed -n -E "s/^error: could not compile \`$crate\` \(lib\) due to ([0-9]+) previous errors?.*/\\1/p" "$log")"
     warnings="$(sed -n -E \
         -e "s/^warning: \`$crate\` \(lib\) generated ([0-9]+) warnings?.*/\\1/p" \
-        -e "s/^error: could not compile \`$crate\` .*; ([0-9]+) warnings? emitted.*/\\1/p" "$log")"
+        -e "s/^error: could not compile \`$crate\` .*; ([0-9]+) warnings? emitted.*/\\1/p" "$log" |
+        head -n 1)"
     if [[ -n $failed ]]; then
         printf '%-15s %4s errors, %s warnings\n' "$crate" "$failed" "${warnings:-0}"
         total=$((total + failed))
-    elif grep -q -E "^ +Checking $crate v" "$log"; then
+    elif grep -q -E "^ +(Checking|Compiling|Fresh) $crate v" "$log"; then
         printf '%-15s    0 errors, %s warnings\n' "$crate" "${warnings:-0}"
     else
         printf '%-15s not reached (a dependency failed)\n' "$crate"
@@ -249,7 +253,7 @@ for crate in detcore-std detcore-libc detcore-model hermit-detcore; do
 done
 # Any other crate that failed: a dependency built without std.
 others="$(grep -E '^error: could not compile `' "$log" |
-    grep -v -E '`(detcore-std|detcore-libc|detcore-model|hermit-detcore)`')"
+    grep -v -E '`(detcore-std|detcore-libc|detcore-clap|detcore-model|hermit-detcore)`')"
 if [[ -n $others ]]; then
     echo "$others"
 fi

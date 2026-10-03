@@ -5,6 +5,7 @@ members = [
   "ci/manifest-plan",
   "detcore",
   "detcore-model",
+  "detcore-clap",
   "detcore-dbt",
   "detcore-libc",
   "detcore-sabre",

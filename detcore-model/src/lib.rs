@@ -9,9 +9,9 @@
 //! Widely-shared type definitions.
 
 // On the Narf kernel target (`x86_64-unknown-none`) detcore-model is built
-// without std, as Detcore is: detcore-std stands in for `std` and
-// detcore-libc for `libc`, and what needs an operating system is left out.
-// scripts/check-detcore-nostd.sh checks that build.
+// without std, as Detcore is: detcore-std stands in for `std`, detcore-libc
+// for `libc` and detcore-clap for `clap`, and what needs an operating system
+// is left out. scripts/check-detcore-nostd.sh checks that build.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", feature(if_let_guard, prelude_import))]
 #![cfg_attr(target_os = "none", allow(internal_features))]
@@ -19,6 +19,8 @@
 #[cfg(target_os = "none")]
 #[macro_use]
 extern crate detcore_std as std;
+#[cfg(target_os = "none")]
+extern crate detcore_clap as clap;
 #[cfg(target_os = "none")]
 extern crate detcore_libc as libc;
 #[cfg(target_os = "none")]
@@ -28,6 +30,8 @@ use std::prelude::rust_2024::*;
 
 pub mod backend_engagement;
 pub mod build_info;
+// Probes of the machine hermit runs on, for the host build only.
+#[cfg(not(target_os = "none"))]
 pub mod host_capability;
 
 /// Exit status for a run HERMIT DELIBERATELY REFUSED, as distinct from one
