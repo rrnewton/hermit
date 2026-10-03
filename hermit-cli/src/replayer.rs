@@ -45,11 +45,11 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Chdir;
 use reverie::syscalls::Close;
 use reverie::syscalls::Dup3;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
-use reverie::syscalls::Fchdir;
 use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Flock;
@@ -439,7 +439,11 @@ impl Tool for Replayer {
             Syscall::Pwritev2(syscall) => {
                 Ok(self.handle_write_family(guest, syscall.into()).await?)
             }
-            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598)
+            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Lseek(_) => self.handle_optional_fd_position(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -459,7 +463,13 @@ impl Tool for Replayer {
             }
             Syscall::Openat2(call) => self.handle_openat2(guest, call).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
-            Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598)
+            Syscall::Chdir(_) | Syscall::Fchdir(_) => {
+                self.handle_working_directory_change(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#2373)
@@ -544,6 +554,17 @@ impl Tool for Replayer {
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
             | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): rmdir shares unlink's optional removal.
+            Syscall::Rmdir(_) => self.handle_optional_path_removal(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1588,6 +1609,15 @@ impl Replayer {
             Syscall::Mknodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchownat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchmodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            // TODO-HUMAN-REVIEW(#3598): the legacy forms resolve relative
+            // paths against the working directory, like AT_FDCWD.
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_) => true,
             Syscall::Utimensat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Symlinkat(call) => self.dirfd_is_confined(pid, call.newdirfd()),
             Syscall::Linkat(call) => {
@@ -1657,17 +1687,83 @@ impl Replayer {
         recorded
     }
 
-    async fn handle_fchdir<G: Guest<Self>>(
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Replay `chdir(2)` or `fchdir(2)` from its recorded result and move the
+    /// replay process's working directory with it. A successful recording
+    /// carries the directory the call actually entered; that directory is
+    /// created inside the replay root, as for a recorded `O_DIRECTORY` open,
+    /// and entered by that resolved name. Neither the spelled path nor the
+    /// descriptor is reused: the path may cross a host symlink or `..` that the
+    /// replay root lacks, and the descriptor may be a replay placeholder. Every
+    /// later `AT_FDCWD`-relative or legacy relative-path replay mutation trusts
+    /// `/proc/<pid>/cwd`, so a stale or wrong directory would land them
+    /// elsewhere; the resulting cwd is checked against the recording.
+    async fn handle_working_directory_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        syscall: Fchdir,
+        syscall: Syscall,
     ) -> Result<i64, Errno> {
-        if self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
-            self.handle_replayed_side_effect(guest, syscall.into(), "fchdir")
-                .await
-        } else {
-            self.handle_simple(guest, syscall.into()).await
+        let entered = PathBuf::from(std::ffi::OsString::from_vec(next_event!(guest, Bytes)?));
+        assert!(
+            entered.is_absolute(),
+            "recorded {syscall:?} entered a relative directory {entered:?}"
+        );
+        self.materialize_recorded_directory(
+            guest,
+            syscall,
+            libc::AT_FDCWD,
+            &entered,
+            OFlag::empty(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to materialize recorded working directory {entered:?}: {error}")
+        });
+        // The injection stack holds well under PATH_MAX, so enter the directory
+        // in pieces: the root first, then runs of components, each of which
+        // fits the buffer. A single component is at most NAME_MAX bytes.
+        let mut path = [0_u8; 512];
+        let mut pieces = vec![b"/".to_vec()];
+        for component in entered.components().skip(1) {
+            let component = component.as_os_str().as_bytes();
+            let last = pieces.last_mut().expect("pieces starts non-empty");
+            let separator = usize::from(!last.ends_with(b"/"));
+            if last.len() + separator + component.len() < path.len() {
+                if separator == 1 {
+                    last.push(b'/');
+                }
+                last.extend_from_slice(component);
+            } else {
+                pieces.push(component.to_vec());
+            }
         }
+        for piece in pieces {
+            assert!(
+                piece.len() < path.len(),
+                "path component of {entered:?} exceeds NAME_MAX"
+            );
+            path.fill(0);
+            path[..piece.len()].copy_from_slice(&piece);
+            let mut stack = guest.stack().await;
+            let path_addr = stack.push(path);
+            let path_ptr = PathPtr::from_ptr(unsafe {
+                path_addr.cast::<u8>().as_ptr().cast::<libc::c_char>()
+            })
+            .expect("guest stack address is non-null");
+            let _path_guard = stack.commit()?;
+            if let Err(error) = guest
+                .inject_with_retry(Chdir::new().with_path(Some(path_ptr)))
+                .await
+            {
+                panic!("replayed {syscall:?} into recorded {entered:?} failed: {error}");
+            }
+        }
+        let actual = crate::record_replay_path::process_cwd_path(guest.tid())
+            .unwrap_or_else(|error| panic!("could not read replayed working directory: {error}"));
+        assert_eq!(
+            actual, entered,
+            "replayed {syscall:?} entered a different directory than the recording"
+        );
+        Ok(0)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

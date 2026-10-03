@@ -400,6 +400,8 @@ impl Tool for Recorder {
             Sysno::pwritev,
             Sysno::pwritev2,
             Sysno::access,
+            Sysno::faccessat,
+            Sysno::faccessat2,
             Sysno::lseek,
             Sysno::stat,
             Sysno::fstat,
@@ -425,7 +427,17 @@ impl Tool for Recorder {
             Sysno::symlinkat,
             Sysno::fchmodat,
             Sysno::utimensat,
+            Sysno::rename,
+            Sysno::link,
+            Sysno::symlink,
+            Sysno::chmod,
+            Sysno::chown,
+            Sysno::lchown,
+            Sysno::mknod,
+            Sysno::rmdir,
+            Sysno::chdir,
             Sysno::fchdir,
+            Sysno::getcwd,
             Sysno::close_range,
             Sysno::fadvise64,
             Sysno::flock,
@@ -523,7 +535,12 @@ impl Tool for Recorder {
             Syscall::Writev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev2(syscall) => self.handle_write_family(guest, syscall.into()).await,
-            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): faccessat/faccessat2 are pure queries;
+            // recording their result keeps replay off the replay chroot's files.
+            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -557,7 +574,24 @@ impl Tool for Recorder {
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
             | Syscall::Utimensat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): legacy path mutations share the *at
+            // forms' result-only recording.
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_)
+            | Syscall::Rmdir(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598)
+            Syscall::Chdir(_) | Syscall::Fchdir(_) => {
+                self.handle_working_directory_change(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Getcwd(syscall) => self.handle_getcwd(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,

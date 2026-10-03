@@ -7,6 +7,7 @@
  */
 
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,6 +17,7 @@ use reverie::Guest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Ftruncate;
+use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -833,6 +835,54 @@ impl Recorder {
                 let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
                 guest.memory().read_exact(addr, &mut buf)?;
                 Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Records the path `getcwd` copied out. The raw syscall returns the
+    /// length including the terminating NUL, so the recorded bytes include it.
+    pub(super) async fn handle_getcwd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Getcwd,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|length| {
+                let mut buf = vec![0; length as usize];
+                let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
+                guest.memory().read_exact(addr, &mut buf)?;
+                Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Record a successful `chdir(2)` or `fchdir(2)` as the directory it
+    /// actually entered. The spelled path may go through host symlinks or `..`
+    /// components that the replay root lacks, and an fchdir descriptor may be
+    /// a replay placeholder, so replay moves to this resolved name instead.
+    pub(super) async fn handle_working_directory_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.map(|_| {
+                let cwd = crate::record_replay_path::process_cwd_path(guest.tid()).unwrap_or_else(
+                    |error| panic!("could not record the directory {syscall:?} entered: {error}"),
+                );
+                SyscallEvent::Bytes(cwd.into_os_string().into_vec())
             }),
         );
 

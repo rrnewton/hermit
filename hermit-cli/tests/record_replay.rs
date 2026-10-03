@@ -2163,6 +2163,79 @@ fn record_poll_invalid_nfds_preserves_einval() {
     );
 }
 
+/// faccessat/faccessat2, chdir/getcwd and the legacy path mutations (rename,
+/// link, symlink, chmod, chown, lchown, mknod, rmdir) must replay from the
+/// recording. The replay chroot lacks /etc/passwd and /usr/lib, so a live
+/// query there answers differently and the guest's output diverges.
+#[test]
+fn record_path_queries_and_legacy_mutations() {
+    let _guard = hermit_record_lock();
+    // Host directories absent from the replay chroot: a replayed chdir that
+    // stayed put would make the second round's link collide with the first.
+    // "via" is a host symlink the replay chroot lacks, so only a replay that
+    // enters the recorded directory resolves "via/.." to "first".
+    let host_dirs = tempfile::tempdir().expect("failed to create host directories");
+    let base = host_dirs.path();
+    std::fs::create_dir_all(base.join("first/sub")).expect("failed to create first host directory");
+    std::fs::create_dir(base.join("second")).expect("failed to create second host directory");
+    std::os::unix::fs::symlink("first/sub", base.join("via"))
+        .expect("failed to create host directory symlink");
+    // A resolved working directory longer than the replayer's 512-byte
+    // injection buffer, reached through a short symlink.
+    let deep = (0..6).fold(base.join("long"), |path, _| path.join("d".repeat(100)));
+    std::fs::create_dir_all(&deep).expect("failed to create deep host directory");
+    std::os::unix::fs::symlink(&deep, base.join("longvia"))
+        .expect("failed to create deep host directory symlink");
+    canonical_record_replay_command(
+        "path queries and legacy path mutations",
+        &workload("c_record_replay_path_queries").path,
+        &[base.as_os_str()],
+    );
+}
+
+/// A working directory that was removed has no path: procfs names it
+/// "<dir> (deleted)", which is not a directory replay could enter. Recording
+/// must refuse such an fchdir loudly rather than store that text.
+#[test]
+fn record_refuses_a_removed_working_directory() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let guest = workload("c_record_replay_path_queries");
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path)
+        .arg("--removed-cwd");
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start removed-cwd recording: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The refusal is a recorder panic, which exits with the internal-failure
+    // status. Anything else, including timeout's 124 or a SIGKILL after a
+    // hang, is not the refusal this test pins.
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "removed-cwd recording did not refuse with the internal-failure status: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has been removed"),
+        "removed-cwd recording did not name the removed directory:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("removed-cwd-recorded"),
+        "removed-cwd guest ran past the refused fchdir: {stdout}"
+    );
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

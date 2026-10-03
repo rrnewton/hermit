@@ -25,7 +25,7 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 26] = [
+pub const C_SOURCES: [(&str, &str); 27] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
@@ -52,6 +52,10 @@ pub const C_SOURCES: [(&str, &str); 26] = [
     (
         "c_record_replay_execveat_paths",
         "tests/c/record_replay_execveat_paths.c",
+    ),
+    (
+        "c_record_replay_path_queries",
+        "tests/c/record_replay_path_queries.c",
     ),
     (
         "c_record_replay_mkdir_eexist",
@@ -261,7 +265,7 @@ struct Envelope {
 pub fn prepared_envelope(paths: &BTreeMap<String, PathBuf>) -> Result<String, String> {
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
         return Err(
-            "prepared record workload population must contain exactly all 42 aliases".into(),
+            "prepared record workload population must contain exactly all 43 aliases".into(),
         );
     }
     let workloads = paths
@@ -310,7 +314,7 @@ pub fn consume_prepared(
     }
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
         return Err(
-            "prepared record workload population must contain exactly all 42 aliases".into(),
+            "prepared record workload population must contain exactly all 43 aliases".into(),
         );
     }
     Ok(Some(
