@@ -1130,6 +1130,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Self::observe_injected_syscalls(config)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // https://github.com/rrnewton/hermit/pull/3464
+    fn classify_original_source_ioctl(
+        &self,
+        global: &GlobalState,
+        entry: &reverie::OriginalIoctlEntry,
+    ) -> Option<reverie::OriginalIoctlEffect> {
+        global.classify_original_source_ioctl(self.detpid, entry)
+    }
+
     fn on_injected_syscall_observed(
         &self,
         tid: Tid,

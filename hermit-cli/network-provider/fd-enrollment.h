@@ -3,6 +3,7 @@
 #ifndef HERMIT_FD_ENROLLMENT_H
 #define HERMIT_FD_ENROLLMENT_H
 #include "fd-effects.h"
+#include "grouped-probes.h"
 /* Operation5 remains reserved by the unselected Socket primitive. This command
  * shares the existing31 occupied cells; it creates no separate ticket owner. */
 #define AP_TABLE_ENROLLMENT 6
@@ -24,6 +25,24 @@ struct ap_fd_enrollment {
     s32 ptrace_return;
     u32 reserved;
 };
+/* The caller must read these actual fields from the reference-held census
+ * file, under the already authenticated ACTIVE grouped-image contract. This
+ * predicate never resolves a dispatcher from stat/device facts alone. Both
+ * audited const tables retain f_op throughout the supported file lifetime. */
+static __attribute__((always_inline)) inline u64 ap_fd_source_ioctl_dispatch(
+        u64 anchor,u64 fops,u64 unlocked_ioctl,u64 inode_fops,u64 filesystem,
+        u32 mode,u32 major,u32 minor) {
+    if(!fops || !ap_grouped_image_address(anchor,AP_GROUPED_CONNECT_IMAGE))return 0;
+    if(fops==ap_grouped_image_address(anchor,AP_SOURCE_NULL_FOPS_IMAGE) && !unlocked_ioctl &&
+       ap_fd_source_ioctl_valid(AP_SOURCE_IOCTL_DISPATCH_NULL,mode,major,minor))
+        return AP_SOURCE_IOCTL_DISPATCH_NULL;
+    if(fops==ap_grouped_image_address(anchor,AP_SOURCE_BTRFS_FOPS_IMAGE) && inode_fops==fops &&
+       unlocked_ioctl==ap_grouped_image_address(anchor,AP_SOURCE_BTRFS_IOCTL_IMAGE) &&
+       filesystem==AP_SOURCE_BTRFS_MAGIC &&
+       ap_fd_source_ioctl_valid(AP_SOURCE_IOCTL_DISPATCH_BTRFS,mode,major,minor))
+        return AP_SOURCE_IOCTL_DISPATCH_BTRFS;
+    return AP_SOURCE_IOCTL_DISPATCH_UNKNOWN;
+}
 /* The actual GETREGSET interval authenticates quiescence: ptrace_check_attach
  * froze this child and waited inactive, including against SIGKILL. An ordinary
  * stopped-state sample alone is insufficient. A new table must have no other
@@ -57,8 +76,10 @@ static __attribute__((always_inline)) inline int ap_fd_enrollment_event(
         row->task==e->task && row->task_start==e->task_start && row->table==e->table &&
         !row->previous_file && row->accept_command==e->command &&
         (kind==AP_FD_ENROLL_SLOT ? (ap_fd_profile_valid(row->mode) &&
-         ap_fd_device_valid(row->mode,row->device_major,row->device_minor)) :
-         (!row->mode && !row->status_flags && !row->device_major && !row->device_minor));
+         ap_fd_device_valid(row->mode,row->device_major,row->device_minor) &&
+         ap_fd_source_ioctl_valid(row->source_ioctl_dispatch,row->mode,row->device_major,row->device_minor)) :
+         (!row->mode && !row->status_flags && !row->device_major && !row->device_minor &&
+          !row->source_ioctl_dispatch));
 }
 static __attribute__((always_inline)) inline int ap_fd_enrollment_census_matches(
     const struct ap_fd_enrollment *e,const struct ap_fd_event *begin,
@@ -83,7 +104,8 @@ static __attribute__((always_inline)) inline int ap_fd_enrollment_census_matches
         for(u32 j=0;j<i;j++)
             if(slots[j].file==row->file && (slots[j].mode!=row->mode ||
                slots[j].status_flags!=row->status_flags || slots[j].device_major!=row->device_major ||
-                slots[j].device_minor!=row->device_minor))return 0;
+                slots[j].device_minor!=row->device_minor ||
+                slots[j].source_ioctl_dispatch!=row->source_ioctl_dispatch))return 0;
     }
     return 1;
 }

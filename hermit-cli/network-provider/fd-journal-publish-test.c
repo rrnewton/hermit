@@ -55,7 +55,7 @@ static void reset(void) {
     expected=(struct ap_fd_event){.sequence=42,.complete=2,.kind=1,
         .task=3,.task_start=5,.table=7,.file=11,.previous_file=13,
         .dependency=17,.accept_command=19,.fd=-23,.returned=-29,
-        .mode=31,.status_flags=37,.device_major=43,.device_minor=47};
+        .mode=31,.status_flags=37,.device_major=43,.device_minor=47,.source_ioctl_dispatch=53};
     actor.start_boottime=expected.task_start;
     stats_calls=update_calls=lookup_calls=problem_calls=publish_calls=0;
     fail_stats=fail_update=fail_lookup=changed_completion=0;
@@ -64,7 +64,7 @@ static u64 publish(void) {
     return fd_event_for_profile(expected.task,expected.task_start,expected.kind,
         expected.table,expected.fd,expected.file,expected.previous_file,
         expected.dependency,expected.accept_command,expected.returned,
-        expected.mode,expected.status_flags,expected.device_major,expected.device_minor);
+        expected.mode,expected.status_flags,expected.device_major,expected.device_minor,expected.source_ioctl_dispatch);
 }
 static void published(void) {
     assert(stats_calls==1 && update_calls==1 && lookup_calls==1 && publish_calls==1);
@@ -74,10 +74,12 @@ static void published(void) {
 static void all_fields_and_wrappers(void) {
     reset();assert(publish()==42);published();
     reset();expected.mode=expected.status_flags=expected.device_major=expected.device_minor=0;
+    expected.source_ioctl_dispatch=0;
     assert(fd_event_for(expected.task,expected.task_start,expected.kind,expected.table,
         expected.fd,expected.file,expected.previous_file,expected.dependency,
         expected.accept_command,expected.returned)==42);published();
     reset();expected.mode=expected.status_flags=expected.device_major=expected.device_minor=0;
+    expected.source_ioctl_dispatch=0;
     assert(fd_event(expected.kind,expected.table,expected.fd,expected.file,
         expected.previous_file,expected.dependency,expected.accept_command,expected.returned)==42);
     published();
@@ -99,6 +101,7 @@ static void all_fields_and_wrappers(void) {
         expected.status_flags=0x40000000U+i*31;
         expected.device_major=0x20000000U+i*37;
         expected.device_minor=0x10000000U+i*41;
+        expected.source_ioctl_dispatch=0x4000000000ULL+i*43;
         assert(publish()==42);published();
     }
 }

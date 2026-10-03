@@ -803,7 +803,22 @@ struct ap_fd_event {
     /* Normalized kernel MAJOR/MINOR(i_rdev), not libc st_rdev encoding.
      * Both are zero for non-device inodes. */
     u32 device_major, device_minor;
+    /* Actual immutable dispatch table observed on this held file at the
+     * initial census. No numeric fd, inode kind or ioctl command issues it. */
+    u64 source_ioctl_dispatch;
 };
+#define AP_SOURCE_IOCTL_DISPATCH_UNKNOWN 0ULL
+#define AP_SOURCE_IOCTL_DISPATCH_NULL 1ULL
+#define AP_SOURCE_IOCTL_DISPATCH_BTRFS 2ULL
+static __attribute__((always_inline)) inline int ap_fd_source_ioctl_valid(
+        u64 dispatch,u32 mode,u32 major,u32 minor) {
+    switch(dispatch) {
+    case AP_SOURCE_IOCTL_DISPATCH_UNKNOWN:return 1;
+    case AP_SOURCE_IOCTL_DISPATCH_NULL:return (mode&0170000)==0020000 && major==1 && minor==3;
+    case AP_SOURCE_IOCTL_DISPATCH_BTRFS:return (mode&0170000)==0100000 && !major && !minor;
+    default:return 0;
+    }
+}
 static __attribute__((always_inline)) inline int ap_fd_profile_valid(u32 mode) {
     switch(mode & 0170000) {
     case 0000000: case 0010000: case 0020000: case 0040000: case 0060000:

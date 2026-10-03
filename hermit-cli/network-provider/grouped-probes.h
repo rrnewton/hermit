@@ -7,6 +7,12 @@
  * chooses one physical role before any original operand/frame validator. */
 #define AP_GROUPED_COOKIE 0x4845524d49544731ULL
 #define AP_GROUPED_CONNECT_IMAGE 0xffffffff8206bf70ULL
+/* Complete const table bytes are checked in grouped-target.h against the same
+ * installed image/build ID before this authenticated anchor is activated. */
+#define AP_SOURCE_NULL_FOPS_IMAGE 0xffffffff82aff468ULL
+#define AP_SOURCE_BTRFS_FOPS_IMAGE 0xffffffff82a8bba8ULL
+#define AP_SOURCE_BTRFS_IOCTL_IMAGE 0xffffffff82169750ULL
+#define AP_SOURCE_BTRFS_MAGIC 0x9123683eULL
 #define AP_GROUPED_VMEMMAP_BASE_IMAGE 0xffffffff82c3f2b0ULL
 #define AP_GROUPED_PAGE_OFFSET_BASE_IMAGE 0xffffffff82c3f2c0ULL
 #define AP_GROUPED_SITE_COUNT 17U

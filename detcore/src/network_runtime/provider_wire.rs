@@ -15,6 +15,12 @@ pub enum ProviderWireFormat {
     /// Adapter ABI8 with explicit receive attempts and byte-frontier version5.
     #[serde(rename = "abi8-copy5")]
     Abi8Copy5,
+    /// Adapter ABI9 carries the explicit112-byte descriptor dispatch event.
+    #[serde(rename = "abi9-copy4")]
+    Abi9Copy4,
+    /// Same descriptor ABI with explicit receive attempts/frontier version5.
+    #[serde(rename = "abi9-copy5")]
+    Abi9Copy5,
 }
 
 impl ProviderWireFormat {
@@ -24,6 +30,8 @@ impl ProviderWireFormat {
         match (abi, copy) {
             (0x4150_5255_5354_0007, 4) => Ok(Self::Abi7Copy4),
             (0x4150_5255_5354_0008, 5) => Ok(Self::Abi8Copy5),
+            (0x4150_5255_5354_0009, 4) => Ok(Self::Abi9Copy4),
+            (0x4150_5255_5354_0009, 5) => Ok(Self::Abi9Copy5),
             _ => Err(io::Error::other(
                 "unsupported provider adapter/copy version pair",
             )),
@@ -37,6 +45,8 @@ impl ProviderWireFormat {
         match (abi, copy) {
             ("4150525553540007", None | Some(4)) => Ok(Self::Abi7Copy4),
             ("4150525553540008", Some(5)) => Ok(Self::Abi8Copy5),
+            ("4150525553540009", Some(4)) => Ok(Self::Abi9Copy4),
+            ("4150525553540009", Some(5)) => Ok(Self::Abi9Copy5),
             _ => Err(io::Error::other(
                 "unsupported provider package wire declaration",
             )),
@@ -48,14 +58,20 @@ impl ProviderWireFormat {
         match self {
             Self::Abi7Copy4 => 0x4150_5255_5354_0007,
             Self::Abi8Copy5 => 0x4150_5255_5354_0008,
+            Self::Abi9Copy4 | Self::Abi9Copy5 => 0x4150_5255_5354_0009,
         }
+    }
+
+    /// Descriptor-event layout is selected only by the authenticated adapter.
+    pub(crate) fn has_source_ioctl_dispatch(self) -> bool {
+        matches!(self, Self::Abi9Copy4 | Self::Abi9Copy5)
     }
 
     /// Receive-copy grammar bound before any observation is parsed.
     pub fn copy_version(self) -> u64 {
         match self {
-            Self::Abi7Copy4 => 4,
-            Self::Abi8Copy5 => 5,
+            Self::Abi7Copy4 | Self::Abi9Copy4 => 4,
+            Self::Abi8Copy5 | Self::Abi9Copy5 => 5,
         }
     }
 }
@@ -82,13 +98,38 @@ mod tests {
             7,
             8,
             0x4150_5255_5354_0006,
-            0x4150_5255_5354_0009,
+            0x4150_5255_5354_000a,
             u64::MAX,
         ] {
             for copy in [4, 5] {
                 assert!(ProviderWireFormat::from_versions(abi, copy).is_err());
             }
         }
+    }
+
+    #[test]
+    fn dispatch_event_abi_requires_explicit_grammar_and_distinct_legacy_layout() {
+        for (copy, expected) in [
+            (4, ProviderWireFormat::Abi9Copy4),
+            (5, ProviderWireFormat::Abi9Copy5),
+        ] {
+            assert_eq!(
+                ProviderWireFormat::from_versions(0x4150_5255_5354_0009, copy).unwrap(),
+                expected
+            );
+            assert_eq!(
+                ProviderWireFormat::from_package("4150525553540009", Some(copy)).unwrap(),
+                expected
+            );
+            assert!(expected.has_source_ioctl_dispatch());
+            assert_eq!(expected.copy_version(), copy);
+            assert_eq!(expected.abi_version(), 0x4150_5255_5354_0009);
+        }
+        for copy in [None, Some(0), Some(3), Some(6), Some(u64::MAX)] {
+            assert!(ProviderWireFormat::from_package("4150525553540009", copy).is_err());
+        }
+        assert!(!ProviderWireFormat::Abi7Copy4.has_source_ioctl_dispatch());
+        assert!(!ProviderWireFormat::Abi8Copy5.has_source_ioctl_dispatch());
     }
 
     #[test]

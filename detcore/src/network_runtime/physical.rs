@@ -1,6 +1,7 @@
 //! Custody-purpose identities sharing the authenticated stopped-task description.
 //! Possession never selects scheduler signal behavior.
 mod foreground;
+mod source_ioctl;
 use std::collections::BTreeMap;
 
 pub(crate) use foreground::ForegroundRoot;

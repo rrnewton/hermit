@@ -308,6 +308,8 @@ fn run() -> Result<()> {
     }
     let contract_name = format!("{}-contract.json", args.component);
     let contract = Contract::parse(&read_regular(&args.source.join(&contract_name), 32768)?)?;
+    ensure!(args.component != "accepted" || contract.abi_version == "4150525553540009",
+        "current accepted producer requires descriptor-event ABI9; historical packages keep their original sources");
     let accepted = args.component == "accepted";
     let grouped_build = contract.grouped_event.is_some();
     let ftrace = contract.ftrace_only;
@@ -319,9 +321,9 @@ fn run() -> Result<()> {
         names.extend(["owned-metadata.h", "owned-metadata-driver.h",
             "stream-copy-fault.h"].map(str::to_owned));
     }
-    // Historical contract fixtures remain byte-identical. Their compiled
-    // implementation now includes these shared bodies; bind the extra inputs
-    // even when producing the separately named legacy topology.
+    // Maintained topology contracts move to the current adapter together;
+    // decoding historical packages remains a separate compatibility path.
+    // Bind these shared bodies even for the separately named classic topology.
     if accepted && !ftrace {
         names.extend(["stream-copy-custody.inc", "stream-copy-problem.inc",
             "stream-copy-unit-enter.inc", "stream-copy-emit.inc",

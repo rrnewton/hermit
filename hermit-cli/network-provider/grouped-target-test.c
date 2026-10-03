@@ -63,9 +63,9 @@ int main(void) {
     }
     struct copy_image_fixture fixture={.corrupt=-1,.truncate=-1};
     FILE *input=copy_image_fixture_open(&fixture);assert(input);assert(!ap_check_grouped_image(input));assert(!fclose(input));controls++;
-    /* Original 23,504 bytes plus complete fixup (1,128), copy helper
-     * (1,690), and this REP's exact exception-table entry (12). Every new
-     * byte is independently corrupted, and each of all 30 slices truncated. */
-    assert(bytes==26334 && controls==26365);
-    printf("GROUPED_IMAGE bytes=%u slices=30 mutations_truncations_positive=%u\n",bytes,controls);return 0;
+    /* Original 26,334 bytes remain covered. Add both complete272-byte
+     * dispatcher tables and the full3,621-byte Btrfs ioctl switch. Every byte
+     * is independently corrupted, and each of all33 slices truncated. */
+    assert(bytes==30499 && controls==30533);
+    printf("GROUPED_IMAGE bytes=%u slices=33 mutations_truncations_positive=%u\n",bytes,controls);return 0;
 }

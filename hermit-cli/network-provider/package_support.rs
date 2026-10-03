@@ -151,11 +151,13 @@ pub struct Contract {
 
 impl Contract {
     /// Native accepted-provider grammar; old ABI7 absence means exactly V4.
-    /// ABI8 has no implicit grammar and unknown/crossed pairs are refused.
+    /// ABI8 and ABI9 have no implicit grammar. ABI9 carries the dispatch-bearing
+    /// descriptor event with either explicitly selected supported copy grammar.
     pub fn accepted_copy_version(&self) -> Result<u64> {
         match (self.abi_version.as_str(), self.copy_version) {
             ("4150525553540007", None | Some(4)) => Ok(4),
             ("4150525553540008", Some(5)) => Ok(5),
+            ("4150525553540009", Some(version @ (4 | 5))) => Ok(version),
             _ => anyhow::bail!("unsupported accepted adapter/copy version pair"),
         }
     }
@@ -1485,7 +1487,11 @@ mod tests {
             ("4150525553540008", None, None),
             ("4150525553540008", Some(4), None),
             ("4150525553540007", Some(5), None),
-            ("4150525553540009", Some(5), None),
+            ("4150525553540009", Some(4), Some(4)),
+            ("4150525553540009", Some(5), Some(5)),
+            ("4150525553540009", None, None),
+            ("4150525553540009", Some(6), None),
+            ("415052555354000a", Some(5), None),
         ] {
             raw["abi_version"] = json!(abi);
             match copy { Some(value) => { raw["copy_version"] = json!(value); },

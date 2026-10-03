@@ -1717,6 +1717,33 @@ INLINE u64 fd_enrollment_event(struct ap_fd_enrollment *e,u64 kind,s32 fd,u64 fi
     return fd_event_for(e->task,e->task_start,kind,e->table,fd,file,0,
                         kind==AP_FD_ENROLL_BEGIN?0:e->begin,e->command,returned);
 }
+/* No new observation owner: borrow the same held census file. Unknown
+ * dispatch is conservative; a failed required kernel read invalidates census.
+ * Classic images have no authenticated anchor and cannot issue this proof. */
+static __attribute__((noinline)) int fd_enrollment_source_ioctl(
+        struct file *file,struct inode *inode,u32 mode,u32 device,u64 *dispatch) {
+    *dispatch=AP_SOURCE_IOCTL_DISPATCH_UNKNOWN;
+#ifdef AP_GROUPED_PROVIDER
+    u32 zero=0;struct ap_config *config=lookup(&ap_config_map,&zero);
+    if(!config || config->anchor_phase!=AP_GROUPED_ANCHOR_ACTIVE ||
+       !config->anchor_task || !config->anchor_start || !config->anchor_ip)return 0;
+    u32 kind=mode&0170000;
+    if(kind!=0100000 && !(kind==0020000 &&
+       ap_fd_device_major(device)==1 && ap_fd_device_minor(device)==3))return 0;
+    const struct file_operations *fops=0,*inode_fops=0;u64 unlocked_ioctl=0,filesystem=0;
+    if(fd_read_kernel(&fops,sizeof(fops),CORE(&file->f_op)) || !fops ||
+       fd_read_kernel(&unlocked_ioctl,sizeof(unlocked_ioctl),CORE(&fops->unlocked_ioctl)))return -1;
+    if(kind==0100000) {
+        struct super_block *sb=0;
+        if(fd_read_kernel(&inode_fops,sizeof(inode_fops),CORE(&inode->i_fop)) ||
+           fd_read_kernel(&sb,sizeof(sb),CORE(&inode->i_sb)) || !sb ||
+           fd_read_kernel(&filesystem,sizeof(filesystem),CORE(&sb->s_magic)))return -1;
+    }
+    *dispatch=ap_fd_source_ioctl_dispatch(config->anchor_ip,(u64)fops,unlocked_ioctl,
+        (u64)inode_fops,filesystem,mode,ap_fd_device_major(device),ap_fd_device_minor(device));
+#endif
+    return 0;
+}
 SEC("fentry/ptrace_request") int fd_enrollment_enter(u64 *ctx) {
     struct task_struct *task=(struct task_struct *)ctx[0];
     struct ap_task_command *c=authenticated_command(task_storage(&tasks,task,0,0));
@@ -1776,9 +1803,13 @@ SEC("fentry/ptrace_request") int fd_enrollment_enter(u64 *ctx) {
                fd_read_kernel(&device,sizeof(device),CORE(&inode->i_rdev))) {
                 e->problem|=AP_FD_MISSING;return 0;
             }
+            u64 dispatch=0;
+            if(fd_enrollment_source_ioctl(file,inode,mode,device,&dispatch)) {
+                e->problem|=AP_FD_MISSING;return 0;
+            }
             u64 identity=fd_file(file);
             if(!identity || !fd_event_for_profile(e->task,e->task_start,AP_FD_ENROLL_SLOT,e->table,
-                 (s32)fd,identity,0,e->begin,e->command,(flags>>(fd%64))&1,mode,status_flags,ap_fd_device_major(device),ap_fd_device_minor(device))) {
+                 (s32)fd,identity,0,e->begin,e->command,(flags>>(fd%64))&1,mode,status_flags,ap_fd_device_major(device),ap_fd_device_minor(device),dispatch)) {
                 e->problem|=AP_FD_MISSING;return 0;
             }
             e->files++;

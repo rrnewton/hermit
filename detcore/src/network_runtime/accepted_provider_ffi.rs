@@ -18,7 +18,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
@@ -235,7 +234,9 @@ pub struct OriginalSendCapture {
     pub bytes: [u8; 512],
 }
 impl Default for OriginalSendCapture {
-    fn default() -> Self { unsafe { std::mem::zeroed() } }
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 const _: () = assert!(std::mem::size_of::<OriginalSendCapture>() == 624);
 /// Exact physical cleanup evidence, not an observed syscall result.
@@ -274,6 +275,13 @@ pub struct TableEnrollmentEffect {
     pub command: CommandResult,
     pub enrollment: FdEnrollment,
 }
+#[path = "accepted_provider_ffi/fd_event_wire.rs"]
+mod fd_event_wire;
+
+// Closed producer classifications from the authenticated initial census.
+pub const SOURCE_IOCTL_DISPATCH_UNKNOWN: u64 = 0;
+pub const SOURCE_IOCTL_DISPATCH_NULL: u64 = 1;
+pub const SOURCE_IOCTL_DISPATCH_BTRFS: u64 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FdEvent {
@@ -293,6 +301,7 @@ pub struct FdEvent {
     pub status_flags: u32,
     pub device_major: u32,
     pub device_minor: u32,
+    pub source_ioctl_dispatch: u64,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -353,12 +362,13 @@ const _: () = {
     assert!(offset_of!(FdAccept, phases) == 136);
     assert!(offset_of!(FdAccept, requested_fd) == 152);
     assert!(
-        size_of::<FdEvent>() == 104
+        size_of::<FdEvent>() == 112
             && offset_of!(FdEvent, complete) == 80
             && offset_of!(FdEvent, mode) == 88
             && offset_of!(FdEvent, status_flags) == 92
             && offset_of!(FdEvent, device_major) == 96
             && offset_of!(FdEvent, device_minor) == 100
+            && offset_of!(FdEvent, source_ioctl_dispatch) == 104
     );
     assert!(size_of::<FdStatus>() == 32);
     assert!(size_of::<OriginalTerminal>() == 480);
@@ -484,7 +494,7 @@ fn authenticate_provider_declarations(
     if read(c"ap_adapter_abi_version")? != wire.abi_version() {
         return Err(LoadError("provider adapter ABI version mismatch".into()));
     }
-    if wire == super::ProviderWireFormat::Abi8Copy5
+    if wire != super::ProviderWireFormat::Abi7Copy4
         && read(c"ap_adapter_copy_version")? != wire.copy_version()
     {
         return Err(LoadError("provider copy grammar version mismatch".into()));
@@ -620,8 +630,17 @@ struct Api {
     ) -> c_int,
     prepare_original_read:
         unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, u64, *mut u64) -> c_int,
-    prepare_original_sendto:
-        unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, u64, c_int, *mut u64) -> c_int,
+    prepare_original_sendto: unsafe extern "C" fn(
+        SessionPtr,
+        c_int,
+        u64,
+        u64,
+        c_int,
+        u64,
+        u64,
+        c_int,
+        *mut u64,
+    ) -> c_int,
     original_sendto_capture:
         unsafe extern "C" fn(SessionPtr, u64, *mut OriginalSendCapture) -> c_int,
     prepare_original_connect:
@@ -662,8 +681,8 @@ struct Api {
     collect_accept:
         unsafe extern "C" fn(SessionPtr, c_int, u64, *mut CommandResult, *mut FdAccept) -> c_int,
     read_fd_status: unsafe extern "C" fn(SessionPtr, *mut FdStatus) -> c_int,
-    read_fd_event: unsafe extern "C" fn(SessionPtr, u64, *mut FdEvent) -> c_int,
-    ack_fd_event: unsafe extern "C" fn(SessionPtr, *const FdEvent) -> c_int,
+    read_fd_event: unsafe extern "C" fn(SessionPtr, u64, *mut c_void) -> c_int,
+    ack_fd_event: unsafe extern "C" fn(SessionPtr, *const c_void) -> c_int,
 
     open: unsafe extern "C" fn(*const c_char, u64, *mut SessionPtr) -> c_int,
     register_task: unsafe extern "C" fn(SessionPtr, c_int) -> c_int,
@@ -918,7 +937,17 @@ impl Library {
             ),
             prepare_original_sendto: symbol!(
                 "ap_prepare_original_sendto",
-                unsafe extern "C" fn(SessionPtr, c_int, u64, u64, c_int, u64, u64, c_int, *mut u64) -> c_int
+                unsafe extern "C" fn(
+                    SessionPtr,
+                    c_int,
+                    u64,
+                    u64,
+                    c_int,
+                    u64,
+                    u64,
+                    c_int,
+                    *mut u64,
+                ) -> c_int
             ),
             original_sendto_capture: symbol!(
                 "ap_original_sendto_capture",
@@ -1049,11 +1078,11 @@ impl Library {
             ),
             read_fd_event: symbol!(
                 "ap_read_fd_event",
-                unsafe extern "C" fn(SessionPtr, u64, *mut FdEvent) -> c_int
+                unsafe extern "C" fn(SessionPtr, u64, *mut c_void) -> c_int
             ),
             ack_fd_event: symbol!(
                 "ap_ack_fd_event",
-                unsafe extern "C" fn(SessionPtr, *const FdEvent) -> c_int
+                unsafe extern "C" fn(SessionPtr, *const c_void) -> c_int
             ),
 
             open: symbol!(
@@ -1707,21 +1736,44 @@ impl Session {
     }
 
     pub fn prepare_original_sendto(
-        &mut self, target: BorrowedFd<'_>, call: u64, mm: u64,
+        &mut self,
+        target: BorrowedFd<'_>,
+        call: u64,
+        mm: u64,
         operands: (i32, u64, u64, i32),
     ) -> Observation<u64> {
         let (fd, buffer, count, flags) = operands;
         let mut raw = 0;
-        let rc = unsafe { (self.library.api.prepare_original_sendto)(
-            self.pointer(), target.as_raw_fd(), call, mm, fd, buffer, count, flags, &mut raw
-        ) };
-        Observation { status: CallStatus::capture("ap_prepare_original_sendto", rc), raw }
+        let rc = unsafe {
+            (self.library.api.prepare_original_sendto)(
+                self.pointer(),
+                target.as_raw_fd(),
+                call,
+                mm,
+                fd,
+                buffer,
+                count,
+                flags,
+                &mut raw,
+            )
+        };
+        Observation {
+            status: CallStatus::capture("ap_prepare_original_sendto", rc),
+            raw,
+        }
     }
 
-    pub(super) fn original_sendto_capture(&mut self, command: u64) -> io::Result<OriginalSendCapture> {
+    pub(super) fn original_sendto_capture(
+        &mut self,
+        command: u64,
+    ) -> io::Result<OriginalSendCapture> {
         let mut raw = OriginalSendCapture::default();
-        let rc = unsafe { (self.library.api.original_sendto_capture)(self.pointer(), command, &mut raw) };
-        if rc != 0 { return Err(io::Error::last_os_error()); }
+        let rc = unsafe {
+            (self.library.api.original_sendto_capture)(self.pointer(), command, &mut raw)
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(raw)
     }
 
@@ -1997,16 +2049,17 @@ impl Session {
         }
     }
     pub fn read_fd_event(&mut self, sequence: u64) -> Observation<FdEvent> {
-        let mut raw = FdEvent::default();
-        let rc = unsafe { (self.library.api.read_fd_event)(self.pointer(), sequence, &mut raw) };
-        Observation {
-            status: CallStatus::capture("ap_read_fd_event", rc),
-            raw,
-        }
+        fd_event_wire::read(self.wire_format(), |raw| {
+            // SAFETY: declaration authentication binds this DSO to the exact
+            // layout selected by read; the borrowed destination remains live.
+            unsafe { (self.library.api.read_fd_event)(self.pointer(), sequence, raw) }
+        })
     }
     pub fn ack_fd_event(&mut self, receipt: &FdEvent) -> CallStatus {
-        CallStatus::capture("ap_ack_fd_event", unsafe {
-            (self.library.api.ack_fd_event)(self.pointer(), receipt)
+        fd_event_wire::ack(self.wire_format(), receipt, |raw| {
+            // SAFETY: ack retains the exact authenticated legacy/current layout
+            // throughout this synchronous call, without truncating dispatch.
+            unsafe { (self.library.api.ack_fd_event)(self.pointer(), raw) }
         })
     }
     pub fn resolve_accepted(
@@ -2128,7 +2181,12 @@ mod topology_tests {
     fn loader_authenticates_topology_before_any_operational_symbol() {
         use crate::network_runtime::ProviderTopology;
         use crate::network_runtime::ProviderWireFormat;
-        for wire in [ProviderWireFormat::Abi7Copy4, ProviderWireFormat::Abi8Copy5] {
+        for wire in [
+            ProviderWireFormat::Abi7Copy4,
+            ProviderWireFormat::Abi8Copy5,
+            ProviderWireFormat::Abi9Copy4,
+            ProviderWireFormat::Abi9Copy5,
+        ] {
             for expected in [
                 ProviderTopology::ClassicV40,
                 ProviderTopology::GroupedV1 {
@@ -2158,7 +2216,7 @@ mod topology_tests {
                         assert_eq!(observed, expected);
                     }
                     let mut expected_names = vec![c"ap_adapter_abi_version".to_owned()];
-                    if wire == ProviderWireFormat::Abi8Copy5 {
+                    if wire != ProviderWireFormat::Abi7Copy4 {
                         expected_names.push(c"ap_adapter_copy_version".to_owned());
                     }
                     expected_names.push(c"ap_provider_topology_version".to_owned());

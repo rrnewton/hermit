@@ -14,6 +14,7 @@ mod foreground_poll;
 mod foreground_store;
 mod native_source_read;
 mod original_connect;
+mod original_source_ioctl;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;

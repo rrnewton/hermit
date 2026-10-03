@@ -41,10 +41,10 @@ _Static_assert(sizeof(struct ap_program_id)==8,"identifier ABI");
 #error "Selected copy grammar is not a declared native producer grammar"
 #endif
 #endif
-#if AP_NATIVE_COPY_VERSION == 4ULL
-u64 ap_adapter_abi_version(void) { return 0x4150525553540007ULL; }
-#elif AP_NATIVE_COPY_VERSION == 5ULL
-u64 ap_adapter_abi_version(void) { return 0x4150525553540008ULL; }
+/* ABI9 adds the explicit112-byte descriptor census event. Older hosts must
+ * reject this DSO before resolving an operation that writes the larger event. */
+#if AP_NATIVE_COPY_VERSION == 4ULL || AP_NATIVE_COPY_VERSION == 5ULL
+u64 ap_adapter_abi_version(void) { return 0x4150525553540009ULL; }
 #else
 #error "No authenticated adapter ABI for this copy grammar"
 #endif
@@ -55,11 +55,12 @@ _Static_assert(offsetof(struct ap_fd_enrollment,phases)==72,"enrollment phases A
 _Static_assert(offsetof(struct ap_fd_enrollment,slots)==88,"enrollment counts ABI");
 _Static_assert(offsetof(struct ap_fd_enrollment,ptrace_return)==104,"enrollment native result ABI");
 
-_Static_assert(sizeof(struct ap_fd_event)==104,"profile-bearing event ABI v3");
+_Static_assert(sizeof(struct ap_fd_event)==112,"dispatch-bearing event ABI v4");
 _Static_assert(offsetof(struct ap_fd_event,mode)==88,"event inode mode ABI");
 _Static_assert(offsetof(struct ap_fd_event,status_flags)==92,"event status ABI");
 _Static_assert(offsetof(struct ap_fd_event,device_major)==96,"event device major ABI");
 _Static_assert(offsetof(struct ap_fd_event,device_minor)==100,"event device minor ABI");
+_Static_assert(offsetof(struct ap_fd_event,source_ioctl_dispatch)==104,"event source dispatch ABI");
 
 _Static_assert(sizeof(struct ap_original_selection)==104,"original selection ABI");
 _Static_assert(offsetof(struct ap_original_selection,ready)==80,"original selection publication");

@@ -15,7 +15,8 @@ use super::accepted_provider::FdStatus;
 const MAX_RETAINED: usize = 128;
 // Historical raw records have a separate finite budget, matching the existing
 // network trace payload ceiling. Neither budget authorizes semantic retirement.
-const MAX_HISTORY_ROWS: usize = detcore_model::network_trace::MAX_NETWORK_TRACE_PAYLOAD_BYTES as usize
+const MAX_HISTORY_ROWS: usize = detcore_model::network_trace::MAX_NETWORK_TRACE_PAYLOAD_BYTES
+    as usize
     / std::mem::size_of::<FdEvent>();
 #[derive(Debug, Default)]
 pub(super) struct History {
@@ -74,12 +75,32 @@ fn require(ok: bool) -> io::Result<()> {
 fn same_actor(a: &FdEvent, b: &FdEvent) -> bool {
     a.task == b.task && a.task_start == b.task_start && a.sequence < b.sequence
 }
+fn source_ioctl_dispatch_valid(e: &FdEvent) -> bool {
+    use super::accepted_provider_ffi::SOURCE_IOCTL_DISPATCH_BTRFS;
+    use super::accepted_provider_ffi::SOURCE_IOCTL_DISPATCH_NULL;
+    use super::accepted_provider_ffi::SOURCE_IOCTL_DISPATCH_UNKNOWN;
+    match e.source_ioctl_dispatch {
+        SOURCE_IOCTL_DISPATCH_UNKNOWN => true,
+        SOURCE_IOCTL_DISPATCH_NULL => {
+            e.mode & libc::S_IFMT == libc::S_IFCHR && e.device_major == 1 && e.device_minor == 3
+        }
+        SOURCE_IOCTL_DISPATCH_BTRFS => {
+            e.mode & libc::S_IFMT == libc::S_IFREG && e.device_major == 0 && e.device_minor == 0
+        }
+        _ => false,
+    }
+}
 fn clean(e: &FdEvent) -> bool {
     e.previous_file == 0 && e.accept_command == 0
 }
 impl History {
     fn unpublished_len(&self) -> usize {
-        self.rows.range((std::ops::Bound::Excluded(self.published_through), std::ops::Bound::Unbounded)).count()
+        self.rows
+            .range((
+                std::ops::Bound::Excluded(self.published_through),
+                std::ops::Bound::Unbounded,
+            ))
+            .count()
     }
     fn require_capacity(&self) -> io::Result<()> {
         if self.unpublished_len() >= MAX_RETAINED {
@@ -99,9 +120,14 @@ impl History {
         require(self.failed.is_none())?;
         let mut open = std::collections::BTreeSet::new();
         let mut through = self.published_through;
-        for (&sequence, row) in self.rows.range((std::ops::Bound::Excluded(through), std::ops::Bound::Unbounded)) {
+        for (&sequence, row) in self.rows.range((
+            std::ops::Bound::Excluded(through),
+            std::ops::Bound::Unbounded,
+        )) {
             match row.kind {
-                1 | 4 | 10 | 12 | 14 | 17 | 20 => { open.insert(sequence); }
+                1 | 4 | 10 | 12 | 14 | 17 | 20 => {
+                    open.insert(sequence);
+                }
                 2 | 3 | 6 | 11 | 13 | 16 | 19 | 22 if row.dependency != 0 => {
                     let begin = if row.kind == 13 && row.returned == 1 {
                         self.row(row.dependency, 9)?.dependency
@@ -158,8 +184,13 @@ impl History {
                     e.device_minor,
                 )
                 .is_some()
+                    && source_ioctl_dispatch_valid(e)
             } else {
-                e.mode == 0 && e.status_flags == 0 && e.device_major == 0 && e.device_minor == 0
+                e.mode == 0
+                    && e.status_flags == 0
+                    && e.device_major == 0
+                    && e.device_minor == 0
+                    && e.source_ioctl_dispatch == 0
             })?;
             require(
                 e.table <= status.next_table
@@ -184,7 +215,8 @@ impl History {
     fn children(&self, begin: &FdEvent, end: &FdEvent, kind: u64) -> Vec<FdEvent> {
         self.rows
             .range((begin.sequence + 1)..end.sequence)
-            .filter(|&(_, e)| e.dependency == begin.sequence && e.kind == kind).map(|(_, e)| e.clone())
+            .filter(|&(_, e)| e.dependency == begin.sequence && e.kind == kind)
+            .map(|(_, e)| e.clone())
             .collect()
     }
     fn paired(&self, end: &FdEvent, kind: u64) -> io::Result<&FdEvent> {
@@ -646,6 +678,7 @@ impl History {
                 slot.status_flags,
                 slot.device_major,
                 slot.device_minor,
+                slot.source_ioctl_dispatch,
             );
             require(
                 profiles
@@ -788,6 +821,7 @@ mod tests {
             status_flags: 0,
             device_major: 0,
             device_minor: 0,
+            source_ioctl_dispatch: 0,
         }
     }
     fn retain(h: &mut History, e: FdEvent) -> io::Result<()> {
@@ -1610,6 +1644,73 @@ mod enrollment_tests {
             bad.device_minor = minor;
             assert!(history.retain(old.status.unwrap(), bad.clone()).is_err());
             assert_eq!(history.rows[&2], bad);
+            assert!(history.failed.is_some());
+        }
+    }
+
+    #[test]
+    fn dispatch_requires_supported_profile_consistent_aliases_and_enrollment_slot() {
+        for (dispatch, mode, major, minor) in [
+            (ffi::SOURCE_IOCTL_DISPATCH_NULL, libc::S_IFCHR | 0o600, 1, 3),
+            (
+                ffi::SOURCE_IOCTL_DISPATCH_BTRFS,
+                libc::S_IFREG | 0o600,
+                0,
+                0,
+            ),
+        ] {
+            let (old, ticket, out) = populated(false, 0);
+            let status = old.status.clone().unwrap();
+            let mut history = History::default();
+            for mut row in old.rows.into_values() {
+                if row.kind == 21 {
+                    row.mode = mode;
+                    row.device_major = major;
+                    row.device_minor = minor;
+                    row.source_ioctl_dispatch = dispatch;
+                }
+                history.retain(status.clone(), row).unwrap();
+            }
+            enroll(&history, ticket, &out).unwrap();
+            history.rows.get_mut(&3).unwrap().source_ioctl_dispatch = 0;
+            assert!(enroll(&history, ticket, &out).is_err());
+        }
+        for (kind, dispatch, mode, major, minor) in [
+            (21, 3, libc::S_IFREG | 0o600, 0, 0),
+            (
+                21,
+                ffi::SOURCE_IOCTL_DISPATCH_NULL,
+                libc::S_IFCHR | 0o600,
+                1,
+                8,
+            ),
+            (
+                21,
+                ffi::SOURCE_IOCTL_DISPATCH_NULL,
+                libc::S_IFREG | 0o600,
+                0,
+                0,
+            ),
+            (
+                21,
+                ffi::SOURCE_IOCTL_DISPATCH_BTRFS,
+                libc::S_IFDIR | 0o600,
+                0,
+                0,
+            ),
+            (20, ffi::SOURCE_IOCTL_DISPATCH_NULL, 0, 0, 0),
+            (20, ffi::SOURCE_IOCTL_DISPATCH_BTRFS, 0, 0, 0),
+        ] {
+            let (old, _, _) = populated(false, 0);
+            let mut bad = old.rows[&1].clone();
+            bad.kind = kind;
+            bad.source_ioctl_dispatch = dispatch;
+            bad.mode = mode;
+            bad.device_major = major;
+            bad.device_minor = minor;
+            let mut history = History::default();
+            assert!(history.retain(old.status.unwrap(), bad.clone()).is_err());
+            assert_eq!(history.rows[&1], bad);
             assert!(history.failed.is_some());
         }
     }

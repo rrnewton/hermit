@@ -39,20 +39,21 @@ static __attribute__((noinline)) u64 fd_event_publish(const struct ap_fd_event *
     e->fd=fields->fd;e->returned=fields->returned;
     e->mode=fields->mode;e->status_flags=fields->status_flags;
     e->device_major=fields->device_major;e->device_minor=fields->device_minor;
+    e->source_ioctl_dispatch=fields->source_ioctl_dispatch;
     __sync_val_compare_and_swap(&e->complete,2,1);
     return sequence;
 }
 INLINE u64 fd_event_for_profile(u64 actor,u64 start,u64 kind,u64 table,s32 fd,u64 file,u64 previous,
-                        u64 dependency,u64 command,s32 returned,u32 mode,u32 status_flags,u32 device_major,u32 device_minor) {
+                        u64 dependency,u64 command,s32 returned,u32 mode,u32 status_flags,u32 device_major,u32 device_minor,u64 source_ioctl_dispatch) {
     const struct ap_fd_event fields={.kind=kind,.task=actor,.task_start=start,.table=table,
         .file=file,.previous_file=previous,.dependency=dependency,.accept_command=command,
         .fd=fd,.returned=returned,.mode=mode,.status_flags=status_flags,
-        .device_major=device_major,.device_minor=device_minor};
+        .device_major=device_major,.device_minor=device_minor,.source_ioctl_dispatch=source_ioctl_dispatch};
     return fd_event_publish(&fields);
 }
 INLINE u64 fd_event_for(u64 actor,u64 start,u64 kind,u64 table,s32 fd,u64 file,u64 previous,
                         u64 dependency,u64 command,s32 returned) {
-    return fd_event_for_profile(actor,start,kind,table,fd,file,previous,dependency,command,returned,0,0,0,0);
+    return fd_event_for_profile(actor,start,kind,table,fd,file,previous,dependency,command,returned,0,0,0,0,0);
 }
 /* Immutable caller-owned scalar operands only. Every caller evaluates the
  * same original arguments before current actor sampling. Expanding the full

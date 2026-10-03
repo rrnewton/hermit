@@ -11,6 +11,8 @@ use crate::tool_local::FileMetadata;
 
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod source_ioctl_fixture;
 
 /// Private census/EXEC provenance. Neither serde, a config bit nor a numeric
 /// task/file identifier constructs this authority. Revocation is irreversible.
@@ -416,9 +418,17 @@ pub(crate) fn controlled_foreground_root(thread: i32) -> ControlledRootFixture {
 
 #[cfg(test)]
 pub(crate) fn controlled_foreground_runtime(thread: i32) -> ControlledRuntimeFixture {
+    runtime_from_controlled_tasks(thread, controlled_tasks(thread))
+}
+
+#[cfg(test)]
+fn runtime_from_controlled_tasks(
+    thread: i32,
+    fixture: ControlledTaskFixture,
+) -> ControlledRuntimeFixture {
     use std::os::fd::FromRawFd;
     use std::os::fd::OwnedFd;
-    let (mut tasks, owner, metadata, memory, claim) = controlled_tasks(thread);
+    let (mut tasks, owner, metadata, memory, claim) = fixture;
     tasks
         .bind_foreground_metadata(owner, &metadata, &memory)
         .unwrap();

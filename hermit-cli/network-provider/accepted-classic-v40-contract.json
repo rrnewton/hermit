@@ -1,6 +1,7 @@
 {
   "schema": 1,
-  "abi_version": "4150525553540007",
+  "abi_version": "4150525553540009",
+  "copy_version": 4,
   "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
   "maps": 23,
   "programs": 46,

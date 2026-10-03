@@ -61,9 +61,9 @@ int main(void) {
     e=receipt();c=submitted();
     struct ap_fd_event begin=row(29,AP_FD_ENROLL_BEGIN,-1,0,0),end=row(37,AP_FD_ENROLL_END,64,0,2);
     struct ap_fd_event slots[2]={row(31,AP_FD_ENROLL_SLOT,0,41,0),row(33,AP_FD_ENROLL_SLOT,7,41,1)};
-    CHECK(sizeof(struct ap_fd_event)==104 && offsetof(struct ap_fd_event,complete)==80 &&
+    CHECK(sizeof(struct ap_fd_event)==112 && offsetof(struct ap_fd_event,complete)==80 &&
           offsetof(struct ap_fd_event,mode)==88 && offsetof(struct ap_fd_event,device_major)==96 &&
-          offsetof(struct ap_fd_event,device_minor)==100);
+          offsetof(struct ap_fd_event,device_minor)==100 && offsetof(struct ap_fd_event,source_ioctl_dispatch)==104);
     CHECK(ap_fd_enrollment_census_matches(&e,&begin,slots,2,&end)); /* exact two aliases */
     CHECK(!ap_fd_enrollment_census_matches(&e,&begin,slots,1,&end));
     CHECK(!ap_fd_enrollment_census_matches(&e,&begin,NULL,2,&end));
@@ -105,6 +105,44 @@ int main(void) {
     slots[0].mode=0100644;slots[1].mode=0140600;slots[1].file=42;
     CHECK(ap_fd_enrollment_census_matches(&e,&begin,slots,2,&end)); /* distinct regular/socket */
     slots[0].mode=slots[1].mode=010600;slots[1].file=41;
+    /* Identical current numeric/stat profiles never identify a dispatcher.
+     * The table address/handler are physical observations, translated through
+     * a valid anchor. Exercise relocation as well as the zero-slide image. */
+    for(unsigned slide=0;slide<2;slide++) {
+        u64 anchor=AP_GROUPED_CONNECT_IMAGE-(u64)slide*0x200000;
+        u64 null_ops=ap_grouped_image_address(anchor,AP_SOURCE_NULL_FOPS_IMAGE);
+        u64 btrfs_ops=ap_grouped_image_address(anchor,AP_SOURCE_BTRFS_FOPS_IMAGE);
+        u64 btrfs_ioctl=ap_grouped_image_address(anchor,AP_SOURCE_BTRFS_IOCTL_IMAGE);
+        CHECK(ap_fd_source_ioctl_dispatch(anchor,null_ops,0,0,0,0020600,1,3)==AP_SOURCE_IOCTL_DISPATCH_NULL);
+        CHECK(ap_fd_source_ioctl_dispatch(anchor,btrfs_ops,btrfs_ioctl,btrfs_ops,AP_SOURCE_BTRFS_MAGIC,0100600,0,0)==AP_SOURCE_IOCTL_DISPATCH_BTRFS);
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,null_ops+8,0,0,0,0020600,1,3));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,null_ops,btrfs_ioctl,0,0,0020600,1,3));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,null_ops,0,0,0,0020600,1,8));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,btrfs_ops+8,btrfs_ioctl,btrfs_ops+8,AP_SOURCE_BTRFS_MAGIC,0100600,0,0));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,btrfs_ops,btrfs_ioctl+8,btrfs_ops,AP_SOURCE_BTRFS_MAGIC,0100600,0,0));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,btrfs_ops,btrfs_ioctl,btrfs_ops+8,AP_SOURCE_BTRFS_MAGIC,0100600,0,0));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,btrfs_ops,btrfs_ioctl,btrfs_ops,0,0100600,0,0));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor,btrfs_ops,btrfs_ioctl,btrfs_ops,AP_SOURCE_BTRFS_MAGIC,0040600,0,0));
+        CHECK(!ap_fd_source_ioctl_dispatch(anchor+1,null_ops,0,0,0,0020600,1,3));
+        CHECK(!ap_fd_source_ioctl_dispatch(0,null_ops,0,0,0,0020600,1,3));
+    }
+    BAD_ROW(begin,source_ioctl_dispatch,AP_SOURCE_IOCTL_DISPATCH_NULL);
+    BAD_ROW(end,source_ioctl_dispatch,AP_SOURCE_IOCTL_DISPATCH_BTRFS);
+    BAD_ROW(slots[0],source_ioctl_dispatch,3);
+    slots[0].mode=slots[1].mode=0020600;
+    slots[0].device_major=slots[1].device_major=1;
+    slots[0].device_minor=slots[1].device_minor=3;
+    slots[0].source_ioctl_dispatch=slots[1].source_ioctl_dispatch=AP_SOURCE_IOCTL_DISPATCH_NULL;
+    CHECK(ap_fd_enrollment_census_matches(&e,&begin,slots,2,&end));
+    BAD_ROW(slots[0],source_ioctl_dispatch,0); /* aliases cannot split dispatch */
+    BAD_ROW(slots[0],source_ioctl_dispatch,AP_SOURCE_IOCTL_DISPATCH_BTRFS);
+    slots[0].mode=slots[1].mode=0100600;
+    slots[0].device_major=slots[1].device_major=0;
+    slots[0].device_minor=slots[1].device_minor=0;
+    slots[0].source_ioctl_dispatch=slots[1].source_ioctl_dispatch=AP_SOURCE_IOCTL_DISPATCH_BTRFS;
+    CHECK(ap_fd_enrollment_census_matches(&e,&begin,slots,2,&end));
+    BAD_ROW(slots[0],source_ioctl_dispatch,0);
+    BAD_ROW(slots[0],source_ioctl_dispatch,AP_SOURCE_IOCTL_DISPATCH_NULL);
     e.files=0;end.returned=0;
     CHECK(ap_fd_enrollment_census_matches(&e,&begin,NULL,0,&end)); /* Real complete64-slot empty census */
     end.fd=0;CHECK(!ap_fd_enrollment_census_matches(&e,&begin,NULL,0,&end));
