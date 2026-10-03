@@ -133,7 +133,7 @@ pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
 fn source_identity(root: &Path, source_sha: Option<&str>) -> Result<(String, bool), String> {
     match source_sha {
         Some(sha) => {
-            validate_source_sha(sha)?;
+            validate_source_snapshot(root, sha)?;
             Ok((sha.to_string(), false))
         }
         None => Ok((
@@ -158,6 +158,33 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
              pass the output of `git rev-parse HEAD` for the archived commit"
         ))
     }
+}
+
+/// A `--source-sha` names the commit of a Git-less snapshot at `root`, which
+/// is then recorded as clean. A directory holding files Git tracks is refused:
+/// Git reports their commit and whether they are dirty, and the name would
+/// override both. A snapshot extracted inside a checkout but not tracked by it
+/// (ci/buck-e2e/staged/src) is accepted, and so is any root on a host without
+/// git (an RE worker).
+pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
+    validate_source_sha(sha)?;
+    let tracked = crate::git_environment::git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--error-unmatch", "--", "."])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if tracked {
+        return Err(format!(
+            "--source-sha names the commit of a Git-less `git archive` snapshot, but Git \
+             tracks files under {}, and Git reports their commit and whether they are dirty; \
+             drop --source-sha, or pass --repo-root naming the archive",
+            root.display()
+        ));
+    }
+    Ok(())
 }
 
 fn first_attempt() -> u64 {
@@ -6435,6 +6462,42 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         assert_eq!(named, Ok((sha.to_string(), false)));
         assert!(asked.is_err(), "{asked:?}");
+    }
+
+    /// Where Git tracks files it knows their commit and whether they are dirty,
+    /// so a `--source-sha` that would override both is refused, at the
+    /// checkout's top level and below it. A snapshot extracted inside the
+    /// checkout but not tracked by it keeps its name.
+    #[test]
+    fn a_source_sha_is_refused_where_git_tracks_the_files() {
+        let checkout = std::env::temp_dir().join(format!("runner-checkout-{}", std::process::id()));
+        let snapshot = checkout.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "").unwrap();
+        let git = |args: &[&str]| {
+            crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let tracking = git(&["init", "-q"]) && git(&["add", "src/lib.rs"]);
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let refused = [
+            source_identity(&checkout, Some(sha)),
+            source_identity(&checkout.join("src"), Some(sha)),
+        ];
+        let nested = source_identity(&snapshot, Some(sha));
+        fs::remove_dir_all(&checkout).unwrap();
+        assert!(tracking);
+        for identity in refused {
+            let error = identity.unwrap_err();
+            assert!(error.contains("Git tracks files under"), "{error}");
+        }
+        assert_eq!(nested, Ok((sha.to_string(), false)));
     }
 
     /// The four outcomes of the verification-spelling probe.
