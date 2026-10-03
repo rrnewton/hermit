@@ -219,16 +219,20 @@ fn guest_max_fds(tid: Pid) -> Option<i32> {
     parse_fd_size(&status)
 }
 
+/// A task's table holds at least `NR_OPEN_DEFAULT` (`BITS_PER_LONG`) entries.
+/// A smaller value means a task without a table, or the wrong task, and would
+/// silently record empty sets, so it is treated as unknown.
 fn parse_fd_size(status: &str) -> Option<i32> {
     status
         .lines()
         .find_map(|line| line.strip_prefix("FDSize:"))
         .and_then(|value| value.trim().parse().ok())
+        .filter(|&size: &i32| size >= 64)
 }
 
 /// The `nfds` the kernel acted on. Without a table size, fall back to the
-/// largest table Linux allows (`fs.nr_open` defaults to 1048576), so a guest
-/// passing `INT_MAX` cannot make the recorder allocate gigabytes.
+/// default `fs.nr_open` limit of 1048576 descriptors (128 KiB per set), so a
+/// guest passing `INT_MAX` cannot make the recorder allocate gigabytes.
 fn select_capture_nfds(nfds: i32, max_fds: Option<i32>) -> i32 {
     nfds.min(max_fds.unwrap_or(1 << 20))
 }
@@ -819,6 +823,9 @@ mod tests {
         let status = "Name:\tguest\nFDSize:\t64\nGroups:\t\n";
         assert_eq!(parse_fd_size(status), Some(64));
         assert_eq!(parse_fd_size("Name:\tguest\n"), None);
+        assert_eq!(parse_fd_size("FDSize:\t0\n"), None);
+        let own = Pid::from_raw(unsafe { libc::gettid() });
+        assert!(guest_max_fds(own).is_some_and(|size| size >= 64));
 
         assert_eq!(select_capture_nfds(4, Some(64)), 4);
         assert_eq!(select_capture_nfds(i32::MAX, Some(64)), 64);

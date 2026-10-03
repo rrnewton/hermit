@@ -391,8 +391,8 @@ pub struct SelectEvent {
 
     /// Post-kernel bytes of the read, write and exception sets, in argument
     /// order. Each holds the readable prefix of the set's `FDS_BYTES(nfds)`
-    /// range, with `nfds` clamped to the guest's descriptor table, or `None` when the pointer was null or the kernel did not copy
-    /// the sets out.
+    /// range, with `nfds` clamped to the guest's descriptor table, or `None`
+    /// when the pointer was null or the kernel did not copy the sets out.
     pub fd_sets: [Option<Vec<u8>>; 3],
 
     /// Post-kernel bytes of the timeout, when its pointer was non-null and
