@@ -948,7 +948,9 @@ fn generated_plan_populations_preserve_command_policy() {
     // replay cells https://github.com/rrnewton/hermit/pull/3580 selects.
     let compat = crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
     let select = crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
-    let total = 900 + compat + select;
+    // https://github.com/rrnewton/reverie/issues/891 selects six more portable
+    // KVM verify cells; keep the earlier populations as explicit baselines.
+    let total = 900 + compat + select + 6;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -987,7 +989,8 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(hosted_cells.len(), 893 + compat + select - 241);
+    // The six new KVM cells are also excluded, so the hosted total is unchanged.
+    assert_eq!(hosted_cells.len(), 893 + compat + select + 6 - (241 + 6));
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1034,7 +1037,7 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat + select,
+            893 + compat + select + 6,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1148,13 +1151,17 @@ fn generated_plan_populations_preserve_command_policy() {
                 .cloned()
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
-            assert_eq!(expected_relations.len(), if active { 174 } else { 0 });
+            // These pre-fold-shaped plans use today's population, including six more KVM cells.
+            // https://github.com/rrnewton/reverie/issues/891
+            assert_eq!(expected_relations.len(), if active { 174 + 6 } else { 0 });
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
                 expected_relations
             );
             if active {
-                for (backend, count) in [("kvm", 75), ("liteinst", 97), ("sabre", 1), ("dbt", 1)] {
+                for (backend, count) in
+                    [("kvm", 75 + 6), ("liteinst", 97), ("sabre", 1), ("dbt", 1)]
+                {
                     assert_eq!(
                         expected_relations
                             .iter()

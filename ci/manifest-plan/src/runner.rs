@@ -8064,6 +8064,9 @@ mod tests {
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
                 + SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
+                // Six KVM verify selections; the frozen calibration stays unchanged.
+                // https://github.com/rrnewton/reverie/issues/891
+                + 6
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
@@ -12290,7 +12293,9 @@ exit "$(cat "$PWD/exit-status")"
         // candidate's arguments.
         // S13 of https://github.com/rrnewton/hermit/issues/3301 enabled dbt on
         // pid-probe, which adds the one portable dbt candidate.
-        assert_eq!(candidates.len(), 174);
+        // Six more portable KVM verify cells preserve the same parity argument contract.
+        // https://github.com/rrnewton/reverie/issues/891
+        assert_eq!(candidates.len(), 174 + 6);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12299,7 +12304,7 @@ exit "$(cat "$PWD/exit-status")"
         }
         assert_eq!(
             by_backend,
-            BTreeMap::from([("dbt", 1), ("kvm", 75), ("liteinst", 97), ("sabre", 1)])
+            BTreeMap::from([("dbt", 1), ("kvm", 75 + 6), ("liteinst", 97), ("sabre", 1)])
         );
         assert!(
             candidates
