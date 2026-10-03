@@ -55,7 +55,10 @@ demos/08-btrfs-convert-uaf/prepare-assets.sh builds:
   ignored/demo08-btrfs/buggy/btrfs-convert
   ignored/demo08-btrfs/fixed/btrfs-convert
   ignored/demo08-btrfs/pop-tiny.img
-When those assets are absent the demo prints SKIPPED and exits 0.
+When those assets are absent the demo prints SKIPPED and exits 77, the
+conventional "skipped" status, because a skip produced no result and is not a
+pass. demos/run-all.sh sets DEMO_SKIP_EXIT_STATUS=0 and records the demo as
+skipped from its SKIPPED line; the sweep then exits 3.
 
 Useful overrides:
   DEMO08_DIR=/path        asset directory (buggy/, fixed/, pop-tiny.img)
@@ -63,7 +66,9 @@ Useful overrides:
   DEMO08_CRASH_SEED=N     use this seed instead of the one prepare-assets.sh recorded
   DEMO08_TIMEOUT=90       per-run timeout in seconds; prepare-assets.sh reads the
                           same variable, so it only records a seed that fits here
-  DEMO08_REQUIRE_ASSETS=1 fail instead of skipping when assets are absent
+  DEMO08_REQUIRE_ASSETS=1 fail (exit 1) instead of skipping when assets are absent
+  DEMO_SKIP_EXIT_STATUS=77
+                          exit status of a skip, 0 to 255; run-all.sh sets 0
 EOF
 }
 
@@ -81,11 +86,21 @@ if [ "$REQUIRE_ASSETS" != 0 ] && [ "$REQUIRE_ASSETS" != 1 ]; then
   echo "error: DEMO08_REQUIRE_ASSETS must be 0 or 1" >&2
   exit 2
 fi
+# A skip produced no result, so on its own it must not exit 0 like a pass.
+# run-all.sh reads the SKIPPED line itself and sets this to 0.
+SKIP_EXIT_STATUS="${DEMO_SKIP_EXIT_STATUS:-77}"
+if ! [[ "$SKIP_EXIT_STATUS" =~ ^(0|[1-9][0-9]{0,2})$ ]] ||
+  [ "$SKIP_EXIT_STATUS" -gt 255 ]; then
+  echo "error: DEMO_SKIP_EXIT_STATUS must be an exit status from 0 to 255" >&2
+  exit 2
+fi
 
 # The ASAN binaries and the image are large and host-specific, so they live in
-# an ignored directory rather than the repository. Skip cleanly (exit 0) when
-# they are absent, so run-all.sh reports the demo as skipped, not failed; the
-# sweep still exits 3 for the skip.
+# an ignored directory rather than the repository. When they are absent, skip
+# with SKIP_EXIT_STATUS (77 unless the caller set DEMO_SKIP_EXIT_STATUS), so a
+# standalone run is never read as a pass. run-all.sh sets it to 0 and reports
+# the demo as skipped, not failed, from the SKIPPED line; the sweep still exits
+# 3 for the skip.
 for f in "$BUGGY" "$FIXED" "$IMAGE"; do
   if [ ! -r "$f" ]; then
     if [ "$REQUIRE_ASSETS" = 1 ]; then
@@ -95,7 +110,7 @@ for f in "$BUGGY" "$FIXED" "$IMAGE"; do
     fi
     echo "Build the ASAN btrfs-convert variants and the image first:"
     echo "  demos/08-btrfs-convert-uaf/prepare-assets.sh"
-    [ "$REQUIRE_ASSETS" = 0 ] && exit 0
+    [ "$REQUIRE_ASSETS" = 0 ] && exit "$SKIP_EXIT_STATUS"
     exit 1
   fi
 done

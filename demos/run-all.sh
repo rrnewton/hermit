@@ -33,15 +33,19 @@ that exits 0 without that line, for example after stopping silently or after
 printing only another demo's result, is recorded as FAIL.
 
 A demo that cannot run on this host prints a SKIPPED line and is recorded as
-SKIP; demo 8 does this until its prepare-assets.sh has been run. Demos 5 and 6
-compare each run with a reference run that their first run saves. The sweep
-sets QEMU_BOOT_REPEAT=1 and QEMU_RESUME_REPEAT=1, so a demo that has no
-reference run yet saves one and then runs again to compare. A demo whose last
-result line still says FIRST RUN SAVED compared nothing and is recorded as
-UNCOMPARED. Neither a skipped nor an uncompared demo produced a result, so
-neither counts as a pass. The sweep tells them from a pass by reading the
-demo's log, so a demo whose log could not be written or read is recorded as
-ERROR: its result is unknown.
+SKIP; demo 8 does this until its prepare-assets.sh has been run. Run on its
+own, such a demo exits 77, so that a skip is never read as a pass; the sweep
+sets DEMO_SKIP_EXIT_STATUS=0, so that the demo exits 0 and the SKIPPED line
+tells the skip from a failure.
+
+Demos 5 and 6 compare each run with a reference run that their first run
+saves. The sweep sets QEMU_BOOT_REPEAT=1 and QEMU_RESUME_REPEAT=1, so a demo
+that has no reference run yet saves one and then runs again to compare. A
+demo whose last result line still says FIRST RUN SAVED compared nothing and
+is recorded as UNCOMPARED. Neither a skipped nor an uncompared demo produced
+a result, so neither counts as a pass. The sweep tells them from a pass by
+reading the demo's log, so a demo whose log could not be written or read is
+recorded as ERROR: its result is unknown.
 
 Exit status:
   0  every selected demo passed
@@ -138,6 +142,12 @@ export DEMO_TMP="${DEMO_TMP:-$(mktemp -d -t hermit-demo.XXXXXX)}"
 # QEMU_RESUME_REPEAT (demo 6) is 0. The sweep exists to measure, so it always
 # asks for the second run, whatever the caller's environment says.
 export QEMU_BOOT_REPEAT=1 QEMU_RESUME_REPEAT=1
+
+# A demo that cannot run here exits 77 on its own, because a skip is not a
+# pass. Behind make, which turns any failing status into 2, the sweep could not
+# tell that 77 from a failure, so it asks for exit 0 and reads the SKIPPED line
+# instead, whatever the caller's environment says.
+export DEMO_SKIP_EXIT_STATUS=0
 
 failures=0
 passes=0

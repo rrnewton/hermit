@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Tests for how run-all.sh classifies a demo that declined to run.
 
-A demo exits 0 when it cannot run -- demo 8 does this when its ASAN assets are
-absent -- so the exit code alone cannot separate a pass from a skip. run-all.sh
-reads the demo's SKIPPED line instead, records the demo as SKIP, and never
-reports a skipped demo as passed. A sweep with a skip and no failure exits 3, so
-a caller that reads only the exit status does not take it for a success. There
-is no option that accepts a skip: a caller that accepts one checks for exit
-status 3 itself.
+Inside the sweep a demo exits 0 when it cannot run -- demo 8 does this when its
+ASAN assets are absent. Run on its own it exits 77, but make turns that into 2,
+so the sweep sets DEMO_SKIP_EXIT_STATUS=0, and the exit code alone cannot
+separate a pass from a skip. run-all.sh reads the demo's SKIPPED line instead,
+records the demo as SKIP, and never reports a skipped demo as passed. A sweep
+with a skip and no failure exits 3, so a caller that reads only the exit status
+does not take it for a success. There is no option that accepts a skip: a
+caller that accepts one checks for exit status 3 itself.
 
 Because the SKIPPED line is read from the demo's log, a log directory, log, or
 summary that cannot be created, written, or read makes the sweep exit 4. An
@@ -214,6 +215,18 @@ case "${@: -1}" in
   demo7) echo "=== Demo 7: drgn Kernel Task Evolution: SUCCESS ===" ;;
 esac
 exit 0
+"""
+
+# Prints the skip status the sweep asked for, then passes.
+DEMO_THAT_PRINTS_ITS_SKIP_EXIT_STATUS = """#!/usr/bin/env bash
+echo "DEMO_SKIP_EXIT_STATUS=${DEMO_SKIP_EXIT_STATUS-unset}"
+echo "=== Demo 3: Chaos Concurrency Testing: SUCCESS ==="
+exit 0
+"""
+
+# Runs the real demo 8 run.sh, which skips when its assets are absent.
+REAL_DEMO_8 = """#!/usr/bin/env bash
+exec REAL_RUN_SH
 """
 
 # Stands in for grep on PATH. It fails as grep does when it cannot read a file,
@@ -500,6 +513,48 @@ class RunAllSkipClassificationTest(unittest.TestCase):
                 self.assertEqual(sweep.calls, [], "no demo may run after a usage error")
                 self.assertIn("is not a demo target", sweep.result.stdout)
                 self.assertNeverAPassOrSuccess(sweep)
+
+    def test_the_sweep_asks_demos_for_exit_0_on_a_skip(self):
+        """Run on its own, a demo that skips exits 77. make would turn that
+        into 2, which the sweep could not tell from a failure, so the sweep
+        asks for 0, whatever the caller set, and reads the SKIPPED line."""
+
+        def caller_asked_for_77(scratch, environment):
+            environment["DEMO_SKIP_EXIT_STATUS"] = "77"
+
+        sweep = self._run(
+            DEMO_THAT_PRINTS_ITS_SKIP_EXIT_STATUS,
+            target="demo3",
+            prepare=caller_asked_for_77,
+        )
+        self.assertIn("\nDEMO_SKIP_EXIT_STATUS=0\n", sweep.result.stdout)
+        self.assertEqual(sweep.result.returncode, 0, sweep.result.stdout)
+
+    def test_demo_8s_real_skip_is_a_skip_in_the_sweep(self):
+        """Demo 8's own run.sh, without its assets, is recorded as SKIP and
+        the sweep is INCOMPLETE with exit 3, not a failure and not a pass."""
+
+        def without_demo_8_assets(scratch, environment):
+            for key in list(environment):
+                if key.startswith("DEMO08_"):
+                    del environment[key]
+            environment["DEMO08_DIR"] = str(scratch / "no-demo8-assets")
+            environment["DEMO08_ARTIFACTS"] = str(scratch / "demo8-artifacts")
+
+        stub = REAL_DEMO_8.replace(
+            "REAL_RUN_SH", shlex.quote(str(ROOT / "demos/08-btrfs-convert-uaf/run.sh"))
+        )
+        sweep = self._run(stub, target="demo8", prepare=without_demo_8_assets)
+        self.assertIn("=== Demo 8: SKIPPED -- missing asset:", sweep.result.stdout)
+        self.assertIsNotNone(sweep.summary, sweep.result.stdout)
+        self.assertEqual(self._statuses(sweep.summary), ["SKIP"])
+        self.assertEqual(sweep.result.returncode, 3, sweep.result.stdout)
+        self.assertIn(
+            "Demo suite: INCOMPLETE — 0 of 1 requested demos passed, "
+            "1 skipped and unmeasured",
+            sweep.result.stdout,
+        )
+        self.assertNeverAPassOrSuccess(sweep)
 
     def test_a_log_directory_that_cannot_be_created_stops_the_sweep(self):
         def log_dir_below_a_file(scratch, environment):

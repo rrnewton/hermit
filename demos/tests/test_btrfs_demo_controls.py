@@ -809,11 +809,52 @@ class DemoRunControlsTest(unittest.TestCase):
             self.assertEqual((self.artifacts / name).read_text(), FULL_REPORT, name)
 
     def test_missing_assets_skip_by_default(self):
+        # A skip run on its own exits 77, the conventional "skipped" status,
+        # not 0: it produced no result, so it must not read as a pass.
         shutil.rmtree(self.assets / "buggy")
-        result = self._run(DEMO08_REQUIRE_ASSETS=None)
-        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self._run(DEMO08_REQUIRE_ASSETS=None, DEMO_SKIP_EXIT_STATUS=None)
+        self.assertEqual(result.returncode, 77, result.stdout)
         self.assertIn("=== Demo 8: SKIPPED -- missing asset:", result.stdout)
+        self.assertNotIn("SUCCESS ===", result.stdout)
         self.assertFalse((self.tmp / "hermit-args").exists())
+
+    def test_a_skip_exits_with_the_status_the_caller_asks_for(self):
+        # run-all.sh asks for 0 and reads the SKIPPED line itself.
+        shutil.rmtree(self.assets / "buggy")
+        for status in ("0", "5", "255"):
+            with self.subTest(status=status):
+                result = self._run(
+                    DEMO08_REQUIRE_ASSETS=None, DEMO_SKIP_EXIT_STATUS=status
+                )
+                self.assertEqual(result.returncode, int(status), result.stdout)
+                self.assertIn("=== Demo 8: SKIPPED -- missing asset:", result.stdout)
+                self.assertFalse((self.tmp / "hermit-args").exists())
+
+    def test_a_malformed_skip_exit_status_is_refused(self):
+        # Refused before the asset check, so a typo cannot turn a skip into
+        # some other status.
+        shutil.rmtree(self.assets / "buggy")
+        for status in ("abc", "256", "-1", "08", "1.5", " 7", "77x"):
+            with self.subTest(status=status):
+                result = self._run(
+                    DEMO08_REQUIRE_ASSETS=None, DEMO_SKIP_EXIT_STATUS=status
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(
+                    "error: DEMO_SKIP_EXIT_STATUS must be an exit status from 0 to 255",
+                    result.stdout,
+                )
+                self.assertNotIn("SKIPPED", result.stdout)
+                self.assertFalse((self.tmp / "hermit-args").exists())
+
+    def test_required_assets_still_fail_when_a_skip_may_exit_0(self):
+        # Positive control: asking for exit 0 on a skip does not soften
+        # DEMO08_REQUIRE_ASSETS=1, which _run sets.
+        shutil.rmtree(self.assets / "buggy")
+        result = self._run(DEMO_SKIP_EXIT_STATUS="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("=== Demo 8: FAILURE -- required asset is missing:", result.stdout)
+        self.assertNotIn("SKIPPED", result.stdout)
 
     def test_missing_assets_fail_when_required(self):
         shutil.rmtree(self.assets / "buggy")

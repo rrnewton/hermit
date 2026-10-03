@@ -48,9 +48,12 @@ instead of the expected crash. The story of the bug is in
 - About 256 MB of disk for the image and a few hundred megabytes more for the
   btrfs-progs build under `ignored/`.
 
-Without the prepared assets, `run.sh` prints `SKIPPED` and exits 0, so
-`demos/run-all.sh` counts it as skipped rather than failed. A skipped demo
-produced no result, so the sweep then exits 3 instead of 0.
+Without the prepared assets, `run.sh` prints `SKIPPED` and exits 77, the
+conventional "skipped" status, so a skip run on its own, or through
+`make -C demos demo8` (which then exits 2), is never read as a pass.
+`demos/run-all.sh` sets `DEMO_SKIP_EXIT_STATUS=0` for the demos it runs and
+counts this one as skipped rather than failed from its `SKIPPED` line. A
+skipped demo produced no result, so the sweep then exits 3 instead of 0.
 
 ## Run it
 
@@ -452,7 +455,8 @@ Controls (environment variables):
 | `DEMO08_ARTIFACTS` | `target/demos/08-btrfs-convert-uaf` | Scratch images and saved reports. Under `/tmp`, give an absolute path that begins with `/tmp/`; see [Run it](#run-it). |
 | `DEMO08_CRASH_SEED` | from `.crash-seed`, else `7` | The chaos seed to use. |
 | `DEMO08_TIMEOUT` | `90` | Seconds allowed per run. `prepare-assets.sh` applies the same limit, so it only records a seed that fits. |
-| `DEMO08_REQUIRE_ASSETS` | `0` | Set to `1` to fail instead of skipping when the assets are missing. |
+| `DEMO08_REQUIRE_ASSETS` | `0` | Set to `1` to fail (exit 1) instead of skipping when the assets are missing. With `0`, a missing asset is a skip, which exits with `DEMO_SKIP_EXIT_STATUS`. |
+| `DEMO_SKIP_EXIT_STATUS` | `77` | The exit status of a skip, from 0 to 255; any other value is refused with exit 2. `demos/run-all.sh` sets `0`, because it reads the `SKIPPED` line and counts the demo as skipped. |
 | `DEMO08_CALIBRATION_SEEDS` | `64` | How many seeds `prepare-assets.sh` tries. |
 | `DEMO08_REFUSAL_RETRIES` | `2` | How many more times `prepare-assets.sh` runs a seed after Hermit refuses a run with exit status 122. A seed refused on every attempt is reported as refused, not as one that did not crash. |
 | `DEMO08_BUILD_ROOT`, `DEMO08_BUILD_JOBS`, `DEMO08_BTRFS_REPO` | `ignored/demo08-build`, all CPUs, the GitHub URL | Where and how the btrfs-progs build runs. |
