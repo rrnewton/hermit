@@ -474,12 +474,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 770 prior identities.
     // https://github.com/rrnewton/hermit/issues/3537 adds
     // recorder::mmap::tests::{parses_maps_lines,
-    // file_backed_ranges_clip_to_the_advised_range,
+    // private_file_ranges_clip_to_the_advised_range,
+    // private_file_ranges_skip_shared_mappings,
     // wipeonfork_prefix_stops_at_the_first_private_file_mapping} and
     // replayer::mmap::tests::{differing_pages_merges_adjacent_changed_pages,
     // differing_pages_treats_unread_bytes_as_changed}, which retain all 777
     // prior identities.
-    ("test.hermit_unit", 782),
+    ("test.hermit_unit", 783),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -638,7 +639,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3580 tests.
     // The host twin selects the same https://github.com/rrnewton/hermit/issues/3537 tests.
-    ("test.hermit_unit_on_host", 782),
+    ("test.hermit_unit_on_host", 783),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image

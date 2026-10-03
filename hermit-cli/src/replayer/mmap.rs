@@ -126,6 +126,11 @@ impl Replayer {
         );
 
         if event.live_len == len {
+            // Some recorded outcomes depend on the mapping type, which replay's
+            // anonymous stand-ins do not preserve: MADV_GUARD_INSTALL on a
+            // private file mapping fails with EINVAL before Linux 6.15, and
+            // advice on device or hugetlbfs mappings can fail where anonymous
+            // memory accepts it. Those fail the assertion below loudly.
             let result = guest.inject_with_retry(syscall).await;
             assert_eq!(
                 result,
@@ -167,7 +172,7 @@ impl Replayer {
                 let mut current = vec![0u8; refill.bytes.len()];
                 let readable = read_prefix(&mem, refill.addr, &mut current);
                 for (offset, run) in differing_pages(&current[..readable], &refill.bytes) {
-                    self.write_refill(guest, refill, offset, run).await?;
+                    self.write_refill(guest, refill, offset, run).await;
                 }
             }
         }
@@ -179,19 +184,25 @@ impl Replayer {
 impl Replayer {
     /// Writes `refill.bytes[offset..offset + len]`, lifting write protection
     /// for the duration of the write.
+    ///
+    /// The advice has already been applied, so a failure here panics rather
+    /// than return an error the recording never saw.
     async fn write_refill<G: Guest<Self>>(
         &self,
         guest: &mut G,
         refill: &MadviseRefill,
         offset: usize,
         len: usize,
-    ) -> Result<(), Errno> {
+    ) {
         let start = refill.addr + offset;
         let prot = ProtFlags::from_bits_truncate(refill.prot);
         if !prot.contains(ProtFlags::PROT_WRITE) {
             guest
                 .inject_with_retry(protection(start, len, prot | ProtFlags::PROT_WRITE))
-                .await?;
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("Cannot unprotect madvise refill at {start:#x}: {err}")
+                });
         }
         // This is safe since the recorder only records mapped addresses.
         let addr = unsafe { AddrMut::<u8>::from_raw_unchecked(start) };
@@ -202,9 +213,11 @@ impl Replayer {
         if !prot.contains(ProtFlags::PROT_WRITE) {
             guest
                 .inject_with_retry(protection(start, len, prot))
-                .await?;
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("Cannot reprotect madvise refill at {start:#x}: {err}")
+                });
         }
-        Ok(())
     }
 }
 
