@@ -21,9 +21,11 @@
 # Steps, all on the host, in the checkout: regenerate the Buck third-party rules
 # (bootstrap/regenerate-rust-deps), stage the RE link inputs for buck-hybrid
 # (shim/modes/stage-re-inputs), stage the inputs Buck does not build yet with a cargo
-# build in target/buck-e2e-stage (ci/buck-e2e/stage --from-cargo), then
+# build in the checkout's target/ (ci/buck-e2e/stage --from-cargo), then
 # ci/buck-e2e/run --no-verdict with -c hermit_e2e.hermit=staged, so the cells test that
-# cargo-built validate-profile hermit. The buck2 daemon is killed on every exit.
+# cargo-built validate-profile target/validate/hermit, the payload a Cargo-runner run
+# certifies. Nothing else in the full plan builds in the host target/ beside it: the
+# other Cargo nodes build in the pinned root, and setup.manifest_plan finishes first. The buck2 daemon is killed on every exit.
 # Network steps run through with-proxy when it is installed.
 #
 # Exit status: 0 once the rows are written, whatever the cells' verdicts (the twins judge
@@ -70,8 +72,8 @@ if [[ $mode == hybrid ]]; then
     step "staging the RE link inputs"
     "${proxy[@]}" ./shim/modes/stage-re-inputs
 fi
-step "staging the inputs Buck does not build (cargo, target/buck-e2e-stage)"
-"${proxy[@]}" ./ci/buck-e2e/stage --from-cargo --target-dir target/buck-e2e-stage
+step "staging the inputs Buck does not build (cargo, target/)"
+"${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
 rm -rf -- "${state:?}/results"
 mkdir -p "$state/work"
 step "running every cell under Buck ($runner)"

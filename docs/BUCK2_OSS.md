@@ -420,12 +420,14 @@ Buck plan nothing waits for them. They still run, and a failure still fails the
 validation, but the Buck cells no longer wait on them, so a failure among them
 no longer stops the cells early.
 
-The cells therefore test the Cargo-built validate-profile `hermit` staged at
-`target/buck-e2e-stage/validate/hermit`, with the same debug assertions and
-overflow checks as a Cargo-runner run. The ledger row records `release_builder:
-cargo`, `e2e_runner` (`cargo`, `buck-local` or `buck-hybrid`), and an
-`e2e_payload` whose path is that staged binary. A Buck-runner request is never
-answered from the tree cache. The host prerequisites below apply, and
+The cells therefore test the Cargo-built validate-profile
+`target/validate/hermit`, which `ci/buck-e2e/stage --from-cargo` builds on the
+host in the checkout's `target/`, with the same debug assertions and overflow
+checks as a Cargo-runner run. The ledger row records `release_builder: cargo`,
+the Cargo `e2e_payload` identity unchanged, and `e2e_runner` (`cargo`,
+`buck-local` or `buck-hybrid`). A Buck-runner request is never answered from the
+tree cache, and a Buck-runner row never answers a cargo request: the cache reads
+`e2e_runner` as well as the payload. The host prerequisites below apply, and
 `HERMIT_GIT_DEP_MIRRORS` must be set in the validation's environment when the
 proxy refuses GitHub to Reindeer.
 
