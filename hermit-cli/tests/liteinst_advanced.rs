@@ -1199,17 +1199,68 @@ struct ClockSample {
     uptime: i64,
 }
 
+/// DIAGNOSTIC ONLY (hosted-runner measurement for
+/// https://github.com/rrnewton/hermit/issues/3517; never for landing): print
+/// the host facts and a compact Detcore syscall, cost and commit trace.
+fn diag_dump_trace(backend: &str, output: &Output) {
+    static HOST_DONE: std::sync::Once = std::sync::Once::new();
+    HOST_DONE.call_once(|| {
+        let fixture = bootstrap_time_clock_trajectory().display().to_string();
+        let runtime = liteinst_runtime::liteinst_runtime_library()
+            .display()
+            .to_string();
+        let script = format!(
+            "uname -a; grep -m1 'model name' /proc/cpuinfo; grep -m1 '^flags' /proc/cpuinfo; \
+             nproc; cc --version | head -1; ls -la {fixture} {runtime}; \
+             readelf -lW {fixture} | grep -E 'Type|LOAD|INTERP|GNU_'; readelf -dW {fixture}; \
+             readelf -lW {runtime} | grep -E 'LOAD|GNU_'; readelf -dW {runtime} | grep -E 'NEEDED|PATH'; \
+             ls -la /lib64/ld-linux-x86-64.so.2 /etc/ld.so.preload 2>&1; cat /proc/sys/kernel/randomize_va_space"
+        );
+        let host = Command::new("sh").arg("-c").arg(&script).output();
+        match host {
+            Ok(host) => {
+                for line in String::from_utf8_lossy(&host.stdout).lines() {
+                    eprintln!("DIAGHOST {line}");
+                }
+                for line in String::from_utf8_lossy(&host.stderr).lines() {
+                    eprintln!("DIAGHOST-ERR {line}");
+                }
+            }
+            Err(error) => eprintln!("DIAGHOST failed: {error}"),
+        }
+    });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        let line = line.split(" DETLOG_RECORD=").next().unwrap_or(line);
+        let compact = if let Some(at) = line.find("inbound syscall: ") {
+            format!("S {}", &line[at + "inbound syscall: ".len()..])
+        } else if let Some(at) = line.find("COMMIT turn ") {
+            format!("C {}", &line[at + "COMMIT turn ".len()..])
+        } else if let Some(at) = line.find("added syscall cost of ") {
+            format!("T {}", &line[at + "added syscall cost of ".len()..])
+        } else if line.contains("liteinst") || line.contains("bootstrap") {
+            format!("L {line}")
+        } else {
+            continue;
+        };
+        let compact: String = compact.chars().take(240).collect();
+        eprintln!("DIAG {backend} {compact}");
+    }
+}
+
 fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
     if backend == "liteinst" {
         liteinst_runtime::ensure_liteinst_runtime();
     }
     let home = tempfile::tempdir().expect("failed to create clock-trajectory HOME");
     let output = bootstrap_time_command(backend, home.path())
+        .env("RUST_LOG", "detcore_model::time=trace")
         .arg("--")
         .arg(bootstrap_time_clock_trajectory())
         .output()
         .unwrap_or_else(|error| panic!("failed to run Hermit {backend}: {error}"));
     assert_bootstrap_time_success(backend, &output);
+    diag_dump_trace(backend, &output);
     let stdout = String::from_utf8(output.stdout).expect("clock trajectory output is UTF-8");
     let samples = stdout
         .lines()
@@ -1341,6 +1392,7 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
         exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
         "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
     );
+    panic!("DIAGNOSTIC branch: always fail so the hosted runner keeps the trace\nliteinst={liteinst:?}\nptrace={ptrace:?}");
 }
 
 /// LiteInst's dispatch record: it measures its patch candidates and finds some
