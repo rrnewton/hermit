@@ -5642,6 +5642,8 @@ impl Scheduler {
                 realtime_elapsed: None,
                 timeslice_stats,
                 per_thread_timeslice,
+                // The backend, not the scheduler, measures dispatch.
+                dispatch_stats: None,
             },
             info_reprio_descrip,
         ))

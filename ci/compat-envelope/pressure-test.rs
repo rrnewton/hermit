@@ -15529,6 +15529,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             scheduler_turns: 13,
             virtual_nanoseconds: 35,
             syscalls: Some(6),
+            dispatch: None,
         }),
         run2: None,
     };

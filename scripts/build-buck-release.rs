@@ -3634,7 +3634,7 @@ fn verify_closed_report_shape(value: &Value) -> Result<(), String> {
                     stats,
                     &format!("runtime.{run}"),
                     &["scheduler_turns", "virtual_nanoseconds"],
-                    &["scheduler_turns", "virtual_nanoseconds", "syscalls"],
+                    &["scheduler_turns", "virtual_nanoseconds", "syscalls", "dispatch"],
                 )?;
             }
         }

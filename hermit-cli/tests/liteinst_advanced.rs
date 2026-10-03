@@ -11,6 +11,8 @@
 // no tests, because there is no backend for them to exercise.
 #![cfg(feature = "liteinst")]
 
+#[path = "common/dispatch_stats.rs"]
+mod dispatch_stats;
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
@@ -1339,4 +1341,23 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
         exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
         "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
     );
+}
+
+/// LiteInst's dispatch record: it measures its patch candidates and finds some
+/// in the guest.
+#[test]
+fn liteinst_dispatch_record_reports_patched_sites() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let guest = dispatch_stats::build_guest("guest-liteinst", &[]);
+    let record = dispatch_stats::dispatch_record(
+        "liteinst",
+        &liteinst_runtime::hermit_binary(),
+        &[],
+        &guest,
+    );
+    let candidates = record
+        .sites
+        .candidates
+        .expect("LiteInst measures its candidates");
+    assert!(candidates > 0, "{record}");
 }

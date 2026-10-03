@@ -2744,10 +2744,19 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
     let debug_args = ["--log", "debug", "run", "--strict", "--", "/bin/true"];
     let debug_output = hermit(&debug_args);
     assert_success(&debug_output, &debug_args);
+    let debug_stderr = stderr(&debug_output);
     assert!(
-        stderr(&debug_output).contains("backend run complete backend=ptrace stats=metrics=none"),
-        "{}",
-        stderr(&debug_output)
+        debug_stderr.contains("backend run complete backend=ptrace stats=ptrace activity stats: "),
+        "{debug_stderr}"
+    );
+    let dispatch_marker = " dispatch=dispatch stats v1 backend=ptrace dispatches=";
+    let dispatches = debug_stderr
+        .split_once(dispatch_marker)
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("{debug_stderr}"));
+    assert!(
+        dispatches.starts_with(|c: char| c.is_ascii_digit()),
+        "ptrace always measures its dispatches: {debug_stderr}"
     );
 }
 

@@ -1640,6 +1640,18 @@ async fn run_sabre(
     }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
+    // Always collect: the statistics page is a descriptor the guest can see,
+    // so creating it only when a summary or DEBUG log is requested would make
+    // those flags change the guest's view. The plugin takes the variable out
+    // of the guest environment, and the descriptor sits above the plugin's
+    // fixed RPC socket.
+    let stats = reverie_sabre_stats::SabreStats::create(reverie::BackendStatsRequest::ENABLED)
+        .map_err(|error| anyhow!("failed to create the SaBRe statistics page: {error}"))?
+        .expect("an enabled request creates the statistics page");
+    command.env(
+        reverie_sabre_stats::BACKEND_STATS_ENV,
+        stats.raw_fd().to_string(),
+    );
 
     // THE SOCKET PATH IS DELIBERATELY RANDOM AND MUST NOT BE COMPARED.
     //
@@ -1687,6 +1699,7 @@ async fn run_sabre(
         fallback_ready,
         global.clone(),
         bootstrap_launch,
+        stats.clone(),
         capture_output,
     )
     .await
@@ -1758,8 +1771,13 @@ async fn run_sabre(
     if requires_forced_shutdown {
         global.cancel_internal_scheduler().await;
     }
+    let dispatch_stats = backend_stats::report(
+        Backend::Sabre,
+        backend_stats::request(print_summary_to_json_file),
+        &stats,
+    );
     global
-        .clean_up(print_summary, print_summary_to_json_file)
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
     tracing::info!(
         target: "hermit::sabre::fallback",
@@ -2617,17 +2635,33 @@ async fn dispatch_backend(
         #[cfg(feature = "liteinst")]
         {
             let preload = liteinst_runtime_library_path()?;
-            let (exit_status, mut global_state) =
-                reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                    command, config, preload,
-                )
-                .await?;
+            let stats_request = backend_stats::request(print_summary_to_json_file);
+            let (exit_status, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
+                let (exit_status, global_state, source) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                (exit_status, global_state, dispatch_stats)
+            } else {
+                let (exit_status, global_state) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (exit_status, global_state, None)
+            };
             if liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
             global_state
-                .clean_up(print_summary, print_summary_to_json_file)
+                .clean_up_with_dispatch_stats(
+                    print_summary,
+                    print_summary_to_json_file,
+                    dispatch_stats,
+                )
                 .await;
             return Ok(exit_status);
         }
@@ -2639,7 +2673,7 @@ async fn dispatch_backend(
     }
     ensure_backend_dispatch(backend)?;
 
-    let stats_request = backend_stats::request();
+    let stats_request = backend_stats::request(print_summary_to_json_file);
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -2656,12 +2690,14 @@ async fn dispatch_backend(
     }
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
-    let (exit_status, global_state) =
-        ptrace_completion::wait(builder.spawn().await?, control).await?;
+    let tracer = builder.backend_stats(stats_request).spawn().await?;
+    let stats_source = tracer.backend_stats();
+    let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+    let dispatch_stats =
+        backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
-        .clean_up(print_summary, print_summary_to_json_file)
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await; // Before it's dropped by this function.
-    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
 
@@ -2876,18 +2912,34 @@ async fn dispatch_output_backend(
         {
             command.stdin(output_backend_stdin()?);
             let preload = liteinst_runtime_library_path()?;
-            let (output, mut global_state) =
-                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                    command, config, preload,
-                )
-                .await?;
+            let stats_request = backend_stats::request(print_summary_to_json_file);
+            let (output, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
+                let (output, global_state, source) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+                        Detcore,
+                    >(command, config, preload)
+                    .await?;
+                let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                (output, global_state, dispatch_stats)
+            } else {
+                let (output, global_state) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (output, global_state, None)
+            };
             let status = output.status;
             if liteinst_requires_forced_shutdown(status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
             global_state
-                .clean_up(print_summary, print_summary_to_json_file)
+                .clean_up_with_dispatch_stats(
+                    print_summary,
+                    print_summary_to_json_file,
+                    dispatch_stats,
+                )
                 .await;
             return Ok(Output {
                 status,
@@ -2903,7 +2955,7 @@ async fn dispatch_output_backend(
     }
     ensure_backend_dispatch(backend)?;
 
-    let stats_request = backend_stats::request();
+    let stats_request = backend_stats::request(print_summary_to_json_file);
     command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -2923,12 +2975,14 @@ async fn dispatch_output_backend(
     }
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
-    let (output, global_state) =
-        ptrace_completion::wait_with_output(builder.spawn().await?, control).await?;
+    let tracer = builder.backend_stats(stats_request).spawn().await?;
+    let stats_source = tracer.backend_stats();
+    let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+    let dispatch_stats =
+        backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
-        .clean_up(print_summary, print_summary_to_json_file)
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
-    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }
 

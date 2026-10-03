@@ -481,6 +481,7 @@ fn runtime_stats(summary: &RunSummary) -> RuntimeStats {
         scheduler_turns: summary.sched_turns,
         virtual_nanoseconds: summary.virttime_elapsed,
         syscalls: summary.syscalls,
+        dispatch: summary.dispatch_stats.clone(),
     }
 }
 
@@ -3899,6 +3900,35 @@ mod tests {
         assert_eq!(json["verdict"], "no_result");
         assert_eq!(json["runtime"]["run1"]["virtual_nanoseconds"], 34);
         assert_eq!(json["runtime"]["run2"]["syscalls"], 6);
+        assert!(json["runtime"]["run1"].get("dispatch").is_none());
+    }
+
+    #[test]
+    fn report_carries_each_run_dispatch_record() {
+        let record = reverie::DispatchStats::new(
+            "ptrace",
+            reverie::DispatchCounters {
+                ptrace_seccomp_stops: Some(9),
+                ..reverie::DispatchCounters::ZERO
+            },
+            reverie::SiteCounters::NONE_PATCHED,
+        );
+        let first = RunSummary {
+            dispatch_stats: Some(record.clone()),
+            ..Default::default()
+        };
+        let runtime = verification_runtime_from_summaries(Some(&first), None)
+            .expect("one summary produces runtime totals");
+        assert_eq!(runtime.run1.unwrap().dispatch, Some(record.clone()));
+
+        let mut report = VerificationReport::no_result();
+        report.runtime = verification_runtime_from_summaries(Some(&first), Some(&first));
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["runtime"]["run2"]["dispatch"]["backend"], "ptrace");
+        assert_eq!(
+            json["runtime"]["run2"]["dispatch"]["schema_version"],
+            reverie::DISPATCH_STATS_SCHEMA_VERSION
+        );
     }
 
     #[test]

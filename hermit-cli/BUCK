@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.4.0",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "f4a19322a925268f855b9b5cad1c05fb71817246",
+    "HERMIT_REVERIE_PIN": "d766df20b7809d707e29bf7ceff24d3f52f0a3dc",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -84,6 +84,7 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
+        "//hermetic_infra/reverie:reverie-sabre-stats",
     ],
 )
 
@@ -182,6 +183,7 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
+        "//hermetic_infra/reverie:reverie-sabre-stats",
     ],
 )
 

@@ -425,7 +425,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 778 prior identities.
     // ci/manifest-plan dagrun_pin every_spelling_of_a_dagrun_declaration_is_found_and_refused
     // retains all 779 prior identities.
-    ("test.regular_crates", 783),
+    // https://github.com/rrnewton/hermit/pull/3522 adds
+    // runner::tests::a_passing_patching_backend_report_must_carry_a_consistent_dispatch_record,
+    // which retains all 783 prior identities.
+    ("test.regular_crates", 784),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -498,7 +501,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_start::tests::completion_hint_offers_plain_playback_before_the_gdb_session
     // (newcomer-audit CLI help and replay-hint wording) retain all 767 prior
     // identities.
-    ("test.hermit_unit", 790),
+    // https://github.com/rrnewton/hermit/pull/3522 adds
+    // backend_stats::tests::a_requested_summary_collects_without_debug_logging
+    // and verify::tests::report_carries_each_run_dispatch_record and removes
+    // backend_stats::tests::baseline_ptrace_snapshot_is_explicit, because
+    // ptrace now reports real dispatch counters instead of "metrics=none".
+    // The other 789 identities are retained.
+    ("test.hermit_unit", 791),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -572,7 +581,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // reopened_pipe_progress adds six reopened-pipe progress and host-pipe
     // full-read tests (https://github.com/rrnewton/hermit/pull/3534); they
     // retain all 183 prior identities.
-    ("test.hermit_integration", 189),
+    // The dispatch_stats binary adds ptrace_reports_seccomp_stops_and_no_patching
+    // and debug_log_carries_the_report_without_a_summary_file; both retain all
+    // 189 prior identities.
+    ("test.hermit_integration", 191),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -615,8 +627,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
     // identities.
-    ("test.liteinst_strict", 27),
-    ("test.sabre_examples", 6),
+    // liteinst_dispatch_record_reports_patched_sites retains all 27 prior
+    // identities.
+    ("test.liteinst_strict", 28),
+    // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
+    // prior identities.
+    ("test.sabre_examples", 7),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -664,7 +680,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // It also selects the four verify-claim wording tests.
     // The host twin also selects the six reopened_pipe_progress tests
     // (https://github.com/rrnewton/hermit/pull/3534).
-    ("test.hermit_integration_on_host", 189),
+    // The host twin also selects the two dispatch_stats tests
+    // (https://github.com/rrnewton/hermit/pull/3522).
+    ("test.hermit_integration_on_host", 191),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -676,13 +694,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3598 test,
     // and the two Cargo version-format tests
     // (https://github.com/rrnewton/hermit/pull/3547).
-    ("test.hermit_unit_on_host", 790),
+    // The host twin carries the same dispatch-record change (+2, -1;
+    // https://github.com/rrnewton/hermit/pull/3522).
+    ("test.hermit_unit_on_host", 791),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
-    // identities.
-    ("test.liteinst_strict_on_host", 27),
+    // identities. The host twin also selects
+    // liteinst_dispatch_record_reports_patched_sites.
+    ("test.liteinst_strict_on_host", 28),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
@@ -691,9 +712,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
     // The dagrun pin guard retains all 778 prior identities.
     // Its every-spelling companion retains all 779 prior identities.
-    ("test.regular_crates_on_host", 783),
+    // The dispatch-record runner test retains all 783 prior identities
+    // (https://github.com/rrnewton/hermit/pull/3522).
+    ("test.regular_crates_on_host", 784),
     ("test.rr_suite_contract_on_host", 1),
-    ("test.sabre_examples_on_host", 6),
+    // The host twin also selects
+    // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
+    ("test.sabre_examples_on_host", 7),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -2948,7 +2973,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -2964,6 +2989,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"clock_passthrough"########,
             r########"container_init_deadline"########,
             r########"cpufreq_avg_determinism"########,
+            r########"dispatch_stats"########,
             r########"epoll_determinism"########,
             r########"epoll_pwait_zero_timeout_progress"########,
             r########"file_nr_determinism"########,

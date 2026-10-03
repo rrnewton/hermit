@@ -21,6 +21,7 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:shell-words",
         "fbsource//third-party/rust:tracing",
+        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-syscalls",
     ],
 )

@@ -784,7 +784,20 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    pub async fn clean_up(self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+        self.clean_up_with_dispatch_stats(to_stderr, print_summary_to_json_file, None)
+            .await
+    }
+
+    /// [`Self::clean_up`], also carrying the backend's dispatch record into the
+    /// machine-readable summary. The human-readable report, including the INFO
+    /// view `--verify` compares, never shows it.
+    pub async fn clean_up_with_dispatch_stats(
+        mut self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
@@ -794,6 +807,7 @@ impl GlobalState {
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
         let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
+        summary.dispatch_stats = dispatch_stats;
 
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {

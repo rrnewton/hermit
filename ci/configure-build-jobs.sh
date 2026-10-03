@@ -643,8 +643,26 @@ fi
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. Client
 # preparation still rebuilds the on-demand client from the new client.c. This is
 # source-identity carry, not a new timing sample or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f4a19322a925268f855b9b5cad1c05fb71817246 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f4a19322a925268f855b9b5cad1c05fb71817246 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO d766df20b7809d707e29bf7ceff24d3f52f0a3dc (2026-10-03): from
+# f4a19322a925268f855b9b5cad1c05fb71817246, the 30-commit range (the shared dispatch-stats record,
+# libc 0.2.190, the gdbstub T packet and breakpoint fixes, KVM descriptor fixes,
+# alias tests, LiteInst fallback switches, and the reverie-sabre-stats Buck target)
+# changes reverie-dbt only in native/client.c, a new native/reverie_vdso_symbols.h,
+# src/backend_stats.rs and a new tests/vdso_symbol_header.rs (tree
+# c513f8f99c52e047591e8526da6332a099dde509 -> ee627a7227998bdd91018dab1efbe6ab7964ec6b).
+# None is an input to the DynamoRIO SDK recipe key above. Cargo.toml remains blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, native/CMakeLists.txt remains blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3 and DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains blob
+# 4168dea2771f18a00fb1afdfd2218efba415ecbb; rust-toolchain.toml remains blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. Client
+# preparation still rebuilds the on-demand client from the new client.c. This is
+# source-identity carry, not a new timing sample or runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d766df20b7809d707e29bf7ceff24d3f52f0a3dc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d766df20b7809d707e29bf7ceff24d3f52f0a3dc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

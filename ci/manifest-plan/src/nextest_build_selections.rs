@@ -74,6 +74,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cpufreq_avg_determinism",
             "--test",
+            "dispatch_stats",
+            "--test",
             "epoll_determinism",
             "--test",
             "epoll_pwait_zero_timeout_progress",
@@ -601,10 +603,15 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "189");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "191");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "reopened_pipe_progress"])
+            );
+            // The ptrace dispatch record and its DEBUG-only control.
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "dispatch_stats"])
             );
             assert!(
                 step.integration_test_binaries
@@ -612,6 +619,13 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|binary| binary == "reopened_pipe_progress")
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "dispatch_stats")
             );
             assert!(
                 args.windows(2)

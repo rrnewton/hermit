@@ -3530,6 +3530,48 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
     VerificationReport::from_current_json_slice(bytes)
 }
+
+/// Backends whose every completed run must carry a dispatch record.
+const DISPATCH_RECORD_BACKENDS: [&str; 3] = ["ptrace", "liteinst", "sabre"];
+
+/// Why a passing verify report's runtime does not carry each run's dispatch
+/// record for `backend`, or `None` when it does.
+///
+/// Only a run whose summary was read is checked: a report without runtime has
+/// nothing to carry the record in. KVM and DBT have no record, and native runs
+/// no backend, so they are not checked.
+fn dispatch_record_error(backend: &str, runtime: Option<&VerificationRuntime>) -> Option<String> {
+    if !DISPATCH_RECORD_BACKENDS.contains(&backend) {
+        return None;
+    }
+    let runtime = runtime?;
+    [
+        ("run1", runtime.run1.as_ref()),
+        ("run2", runtime.run2.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(run, stats)| Some((run, stats?)))
+    .find_map(|(run, stats)| {
+        let Some(record) = &stats.dispatch else {
+            return Some(format!(
+                "verification runtime.{run} carries no {backend} dispatch record"
+            ));
+        };
+        if record.backend != backend {
+            return Some(format!(
+                "verification runtime.{run} dispatch record names backend {}, expected {backend}",
+                record.backend
+            ));
+        }
+        let inconsistencies = record.inconsistencies();
+        (!inconsistencies.is_empty()).then(|| {
+            format!(
+                "verification runtime.{run} dispatch record is inconsistent: {}",
+                inconsistencies.join("; ")
+            )
+        })
+    })
+}
 pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
         spec,
@@ -4029,6 +4071,18 @@ fn execute_spec_until(
                 error_kind = Some("incomplete-verification-evidence".into());
                 reason = Some(format!("verification report is missing: {error}"));
             }
+        }
+    }
+    if outcome == "PASS" {
+        if let Some(error) = spec
+            .id
+            .backend
+            .as_deref()
+            .and_then(|backend| dispatch_record_error(backend, runtime.as_ref()))
+        {
+            outcome = "ERROR".into();
+            error_kind = Some("incomplete-verification-evidence".into());
+            reason = Some(error);
         }
     }
     if let Some(timeout) = output.timeout {
@@ -7317,9 +7371,139 @@ mod tests {
 
     use super::PRODUCER_STRIPPED_REPORT;
 
+    /// A ptrace dispatch record that satisfies [`dispatch_record_error`].
+    fn ptrace_dispatch_record() -> detcore_model::summary::DispatchStats {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "backend": "ptrace",
+            "counters": {
+                "signal_traps": 0,
+                "patched_direct_calls": 0,
+                "ptrace_seccomp_stops": 40,
+                "ptrace_sigtrap_stops": 0,
+                "sigill_marker_hits": 0,
+                "ptrace_syscall_entry_stops": 0,
+                "ptrace_syscall_exit_stops": 0,
+                "refusals": 0
+            },
+            "sites": {"candidates": 0, "patched": 0, "fell_back": 0}
+        }))
+        .unwrap()
+    }
+
+    /// The producer report above predates the dispatch record; a current
+    /// ptrace run carries one in each run's runtime.
+    fn with_ptrace_dispatch(mut report: VerificationReport) -> VerificationReport {
+        let runtime = report.runtime.as_mut().unwrap();
+        for stats in [runtime.run1.as_mut(), runtime.run2.as_mut()] {
+            stats.unwrap().dispatch = Some(ptrace_dispatch_record());
+        }
+        report
+    }
+
+    #[test]
+    fn a_passing_patching_backend_report_must_carry_a_consistent_dispatch_record() {
+        let current = with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
+        let pass = attempt_with_report(None, Comparator::Stripped, current.clone(), "exit 0", 5);
+        assert_eq!(pass.outcome, "PASS", "{:?}", pass.reason);
+        assert_eq!(
+            pass.runtime
+                .as_ref()
+                .unwrap()
+                .run2
+                .as_ref()
+                .unwrap()
+                .dispatch,
+            Some(ptrace_dispatch_record())
+        );
+
+        let refused = |report: VerificationReport, expected: &str| {
+            let result = attempt_with_report(None, Comparator::Stripped, report, "exit 0", 5);
+            assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+            assert_eq!(
+                result.error_kind.as_deref(),
+                Some("incomplete-verification-evidence")
+            );
+            assert!(
+                result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{:?}",
+                result.reason
+            );
+        };
+        let mut missing = current.clone();
+        missing
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run2
+            .as_mut()
+            .unwrap()
+            .dispatch = None;
+        refused(missing, "runtime.run2 carries no ptrace dispatch record");
+        let mut relabeled = current.clone();
+        relabeled
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .backend = "liteinst".into();
+        refused(relabeled, "names backend liteinst, expected ptrace");
+        let mut impossible = current.clone();
+        impossible
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .sites
+            .patched = Some(1);
+        refused(impossible, "exceeds candidates 0");
+
+        // A failing comparison keeps its own classification.
+        let mut diverged = current;
+        diverged.verified = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch = None;
+        let fail = attempt_with_report(None, Comparator::Stripped, diverged, "exit 1", 5);
+        assert_eq!(fail.outcome, "FAIL", "{:?}", fail.reason);
+
+        // Backends without a record are not held to one.
+        let historical: VerificationReport =
+            serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        assert_eq!(
+            dispatch_record_error("kvm", historical.runtime.as_ref()),
+            None
+        );
+        assert_eq!(
+            dispatch_record_error("dbt", historical.runtime.as_ref()),
+            None
+        );
+        assert_eq!(dispatch_record_error("ptrace", None), None);
+        assert!(dispatch_record_error("sabre", historical.runtime.as_ref()).is_some());
+    }
+
     #[test]
     fn a_stripped_cell_passes_only_a_matched_report_and_a_strict_one_still_needs_canonical() {
-        let matched: VerificationReport = serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        let matched = with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
         assert_eq!(
             matched.comparison.as_ref().unwrap().strictness,
             crate::canonical_verdict::LogCompareStrictness::Stripped

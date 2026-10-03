@@ -805,6 +805,11 @@ pub struct RunOpts {
     /// not have to recover any count from the presentation banner.
     #[clap(skip)]
     e9patch_engagement: Option<BackendEngagement>,
+
+    /// The root-image rewrite's sites in the dispatch record's terms; every
+    /// count is unmeasured when the root executable was not an ELF image.
+    #[clap(skip)]
+    e9patch_sites: Option<reverie::SiteCounters>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -4375,6 +4380,7 @@ impl RunOpts {
                 mapped_sites: 0,
                 b0_sites: 0,
             });
+            self.e9patch_sites = Some(reverie::SiteCounters::default());
             eprintln!(
                 ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
                  main_executable=non-ELF; preprocessing=not-applicable"
@@ -4393,6 +4399,10 @@ impl RunOpts {
             b0_sites: u64::try_from(prepared.b0_sites)
                 .map_err(|_| Error::msg("e9patch B0-site count does not fit u64"))?,
         });
+        self.e9patch_sites = Some(reverie::SiteCounters::from_rewrite(
+            prepared.candidate_sites as u64,
+            prepared.patched_sites as u64,
+        ));
         if prepared.patched_sites != 0 {
             self.validate_e9patch_mount_targets()?;
             self.validate_e9patch_source_visibility(&prepared.binary)?;
@@ -5421,34 +5431,59 @@ impl RunOpts {
             self.summary_json.as_deref(),
             guest_capture,
             |summary_json| {
-                if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-                    let out = hermit::run_with_output_backend_timeout(
-                        command,
-                        config,
-                        self.summary,
-                        summary_json,
-                        backend,
-                        timeout,
-                    )?;
-                    if let Some(capture) = guest_capture {
-                        capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
-                        Ok((out.status, None))
+                let result =
+                    if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
+                        let out = hermit::run_with_output_backend_timeout(
+                            command,
+                            config,
+                            self.summary,
+                            summary_json,
+                            backend,
+                            timeout,
+                        )?;
+                        if let Some(capture) = guest_capture {
+                            capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
+                            (out.status, None)
+                        } else {
+                            (out.status, Some(out))
+                        }
                     } else {
-                        Ok((out.status, Some(out)))
-                    }
-                } else {
-                    let status = hermit::run_with_backend_timeout(
-                        command,
-                        config,
-                        self.summary,
-                        summary_json,
-                        backend,
-                        timeout,
-                    )?;
-                    Ok((status, None))
-                }
+                        let status = hermit::run_with_backend_timeout(
+                            command,
+                            config,
+                            self.summary,
+                            summary_json,
+                            backend,
+                            timeout,
+                        )?;
+                        (status, None)
+                    };
+                self.relabel_e9patch_dispatch_stats(summary_json)?;
+                Ok(result)
             },
         )
+    }
+
+    /// The e9patch spelling runs on the ptrace runtime, which records its
+    /// dispatch as ptrace's. Attribute that record to e9patch, with the
+    /// sites the rewrite measured; the tracer's stop counts stand, since a
+    /// patched site still reaches it through a ptrace stop.
+    fn relabel_e9patch_dispatch_stats(&self, summary_json: &Option<PathBuf>) -> Result<(), Error> {
+        let (Some(path), Some(sites)) = (summary_json, self.e9patch_sites) else {
+            return Ok(());
+        };
+        let mut summary: RunSummary = serde_json::from_slice(
+            &fs::read(path)
+                .with_context(|| format!("reading the e9patch run summary {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing the e9patch run summary {}", path.display()))?;
+        let Some(record) = summary.dispatch_stats.as_mut() else {
+            return Ok(());
+        };
+        record.backend = Backend::E9patch.as_str().to_owned();
+        record.sites = sites;
+        fs::write(path, serde_json::to_string_pretty(&summary)? + "\n")
+            .with_context(|| format!("writing the e9patch run summary {}", path.display()))
     }
 
     fn run_verify_in_container(
@@ -5500,14 +5535,16 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output_backend_timeout_and_skid_overshoots(
+        let result = hermit::run_with_output_backend_timeout_and_skid_overshoots(
             command,
             config,
             self.summary,
             &self.summary_json,
             self.runtime_backend(),
             None,
-        )
+        )?;
+        self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
+        Ok(result)
     }
 }
 

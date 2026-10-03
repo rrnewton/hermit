@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/dispatch_stats.rs"]
+mod dispatch_stats;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
@@ -770,4 +773,45 @@ int main(void) {
     );
 
     assert_backend_parity_and_sabre_verify(&program, &[], &loader, "public libc getrandom");
+}
+
+/// SaBRe's dispatch record: its rewrite sites are measured, and every tracer
+/// syscall-exit stop follows an entry stop.
+#[test]
+fn sabre_dispatch_record_reports_its_routes_and_tracer_stops() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let guest = dispatch_stats::build_guest("guest-sabre", &[]);
+    let record = dispatch_stats::dispatch_record(
+        "sabre",
+        &hermit_binary(),
+        &[("HERMIT_SABRE_BINARY", &loader)],
+        &guest,
+    );
+    assert!(
+        record.sites.candidates.is_some_and(|sites| sites > 0),
+        "{record}"
+    );
+    assert!(
+        record.sites.patched.is_some_and(|sites| sites > 0),
+        "{record}"
+    );
+    assert!(
+        record
+            .counters
+            .patched_direct_calls
+            .is_some_and(|calls| calls > 0),
+        "{record}"
+    );
+    let (Some(exit_stops), Some(entry_stops)) = (
+        record.counters.ptrace_syscall_exit_stops,
+        record.counters.ptrace_syscall_entry_stops,
+    ) else {
+        panic!("the SaBRe supervisor must measure its syscall stops: {record}");
+    };
+    assert!(
+        exit_stops <= entry_stops,
+        "a syscall exit stop without its entry: {record}"
+    );
 }
