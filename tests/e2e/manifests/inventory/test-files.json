@@ -2002,7 +2002,13 @@
       "disposition": "guest-fixture",
       "path": "tests/c/utimensat_mtime.c",
       "runner": "hermit-cli/tests/utimensat_mtime.rs",
-      "why": "tests/c/utimensat_mtime.c is owned by hermit-cli/tests/utimensat_mtime.rs: Guest that writes two files, then sets their mtimes through utimensat (explicit, UTIME_OMIT and a touch -r style copy), futimens and utimes, and checks each value with stat; a later write must still move the mtime. It passes natively, and the Rust integration test runs it natively and under hermit run --strict --verify --verify-strict, requiring bitwise parity with compared INFO messages. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+      "why": "tests/c/utimensat_mtime.c is owned by hermit-cli/tests/utimensat_mtime.rs: Guest that writes two files, then sets their mtimes through utimensat (explicit, UTIME_OMIT and a touch -r style copy), futimens and utimes, and through the raw utime and utimes syscalls (explicit and NULL), and checks each value with stat; a later write must still move the mtime. It passes natively, and the Rust integration test runs it natively and under hermit run --strict --verify --verify-strict, requiring bitwise parity with compared INFO messages. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/utimensat_rename_race.c",
+      "runner": "hermit-cli/tests/utimensat_mtime.rs",
+      "why": "tests/c/utimensat_rename_race.c is owned by hermit-cli/tests/utimensat_mtime.rs: Two-thread guest in which one thread sets an explicit mtime on a name through utimensat while the other renames prepared, hard-linked files over that name; it reports which files it sees with the explicit mtime. The Rust integration test runs it natively and under hermit run --no-sequentialize-threads and requires every file the guest sees with the explicit mtime to really have it on the host. Driven only by its own integration test and nondeterministic by design, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "disposition": "manifest-test",

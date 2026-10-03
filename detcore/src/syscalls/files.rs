@@ -3690,18 +3690,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utime,
     ) -> Result<i64, Errno> {
-        let mut stack = guest.stack().await;
-        let mut memory = guest.memory();
-        let tp: AddrMut<[Timespec; 2]> = stack.reserve();
-
-        let tp_val = match call.times() {
+        let times = match call.times() {
             None => {
                 let now: Timespec = thread_observe_time(guest).await.into();
                 [now, now]
             }
             Some(times) => {
-                let utimptr = times;
-                let utimbuf = memory.read_value(utimptr)?;
+                let utimbuf = guest.memory().read_value(times)?;
                 [
                     Timespec {
                         tv_sec: utimbuf.actime,
@@ -3715,15 +3710,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
-        memory.write_value(tp, &tp_val)?;
-        stack.commit()?;
-
         let utimensat = syscalls::Utimensat::new()
             .with_dirfd(libc::AT_FDCWD)
-            .with_path(call.path())
-            .with_times(Some(tp.into()));
+            .with_path(call.path());
 
-        self.handle_utimensat(guest, utimensat).await
+        self.set_file_times(guest, utimensat, Some(times)).await
     }
 
     /// utimes syscall
@@ -3732,19 +3723,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utimes,
     ) -> Result<i64, Errno> {
-        let mut memory = guest.memory();
+        let utimensat = syscalls::Utimensat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(call.filename());
 
-        let tp: AddrMut<[Timespec; 2]> = match call.times() {
+        match call.times() {
             None => {
                 let now: Timespec = thread_observe_time(guest).await.into();
-                let mut stack = guest.stack().await;
-                let tp: AddrMut<[Timespec; 2]> = stack.reserve();
-                memory.write_value(tp, &[now, now])?;
-                stack.commit()?;
-                tp
+                self.set_file_times(guest, utimensat, Some([now, now]))
+                    .await
             }
             Some(times) => {
                 // Convert the timeval array to a timespec array.
+                let mut memory = guest.memory();
                 let tvs = memory.read_value(times)?;
                 let tp: Addr<[Timespec; 2]> = times.cast();
 
@@ -3753,16 +3744,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let tp = unsafe { tp.into_mut() };
 
                 memory.write_value(tp, &[tvs[0].into(), tvs[1].into()])?;
-                tp
+                self.set_file_times(guest, utimensat.with_times(Some(tp.into())), None)
+                    .await
             }
-        };
-
-        let utimensat = syscalls::Utimensat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_path(call.filename())
-            .with_times(Some(tp.into()));
-
-        self.handle_utimensat(guest, utimensat).await
+        }
     }
 
     /// ustimensat syscall
@@ -3771,40 +3756,100 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utimensat,
     ) -> Result<i64, Errno> {
-        let res = self.record_or_replay(guest, call).await?;
-        if !guest.config().virtualize_metadata {
-            return Ok(res);
+        self.set_file_times(guest, call, None).await
+    }
+
+    /// Performs a utimensat call and copies the mtime it sets into the virtual
+    /// mtime. With `staged` the times are first pushed onto the guest's scratch
+    /// stack and replace the call's `times` pointer; utime and utimes(NULL)
+    /// build their times that way.
+    async fn set_file_times<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Utimensat,
+        staged: Option<[Timespec; 2]>,
+    ) -> Result<i64, Errno> {
+        if !guest.config().virtualize_metadata && staged.is_none() {
+            return self.record_or_replay(guest, call).await;
         }
 
-        // The kernel has applied the new times to the real file, but the guest
+        // The staged times and the buffer for the target lookups share one
+        // scratch stack, and its guard is held until the last injected syscall
+        // has run, so that neither the kernel's read of the times nor a lookup
+        // finds the other's bytes, or a restored stack, at its address.
+        let mut stack = guest.stack().await;
+        let call = match staged {
+            Some(times) => call.with_times(Some(stack.push(times))),
+            None => call,
+        };
+        let statptr: StatPtr = StatPtr(stack.reserve());
+        let _guard = stack.commit()?;
+
+        if !guest.config().virtualize_metadata {
+            return self.record_or_replay(guest, call).await;
+        }
+
+        // The kernel applies the new times to the real file, but the guest
         // observes the virtual mtime, which otherwise only moves on writes. Copy
         // the requested mtime into it so that `tar` extraction, `cp -p` and
         // `touch -r` restore a file's mtime and `make` compares the times the
         // build asked for rather than the order in which files were unpacked.
-        // Reading the times back cannot fault: the kernel just read them.
-        let mtime = match call.times() {
-            None => libc::timespec {
+        //
+        // Nothing below may change the syscall's result: an unreadable `times`
+        // or a failed lookup only skips the virtual update, and the kernel
+        // reports its own error for the call itself.
+        let mtime = match (staged, call.times()) {
+            (Some([_, mtime]), _) => Some(mtime),
+            (None, None) => Some(Timespec {
                 tv_sec: 0,
                 tv_nsec: libc::UTIME_NOW,
-            },
-            Some(times) => {
-                let [_, mtime] = guest.memory().read_value(times)?;
-                libc::timespec {
-                    tv_sec: mtime.tv_sec,
-                    tv_nsec: mtime.tv_nsec,
-                }
-            }
+            }),
+            (None, Some(times)) => guest
+                .memory()
+                .read_value(times)
+                .ok()
+                .map(|[_, mtime]| mtime),
+        }
+        .filter(|mtime| mtime.tv_nsec != libc::UTIME_OMIT);
+        let before = match mtime {
+            Some(_) => self.utimensat_target(guest, &call, statptr).await,
+            None => None,
         };
-        if mtime.tv_nsec == libc::UTIME_OMIT {
+
+        let res = self.record_or_replay(guest, call).await?;
+
+        // Update only the inode the kernel modified. Without thread
+        // sequentialization another guest thread can rename, unlink or replace
+        // the target, or dup2 over the descriptor, around the call; the target
+        // is resolved before and after it, and the update is skipped unless
+        // both name the same file.
+        let (Some(mtime), Some(before)) = (mtime, before) else {
+            return Ok(res);
+        };
+        if self.utimensat_target(guest, &call, statptr).await != Some(before) {
             return Ok(res);
         }
+        let (_, raw_ino) = before;
+        if mtime.tv_nsec == libc::UTIME_NOW {
+            touch_file(guest, raw_ino).await;
+        } else {
+            let nanos = i128::from(mtime.tv_sec) * 1_000_000_000 + i128::from(mtime.tv_nsec);
+            let nanos = u64::try_from(nanos.max(0)).unwrap_or(u64::MAX);
+            set_file_mtime(guest, raw_ino, LogicalTime::from_nanos(nanos)).await;
+        }
+        Ok(res)
+    }
 
-        // Find the raw inode the kernel just updated, with the same target
-        // selection: the descriptor itself for `futimens` (a NULL path), else a
-        // path walk honoring the flags utimensat accepts.
-        let mut stack = guest.stack().await;
-        let statptr: StatPtr = StatPtr(stack.reserve());
-        stack.commit()?;
+    /// The device and raw inode of the file a utimensat call targets, with the
+    /// same target selection: the descriptor itself for `futimens` (a NULL
+    /// path), else a path walk honoring the flags utimensat accepts. `None` if
+    /// the lookup fails.
+    async fn utimensat_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::Utimensat,
+        statptr: StatPtr<'_>,
+    ) -> Option<(u64, RawInode)> {
         let lookup = match call.path() {
             None => Syscall::Fstat(
                 syscalls::Fstat::new()
@@ -3822,17 +3867,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             }
         };
-        self.record_or_replay(guest, lookup).await?;
-        let raw_ino: RawInode = statptr.read(&guest.memory())?.st_ino;
-
-        if mtime.tv_nsec == libc::UTIME_NOW {
-            touch_file(guest, raw_ino).await;
-        } else {
-            let nanos = i128::from(mtime.tv_sec) * 1_000_000_000 + i128::from(mtime.tv_nsec);
-            let nanos = u64::try_from(nanos.max(0)).unwrap_or(u64::MAX);
-            set_file_mtime(guest, raw_ino, LogicalTime::from_nanos(nanos)).await;
-        }
-        Ok(res)
+        self.record_or_replay(guest, lookup).await.ok()?;
+        let stat = statptr.read(&guest.memory()).ok()?;
+        Some((stat.st_dev, stat.st_ino))
     }
 
     /// socket system call.
