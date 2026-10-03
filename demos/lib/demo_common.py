@@ -58,7 +58,10 @@ WALLCLOCK_RE = re.compile(
 # derives N deterministically (determinize_inode in detcore/src/tool_global.rs),
 # so it too is compared exactly.
 HOST_ADDR_RE = re.compile(r"<hostaddr (0[xX][A-Fa-f0-9]+)>")
-RUN_METADATA_SCHEMA_VERSION = 2
+# Schema 2 made qemu_binary_sha256 required. Schema 3 adds guest_exit_status,
+# the guest command's exit status, to qemu-resume rows and requires it there.
+RUN_METADATA_SCHEMA_VERSION = 3
+SUPPORTED_RUN_METADATA_SCHEMA_VERSIONS = (1, 2, RUN_METADATA_SCHEMA_VERSION)
 
 
 class QemuRunKind(str, Enum):
@@ -87,6 +90,7 @@ class QemuRunMetadataRecord(TypedDict, total=False):
     command_sha256: str
     guest_output: str
     guest_output_sha256: str
+    guest_exit_status: int
     snapshot_saved: bool
 
 
@@ -113,6 +117,7 @@ class QemuRunMetadata:
     guest_output: Optional[str]
     guest_output_sha256: Optional[str]
     snapshot_saved: Optional[bool]
+    guest_exit_status: Optional[int]
     raw: QemuRunMetadataRecord
 
     def with_info_log(self, path: Path) -> "QemuRunMetadata":
@@ -151,6 +156,7 @@ RESUME_METADATA_FIELDS = COMMON_METADATA_FIELDS | frozenset(
         "command_sha256",
         "guest_output",
         "guest_output_sha256",
+        "guest_exit_status",
         "snapshot_saved",
         "qcow2_path",
         "qcow2_sha256",
@@ -205,6 +211,17 @@ def _metadata_qemu_argv(value: Mapping[str, Any]) -> Tuple[str, ...]:
     return tuple(raw)
 
 
+def _metadata_optional_exit_status(value: Mapping[str, Any]) -> Optional[int]:
+    if "guest_exit_status" not in value:
+        return None
+    raw = value.get("guest_exit_status")
+    if not isinstance(raw, int) or isinstance(raw, bool) or not 0 <= raw <= 255:
+        raise _metadata_error(
+            "guest_exit_status", "must be an integer from 0 to 255"
+        )
+    return raw
+
+
 def _metadata_optional_size(value: Mapping[str, Any]) -> Optional[int]:
     if "qcow2_size" not in value:
         return None
@@ -220,7 +237,7 @@ def parse_run_metadata(value: Mapping[str, Any]) -> QemuRunMetadata:
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in (1, RUN_METADATA_SCHEMA_VERSION)
+        or schema_version not in SUPPORTED_RUN_METADATA_SCHEMA_VERSIONS
     ):
         raise _metadata_error(
             "schema_version", "unsupported value {!r}".format(schema_version)
@@ -267,6 +284,7 @@ def parse_run_metadata(value: Mapping[str, Any]) -> QemuRunMetadata:
     command_sha256 = _metadata_optional_sha256(value, "command_sha256")
     guest_output = _metadata_optional_text(value, "guest_output")
     guest_output_sha256 = _metadata_optional_sha256(value, "guest_output_sha256")
+    guest_exit_status = _metadata_optional_exit_status(value)
     snapshot_saved = value.get("snapshot_saved")
     if snapshot_saved is not None and not isinstance(snapshot_saved, bool):
         raise _metadata_error("snapshot_saved", "must be a boolean")
@@ -296,6 +314,16 @@ def parse_run_metadata(value: Mapping[str, Any]) -> QemuRunMetadata:
         ):
             if parsed is None:
                 raise _metadata_error(field, "is required for qemu-resume")
+        if schema_version >= 3 and guest_exit_status is None:
+            raise _metadata_error(
+                "guest_exit_status",
+                "is required for qemu-resume from schema 3 on",
+            )
+        if schema_version < 3 and guest_exit_status is not None:
+            raise _metadata_error(
+                "guest_exit_status",
+                "is not part of schema {}".format(schema_version),
+            )
         if snapshot_saved is None:
             raise _metadata_error("snapshot_saved", "is required for qemu-resume")
         if qemu_binary_sha256 is None and not (
@@ -360,6 +388,7 @@ def parse_run_metadata(value: Mapping[str, Any]) -> QemuRunMetadata:
         guest_output=guest_output,
         guest_output_sha256=guest_output_sha256,
         snapshot_saved=snapshot_saved,
+        guest_exit_status=guest_exit_status,
         raw=cast(QemuRunMetadataRecord, dict(value)),
     )
 
@@ -932,6 +961,11 @@ def compare_runs(
             anchor.guest_output_sha256,
             current.guest_output_sha256,
             "guest output SHA-256",
+        ),
+        (
+            anchor.guest_exit_status,
+            current.guest_exit_status,
+            "guest command exit status",
         ),
     ):
         if anchor_value is None and current_value is None:

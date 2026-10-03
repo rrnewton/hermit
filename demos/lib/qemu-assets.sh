@@ -17,7 +17,7 @@ KERNEL_URL="${QEMU_KERNEL_URL:-$DEFAULT_KERNEL_URL}"
 QEMU="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
 PYTHON="${QEMU_DEMO_PYTHON:-$(command -v python3 || true)}"
 # Bump when the initramfs contents change, so cached copies are rebuilt.
-INITRAMFS_VERSION=7
+INITRAMFS_VERSION=8
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 CHECK_ONLY=0
 
@@ -176,6 +176,23 @@ if [ ! -r "$ARTIFACT_DIR/initramfs.cpio.gz" ] || \
   # its cached blocks, so a read after a snapshot restore sees the command the
   # host wrote in the meantime. The loop sleeps rather than spins because
   # demos 5 and 6 run the guest without timer preemption.
+  #
+  # The command's output is framed so that nothing the command prints can be
+  # mistaken for the frame. /init prints a BEGIN line naming the frame format,
+  # runs the command with its stdout and stderr going to a file, then prints
+  # that file with "| " in front of every line, and last an END line carrying
+  # the command's exit status. Output the command writes to its stdout or
+  # stderr can therefore only appear as "| " lines, so a command that prints
+  # the END marker itself (for example `echo __HERMIT_COMMAND_END__; sleep
+  # 1000000`) cannot end the host's wait or cut its output short. (A command
+  # that writes straight to /dev/console bypasses the file and can still
+  # print any line.) A file rather than a pipe keeps $? the command's own
+  # status, starts no extra process before the command runs, so guest pids
+  # are unchanged, and lets a background job the command started keep its
+  # output open without delaying END; the output therefore appears only after
+  # the command has exited. The host side is CommandTranscriptParser in
+  # demos/lib/qemu_controller.py: change the two together and bump
+  # INITRAMFS_VERSION.
   cat >"$root/init" <<'INIT'
 #!/bin/sh
 mount -t proc     none /proc 2>/dev/null
@@ -196,9 +213,13 @@ while :; do
   esac
   sleep 1
 done
-echo "__HERMIT_COMMAND_BEGIN__"
-sh -c "$CMD"
-echo "__HERMIT_COMMAND_END__"
+echo "__HERMIT_COMMAND_BEGIN__ format=2"
+sh -c "$CMD" >/tmp/.hermit-command-output 2>&1
+STATUS=$?
+while IFS= read -r LINE || [ -n "$LINE" ]; do
+  printf '| %s\n' "$LINE"
+done </tmp/.hermit-command-output
+echo "__HERMIT_COMMAND_END__ status=$STATUS"
 echo "Interactive busybox shell. Type 'poweroff -f' to exit."
 exec setsid cttyhack sh
 INIT

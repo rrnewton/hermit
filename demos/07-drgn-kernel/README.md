@@ -147,8 +147,14 @@ use.
 
 To advance, the demo resumes Hermit's tracer, tells QEMU to continue over its
 control socket, and waits for the command's completion marker on the serial
-port. It then pauses QEMU and stops the tracer again for the second read. Guest
-time advances only between the two reads. The command asks for a 1 millisecond
+port. Since 2026-10-02 the guest's `/init` saves the command's output in a
+file and prints it, with `| ` in front of each line, only after the command's
+shell has exited (see [demo 6's "How it works"](../06-qemu-resume/README.md#how-it-works)),
+so the marker arrives as `| __HERMIT_DEMO07_ADVANCE_DONE__`; the demo looks for
+the marker anywhere in the transcript. The sample above was captured before
+that change and is to be refreshed from the next verified run. The demo then
+pauses QEMU and stops the tracer again for the second read. Guest time advances
+only between the two reads. The command asks for a 1 millisecond
 sleep (`usleep 1000`, printed as `requested_sleep_us=1000`), but that is a
 request, not a measurement: the guest also runs the rest of the command, and it
 keeps running until the demo sees the marker and pauses QEMU. The advance is

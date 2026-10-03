@@ -53,12 +53,12 @@ def _boot_record(work, idx=0, qcow2_sha="d" * 64, info_log=None):
     }
 
 
-def _resume_record(schema_version=dc.RUN_METADATA_SCHEMA_VERSION):
-    return {
+def _resume_record(schema_version=dc.RUN_METADATA_SCHEMA_VERSION, info_log=None):
+    record = {
         "schema_version": schema_version,
         "kind": "qemu-resume",
         "created_at": "2026-08-28T07:00:00Z",
-        "info_log": "/tmp/info.log",
+        "info_log": "/tmp/info.log" if info_log is None else str(info_log),
         "info_log_sha256": "a" * 64,
         "hermit_version": "hermit-test",
         "qemu_version": "qemu-test",
@@ -71,6 +71,9 @@ def _resume_record(schema_version=dc.RUN_METADATA_SCHEMA_VERSION):
         "guest_output_sha256": "d" * 64,
         "snapshot_saved": False,
     }
+    if schema_version >= 3:
+        record["guest_exit_status"] = 0
+    return record
 
 
 def _build_and_publish(assets_str, lib_str, barrier, queue, idx, divergent):
@@ -610,13 +613,17 @@ class RunMetadataContractTest(unittest.TestCase):
             self.assertFalse((run / "run-metadata.json").exists())
 
     def test_schema_two_requires_qemu_binary_identity(self):
-        for record in (_boot_record(Path("/tmp")), _resume_record()):
-            with self.subTest(kind=record["kind"]):
-                del record["qemu_binary_sha256"]
-                with self.assertRaisesRegex(
-                    ValueError, "qemu-run-metadata-qemu_binary_sha256"
-                ):
-                    dc.parse_run_metadata(record)
+        # Schema 2 made the QEMU binary digest required; later schemas keep it.
+        for schema_version in (2, dc.RUN_METADATA_SCHEMA_VERSION):
+            boot = _boot_record(Path("/tmp"))
+            boot["schema_version"] = schema_version
+            for record in (boot, _resume_record(schema_version)):
+                with self.subTest(schema_version=schema_version, kind=record["kind"]):
+                    del record["qemu_binary_sha256"]
+                    with self.assertRaisesRegex(
+                        ValueError, "qemu-run-metadata-qemu_binary_sha256"
+                    ):
+                        dc.parse_run_metadata(record)
 
     def test_schema_one_retains_the_older_optional_qemu_binary(self):
         record = _resume_record(schema_version=1)
@@ -625,7 +632,7 @@ class RunMetadataContractTest(unittest.TestCase):
         self.assertIsNone(metadata.qemu_binary_sha256)
 
     def test_qemu_binary_identity_rejects_non_digest_values(self):
-        for schema_version in (1, dc.RUN_METADATA_SCHEMA_VERSION):
+        for schema_version in dc.SUPPORTED_RUN_METADATA_SCHEMA_VERSIONS:
             records = (_boot_record(Path("/tmp")), _resume_record(schema_version))
             records[0]["schema_version"] = schema_version
             for record in records:
@@ -649,9 +656,99 @@ class RunMetadataContractTest(unittest.TestCase):
                             dc.parse_run_metadata(record)
 
     def test_schema_two_accepts_lowercase_qemu_binary_digest(self):
-        record = _resume_record()
-        metadata = dc.parse_run_metadata(record)
-        self.assertEqual("b" * 64, metadata.qemu_binary_sha256)
+        for schema_version in (2, dc.RUN_METADATA_SCHEMA_VERSION):
+            with self.subTest(schema_version=schema_version):
+                metadata = dc.parse_run_metadata(_resume_record(schema_version))
+                self.assertEqual("b" * 64, metadata.qemu_binary_sha256)
+
+    def test_supported_schemas_are_one_to_current(self):
+        self.assertEqual(3, dc.RUN_METADATA_SCHEMA_VERSION)
+        self.assertEqual((1, 2, 3), dc.SUPPORTED_RUN_METADATA_SCHEMA_VERSIONS)
+
+    def test_schema_three_resume_requires_guest_exit_status(self):
+        record = _resume_record(3)
+        del record["guest_exit_status"]
+        with self.assertRaisesRegex(
+            ValueError,
+            "qemu-run-metadata-guest_exit_status: is required for qemu-resume",
+        ):
+            dc.parse_run_metadata(record)
+
+    def test_guest_exit_status_is_parsed(self):
+        for status in (0, 1, 127, 255):
+            with self.subTest(status=status):
+                record = _resume_record(3)
+                record["guest_exit_status"] = status
+                self.assertEqual(
+                    status, dc.parse_run_metadata(record).guest_exit_status
+                )
+
+    def test_older_resume_schemas_have_no_guest_exit_status(self):
+        for schema_version in (1, 2):
+            with self.subTest(schema_version=schema_version):
+                record = _resume_record(schema_version)
+                self.assertNotIn("guest_exit_status", record)
+                self.assertIsNone(dc.parse_run_metadata(record).guest_exit_status)
+                record["guest_exit_status"] = 0
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "qemu-run-metadata-guest_exit_status: is not part of schema {}".format(
+                        schema_version
+                    ),
+                ):
+                    dc.parse_run_metadata(record)
+
+    def test_guest_exit_status_rejects_non_status_values(self):
+        for invalid in (True, False, -1, 256, "0", 0.0, None):
+            with self.subTest(invalid=invalid):
+                record = _resume_record(3)
+                record["guest_exit_status"] = invalid
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "qemu-run-metadata-guest_exit_status: must be an integer "
+                    "from 0 to 255",
+                ):
+                    dc.parse_run_metadata(record)
+
+    def test_boot_rows_have_no_guest_exit_status(self):
+        record = _boot_record(Path("/tmp"))
+        record["guest_exit_status"] = 0
+        with self.assertRaisesRegex(
+            ValueError, "qemu-run-metadata-field: unknown field.*guest_exit_status"
+        ):
+            dc.parse_run_metadata(record)
+
+    def test_compare_runs_checks_guest_exit_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info_log = Path(tmp) / "hermit-info.log"
+            info_log.write_text(BASE_LOG)
+            anchor = dc.parse_run_metadata(_resume_record(3, info_log))
+            same = dc.parse_run_metadata(_resume_record(3, info_log))
+            passed, report = dc.compare_runs(anchor, same)
+            self.assertTrue(passed, report)
+            self.assertIn("PASS: guest command exit status matches (0)", report)
+
+            different_record = _resume_record(3, info_log)
+            different_record["guest_exit_status"] = 3
+            different = dc.parse_run_metadata(different_record)
+            passed, report = dc.compare_runs(anchor, different)
+            self.assertFalse(passed)
+            self.assertIn(
+                "WARN: guest command exit status differs from first run: "
+                "first=0 current=3",
+                report,
+            )
+
+            # A reference run from before schema 3 recorded no status, so it
+            # cannot vouch for the current run's status.
+            older = dc.parse_run_metadata(_resume_record(2, info_log))
+            passed, report = dc.compare_runs(older, same)
+            self.assertFalse(passed)
+            self.assertIn(
+                "WARN: guest command exit status differs from first run: "
+                "first=None current=0",
+                report,
+            )
 
     def test_saved_resume_requires_its_snapshot_fields(self):
         record = _resume_record()
