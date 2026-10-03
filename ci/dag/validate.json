@@ -4047,6 +4047,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/poll-readiness",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/poll-readiness",
           "mode": "verify",
           "backend": "liteinst"
         },
@@ -4363,6 +4370,13 @@
           "category": "c-programs",
           "test": "c-programs/prodcons-determinism",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pselect6-simulation",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -19940,6 +19954,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/poll-readiness",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/poll-readiness",
           "mode": "verify",
           "backend": "liteinst"
         },
@@ -20186,6 +20207,13 @@
           "category": "c-programs",
           "test": "c-programs/prodcons-determinism",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pselect6-simulation",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {

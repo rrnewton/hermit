@@ -107,6 +107,10 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
+use crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
+#[cfg(test)]
 use crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
 use crate::timeouts::resolve_test_timeouts;
@@ -8028,6 +8032,23 @@ mod tests {
                 assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
             }
         }
+        // https://github.com/rrnewton/hermit/pull/3580 selects ptrace replay of
+        // the two select programs, with the ordinary bounds.
+        for population in [&required, &enabled] {
+            for test in SELECT_REPLAY_2026_10_03_TESTS {
+                let replay = population
+                    .iter()
+                    .filter(|cell| cell.id.test == test && cell.id.mode == "replay")
+                    .collect::<Vec<_>>();
+                assert_eq!(replay.len(), 1, "{test}");
+                assert_eq!(replay[0].id.backend.as_deref(), Some("ptrace"), "{test}");
+                assert_eq!(
+                    replay[0].cpu_timeout_seconds,
+                    DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+                );
+                assert_eq!(replay[0].timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+            }
+        }
         assert_eq!(
             required.len(),
             CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
@@ -8042,6 +8063,7 @@ mod tests {
                 + 3 // the exact RNG identities asserted above
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
+                + SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
         );
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
