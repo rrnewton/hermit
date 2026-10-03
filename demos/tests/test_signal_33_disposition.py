@@ -15,6 +15,13 @@ command. glibc's sigaction(), and with it Python's signal.signal(), refuses to
 change signal 33, so the child makes the rt_sigaction system call directly. The
 tests then check that the starting state took effect, so they do not depend on
 how the child itself was started.
+
+A C library can install its own signal 33 handler before the child's first line
+runs (glibc before 2.34 does, as libpthread starts). Every process on such a
+host starts with signal 33 caught, so the child leaves that handler in place
+rather than set a state no real launch is in. The settle tests still run there
+and still require that no launch inherits signal 33 ignored. Only the control
+test, which needs a start with signal 33 ignored, is skipped.
 """
 
 import ast
@@ -113,14 +120,14 @@ def launch():
 start, mode = sys.argv[2], sys.argv[3]
 report = {"caught_at_entry": own_signal_33_state()[1]}
 # Setting a disposition over a handler the C library already installed would
-# make a state that no real launch is in, so do nothing in that case.
+# make a state that no real launch is in, so start from that handler instead.
 if not report["caught_at_entry"]:
     set_signal_33({"ignored": SIG_IGN, "default": SIG_DFL}[start])
-    report["started_ignored"], report["started_caught"] = own_signal_33_state()
-    if mode == "settle":
-        signal_33.settle_signal_33_disposition()
-    report["first"] = launch()
-    report["second"] = launch()
+report["started_ignored"], report["started_caught"] = own_signal_33_state()
+if mode == "settle":
+    signal_33.settle_signal_33_disposition()
+report["first"] = launch()
+report["second"] = launch()
 print(json.dumps(report))
 """
 
@@ -150,28 +157,39 @@ def _spawn_child(start, mode):
 
 class Signal33DispositionTest(unittest.TestCase):
     def _report(self, start, mode):
-        """Run the child from `start` and check that the starting state took."""
+        """Run the child from `start` and check that the starting state took.
+
+        When the C library caught signal 33 before the child's first line ran,
+        the child keeps that handler, so it starts caught whatever `start` is.
+        """
         report = _spawn_child(start, mode)
         if report["caught_at_entry"]:
-            # Decided before the child changes anything or calls the code under
-            # test. Here no `hermit` can inherit signal 33 ignored, so there is
-            # no difference between launches to remove.
-            self.skipTest(
-                "the C library installed its own signal 33 handler before the "
-                "child's first line ran (glibc before 2.34 does this as "
-                "libpthread starts), so no launch can inherit signal 33 "
-                "ignored: {}".format(report)
-            )
+            expected = (False, True)
+            state = "caught by the C library's own handler"
+        else:
+            expected = (start == "ignored", False)
+            state = start
         self.assertEqual(
             (report["started_ignored"], report["started_caught"]),
-            (start == "ignored", False),
-            "rt_sigaction did not leave signal 33 {}: {}".format(start, report),
+            expected,
+            "signal 33 did not start {}: {}".format(state, report),
         )
         return report
 
     def test_without_settling_the_second_launch_differs(self):
         """Control: the flip that settle_signal_33_disposition removes exists here."""
         report = self._report("ignored", "control")
+        if report["caught_at_entry"]:
+            # Only this control needs a start with signal 33 ignored. The skip
+            # is decided by the child's state on entry, before it changes
+            # anything or calls the code under test.
+            self.skipTest(
+                "the C library installed its own signal 33 handler before the "
+                "child's first line ran (glibc before 2.34 does this as "
+                "libpthread starts), so no launch can inherit signal 33 "
+                "ignored and there is no difference between launches to "
+                "show: {}".format(report)
+            )
         self.assertEqual(
             (report["first"], report["second"]),
             (True, False),
