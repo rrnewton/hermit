@@ -1138,6 +1138,22 @@ def make_run_dir(parent: Path, prefix: str) -> Path:
     return run_dir
 
 
+class LogCapExceeded(RuntimeError):
+    """wait_for_process stopped a process whose log grew past its cap."""
+
+    def __init__(self, log_path: Path, log_size: int, max_log_bytes: int, elapsed: float):
+        super().__init__(
+            "{} grew to {} bytes, past the {}-byte log cap; the run was stopped".format(
+                log_path, log_size, max_log_bytes
+            )
+        )
+        self.log_path = Path(log_path)
+        self.log_size = log_size
+        self.max_log_bytes = max_log_bytes
+        # Seconds from the start of the wait until the cap was seen.
+        self.elapsed = elapsed
+
+
 def wait_for_process(
     process: subprocess.Popen,
     timeout: float,
@@ -1151,9 +1167,9 @@ def wait_for_process(
 
     ``timeout`` bounds the wall time. When ``log_path`` and ``max_log_bytes`` are
     both set, the file is also watched: if it grows past the cap, the process
-    group is stopped and RuntimeError names the cap, so a runaway log cannot fill
-    the disk. The caller is expected to have started the process with
-    ``start_new_session=True``.
+    group is stopped and LogCapExceeded (a RuntimeError) names the cap, so a
+    runaway log cannot fill the disk. The caller is expected to have started the
+    process with ``start_new_session=True``.
 
     When ``first_output_label`` is set (used with ``stream_path``), a live
     seconds-counter ticks until the very first byte of streamed output appears,
@@ -1235,9 +1251,11 @@ def wait_for_process(
                     log_size = 0
                 if log_size > max_log_bytes:
                     stop_process(process)
-                    raise RuntimeError(
-                        "{} grew to {} bytes, past the {}-byte log cap; the run "
-                        "was stopped".format(log_path, log_size, max_log_bytes)
+                    raise LogCapExceeded(
+                        Path(log_path),
+                        log_size,
+                        max_log_bytes,
+                        time.monotonic() - started,
                     )
 
             now = time.monotonic()

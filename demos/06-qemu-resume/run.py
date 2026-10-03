@@ -29,6 +29,7 @@ from demo_common import (  # noqa: E402
     hash_file,
     hermit_binary,
     hermit_tmp_args,
+    LogCapExceeded,
     load_anchor,
     make_run_dir,
     print_comparison,
@@ -43,6 +44,7 @@ from demo_common import (  # noqa: E402
 )
 from qemu_controller import (  # noqa: E402
     BEGIN_LINE,
+    CommandTranscriptParser,
     StaleGuestInitError,
     build_qemu_command,
     parse_command_transcript,
@@ -212,6 +214,59 @@ def failed_run_message(return_code: int, serial_log: Path) -> str:
     return message
 
 
+def guest_command_progress(serial_log: Path) -> str:
+    """Say how far the guest's command had got, from the serial log."""
+    try:
+        transcript = serial_log.read_bytes()
+    except OSError:
+        return "QEMU had not written the serial log {}".format(serial_log)
+    parser = CommandTranscriptParser()
+    try:
+        result = parser.feed(transcript)
+    except StaleGuestInitError as error:
+        return str(error)
+    if result is not None:
+        return (
+            "the guest command had finished with exit status {}, but Hermit/QEMU "
+            "had not exited".format(result.exit_status)
+        )
+    if parser.started:
+        return (
+            "the guest command had not finished: the serial log has the {} line "
+            "but no END line".format(BEGIN_LINE.decode())
+        )
+    return "the guest had not started the command: the serial log has no {} line".format(
+        BEGIN_LINE.decode()
+    )
+
+
+def stopped_run_message(error: Exception, serial_log: Path) -> str:
+    """Name what stopped an unfinished resume, and how far the guest had got.
+
+    A command that never exits, or one whose END line a kernel message hid,
+    keeps the run going until a bound stops it. With the default settings the
+    INFO log cap is reached first: on 2026-10-03 Hermit wrote 18.5 to 19.2 MB
+    of INFO log per second of resume, so the 512 MiB cap stopped a
+    `sleep 1000000` after about 29 seconds, well before the 120-second
+    QEMU_TIMEOUT. Neither bound can end in SUCCESS.
+    """
+    if isinstance(error, LogCapExceeded):
+        cause = (
+            "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
+            "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, so the run was "
+            "stopped before QEMU_TIMEOUT ({}s)".format(
+                error.log_path,
+                error.log_size,
+                error.max_log_bytes,
+                error.elapsed,
+                TIMEOUT,
+            )
+        )
+    else:
+        cause = "Hermit/QEMU did not exit within QEMU_TIMEOUT ({}s)".format(TIMEOUT)
+    return "{}; {}".format(cause, guest_command_progress(serial_log))
+
+
 def ensure_boot_snapshot() -> None:
     """Build demo 5's default boot snapshot; never guess for custom paths."""
     if BOOT_SNAPSHOT_DISK.is_file():
@@ -371,6 +426,9 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
                     log_path=info_log,
                     max_log_bytes=MAX_LOG_BYTES,
                 )
+            except (LogCapExceeded, TimeoutError) as error:
+                print(flush=True)
+                raise RuntimeError(stopped_run_message(error, serial_log)) from error
             finally:
                 copier.join(OUTPUT_DRAIN_TIMEOUT)
             if copier.is_alive():
